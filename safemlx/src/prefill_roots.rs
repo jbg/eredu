@@ -274,6 +274,7 @@ impl PrefillRoots {
             size_of::<Option<runtime_lock::RuntimeLockGuard>>(),
             size_of::<Result<(), PrefillRootsError>>(),
             size_of::<Result<bool, PrefillRootsError>>(),
+            size_of::<(&mut Self, &Array)>(),
         ]
         .into_iter()
         .try_fold(raw.native_controls, usize::checked_add)
@@ -468,6 +469,19 @@ impl PrefillRoots {
         } else {
             Err(cause(status))
         }
+    }
+    /// Release one exact collector alias pair after the same current original
+    /// scope proves that root complete. This does not wait, evaluate, recycle
+    /// append capacity, reset the collector, or weaken final stream completion.
+    pub fn retire_completed_current(&mut self, value: &Array) -> Result<(), PrefillRootsError> {
+        let Some(_guard) = runtime_lock::try_enter_for_recovery() else {
+            return Err(PrefillRootsCause::RuntimeBusy.into());
+        };
+        // SAFETY: both handles stay borrowed; native authenticates the bound
+        // current scope, descriptor identity and completion before either erase.
+        self.retained_status(unsafe {
+            safemlx_sys::mlx_prefill_roots_retire_completed_current(self.raw, value.as_ptr())
+        })
     }
     /// Closed validation path: an original collector requires each result's
     /// descriptor to belong to its same Graph arena and deduplicates aliases.

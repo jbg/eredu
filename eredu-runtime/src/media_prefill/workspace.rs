@@ -1,11 +1,11 @@
-//! Ordinary metadata execution through the actual retained-ingress traversal.
+//! Metadata execution through the actual retained-ingress traversal.
 //! These types are fixed to WorkspaceBackend and cannot submit native work or
 //! issue original admission. The enclosing quote owns its ordinary metadata lease.
 use super::*;
 use crate::{LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError, ResidentRuntime};
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceMetadataFunding, WorkspaceTensor},
+    workspace::{WorkspaceBackend, WorkspaceContext, HostMetadataFunding, WorkspaceTensor},
 };
 
 /// Metadata-only source with the same cut, inactive outcomes and phase changes
@@ -16,8 +16,8 @@ where
     A: PrefillIngressArchitecture<WorkspaceBackend, S>,
 {
     source: PreparedMediaPrefill<A, WorkspaceBackend, S>,
-    // Source table/flags/request shells and retained values retire first.
-    _funding: Option<WorkspaceMetadataFunding>,
+    // Source tables, flags and retained values retire before their funding.
+    _funding: Option<HostMetadataFunding>,
 }
 impl<A, S> MediaEquationSource<A, S>
 where
@@ -28,7 +28,7 @@ where
     /// Native storage and the preparation lease are retained by the closed caller.
     pub fn new(architecture: &A, plan: A::IngressPlan) -> Result<Self, Error> {
         Self::construct(architecture, plan, construction::Destination(None), || {
-            architecture.execution_graph()
+            architecture.execution_graph().map(crate::ArchitectureExecutionGraph::into_owned)
         })
     }
 
@@ -43,7 +43,7 @@ where
         context: &WorkspaceContext,
     ) -> Result<Self, Error> {
         Self::construct_counted(architecture, plan, context, || {
-            architecture.execution_graph()
+            architecture.execution_graph()?.into_owned_with_metadata(context)
         })
     }
 
@@ -60,6 +60,49 @@ where
         Self::construct_counted(architecture, plan, context, || {
             graph.clone_with_metadata(context)
         })
+    }
+
+    /// Constructs the metadata source from the selected strategy's exact paid
+    /// cut worker, including its local decoder-ingress ownership.
+    pub fn new_selected<R, P, E>(runtime: &E::Runtime, plan: A::IngressPlan,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error>
+    where R: LayerwisePolicy<WorkspaceBackend, A::Unit>,
+        P: LayerwisePolicy<WorkspaceBackend, A::Unit, Error = R::Error>,
+        R::Error: std::error::Error + Send + Sync + 'static,
+        E: MediaTextExecutionStrategy<A, WorkspaceBackend, S, R, P>,
+    {
+        construction::admit_source::<A, S>(context)?;
+        context.charge_metadata(std::mem::size_of::<(&E::Runtime, A::IngressPlan,
+            Result<CompositePrefillCut, Error>)>())?;
+        let funding = context.metadata_funding();
+        let result = (|| {
+            let cut = E::prepare_media_cut_with_metadata(runtime, &plan, context)?;
+            Self::finish_source(plan, construction::Destination(Some(context)), cut)
+        })();
+        result.map_err(|cause| Error::backend_retained_source(construction::SourceFailure { cause, _funding: funding }))
+    }
+
+    /// Executes the selected strategy's original media worker with this exact
+    /// metadata source. It cannot manufacture native completion or admission.
+    pub fn forward_selected<R, P, E, O>(&mut self, strategy: &mut E,
+        runtime: &mut E::Runtime, span: &PrefillChunk, state: &mut S,
+        context: &WorkspaceContext, observer: &mut O,
+        paths: Option<&crate::PreparedLayeredObservationPaths>,
+    ) -> Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>
+    where R: LayerwisePolicy<WorkspaceBackend, A::Unit>,
+        P: LayerwisePolicy<WorkspaceBackend, A::Unit, Error = R::Error>,
+        R::Error: std::error::Error + Send + Sync + 'static,
+        E: MediaTextExecutionStrategy<A, WorkspaceBackend, S, R, P>,
+        O: crate::ActivationObserver<WorkspaceTensor, Error> + ?Sized,
+    {
+        context.charge_metadata(std::mem::size_of::<(
+            &mut Self, &mut E, &mut E::Runtime, &PrefillChunk, &mut S,
+            &WorkspaceContext, &mut O, Option<&crate::PreparedLayeredObservationPaths>,
+            Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>,
+        )>())?;
+        strategy.forward_media_span(runtime, &mut self.source, span, state, context,
+            observer, paths, span.output).map_err(|cause| context.metadata_source(cause))
     }
 
     fn construct_counted(
@@ -90,18 +133,27 @@ where
         destination: construction::Destination<'_>,
         graph: impl FnOnce() -> Result<ExecutionGraph, Error>,
     ) -> Result<Self, Error> {
+        Self::construct_with_cut(architecture, plan, destination,
+            || destination.cut(graph()?, architecture.primary_execution_group()))
+    }
+
+    fn construct_with_cut(architecture: &A, plan: A::IngressPlan,
+        destination: construction::Destination<'_>, cut: impl FnOnce() -> Result<CompositePrefillCut, Error>,
+    ) -> Result<Self, Error> {
         match destination.0 {
-            Some(context) => architecture.validate_ingress_plan_with_metadata(&plan, context)?,
-            None => architecture.validate_ingress_plan(&plan)?,
+            Some(context) => architecture.validate_ingress_plan(&plan, Some(context))?,
+            None => architecture.validate_ingress_plan(&plan, None)?,
         }
+        Self::finish_source(plan, destination, cut()?)
+    }
+
+    fn finish_source(plan: A::IngressPlan, destination: construction::Destination<'_>,
+        cut: CompositePrefillCut,
+    ) -> Result<Self, Error> {
         let binding =
             A::ingress_session_binding(&plan).ok_or_else(|| destination.missing_binding())?;
-        let execution = binding.execution.clone();
         let revision = binding.revision.clone();
-        let geometry = A::ingress_geometry(&plan);
-        let request = destination.request(&execution, geometry)?;
-        let cut = destination.cut(graph()?, architecture.primary_execution_group())?;
-        let source = destination.prepared(plan, cut, request, &execution, revision)?;
+        let source = destination.equation(plan, cut, revision)?;
         Ok(Self {
             source,
             _funding: destination.0.and_then(WorkspaceContext::metadata_funding),
@@ -118,7 +170,7 @@ where
         let revision = self.source.revision.clone();
         self.source
             .committed(&revision)
-            .map_err(Error::backend_source)
+            .map_err(|cause| match self.source.metadata.as_ref() { Some(metadata) => metadata.metadata_source(cause), None => Error::backend_retained_source(cause) })
     }
     pub fn forward_resident<H>(
         &mut self,
@@ -131,7 +183,7 @@ where
     where
         H: LayeredTraversalHook<WorkspaceBackend, A::ForwardContext, Error> + ?Sized,
     {
-        let initial = self.source.start(span).map_err(Error::backend_source)?;
+        let initial = self.source.start(span).map_err(|cause| match self.source.metadata.as_ref() { Some(metadata) => metadata.metadata_source(cause), None => Error::backend_retained_source(cause) })?;
         runtime.forward_with_invocation_and_traversal_hook(
             MediaInvocation {
                 source: &mut self.source,
@@ -160,7 +212,7 @@ where
         let initial = self
             .source
             .start(span)
-            .map_err(|e| LayerwiseRuntimeError::Architecture(Error::backend_source(e)))?;
+            .map_err(|e| LayerwiseRuntimeError::Architecture(context.metadata_source(e)))?;
         runtime.forward_with_unit_executor_and_invocation(
             MediaInvocation {
                 source: &mut self.source,
@@ -234,7 +286,7 @@ where
         Provider:crate::RoutedExpertProvider<WorkspaceBackend>,Provider::Error:std::fmt::Display,
         H:LayeredTraversalHook<WorkspaceBackend,A::ForwardContext,Error>+?Sized,
     {
-        let initial=self.source.start(span).map_err(Error::backend_source)?;
+        let initial=self.source.start(span).map_err(|cause| match self.source.metadata.as_ref() { Some(metadata) => metadata.metadata_source(cause), None => Error::backend_retained_source(cause) })?;
         runtime.forward_with_invocation_and_unit_executor(MediaInvocation{source:&mut self.source,span,initial},
             state,context,hook,span.output,
             |architecture,group,index,unit,hidden,state,forward,context,hook| {
@@ -257,7 +309,7 @@ where
         Provider:crate::RoutedExpertProvider<WorkspaceBackend>,Provider::Error:std::fmt::Display,
         H:LayeredTraversalHook<WorkspaceBackend,A::ForwardContext,Error>+?Sized,
     {
-        let initial=self.source.start(span).map_err(|cause|LayerwiseRuntimeError::Architecture(Error::backend_source(cause)))?;
+        let initial=self.source.start(span).map_err(|cause|LayerwiseRuntimeError::Architecture(context.metadata_source(cause)))?;
         runtime.forward_with_unit_executor_and_invocation(MediaInvocation{source:&mut self.source,span,initial},
             state,context,|architecture,group,index,unit,hidden,state,forward,context,hook| {
                 if hook.observes_activations(){
@@ -312,7 +364,7 @@ fn observed_hook<'a, H: ?Sized>(
     &'a mut H,
     crate::layered::BorrowedHook<'a, dyn crate::working_memory::InferenceWorkspaceObserver + 'a>,
 >, Error> {
-    type Pair<'a, H: ?Sized> = crate::CompositeLayeredTraversalHook<
+    type Pair<'a, H> = crate::CompositeLayeredTraversalHook<
         &'a mut H,
         crate::layered::BorrowedHook<'a, dyn crate::working_memory::InferenceWorkspaceObserver + 'a>,
     >;

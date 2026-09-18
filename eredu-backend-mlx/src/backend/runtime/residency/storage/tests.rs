@@ -60,6 +60,7 @@ fn retained_storage_merges_physical_aliases_and_outlives_original_handles() {
             .values()
             .next()
             .unwrap()
+            .owned().unwrap()
             .1
             .evaluated()
             .unwrap()
@@ -167,5 +168,81 @@ fn retained_storage_deduplicates_certified_host_array_backing_in_either_order() 
         assert_eq!(view.evaluated().unwrap().as_slice::<f32>(), &values[16..]);
         drop(view);
         assert_eq!(first.byte_bound().unwrap(), Some(expected));
+    }
+}
+
+/// Exercises the actual inventory collector with cells constructed by the
+/// genuine named-destination fixture; this helper grants no publication proof.
+pub(crate) struct CanonicalCollectionFixture(RetainedStorage);
+impl CanonicalCollectionFixture {
+    pub(crate) fn new(cell: &super::super::manager::CanonicalArrayOwner) -> Self {
+        assert!(
+            cell.proof().is_none(),
+            "prepared tables alone grant no receipt"
+        );
+        let mut storage = RetainedStorage::default();
+        storage.include_array(cell.array()).unwrap();
+        assert!(
+            storage
+                .array_entries()
+                .next()
+                .unwrap()
+                .1
+                .1
+                .canonical()
+                .is_none()
+        );
+        storage.include_canonical_array(cell).unwrap();
+        storage.include_canonical_array(cell).unwrap();
+        assert_eq!(storage.array_entries().count(), 1);
+        let retained = &storage.array_entries().next().unwrap().1.1;
+        assert!(retained.canonical().unwrap().same_cell(cell));
+        let RetainedArray::Canonical { displaced, .. } = retained else {
+            panic!("same row upgraded")
+        };
+        assert!(
+            displaced.is_some(),
+            "the earlier native handle is retained outside the manager loan"
+        );
+        Self(storage)
+    }
+    pub(crate) fn reject_conflict(&mut self, cell: &super::super::manager::CanonicalArrayOwner) {
+        let before = self
+            .0
+            .array_entries()
+            .next()
+            .unwrap()
+            .1
+            .1
+            .canonical()
+            .unwrap()
+            .clone();
+        assert!(self.0.include_canonical_array(cell).is_err());
+        assert_eq!(self.0.array_entries().count(), 1);
+        let retained = self
+            .0
+            .array_entries()
+            .next()
+            .unwrap()
+            .1
+            .1
+            .canonical()
+            .unwrap();
+        assert!(retained.same_cell(&before));
+        assert!(!retained.same_cell(cell));
+    }
+    pub(crate) fn assert_values(&self) {
+        assert_eq!(
+            self.0
+                .array_entries()
+                .next()
+                .unwrap()
+                .1
+                .1
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[1, 2]
+        );
     }
 }

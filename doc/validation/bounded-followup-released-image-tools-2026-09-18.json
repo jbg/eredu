@@ -1,0 +1,1851 @@
+{
+  "started_at": "2026-09-18T08:28:06.094274+00:00",
+  "status": "passed",
+  "validator_command": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "validation/prepared_chat_tools.py",
+    "--binary",
+    "/private/tmp/eredu-current-prepared-chat-generate-media-readiness",
+    "--checkpoint",
+    "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+    "--pinned-record",
+    "doc/validation/bounded-followup-native-2026-09-18.json",
+    "--source-root",
+    "/Users/jbg/dev/eredu",
+    "--output",
+    "/private/tmp/eredu-released-image-tools-repro-results-2026-09-18",
+    "--request-template",
+    "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+    "--capacity",
+    "68719476736",
+    "--chunk",
+    "128",
+    "--max-tokens",
+    "48"
+  ],
+  "working_directory": "/Users/jbg/dev/eredu",
+  "scope": "Pinned released checkpoint ordinary authenticated processed image plus Required/Auto tools; no drafter, visual recognition or independent media-numerics claim.",
+  "checkpoint": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+    "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+    "files": [
+      {
+        "name": ".gitattributes",
+        "size": 1570,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+        "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+      },
+      {
+        "name": "LICENSE",
+        "size": 11544,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+        "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      {
+        "name": "README.md",
+        "size": 61705,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+        "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+      },
+      {
+        "name": "chat_template.jinja",
+        "size": 7755,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+        "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+      },
+      {
+        "name": "config.json",
+        "size": 2907,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+        "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+      },
+      {
+        "name": "merges.txt",
+        "size": 3353259,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+        "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+      },
+      {
+        "name": "model.safetensors-00001-of-00001.safetensors",
+        "size": 1746942600,
+        "digest_algorithm": "sha256",
+        "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size": 50900,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+        "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size": 390,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+        "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+      },
+      {
+        "name": "tokenizer.json",
+        "size": 12807982,
+        "digest_algorithm": "sha256",
+        "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size": 16709,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+        "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+      },
+      {
+        "name": "video_preprocessor_config.json",
+        "size": 385,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+        "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+      },
+      {
+        "name": "vocab.json",
+        "size": 6722759,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+        "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+      }
+    ]
+  },
+  "binary": {
+    "path": "/private/tmp/eredu-current-prepared-chat-generate-media-readiness",
+    "size": 848927896,
+    "sha256": "02f459412d4f9b11c25f2d5536bdc292c7efb5841e7f7ef50af07b61ce3a8288"
+  },
+  "sources": {
+    "validator_sha256": "fb9d3cf6ac0e8c83b04d797af902f9d6d99e0d588f3f2ee18c24bebce4a33c2a",
+    "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+  },
+  "environment": {
+    "system": "Darwin",
+    "macos": "26.6.2",
+    "machine": "arm64",
+    "RUST_MIN_STACK": "67108864",
+    "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+    "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+    "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+  },
+  "capacity_bytes": 68719476736,
+  "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+  "runs": [
+    {
+      "policy": "required",
+      "command": [
+        "/usr/bin/time",
+        "-l",
+        "/private/tmp/eredu-current-prepared-chat-generate-media-readiness",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-released-image-tools-repro-results-2026-09-18/required.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 35.21086866711266,
+      "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "c9b82a82a33e351fd64cccb61ebc39b34f0f7d57e3c6aa2e30a888e656af6c7e",
+      "stderr": "committed_tokens=25 finish=GrammarComplete\n       35.16 real        30.42 user         6.54 sys\n          3199565824  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              213284  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                5026  involuntary context switches\n        500804135392  instructions retired\n        133109964754  cycles elapsed\n          5690428656  peak memory footprint\n",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3199565824,
+        "peak_memory_footprint_bytes": 5690428656
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25,
+      "request_fields": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_path": "/private/tmp/eredu-released-image-tools-repro-results-2026-09-18/required.request.json",
+      "prepared_parts_recipe": "See input_preparation and the retained generator; exact expanded document identified by request_sha256."
+    },
+    {
+      "policy": "auto",
+      "command": [
+        "/usr/bin/time",
+        "-l",
+        "/private/tmp/eredu-current-prepared-chat-generate-media-readiness",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-released-image-tools-repro-results-2026-09-18/auto.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 31.35711900005117,
+      "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "3e117696802be95e40a74d6182859b1df4e42c8516e4cb108913d13d0fd861fb",
+      "stderr": "committed_tokens=25 finish=GrammarComplete\n       31.31 real        26.70 user         6.35 sys\n          3189145600  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212649  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                5251  involuntary context switches\n        479783100763  instructions retired\n        124132120543  cycles elapsed\n          5680565488  peak memory footprint\n",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3189145600,
+        "peak_memory_footprint_bytes": 5680565488
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25,
+      "request_fields": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_path": "/private/tmp/eredu-released-image-tools-repro-results-2026-09-18/auto.request.json",
+      "prepared_parts_recipe": "See input_preparation and the retained generator; exact expanded document identified by request_sha256."
+    }
+  ],
+  "request_template": {
+    "path": "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+    "sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f"
+  },
+  "input_preparation": {
+    "checkpoint": "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+    "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+    "generator_sha256": "2735fa310f5bf5b5c8e8a3412fdfc99434f265b15716f5d779f4a914ce412cb9",
+    "versions": {
+      "transformers": "5.16.0.dev0",
+      "tokenizers": "0.22.2"
+    },
+    "image": {
+      "width": 256,
+      "height": 256,
+      "rgb": [
+        153,
+        153,
+        153
+      ],
+      "patch_grid": [
+        1,
+        16,
+        16
+      ]
+    },
+    "text_positions": 322,
+    "marker_position": 298,
+    "decoder_positions": 385,
+    "purpose": "Authenticated image plus ordinary tools; no visual recognition or numerical-reference claim."
+  },
+  "input_generator": "validation/prepared_chat_image_request.py",
+  "input_preparation_sha256": "4047964953f3518d4180052372adb64778f9aa7a1b0a038bec9cf38113e23961",
+  "build_log": "/private/tmp/eredu-current-native-media-readiness-build.log",
+  "build_log_sha256": "ce9d49a04771ab4f4b76079c157cf13cdf02c833e581d0a3b04a2e6bc976930a",
+  "validation_limit": "Includes completed ingress source publication and distributed readiness; predates shared partition media quotation, final autoregressive stream attachment and paid distributed reset. Functional debug-build run, not isolated throughput benchmark.",
+  "followup_runs": [
+    {
+      "started_at": "2026-09-18T08:42:19.068250+00:00",
+      "status": "passed",
+      "validator_command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "validation/prepared_chat_tools.py",
+        "--binary",
+        "/private/tmp/eredu-current-prepared-chat-generate-partition-reset",
+        "--checkpoint",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "--pinned-record",
+        "doc/validation/bounded-followup-native-2026-09-18.json",
+        "--source-root",
+        "/Users/jbg/dev/eredu",
+        "--output",
+        "/private/tmp/eredu-released-image-tools-partition-reset-2026-09-18",
+        "--request-template",
+        "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "--capacity",
+        "68719476736",
+        "--chunk",
+        "128",
+        "--max-tokens",
+        "48"
+      ],
+      "working_directory": "/Users/jbg/dev/eredu",
+      "scope": "Actual released ordinary image plus Required/Auto tools after shared interval-loop changes. Exact input generator and64GiB unchanged. No distributed or visual-recognition claim.",
+      "checkpoint": {
+        "repository": "Qwen/Qwen3.5-0.8B",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+        "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+        "files": [
+          {
+            "name": ".gitattributes",
+            "size": 1570,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+            "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+          },
+          {
+            "name": "LICENSE",
+            "size": 11544,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+            "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+          },
+          {
+            "name": "README.md",
+            "size": 61705,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+            "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+          },
+          {
+            "name": "chat_template.jinja",
+            "size": 7755,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+            "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+          },
+          {
+            "name": "config.json",
+            "size": 2907,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+            "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+          },
+          {
+            "name": "merges.txt",
+            "size": 3353259,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+            "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+          },
+          {
+            "name": "model.safetensors-00001-of-00001.safetensors",
+            "size": 1746942600,
+            "digest_algorithm": "sha256",
+            "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+            "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          },
+          {
+            "name": "model.safetensors.index.json",
+            "size": 50900,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+            "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+          },
+          {
+            "name": "preprocessor_config.json",
+            "size": 390,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "name": "tokenizer.json",
+            "size": 12807982,
+            "digest_algorithm": "sha256",
+            "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "size": 16709,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+            "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+          },
+          {
+            "name": "video_preprocessor_config.json",
+            "size": 385,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "name": "vocab.json",
+            "size": 6722759,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+            "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+          }
+        ]
+      },
+      "binary": {
+        "path": "/private/tmp/eredu-current-prepared-chat-generate-partition-reset",
+        "size": 852211080,
+        "sha256": "00dd853d6b0fdcae3c43decc9b664516f7cf5cd3abbd3bd1a174a32861c0ebff"
+      },
+      "sources": {
+        "validator_sha256": "fb9d3cf6ac0e8c83b04d797af902f9d6d99e0d588f3f2ee18c24bebce4a33c2a",
+        "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+      },
+      "environment": {
+        "system": "Darwin",
+        "macos": "26.6.2",
+        "machine": "arm64",
+        "RUST_MIN_STACK": "67108864",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+      },
+      "capacity_bytes": 68719476736,
+      "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+      "runs": [
+        {
+          "policy": "required",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-partition-reset",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-partition-reset-2026-09-18/required.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 37.48324904195033,
+          "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "6f09925c221ae009ad978737d3426d5a92caf3e05e47b344d33990aa611dbd63",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       37.43 real        27.59 user         6.25 sys\n          3187507200  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212549  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                4435  involuntary context switches\n        501263444090  instructions retired\n        129899769188  cycles elapsed\n          5682793760  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3187507200,
+            "peak_memory_footprint_bytes": 5682793760
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_path": "/private/tmp/eredu-released-image-tools-partition-reset-2026-09-18/required.request.json",
+          "prepared_parts_recipe": "Same retained image input generator and exact request-template hash."
+        },
+        {
+          "policy": "auto",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-partition-reset",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-partition-reset-2026-09-18/auto.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 32.69037929200567,
+          "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "cd16619867e68cfcf5824025350541663ca686161b136ca907d99f1f7e9d0b8b",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       32.63 real        28.05 user         6.43 sys\n          3187998720  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212579  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                5135  involuntary context switches\n        479598648330  instructions retired\n        124559302166  cycles elapsed\n          5675355400  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3187998720,
+            "peak_memory_footprint_bytes": 5675355400
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_path": "/private/tmp/eredu-released-image-tools-partition-reset-2026-09-18/auto.request.json",
+          "prepared_parts_recipe": "Same retained image input generator and exact request-template hash."
+        }
+      ],
+      "request_template": {
+        "path": "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f"
+      },
+      "stage": "shared_serial_partition_media_loop_and_reset",
+      "build_log": "/private/tmp/eredu-current-native-partition-reset-public-build.log",
+      "build_log_sha256": "8e5439aa4215108c8300f0d54fb08f4092f517cd4704f8c88bf539e680ea0fec",
+      "validation_limit": "Functional debug-build run alongside backend compilation; predates later parallel declaration-funding fixes, which affect distributed paths."
+    },
+    {
+      "started_at": "2026-09-18T08:54:56.767093+00:00",
+      "status": "passed",
+      "validator_command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "validation/prepared_chat_tools.py",
+        "--binary",
+        "/private/tmp/eredu-current-prepared-chat-generate-paid-partition",
+        "--checkpoint",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "--pinned-record",
+        "doc/validation/bounded-followup-native-2026-09-18.json",
+        "--source-root",
+        "/Users/jbg/dev/eredu",
+        "--output",
+        "/private/tmp/eredu-released-image-tools-paid-partition-2026-09-18",
+        "--request-template",
+        "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "--capacity",
+        "68719476736",
+        "--chunk",
+        "128",
+        "--max-tokens",
+        "48"
+      ],
+      "working_directory": "/Users/jbg/dev/eredu",
+      "scope": "released public ordinary prepared-chat tools; no drafter or numerical-reference rerun",
+      "checkpoint": {
+        "repository": "Qwen/Qwen3.5-0.8B",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+        "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+        "files": [
+          {
+            "name": ".gitattributes",
+            "size": 1570,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+            "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+          },
+          {
+            "name": "LICENSE",
+            "size": 11544,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+            "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+          },
+          {
+            "name": "README.md",
+            "size": 61705,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+            "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+          },
+          {
+            "name": "chat_template.jinja",
+            "size": 7755,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+            "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+          },
+          {
+            "name": "config.json",
+            "size": 2907,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+            "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+          },
+          {
+            "name": "merges.txt",
+            "size": 3353259,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+            "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+          },
+          {
+            "name": "model.safetensors-00001-of-00001.safetensors",
+            "size": 1746942600,
+            "digest_algorithm": "sha256",
+            "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+            "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          },
+          {
+            "name": "model.safetensors.index.json",
+            "size": 50900,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+            "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+          },
+          {
+            "name": "preprocessor_config.json",
+            "size": 390,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "name": "tokenizer.json",
+            "size": 12807982,
+            "digest_algorithm": "sha256",
+            "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "size": 16709,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+            "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+          },
+          {
+            "name": "video_preprocessor_config.json",
+            "size": 385,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "name": "vocab.json",
+            "size": 6722759,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+            "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+          }
+        ]
+      },
+      "binary": {
+        "path": "/private/tmp/eredu-current-prepared-chat-generate-paid-partition",
+        "size": 852631360,
+        "sha256": "a3383eb3de4ceabbed9dd80a009dfd57fcf8d3403c14c7b6a068889e8a56143e"
+      },
+      "sources": {
+        "validator_sha256": "fb9d3cf6ac0e8c83b04d797af902f9d6d99e0d588f3f2ee18c24bebce4a33c2a",
+        "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+      },
+      "environment": {
+        "system": "Darwin",
+        "macos": "26.6.2",
+        "machine": "arm64",
+        "RUST_MIN_STACK": "67108864",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+      },
+      "capacity_bytes": 68719476736,
+      "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+      "runs": [
+        {
+          "policy": "required",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-paid-partition",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-paid-partition-2026-09-18/required.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 38.550050207879394,
+          "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "6207aabdd6676ead2f589aa949aa4ca5f58f360dbf7809142c86ba81cf8addee",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       38.49 real        28.41 user         6.37 sys\n          3182362624  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212503  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                4891  involuntary context switches\n        501254322963  instructions retired\n        129965353051  cycles elapsed\n          5672389944  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3182362624,
+            "peak_memory_footprint_bytes": 5672389944
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_path": "/private/tmp/eredu-released-image-tools-paid-partition-2026-09-18/required.request.json",
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "prepared_parts_recipe": "Expanded arrays remain in request_path; exact hash is request_sha256. Reproduce from parent input_preparation and input_generator."
+        },
+        {
+          "policy": "auto",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-paid-partition",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-paid-partition-2026-09-18/auto.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 33.15768708381802,
+          "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "e73631b358cd0f6d52afe63efe9ed725030578ba051447bc27aec16140bfaf96",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       33.12 real        28.47 user         6.51 sys\n          3194273792  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212627  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                8474  involuntary context switches\n        480221391463  instructions retired\n        125671650017  cycles elapsed\n          5687397712  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3194273792,
+            "peak_memory_footprint_bytes": 5687397712
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_path": "/private/tmp/eredu-released-image-tools-paid-partition-2026-09-18/auto.request.json",
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "prepared_parts_recipe": "Expanded arrays remain in request_path; exact hash is request_sha256. Reproduce from parent input_preparation and input_generator."
+        }
+      ],
+      "request_template": {
+        "path": "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f"
+      },
+      "stage": "shared_activation_free_dispatch",
+      "build_log": "/private/tmp/eredu-current-native-paid-partition-public-build.log",
+      "build_log_sha256": "922110ed6544e3c875964768618f084ff3c83e9e3ee9a5dcfd3838e811d48e34",
+      "validation_limit": "Functional single-device image/tool validation, including shared no-activation dispatch. This binary predates the final Qwen-VL partition declaration accounting corrections, which do not affect this Qwen3.5 single-device path. Timing overlaps compilation and is not an isolated performance benchmark."
+    },
+    {
+      "started_at": "2026-09-18T09:18:52.029449+00:00",
+      "status": "passed",
+      "validator_command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "validation/prepared_chat_tools.py",
+        "--binary",
+        "/private/tmp/eredu-current-prepared-chat-generate-media-transaction",
+        "--checkpoint",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "--pinned-record",
+        "doc/validation/bounded-followup-native-2026-09-18.json",
+        "--source-root",
+        "/Users/jbg/dev/eredu",
+        "--output",
+        "/private/tmp/eredu-released-image-tools-media-transaction-2026-09-18",
+        "--request-template",
+        "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "--capacity",
+        "68719476736",
+        "--chunk",
+        "128",
+        "--max-tokens",
+        "48"
+      ],
+      "working_directory": "/Users/jbg/dev/eredu",
+      "scope": "released public ordinary prepared-chat tools; no drafter or numerical-reference rerun",
+      "checkpoint": {
+        "repository": "Qwen/Qwen3.5-0.8B",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+        "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+        "files": [
+          {
+            "name": ".gitattributes",
+            "size": 1570,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+            "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+          },
+          {
+            "name": "LICENSE",
+            "size": 11544,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+            "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+          },
+          {
+            "name": "README.md",
+            "size": 61705,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+            "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+          },
+          {
+            "name": "chat_template.jinja",
+            "size": 7755,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+            "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+          },
+          {
+            "name": "config.json",
+            "size": 2907,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+            "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+          },
+          {
+            "name": "merges.txt",
+            "size": 3353259,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+            "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+          },
+          {
+            "name": "model.safetensors-00001-of-00001.safetensors",
+            "size": 1746942600,
+            "digest_algorithm": "sha256",
+            "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+            "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          },
+          {
+            "name": "model.safetensors.index.json",
+            "size": 50900,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+            "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+          },
+          {
+            "name": "preprocessor_config.json",
+            "size": 390,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "name": "tokenizer.json",
+            "size": 12807982,
+            "digest_algorithm": "sha256",
+            "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "size": 16709,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+            "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+          },
+          {
+            "name": "video_preprocessor_config.json",
+            "size": 385,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "name": "vocab.json",
+            "size": 6722759,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+            "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+          }
+        ]
+      },
+      "binary": {
+        "path": "/private/tmp/eredu-current-prepared-chat-generate-media-transaction",
+        "size": 856550408,
+        "sha256": "698e38797ee77f0f1f322ff4e7623c6fdca50dc6c89b568dc0cecbc50dcecb51"
+      },
+      "sources": {
+        "validator_sha256": "fb9d3cf6ac0e8c83b04d797af902f9d6d99e0d588f3f2ee18c24bebce4a33c2a",
+        "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+      },
+      "environment": {
+        "system": "Darwin",
+        "macos": "26.6.2",
+        "machine": "arm64",
+        "RUST_MIN_STACK": "67108864",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+      },
+      "capacity_bytes": 68719476736,
+      "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+      "runs": [
+        {
+          "policy": "required",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-media-transaction",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-media-transaction-2026-09-18/required.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 38.22137774992734,
+          "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "04c8dddd832ccca9b55dae67b474126db65d802024669208e7c6310ea059e100",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       38.20 real        27.60 user         6.28 sys\n          3190784000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212750  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                4667  involuntary context switches\n        501388280709  instructions retired\n        128873956874  cycles elapsed\n          5680778624  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3190784000,
+            "peak_memory_footprint_bytes": 5680778624
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_path": "/private/tmp/eredu-released-image-tools-media-transaction-2026-09-18/required.request.json",
+          "prepared_parts_recipe": "Regenerate the authenticated uniform image payload using validation/prepared_chat_image_request.py and the pinned preparation recipe recorded in this document; expanded arrays remain outside the repository."
+        },
+        {
+          "policy": "auto",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-media-transaction",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-media-transaction-2026-09-18/auto.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 29.317144209053367,
+          "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "cc12a0c6ab3da342440f8ed24f3a5006c9ad4a81fb6431b2111e6895d2120269",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       29.26 real        24.92 user         6.05 sys\n          3189899264  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212691  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                4573  involuntary context switches\n        479785337377  instructions retired\n        121421519645  cycles elapsed\n          5675994496  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3189899264,
+            "peak_memory_footprint_bytes": 5675994496
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25,
+          "request_fields": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_path": "/private/tmp/eredu-released-image-tools-media-transaction-2026-09-18/auto.request.json",
+          "prepared_parts_recipe": "Regenerate the authenticated uniform image payload using validation/prepared_chat_image_request.py and the pinned preparation recipe recorded in this document; expanded arrays remain outside the repository."
+        }
+      ],
+      "request_template": {
+        "path": "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f"
+      },
+      "stage": "shared_media_execution_transaction_and_native_scalar_facts",
+      "build_log": "/private/tmp/eredu-current-media-transaction-public-build.log",
+      "build_log_sha256": "c4532e7fd69af74758fadf41ee74fdea6ccc72fe6bd5c118f3c8967cc25b7cb8",
+      "validation_limit": "Actual resident single-device image/tool public execution after shared text/media context loans and native scalar facts. This does not validate distributed media, disk-window changes, CPU grouped normalization or blockwise-attention fixes. Wall times are functional measurements, not isolated benchmarks."
+    },
+    {
+      "started_at": "2026-09-18T09:53:39.173711+00:00",
+      "status": "passed",
+      "validator_command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "validation/prepared_chat_tools.py",
+        "--binary",
+        "/private/tmp/eredu-current-prepared-chat-generate-canonical-slices",
+        "--checkpoint",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "--pinned-record",
+        "doc/validation/bounded-followup-native-2026-09-18.json",
+        "--source-root",
+        "/Users/jbg/dev/eredu",
+        "--output",
+        "/private/tmp/eredu-released-image-tools-cold-compilers-2026-09-18",
+        "--request-template",
+        "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "--capacity",
+        "68719476736",
+        "--chunk",
+        "128",
+        "--max-tokens",
+        "48"
+      ],
+      "working_directory": "/Users/jbg/dev/eredu",
+      "scope": "released public ordinary prepared-chat tools; no drafter or numerical-reference rerun",
+      "checkpoint": {
+        "repository": "Qwen/Qwen3.5-0.8B",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+        "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+        "files": [
+          {
+            "name": ".gitattributes",
+            "size": 1570,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+            "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+          },
+          {
+            "name": "LICENSE",
+            "size": 11544,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+            "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+          },
+          {
+            "name": "README.md",
+            "size": 61705,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+            "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+          },
+          {
+            "name": "chat_template.jinja",
+            "size": 7755,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+            "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+          },
+          {
+            "name": "config.json",
+            "size": 2907,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+            "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+          },
+          {
+            "name": "merges.txt",
+            "size": 3353259,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+            "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+          },
+          {
+            "name": "model.safetensors-00001-of-00001.safetensors",
+            "size": 1746942600,
+            "digest_algorithm": "sha256",
+            "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+            "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          },
+          {
+            "name": "model.safetensors.index.json",
+            "size": 50900,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+            "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+          },
+          {
+            "name": "preprocessor_config.json",
+            "size": 390,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "name": "tokenizer.json",
+            "size": 12807982,
+            "digest_algorithm": "sha256",
+            "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "size": 16709,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+            "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+          },
+          {
+            "name": "video_preprocessor_config.json",
+            "size": 385,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "name": "vocab.json",
+            "size": 6722759,
+            "digest_algorithm": "git-blob-sha1",
+            "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+            "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+          }
+        ]
+      },
+      "binary": {
+        "path": "/private/tmp/eredu-current-prepared-chat-generate-canonical-slices",
+        "size": 856786200,
+        "sha256": "8da06787784ed8f742fa981d8806b57daaf462ae5a30806b228907cdbcadd198"
+      },
+      "sources": {
+        "validator_sha256": "fb9d3cf6ac0e8c83b04d797af902f9d6d99e0d588f3f2ee18c24bebce4a33c2a",
+        "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+      },
+      "environment": {
+        "system": "Darwin",
+        "macos": "26.6.2",
+        "machine": "arm64",
+        "RUST_MIN_STACK": "67108864",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+      },
+      "capacity_bytes": 68719476736,
+      "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+      "runs": [
+        {
+          "policy": "required",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-canonical-slices",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-cold-compilers-2026-09-18/required.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 60.085193208185956,
+          "request": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "9c3ee9c16b3b60132506c91c76d7caf9c7223066be1345210538c546ff05ebf8",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       60.05 real        29.88 user         6.45 sys\n          3185852416  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212726  page reclaims\n                   3  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   2  voluntary context switches\n                4844  involuntary context switches\n        501726142452  instructions retired\n        130487957743  cycles elapsed\n          5676649856  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3185852416,
+            "peak_memory_footprint_bytes": 5676649856
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25
+        },
+        {
+          "policy": "auto",
+          "command": [
+            "/usr/bin/time",
+            "-l",
+            "/private/tmp/eredu-current-prepared-chat-generate-canonical-slices",
+            "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+            "/private/tmp/eredu-released-image-tools-cold-compilers-2026-09-18/auto.request.json",
+            "68719476736",
+            "metal:0"
+          ],
+          "status": "passed",
+          "returncode": 0,
+          "wall_seconds": 31.738546333042905,
+          "request": {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+              },
+              {
+                "role": "user",
+                "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "reading",
+                  "description": "Record the requested integer value.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "integer",
+                        "enum": [
+                          17
+                        ]
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 48,
+            "seed": 0,
+            "prefill_chunk_positions": 128,
+            "enable_thinking": false
+          },
+          "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+          "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+          "stderr_sha256": "9346dd5bb49f2c51fb41400c47b18fe20c15b61b3111fd887aad3beb0bdb6d2f",
+          "stderr": "committed_tokens=25 finish=GrammarComplete\n       31.73 real        27.10 user         6.37 sys\n          3188293632  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              212270  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                4760  involuntary context switches\n        479572649829  instructions retired\n        124194337661  cycles elapsed\n          5685169392  peak memory footprint\n",
+          "process_memory": {
+            "scope": "whole subprocess; not framework-domain usage",
+            "maximum_resident_set_size_bytes": 3188293632,
+            "peak_memory_footprint_bytes": 5685169392
+          },
+          "events": [
+            {
+              "ToolCallStart": {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading"
+              }
+            },
+            {
+              "ToolArgumentsDelta": {
+                "index": 0,
+                "json_fragment": "{\"value\":17}"
+              }
+            },
+            "ToolCallEnd",
+            {
+              "Finished": {
+                "reason": "grammar_complete"
+              }
+            }
+          ],
+          "semantic_result": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_0",
+                "name": "reading",
+                "arguments": {
+                  "value": 17
+                }
+              }
+            ],
+            "finish_reason": "grammar_complete",
+            "visible_text": "",
+            "reasoning_text": ""
+          },
+          "committed_tokens": 25
+        }
+      ],
+      "request_template": {
+        "path": "/private/tmp/eredu-released-image-tools-repro-2026-09-18/image.request.json",
+        "sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f"
+      },
+      "stage": "prospective_cold_compiler_frames_and_exact_coordinate_sources",
+      "build_log": "/private/tmp/eredu-current-canonical-slices-public-build.log",
+      "build_log_sha256": "5326bd56740f29ea6e448603f321bdc6f6c8b2ffff335e31436ab343ee8bb0e3",
+      "validation_limit": "Functional debug execution with simultaneous native compilation and fixture processes; timings are not isolated benchmarks. This binary includes final CGrammar, SchemaCopy, JSON and Lark frame accounting. Image values and processed arrays remain in external request files; sensor17 is explicitly supplied in text, so no image recognition or independent image-logit accuracy is claimed."
+    }
+  ]
+}

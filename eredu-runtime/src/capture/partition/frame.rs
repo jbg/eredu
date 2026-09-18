@@ -1,6 +1,6 @@
 //! Exact reached protocol frames and custody-retaining host destinations.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// The existing receipt protocol's actual collective occurrence.
@@ -95,7 +95,7 @@ impl<'a> PartitionCaptureFrame<'a> {
 pub struct PartitionCaptureBuffer<T> {
     values: Vec<T>,
     limit: usize,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 /// Typed constructor failure retaining the original metadata account.
 #[derive(Debug, thiserror::Error)]
@@ -105,9 +105,9 @@ pub enum PartitionCaptureStorageError {
     Funding {
         /// Exact fixed reservation failure.
         #[source]
-        cause: WorkspaceMetadataFundingError,
+        cause: HostMetadataFundingError,
         /// Original cumulative account; a failure never refunds prior work.
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     },
     /// The existing counted metadata vector producer failed.
     #[error("capture destination construction: {cause}")]
@@ -116,7 +116,7 @@ pub enum PartitionCaptureStorageError {
         #[source]
         cause: eredu_nn::Error,
         /// Account outliving the producer's error payload.
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     },
 }
 impl<T> PartitionCaptureBuffer<T> {
@@ -132,20 +132,20 @@ impl<T> PartitionCaptureBuffer<T> {
     /// metadata vector producer. This grants no numerical/native backing.
     pub fn funded(
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, PartitionCaptureStorageError> {
         let controls = [
             size_of::<Self>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             size_of::<Result<Self, PartitionCaptureStorageError>>(),
             size_of::<PartitionCaptureStorageError>(),
-            size_of::<(&WorkspaceMetadataFunding, usize)>(),
+            size_of::<(&HostMetadataFunding, usize)>(),
         ];
         let bytes = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or_else(|| PartitionCaptureStorageError::Funding {
-                cause: WorkspaceMetadataFundingError::Overflow,
+                cause: HostMetadataFundingError::Overflow,
                 funding: funding.clone(),
             })?;
         funding
@@ -211,7 +211,7 @@ impl<T> std::ops::DerefMut for PartitionCaptureBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_nn::workspace::WorkspaceMetadataAccount;
+    use eredu_nn::workspace::HostMetadataAccount;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -223,10 +223,10 @@ mod tests {
         refuse: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             if self.refuse.load(Ordering::SeqCst) {
-                return Err(WorkspaceMetadataFundingError::Overflow);
+                return Err(HostMetadataFundingError::Overflow);
             }
             self.used.fetch_add(bytes, Ordering::SeqCst);
             Ok(())
@@ -243,7 +243,7 @@ mod tests {
         let used = Arc::new(AtomicUsize::new(0));
         let refuse = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
-        let funding = WorkspaceMetadataFunding::new(Account {
+        let funding = HostMetadataFunding::new(Account {
             used: used.clone(),
             refuse: refuse.clone(),
             retired: retired.clone(),
@@ -318,3 +318,5 @@ mod tests {
 impl<T> AsRef<[T]> for PartitionCaptureBuffer<T> {
     fn as_ref(&self) -> &[T] { &self.values }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

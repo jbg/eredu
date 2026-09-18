@@ -1,13 +1,13 @@
 use super::*;
 use eredu_core::{SharedTensorObservation, TensorObservation, TensorObservationData, ObservationPosition};
-use eredu_nn::workspace::WorkspaceMetadataAccount;
+use eredu_nn::workspace::HostMetadataAccount;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 #[derive(Debug)]
 struct Account { used: Arc<AtomicUsize>, retired: Arc<AtomicBool>, refuse: Arc<AtomicBool> }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
-        if self.refuse.load(Ordering::SeqCst) { return Err(WorkspaceMetadataFundingError::Overflow); }
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+        if self.refuse.load(Ordering::SeqCst) { return Err(HostMetadataFundingError::Overflow); }
         self.used.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
@@ -39,7 +39,7 @@ fn borrowed_partition_receipt_keeps_canonical_unicode_nonfinite_values_and_paid_
     let tensor = record.payload.as_ref().unwrap().as_tensor().unwrap();
     let before = match tensor.data() { TensorObservationData::F32(values) => values.as_ptr(), _ => unreachable!() };
     let used = Arc::new(AtomicUsize::new(0)); let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account { used: used.clone(), retired: retired.clone(), refuse: Arc::new(AtomicBool::new(false)) }).unwrap();
+    let funding = HostMetadataFunding::new(Account { used: used.clone(), retired: retired.clone(), refuse: Arc::new(AtomicBool::new(false)) }).unwrap();
     let actual = PartitionCaptureRecordEncoding::new(&context, "receipt-λ", 5, PartitionCaptureCombination::Disjoint, &record, 8192).encode(&funding).unwrap();
     // The caller-owned ordinary wire DTO is an independent expected consumer.
     let ordinary = PartitionCaptureProducerRecord {
@@ -65,7 +65,7 @@ fn borrowed_partition_receipt_keeps_canonical_unicode_nonfinite_values_and_paid_
 fn borrowed_partition_receipt_refusal_retains_spending_and_custody() {
     let (context, record) = source();
     let used = Arc::new(AtomicUsize::new(0)); let retired = Arc::new(AtomicBool::new(false)); let refuse = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account { used: used.clone(), retired: retired.clone(), refuse: refuse.clone() }).unwrap();
+    let funding = HostMetadataFunding::new(Account { used: used.clone(), retired: retired.clone(), refuse: refuse.clone() }).unwrap();
     let failed = PartitionCaptureRecordEncoding::new(&context, "receipt", 0, PartitionCaptureCombination::Disjoint, &record, 7).encode(&funding).unwrap_err();
     assert!(matches!(failed, PartitionCaptureEncodingError::Source { .. }));
     let spent = used.load(Ordering::SeqCst); assert!(spent > 0);
@@ -82,7 +82,7 @@ fn borrowed_partition_receipt_refusal_retains_spending_and_custody() {
 #[test]
 fn contiguous_empty_wire_keeps_an_empty_sequence_and_actual_optional_precision() {
     let (context, _) = source();
-    let funding = WorkspaceMetadataFunding::new(Account { used: Arc::new(AtomicUsize::new(0)),
+    let funding = HostMetadataFunding::new(Account { used: Arc::new(AtomicUsize::new(0)),
         retired: Arc::new(AtomicBool::new(false)), refuse: Arc::new(AtomicBool::new(false)) }).unwrap();
     for dtype in [None, Some(TensorDtype::Bf16)] {
         let output = encode_contiguous(&context, "receipt-empty", 1, PartitionCaptureCombination::Disjoint,

@@ -226,6 +226,7 @@ pub struct QwenProcessorPlan {
 }
 
 impl QwenProcessorPlan {
+    pub(crate) const fn framing(&self) -> Option<MediaFraming> { self.framing }
     /// Parses Hugging Face model and optional visual processor JSON.
     pub fn from_hf_json(
         model: &[u8],
@@ -405,11 +406,9 @@ impl QwenProcessorPlan {
         let groups = indices
             .chunks_exact(source.temporal_patch_size)
             .map(|chunk| {
-                let first = chunk[0] as f64 / source_fps;
-                let last = chunk[chunk.len() - 1] as f64 / source_fps;
                 QwenVideoGroupPlan {
                     source_indices: chunk.to_vec(),
-                    timestamp_text: format!("<{:.1} seconds>", (first + last) / 2.0),
+                    timestamp_text: qwen_timestamp(chunk[0], chunk[chunk.len() - 1], source_fps).to_string(),
                 }
             })
             .collect();
@@ -1173,6 +1172,14 @@ pub struct Gemma4ProcessorPlan {
 }
 
 impl Gemma4ProcessorPlan {
+    /// The exact already selected framing used by the ordinary processor worker.
+    pub(crate) const fn framing(&self, modality: eredu_core::InputModality) -> Option<MediaFraming> {
+        match modality {
+            eredu_core::InputModality::Image | eredu_core::InputModality::Video => self.image_framing,
+            eredu_core::InputModality::Audio => self.audio_framing,
+            _ => None,
+        }
+    }
     /// Parses Hugging Face model and optional visual processor JSON.
     pub fn from_hf_json(
         model: &[u8],
@@ -1356,7 +1363,7 @@ impl Gemma4ProcessorPlan {
             .enumerate()
             .map(|(index, source_index)| Gemma4VideoFramePlan {
                 source_index,
-                timestamp_text: gemma_timestamp(source_index, source_fps, index == 0),
+                timestamp_text: gemma_timestamp(source_index, source_fps, index == 0).to_string(),
             })
             .collect();
         let (transform, max_patches) = gemma_visual_plan(policy, height, width)?;
@@ -1513,13 +1520,17 @@ fn gemma_aspect_ratio_preserving_size(
     Ok((target_height, target_width))
 }
 
-fn gemma_timestamp(source_index: usize, source_fps: f64, first: bool) -> String {
-    let seconds = (source_index as f64 / source_fps).floor() as u64;
-    let timestamp = format!("{:02}:{:02}", seconds / 60, seconds % 60);
-    if first {
-        format!("{timestamp} ")
-    } else {
-        format!(" {timestamp} ")
+pub(crate) fn qwen_timestamp(first: usize, last: usize, fps: f64) -> eredu_runtime::working_memory::CompositeGeneratedText {
+    eredu_runtime::working_memory::CompositeGeneratedText::DecimalSeconds {
+        value_bits: ((first as f64 / fps + last as f64 / fps) / 2.0).to_bits(),
+        prefix: "<", suffix: " seconds>",
+    }
+}
+
+pub(crate) fn gemma_timestamp(source_index: usize, source_fps: f64, first: bool) -> eredu_runtime::working_memory::CompositeGeneratedText {
+    eredu_runtime::working_memory::CompositeGeneratedText::ClockSeconds {
+        seconds: (source_index as f64 / source_fps).floor() as u64,
+        leading_space: !first,
     }
 }
 

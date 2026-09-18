@@ -105,6 +105,19 @@ pub(crate) fn standard_parallel_linear_format(
     member: &ParameterMemberSpec,
     format: LinearFormat,
 ) -> Result<Option<LinearFormatSpec>, ParallelPlanError> {
+    standard_parallel_linear_format_with(member, format, DeclarationDestination(None))
+        .map_err(ParameterGroupError::ordinary)
+}
+
+/// The same physical companion declaration with a caller-owned metadata destination.
+pub(crate) fn standard_parallel_linear_format_with(
+    member: &ParameterMemberSpec,
+    format: LinearFormat,
+    destination: DeclarationDestination<'_>,
+) -> Result<Option<LinearFormatSpec>, ParameterGroupError> {
+    destination.controls::<(&ParameterMemberSpec, LinearFormat, Option<LinearFormatSpec>,
+        crate::decoder::ModuleMetadata<'_>, Result<LinearFormatSpec, Error>, Error,
+        &str, &str, bool)>()?;
     if format == LinearFormat::Dense || member.global_shape().len() < 2 {
         return Ok(None);
     }
@@ -116,12 +129,16 @@ pub(crate) fn standard_parallel_linear_format(
     } else {
         return Ok(None);
     };
+    let mut metadata = crate::decoder::ModuleMetadata::destination(destination.0);
     let declaration = if expert_bank {
-        standard_expert_format(prefix, format)
+        expert_format_with(prefix, format, metadata)
     } else {
-        standard_linear_format(name, format)
-    }
-    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        crate::decoder::static_construction::format::standard_linear_format_with(
+            name, format, &mut metadata)
+    }.map_err(|error| match destination.0 {
+        Some(_) => ParameterGroupError::Metadata(error),
+        None => ParameterGroupError::Ordinary(ParallelPlanError::InvalidGroup(error.to_string())),
+    })?;
     Ok(Some(declaration))
 }
 

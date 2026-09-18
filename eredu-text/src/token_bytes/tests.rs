@@ -29,7 +29,7 @@ fn exact_byte_worker_preserves_alphabet_fallback_and_atomic_refusal() {
     let mut untouched = [23; 4];
     assert!(matches!(
         encoding.write("a🙂", &mut untouched),
-        Err(TokenByteError::Unmapped('🙂'))
+        Err(TokenByteError::Destination)
     ));
     assert_eq!(untouched, [23; 4]);
     assert!(matches!(
@@ -37,6 +37,24 @@ fn exact_byte_worker_preserves_alphabet_fallback_and_atomic_refusal() {
         Err(TokenByteError::Destination)
     ));
     assert_eq!(untouched, [23; 4]);
+    for token in ["a🙂", "Ġ🙂", "\n{\"name\":\"reading\"}", "Ġa\n"] {
+        let mut output = vec![0; encoding.encoded_len(token).unwrap()];
+        encoding.write(token, &mut output).unwrap();
+        assert_eq!(
+            output,
+            token.as_bytes(),
+            "raw fallback covers the entire token"
+        );
+        let mut trie = vec![0; encoding.trie_token_len(token, false).unwrap()];
+        encoding.write_trie_token(token, false, &mut trie).unwrap();
+        assert_eq!(trie, output);
+        let mut special = vec![0; encoding.trie_token_len(token, true).unwrap()];
+        encoding
+            .write_trie_token(token, true, &mut special)
+            .unwrap();
+        assert_eq!(special[0], 0xff);
+        assert_eq!(&special[1..], token.as_bytes());
+    }
     let decoder = DecoderWrapper::Sequence(Sequence::new(vec![
         DecoderWrapper::ByteLevel(ByteLevel::default()),
         DecoderWrapper::ByteFallback(ByteFallback::default()),

@@ -25,9 +25,9 @@ struct Payload {
     observer: RefCell<Option<OriginalScopeObserver>>,
     active: Cell<bool>,
     issued: Cell<bool>,
-    stream: StreamCopyPlan<WorkspaceMetadataFunding>,
+    stream: StreamCopyPlan<HostMetadataFunding>,
     role: CompletionRole,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Native arrays and event stay in Q until its existing Recovery settles.
 pub(crate) struct NestedCompletionOwner(Option<Rc<Payload>>);
@@ -43,7 +43,7 @@ impl Drop for NestedCompletionOwner {
 #[derive(Clone)]
 pub(crate) struct NestedCompletionProjection {
     value: Weak<Payload>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(crate) struct NestedCompletionActivation(NestedCompletionProjection);
 impl Drop for NestedCompletionActivation {
@@ -59,7 +59,7 @@ impl NestedCompletionOwner {
     pub(crate) fn control_bytes(
         roots: usize,
         validations: usize,
-        stream: &StreamCopyPlan<WorkspaceMetadataFunding>,
+        stream: &StreamCopyPlan<HostMetadataFunding>,
     ) -> Option<usize> {
         let parts = [
             size_of::<Self>(),
@@ -88,7 +88,7 @@ impl NestedCompletionOwner {
             size_of::<Result<NestedCompletionActivation, Error>>(),
             size_of::<Option<Rc<Payload>>>(),
             size_of::<Result<Self, Error>>(),
-            size_of::<StreamCopyPlan<WorkspaceMetadataFunding>>(),
+            size_of::<StreamCopyPlan<HostMetadataFunding>>(),
             size_of::<RefCell<Option<NestedCompletionProjection>>>(),
             size_of::<std::cell::Ref<'_, Option<NestedCompletionProjection>>>(),
             size_of::<std::cell::RefMut<'_, Option<NestedCompletionProjection>>>(),
@@ -108,20 +108,20 @@ impl NestedCompletionOwner {
         roots: usize,
         validations: usize,
         role: &OriginalEmbeddedSpeculativeRole,
-        funding: &WorkspaceMetadataFunding,
-        stream: StreamCopyPlan<WorkspaceMetadataFunding>,
+        funding: &HostMetadataFunding,
+        stream: StreamCopyPlan<HostMetadataFunding>,
     ) -> Result<Self, Error> {
         Self::prepare_role(roots, validations, || CompletionRole::Embedded(role.clone()), funding, stream)
     }
     pub(crate) fn prepare_external(
         roots: usize, validations: usize, role: &OriginalExternalSpeculativeRole,
-        funding: &WorkspaceMetadataFunding, stream: StreamCopyPlan<WorkspaceMetadataFunding>,
+        funding: &HostMetadataFunding, stream: StreamCopyPlan<HostMetadataFunding>,
     ) -> Result<Self, Error> {
         Self::prepare_role(roots, validations, || CompletionRole::External(role.clone()), funding, stream)
     }
     fn prepare_role(
         roots: usize, validations: usize, role: impl FnOnce() -> CompletionRole,
-        funding: &WorkspaceMetadataFunding, stream: StreamCopyPlan<WorkspaceMetadataFunding>,
+        funding: &HostMetadataFunding, stream: StreamCopyPlan<HostMetadataFunding>,
     ) -> Result<Self, Error> {
         funding
             .reserve_metadata(

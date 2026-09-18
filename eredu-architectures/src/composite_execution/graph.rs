@@ -72,6 +72,47 @@ impl Destination<'_> {
             None => Ok(args.to_string()),
         }
     }
+    pub(crate) fn boundary_spec(
+        self, role: &str, shape: &[eredu_runtime::BoundaryTensorDimension],
+        dtype: eredu_runtime::BoundaryTensorDtype,
+    ) -> Result<eredu_runtime::BoundaryTensorSpec, Error> {
+        self.controls::<(&str, &[eredu_runtime::BoundaryTensorDimension],
+            eredu_runtime::BoundaryTensorDtype, eredu_runtime::BoundaryTensorSpec)>()?;
+        match self.0 {
+            Some(context) => eredu_runtime::BoundaryTensorSpec::new_with_metadata(role, shape, dtype, context),
+            None => Ok(eredu_runtime::BoundaryTensorSpec::new(role, shape.iter().copied(), dtype)),
+        }
+    }
+    pub(crate) fn boundary_schema(
+        self, identity: &'static str, primary: eredu_runtime::BoundaryTensorSpec,
+        auxiliary: Vec<eredu_runtime::BoundaryTensorSpec>,
+    ) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.controls::<(&'static str, eredu_runtime::BoundaryTensorSpec,
+            Vec<eredu_runtime::BoundaryTensorSpec>, eredu_runtime::BoundaryWireSchema)>()?;
+        match self.0 {
+            Some(context) => eredu_runtime::BoundaryWireSchema::from_owned_with_metadata(identity, primary, auxiliary, context),
+            None => eredu_runtime::BoundaryWireSchema::new(identity, primary, auxiliary).map_err(Error::backend_retained_source),
+        }
+    }
+    pub(crate) fn resolve_boundary(
+        self, schema: &eredu_runtime::BoundaryWireSchema, batch: i32, sequences: &[i32],
+    ) -> Result<eredu_runtime::ResolvedBoundaryWireSchema, Error> {
+        self.controls::<(&eredu_runtime::BoundaryWireSchema, i32, &[i32],
+            eredu_runtime::ResolvedBoundaryWireSchema)>()?;
+        match self.0 {
+            Some(context) => schema.resolve_each_with_metadata(batch, sequences, context),
+            None => schema.resolve_each(batch, sequences.iter().copied()).map_err(Error::backend_retained_source),
+        }
+    }
+    pub(crate) fn boundary_value<T>(
+        self, role: &str, tensor: T,
+    ) -> Result<eredu_runtime::ArchitectureBoundaryValue<T>, Error> {
+        self.controls::<(&str, T, eredu_runtime::ArchitectureBoundaryValue<T>)>()?;
+        match self.0 {
+            Some(context) => eredu_runtime::ArchitectureBoundaryValue::new_with_metadata(role, tensor, context),
+            None => eredu_runtime::ArchitectureBoundaryValue::new(role, tensor).map_err(Error::backend_retained_source),
+        }
+    }
     pub(crate) fn group(
         self,
         id: &str,

@@ -198,13 +198,13 @@ fn selective_control_artifacts(
     let generation_options = loaded.speculative_generation_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat_with_capacity(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"hello"})],
             add_generation_prompt: true,
             tool_choice: ToolChoice::None,
             tools: if chunk.is_some() { vec![] } else { vec![serde_json::json!({"type":"function", "function":{"name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}}})] },
             ..Default::default()
-        })
+        }, ORIGINAL_CAPACITY)
         .unwrap();
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -221,30 +221,33 @@ fn selective_control_artifacts(
         ..Default::default()
     };
     let expected = if compare {
-        let request = PreparedChatSpeculativeGenerationRequest {
-            input: if chunk.is_some() {
-                PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5])
+        let request = PreparedChatSpeculativeRequest {
+            chat: &chat,
+            output_mode: if chunk.is_some() {
+                PreparedChatOutputMode::Text
             } else {
-                PreparedChatInput::rendered_prompt(&chat)
+                PreparedChatOutputMode::Semantic
+            },
+            skip_special_tokens: true,
+            input: if chunk.is_some() {
+                PreparedChatPrompt::TokenIds(&[1, 3, 2, 4, 5])
+            } else {
+                PreparedChatPrompt::Rendered
             },
             drafting: drafting.as_speculative_draft().unwrap(),
-            settings: PreparedChatGenerationSettings {
-                inference: Default::default(),
-                ..settings
-            },
+            settings: chat_settings(
+                &chat,
+                PreparedChatGenerationSettings {
+                    inference: Default::default(),
+                    ..settings
+                },
+            ),
             options: generation_options.clone(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},
         };
-        Some(
-            if chunk.is_some() {
-                model.generate_prepared_text_speculative(request)
-            } else {
-                model.generate_prepared_chat_speculative(request)
-            }
-            .unwrap(),
-        )
+        Some(model.generate_prepared_chat_speculative(request).unwrap())
     } else {
         None
     };
@@ -280,10 +283,12 @@ fn selective_control_artifacts(
     let edits = if experiment {
         use eredu_core::intervention::*;
         let discovery = model.speculative_intervention_discovery().unwrap();
-        assert!(discovery
-            .points
-            .iter()
-            .all(|p| p.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH));
+        assert!(
+            discovery
+                .points
+                .iter()
+                .all(|p| p.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+        );
         [
             (SpeculativeCaptureRole::Target, 12),
             (SpeculativeCaptureRole::Draft, 11),
@@ -326,14 +331,21 @@ fn selective_control_artifacts(
     }
     let mut replays = Vec::new();
     let mut captures = Vec::new();
-    let request = PreparedChatSpeculativeGenerationRequest {
-        input: if chunk.is_some() {
-            PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5])
+    let request = PreparedChatSpeculativeRequest {
+        chat: &chat,
+        output_mode: if chunk.is_some() {
+            PreparedChatOutputMode::Text
         } else {
-            PreparedChatInput::rendered_prompt(&chat)
+            PreparedChatOutputMode::Semantic
+        },
+        skip_special_tokens: true,
+        input: if chunk.is_some() {
+            PreparedChatPrompt::TokenIds(&[1, 3, 2, 4, 5])
+        } else {
+            PreparedChatPrompt::Rendered
         },
         drafting: drafting.as_speculative_draft().unwrap(),
-        settings,
+        settings: chat_settings(&chat, settings),
         options: generation_options,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -391,9 +403,11 @@ fn selective_control_artifacts(
                 reseed: Some(123),
             })?;
             session.intervene(edits.clone())?;
-            assert!(session
-                .intervene(vec![edits[0].clone(), edits[0].clone()])
-                .is_err());
+            assert!(
+                session
+                    .intervene(vec![edits[0].clone(), edits[0].clone()])
+                    .is_err()
+            );
             session.force_next_token(10)?;
             let changed = session.snapshot()?;
             let mut child_replays = Vec::new();
@@ -431,10 +445,11 @@ fn selective_control_artifacts(
             let mut unedited = Vec::new();
             while let Some(step) = session.step()? {
                 unedited.extend(step.committed_token_ids);
-                assert!(step
-                    .captures
-                    .iter()
-                    .all(|c| c.capture.as_step().interventions.is_empty()));
+                assert!(
+                    step.captures
+                        .iter()
+                        .all(|c| c.capture.as_step().interventions.is_empty())
+                );
                 captures.extend(step.captures.iter().cloned());
             }
             assert_eq!(unedited, replays[0]);
@@ -444,9 +459,9 @@ fn selective_control_artifacts(
         Ok(())
     };
     let output = if chunk.is_some() {
-        model.with_controlled_text_speculative(request, control, drive)
+        model.with_controlled_prepared_chat_speculative(request, control, drive)
     } else {
-        model.with_controlled_chat_speculative(request, control, drive)
+        model.with_controlled_prepared_chat_speculative(request, control, drive)
     }
     .unwrap();
 
@@ -505,13 +520,18 @@ fn selective_control_artifacts(
             SpeculativeCaptureRole::Target,
             SpeculativeCaptureRole::Draft,
         ] {
-            assert!(captures.iter().any(|capture| capture.role == role
-                && capture.capture.as_step().interventions.iter().any(|record| matches!(
-                    record.outcome,
-                    InterventionOutcome::Applied
-                ) && !record
-                    .evidence
-                    .is_empty())));
+            assert!(captures.iter().any(|capture| {
+                capture.role == role
+                    && capture
+                        .capture
+                        .as_step()
+                        .interventions
+                        .iter()
+                        .any(|record| {
+                            matches!(record.outcome, InterventionOutcome::Applied)
+                                && !record.evidence.is_empty()
+                        })
+            }));
         }
     }
     assert!(
@@ -560,7 +580,7 @@ fn k2_independent_selective_prefill_matches_full_run_and_control_on_all_residenc
                     .build()
                     .unwrap();
                 let mut tokenizer = Tokenizer::new(words);
-                tokenizer.with_pre_tokenizer(Some(Whitespace));
+                tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
                 tokenizer.with_decoder(Some(ByteLevel::default()));
                 tokenizer.save(root.join("tokenizer.json"), false).unwrap();
                 std::fs::write(

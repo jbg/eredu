@@ -28,7 +28,13 @@ const IGNORED_EXTENSIONS: [&str; 3] = [".j2", ".jinja2", ".jinja"];
 ///
 /// Additionally `.j2`, `.jinja` and `.jinja2` as final extension is ignored. So
 /// `.html.j2` is the considered the same as `.html`.
-pub fn default_auto_escape_callback(mut name: &str) -> AutoEscape {
+pub fn default_auto_escape_callback(name: &str) -> AutoEscape {
+    auto_escape_from_name(name, false)
+}
+
+/// Selects escaping without allocating a composed name. A literal prefix
+/// before this final name fragment cannot itself be a recognized extension.
+pub(crate) fn auto_escape_from_name(mut name: &str, prefixed: bool) -> AutoEscape {
     for ext in IGNORED_EXTENSIONS {
         if let Some(stripped) = name.strip_suffix(ext) {
             name = stripped;
@@ -36,7 +42,8 @@ pub fn default_auto_escape_callback(mut name: &str) -> AutoEscape {
         }
     }
 
-    match name.rsplit('.').next() {
+    match name.rsplit_once('.').map(|(_, extension)| extension)
+        .or_else(|| (!prefixed).then_some(name)) {
         Some("html" | "htm" | "xml") => AutoEscape::Html,
         #[cfg(feature = "json")]
         Some("json" | "json5" | "js" | "yaml" | "yml") => AutoEscape::Json,

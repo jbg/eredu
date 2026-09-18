@@ -84,6 +84,37 @@ pub trait PreparedTextHostCopy {
     }
 }
 
+/// Borrowed additional host state copied inside the original semantic snapshot
+/// transaction. The source remains immutable until this plan is consumed.
+///
+/// Implementations report the actual complete producer: destination backing,
+/// transient controls, partial failure and error storage. `copy` executes only
+/// after these bytes have joined the same physical admission as the cursor and
+/// parser. It must retain the supplied destination authority in every escaping
+/// payload or error; an input/source authority cannot substitute for it.
+pub trait PreparedTextHostJournal {
+    /// Independently owned journal copied from this exact borrowed source.
+    type Copied;
+    /// Logical retained/copy bytes charged once to the shared SnapshotBudget.
+    fn storage_bytes(&self) -> Option<u64>;
+    /// Exact prospective destination, scratch, control and failure producer bytes.
+    fn preparation_bytes(&self) -> Option<usize>;
+    /// Consumes the plan after original physical and logical admission.
+    fn copy(
+        self,
+        retained_bytes: u64,
+        destination: &eredu_core::HostPreparationAuthority,
+    ) -> Result<Self::Copied, TextHostCopyError>;
+}
+impl PreparedTextHostJournal for () {
+    type Copied = ();
+    fn storage_bytes(&self) -> Option<u64> { Some(0) }
+    fn preparation_bytes(&self) -> Option<usize> { Some(0) }
+    fn copy(self, _: u64, _: &eredu_core::HostPreparationAuthority) -> Result<(), TextHostCopyError> {
+        Ok(())
+    }
+}
+
 /// Compatibility callbacks keep their existing caller-owned estimate and scope.
 /// New concrete providers bind their actual borrowed source in their own plan.
 pub(super) struct CallbackHostCopy<F> {

@@ -5,7 +5,7 @@ use crate::{api::ParserLimits, earley::PreparedLexer};
 use advance::Context as _;
 use std::mem::{size_of, size_of_val};
 use toktrie::{TokTrie, TokenId};
-impl<F: Fn(usize) -> Result<(), E>, E> validate::Context for Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> validate::Context for Context<'_, F> {
     fn accepting_inner(&mut self) -> Result<bool, Self::Error> {
         if !token::flush(self)? {
             return Ok(false);
@@ -30,7 +30,7 @@ impl PreparedEarleySeed {
     /// ordinals. Like the ordinary multi-token query, this can ignore a
     /// per-lexeme max-token limit across the supplied token sequence.
     /// The supplied lexer/trie must belong to this owner's retained source.
-    pub fn validate_tokens<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn validate_tokens<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -49,7 +49,7 @@ impl PreparedEarleySeed {
                 size_of::<Result<bool, Cause<E>>>(),
                 size_of::<Result<(), E>>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)

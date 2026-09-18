@@ -1,26 +1,30 @@
-//! Same-shape I32 addition through the existing typed CPU binary worker.
+//! I32 arithmetic and broadcasts through the existing typed CPU binary worker.
 use super::*;
 pub(super) fn inspect(
     operation: WorkspaceOperationView<'_>,
     mechanism: MlxCpuWorkspaceMechanisms,
 ) -> facts::FactResult<Option<OperationPlan>> {
-    if !matches!(
-        operation.kind,
-        WorkspaceOperationKindView::Elementwise("add")
-    ) || operation.inputs.len() != 2
-        || operation.outputs.len() != 1
-    {
+    let binary = match operation.kind {
+        WorkspaceOperationKindView::Elementwise("add") => CpuBinaryOperation::Add,
+        WorkspaceOperationKindView::Elementwise("subtract") => CpuBinaryOperation::Subtract,
+        WorkspaceOperationKindView::Elementwise("multiply") => CpuBinaryOperation::Multiply,
+        _ => return Ok(None),
+    };
+    if operation.inputs.len() != 2 || operation.outputs.len() != 1 {
         return Ok(None);
     }
     let output = operation.outputs.get(0).expect("one integer output");
     let rank = output.shape().len();
     if output.dtype() != WorkspaceDtype::Int32
+        || output.representation().is_some()
         || rank > 4
         || output.shape().iter().any(|&n| n <= 0)
-        || operation
-            .inputs
-            .iter()
-            .any(|input| input.dtype() != WorkspaceDtype::Int32 || input.shape() != output.shape())
+        || operation.inputs.iter().any(|input| {
+            input.dtype() != WorkspaceDtype::Int32
+                || input.representation().is_some()
+                || input.shape().len() > rank
+                || input.shape().iter().any(|&n| n <= 0)
+        })
     {
         return Ok(None);
     }
@@ -28,22 +32,43 @@ pub(super) fn inspect(
     if elements == 0 || elements > i32::MAX as usize {
         return Ok(None);
     }
-    let Some(native) = OperationEvent::cpu_binary_layout(
-        CpuBinaryOperation::Add,
-        safemlx::Dtype::Int32,
-        rank,
-        elements,
-        false,
-    ) else {
+    let left = operation.inputs.get(0).expect("two integer inputs");
+    let right = operation.inputs.get(1).expect("two integer inputs");
+    let shape = WorkspaceBroadcastShape::new(left.shape(), right.shape())
+        .map_err(|_| MlxWorkspaceFactError::descriptor("CPU integer broadcast differs"))?;
+    if !shape.dimensions().eq(output.shape().iter().copied()) {
+        return Err(MlxWorkspaceFactError::descriptor(
+            "CPU integer output shape differs",
+        ));
+    }
+    let mut population = CpuPopulation::default();
+    // The ordinary frontend keeps both I32 operands, then broadcasts only
+    // changed shapes. Native dispatch validates their actual strides and
+    // backing spans; the logical dtype supplies no floating-layout evidence.
+    for input in operation.inputs.iter() {
+        if input.shape() != output.shape() {
+            let Some(alias) =
+                OperationEvent::cpu_broadcast_alias_layout(input.shape().len(), rank, false)
+            else {
+                return Ok(None);
+            };
+            if alias.backing_births() != 0 || population.copy(alias, 1).is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    let Some(native) =
+        OperationEvent::cpu_binary_layout(binary, safemlx::Dtype::Int32, rank, elements, false)
+    else {
         return Ok(None);
     };
-    let mut population = CpuPopulation::default();
     if population.binary(native).is_none() || population.births != 1 {
         return Ok(None);
     }
     let frames = [
         size_of::<WorkspaceOperationView<'_>>(),
-        size_of::<WorkspaceLayoutView<'_>>() * 3,
+        size_of::<WorkspaceLayoutView<'_>>() * 4,
+        size_of::<Option<WorkspaceLayoutView<'_>>>(),
         size_of::<MlxCpuWorkspaceMechanisms>(),
         size_of::<CpuPopulation>(),
         size_of::<OperationPlan>(),
@@ -51,6 +76,15 @@ pub(super) fn inspect(
         size_of::<facts::FactResult<Option<OperationPlan>>>(),
         size_of::<safemlx::CpuBinaryEvalLayout>(),
         size_of::<Option<safemlx::CpuBinaryEvalLayout>>(),
+        size_of::<CpuBinaryOperation>(),
+        size_of::<CpuCopyEvalLayout>(),
+        size_of::<Option<CpuCopyEvalLayout>>(),
+        size_of::<WorkspaceBroadcastShape<'_>>(),
+        size_of::<eredu_nn::workspace::WorkspaceLayoutIter<'_>>(),
+        size_of::<std::slice::Iter<'_, i32>>(),
+        size_of::<Result<WorkspaceBroadcastShape<'_>, eredu_nn::workspace::WorkspaceShapeError>>(),
+        size_of::<facts::FactResult<WorkspaceBroadcastShape<'_>>>(),
+        size_of_val(&shape.dimensions()),
         size_of::<(&safemlx::Array, &safemlx::Array, &safemlx::Stream)>(),
         size_of::<Result<safemlx::Array, safemlx::error::Exception>>(),
         size_of::<usize>() * 3,
@@ -79,6 +113,15 @@ pub(super) fn inspect(
         scratch_bytes: 0,
     }))
 }
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+#[path = "integer_pointwise/source_tests.rs"]
+mod source_tests;
 
 #[cfg(all(
     test,

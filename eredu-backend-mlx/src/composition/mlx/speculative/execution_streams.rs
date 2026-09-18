@@ -174,10 +174,10 @@ impl<'a> SpeculativeExecutionStreams<'a> {
                 &OriginalCopyEnvironment<'_>, &OriginalCopyEnvironment<'_>)>(),
             std::mem::size_of::<Result<(), Error>>(),
             eredu_core::BackendFailure::source_retention_peak_bytes::<eredu_runtime::working_memory::WorkingMemoryError>()
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?,
         ];
         let bytes=frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?;
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?;
         sources.metadata_funding().reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
         sources.validate_environment(environment)?;
         if !std::ptr::eq(environment, draft_environment) {
@@ -278,7 +278,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         ];
         sources.metadata_funding().reserve_metadata(
             controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?,
         ).map_err(Error::WorkspacePlanning)?;
         let mut shortened: SpeculativeExecutionStreams<'scope> = self;
         shortened.embedded_invocation = Some(active);
@@ -321,7 +321,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             std::mem::size_of::<std::slice::Iter<'_, &eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>>(),
         ];
         sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if self.tensor_sources.is_some_and(|prior|prior.len()>evidence.len()
             || prior.iter().zip(evidence).any(|(a,b)|!std::ptr::eq(*a,*b))) {

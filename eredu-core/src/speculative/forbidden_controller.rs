@@ -268,7 +268,7 @@ pub struct ForbiddenControllerSource<'a> {
     validity: &'a SharedTokenFilter,
     inputs: &'a ForbiddenControllerInputs,
     prefix: TriggerPrefix,
-    original: Option<crate::OriginalTokenDomainWitness<'a>>,
+    original: Option<crate::OriginalSourceWitness<'a>>,
 }
 impl<'a> ForbiddenControllerSource<'a> {
     /// Borrows an actual controller; the supplied prefix belongs to these inputs.
@@ -293,14 +293,18 @@ impl<'a> ForbiddenControllerSource<'a> {
     /// must downcast the exact recognized compiler owner and authenticate it.
     pub fn with_original_storage(
         mut self,
-        original: crate::OriginalTokenDomainWitness<'a>,
+        original: crate::OriginalSourceWitness<'a>,
     ) -> Self {
         self.original = Some(original);
         self
     }
     /// Borrowed compiler witness; its presence alone grants no authority.
-    pub fn original_storage(self) -> Option<crate::OriginalTokenDomainWitness<'a>> {
+    pub fn original_storage(self) -> Option<crate::OriginalSourceWitness<'a>> {
         self.original
+    }
+    /// Authenticates the actual retained history payer, without a replacement grant.
+    pub fn history_is_funded_by(self, funding: &crate::HostMetadataFunding) -> bool {
+        self.history.is_funded_by(funding)
     }
     /// Actual durable canonical prefix.
     pub fn history(self) -> &'a [u32] {

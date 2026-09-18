@@ -130,7 +130,7 @@ fn build(
     let validate_formats = options
         .validate_formats
         .unwrap_or_else(|| formats_are_assertions_by_default(draft));
-    validate_schema(draft, value)?;
+    validate_schema(draft, value).map_err(crate::compilation::CompileError::into_ordinary)?;
     let resource = draft.create_resource_ref(value);
     let base_uri = resolve_base_uri(options.base_uri.as_ref(), resource.id())?;
     let mut builder = match options.registry {

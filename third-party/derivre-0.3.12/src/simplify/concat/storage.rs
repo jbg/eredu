@@ -95,8 +95,7 @@ impl Blueprint {
             buffers: Buffers::default(),
         };
         let (_, frames, _) = source
-            .prepared_extents()
-            .map_err(|e| fail(Cause::Source(e)))?;
+            .storage_extents();
         let parts = frames
             .checked_add(1)
             .and_then(|n| n.checked_mul(frames))
@@ -433,16 +432,16 @@ mod tests {
     }
     #[test]
     fn shared_concat_source_preserves_recursive_byte_groups_and_failed_frame_custody() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let atom = source.mk_repeat(a, 1, 2);
-        let literal = source.mk_byte_literal(b"0123456789abcdefghijklmnopqrstuv");
-        let inner = source.mk(Expr::Concat(ExprFlags::POSITIVE, [atom, literal]));
-        let root = source.mk(Expr::Concat(ExprFlags::POSITIVE, [inner, b]));
-        let existing_tail = source.mk_byte_concat(b"b", c);
-        source.reserve(64);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let atom = source.mk_repeat(a, 1, 2).unwrap();
+        let literal = source.mk_byte_literal(b"0123456789abcdefghijklmnopqrstuv").unwrap();
+        let inner = source.mk(Expr::Concat(ExprFlags::POSITIVE, [atom, literal])).unwrap();
+        let root = source.mk(Expr::Concat(ExprFlags::POSITIVE, [inner, b])).unwrap();
+        let existing_tail = source.mk_byte_concat(b"b", c).unwrap();
+        source.reserve(64).unwrap();
         let mut ordinary = source.clone();
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
         drop(source);
@@ -455,7 +454,7 @@ mod tests {
         let mut scope = plan.compile().unwrap();
         let capacity = capacities(&scope);
         let result = scope.concat(root, atom).unwrap();
-        let expected = ordinary.mk_concat(root, atom);
+        let expected = ordinary.mk_concat(root, atom).unwrap();
         assert_eq!(result, expected);
         assert_eq!(
             scope.source.expr_to_string(result),
@@ -470,7 +469,7 @@ mod tests {
         assert_eq!(capacities(&scope), capacity);
         assert_eq!(
             scope.concat(ExprRef::EMPTY_STRING, result).unwrap(),
-            ordinary.mk_concat(ExprRef::EMPTY_STRING, expected)
+            ordinary.mk_concat(ExprRef::EMPTY_STRING, expected).unwrap()
         );
         assert_eq!(scope.source.cost(), ordinary.cost());
 

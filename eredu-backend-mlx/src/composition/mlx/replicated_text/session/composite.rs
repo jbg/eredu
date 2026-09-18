@@ -1,4 +1,5 @@
 use super::*;
+mod autoregressive;
 mod decode_input;
 mod external_prefill;
 mod external_state;
@@ -161,6 +162,8 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedComposite<
     media_prefill: Option<NativeMediaPrefillEntry<A, D>>,
     bind_original_media: Option<NativeOriginalMediaBinding<A>>,
     original_media_prefill: Option<NativeOriginalMediaPrefillEntry<A, D>>,
+    speculative_media_prepare: Option<media_prefill::speculative::Prepare<A,D>>,
+    speculative_media_run: Option<media_prefill::speculative::Run<A,D>>,
     media_capture_validation: Option<NativeMediaCaptureValidation<A>>,
     pub(super) admission: A::AdmissionConfig,
     pub(super) processor: eredu_runtime::SelectedProcessorExecution,
@@ -348,6 +351,12 @@ where
                 }
                 let config=A::retain_admission_config_with_metadata(self.admission,metadata)?;
                 let inspector=input::MlxTensorInputInspector;
+                if let Some(input::OriginalMediaPacket::Original(packet)) = input.original_media() {
+                    return eredu_architectures::speculative_execution::AdmittedPredictionPrefill::from_compiled_source_with_metadata(
+                        prepared, packet.semantics(), config, inspector, input.shared_cache_identity().cloned(),
+                        input.prefill_chunk_positions(), metadata,
+                    ).map_err(Error::Neural);
+                }
                 let admitted=A::admit_prepared_input_with_metadata(&config,&prepared,&inspector,metadata)?;
                 eredu_architectures::speculative_execution::AdmittedPredictionPrefill::from_prepared_owner_with_metadata(
                     prepared,admitted,config,inspector,input.shared_cache_identity().cloned(),input.prefill_chunk_positions(),metadata,
@@ -504,7 +513,7 @@ where
                 self.session.parameter_declarations(),
                 members,
             )
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         self.prepared_parameters
             .extend(self.prepared_bank_parameters.iter().map(|p| p.slot.clone()));
         self.prepared_parameters
@@ -549,6 +558,8 @@ where
             media_prefill: self.media_prefill,
             bind_original_media: self.bind_original_media,
             original_media_prefill: self.original_media_prefill,
+            speculative_media_prepare: self.speculative_media_prepare,
+            speculative_media_run: self.speculative_media_run,
             media_capture_validation: self.media_capture_validation,
             admission: self.admission,
             processor: self.processor,
@@ -599,6 +610,8 @@ where
             media_prefill: None,
             bind_original_media: None,
             original_media_prefill: None,
+            speculative_media_prepare: None,
+            speculative_media_run: None,
             media_capture_validation: None,
             admission,
             processor,
@@ -671,6 +684,32 @@ where
         + 'static,
     P: CompositePredictionCapability<A, D> + 'static,
 {
+    fn resident_reset_profile(&self) -> Option<ResidentResetProfile> {
+        (!P::present()).then_some(ResidentResetProfile::Hybrid)
+    }
+
+    fn resident_hybrid_reset_source(&self) -> Result<
+        eredu_runtime::working_memory::ResidentResetSource<'_, MlxHybridState>,
+        eredu_runtime::working_memory::WorkingMemoryError,
+    > {
+        if self.resident_reset_profile().is_none() {
+            return Err(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound);
+        }
+        self.session.projected_resident_reset_source::<MlxHybridState>()
+    }
+
+    fn install_resident_hybrid_reset(&mut self,
+        installation: eredu_runtime::working_memory::ResidentResetInstallation<MlxHybridState>,
+    ) -> Result<eredu_runtime::working_memory::ResidentResetDisplaced<MlxHybridState>, (
+        eredu_runtime::working_memory::WorkingMemoryError,
+        eredu_runtime::working_memory::ResidentResetInstallation<MlxHybridState>,
+    )> {
+        if self.resident_reset_profile().is_none() {
+            return Err((eredu_runtime::working_memory::WorkingMemoryError::UnknownBound, installation));
+        }
+        self.session.install_resident_reset(installation)
+    }
+
     fn current_media_semantic_binding(
         &self,
     ) -> Result<
@@ -681,7 +720,7 @@ where
     }
     fn prepare_original_media_semantic_binding(
         &self,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<(), eredu_runtime::replicated_session::OriginalMediaBindingError> {
         self.session.prepare_original_media_semantic_binding(funding).map(|_| ())
     }
@@ -917,8 +956,9 @@ where
     fn inspection_adapters_for_test(
         &self,
         geometry: eredu_core::InferenceGeometry,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
     ) -> Result<(), Error> {
-        MlxReplicatedTextMechanisms::inspection_adapters_for_test(&self.session, geometry)
+        MlxReplicatedTextMechanisms::inspection_adapters_for_test(&self.session, geometry, pool)
     }
     #[cfg(test)]
     fn prefill_status_for_test(&self) -> Result<(bool, bool), Error> {
@@ -929,7 +969,7 @@ where
         &self,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<(), Error> {
         MlxReplicatedTextMechanisms::bind_session_neural_recipe(&self.session, pool, recipe, funding)
     }
@@ -942,7 +982,7 @@ where
         native_root_capacity: Option<u64>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Option<eredu_runtime::working_memory::TextPrefillScopeFacts>, Error> {
         MlxReplicatedTextMechanisms::session_prefill_control_facts(
             &self.session,
@@ -965,7 +1005,7 @@ where
         host_destinations: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         Option<crate::backend::runtime::execution::generic::OriginalOperationBankOwner>,
         Error,
@@ -1020,7 +1060,7 @@ where
 
     fn retire_expired_opening_rows(&self) -> Result<(), Error> {
         MlxReplicatedTextMechanisms::retire_session_opening_rows(&self.session)?;
-        MlxReplicatedTextMechanisms::retire_session_prefill_controls(&self.session)
+        MlxReplicatedTextMechanisms::retire_session_controls(&self.session)
     }
 
     #[cfg(test)]
@@ -1053,10 +1093,14 @@ where
     fn validate_prepared_observation_paths(
         &self,
         expected: &eredu_runtime::SharedLayeredObservationPaths,
+        metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<(), Error> {
         self.session
             .validate_prepared_observation_paths(expected)
-            .map_err(|error| Error::Other(Box::new(error)))
+            .map_err(|cause| match metadata.funding() {
+                Some(funding) => crate::composition::mlx::model::retain_planning_error(cause, funding),
+                None => Error::Other(Box::new(cause)),
+            })
     }
 
     fn collect_retained_idle_auxiliary_storage(
@@ -1413,6 +1457,68 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
+    fn uses_ordinary_unit_equations(&self) -> bool {
+        self.session.execution_strategy().uses_ordinary_unit_equations()
+    }
+    fn bind_speculative_neural_recipe(
+        &self,
+        source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        recipe: &mut crate::backend::nn::workspace::AutoregressiveEquationRecipe,
+    ) -> Result<
+        (
+            u64,
+            Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+        ),
+        Error,
+    > {
+        MlxReplicatedTextMechanisms::bind_session_speculative_neural_recipe(
+            &self.session,
+            source,
+            pool,
+            funding,
+            recipe,
+        )
+    }
+    fn prepare_speculative_neural_bank(
+        &self,
+        source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        recipe: &crate::backend::nn::workspace::AutoregressiveEquationRecipe,
+        role: eredu_runtime::working_memory::OriginalSpeculativeRole,
+        scope: &safemlx::SubmissionScope,
+        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
+    {
+        MlxReplicatedTextMechanisms::prepare_session_speculative_neural_bank(
+            &self.session,
+            source,
+            recipe,
+            role,
+            scope,
+            partition,
+        )
+    }
+
+    fn prepare_speculative_span_neural_bank(
+        &self,
+        source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        recipe: &crate::backend::nn::workspace::AutoregressiveEquationRecipe,
+        span: &eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
+        scope: &safemlx::SubmissionScope,
+        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
+    {
+        MlxReplicatedTextMechanisms::prepare_session_speculative_span_neural_bank(
+            &self.session,
+            source,
+            recipe,
+            span,
+            scope,
+            partition,
+        )
+    }
+
     fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
         self.session
             .prepare_prediction_target_state(&self.stream)
@@ -1541,23 +1647,61 @@ where
         prefill: bool,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let (prepared, admitted, _) = self.text_input(tokens)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let output = self.with_native_prediction_target_state(cache, |session| {
-            session
-                .sequence_logits(
-                    paired,
-                    if prefill {
-                        eredu_runtime::ExpertPass::Prefill
-                    } else {
-                        eredu_runtime::ExpertPass::Decode
-                    },
-                    stream,
-                )
-                .map_err(|e| Error::Other(Box::new(e)))
-        })?;
-        Ok(self.published(output.into_array()))
+        self.autoregressive_forward_inner(tokens, cache, prefill, eredu_core::OutputDemand::Sequence, stream, None)
+            .map(|output| output.expect("sequence forward preserves output"))
+    }
+    fn autoregressive_forward_with_completion(
+        &mut self, tokens: &Array, cache: &mut MlxPredictionTargetState,
+        stream: &Stream, completion: &mut dyn AutoregressiveSequenceCompletion,
+    ) -> Result<Array, Error> {
+        self.autoregressive_forward_inner(tokens, cache, false, eredu_core::OutputDemand::Sequence, stream, Some(completion))
+            .map(|output| output.expect("sequence forward preserves output"))
+    }
+    fn autoregressive_prefill_span_with_completion(
+        &mut self, tokens: &Array, cache: &mut MlxPredictionTargetState,
+        span: &eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
+        stream: &Stream, completion: &mut dyn AutoregressiveSequenceCompletion,
+    ) -> Result<Option<Array>, Error> {
+        if !span.role().same_role(completion.role()) || cache.generation_fixed() != Some(span.chunk().position) {
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        }
+        self.autoregressive_forward_inner(tokens, cache, true, span.chunk().output, stream, Some(completion))
+    }
+
+    fn prepare_autoregressive_media_semantics(
+        &mut self,
+        source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
+        cache: &mut MlxPredictionTargetState,
+        blueprint: &eredu_architectures::prepared_execution::PreparedInferenceBlueprint,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        stream: &Stream,
+    ) -> Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error> {
+        autoregressive::prepare_media_semantics(self, source, cache, blueprint, pool, funding, stream)
+    }
+    fn prepare_autoregressive_media_prefill(
+        &mut self, packet: &input::OriginalMediaPacket, semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics, cache: &mut MlxPredictionTargetState,
+        geometry: eredu_core::InferenceGeometry, role: &eredu_runtime::working_memory::OriginalSpeculativeRole,
+        metadata: &eredu_nn::workspace::WorkspaceContext, stream: &Stream,
+    ) -> Result<OriginalAutoregressiveMediaPrefill,Error> {
+        let prepare=self.speculative_media_prepare.ok_or(Error::PrefillScopeUnavailable)?;
+        let funding=metadata.metadata_funding().ok_or(Error::PrefillScopeUnavailable)?;
+        external_state::with_state_and_metadata(&mut self.session,cache,stream,Some(&funding),
+            |session,_| prepare(session,packet,semantics,geometry,role,metadata))
+    }
+    fn autoregressive_media_prefill_span_with_completion(
+        &mut self, source:&mut OriginalAutoregressiveMediaPrefill, cache:&mut MlxPredictionTargetState,
+        span:&eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
+        stream:&Stream, completion:&mut dyn AutoregressiveSequenceCompletion,
+    ) -> Result<Option<Array>,Error> {
+        if !span.role().same_role(completion.role()) || cache.generation_fixed()!=Some(span.chunk().position) {
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        }
+        let run=self.speculative_media_run.ok_or(Error::PrefillScopeUnavailable)?;
+        let funding=completion.metadata_funding();
+        external_state::with_state_and_metadata(&mut self.session,cache,stream,Some(&funding),
+            |session,_| run(session,source,span,stream,completion))
+            .map(|output|self.published(output.map(MlxTensor::into_array)))
     }
 
     fn prepare_resident_decoder_copy(
@@ -1769,7 +1913,7 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
-    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
+    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport<&'static str> {
         use eredu_core::execution_control::ControlSupport;
         let policy = super::native_control_policy_support(
             D::PARTITIONED_SESSION,
@@ -1779,10 +1923,9 @@ where
         if matches!(policy, ControlSupport::Unsupported { .. }) {
             return policy;
         }
-        if self.session.estimate_control_state().is_none() {
+        if self.session.estimate_original_control_state().is_none() {
             return ControlSupport::Unsupported {
-                reason: "native state isolation or a complete storage estimate is unavailable"
-                    .into(),
+                reason: "native state isolation or a complete storage estimate is unavailable",
             };
         }
         ControlSupport::Supported
@@ -1829,7 +1972,7 @@ where
         if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
             self.native_control_support()
         {
-            return Err(Error::ArchitectureModel(reason));
+            return Err(Error::ArchitectureModel(reason.into()));
         }
         self.session
             .capture_control_state(&self.stream)
@@ -1869,7 +2012,7 @@ where
         if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
             self.native_control_support()
         {
-            return Err(Error::ArchitectureModel(reason));
+            return Err(Error::ArchitectureModel(reason.into()));
         }
         let saved = saved
             .downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<MlxHybridState>>()
@@ -1879,12 +2022,22 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
+    fn original_control_branch_sources(&self, slot: &dyn std::any::Any)
+        -> Result<[eredu_runtime::replicated_session::ControlBranchSource; 2], Error> {
+        use crate::composition::mlx::session::{PreparedControlSlotError, prepared_control_slot_error};
+        let slot = slot.downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<MlxHybridState>>()
+            .ok_or_else(|| prepared_control_slot_error(PreparedControlSlotError::Type))?;
+        self.session.original_control_branch_sources(slot).map_err(prepared_control_slot_error)
+    }
+
     fn exchange_original_control_state(
         &mut self,
         slot: &mut dyn std::any::Any,
-        metadata: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        metadata: &eredu_nn::workspace::HostMetadataFunding,
         media: Option<&eredu_runtime::working_memory::MediaSessionBinding>,
-    ) -> Result<Option<eredu_runtime::working_memory::CopiedMediaStateBinding>, Error> {
+        branch: Option<(&eredu_runtime::working_memory::PendingTextBranchExchange,
+            &[eredu_runtime::replicated_session::ControlBranchSource; 2])>,
+    ) -> Result<eredu_runtime::replicated_session::ControlExchangeResult, Error> {
         use crate::composition::mlx::session::{
             PreparedControlSlotError, prepared_control_slot_error,
         };
@@ -1900,7 +2053,7 @@ where
         let slot = slot.downcast_mut::<eredu_runtime::replicated_session::ReplicatedTextControlState<MlxHybridState>>()
             .ok_or_else(|| prepared_control_slot_error(PreparedControlSlotError::Type))?;
         self.session
-            .exchange_control_state_prepared_fixed(slot, &self.stream, Some(metadata), media)
+            .exchange_control_state_prepared_fixed(slot, &self.stream, Some(metadata), media, branch)
             .map_err(prepared_control_slot_error)
     }
 
@@ -2359,7 +2512,7 @@ where
                     let [batch, sequence] = packet.shape();
                     geometry
                         .validate_prefill(batch, sequence)
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                 }
                 let media = self.original_media_prefill.ok_or_else(|| {
                     Error::before_model_mutation(
@@ -2434,7 +2587,7 @@ where
                     request.validate_prefill(batch, sequence).map_err(|cause| {
                         match continuation_metadata.as_ref() {
                             Some(context) => context.metadata_source(cause),
-                            None => eredu_nn::Error::backend_source(cause),
+                            None => eredu_nn::Error::backend_retained_source(cause),
                         }
                     })?;
                 }
@@ -2541,7 +2694,7 @@ where
                 Err(error) => (
                     Err(match continuation_metadata.as_ref() {
                         Some(context) => context.metadata_source(error),
-                        None => eredu_nn::Error::backend_source(error),
+                        None => eredu_nn::Error::backend_retained_source(error),
                     }),
                     None,
                 ),
@@ -2615,7 +2768,7 @@ where
             },
             Err(error) => Err(match metadata {
                 Some(metadata) => metadata.metadata_source(error),
-                None => eredu_nn::Error::backend_source(error),
+                None => eredu_nn::Error::backend_retained_source(error),
             }),
         };
         #[cfg(test)]
@@ -3023,3 +3176,5 @@ where
         true
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

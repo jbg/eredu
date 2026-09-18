@@ -1,33 +1,61 @@
 //! Capture coordinates follow declared equations and retained parameter placement.
 use super::*;
 use eredu_core::{
+    ObservationPosition, SymbolicDimension,
     capture::CaptureError,
     component::{ComponentTensorTransform, ComponentTensorTransformEquation as Equation},
     speculative::SpeculativeCaptureScope,
-    ObservationPosition, SymbolicDimension,
 };
 
 pub(super) fn register(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     layout: &LocalModelLayout,
     scope: SpeculativeCaptureScope,
     owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
 ) -> Result<(), ComponentPartitionError> {
-    let mut pending = descriptor
-        .component_transforms
-        .iter()
-        .filter_map(|transform| {
-            match crate::speculative_execution::speculative_capture_scope(
-                descriptor,
-                &transform.node_id,
-            ) {
-                Ok(actual) if actual == scope => Some(Ok(transform)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    worker(
+        observations,
+        descriptor,
+        layout,
+        scope,
+        owns,
+        Destination(None),
+    )
+}
+#[cfg(test)]
+fn complete_groups(
+    coordinates: &ComponentCoordinateMap,
+    groups: usize,
+    width: usize,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    groups_worker(coordinates, groups, width, Destination(None))
+}
+pub(super) fn worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    layout: &LocalModelLayout,
+    scope: SpeculativeCaptureScope,
+    owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+    allocation: Destination<'_>,
+) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &LocalModelLayout,
+        SpeculativeCaptureScope,
+        Vec<&ComponentTensorTransform>,
+        Vec<&ComponentTensorTransform>,
+        PartitionedObservation,
+        usize,
+    )>()?;
+    allocation.controls_of(&owns)?;
+    let mut pending = Vec::new();
+    for transform in &descriptor.component_transforms {
+        if allocation.scope(descriptor, &transform.node_id)? == scope {
+            allocation.push(&mut pending, transform)?;
+        }
+    }
     // A whole residual write can establish the owner of a convolution or
     // post-normalization before a scalar group does (for example a reduced
     // routed/shared sum). Both preserve axes and invocation ownership, so their
@@ -42,11 +70,15 @@ pub(super) fn register(
         {
             continue;
         }
-        let Some(output) = observations.get(&transform.output).cloned() else {
+        let Some(output) = observations
+            .get(&transform.output)
+            .map(|value| allocation.observation(value))
+            .transpose()?
+        else {
             continue;
         };
         let invalid = || {
-            CaptureError::Invalid(format!(
+            allocation.capture_invalid(format_args!(
                 "invalid shape-preserving input boundary: {}",
                 transform.id
             ))
@@ -75,11 +107,16 @@ pub(super) fn register(
                 {
                     return Err(invalid().into());
                 }
-                insert_observation(observations, original, output.clone())?;
+                observations::insert(
+                    observations,
+                    original,
+                    allocation.observation(&output)?,
+                    allocation,
+                )?;
             }
             _ => return Err(invalid().into()),
         }
-        insert_observation(observations, &transform.input, output)?;
+        observations::insert(observations, &transform.input, output, allocation)?;
     }
     // Equations need not be listed in dependency order. Only already established
     // inputs authorize propagation; cycles or missing sources cannot imply zero.
@@ -87,34 +124,62 @@ pub(super) fn register(
         let mut remaining = Vec::new();
         let before = pending.len();
         for transform in pending {
-            let Some(input) = observations.get(&transform.input).cloned() else {
-                remaining.push(transform);
+            let Some(input) = observations
+                .get(&transform.input)
+                .map(|value| allocation.observation(value))
+                .transpose()?
+            else {
+                allocation.push(&mut remaining, transform)?;
                 continue;
             };
-            register_one(observations, descriptor, layout, transform, input, owns)?;
+            one(
+                observations,
+                descriptor,
+                layout,
+                transform,
+                input,
+                owns,
+                allocation,
+            )?;
         }
         if remaining.len() == before {
-            return Err(CaptureError::Invalid(format!(
+            return Err(allocation.capture_invalid(format_args!(
                 "transform has no established input placement: {}",
                 remaining[0].input
-            ))
-            .into());
+            )));
         }
         pending = remaining;
     }
     Ok(())
 }
 
-fn register_one(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+fn one(
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     layout: &LocalModelLayout,
     transform: &ComponentTensorTransform,
     input: PartitionedObservation,
     owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
-    let invalid =
-        || CaptureError::Invalid(format!("invalid transform placement: {}", transform.id));
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &LocalModelLayout,
+        &ComponentTensorTransform,
+        PartitionedObservation,
+        PartitionedObservation,
+        &str,
+        &[usize],
+        bool,
+    )>()?;
+    allocation.controls_of(&owns)?;
+    let invalid = || {
+        allocation.capture_invalid(format_args!(
+            "invalid transform placement: {}",
+            transform.id
+        ))
+    };
     let axes = |path: &str| {
         descriptor
             .observations
@@ -130,9 +195,11 @@ fn register_one(
             return Err(invalid().into());
         }
         if local {
-            Ok(Some(layout.tensor(name).ok_or_else(|| {
-                ComponentPartitionError::MissingWeight(name.into())
-            })?))
+            Ok(Some(
+                layout
+                    .tensor(name)
+                    .ok_or_else(|| allocation.missing(name))?,
+            ))
         } else {
             Ok(None)
         }
@@ -153,7 +220,7 @@ fn register_one(
             }
             Ok(())
         };
-    let mut output = input.clone();
+    let mut output = allocation.observation(&input)?;
     match &transform.equation {
         Equation::ConstantScale { .. } => {
             if input_axes != output_axes {
@@ -173,13 +240,14 @@ fn register_one(
             }) {
                 if let Some([axis]) = point.axes.as_deref() {
                     if axis.dimension == SymbolicDimension::Known(1) {
-                        replicated_observation(
+                        observations::replicated(
                             observations,
                             descriptor,
                             &point.path,
                             &axis.name,
                             local,
                             input.site,
+                            allocation,
                         )?;
                     }
                 }
@@ -225,8 +293,13 @@ fn register_one(
             }
             if let Some(tensor) = parameter(&kernel.parameter)? {
                 if tensor.global_shape() != [*channels, 1, *taps]
-                    || derive_tensor_axis_coordinates(&kernel.parameter, *channels, tensor, 0)?
-                        != *input.coordinates.as_ref().expect("local input")
+                    || coordinates::tensor_worker(
+                        &kernel.parameter,
+                        *channels,
+                        tensor,
+                        0,
+                        allocation,
+                    )? != *input.coordinates.as_ref().expect("local input")
                 {
                     return Err(invalid().into());
                 }
@@ -253,11 +326,11 @@ fn register_one(
                 return Err(invalid().into());
             }
             replicated_parameter(&weight.parameter, &[*input_width, *output_width])?;
-            output.axis = output_axes[2].name.clone();
+            output.axis = allocation.text(&output_axes[2].name)?;
             output.coordinates = input
                 .coordinates
                 .as_ref()
-                .map(|coordinates| complete_groups(coordinates, *groups, *input_width))
+                .map(|coordinates| groups_worker(coordinates, *groups, *input_width, allocation))
                 .transpose()?;
         }
     }
@@ -274,7 +347,12 @@ fn register_one(
     {
         return Err(invalid().into());
     }
-    insert_observation(observations, &transform.output, output.clone())?;
+    observations::insert(
+        observations,
+        &transform.output,
+        allocation.observation(&output)?,
+        allocation,
+    )?;
     if let Some(effective) = &transform.effective_output {
         if axes(effective)? != output_axes
             || descriptor
@@ -284,18 +362,29 @@ fn register_one(
         {
             return Err(invalid().into());
         }
-        insert_observation(observations, effective, output)?;
+        observations::insert(observations, effective, output, allocation)?;
     }
     Ok(())
 }
 
-fn complete_groups(
+fn groups_worker(
     coordinates: &ComponentCoordinateMap,
     groups: usize,
     width: usize,
+    allocation: Destination<'_>,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let invalid =
-        || CaptureError::Invalid("projection placement splits a shared input group".into());
+    allocation.controls::<(
+        &ComponentCoordinateMap,
+        usize,
+        usize,
+        Vec<usize>,
+        ComponentCoordinateMap,
+    )>()?;
+    let invalid = || {
+        allocation.capture_invalid(format_args!(
+            "projection placement splits a shared input group"
+        ))
+    };
     if width == 0
         || groups.checked_mul(width) != Some(coordinates.global_count())
         || !coordinates.local_count().is_multiple_of(width)
@@ -309,7 +398,7 @@ fn complete_groups(
         return ComponentCoordinateMap::range(groups, range.start / width..range.end / width)
             .map_err(Into::into);
     }
-    let mut selected = Vec::with_capacity(coordinates.local_count() / width);
+    let mut selected = allocation.vector(coordinates.local_count() / width)?;
     for local in (0..coordinates.local_count()).step_by(width) {
         let first = coordinates.local_to_global(local).ok_or_else(&invalid)?;
         if !first.is_multiple_of(width)
@@ -320,7 +409,7 @@ fn complete_groups(
         }
         selected.push(first / width);
     }
-    ComponentCoordinateMap::indices(groups, selected).map_err(Into::into)
+    allocation.indices(groups, selected)
 }
 
 #[cfg(test)]
@@ -391,6 +480,54 @@ mod tests {
         let parameters =
             ArchitectureParameterDescription::new(&graph, &units, expected, owned).unwrap();
         (descriptor, parameters)
+    }
+
+    #[test]
+    fn idle_rank_source_still_pays_complete_invocation_declarations(){
+        let (descriptor,parameters)=fixture();
+        let topology=ParallelRankTopology::new(ParallelTopology::new(1,2,1,1).unwrap(),0).unwrap();
+        let layout=crate::partitioned_execution::derive_partitioned_local_layout(&parameters,topology).unwrap();
+        let ownership=eredu_runtime::PartitionOwnership::new(false,false,std::iter::empty::<&str>()).unwrap();
+        construction::tests::verify(|allocation|ComponentPartitionLayout::from_ownership_worker(&descriptor,&parameters,&layout,topology,&ownership,&[],1,None,allocation));
+    }
+
+    #[test]
+    fn transform_source_refuses_each_destination_without_dependency_fallback() {
+        let (mut descriptor, parameters) = fixture();
+        descriptor.component_transforms.reverse();
+        let topology =
+            ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap();
+        let layout =
+            crate::partitioned_execution::derive_partitioned_local_layout(&parameters, topology)
+                .unwrap();
+        construction::tests::verify(|allocation| {
+            let mut result = ComponentPartitionLayout::from_components_worker(
+                &descriptor,
+                &descriptor.components,
+                &layout,
+                topology,
+                &|_| Ok(true),
+                allocation,
+            )?;
+            observations::replicated(
+                &mut result.observations,
+                &descriptor,
+                &descriptor.component_readout.as_ref().unwrap().normalized,
+                "hidden",
+                true,
+                ObservationHookSite::Readout,
+                allocation,
+            )?;
+            worker(
+                &mut result.observations,
+                &descriptor,
+                &layout,
+                SpeculativeCaptureScope::Target,
+                &|_| Ok(true),
+                allocation,
+            )?;
+            Ok(result)
+        });
     }
 
     #[test]
@@ -483,10 +620,12 @@ mod tests {
                     local.then_some(Some(0..1))
                 );
             }
-            assert!(projected
-                .observations
-                .keys()
-                .all(|path| !path.starts_with("model.mtp.")));
+            assert!(
+                projected
+                    .observations
+                    .keys()
+                    .all(|path| !path.starts_with("model.mtp."))
+            );
             let scaled = &projected.observations["readout.scaled"];
             assert_eq!(scaled.site(), ObservationHookSite::Readout);
             assert_eq!(scaled.exports(), rank.pipeline_parallel_rank() == 1);
@@ -515,10 +654,10 @@ mod tests {
                 (0..topology.world_size())
                     .map(|rank| ComponentPartitionLayout {
                         topology: ParallelRankTopology::new(topology, rank).unwrap(),
-                        groups: BTreeMap::new(),
-                        paths: BTreeMap::new(),
-                        observations: BTreeMap::new(),
-                        routed: BTreeMap::new(),
+                        groups: SourceMap::new(),
+                        paths: SourceMap::new(),
+                        observations: SourceMap::new(),
+                        routed: SourceMap::new(),
                     })
                     .collect(),
             )
@@ -566,9 +705,11 @@ mod tests {
         stale.component_scopes[0]
             .static_parameter_roles
             .retain(|role| role != "mtp");
-        assert!(empty()
-            .with_prediction(&stale, &prepared, &execution)
-            .is_err());
+        assert!(
+            empty()
+                .with_prediction(&stale, &prepared, &execution)
+                .is_err()
+        );
     }
 
     #[test]

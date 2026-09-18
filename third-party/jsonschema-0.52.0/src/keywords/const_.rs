@@ -6,8 +6,8 @@ use crate::{
     validator::{Validate, ValidationContext},
     Array, Json, Node,
 };
-use serde_json::{Map, Number, Value};
 use jsonschema_value::literal::Literal;
+use serde_json::{Map, Number, Value};
 
 use crate::paths::{LazyLocation, RefTracker};
 
@@ -17,14 +17,15 @@ struct ConstArrayValidator {
 }
 impl ConstArrayValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        value: &[Value],
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        value: &'a [Value],
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        Ok(Box::new(ConstArrayValidator {
-            value: value.iter().map(Literal::from_value).collect(),
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ConstArrayValidator {
+            value: ctx.funding().literals(value)?,
             location,
-        }))
+        })?)
     }
 }
 impl<F: Json> Validate<F> for ConstArrayValidator {
@@ -35,11 +36,21 @@ impl<F: Json> Validate<F> for ConstArrayValidator {
         ])
     }
 
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.vector(&self.value)?; for value in &self.value { source.literal(value)?; } source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.value)?;
+        for value in &self.value {
+            source.literal(value)?;
+        }
+        source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -49,13 +60,13 @@ impl<F: Json> Validate<F> for ConstArrayValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_array(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                &self.value.iter().map(Literal::to_value).collect::<Vec<_>>(),
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: Value::Array(
+                        funding.copy_vec(&self.value, |value| funding.literal_value(value))?,
+                    ),
+                })
+            })
         }
     }
 
@@ -80,10 +91,13 @@ struct ConstBooleanValidator {
 impl ConstBooleanValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         value: bool,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(ConstBooleanValidator { value, location }))
+        Ok(ctx
+            .funding()
+            .boxed(ConstBooleanValidator { value, location })?)
     }
 }
 impl<F: Json> Validate<F> for ConstBooleanValidator {
@@ -96,11 +110,17 @@ impl<F: Json> Validate<F> for ConstBooleanValidator {
         ])
     }
 
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -110,13 +130,11 @@ impl<F: Json> Validate<F> for ConstBooleanValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_boolean(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                self.value,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: Value::Bool(self.value),
+                })
+            })
         }
     }
 
@@ -131,8 +149,11 @@ struct ConstNullValidator {
 }
 impl ConstNullValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ConstNullValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ConstNullValidator { location })?)
     }
 }
 impl<F: Json> Validate<F> for ConstNullValidator {
@@ -145,11 +166,17 @@ impl<F: Json> Validate<F> for ConstNullValidator {
         ])
     }
 
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -159,12 +186,11 @@ impl<F: Json> Validate<F> for ConstNullValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_null(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: Value::Null,
+                })
+            })
         }
     }
     #[inline]
@@ -181,29 +207,46 @@ struct ConstNumberValidator {
 
 impl ConstNumberValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         original_value: &Number,
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        Ok(Box::new(ConstNumberValidator {
-            original_value: original_value.clone(),
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ConstNumberValidator {
+            original_value: ctx.funding().number(original_value)?,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for ConstNumberValidator {
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        let numeric = crate::cmp::original_number_equality_control_bytes::<<F::Node<'_> as crate::Node<'_, F>>::Number>()
-            .ok_or(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision number equality")))?;
-        crate::validator::workspace::body_controls::<F, Self>(&[numeric, std::mem::size_of::<&serde_json::Number>()])
+        let numeric = crate::cmp::original_number_equality_control_bytes::<
+            <F::Node<'_> as crate::Node<'_, F>>::Number,
+        >()
+        .ok_or(crate::validator::workspace::Error::Unqualified(
+            crate::validator::workspace::Component::Validator(
+                "arbitrary-precision number equality",
+            ),
+        ))?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            numeric,
+            std::mem::size_of::<&serde_json::Number>(),
+        ])
     }
 
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.number(&self.original_value)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.number(&self.original_value)?;
+        source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -213,13 +256,11 @@ impl<F: Json> Validate<F> for ConstNumberValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_number(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                &self.original_value,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: Value::Number(funding.number(&self.original_value)?),
+                })
+            })
         }
     }
 
@@ -240,14 +281,15 @@ pub(crate) struct ConstObjectValidator {
 
 impl ConstObjectValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        value: &Map<String, Value>,
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        value: &'a Map<String, Value>,
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        Ok(Box::new(ConstObjectValidator {
-            value: Literal::from_object(value),
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ConstObjectValidator {
+            value: ctx.funding().literal_object(value)?,
             location,
-        }))
+        })?)
     }
 }
 
@@ -258,11 +300,18 @@ impl<F: Json> Validate<F> for ConstObjectValidator {
             std::mem::size_of::<std::slice::Iter<'_, Literal>>(),
         ])
     }
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.literal(&self.value)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.literal(&self.value)?;
+        source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -272,13 +321,11 @@ impl<F: Json> Validate<F> for ConstObjectValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_object(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                &self.value.to_value(),
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: funding.literal_value(&self.value)?,
+                })
+            })
         }
     }
 
@@ -295,11 +342,15 @@ pub(crate) struct ConstStringValidator {
 
 impl ConstStringValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(value: &str, location: Location) -> CompilationResult<'_, F> {
-        Ok(Box::new(ConstStringValidator {
-            value: value.to_string(),
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        value: &'a str,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ConstStringValidator {
+            value: ctx.funding().copy_str(value)?,
             location,
-        }))
+        })?)
     }
 }
 
@@ -313,11 +364,18 @@ impl<F: Json> Validate<F> for ConstStringValidator {
         ])
     }
 
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.string(&self.value)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.string(&self.value)?;
+        source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -327,13 +385,11 @@ impl<F: Json> Validate<F> for ConstStringValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::constant_string(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                &self.value,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Constant {
+                    expected_value: Value::String(funding.copy_str(&self.value)?),
+                })
+            })
         }
     }
 
@@ -353,14 +409,15 @@ pub(crate) fn compile<'a, F: Json>(
     _: &'a Map<String, Value>,
     schema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    let location = ctx.location().join("const");
+    let location =
+        crate::keywords::try_compile!(ctx.location().join_with_funding("const", ctx.funding()));
     match schema {
-        Value::Array(items) => Some(ConstArrayValidator::compile(items, location)),
-        Value::Bool(item) => Some(ConstBooleanValidator::compile(*item, location)),
-        Value::Null => Some(ConstNullValidator::compile(location)),
-        Value::Number(item) => Some(ConstNumberValidator::compile(item, location)),
-        Value::Object(map) => Some(ConstObjectValidator::compile(map, location)),
-        Value::String(string) => Some(ConstStringValidator::compile(string, location)),
+        Value::Array(items) => Some(ConstArrayValidator::compile(ctx, items, location)),
+        Value::Bool(item) => Some(ConstBooleanValidator::compile(ctx, *item, location)),
+        Value::Null => Some(ConstNullValidator::compile(ctx, location)),
+        Value::Number(item) => Some(ConstNumberValidator::compile(ctx, item, location)),
+        Value::Object(map) => Some(ConstObjectValidator::compile(ctx, map, location)),
+        Value::String(string) => Some(ConstStringValidator::compile(ctx, string, location)),
     }
 }
 

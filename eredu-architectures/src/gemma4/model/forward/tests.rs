@@ -10,10 +10,10 @@ use std::{convert::Infallible,sync::{Arc,atomic::{AtomicBool,AtomicUsize,Orderin
 struct AccountState {remaining:AtomicUsize,retired:AtomicBool}
 #[derive(Debug)]
 struct Account(Arc<AccountState>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
         let n=self.0.remaining.load(Ordering::SeqCst);
-        self.0.remaining.store(n.checked_sub(bytes).ok_or(WorkspaceMetadataFundingError::Capacity{
+        self.0.remaining.store(n.checked_sub(bytes).ok_or(HostMetadataFundingError::Capacity{
             required:bytes as u64,available:n as u64})?,Ordering::SeqCst);
         Ok(())
     }
@@ -33,7 +33,7 @@ impl WorkspaceFactMechanisms for NoEquations {
 }
 fn context()->(WorkspaceContext,Arc<AccountState>){
     let state=Arc::new(AccountState{remaining:AtomicUsize::new(usize::MAX),retired:AtomicBool::new(false)});
-    let funding=WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding=HostMetadataFunding::new(Account(state.clone())).unwrap();
     (WorkspaceContext::new_with_metadata_funding(NoEquations,funding).unwrap(),state)
 }
 fn config()->FamilyConfig {

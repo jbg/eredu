@@ -11,8 +11,13 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 mod candidate_tests;
 mod delivery;
-pub use delivery::{CaptureDeliveryPending, CapturedStepDelivery};
+pub use delivery::CaptureDeliveryPending;
 mod invocation;
+mod identity;
+mod admission;
+pub use admission::CaptureAdmissionStorageError;
+mod source_construction;
+pub use source_construction::CaptureSourceConstruction;
 mod text_origin;
 pub use text_origin::CaptureTextOrigin;
 #[cfg(test)]
@@ -452,7 +457,6 @@ impl CapturePlan {
         capabilities: &CaptureCapabilities,
         bounds: CaptureInvocationBounds,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        bounds.maximum()?;
         self.admit_geometry(
             catalog,
             support,
@@ -461,6 +465,43 @@ impl CapturePlan {
             Some(bounds),
             CaptureTextOrigin::default(),
         )
+    }
+
+    /// Copies this borrowed declaration through the closed source-copy worker.
+    /// The caller retains the funding owner until this destination or its failed
+    /// construction has retired. This produces no admission or execution grant.
+    pub fn copy_with_funding(&self, funding: &crate::HostMetadataFunding) -> Result<Self, CaptureError> {
+        admission::allocation::Allocation(Some(funding)).plan(self)
+    }
+
+    /// Admits the same declaration with prospective metadata reservations.
+    /// The caller retains the actual account with the result and any failure;
+    /// source buffers supplied by the caller remain caller-owned until copied.
+    pub fn admit_with_funding(
+        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities, request: CaptureRequestShape,
+        funding: &crate::HostMetadataFunding,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
+        admission::admit_geometry(self,catalog,support,capabilities,request,None,
+            CaptureTextOrigin::default(),admission::allocation::Allocation(Some(funding)))
+    }
+    /// Same funded admission with an exact cached opening origin.
+    pub fn admit_with_text_origin_and_funding(
+        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities, request: CaptureRequestShape,
+        origin: CaptureTextOrigin, funding: &crate::HostMetadataFunding,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
+        admission::admit_geometry(self,catalog,support,capabilities,request,None,
+            origin,admission::allocation::Allocation(Some(funding)))
+    }
+    /// Same funded admission for independent invocation geometry.
+    pub fn admit_invocations_with_funding(
+        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities, bounds: CaptureInvocationBounds,
+        funding: &crate::HostMetadataFunding,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
+        admission::admit_geometry(self,catalog,support,capabilities,bounds.request(),Some(bounds),
+            CaptureTextOrigin::default(),admission::allocation::Allocation(Some(funding)))
     }
 
     fn admit_geometry(
@@ -472,205 +513,7 @@ impl CapturePlan {
         invocation_bounds: Option<CaptureInvocationBounds>,
         text_origin: CaptureTextOrigin,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        revalidation::validate_schema(&self, catalog, support, capabilities)?;
-        if request.batch == 0 || request.prompt_tokens == 0 || request.max_predictions == 0 {
-            return Err(CaptureError::Invalid(
-                "batch, prompt, and prediction limits must be positive".into(),
-            ));
-        }
-        if invocation_bounds.is_none() {
-            // Preserve the legacy zero-origin request check. The additional
-            // origin span uses the last actual prediction, not a phantom decode.
-            add(request.prompt_tokens, request.max_predictions)?;
-            text_origin.validate_request(request)?;
-        } else if text_origin != CaptureTextOrigin::default() {
-            return Err(CaptureError::Invalid(
-                "ordinary text origin cannot replace invocation authority".into(),
-            ));
-        }
-        mul(request.batch, request.prompt_tokens)?;
-        let mut ids = std::collections::BTreeSet::new();
-        let mut points = Vec::new();
-        for selection in &self.selections {
-            if selection.id.is_empty() || !ids.insert(selection.id.as_str()) {
-                return Err(CaptureError::Invalid(
-                    "capture IDs must be nonempty and unique".into(),
-                ));
-            }
-            let point = catalog
-                .get(&selection.path)
-                .ok_or_else(|| CaptureError::MissingPath(selection.path.clone()))?;
-            let sparse = matches!(
-                point.value_type,
-                crate::ObservationValueType::RoutedUnits { .. }
-            );
-            if sparse != matches!(selection.transform, CaptureTransform::RoutedUnits) {
-                return Err(CaptureError::Unsupported(
-                    "routed-unit boundaries require the routed_units transform".into(),
-                ));
-            }
-            if let crate::ObservationValueType::RoutedUnits { geometry, .. } = &point.value_type {
-                geometry.components()?;
-            }
-            revalidation::validate_transform(selection, capabilities)?;
-            if selection.schedule.every == 0
-                || selection
-                    .schedule
-                    .end_prediction
-                    .is_some_and(|end| end <= selection.schedule.first_prediction)
-            {
-                return Err(CaptureError::Invalid("invalid capture schedule".into()));
-            }
-            revalidation::validate_phase_support(selection, support)?;
-            if matches!(selection.transform, CaptureTransform::Slice) && selection.slices.is_empty()
-            {
-                return Err(CaptureError::Invalid(
-                    "slice capture requires an explicit axis slice; use FullTensor to opt in"
-                        .into(),
-                ));
-            }
-            revalidation::validate_histogram(selection, capabilities)?;
-            if let CaptureTransform::TopCandidates { count } = selection.transform {
-                if count == 0
-                    || selection.path != crate::MODEL_LOGITS_OBSERVATION_PATH
-                    || !selection.slices.is_empty()
-                {
-                    return Err(CaptureError::Invalid("candidate capture requires positive count, unsliced model.logits, and single-sequence execution".into()));
-                }
-                if request.batch != 1 {
-                    return Err(CaptureError::Unsupported(
-                        "candidate capture requires batch one".into(),
-                    ));
-                }
-                if let Some(SymbolicDimension::Known(vocabulary)) = point
-                    .axes
-                    .as_ref()
-                    .and_then(|axes| axes.last())
-                    .map(|a| &a.dimension)
-                {
-                    if count > *vocabulary as u64 {
-                        return Err(CaptureError::Invalid(
-                            "candidate count exceeds vocabulary".into(),
-                        ));
-                    }
-                }
-            }
-            if let CaptureTransform::TokenScores { token_ids } = &selection.transform {
-                let unique: std::collections::BTreeSet<_> = token_ids.iter().collect();
-                if token_ids.is_empty()
-                    || token_ids.len() > 64
-                    || unique.len() != token_ids.len()
-                    || selection.path != crate::MODEL_LOGITS_OBSERVATION_PATH
-                    || !selection.slices.is_empty()
-                {
-                    return Err(CaptureError::Invalid(
-                        "token scoring requires 1..=64 unique IDs and unsliced model.logits".into(),
-                    ));
-                }
-                if request.batch != 1 {
-                    return Err(CaptureError::Unsupported(
-                        "token scoring requires batch one".into(),
-                    ));
-                }
-                if let Some(SymbolicDimension::Known(vocabulary)) = point
-                    .axes
-                    .as_ref()
-                    .and_then(|axes| axes.last())
-                    .map(|axis| &axis.dimension)
-                {
-                    if token_ids.iter().any(|id| *id as usize >= *vocabulary) {
-                        return Err(CaptureError::Invalid(
-                            "selected score ID exceeds model vocabulary".into(),
-                        ));
-                    }
-                }
-            }
-            let mut axes = std::collections::BTreeSet::new();
-            for slice in &selection.slices {
-                if slice.stride == 0 || slice.start > slice.end || !axes.insert(&slice.axis) {
-                    return Err(CaptureError::Invalid(
-                        "invalid or duplicate axis slice".into(),
-                    ));
-                }
-                if !point
-                    .axes
-                    .as_ref()
-                    .is_some_and(|axes| axes.iter().any(|axis| axis.name == slice.axis))
-                {
-                    return Err(CaptureError::Invalid(format!(
-                        "unknown axis {}",
-                        slice.axis
-                    )));
-                }
-            }
-            // Resolve every known shape before execution, and defer only genuinely
-            // runtime-dependent dimensions. Unknown never becomes a zero extent.
-            for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
-                let range = if invocation_bounds.is_some() {
-                    selection
-                        .schedule
-                        .count_coordinates(phase, 0, request.max_predictions)?
-                } else {
-                    selection
-                        .schedule
-                        .count_and_last(phase, request.max_predictions)?
-                };
-                if let Some((count, last)) = range {
-                    let first = last - mul(count - 1, selection.schedule.every)?;
-                    for prediction in [first, last] {
-                        for slice in &selection.slices {
-                            let axis = point
-                                .axes
-                                .as_ref()
-                                .and_then(|axes| axes.iter().find(|axis| axis.name == slice.axis))
-                                .expect("axis was validated");
-                            let geometry = match invocation_bounds {
-                                Some(bounds) => bounds.maximum()?,
-                                None => text_origin.invocation_shape(request, phase, prediction)?,
-                            };
-                            if geometry
-                                .extent(&axis.dimension)?
-                                .is_some_and(|extent| slice.end > extent)
-                            {
-                                return Err(CaptureError::Invalid(format!(
-                                    "slice {} exceeds known request extent",
-                                    slice.axis
-                                )));
-                            }
-                        }
-                        let geometry = match invocation_bounds {
-                            Some(bounds) => bounds.maximum()?,
-                            None => text_origin.invocation_shape(request, phase, prediction)?,
-                        };
-                        if let Some(shape) = geometry.resolve(point)? {
-                            resolve_slice(point, selection, &shape)?;
-                        }
-                    }
-                }
-            }
-            points.push(point.clone());
-        }
-        // Identity includes catalog semantics and request shape, not just caller labels.
-        let bytes = match invocation_bounds {
-            Some(bounds) => serde_json::to_vec(&("invocation", &self, &points, bounds)),
-            None if text_origin == CaptureTextOrigin::default() => {
-                serde_json::to_vec(&(&self, &points, request))
-            }
-            None => serde_json::to_vec(&("text_origin", &self, &points, request, text_origin)),
-        }
-        .map_err(|e| CaptureError::Invalid(e.to_string()))?;
-        let identity = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        Ok(AdmittedCapturePlan {
-            plan: self,
-            points,
-            request,
-            invocation_bounds,
-            text_origin,
-            identity,
-        })
+        admission::admit_geometry(self, catalog, support, capabilities, request, invocation_bounds, text_origin, admission::allocation::Allocation(None))
     }
 }
 
@@ -867,12 +710,20 @@ pub fn resolve_slice(
     selection: &CaptureSelection,
     shape: &[u64],
 ) -> Result<ResolvedCaptureSlice, CaptureError> {
+    resolve_slice_with(point, selection, shape, admission::allocation::Allocation(None))
+}
+fn resolve_slice_with(point: &ObservationPoint, selection: &CaptureSelection, shape: &[u64],
+    allocation: admission::allocation::Allocation<'_>) -> Result<ResolvedCaptureSlice, CaptureError> {
     let mut output = ResolvedCaptureSlice {
-        starts: vec![0; shape.len()],
-        ends: shape.to_vec(),
-        strides: vec![1; shape.len()],
-        shape: shape.to_vec(),
+        starts: allocation.vector(shape.len())?,
+        ends: allocation.vector(shape.len())?,
+        strides: allocation.vector(shape.len())?,
+        shape: allocation.vector(shape.len())?,
     };
+    output.starts.resize(shape.len(),0);
+    output.ends.extend_from_slice(shape);
+    output.strides.resize(shape.len(),1);
+    output.shape.extend_from_slice(shape);
     resolve_slice_into(
         point.axes.as_deref(),
         &selection.slices,
@@ -882,7 +733,7 @@ pub fn resolve_slice(
         &mut output.strides,
         &mut output.shape,
     )
-    .map_err(|cause| cause.legacy(&selection.slices))?;
+    .map_err(|cause| cause.legacy_with(&selection.slices, allocation))?;
     Ok(output)
 }
 
@@ -1368,6 +1219,12 @@ impl CaptureReservation for CaptureLedger {
 /// Invalid, unsupported, or oversized capture requests.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CaptureError {
+    /// Fixed prospective declaration-storage refusal.
+    #[error(transparent)]
+    AdmissionStorage(#[from] CaptureAdmissionStorageError),
+    /// Fixed intervention declaration refusal, without allocated diagnostics.
+    #[error(transparent)]
+    Intervention(#[from] crate::intervention::InterventionDeclarationError),
     /// Ordinary error and complete diagnostic storage retained independently of a frame.
     #[error(transparent)]
     Retained(RetainedCaptureError),
@@ -1612,7 +1469,7 @@ pub trait CaptureBackend {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureStepOutcome {
-    /// A low-level caller or older serialized record supplied no transaction evidence.
+    /// A low-level caller supplied no transaction evidence.
     #[default]
     Untracked,
     /// The model forward transaction committed. Subsequent sampling can still fail.
@@ -1627,8 +1484,7 @@ pub enum CaptureStepOutcome {
 /// callback costs are included in end-to-end time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapturedStep {
-    /// Actual model transaction outcome; absence in older records is untracked.
-    #[serde(default)]
+    /// Explicit model transaction outcome, including an untracked low-level call.
     pub outcome: CaptureStepOutcome,
     /// Forward phase that produced these captures.
     pub phase: CapturePhase,

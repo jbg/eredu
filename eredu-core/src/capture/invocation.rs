@@ -61,21 +61,26 @@ impl CaptureAxisError {
         }))
     }
     pub(crate) fn legacy_parts(self, point: Option<(&str, &[crate::TensorAxis])>) -> CaptureError {
+        self.legacy_parts_with(point, super::admission::allocation::Allocation(None))
+    }
+    pub(crate) fn legacy_parts_with(self, point: Option<(&str, &[crate::TensorAxis])>,
+        allocation: super::admission::allocation::Allocation<'_>) -> CaptureError {
+        let result = (|| -> Result<CaptureError, CaptureError> { Ok(
         match self {
             Self::EmptyPredictionRange => {
-                CaptureError::Invalid("empty invocation prediction range".into())
+                CaptureError::Invalid(allocation.text("empty invocation prediction range")?)
             }
             Self::InvocationBounds => CaptureError::Invalid(
-                "invocation exceeds admitted geometry or prediction range".into(),
+                allocation.text("invocation exceeds admitted geometry or prediction range")?,
             ),
-            Self::Empty => CaptureError::Invalid("empty invocation geometry".into()),
+            Self::Empty => CaptureError::Invalid(allocation.text("empty invocation geometry")?),
             Self::Overflow => CaptureError::Overflow,
             Self::RankBound => {
-                CaptureError::Unsupported("capture rank exceeds the 32-axis metadata bound".into())
+                CaptureError::Unsupported(allocation.text("capture rank exceeds the 32-axis metadata bound")?)
             }
-            Self::Rank => CaptureError::Invalid("runtime rank differs from the catalog".into()),
+            Self::Rank => CaptureError::Invalid(allocation.text("runtime rank differs from the catalog")?),
             Self::Context => CaptureError::Unsupported(
-                "selected context axis requires exact invocation context".into(),
+                allocation.text("selected context axis requires exact invocation context")?,
             ),
             Self::Extent {
                 index,
@@ -83,12 +88,15 @@ impl CaptureAxisError {
                 expected,
             } => {
                 let (path, axes) = point.expect("extent diagnostic has declaration");
-                CaptureError::Invalid(format!(
+                CaptureError::Invalid(allocation.format(format_args!(
                     "runtime extent for {}/{} is {actual}, expected {expected} from catalog/request",
                     path, axes[index].name
-                ))
+                ))?)
             }
         }
+        ) })();
+        result.unwrap_or_else(|cause| cause)
+
     }
 }
 impl CaptureInvocationShape {
@@ -111,7 +119,7 @@ impl CaptureInvocationShape {
         }
         Ok(())
     }
-    fn extent_fixed(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureAxisError> {
+    pub(crate) fn extent_fixed(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureAxisError> {
         use CaptureAxisError as E;
         Ok(match dimension {
             SymbolicDimension::Known(n) => Some(u64::try_from(*n).map_err(|_| E::Overflow)?),
@@ -236,14 +244,16 @@ impl CaptureInvocationShape {
     }
     /// Resolves declared axes without materializing a source. Unknown axes stay unknown.
     pub fn resolve(self, point: &ObservationPoint) -> Result<Option<Vec<u64>>, CaptureError> {
-        self.validate()?;
-        let Some(axes) = &point.axes else {
-            return Ok(None);
-        };
-        let mut shape = vec![0; axes.len()];
-        let known = self
-            .resolve_axes_into(axes, &mut shape)
-            .map_err(|cause| cause.legacy(Some(point)))?;
+        self.resolve_with(point, super::admission::allocation::Allocation(None))
+    }
+    pub(crate) fn resolve_with(self, point: &ObservationPoint,
+        allocation: super::admission::allocation::Allocation<'_>) -> Result<Option<Vec<u64>>, CaptureError> {
+        self.validate_fixed().map_err(|cause|cause.legacy_parts_with(None,allocation))?;
+        let Some(axes) = &point.axes else { return Ok(None); };
+        let mut shape = allocation.vector(axes.len())?;
+        shape.resize(axes.len(),0);
+        let known = self.resolve_axes_into(axes, &mut shape)
+            .map_err(|cause|cause.legacy_parts_with(Some((&point.path,axes)),allocation))?;
         Ok(known.then_some(shape))
     }
 }
@@ -323,7 +333,7 @@ impl CaptureInvocationBounds {
     pub fn maximum(self) -> Result<CaptureInvocationShape, CaptureError> {
         self.maximum_fixed().map_err(|cause| cause.legacy(None))
     }
-    fn maximum_fixed(self) -> Result<CaptureInvocationShape, CaptureAxisError> {
+    pub(crate) fn maximum_fixed(self) -> Result<CaptureInvocationShape, CaptureAxisError> {
         if self.max_predictions == 0 {
             return Err(CaptureAxisError::EmptyPredictionRange);
         }

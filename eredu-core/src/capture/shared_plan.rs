@@ -15,6 +15,8 @@ use std::{
 struct Inner {
     // Automatic field retirement destroys all nested plan payload before custody.
     plan: AdmittedCapturePlan,
+    // Only the closed limit-revision compiler installs this exact source alias.
+    predecessor: Option<SharedCapturePlan>,
     #[cfg(test)]
     retired: Option<tests::PayloadRetired>,
     custody: SharedStorageCustody,
@@ -45,8 +47,10 @@ impl PlanOwner {
 }
 impl Drop for PlanOwner {
     fn drop(&mut self) {
-        if let Some(owner) = self.0.take() {
-            if let Some(inner) = Arc::into_inner(owner) {
+        let mut pending = self.0.take().map(|owner| PlanOwner(Some(owner)));
+        while let Some(mut tail) = pending.take() {
+            if let Some(mut inner) = Arc::into_inner(tail.0.take().expect("live capture source")) {
+                pending = inner.predecessor.take().map(|source| source.0);
                 // All strong exits consume their Arc; no Weak/raw owner escapes.
                 // Arc/control deallocation precedes payload, attachment Vec and
                 // finally ordinary custody retirement.
@@ -92,6 +96,7 @@ impl SharedCapturePlan {
     pub fn new(plan: AdmittedCapturePlan) -> Self {
         Self(PlanOwner(Some(Arc::new(Inner {
             plan,
+            predecessor: None,
             #[cfg(test)]
             retired: None,
             custody: SharedStorageCustody::new(),
@@ -103,9 +108,11 @@ impl SharedCapturePlan {
         }))))
     }
 
-    pub(super) fn from_prepared_copy(plan: AdmittedCapturePlan, host: HostPreparationAuthority) -> Self {
+    pub(super) fn from_prepared_copy(plan: AdmittedCapturePlan, host: HostPreparationAuthority,
+        predecessor: Option<SharedCapturePlan>) -> Self {
         Self(PlanOwner(Some(Arc::new(Inner {
             plan,
+            predecessor,
             #[cfg(test)] retired: None,
             custody: SharedStorageCustody::new(),
             #[cfg(test)] shell_retired: None,
@@ -119,8 +126,8 @@ impl SharedCapturePlan {
     }
 
     /// Concrete storage added when an already priced admitted payload moves
-    /// into this owner: outer Arc/control/custody plus its independent identity
-    /// Arc. The inline admitted payload is excluded because capacity_bytes and
+    /// into this owner: outer Arc/control/custody with an inline identity key.
+    /// The inline admitted payload is excluded because capacity_bytes and
     /// existing ordinary checkpoint plans already count it. Attachments and
     /// allocator overhead remain separate; this is not a construction grant.
     pub fn new_owner_control_bytes() -> Option<u64> {
@@ -129,8 +136,7 @@ impl SharedCapturePlan {
         let bytes = outer
             .pad_to_align()
             .size()
-            .checked_sub(std::mem::size_of::<AdmittedCapturePlan>())?
-            .checked_add(header.size())?;
+            .checked_sub(std::mem::size_of::<AdmittedCapturePlan>())?;
         u64::try_from(bytes).ok()
     }
 
@@ -184,6 +190,18 @@ impl SharedCapturePlan {
             self.0 .0.as_ref().expect("live source"),
             other.0 .0.as_ref().expect("live source"),
         )
+    }
+
+    /// This owner was built by the checked limit-revision compiler from this
+    /// exact predecessor. Equal declarations or digests provide no such proof.
+    pub fn is_limit_revision_of(&self, source: &Self) -> bool {
+        self.0.get().predecessor.as_ref().is_some_and(|parent| parent.same_storage(source))
+    }
+
+    /// Exact predecessor retained by the closed limit-revision compiler.
+    /// This borrow supplies source lineage, never publication or execution credit.
+    pub fn limit_revision_source(&self) -> Option<&Self> {
+        self.0.get().predecessor.as_ref()
     }
 
     /// Complete retained plan payload, including inline DTOs and spare capacity.
@@ -271,6 +289,12 @@ impl SharedCapturePlan {
     }
 }
 
+impl std::ops::Deref for SharedCapturePlan {
+    type Target = AdmittedCapturePlan;
+    fn deref(&self) -> &Self::Target {
+        self.admission()
+    }
+}
 impl AsRef<AdmittedCapturePlan> for SharedCapturePlan {
     fn as_ref(&self) -> &AdmittedCapturePlan {
         self.admission()

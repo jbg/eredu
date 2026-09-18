@@ -5,8 +5,8 @@ use crate::backend::runtime::distributed::group::LogicalPackedWorldPlan;
 use safemlx::{Array,Dtype,distributed::{GroupWorkerOperation,
     GroupCpuLayoutStorage,GroupCpuCompletionStorage,GroupCpuCompletionLayoutStorage,
     OwnedGroupCpuCompletionLayoutStorage}};
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,parts:&[usize])->Result<(),Error>{
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,parts:&[usize])->Result<(),Error>{
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
@@ -42,7 +42,7 @@ pub(crate) struct OwnedPackedWorldSource {
     order:usize,
     backing:usize,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalParallelSource {
     pub(crate) fn packed_world_completion(&self,order:usize,shape:&[i32],dtype:Dtype)->Result<OwnedPackedWorldCompletion,Error>{

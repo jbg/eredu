@@ -186,15 +186,7 @@ pub(super) struct MemberSource<'a> {
     rows: eredu_nn::LinearRowLayout,
 }
 impl<'a> MemberSource<'a> {
-    pub(super) fn ordinary(value: &'a ParameterMetadata) -> Self {
-        Self {
-            id: value.id.as_str(),
-            companion: value.linear_companion,
-            primary: value.linear_companion_of.as_ref().map(|id| id.as_str()),
-            rows: value.linear_row_layout,
-        }
-    }
-    fn borrowed(value: ParameterMetadataView<'a>) -> Self {
+    pub(super) fn borrowed(value: ParameterMetadataView<'a>) -> Self {
         Self {
             id: value.id().as_str(),
             companion: value.linear_companion(),
@@ -208,6 +200,9 @@ pub(super) trait Destination: Copy {
     fn vector<T>(self, count: usize) -> Result<Vec<T>, Self::Error>;
     fn string(self, args: std::fmt::Arguments<'_>) -> Result<String, Self::Error>;
     fn invalid_tensor(self, args: std::fmt::Arguments<'_>) -> Self::Error;
+    fn invalid_group(self, args: std::fmt::Arguments<'_>) -> Self::Error;
+    fn controls<T>(self) -> Result<(), Self::Error>;
+    fn value_controls<T>(self, _: &T) -> Result<(), Self::Error> { self.controls::<T>() }
     fn issue(self, cause: GroupIssue<'_>) -> Self::Error;
     fn overflow(self) -> Self::Error;
 }
@@ -224,6 +219,8 @@ impl Destination for Ordinary {
     fn invalid_tensor(self, args: std::fmt::Arguments<'_>) -> Self::Error {
         ParallelPlanError::InvalidTensor(args.to_string())
     }
+    fn invalid_group(self,args:std::fmt::Arguments<'_>)->Self::Error {ParallelPlanError::InvalidGroup(args.to_string())}
+    fn controls<T>(self)->Result<(),Self::Error>{Ok(())}
     fn issue(self, cause: GroupIssue<'_>) -> Self::Error {
         cause.ordinary()
     }
@@ -232,7 +229,7 @@ impl Destination for Ordinary {
     }
 }
 #[derive(Clone, Copy)]
-struct Checked<'a>(&'a WorkspaceContext);
+pub(super) struct Checked<'a>(pub(super) &'a WorkspaceContext);
 impl Destination for Checked<'_> {
     type Error = eredu_nn::Error;
     fn vector<T>(self, count: usize) -> Result<Vec<T>, Self::Error> {
@@ -243,6 +240,12 @@ impl Destination for Checked<'_> {
     }
     fn invalid_tensor(self, args: std::fmt::Arguments<'_>) -> Self::Error {
         self.0.metadata_error(args)
+    }
+    fn invalid_group(self,args:std::fmt::Arguments<'_>)->Self::Error {self.0.metadata_error(args)}
+    fn controls<T>(self)->Result<(),Self::Error>{
+        let sizes=[size_of::<T>(),size_of::<Self>(),size_of::<Result<T,Self::Error>>()];
+        let bytes=sizes.into_iter().try_fold(size_of_val(&sizes),usize::checked_add).ok_or(WorkspaceMetadataError::Overflow)?;
+        self.0.charge_metadata(bytes)?; Ok(())
     }
     fn issue(self, cause: GroupIssue<'_>) -> Self::Error {
         self.0.metadata_error(format_args!("{cause}"))

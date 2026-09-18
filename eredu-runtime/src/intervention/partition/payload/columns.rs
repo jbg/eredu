@@ -6,7 +6,7 @@ impl PreparedWindowInterventionPayload {
     /// This is a host source constructor; callers still validate global/local
     /// slices, original plan identity and the real native invocation.
     pub fn prepare_columns(action: &InterventionAction, coordinates: &ComponentCoordinateMap,
-        funding: WorkspaceMetadataFunding) -> Result<Self, PreparedWindowInterventionPayloadError> {
+        funding: HostMetadataFunding) -> Result<Self, PreparedWindowInterventionPayloadError> {
         let result: Result<InterventionAction, Cause> = (|| {
             funding.reserve_metadata(Self::column_control_bytes().ok_or(WindowInterventionPayloadError::Overflow)?)?;
             let indices = match action {
@@ -36,9 +36,11 @@ impl PreparedWindowInterventionPayload {
     /// metadata_vec layouts from the retained source lengths before allocation.
     pub fn column_control_bytes() -> Option<usize> {
         let frames = [Self::control_bytes()?, ComponentIndexProjectionPlan::control_bytes()?,
-            size_of::<(&InterventionAction, &ComponentCoordinateMap, WorkspaceMetadataFunding)>(),
+            size_of::<(&InterventionAction, &ComponentCoordinateMap, HostMetadataFunding)>(),
             size_of::<Result<InterventionAction, Cause>>(), size_of::<Vec<(u32, usize)>>(), size_of::<Vec<u32>>(),
             size_of::<Result<Vec<(u32, usize)>, eredu_nn::Error>>(), size_of::<Result<Vec<u32>, eredu_nn::Error>>()];
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

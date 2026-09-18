@@ -129,6 +129,13 @@ fn attempt_preparation(
         "no ordinary inspection owner"
     );
     let Some(error) = error else {
+        // Native source families retire their host owners through the unlocked
+        // reclaimer even when admission stopped before any GPU submission.
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+            safemlx::reclaim_allocation_owners();
+            pool.used_bytes().unwrap() == used
+        });
         assert_eq!(
             pool.used_bytes().unwrap(),
             used,
@@ -347,7 +354,7 @@ fn request_facts_matrix(extended: bool) {
                         max_output_tokens: 3,
                         prefill_chunk_positions: 2,
                         output: eredu_core::OutputDemand::LastPosition,
-                    })
+                    }, &pool)
                     .unwrap();
             });
             assert!(roots.is_empty());
@@ -453,7 +460,6 @@ fn request_facts_matrix(extended: bool) {
                 .original_request_media_binding()
                 .unwrap();
             for manual in [false, true] {
-                eprintln!("media admission case: conditional={conditional}, residency={mode}, controlled={manual}, extended={extended}");
                 if let Some(refusal) =
                     attempt_preparation(&mut runtime, prompt.clone(), manual, None)
                 {

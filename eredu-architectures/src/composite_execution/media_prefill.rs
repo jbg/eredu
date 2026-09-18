@@ -28,79 +28,28 @@ where
     }
     fn validate_ingress_cache_identity(
         plan: &Self::IngressPlan,
-        identity: &eredu_runtime::SharedPreparedInputCacheIdentity,
-    ) -> Result<(), Self::Error> {
+        identity: &eredu_runtime::SharedPreparedInputCacheIdentity, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Self::Error> {
         if identity.prepared() != A::prepared_ingress_input(plan).prepared().identity() {
-            return Err(A::ingress_error(MediaIngressError::ForeignIdentity));
+            return Err(A::ingress_error(MediaIngressError::ForeignIdentity, metadata_context));
         }
         Ok(())
     }
-    fn validate_ingress_cache_identity_with_metadata(
-        plan: &Self::IngressPlan,
-        identity: &eredu_runtime::SharedPreparedInputCacheIdentity,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<(), Self::Error> {
-        if identity.prepared() != A::prepared_ingress_input(plan).prepared().identity() {
-            return Err(A::ingress_error_with_metadata(
-                MediaIngressError::ForeignIdentity,
-                context,
-            ));
-        }
-        Ok(())
-    }
-    fn ingress_execution_graph(
-        &self,
-    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+
+    fn ingress_execution_graph(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         match &self.prepared_graph {
-            PreparedCompositeGraph::Validated(selected) => {
-                Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
-                    selected.requirements().execution_graph(),
-                ))
-            }
-            PreparedCompositeGraph::Invalidated => {
-                Err(A::ingress_error(MediaIngressError::ForeignGraph))
-            }
-            PreparedCompositeGraph::Unprepared => self.inner.ingress_execution_graph(),
+            PreparedCompositeGraph::Validated(selected) => Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(selected.requirements().execution_graph())),
+            PreparedCompositeGraph::Invalidated => Err(A::ingress_error(MediaIngressError::ForeignGraph, context)),
+            PreparedCompositeGraph::Unprepared => self.inner.ingress_execution_graph(context),
         }
     }
-    fn ingress_execution_graph_with_metadata(
-        &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
-        match &self.prepared_graph {
-            PreparedCompositeGraph::Validated(selected) => {
-                Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
-                    selected.requirements().execution_graph(),
-                ))
-            }
-            PreparedCompositeGraph::Invalidated => Err(A::ingress_error_with_metadata(
-                MediaIngressError::ForeignGraph,
-                context,
-            )),
-            PreparedCompositeGraph::Unprepared => {
-                self.inner.ingress_execution_graph_with_metadata(context)
-            }
-        }
+
+
+    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Self::Error> {
+        self.inner.validate_ingress_plan(plan, metadata_context)
     }
-    fn validate_ingress_plan_with_metadata(
-        &self,
-        plan: &Self::IngressPlan,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .validate_ingress_plan_with_metadata(plan, context)
-    }
-    fn ingress_error_with_metadata(
-        error: MediaIngressError,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Self::Error {
-        A::ingress_error_with_metadata(error, context)
-    }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan) -> Result<(), Self::Error> {
-        self.inner.validate_ingress_plan(plan)
-    }
-    fn ingress_error(error: MediaIngressError) -> Self::Error {
-        A::ingress_error(error)
+    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Self::Error {
+        A::ingress_error(error, metadata_context)
     }
 
     fn begin_ingress(
@@ -240,7 +189,7 @@ where
         B: NeuralBackend<Tensor = eredu_nn::workspace::WorkspaceTensor>,
         Self: CompositeArchitecture<B, S, Error = eredu_nn::Error>,
     {
-        Err(input.reject(eredu_nn::Error::backend_source(
+        Err(input.reject(eredu_nn::Error::backend_retained_source(
             MediaIngressError::ForeignIdentity,
         )))
     }
@@ -271,11 +220,25 @@ where
         tensor_partitions: usize,
         pipeline_stages: usize,
     ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String>;
+    /// The same encoder-wave producer with prospective metadata funding.
+    fn media_group_collective_waves_with_metadata(
+        &self,_plan:&Self::IngressPlan,_group:usize,_tensor_partitions:usize,_pipeline_stages:usize,
+        _context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<Vec<CompositeTensorCollective>>>,eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
     /// Exact segmented embedding lookup waves for this decoder interval.
     fn media_primary_ingress_collectives(
         &self,
         plan: &Self::IngressPlan,
         span: &eredu_runtime::prefill::PrefillChunk,
         tensor_partitions: usize,
-    ) -> Result<Option<Vec<CompositeTensorCollective>>, String>;
+    ) -> Result<Option<Vec<CompositeTensorCollective>>, String>;    /// The same segmented lookup producer with prospective metadata funding.
+    fn media_primary_ingress_collectives_with_metadata(
+        &self,_plan:&Self::IngressPlan,_span:&eredu_runtime::prefill::PrefillChunk,_tensor_partitions:usize,
+        _context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<CompositeTensorCollective>>,eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
 }

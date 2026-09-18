@@ -3,22 +3,22 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    api::{RegexExt, SkipSpec},
-    HashMap,
+use crate::api::{RegexExt, SkipSpec};
+use crate::earley::{
+    PreparedLexer,
+    regexvec::{LexemeSet, prepared::PreparedRegexVector},
 };
-use anyhow::{anyhow, bail, Result};
-use derivre::RegexAst;
-use serde::de;
-use serde_json::{Deserializer, Value};
-use toktrie::bytes::limit_str;
+use derivre::{ParserAllocationFunding, RegexAst, SourceHashMap as HashMap};
+use derivre::{
+    ParserError, ParserResult as Result, parser_bail as bail, parser_ensure as ensure,
+    parser_error as anyhow,
+};
+use serde_json::Value;
+use toktrie::TokenMaskConstructionPlan;
 
 use crate::{
     api::ParserLimits,
-    earley::{
-        lexer::{Lexer, LexerResult},
-        lexerspec::LexerSpec,
-    },
+    earley::{lexer::LexerResult, lexerspec::LexerSpec},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,19 +100,32 @@ pub enum LexemeValue {
     Regex(RegexExt),
 }
 
-impl LexemeValue {
-    pub fn get_string(&self) -> Result<String> {
-        match self {
-            LexemeValue::String(s) => Ok(s.clone()),
-            _ => bail!("expected string, got JSON"),
-        }
-    }
-}
-
 impl Display for LexemeValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LexemeValue::String(s) => write!(f, "{:?}", limit_str(s, 100)),
+            LexemeValue::String(s) => {
+                use std::fmt::Write;
+                f.write_char('"')?;
+                for chunk in s.as_bytes()[..s.len().min(100)].utf8_chunks() {
+                    for ch in chunk
+                        .valid()
+                        .chars()
+                        .chain((!chunk.invalid().is_empty()).then_some('\u{fffd}'))
+                    {
+                        if ch == '\'' {
+                            f.write_char(ch)?;
+                        } else {
+                            for ch in ch.escape_debug() {
+                                f.write_char(ch)?;
+                            }
+                        }
+                    }
+                }
+                if s.len() > 100 {
+                    f.write_str("...")?;
+                }
+                f.write_char('"')
+            }
             _ => write!(f, "{{ ...json... }}"),
         }
     }
@@ -143,43 +156,58 @@ pub struct Location {
     pub line: usize,
     pub column: usize,
     pub src: Rc<String>,
+    pub funding: ParserAllocationFunding,
 }
 
-pub(crate) fn highlight_location(src: &str, line_no: usize, col_no: usize) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let start = line_no.saturating_sub(3); // 2 lines before
-    let end = (line_no + 2).min(lines.len());
-
-    let mut result = String::new();
-
-    for (i, &line) in lines[start..end].iter().enumerate() {
-        let actual_line = start + i + 1;
-        result.push_str(&format!("{actual_line:>4} | {line}\n"));
-        if actual_line == line_no {
-            let prefix_len = format!("{actual_line:>4} | ").len();
-            let marker = " ".repeat(prefix_len + col_no.saturating_sub(1)) + "^";
-            result.push_str(&format!("{marker}\n"));
-        }
+pub(crate) struct HighlightLocation<'a> {
+    source: &'a str,
+    line: usize,
+    column: usize,
+}
+pub(crate) fn highlight_location(
+    source: &str,
+    line: usize,
+    column: usize,
+) -> HighlightLocation<'_> {
+    HighlightLocation {
+        source,
+        line,
+        column,
     }
-
-    result
+}
+impl Display for HighlightLocation<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let start = self.line.saturating_sub(3);
+        let count = self.line.saturating_add(2).saturating_sub(start);
+        for (index, line) in self.source.lines().enumerate().skip(start).take(count) {
+            let actual = index + 1;
+            writeln!(output, "{actual:>4} | {line}")?;
+            if actual == self.line {
+                let digits = actual.checked_ilog10().unwrap_or(0) as usize + 1;
+                let width = digits
+                    .max(4)
+                    .saturating_add(3)
+                    .saturating_add(self.column.saturating_sub(1));
+                writeln!(output, "{:width$}^", "")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Location {
-    pub fn augment(&self, err: impl Display) -> anyhow::Error {
-        let err = err.to_string();
-        if err.starts_with("at ") {
-            // don't add more location info
-            anyhow::anyhow!("{err}")
-        } else {
-            anyhow::anyhow!(
-                "at {}({}): {}\n{}",
-                self.line,
-                self.column,
-                err,
-                highlight_location(&self.src, self.line, self.column)
-            )
+    pub fn augment(&self, error: ParserError) -> ParserError {
+        if crate::earley::is_grammar_storage_failure(&error) {
+            return error;
         }
+        error.annotate(
+            format_args!("at {}({}): ", self.line, self.column),
+            format_args!(
+                "\n{}",
+                highlight_location(&self.src, self.line, self.column)
+            ),
+            &self.funding,
+        )
     }
 }
 
@@ -232,36 +260,67 @@ impl Token {
     ];
 }
 
-pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
-    let comment_or_ws = r"((#|//)[^\n]*)|[ \t]+".to_string();
-    let mut spec = LexerSpec::new().unwrap();
-    let cls = spec
-        .setup_lexeme_class_with_skip(SkipSpec::unbounded(RegexAst::Regex(comment_or_ws)))
-        .unwrap();
+pub fn lex_lark(input: &str, funding: &ParserAllocationFunding) -> Result<Vec<Lexeme>> {
+    let reserve = |bytes| funding.reserve(bytes);
+    let comment_or_ws = funding.try_copy_str(r"((#|//)[^\n]*)|[ \t]+")?;
+    let mut spec = LexerSpec::new(funding.clone())?;
+    let cls =
+        spec.setup_lexeme_class_with_skip(SkipSpec::unbounded(RegexAst::Regex(comment_or_ws)))?;
     let mut lexeme_idx_to_token = HashMap::default();
-    lexeme_idx_to_token.insert(spec.skip_id(cls), Token::SKIP);
+    funding.try_insert(&mut lexeme_idx_to_token, spec.skip_id(cls), Token::SKIP)?;
     for (token, literal) in Token::LITERAL_TOKENS {
-        let l = spec
-            .add_simple_literal(format!("{token:?}"), literal, false)
-            .unwrap();
-        lexeme_idx_to_token.insert(l, *token);
+        let l = spec.add_simple_literal(
+            funding.try_format(format_args!("{token:?}"))?,
+            literal,
+            false,
+        )?;
+        funding.try_insert(&mut lexeme_idx_to_token, l, *token)?;
     }
     for (token, regexp) in Token::REGEX_TOKENS {
-        let l = spec
-            .add_greedy_lexeme(
-                format!("{token:?}"),
-                RegexAst::Regex(regexp.to_string()),
-                false,
-                None,
-                usize::MAX,
-            )
-            .unwrap();
-        lexeme_idx_to_token.insert(l, *token);
+        let l = spec.add_greedy_lexeme(
+            funding.try_format(format_args!("{token:?}"))?,
+            RegexAst::Regex(funding.try_copy_str(regexp)?),
+            false,
+            None,
+            usize::MAX,
+        )?;
+        funding.try_insert(&mut lexeme_idx_to_token, l, *token)?;
     }
     let mut limits = ParserLimits::default();
-    let mut lexer = Lexer::from(&spec, &mut limits, false).unwrap();
-    let all_lexemes = spec.all_lexemes();
-    let state0 = lexer.start_state(&all_lexemes);
+    funding.reserve(
+        LexerSpec::root_source_inspection_control_bytes()
+            .ok_or_else(|| funding.storage_overflow())?,
+    )?;
+    let root_plan = spec
+        .root_source_plan()
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    funding.reserve(root_plan.requirements().required_bytes())?;
+    let roots = root_plan
+        .compile()
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    let mask_plan = TokenMaskConstructionPlan::zeroed(spec.lexemes.len())
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    funding.reserve(mask_plan.requirements().required_bytes())?;
+    let mut mask = mask_plan
+        .compile()
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    mask.set_all(true);
+    let all_lexemes = LexemeSet::from_owned_vob(mask);
+    let input_source = roots
+        .ordinary(spec.regex_builder.into_exprset())
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    let vector = PreparedRegexVector::prepare_with_backing(
+        input_source,
+        &mut limits,
+        Some(funding.clone()),
+        &reserve,
+    )
+    .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    let mut lexer = PreparedLexer::prepare(vector, &reserve)
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
+    let state0 = lexer
+        .start_state(&all_lexemes, &reserve)
+        .map_err(|error| derivre::ParserError::cause(error, funding))?;
     let mut line_no = 1;
     let mut column_no = 1;
     let mut curr_lexeme = Lexeme {
@@ -274,7 +333,7 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
     let mut lexemes = Vec::new();
     let mut start_idx = 0;
 
-    let input = format!("{input}\n");
+    let input = funding.try_format(format_args!("{input}\n"))?;
     let input_bytes = input.as_bytes();
 
     let mut idx = 0;
@@ -282,15 +341,20 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
     while idx <= input_bytes.len() {
         let mut b = b'\n';
         let res = if idx == input_bytes.len() {
-            lexer.try_lexeme_end(state)
+            lexer
+                .try_lexeme_end(state, &reserve)
+                .map_err(|error| derivre::ParserError::cause(error, funding))?
         } else {
             b = input_bytes[idx];
-            lexer.advance(state, b, false)
+            lexer
+                .advance(state, b, &reserve)
+                .map_err(|error| derivre::ParserError::cause(error, funding))?
         };
 
         match res {
             LexerResult::Error => {
                 bail!(
+                    funding,
                     "{}({}): lexer error\n{}",
                     line_no,
                     column_no,
@@ -299,6 +363,7 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
             }
             LexerResult::SpecialToken(_) => {
                 bail!(
+                    funding,
                     "{}({}): lexer special token\n{}",
                     line_no,
                     column_no,
@@ -310,7 +375,13 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
             }
             LexerResult::Lexeme(p) => {
                 let transition_byte = if p.byte_next_row { p.byte } else { None };
-                let lx_idx = lexer.lexemes_from_idx(p.idx).first().unwrap();
+                let lx_idx = crate::earley::lexer::matching(&spec.lexemes, p.idx, |state| {
+                    lexer.vector().state_desc(state)
+                })
+                .and_then(|matches| matches.first())
+                .ok_or_else(|| {
+                    anyhow!(funding, "fixed Lark lexical source has no matching token")
+                })?;
 
                 let token = lexeme_idx_to_token[&lx_idx];
                 curr_lexeme.token = token;
@@ -328,12 +399,10 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
                 {
                     let inp_slice = &input_bytes[end_idx..];
                     let (lexeme_value, n_bytes) = if token == Token::KwRegex {
-                        let (v, n) = parse_json_prefix(inp_slice)
-                            .map_err(|e| anyhow!("failed to parse %regex: {}", e))?;
+                        let (v, n) = super::json_value::parse_regex(inp_slice, funding)?;
                         (LexemeValue::Regex(v), n)
                     } else {
-                        let (v, n) = parse_json_prefix(inp_slice)
-                            .map_err(|e| anyhow!("failed to parse {:?}: {}", raw_value, e))?;
+                        let (v, n) = super::json_value::parse(inp_slice, funding)?;
                         (LexemeValue::Json(v), n)
                     };
 
@@ -352,7 +421,7 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
                     b = input_bytes[idx];
                     lexeme_value
                 } else {
-                    LexemeValue::String(raw_value.to_string())
+                    LexemeValue::String(funding.try_copy_str(raw_value)?)
                 };
 
                 start_idx = end_idx;
@@ -360,11 +429,15 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
                 // println!("lex: {:?}", curr_lexeme);
 
                 if curr_lexeme.token != Token::SKIP {
-                    lexemes.push(curr_lexeme.take());
+                    funding.try_push(&mut lexemes, curr_lexeme.take())?;
                 }
 
-                state = lexer.start_state(&all_lexemes);
-                state = lexer.transition_start_state(state, transition_byte);
+                state = lexer
+                    .start_state(&all_lexemes, &reserve)
+                    .map_err(|error| derivre::ParserError::cause(error, funding))?;
+                state = lexer
+                    .transition_start_state(state, transition_byte, &reserve)
+                    .map_err(|error| derivre::ParserError::cause(error, funding))?;
 
                 curr_lexeme.line = line_no;
                 curr_lexeme.column = column_no;
@@ -383,21 +456,16 @@ pub fn lex_lark(input: &str) -> Result<Vec<Lexeme>> {
     Ok(lexemes)
 }
 
-fn parse_json_prefix<'de, T>(data: &[u8]) -> Result<(T, usize)>
-where
-    T: de::Deserialize<'de>,
-{
-    let cursor = std::io::Cursor::new(data);
-    let mut stream = Deserializer::from_reader(cursor).into_iter::<T>();
-    if let Some(result) = stream.next() {
-        match result {
-            Ok(v) => {
-                let bytes_read = stream.byte_offset();
-                Ok((v, bytes_read))
-            }
-            Err(e) => Err(e.into()),
-        }
-    } else {
-        Err(anyhow::anyhow!("empty json"))
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn highlights_keep_two_context_lines_and_unicode_source_text() {
+        let source = "one\ntwø\nthree\nfour\nfive\nsix";
+        assert_eq!(format!("{}", highlight_location(source, 1, 2)),
+            "   1 | one\n        ^\n   2 | twø\n   3 | three\n");
+        assert_eq!(format!("{}", highlight_location(source, 6, 1)),
+            "   4 | four\n   5 | five\n   6 | six\n       ^\n");
     }
 }

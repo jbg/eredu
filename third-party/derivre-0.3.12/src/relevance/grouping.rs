@@ -2,10 +2,11 @@
 pub(crate) mod storage;
 use super::SymRes;
 use crate::{
-    HashMap,
+    SourceHashMap as HashMap,
+    ParserAllocationFunding,
     ast::{ExprRef, ExprSet},
 };
-use std::convert::Infallible;
+use crate::ParserError as ConstructionError;
 
 pub(crate) trait Memory {
     type Error;
@@ -84,22 +85,23 @@ pub(crate) fn simplify<C: Combine, M: Memory<Error = C::Error>>(
     super::swap_each(&mut grouped);
     Ok(grouped)
 }
-#[derive(Default)]
 struct OrdinaryMemory {
+    funding: ParserAllocationFunding,
     index: HashMap<ExprRef, usize>,
     groups: Vec<(ExprRef, Vec<ExprRef>)>,
 }
 impl Memory for OrdinaryMemory {
-    type Error = Infallible;
-    fn begin(&mut self) -> Result<(), Infallible> {
-        *self = Self::default();
+    type Error = ConstructionError;
+    fn begin(&mut self) -> Result<(), ConstructionError> {
+        self.index.clear();
+        self.groups.clear();
         Ok(())
     }
     fn get(&self, key: ExprRef) -> Option<usize> {
         self.index.get(&key).copied()
     }
-    fn index(&mut self, key: ExprRef, index: usize) -> Result<(), Infallible> {
-        self.index.insert(key, index);
+    fn index(&mut self, key: ExprRef, index: usize) -> Result<(), ConstructionError> {
+        self.funding.try_insert(&mut self.index, key, index)?;
         Ok(())
     }
     fn clear_index(&mut self) {
@@ -108,12 +110,14 @@ impl Memory for OrdinaryMemory {
     fn groups(&self) -> usize {
         self.groups.len()
     }
-    fn add_group(&mut self, key: ExprRef, value: ExprRef) -> Result<(), Infallible> {
-        self.groups.push((key, vec![value]));
+    fn add_group(&mut self, key: ExprRef, value: ExprRef) -> Result<(), ConstructionError> {
+        let mut group = Vec::new();
+        self.funding.try_push(&mut group, value)?;
+        self.funding.try_push(&mut self.groups, (key, group))?;
         Ok(())
     }
-    fn append(&mut self, index: usize, value: ExprRef) -> Result<(), Infallible> {
-        self.groups[index].1.push(value);
+    fn append(&mut self, index: usize, value: ExprRef) -> Result<(), ConstructionError> {
+        self.funding.try_push(&mut self.groups[index].1, value)?;
         Ok(())
     }
     fn group(&mut self, index: usize) -> (ExprRef, &mut Vec<ExprRef>) {
@@ -123,32 +127,32 @@ impl Memory for OrdinaryMemory {
     fn release_group(&mut self, index: usize) {
         drop(std::mem::take(&mut self.groups[index].1));
     }
-    fn output(&mut self, count: usize) -> Result<SymRes, Infallible> {
-        Ok(Vec::with_capacity(count))
+    fn output(&mut self, count: usize) -> Result<SymRes, ConstructionError> {
+        let mut output = Vec::new();
+        self.funding.try_grow_vec(&mut output, count)?;
+        Ok(output)
     }
-    fn push(&mut self, out: &mut SymRes, value: (ExprRef, ExprRef)) -> Result<(), Infallible> {
-        out.push(value);
+    fn push(&mut self, out: &mut SymRes, value: (ExprRef, ExprRef)) -> Result<(), ConstructionError> {
+        self.funding.try_push(out, value)?;
         Ok(())
     }
     fn retire_input(&mut self, _input: SymRes) {}
 }
 struct Ordinary<'a>(&'a mut ExprSet);
 impl Combine for Ordinary<'_> {
-    type Error = Infallible;
-    fn pay(&mut self, amount: usize) -> Result<(), Infallible> {
-        self.0.pay(amount);
+    type Error = ConstructionError;
+    fn pay(&mut self, amount: usize) -> Result<(), ConstructionError> {
+        self.0.pay_prepared(amount)?;
         Ok(())
     }
-    fn regex(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_or(args))
+    fn regex(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_or(args)?)
     }
-    fn selectors(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_byte_set_or(args))
+    fn selectors(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_byte_set_or(args)?)
     }
 }
-pub(super) fn ordinary_simplify(source: &mut ExprSet, input: SymRes) -> SymRes {
-    match simplify(input, &mut OrdinaryMemory::default(), &mut Ordinary(source)) {
-        Ok(result) => result,
-        Err(never) => match never {},
-    }
+pub(super) fn ordinary_simplify(source: &mut ExprSet, input: SymRes) -> crate::ParserResult<SymRes> {
+    let mut memory = OrdinaryMemory { funding: source.construction_funding()?.clone(), index: HashMap::default(), groups: Vec::new() };
+    simplify(input, &mut memory, &mut Ordinary(source))
 }

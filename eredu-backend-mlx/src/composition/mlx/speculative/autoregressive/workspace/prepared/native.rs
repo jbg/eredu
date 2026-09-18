@@ -82,12 +82,49 @@ fn failure(cause: Cause, role: &OriginalSpeculativeRole) -> Error {
     )
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("original speculative role {ordinal} {invocation:?} ({spans} spans; physical/graph/record/controls={bytes:?}, live pool bytes={pool_used:?}): {cause}")]
+struct RoleAdmissionFailure {
+    #[source]
+    cause: eredu_runtime::working_memory::SpeculativeRequestError,
+    invocation: AutoregressiveInvocation,
+    ordinal: usize,
+    spans: usize,
+    bytes: [u64; 4],
+    pool_used: Option<u64>,
+}
+
+fn reserve_role(
+    sources: &AutoregressiveSourcePair,
+    claim: AutoregressiveOccurrenceClaim<'_>,
+    requirements: SpeculativeInvocationRequirements,
+    spans: usize,
+    funding: &HostMetadataFunding,
+) -> Result<OriginalSpeculativeRole, Error> {
+    funding.reserve_metadata(size_of::<(
+        RoleAdmissionFailure,
+        Result<OriginalSpeculativeRole, eredu_runtime::working_memory::SpeculativeRequestError>,
+        Result<OriginalSpeculativeRole, Error>,
+        (AutoregressiveInvocation, usize, usize, [u64; 4], Option<u64>),
+    )>()).map_err(Error::WorkspacePlanning)?;
+    let bytes = requirements.allocation_bytes();
+    let invocation = claim.invocation();
+    let ordinal = claim.ordinal();
+    let pool_used = sources.numerical_sources().pool().used_bytes().ok();
+    sources.request().reserve_role(claim, requirements).map_err(|cause| {
+        retain_planning_error(RoleAdmissionFailure {
+            cause, invocation, ordinal, spans, bytes, pool_used,
+        }, funding.clone())
+    })
+}
+
 use crate::composition::mlx::speculative::original_domains::{
     OriginalSpeculativeDomains as Domains, OriginalSpeculativeRoots as Roots,
     OriginalSpeculativeDomainError, prepare_domains, preparation_control_bytes,
 };
 enum RetainedEquation {
     Decode {
+        media_source: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
         projected: ProjectedResidentState,
         layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         report: InferenceWorkspaceReport,
@@ -96,6 +133,9 @@ enum RetainedEquation {
     Prefill(prefill::ActiveSpeculativePrefill),
 }
 impl RetainedEquation {
+    fn context(&self) -> &WorkspaceContext {
+        match self { Self::Decode { context, .. } => context, Self::Prefill(value) => value.metadata_context() }
+    }
     fn layerwise(&self) -> Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace> {
         match self {
             Self::Decode { layerwise, .. } => layerwise.as_ref(),
@@ -107,7 +147,7 @@ struct Retained {
     roots: Roots,
     domains: Domains,
     equation: RetainedEquation,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     role: OriginalSpeculativeRole,
 }
 impl Retention for Retained {
@@ -115,6 +155,7 @@ impl Retention for Retained {
 }
 
 struct Active {
+    metadata: WorkspaceContext,
     checkpoint: RefCell<Option<MlxPredictionTargetState>>,
     roots: Roots,
     io: RefCell<Option<PreparedAutoregressiveIo>>,
@@ -128,7 +169,7 @@ struct Active {
     graph_started: Cell<bool>,
     completed: Cell<bool>,
     role: OriginalSpeculativeRole,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Clone-only view of the actual installed role. It is not a Scope constructor
 /// and cannot change the source, bank population or observer it authenticates.
@@ -154,10 +195,11 @@ impl ActiveSpeculativeInvocation {
     fn inner(&self) -> &Rc<Active> {
         self.0.as_ref().expect("live role view")
     }
+    pub(crate) fn metadata_context(&self) -> WorkspaceContext { self.inner().metadata.clone() }
     pub(crate) fn role(&self) -> &OriginalSpeculativeRole {
         &self.inner().role
     }
-    pub(crate) fn metadata_funding(&self) -> WorkspaceMetadataFunding {
+    pub(crate) fn metadata_funding(&self) -> HostMetadataFunding {
         self.inner().funding.clone()
     }
     pub(crate) fn observer(&self) -> &OriginalScopeObserver {
@@ -420,6 +462,9 @@ impl Plan {
             size_of::<Option<safemlx::PreparedResidentGraph>>(),
             size_of::<Result<safemlx::PreparedResidentGraph, Exception>>(),
             size_of::<ActiveSpeculativeInvocation>(),
+            size_of::<Option<prefill::ActiveSpeculativePrefill>>(),
+            size_of::<(&Option<prefill::ActiveSpeculativePrefill>, &HostMetadataFunding,
+                &mut dyn FnMut(&Array))>(),
             size_of::<Option<&eredu_runtime::working_memory::OriginalSpeculativePrefillSpan>>(),
             size_of::<(&mut Executable, &mut MlxAutoregressiveState, &ActiveSpeculativeInvocation)>(),
             size_of::<Result<ActiveSpeculativeInvocation, Error>>(),
@@ -588,11 +633,9 @@ impl PreparedAutoregressiveInvocation<'_> {
             None=>requirements,
         }};
         let addressable=addressable.map(|source|source.take(0)).transpose()?.flatten();
-        let role = self
-            .sources.request()
-            .reserve_role(self.claim, requirements)
-            .map_err(|cause| retain_planning_error(cause, self.funding.clone()))?;
+        let role = reserve_role(self.sources, self.claim, requirements, self.recipe.records().len(), &self.funding)?;
         let equation = RetainedEquation::Decode {
+            media_source: self.media_source,
             projected: self.projected, layerwise: self.layerwise,
             report: self.report, context: self.context,
         };
@@ -620,7 +663,7 @@ fn run_span<T, F>(
     checkpoint: MlxPredictionTargetState,
     io: Option<AutoregressiveIoPlan>,
     equation: RetainedEquation,
-    cold_funding: WorkspaceMetadataFunding,
+    cold_funding: HostMetadataFunding,
     mut addressable:Option<SpeculativeAddressableSpan>,
     run: F,
     invoke: fn(F, &mut Executable, &mut MlxAutoregressiveState, &ActiveSpeculativeInvocation) -> Result<T, Error>,
@@ -639,6 +682,14 @@ fn run_span<T, F>(
         let record_quota = domains.record.clone();
         let buffer = domains.buffer.clone();
         let completed_budget = buffer.clone();
+        // Completion includes retained ingress roots as well as current cache
+        // roots. Preserve that same inventory after Recovery retirement: a
+        // later span may install an ingress alias into the decoder state.
+        let completed_prefill = match &equation {
+            RetainedEquation::Prefill(source) => Some(source.clone()),
+            RetainedEquation::Decode { .. } => None,
+        };
+        let metadata = equation.context().clone();
         let retained = Retained {
             roots: roots.clone(),
             domains,
@@ -690,6 +741,7 @@ fn run_span<T, F>(
                 bank.as_ref().ok_or_else(||failure(Cause::Source,&role))?.selected_residency_access()?,
                 buffer.clone(),&observer,None,&cold_funding)).transpose()?;
             let active = ActiveSpeculativeInvocation(Some(Rc::new(Active {
+                metadata,
                 checkpoint: RefCell::new(Some(checkpoint)),
                 roots,
                 io: RefCell::new(io),
@@ -738,7 +790,7 @@ fn run_span<T, F>(
         // exact Record retirement. A single progress poll is not completion.
         // Failed construction still follows Recovery's retained Drop path.
         let output = result?;
-        let status = recovery.finish();
+        let status = recovery.finish().map_err(|cause| failure(cause.into_error().into(), &role))?;
         if !status.settled || status.failed || status.blocked {
             return Err(failure(Cause::Completion, &role));
         }
@@ -753,7 +805,12 @@ fn run_span<T, F>(
         // Publish source facts only after exact completion and Recovery/Record
         // retirement. The next checkpoint authenticates these role births
         // alongside existing registered roots in the shared copy worker.
-        state.native.publish_completed_original_source(&completed_budget, &role, &cold_funding)
+        state.native.publish_completed_original_source(&completed_budget, &role, &cold_funding,
+            environment.stream(),
+            |visitor| match &completed_prefill {
+                Some(source) => source.visit_retained_media_roots(visitor, &cold_funding),
+                None => Ok(()),
+            })
             .map_err(|cause| failure(cause.into(), &role))?;
         Ok(output)
 }
@@ -779,7 +836,7 @@ impl<T,F> AddressableCall<'_,T,F>{
 fn addressable_call_controls<T,F>()->Option<u64>{
     let frames=[size_of::<AddressableCall<'_,T,F>>(),size_of::<&mut AddressableCall<'_,T,F>>(),
         size_of::<(&AddressableExecutionRow,F,&mut Executable,&mut MlxAutoregressiveState,&ActiveSpeculativeInvocation,
-            fn(F,&mut Executable,&mut MlxAutoregressiveState,&ActiveSpeculativeInvocation)->Result<T,Error>,&WorkspaceMetadataFunding)>(),
+            fn(F,&mut Executable,&mut MlxAutoregressiveState,&ActiveSpeculativeInvocation)->Result<T,Error>,&HostMetadataFunding)>(),
         size_of::<Result<(),Error>>(),size_of::<Result<bool,Error>>(),size_of::<Option<Result<T,Error>>>(),
         size_of::<Result<T,Error>>(),size_of::<bool>(),size_of::<Option<SpeculativeAddressableSpan>>(),
         size_of::<Option<AddressableExecutionRow>>(),size_of::<Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>>(),
@@ -789,7 +846,7 @@ fn addressable_call_controls<T,F>()->Option<u64>{
 fn invoke_addressable<T,F>(row:&AddressableExecutionRow,run:F,model:&mut Executable,
     state:&mut MlxAutoregressiveState,active:&ActiveSpeculativeInvocation,
     invoke:fn(F,&mut Executable,&mut MlxAutoregressiveState,&ActiveSpeculativeInvocation)->Result<T,Error>,
-    funding:&WorkspaceMetadataFunding)->Result<T,Error>{
+    funding:&HostMetadataFunding)->Result<T,Error>{
     funding.reserve_metadata(usize::try_from(addressable_call_controls::<T,F>()
         .ok_or_else(||failure(Cause::Overflow,&active.inner().role))?)
         .map_err(|_|failure(Cause::Overflow,&active.inner().role))?).map_err(Error::WorkspacePlanning)?;

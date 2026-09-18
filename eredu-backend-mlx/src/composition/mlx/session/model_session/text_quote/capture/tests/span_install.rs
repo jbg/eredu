@@ -43,7 +43,7 @@ pub(super) fn quoted(
     ids: &Vec<u32>,
     controller: &disk::Controller,
 ) -> IncrementalInferenceQuote {
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), source).unwrap();
+    let capture = CaptureAdmission::new(runtime.session(), geometry(), source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
     let mut g = geometry();
     g.output = capture.physical_output(g.output);
     let storage = ControllerStorageContract::inspect(controller).unwrap();
@@ -172,7 +172,7 @@ fn original_selection_rejects_readout_downgrade_and_accepts_only_actual_shared_h
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = active_source(&runtime, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 0);
     let foreign = active_source(&runtime, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 0);
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), &source).unwrap();
+    let capture = CaptureAdmission::new(runtime.session(), geometry(), &source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
     let before = (
         pool.used_bytes().unwrap(),
         pool.peak_bytes().unwrap(),

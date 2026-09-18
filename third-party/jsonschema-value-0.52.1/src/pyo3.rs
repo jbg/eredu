@@ -41,8 +41,9 @@ impl Json for Pyo3 {
     type PreparedKey = Py<PyString>;
     type StringBuffer = ();
 
-    fn prepare_key(key: &str) -> Py<PyString> {
-        Python::attach(|py| PyString::intern(py, key).unbind())
+    fn prepare_key_with_allocations(key: &str, allocations: &dyn serde_json::allocation::Allocation) -> Result<Py<PyString>, crate::KeyPreparationError> {
+        if allocations.is_enforced() { return Err(crate::KeyPreparationError::Unqualified("Python interned string")); }
+        Ok(Python::attach(|py| PyString::intern(py, key).unbind()))
     }
 
     fn with_string_node<T>((): &mut (), string: &str, f: impl FnOnce(PyNode<'_>) -> T) -> T {

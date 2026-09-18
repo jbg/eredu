@@ -6,7 +6,10 @@ use alloc::vec::Vec;
 
 use regex_syntax::hir::{literal::Literal, Hir, HirKind, Repetition};
 
-use crate::meta::prefix;
+use crate::{
+    meta::prefix,
+    util::allocation::{Allocation, AllocationError, Allocator},
+};
 
 /// Returns true when it's impossible for an earlier match to be detected after
 /// a literal candidate (corresponding to `suffix`) has been found.
@@ -16,37 +19,36 @@ use crate::meta::prefix;
 ///
 /// At present, this always returns `false` when `hirs` has any length except
 /// `1`. That is, this optimization does not apply to multi-regex.
-pub(super) fn has_no_earlier_match(hirs: &[&Hir], suffix: &[u8]) -> bool {
+pub(super) fn has_no_earlier_match_with_allocations(
+    hirs: &[&Hir],
+    suffix: &[u8],
+    funding: &dyn Allocation,
+) -> Result<bool, AllocationError> {
     if hirs.len() != 1 || suffix.is_empty() {
-        return false;
+        return Ok(false);
     }
-    let hir = hirs[0];
-    let Some(prefix) = strip_literal_suffix(hir, suffix) else { return false };
-
-    let fixed_length = prefix::hir_has_fixed_length(&prefix);
-    debug!("reverse suffix has fixed length prefix? {fixed_length}");
-    if fixed_length {
-        return true;
+    let Some(prefix) =
+        strip_literal_suffix_with_allocations(hirs[0], suffix, funding)?
+    else {
+        return Ok(false);
+    };
+    if prefix::hir_has_fixed_length(&prefix) {
+        return Ok(true);
     }
-
-    let class_separator = prefix::has_disjoint_class_separator(
+    let allocation = Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
+    let mut literal = Literal::exact_with_allocations(suffix, syntax)?;
+    literal.make_inexact();
+    if prefix::has_disjoint_class_separator_with_allocations(
         &prefix,
-        &[Literal::inexact(suffix)],
-    );
-    debug!("reverse suffix has disjoint class separator? {class_separator}");
-    if class_separator {
-        return true;
+        &[literal],
+        funding,
+    )? {
+        return Ok(true);
     }
-
-    let internal = prefix::hir_can_contain_literal(&prefix, suffix);
-    debug!("reverse suffix has internal suffix? {internal}");
-    if !internal {
-        return true;
-    }
-
-    // We couldn't prove that the reverse suffix optimization
-    // was safe, so bail out.
-    false
+    Ok(!prefix::hir_can_contain_literal_with_allocations(
+        &prefix, suffix, funding,
+    )?)
 }
 
 /// Strip `suffix` from the end of `hir` and return the HIR that remains.
@@ -54,117 +56,221 @@ pub(super) fn has_no_earlier_match(hirs: &[&Hir], suffix: &[u8]) -> bool {
 /// This is conservative. It returns `None` when the structure of the HIR does
 /// not make the suffix straightforward to remove, even when `suffix` might be
 /// required by the pattern.
+#[cfg(test)]
 fn strip_literal_suffix(hir: &Hir, suffix: &[u8]) -> Option<Hir> {
-    let (prefix, suffix_cursor) =
-        strip_literal_suffix_at(hir, suffix, suffix.len())?;
-    if suffix_cursor == 0 {
-        Some(prefix)
-    } else {
-        None
-    }
+    strip_literal_suffix_with_allocations(hir, suffix, &crate::util::allocation::Unenforced)
+        .expect("ordinary suffix copy allocation")
 }
 
-/// Strip a terminal part of `suffix[..suffix_cursor]` from the end of `hir`.
-///
-/// The returned cursor marks the end of the part of `suffix` that remains to
-/// be stripped. Thus, this call removes `suffix[after..suffix_cursor]`, where
-/// `after` is the returned cursor. A non-zero cursor may be returned only when
-/// the returned HIR cannot consume any bytes. This lets a concatenation
-/// continue stripping from its preceding child without losing adjacency.
-fn strip_literal_suffix_at(
-    hir: &Hir,
+/// Run the original right-to-left suffix removal with paid continuations.
+/// Untouched prefix children are copied once, after stripping succeeds.
+fn strip_literal_suffix_with_allocations<'a>(
+    hir: &'a Hir,
     suffix: &[u8],
-    suffix_cursor: usize,
-) -> Option<(Hir, usize)> {
-    if suffix_cursor == 0 {
-        return Some((hir.clone(), 0));
+    funding: &dyn Allocation,
+) -> Result<Option<Hir>, AllocationError> {
+    enum Frame<'a> {
+        Visit(&'a Hir, usize),
+        Concat {
+            children: &'a [Hir],
+            index: usize,
+            before: usize,
+            tail: Vec<Hir>,
+        },
+        Repeat {
+            rep: &'a Repetition,
+            min: u32,
+            max: Option<u32>,
+            before: usize,
+            tail: Vec<Hir>,
+        },
     }
-    match hir.kind() {
-        HirKind::Literal(lit) => {
-            let bytes = &lit.0;
-            let mut len = 0;
-            while len < bytes.len()
-                && len < suffix_cursor
-                && bytes[bytes.len() - len - 1]
-                    == suffix[suffix_cursor - len - 1]
-            {
-                len += 1;
-            }
-            if len == 0 || (len < bytes.len() && len < suffix_cursor) {
-                return None;
-            }
-            Some((
-                Hir::literal(bytes[..bytes.len() - len].to_vec()),
-                suffix_cursor - len,
-            ))
-        }
-        HirKind::Capture(capture) => {
-            strip_literal_suffix_at(&capture.sub, suffix, suffix_cursor)
-        }
-        HirKind::Concat(hirs) => {
-            let mut prefix = hirs.to_vec();
-            let mut cursor = suffix_cursor;
-            for i in (0..prefix.len()).rev() {
-                let (stripped, after) =
-                    strip_literal_suffix_at(&prefix[i], suffix, cursor)?;
-                if after == cursor {
-                    return None;
-                }
-                prefix[i] = stripped;
-                cursor = after;
+    let allocation = Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
+    let mut stack = Vec::new();
+    allocation.push(&mut stack, Frame::Visit(hir, suffix.len()))?;
+    let mut result = None;
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(mut hir, cursor) => {
                 if cursor == 0 {
-                    break;
+                    result = Some((hir.clone_with_allocations(syntax)?, 0));
+                    continue;
+                }
+                while let HirKind::Capture(capture) = hir.kind() {
+                    hir = &capture.sub;
+                }
+                match hir.kind() {
+                    HirKind::Literal(lit) => {
+                        let bytes = &lit.0;
+                        let mut len = 0;
+                        while len < bytes.len()
+                            && len < cursor
+                            && bytes[bytes.len() - len - 1]
+                                == suffix[cursor - len - 1]
+                        {
+                            len += 1;
+                        }
+                        if len == 0 || (len < bytes.len() && len < cursor) {
+                            return Ok(None);
+                        }
+                        result = Some((
+                            Hir::literal_with_allocations(
+                                syntax
+                                    .copy_slice(&bytes[..bytes.len() - len])?,
+                                syntax,
+                            )?,
+                            cursor - len,
+                        ));
+                    }
+                    HirKind::Concat(children) => {
+                        let index = children.len() - 1;
+                        allocation.push(
+                            &mut stack,
+                            Frame::Concat {
+                                children,
+                                index,
+                                before: cursor,
+                                tail: Vec::new(),
+                            },
+                        )?;
+                        allocation.push(
+                            &mut stack,
+                            Frame::Visit(&children[index], cursor),
+                        )?;
+                    }
+                    HirKind::Repetition(rep) => {
+                        if rep.min == 0 {
+                            return Ok(None);
+                        }
+                        allocation.push(
+                            &mut stack,
+                            Frame::Repeat {
+                                rep,
+                                min: rep.min,
+                                max: rep.max,
+                                before: cursor,
+                                tail: Vec::new(),
+                            },
+                        )?;
+                        allocation.push(
+                            &mut stack,
+                            Frame::Visit(&rep.sub, cursor),
+                        )?;
+                    }
+                    _ => return Ok(None),
                 }
             }
-            Some((Hir::concat(prefix), cursor))
+            Frame::Concat {
+                children,
+                index,
+                before,
+                mut tail,
+            } => {
+                let (stripped, after) =
+                    result.take().expect("completed suffix child");
+                if after == before {
+                    return Ok(None);
+                }
+                allocation.push(&mut tail, stripped)?;
+                if after > 0 && index > 0 {
+                    allocation.push(
+                        &mut stack,
+                        Frame::Concat {
+                            children,
+                            index: index - 1,
+                            before: after,
+                            tail,
+                        },
+                    )?;
+                    allocation.push(
+                        &mut stack,
+                        Frame::Visit(&children[index - 1], after),
+                    )?;
+                } else {
+                    let mut prefix = Vec::new();
+                    allocation.grow(
+                        &mut prefix,
+                        index
+                            .checked_add(tail.len())
+                            .ok_or(AllocationError::SizeOverflow)?,
+                    )?;
+                    for child in &children[..index] {
+                        prefix.push(child.clone_with_allocations(syntax)?);
+                    }
+                    prefix.extend(tail.into_iter().rev());
+                    result = Some((
+                        Hir::concat_with_allocations(prefix, syntax)?,
+                        after,
+                    ));
+                }
+            }
+            Frame::Repeat {
+                rep,
+                min,
+                max,
+                before,
+                mut tail,
+            } => {
+                let (stripped, after) =
+                    result.take().expect("completed repetition suffix");
+                if after == before {
+                    return Ok(None);
+                }
+                let min = min.saturating_sub(1);
+                let max = max.map(|max| max.saturating_sub(1));
+                if !matches!(stripped.kind(), HirKind::Empty) {
+                    allocation.push(&mut tail, stripped)?;
+                }
+                if after > 0 {
+                    if min == 0 {
+                        return Ok(None);
+                    }
+                    allocation.push(
+                        &mut stack,
+                        Frame::Repeat {
+                            rep,
+                            min,
+                            max,
+                            before: after,
+                            tail,
+                        },
+                    )?;
+                    allocation
+                        .push(&mut stack, Frame::Visit(&rep.sub, after))?;
+                } else {
+                    let rest = Hir::repetition_with_allocations(
+                        Repetition {
+                            min,
+                            max,
+                            greedy: rep.greedy,
+                            sub: syntax.boxed(
+                                rep.sub.clone_with_allocations(syntax)?,
+                            )?,
+                        },
+                        syntax,
+                    )?;
+                    let mut prefix = Vec::new();
+                    allocation.grow(
+                        &mut prefix,
+                        tail.len()
+                            .checked_add(1)
+                            .ok_or(AllocationError::SizeOverflow)?,
+                    )?;
+                    if !matches!(rest.kind(), HirKind::Empty) {
+                        prefix.push(rest);
+                    }
+                    prefix.extend(tail.into_iter().rev());
+                    result = Some((
+                        Hir::concat_with_allocations(prefix, syntax)?,
+                        0,
+                    ));
+                }
+            }
         }
-        HirKind::Repetition(rep) => {
-            strip_repetition_literal_suffix(rep, suffix, suffix_cursor)
-        }
-        _ => None,
     }
-}
-
-fn strip_repetition_literal_suffix(
-    rep: &Repetition,
-    suffix: &[u8],
-    suffix_cursor: usize,
-) -> Option<(Hir, usize)> {
-    let mut min = rep.min;
-    let mut max = rep.max;
-    let mut cursor = suffix_cursor;
-    let mut tail = Vec::new();
-    while cursor > 0 {
-        if min == 0 {
-            return None;
-        }
-        let before = cursor;
-        let (stripped, after) =
-            strip_literal_suffix_at(&rep.sub, suffix, cursor)?;
-        if after == before {
-            return None;
-        }
-        min = min.saturating_sub(1);
-        max = max.map(|max| max.saturating_sub(1));
-        if !matches!(stripped.kind(), HirKind::Empty) {
-            tail.push(stripped);
-        }
-        cursor = after;
-    }
-
-    let rest = Hir::repetition(Repetition {
-        min,
-        max,
-        greedy: rep.greedy,
-        sub: rep.sub.clone(),
-    });
-    let mut prefix = Vec::with_capacity(tail.len() + 1);
-    if !matches!(rest.kind(), HirKind::Empty) {
-        prefix.push(rest);
-    }
-    tail.reverse();
-    prefix.extend(tail);
-    Some((Hir::concat(prefix), 0))
+    let (prefix, after) = result.expect("completed suffix root");
+    Ok(if after == 0 { Some(prefix) } else { None })
 }
 
 // We only test when we have `unicode-perl` here since some regexes require

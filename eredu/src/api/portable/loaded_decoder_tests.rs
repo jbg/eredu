@@ -370,21 +370,21 @@ fn private_stop_override_short_or_foreign_source_preserves_existing_compiled_dec
 
 #[test]
 fn actual_text_decoder_aliases_keep_cache_absence_after_loaded_model_drop() {
-    use tokenizers::ModelCachePolicy::NoModelCaches;
+    use tokenizers::ModelCachePolicy;
     let json = br#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[["a","b"]]},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}}"#;
-    let source = ChatTokenizer::from_bytes_with_cache_policy(json, NoModelCaches).unwrap();
+    let source = ChatTokenizer::from_bytes_with_cache_policy(json, ModelCachePolicy::disabled()).unwrap();
     let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
     let (model, compiles) = model_with_tokenizer(&pool, source);
     let mut decoder = model.text_decoder(false);
     assert_eq!(decoder.step(0).unwrap().as_deref(), Some("a"));
     let mut clone = decoder.clone();
-    assert_eq!(decoder.tokenizer.model_cache_policy(), NoModelCaches);
+    assert_eq!(decoder.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
     drop(model);
     assert_eq!(decoder.step(1).unwrap().as_deref(), Some("b"));
     drop(decoder);
-    assert_eq!(clone.tokenizer.model_cache_policy(), NoModelCaches);
+    assert_eq!(clone.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
     assert_eq!(clone.step(2).unwrap().as_deref(), Some("ab"));
-    assert_eq!(compiles.get(), 0); // Legacy TextDecoder did not recompile a source.
+    assert_eq!(compiles.get(), 0); // Decoder aliases do not recompile a source.
 }
 
 impl eredu_runtime::working_memory::OriginalTokenizerBackend for Backend {
@@ -409,7 +409,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for Backend {
         let backend = runtime.backend();
         backend.compiles.set(backend.compiles.get() + 1);
         backend.pool.compile_tokenizer_file(read).map_err(
-            eredu_runtime::working_memory::OriginalTokenizerFileError::into_backend_failure,
+            eredu_runtime::working_memory::OriginalTokenizerInputError::into_backend_failure,
         )
     }
     fn compile_original_tokenizer(
@@ -445,7 +445,7 @@ fn private_fresh_tokenizer_producer_uses_actual_pool_and_rejects_regex_before_ba
         .unwrap();
         let unsupported = input.replace(
             "\"pre_tokenizer\":null",
-            "\"pre_tokenizer\":{\"type\":\"ByteLevel\",\"use_regex\":true}",
+            "\"pre_tokenizer\":{\"type\":\"Split\",\"pattern\":{\"Regex\":\"x+\"},\"behavior\":\"Isolated\",\"invert\":false}",
         );
         assert!(crate::api::tokenizer::compile_original_tokenizer(
             &runtime,
@@ -517,7 +517,7 @@ fn private_consumed_file_producer_admits_i_then_c_and_preserves_borrowed_source_
             let source = error
                 .source()
                 .unwrap()
-                .downcast_ref::<eredu_runtime::working_memory::OriginalTokenizerFileError>()
+                .downcast_ref::<eredu_runtime::working_memory::OriginalTokenizerInputError>()
                 .unwrap();
             assert_eq!(source.input_bytes(), if capacity < i { 0 } else { i });
             assert_eq!(pool.used_bytes().unwrap(), source.input_bytes());
@@ -589,7 +589,7 @@ mod regex;
 
 #[test]
 fn original_text_default_adapters_reject_by_value_before_source_operations() {
-    use eredu_runtime::working_memory::{OriginalTextSourceError, OriginalTokenizerBackend};
+    use eredu_runtime::working_memory::{OriginalTextSourceError, OriginalTokenizerSourceError, OriginalTokenizerBackend};
     let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
     let compiles = Rc::new(Cell::new(0));
     let runtime = ModelRuntime::prepare(
@@ -629,8 +629,8 @@ fn original_text_default_adapters_reject_by_value_before_source_operations() {
     std::io::Write::write_all(&mut file, input).unwrap();
     let read = eredu_checkpoint::artifact::PreparedArtifactFileRead::new(file).unwrap();
     assert!(matches!(
-        Backend::compile_original_tokenizer_file_for_generation(&runtime, read),
-        Err(OriginalTextSourceError::Domain(
+        Backend::compile_original_tokenizer_source_for_generation(&runtime, eredu_runtime::working_memory::OriginalTokenizerInput::File(read)),
+        Err(OriginalTokenizerSourceError::Domain(
             eredu_core::TokenInputRejection::Unsupported
         ))
     ));

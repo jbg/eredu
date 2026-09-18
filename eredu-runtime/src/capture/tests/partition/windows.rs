@@ -214,7 +214,7 @@ fn collector_config(
         .unwrap();
     let backend = Rc::new(RefCell::new(Backend::default()));
     let observer = SpeculativeCaptureObserver::new(
-        CaptureSession::new(admitted),
+        CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admitted)),
         Provider(backend.clone()),
         map as fn(&CaptureExecutionError<std::io::Error>) -> String,
         SpeculativeRequestId::new(0),
@@ -555,20 +555,20 @@ fn reduction_exact_host_limit_and_original_source_retire_without_refund() {
     }
 
     struct Retired {
-        plan: std::sync::Weak<AdmittedCapturePlan>,
+        plan: crate::capture::tests::PlanRetirementProbe,
         drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl Drop for Retired {
         fn drop(&mut self) {
             assert!(
-                self.plan.upgrade().is_none(),
+                self.plan.is_retired(),
                 "actual source must retire before final host custody"
             );
             self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
     let (mut observer, _, _) = collector(5, true, 100, CaptureLimitPolicy::Fail, false);
-    let source = std::sync::Arc::downgrade(observer.session().plan.legacy_arc().unwrap());
+    let source = crate::capture::tests::plan_retirement_probe(&observer.session().plan);
     let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let authority = eredu_core::HostPreparationAuthority::retain(Retired {
         plan: source.clone(),
@@ -582,10 +582,10 @@ fn reduction_exact_host_limit_and_original_source_retire_without_refund() {
     begin(&mut observer, 5, true);
     span(&mut observer, 5, 0, 2, true, false).unwrap();
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(source.upgrade().is_some());
+    assert!(!source.is_retired());
     drop(observer);
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(source.upgrade().is_none());
+    assert!(source.is_retired());
 }
 
 #[test]

@@ -123,7 +123,7 @@ fn original_plan_late_source_failure_keeps_readable_records_and_original_hold() 
     let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
     let root = pool.register_storage([(1u32, 64)]).unwrap();
     let source_quote = replacement_quote(&pool, geometry(), 0).into_incremental();
-    let (_, source_reservation, _) = sealed_plan(&pool, &source_quote, 1_000_000).unwrap();
+    let (source_reservation, _) = sealed_plan(&pool, &source_quote, 1_000_000).unwrap();
     let (source_reservation, source_run) = source_reservation.into_funding().unwrap();
     let source_scope = source_run.scope().unwrap();
     let registered = source_scope
@@ -140,7 +140,7 @@ fn original_plan_late_source_failure_keeps_readable_records_and_original_hold() 
         .unwrap()
         .with_span_workspace()
         .unwrap();
-    let (_, reservation, quote) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
+    let (reservation, quote) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
     drop(initial);
     let (reservation, run) = reservation.into_funding().unwrap();
     let held = quote.span_workspace().retention_peak_bytes().unwrap();

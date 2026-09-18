@@ -14,14 +14,14 @@ impl RegisteredStoragePin {
             size_of::<Option<PlanningPinGroup>>(),
             size_of::<RegisteredStoragePin>(),
             size_of::<Arc<PlanningPinGroup>>(),
-            size_of::<Option<eredu_nn::workspace::WorkspaceMetadataFunding>>(),
+            size_of::<Option<eredu_nn::workspace::HostMetadataFunding>>(),
         ];
         frames
             .into_iter()
             .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
             .ok_or(WorkingMemoryError::Overflow)
     }
-    fn planned(self, funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>) -> Self {
+    fn planned(self, funding: Option<eredu_nn::workspace::HostMetadataFunding>) -> Self {
         match funding {
             Some(funding) => Self::Planned(PlanningStoragePins(Some(Arc::new(PlanningPinGroup {
                 pin: self,
@@ -44,7 +44,7 @@ impl RegisteredStoragePin {
                 .map_err(|_| metadata.source(WorkingMemoryError::Overflow))?,
             size_of::<Vec<RegisteredStoragePin>>(),
             size_of::<RegisteredStoragePin>(),
-            size_of::<Option<eredu_nn::workspace::WorkspaceMetadataFunding>>(),
+            size_of::<Option<eredu_nn::workspace::HostMetadataFunding>>(),
         ];
         let mut bytes = frames
             .into_iter()

@@ -1,0 +1,175 @@
+# Fraction
+
+Lossless fractions and decimals for Rust; an aspirational drop-in replacement for floating-point types.
+
+[![GitHub Actions](https://github.com/dnsl48/fraction/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/dnsl48/fraction/actions/workflows/main.yml?query=branch%3Amaster)
+[![Documentation](https://docs.rs/fraction/badge.svg)](https://docs.rs/fraction/)
+[![Current Version on crates.io](https://img.shields.io/crates/v/fraction.svg)](https://crates.io/crates/fraction/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.70-blue.svg)](#features)
+[![Licence](https://img.shields.io/badge/licence-MIT%20/%20Apache%202.0-blue.svg)](#licence)
+
+## Overview
+
+`fraction` provides:
+
+- `Fraction`, a rational type designed for float-like arithmetic with exact values
+- `Decimal`, a lossless decimal representation with explicit precision
+- `DynaInt`, a dynamically growing integer for checked maths
+- hashable and orderable fractions, including deterministic ordering for `NaN`
+- PostgreSQL, Juniper, Serde, Unicode, and approximate maths support via features
+
+## Install
+
+```toml
+[dependencies]
+fraction = "0.17.0"
+```
+
+Enable optional integrations explicitly:
+
+```toml
+[dependencies]
+fraction = { version = "0.17.0", features = ["with-postgres-support", "with-serde-support"] }
+```
+
+## Features
+
+The `default` feature set enables the features marked **Yes** below.
+
+| Feature                 | Default? | Overview                                                                                                             |
+|-------------------------|----------|----------------------------------------------------------------------------------------------------------------------|
+| `with-bigint`           | Yes      | Adds `num::BigInt`/`BigUint` support, re-exports those types, and enables aliases such as `BigFraction`.             |
+| `with-decimal`          | Yes      | Adds `GenericDecimal` and decimal aliases such as `Decimal`, with precision retained for formatting and comparison.  |
+| `with-dynaint`          | Yes      | Adds `DynaInt`, which keeps small integers inline and promotes them to a larger backing type on overflow.            |
+| `with-approx`           | No       | Enables `with-bigint` and adds accuracy-controlled square-root helpers for fractions and, when enabled, decimals.    |
+| `with-juniper-support`  | No       | Adds Juniper GraphQL scalar, input, and output implementations for the enabled fraction and decimal types.           |
+| `with-postgres-support` | No       | Adds PostgreSQL `NUMERIC` `ToSql`/`FromSql` conversions for the enabled fraction and decimal types.                  |
+| `with-serde-support`    | No       | Adds Serde `Serialize`/`Deserialize` implementations for enabled fraction, decimal, sign, and dynamic-integer types. |
+| `with-unicode`          | No       | Adds Unicode fraction formatting and parsing helpers for `GenericFraction`.                                          |
+
+The Rust 1.70 MSRV smoke harness CI-tests the `with-bigint`/`with-approx`/`with-dynaint`/`with-unicode` feature
+surface. Latest stable is tested with all features enabled. Optional integration dependency graphs, including
+`with-juniper-support` and `with-postgres-support`, may require a newer compiler under fresh dependency resolution.
+
+Unlike primitive floats, `Fraction` treats `NaN` as equal to itself and orders it below negative infinity. That makes
+fractions usable in sets, hash maps, and B-trees.
+
+## Text parsing
+
+For numeric-component forms, ordinary `Fraction`/`Decimal`, Unicode, and `GenericFraction` radix parsing accept at
+most one optional sign at the beginning of the complete value. Numeric components are unsigned: inputs such as `1/-2`,
+`1/+2`, and `1.-2` are rejected. This keeps the sign outside the stored ratio. Fraction Juniper input retains its
+required explicit leading sign and rejects component signs. Decimal Juniper input delegates to ordinary `Decimal`
+grammar and also rejects component signs.
+
+`GenericFraction::from_str_radix` keeps its fraction-only `numerator/denominator` grammar and accepts bases 2
+through 36. It returns `ParseError::UnsupportedBase` for other bases and `ParseError::ZeroDenominator` for zero
+denominators; ordinary fraction, Decimal, and Unicode parsing instead map zero denominators to infinity or NaN.
+`GenericDecimal::from_str_radix` supports base 10 only and reports `ParseError::UnsupportedBase` for other bases.
+
+## Examples
+
+### Fraction
+
+```rust
+use std::str::FromStr;
+use fraction::{Fraction, One, Zero, Sign};
+
+let f = Fraction::new(1u8, 2u8);
+assert_eq!(f, Fraction::new_generic(Sign::Plus, 1i32, 2u8).unwrap());
+assert_eq!(f, Fraction::from(0.5));
+assert_eq!(f, Fraction::from_str("0.5").unwrap());
+assert_eq!(f, Fraction::from_str("1/2").unwrap());
+assert_eq!(Fraction::from_str("1/0").unwrap(), Fraction::infinity());
+assert_eq!(Fraction::from_str("-1/0").unwrap(), Fraction::neg_infinity());
+assert_eq!(Fraction::from_str("0/0").unwrap(), Fraction::nan());
+assert_eq!(f * 2, Fraction::one());
+assert_eq!(f - f, Fraction::zero());
+```
+
+### Decimal
+
+```rust
+use std::str::FromStr;
+use fraction::{Decimal, Fraction};
+
+let d = Decimal::from(1);
+assert_eq!(d, Decimal::from_fraction(Fraction::from(1)));
+
+let d = Decimal::from(1.3);
+assert_eq!(d, Decimal::from_str("1.3").unwrap());
+
+let d = Decimal::from(0.5);
+// Decimal fraction notation uses the same zero-denominator mapping as `Fraction::from_str`.
+assert_eq!(d, Decimal::from_str("1/2").unwrap());
+assert_eq!(Decimal::from_str("1/0").unwrap(), Decimal::infinity());
+assert_eq!(Decimal::from_str("-1/0").unwrap(), Decimal::neg_infinity());
+assert_eq!(Decimal::from_str("0/0").unwrap(), Decimal::nan());
+
+let one_third = Fraction::new(1u8, 3u8);
+assert_eq!(
+    Decimal::from_fraction_with_precision(one_third, 4).to_string(),
+    "0.3333"
+);
+
+let lhs = Decimal::from(0.5) / Decimal::from(0.3); // 5/3, precision 1
+let rhs = Decimal::from_str("1.6").unwrap(); // 8/5, precision 1
+assert_eq!(lhs, rhs);
+assert_eq!(lhs.partial_cmp(&rhs), Some(std::cmp::Ordering::Equal));
+```
+
+Decimals compare by truncating fractional digits to each value’s own precision.
+Trailing zeroes are ignored, `p0` drops all fractional digits, and canonical zero values
+such as `-0`, `-0.9@p0`, and `-0.04@p1` compare and hash as positive zero.
+
+### Formatting
+
+```rust
+type F = fraction::Fraction;
+
+let result = F::from(0.7) / F::from(0.4);
+assert_eq!(format!("{}", result), "7/4");
+assert_eq!(format!("{:.2}", result), "1.75");
+assert_eq!(format!("{:#.3}", result), "1.750");
+```
+
+### Unicode
+
+When `with-unicode` is enabled, Unicode parsing and display helpers are available.
+
+```rust
+#[cfg(feature = "with-unicode")]
+{
+    type F = fraction::Fraction;
+
+    let res = F::from(0.7) / F::from(0.4);
+    assert_eq!("7⁄4", format!("{}", res.get_unicode_display()));
+    assert_eq!("⁷/₄", format!("{}", res.get_unicode_display().supsub()));
+    assert_eq!(F::from_unicode_str("-1¹/₂"), Ok(F::new_neg(3, 2)));
+}
+```
+
+## PostgreSQL notes
+
+Use `Decimal` rather than `Fraction` for PostgreSQL work where possible. PostgreSQL’s binary protocol uses `i16`, so the
+base type for `GenericFraction` or `GenericDecimal` should be at least `u16`.
+
+For very large or repeating values such as `1/3` or `1/7`, `Fraction` can grow to 16383 digits after the decimal point,
+which is slower than an explicitly precision-bound `Decimal`. If you need dynamic growth, `DynaInt<u8, _>` or
+`DynaInt<usize, BigUint>` can help.
+
+Infinity values round-trip using PostgreSQL numeric infinity markers from PostgreSQL 14+ (`0xD000` and `0xF000`).
+Older PostgreSQL versions do not support these values, and constrained `NUMERIC` columns (with declared
+precision/scale limits) reject infinity as out of range.
+
+## Documentation
+
+- [crate docs on docs.rs](https://docs.rs/fraction/)
+- [changelog](CHANGELOG.md)
+
+## Licence
+
+Licensed under either of:
+
+- [MIT](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)

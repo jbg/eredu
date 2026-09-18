@@ -22,7 +22,7 @@ pub(in crate::composition::mlx::session) struct PreparedPartitionEvidenceSource 
     window: Option<InterventionPrefillWindow>,
     attempted: [bool;2],
     scalar: [Option<WorkspaceFloatingType>;2],
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedPartitionEvidenceSource {
     /// Borrow the architecture's ordinary exporter decision, independently of
@@ -168,3 +168,5 @@ impl PreparedPartitionEvidenceSource {
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

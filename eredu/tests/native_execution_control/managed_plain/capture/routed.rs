@@ -8,7 +8,11 @@ const MODE: &str = "EREDU_ORIGINAL_ROUTED_CAPTURE_MODE";
 const RESULT: &str = "ORIGINAL_ROUTED_CAPTURE_RESULT:";
 
 #[derive(Clone, Copy)]
-enum Residency { Resident, Host, ForegroundDisk }
+enum Residency {
+    Resident,
+    Host,
+    ForegroundDisk,
+}
 impl Residency {
     fn plan(self) -> eredu_core::ResidencyPlan {
         match self {
@@ -19,8 +23,10 @@ impl Residency {
                 host_budget_bytes: Some(8 << 20),
             },
             Self::ForegroundDisk => eredu_core::ResidencyPlan::DenseDiskStream {
-                device_budget_bytes: 8 << 20, host_budget_bytes: 0,
-                host_lookahead: 0, background_queue: 0,
+                device_budget_bytes: 8 << 20,
+                host_budget_bytes: 0,
+                host_lookahead: 0,
+                background_queue: 0,
             },
         }
     }
@@ -33,13 +39,13 @@ impl Residency {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             config["num_hidden_layers"] = 3.into();
             std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
-            let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+            let resolved =
+                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
             write_tensor_plan(&fixture.0, resolved.architecture.checkpoint());
         }
         managed_fixture(fixture)
     }
 }
-
 
 fn capture_plan(paths: &[String]) -> CapturePlan {
     let mut plan = CapturePlan::none();
@@ -97,7 +103,7 @@ fn run(mode: &str, residency: Residency) -> serde_json::Value {
             .into_parts();
     if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
                 add_generation_prompt: true,
                 ..Default::default()
@@ -106,40 +112,48 @@ fn run(mode: &str, residency: Residency) -> serde_json::Value {
         let mut options = settings(0.0);
         options.inference.managed_memory_capacity_bytes = None;
         options.inference.prefill_chunk_positions = None;
-        let prepared = model
-            .prepare_observed_token_ids(
-                &chat,
-                vec![0, 1, 2, 3, 4],
-                options,
-                capture_plan(&paths),
-                TraceLimits {
-                    per_record_bytes: 1 << 20,
-                    total_bytes: 8 << 20,
-                },
-            )
-            .unwrap();
+        let prepared_prefix = vec![0, 1, 2, 3, 4];
+        let prepared_capture = capture_plan(&paths);
+        let prepared_trace = TraceLimits {
+            per_record_bytes: 1 << 20,
+            total_bytes: 8 << 20,
+        };
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(options));
+        prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&prepared_capture);
         let mut ids = Vec::new();
         let mut frames = Vec::new();
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
-                if let ObservedGenerationEvent::Token {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |record: ControlledGenerationRecord| {
+                if let Some(ObservedGenerationEvent::Token {
                     token_id,
                     captures: Some(frame),
                     ..
-                } = record.event
+                }) = record.event.progress()
                 {
-                    ids.push(token_id);
-                    frames.push(frame);
+                    ids.push(*token_id);
+                    frames.push(frame.clone());
                 }
                 ControlFlow::Continue(())
-            })
-            .unwrap_or_else(report_failure);
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap_or_else(report_failure);
         drop((model, root));
         assert_eq!(frames.len(), 4);
         let rows: Vec<_> = frames
             .iter()
             .enumerate()
-            .map(|(prediction, frame)| sparse(&frame.records, prediction))
+            .map(|(prediction, frame)| sparse(&frame.as_step().records, prediction))
             .collect();
         return serde_json::json!({"ids": ids, "rows": rows});
     }
@@ -166,14 +180,14 @@ fn run(mode: &str, residency: Residency) -> serde_json::Value {
     );
     let mut ids = Vec::new();
     let mut frames = Vec::new();
-    let mut observer = |token: Option<u32>, frame: Option<CapturedStepDelivery>, seconds: f64| {
+    let mut observer = |token: Option<u32>, frame: Option<SharedCapturedStep>, seconds: f64| {
         assert!(seconds >= 0.0);
         ids.push(token.expect("committed token"));
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+        let Some(frame) = frame else {
             panic!("original shared frame");
         };
         assert_eq!(frame.prediction_index() as usize, frames.len());
-        frames.push(frame);
+        frames.push(frame.clone());
     };
     let cancellation = GenerationCancellationToken::new();
     let mut visible = String::new();
@@ -293,10 +307,12 @@ fn verify_residency(case: &str, residency: Residency) {
                     panic!("float rows");
                 };
                 assert_eq!(actual.len(), expected.len());
-                assert!(actual
-                    .iter()
-                    .zip(expected)
-                    .all(|(a, b)| (a - b).abs() < 5e-5));
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| (a - b).abs() < 5e-5)
+                );
             }
         }
     }
@@ -311,28 +327,41 @@ fn native_routed_capture_matches_ordinary_managed_and_controlled() {
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_routed_host_capture_matches_ordinary_managed_and_controlled() {
-    verify_residency("managed_plain::capture::routed::native_routed_host_capture_matches_ordinary_managed_and_controlled",
-        Residency::Host);
+    verify_residency(
+        "managed_plain::capture::routed::native_routed_host_capture_matches_ordinary_managed_and_controlled",
+        Residency::Host,
+    );
 }
 
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_routed_disk_capture_matches_ordinary_managed_and_controlled() {
-    verify_residency("managed_plain::capture::routed::native_routed_disk_capture_matches_ordinary_managed_and_controlled",
-        Residency::ForegroundDisk);
+    verify_residency(
+        "managed_plain::capture::routed::native_routed_disk_capture_matches_ordinary_managed_and_controlled",
+        Residency::ForegroundDisk,
+    );
 }
 
 fn check_routed_saved(after_commit: bool) {
     let root = managed_fixture(super::super::super::routed_components::routed_fixture());
     let graph = inspect_architecture(&root.0).unwrap();
     let bank = &graph.routed_components[0];
-    let execution = ExecutionPlan::fully_resident(
-        eredu_core::DevicePlan::new("mlx", "metal:0").unwrap());
-    let (model, _) = LoadedModel::load_execution_plan(
-        &MlxBackendFactory::default(), &root.0, &execution).unwrap().into_parts();
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0").unwrap());
+    let (model, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+            .unwrap()
+            .into_parts();
     super::saved::check_saved_capture_loaded_with_transform(
-        model, root, after_commit, &bank.activation, 6, false,
-        CaptureTransform::RoutedUnits, None);
+        model,
+        root,
+        after_commit,
+        &bank.activation,
+        6,
+        false,
+        CaptureTransform::RoutedUnits,
+        None,
+    );
 }
 
 #[test]

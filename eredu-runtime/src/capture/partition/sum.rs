@@ -122,7 +122,7 @@ pub(super) fn payload_usage(
 }
 
 mod numeric;
-pub(crate) use numeric::{sum_f32_at, summarize_f32, fill_histogram_f32, numeric_control_bytes};
+pub(crate) use numeric::{sum_f32_at, summarize_f32, summarize_f32_values, fill_histogram_f32, numeric_control_bytes};
 
 pub(super) fn assemble(
     receipt: &PartitionCaptureReceiptPlan,

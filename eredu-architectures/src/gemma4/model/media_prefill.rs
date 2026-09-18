@@ -18,8 +18,8 @@ pub struct MediaPrefillPlan<T> {
     identity: Option<SharedPreparedInputCacheIdentity>,
     // All source and native/metadata payload owners retire before their funding.
     _workspace_funding: (
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
     metadata: Option<eredu_nn::workspace::WorkspaceContext>,
 }
@@ -153,32 +153,41 @@ where
     ) -> Option<SharedPreparedInputCacheIdentity> {
         plan.identity.clone()
     }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan) -> Result<(), Error> {
-        if plan.original.is_none() && self.args.architecture_fingerprint() != plan.fingerprint {
-            return Err(Error::backend(
-                "Gemma media source belongs to another architecture",
-            ));
+    fn ingress_execution_graph(&self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ArchitectureExecutionGraph<'_>)>()?;
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.execution_graph))
+    }
+    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, &Self::IngressPlan, Option<&eredu_nn::workspace::WorkspaceContext>,
+            PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>, String)>()?;
+        let identity_metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        if let Some(original) = &plan.original {
+            if !original.is_gemma() {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        } else {
+            let matches = match metadata_context {
+                Some(_) => self.checked_graph(identity_metadata)?.fingerprint == plan.fingerprint,
+                None => self.args.architecture_fingerprint() == plan.fingerprint,
+            };
+            if !matches {
+                return Err(metadata.error(format_args!("Gemma media source belongs to another architecture")));
+            }
         }
-        plan.input().map_err(Error::backend)?;
+        plan.input_with_diagnostic(|message| metadata.error(format_args!("{message}")))?;
         Ok(())
     }
-    fn validate_ingress_plan_with_metadata(&self, plan: &Self::IngressPlan,
-        context: &eredu_nn::workspace::WorkspaceContext) -> Result<(), Error> {
-        if !context.uses_checked_metadata() {
-            return <Self as PrefillIngressArchitecture<B,S>>::validate_ingress_plan(self, plan);
+
+
+    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Error {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        if let Err(refusal) = metadata.controls::<(MediaIngressError, Option<&eredu_nn::workspace::WorkspaceContext>)>() {
+            return refusal;
         }
-        context.charge_metadata(std::mem::size_of::<(Self::IngressPlan,
-            PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>)>())?;
-        if !plan.original.as_ref().is_some_and(|original| original.is_gemma()) {
-            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
-        }
-        plan.input_with_diagnostic(|message| context.metadata_error(format_args!("{message}")))?;
-        Ok(())
-    }
-    fn ingress_error_with_metadata(error: MediaIngressError,
-        context: &eredu_nn::workspace::WorkspaceContext) -> Error { context.metadata_source(error) }
-    fn ingress_error(error: MediaIngressError) -> Error {
-        Error::backend_source(error)
+        metadata.source(error)
     }
     fn begin_ingress(
         &mut self,
@@ -603,8 +612,15 @@ where
     {
         // Unlike ordinary eager context construction, retained ingress performs
         // no text lookup while either replicated encoder runs.
-        Ok((group < 2 && tensor_partitions > 1 && pipeline_stages > 1)
-            .then(|| vec![Vec::new(); pipeline_stages]))
+        media_encoder_waves(group,tensor_partitions,pipeline_stages,
+            crate::composite_execution::graph::Destination(None)).map_err(|cause|cause.to_string())
+    }
+    fn media_group_collective_waves_with_metadata(
+        &self,_plan:&Self::IngressPlan,group:usize,tensor_partitions:usize,pipeline_stages:usize,
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,Error> {
+        media_encoder_waves(group,tensor_partitions,pipeline_stages,
+            crate::composite_execution::graph::Destination(Some(context)))
     }
     fn media_primary_ingress_collectives(
         &self,
@@ -612,9 +628,30 @@ where
         span: &eredu_runtime::prefill::PrefillChunk,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        media_ingress_waves(plan,span,self.args.text.hidden_size,tensor_partitions,
+            crate::composite_execution::graph::Destination(None)).map_err(|cause|cause.to_string())
+    }
+    fn media_primary_ingress_collectives_with_metadata(
+        &self,plan:&Self::IngressPlan,span:&eredu_runtime::prefill::PrefillChunk,tensor_partitions:usize,
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,Error> {
+        media_ingress_waves(plan,span,self.args.text.hidden_size,tensor_partitions,
+            crate::composite_execution::graph::Destination(Some(context)))
+    }
+}
+
+
+fn media_ingress_waves<T:Tensor>(
+    plan:&MediaPrefillPlan<T>,span:&eredu_runtime::prefill::PrefillChunk,hidden:i32,tensor_partitions:usize,
+    destination:crate::composite_execution::graph::Destination<'_>,
+)->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,Error> {
+    destination.controls::<(&MediaPrefillPlan<T>, &eredu_runtime::prefill::PrefillChunk,
+        i32, usize, u64, u64, u64, u64, u64, bool, Vec<u64>,
+        PreparedCompositeInput<'_, T, Gemma4InputPartPlan>,
+        Option<Vec<crate::composite_execution::CompositeTensorCollective>>)>()?;
         let mut offset = 0u64;
-        let mut positions = Vec::new();
-        for part in plan.input()?.admitted().gemma_parts() {
+        let mut positions = destination.vector(plan.prepared.parts().len())?;
+        for part in plan.input_with_diagnostic(|cause|destination.error(format_args!("{cause}")))?.admitted().gemma_parts() {
             let (length, text) = match part {
                 Gemma4InputPartPlan::TextTokens { positions } => (positions, true),
                 Gemma4InputPartPlan::Projected { positions, .. } => (positions, false),
@@ -627,7 +664,7 @@ where
             };
             let end = offset
                 .checked_add(length)
-                .ok_or("Gemma collective extent overflow")?;
+                .ok_or_else(||destination.error(format_args!("Gemma collective extent overflow")))?;
             let start = offset.max(span.input.start);
             let stop = end.min(span.input.end);
             if text && start < stop {
@@ -635,10 +672,18 @@ where
             }
             offset = end;
         }
-        crate::composite_execution::segmented_token_ingress_collectives(
+        crate::composite_execution::segmented_token_ingress_collectives_in(
             positions,
-            self.args.text.hidden_size,
+            hidden,
             tensor_partitions,
+            destination,
         )
-    }
+}
+fn media_encoder_waves(group:usize,tensor_partitions:usize,pipeline_stages:usize,
+    destination:crate::composite_execution::graph::Destination<'_>,
+)->Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,Error> {
+    destination.controls::<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>>()?;
+    if group<2 && tensor_partitions>1 && pipeline_stages>1 {
+        destination.try_collect((0..pipeline_stages).map(|_|destination.vector(0))).map(Some)
+    } else {Ok(None)}
 }

@@ -3,14 +3,20 @@ use super::*;
 use safemlx::{CpuBinaryOperation, CpuCopyEvalLayout, OperationEvent};
 use std::mem::{size_of, size_of_val};
 mod dense;
+mod program;
+mod router;
+pub(super) mod grouped;
 mod storage_copy;
+pub(super) mod host_transfer;
 mod pending_input;
 mod pointwise;
 mod integer_pointwise;
 mod integer_storage;
 mod embedding;
+mod expert_movement;
 mod normalization;
 mod activation;
+mod softplus;
 mod gated;
 mod views;
 mod byte_view;
@@ -31,6 +37,7 @@ mod indexed_elements;
 mod gelu;
 mod rope;
 mod attention;
+pub(super) mod blockwise;
 mod causal_mask;
 mod masked_readout;
 mod numerical_random;
@@ -59,6 +66,16 @@ impl MlxCpuWorkspaceMechanisms {
         self,
         operation: WorkspaceOperationView<'_>,
     ) -> facts::FactResult<Option<OperationPlan>> {
+        if matches!(operation.kind, WorkspaceOperationKindView::GroupSelection { .. } | WorkspaceOperationKindView::JointGroupSelection(_)) {
+            return router::inspect(operation, self);
+        }
+        if matches!(operation.kind, WorkspaceOperationKindView::Grouped { .. }) {
+            return grouped::inspect(operation, self);
+        }
+        if matches!(operation.kind,WorkspaceOperationKindView::BlockwiseAttention{..}) {
+            return blockwise::inspect(operation,self);
+        }
+        if let Some(plan)=host_transfer::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=storage_copy::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=pending_input::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=zero_fill::inspect(operation,self)? {return Ok(Some(plan));}
@@ -77,10 +94,14 @@ impl MlxCpuWorkspaceMechanisms {
         if let Some(plan) = embedding::inspect(operation, self)? {
             return Ok(Some(plan));
         }
+        if let Some(plan)=expert_movement::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan) = normalization::inspect(operation, self)? {
             return Ok(Some(plan));
         }
         if let Some(plan) = activation::inspect(operation, self)? {
+            return Ok(Some(plan));
+        }
+        if let Some(plan) = softplus::inspect(operation, self)? {
             return Ok(Some(plan));
         }
         if let Some(plan) = gated::inspect(operation, self)? {
@@ -115,6 +136,9 @@ impl MlxCpuWorkspaceMechanisms {
         operation: WorkspaceOperationView<'_>,
         sink: &mut facts::Emitter<'_>,
     ) -> facts::FactResult<Option<WorkspaceOperationFacts>> {
+        if matches!(operation.kind, WorkspaceOperationKindView::ParameterPlaceholder) {
+            return basic::emit_parameter_placeholder(operation, self.allocation, sink).map(Some);
+        }
         if matches!(operation.kind,WorkspaceOperationKindView::ValueCompletion|WorkspaceOperationKindView::ValueRetention) {
             if value_frontier(operation).is_none(){return Ok(None);}
             return basic::emit(operation,self.allocation,sink);
@@ -126,9 +150,22 @@ impl MlxCpuWorkspaceMechanisms {
         let Some(plan) = self.plan(operation)? else {
             return Ok(None);
         };
-        if matches!(operation.kind, WorkspaceOperationKindView::Contiguous) {
-            // Row layout alone does not prove a shape-sized backing. Native
-            // Contiguous may reuse the exact input or copy its logical extent.
+        if matches!(operation.kind,WorkspaceOperationKindView::HostStoreFloating(..)) {
+            // The accepted Host destination is not a new Device tensor output.
+        } else if matches!(operation.kind, WorkspaceOperationKindView::GroupSelection { .. } | WorkspaceOperationKindView::JointGroupSelection(_)) {
+            router::emit_outputs(operation,self,sink)?;
+        } else if matches!(operation.kind, WorkspaceOperationKindView::Grouped { .. }) {
+            grouped::emit_outputs(operation, self, sink)?;
+        } else if matches!(operation.kind, WorkspaceOperationKindView::BlockwiseAttention{..}) {
+            blockwise::emit_outputs(operation,self,sink)?;
+        } else if matches!(operation.kind, WorkspaceOperationKindView::Contiguous)
+            || (matches!(operation.kind, WorkspaceOperationKindView::View("reshape"))
+                && plan.alias_input.is_none()
+                && operation.outputs.get(0).is_some_and(|v|
+                    matches!(v.dtype(),WorkspaceDtype::Int32|WorkspaceDtype::Uint32))) {
+            // Without complete stride evidence, the actual worker may retain
+            // the full input backing or copy its logical extent. Keep both
+            // storage possibilities, including integer reshape aliases.
             sink.output(facts::Output::AllocateOrAliasInputs {
                 bytes: plan.output_bytes, inputs: facts::Aliases::Slice(&[0]),
             })?;
@@ -152,6 +189,9 @@ impl MlxCpuWorkspaceMechanisms {
         operation: WorkspaceOperationView<'_>,
         sink: &mut facts::HostEmitter<'_>,
     ) -> facts::FactResult<Option<WorkspaceHostFacts>> {
+        if matches!(operation.kind, WorkspaceOperationKindView::ParameterPlaceholder) {
+            return basic::emit_parameter_placeholder_host(operation, sink).map(Some);
+        }
         if matches!(operation.kind,WorkspaceOperationKindView::ValueCompletion|WorkspaceOperationKindView::ValueRetention) {
             if value_frontier(operation).is_none(){return Ok(None);}
             return sink.finish(0,format_args!("borrowed value completion/retention has no host numerical payload; actual CPU root and traversal controls are separately priced")).map(Some);
@@ -170,40 +210,37 @@ impl MlxCpuWorkspaceMechanisms {
     }
 }
 impl WorkspaceMechanisms for MlxCpuWorkspaceMechanisms {
+    fn grouped_observation_schedule(&self, bank: &WorkspaceGroupedBank, tokens: u32)
+        -> Result<Option<WorkspaceGroupedObservationSchedule>, Error> {
+        super::grouped::observation_schedule(bank, tokens)
+    }
+
     fn output_representation(
         &self,
         operation: WorkspaceOperationView<'_>,
         output: usize,
     ) -> Option<WorkspaceRepresentation> {
-        if output != 0 && !matches!(operation.kind, WorkspaceOperationKindView::CandidateExtraction { .. }) {
+        if output != 0 && !matches!(operation.kind, WorkspaceOperationKindView::CandidateExtraction { .. }
+            | WorkspaceOperationKindView::BlockwiseAttention{..} | WorkspaceOperationKindView::Grouped { .. }
+            | WorkspaceOperationKindView::GroupSelection { .. } | WorkspaceOperationKindView::JointGroupSelection(_)) {
             return None;
         }
         let plan = match self.plan(operation) {
             Ok(Some(plan)) => plan,
-            refused => {
-                // Temporary opt-in attribution for a floating source which
-                // becomes Unknown before a collective can finish its trace.
-                if operation.outputs.get(output).is_some_and(|value| value.dtype() == WorkspaceDtype::Float32)
-                    && std::env::var_os("EREDU_CPU_WORKSPACE_SOURCE_TRACE").is_some() {
-                    eprintln!("CPU_WORKSPACE_SOURCE_REFUSAL kind={:?} error={:?}", operation.kind, refused.err());
-                    for (index, input) in operation.inputs.iter().enumerate() {
-                        eprintln!("CPU_WORKSPACE_SOURCE_INPUT index={index} shape={:?} dtype={:?} representation={:?}",
-                            input.shape(), input.dtype(), input.representation());
-                    }
-                    if let Some(value) = operation.outputs.get(output) {
-                        eprintln!("CPU_WORKSPACE_SOURCE_OUTPUT shape={:?} dtype={:?} representation={:?}",
-                            value.shape(), value.dtype(), value.representation());
-                    }
-                }
-                return None;
-            }
+            _ => return None,
         };
+        if matches!(operation.kind,WorkspaceOperationKindView::BlockwiseAttention{..}) {
+            return blockwise::representation(operation,output);
+        }
+        if matches!(operation.kind,WorkspaceOperationKindView::GroupSelection { .. } | WorkspaceOperationKindView::JointGroupSelection(_)) {
+            return router::representation(operation,output);
+        }
         if matches!(operation.kind,WorkspaceOperationKindView::View(name) if super::byte_view::selected(name).is_some()) {
             return byte_view::representation(operation);
         }
         if let Some(input)=plan.alias_input {
             let representation=operation.inputs.get(input)?.representation()?;
-            return Some(if matches!(operation.kind,WorkspaceOperationKindView::View("transpose")|WorkspaceOperationKindView::Transpose(_)) {
+            return Some(if matches!(operation.kind,WorkspaceOperationKindView::Transpose(_)) {
                 views::transpose_representation(operation,representation)
             } else if matches!(operation.kind,WorkspaceOperationKindView::View("reshape"))
                 && !representation.row_contiguous() {
@@ -266,25 +303,41 @@ impl WorkspaceFactMechanisms for MlxCpuWorkspaceMechanisms {
     }
 }
 
-/// Additive actual CPU Eval producers excluding the final Synchronizer. Every
-/// source contributes its owning bank once per quoted completion, including
-/// possible worker scratch; no donation or early-retirement credit is used.
+/// Additive frontend construction and actual CPU Eval populations, excluding
+/// the final Synchronizer. Every source contributes its owning bank once per
+/// quoted completion, including possible worker scratch; no donation or
+/// early-retirement credit is used.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct CpuPopulation {
+    /// Frontend constructor candidates, including identity calls whose temporary
+    /// vectors still use the graph bank although no Eval is constructed.
+    pub(super) construction_entries: usize,
+    /// Actual native Eval producers used by tape and traversal storage.
     pub(super) primitives: usize,
     pub(super) input_edges: usize,
+    /// Retained native operands hidden inside a composite equation. These
+    /// extend traversal storage, but are never new backing births or seeds.
+    pub(super) hidden_leaves: usize,
+    pub(super) maximum_operands: usize,
+    /// Peak Data-publication captures inside one actual native Eval. The
+    /// record clears these between primitives; repeated Evals reuse capacity.
+    pub(super) maximum_captures: usize,
     pub(super) births: usize,
     pub(super) extents: usize,
     pub(super) controls: usize,
 }
 impl CpuPopulation {
-    fn copy(&mut self, source: CpuCopyEvalLayout, inputs: usize) -> Option<()> {
+    pub(super) fn copy(&mut self, source: CpuCopyEvalLayout, inputs: usize) -> Option<()> {
         if source.signal_graph_allocation_extents() != 0 {
             return None;
         }
         self.add(Self {
+            construction_entries: 1,
             primitives: 1,
             input_edges: inputs,
+            hidden_leaves: 0,
+            maximum_operands: inputs,
+            maximum_captures: 0,
             births: source.backing_births(),
             extents: source
                 .graph_allocation_extents()
@@ -292,10 +345,27 @@ impl CpuPopulation {
             controls: source.control_bytes()?,
         })
     }
+    fn concatenate(&mut self, source: CpuCopyEvalLayout, inputs: usize) -> Option<()> {
+        if inputs < 2 || source.backing_births() > 1 { return None; }
+        // Concatenate::eval_cpu publishes one output Data, including an empty
+        // output with no physical birth, then each unchanged
+        // copy_cpu_inplace job makes two unsafe_weak_copy Data publications.
+        // out_slice.copy_shared_buffer aliases directly and adds no capture.
+        let captures = inputs.checked_mul(2)?.checked_add(1)?;
+        let controls = size_of::<(&mut Self, CpuCopyEvalLayout, usize, usize, Option<usize>, Option<()>)>();
+        self.copy(source, inputs)?;
+        self.maximum_captures = self.maximum_captures.max(captures);
+        self.controls = self.controls.checked_add(controls)?;
+        Some(())
+    }
     fn binary(&mut self, source: safemlx::CpuBinaryEvalLayout) -> Option<()> {
         self.add(Self {
+            construction_entries: 1,
             primitives: 1,
             input_edges: 2,
+            hidden_leaves: 0,
+            maximum_operands: 2,
+            maximum_captures: 0,
             births: source.backing_births(),
             extents: source
                 .graph_allocation_extents()
@@ -305,8 +375,12 @@ impl CpuPopulation {
     }
     fn unary(&mut self, source: safemlx::CpuUnaryEvalLayout) -> Option<()> {
         self.add(Self {
+            construction_entries: 1,
             primitives: 1,
             input_edges: 1,
+            hidden_leaves: 0,
+            maximum_operands: 1,
+            maximum_captures: 0,
             births: source.backing_births(),
             extents: source
                 .graph_allocation_extents()
@@ -316,8 +390,12 @@ impl CpuPopulation {
     }
     pub(super) fn add(&mut self, other: Self) -> Option<()> {
         let combined = Self {
+            construction_entries: self.construction_entries.checked_add(other.construction_entries)?,
             primitives: self.primitives.checked_add(other.primitives)?,
             input_edges: self.input_edges.checked_add(other.input_edges)?,
+            hidden_leaves: self.hidden_leaves.checked_add(other.hidden_leaves)?,
+            maximum_operands: self.maximum_operands.max(other.maximum_operands),
+            maximum_captures: self.maximum_captures.max(other.maximum_captures),
             births: self.births.checked_add(other.births)?,
             extents: self.extents.checked_add(other.extents)?,
             controls: self.controls.checked_add(other.controls)?,

@@ -207,7 +207,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
                 },
                 context,
             )
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
 
     /// Executes provider-backed rank-local TP work and performs one reduction.
@@ -238,7 +238,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
 }

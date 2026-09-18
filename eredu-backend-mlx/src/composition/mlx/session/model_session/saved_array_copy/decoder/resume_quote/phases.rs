@@ -26,9 +26,9 @@ pub(super) struct Traced {
     text_interventions:Option<PreparedTextInterventions>,
 }
 #[inline(never)]
-pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextComponents,
+pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&child::Source<'_, '_>,
     config:TextGenerationConfig,controller:TextControllerWorkspace<'_>,host:Option<&eredu_core::HostPreparationAuthority>,
-    planning_metadata:Option<&WorkspaceMetadataFunding>)->Result<Inputs,Error> {
+    planning_metadata:Option<&HostMetadataFunding>)->Result<Inputs,Error> {
         let original = host.is_some();
         let memory = |cause: WorkingMemoryError| planned_error(cause, planning_metadata);
         let unknown = || memory(WorkingMemoryError::UnknownBound);
@@ -107,10 +107,8 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
         {
             return Err(memory(WorkingMemoryError::PreparationConfigurationMismatch));
         }
-        let pending_plan = source
-            .sampling
-            .prepare_pending_tokens()
-            .map_err(|cause| planned_error(cause, planning_metadata))?;
+        let pending_plan = if geometry.max_output_tokens == 0 { None } else { source
+            .sampling.prepare_pending_tokens().map_err(|cause| planned_error(cause, planning_metadata))? };
         if pending_plan.is_none() && !original {
             return Err(unknown());
         }
@@ -153,7 +151,7 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
             None => {
                 let mut complete_source =
                     DecoderCopyOwner::Saved(source.decoder.clone()).complete_storage()?;
-                for array in binding.key().into_iter().chain(binding.pending()) {
+                for array in binding.key().into_iter().chain(binding.pending().filter(|_| geometry.max_output_tokens > 0)) {
                     complete_source.include_array(array)?;
                 }
                 let registered_source = complete_source.pin_registered(pool)?;
@@ -231,7 +229,7 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
         // Unobserved serial resume traces resident-shaped parameter equations.
         // Bind its exact unit source while this Context is still untouched,
         // before any saved-state copy or begin_state_span makes extension late.
-        let prepared_parameters = if original && pending_plan.is_some()
+        let prepared_parameters = if original && geometry.max_output_tokens > 0 && pending_plan.is_some()
             && workspace.parallel().is_none() && source.capture_checkpoint().is_none()
         {
             Some(model.prepare_saved_parameter_source(context)?)
@@ -240,7 +238,7 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
         };
         // Install the exact immutable B root selection before the first copy
         // or equation span on this Context. It never credits copied state/key.
-        let prepared_media = if pending_plan.is_none() {
+        let prepared_media = if pending_plan.is_none() && geometry.max_output_tokens > 0 {
             Some(media::prepare(runtime, source, geometry, &context)?)
         } else {
             if original {
@@ -345,7 +343,7 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
                     Ok(())
                 })
                 .map_err(|cause| planned_error(cause, planning_metadata))?;
-            for array in binding.key().into_iter().chain(binding.pending()) {
+            for array in binding.key().into_iter().chain(binding.pending().filter(|_| geometry.max_output_tokens > 0)) {
                 if failure.is_none() {
                     failure = census.push_retained_source(array).err();
                 }
@@ -385,7 +383,7 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
                 match &pending_plan {
                     Some(pending) => census.finish_resume_input_on(pending.numerical(),runtime.backend().stream()),
                     None => census.finish_resume_completed_input_on(
-                        std::num::NonZeroU64::new(geometry.input_positions).ok_or_else(unknown)?,
+                        geometry.input_positions,
                         runtime.backend().stream(),
                     ),
                 }
@@ -402,8 +400,8 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextCo
             sampling_copy,copied_key,copied_input,random,copy_preparation,registered_source,workspace,prepared_parameters })
 }
 #[inline(never)]
-pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextComponents,
-    controller:TextControllerWorkspace<'_>,mut inputs:Inputs,planning_metadata:Option<&WorkspaceMetadataFunding>)
+pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&child::Source<'_, '_>,
+    controller:TextControllerWorkspace<'_>,mut inputs:Inputs,planning_metadata:Option<&HostMetadataFunding>)
     ->Result<Traced,Error> {
         let memory=|cause:WorkingMemoryError|planned_error(cause,planning_metadata);
         let unknown=||memory(WorkingMemoryError::UnknownBound);
@@ -431,7 +429,32 @@ pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextComp
         // This keeps the existing roots and cumulative metadata funding intact.
         context.begin_span();
         let (generation, layerwise, native_recipe, media_storage) = if original {
-            let (generation, layerwise, mut recipe, media_storage) = if inputs.pending_host_bytes.is_none() {
+            let (generation, layerwise, mut recipe, media_storage) = if geometry.max_output_tokens == 0 {
+                if let Some(edits) = interventions {
+                    edits.prepare_range(source.sampling.next_prediction, 0, context)?;
+                }
+                let equations = eredu_runtime::working_memory::quote_inference_workspace_with_context(
+                    geometry, context, |_| -> Result<WorkspaceTraceReport, Error> { Err(unknown()) })
+                    .map_err(|cause| planned_error(cause, planning_metadata))?;
+                let input = source.sampling.arrays.source.sampling_input.ok_or_else(unknown)?;
+                let layout = context.layout(input.shape(), eredu_nn::workspace::WorkspaceDtype::Float32)?;
+                let quote_sampling = |recorder: &mut dyn eredu_runtime::working_memory::SamplingWorkspaceObserver| {
+                    eredu_runtime::working_memory::quote_sampling_workspace_with_observer(
+                        binding.sampler(), source.sampling.temperature, inputs.random.as_ref(), input.source(&layout)?,
+                        controller.filter, 0, context, Some(recorder))
+                };
+                let (sampling, recipe) = if let Some(parallel) = inputs.workspace.parallel() {
+                    let mut recorder = parallel.recorder(geometry)?;
+                    let sampling = quote_sampling(&mut recorder)?;
+                    (sampling, recorder.finish(equations.span_workspace_plan())?)
+                } else {
+                    let mechanisms = model.resident_workspace_mechanisms().ok_or_else(unknown)?;
+                    let mut recorder = mechanisms.recorder(geometry, context)?;
+                    let sampling = quote_sampling(&mut recorder)?;
+                    (sampling, recorder.finish(equations.span_workspace_plan())?)
+                };
+                (PreparedTextGenerationWorkspace { equations, sampling }, None, recipe, None)
+            } else if inputs.pending_host_bytes.is_none() {
                 let media = media::quote(
                     runtime,
                     source,
@@ -442,6 +465,7 @@ pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextComp
                     inputs.prepared_media.take().ok_or_else(unknown)?,
                     inputs.workspace.addressable(),
                     interventions,
+                    inputs.workspace.parallel(),
                 )?;
                 (
                     media.generation,
@@ -488,9 +512,9 @@ pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&CopiedTextComp
             text_interventions:intervention_rows.into_inner() })
 }
 #[inline(never)]
-pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&'a CopiedTextComponents,
+pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&child::Source<'a, '_>,
     config:TextGenerationConfig,controller:TextControllerWorkspace<'_>,traced:Traced,
-    planning_metadata:Option<&WorkspaceMetadataFunding>)->Result<PreparedSavedTextResumeQuote<'a>,Error> {
+    planning_metadata:Option<&HostMetadataFunding>)->Result<PreparedSavedTextResumeQuote<'a>,Error> {
         let memory=|cause:WorkingMemoryError|planned_error(cause,planning_metadata);
         let unknown=||memory(WorkingMemoryError::UnknownBound);
         let session=runtime.session();let model=&session.payload.model;let pool=runtime.backend().memory_pool();
@@ -530,7 +554,7 @@ pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&'a Copied
         {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
-        let state_input = match source.sampling.pending_media() {
+        let state_input = match source.sampling.pending_media().filter(|_| geometry.max_output_tokens > 0) {
             Some(media) => media
                 .packet()
                 .borrowed_semantics()
@@ -557,10 +581,8 @@ pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&'a Copied
         let state = report_metadata
             .state_from_facts(state)
             .map_err(report_error)?;
-        let state = generation
-            .equations
-            .refine_state_backing_metadata(state, report_metadata)
-            .map_err(report_error)?;
+        let state = if geometry.max_output_tokens == 0 { state } else { generation
+            .equations.refine_state_backing_metadata(state, report_metadata).map_err(report_error)? };
         let native_copy = full_span(
             &sampling_copy,
             "complete saved pending-token isolation/reshape/cast; no source credit",
@@ -642,6 +664,7 @@ pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&'a Copied
                 state,
                 outside,
                 opening_rows,
+                !source_native.paged_sources().is_empty(),
                 paged_host_facts,
                 source
                     .capture_checkpoint()
@@ -678,7 +701,8 @@ pub(super) fn finish<'a>(runtime:&ModelRuntime<MlxBackend<'_>>,source:&'a Copied
             && !source_native.paged_sources().is_empty())
         .then(|| context.clone());
         Ok(PreparedSavedTextResumeQuote {
-            source,
+            source: source.saved,
+            child_capture: None,
             geometry,
             state_input,
             config,
@@ -711,8 +735,8 @@ pub(super) fn control_bytes()->Option<usize> {
         size_of::<Result<Inputs,Error>>(),size_of::<Result<Traced,Error>>(),
         size_of::<eredu_runtime::SharedStateLayout>(),size_of::<Option<u64>>(),
         size_of::<(&ModelRuntime<MlxBackend<'_>>,&CopiedTextComponents,TextGenerationConfig,TextControllerWorkspace<'_>,
-            Option<&eredu_core::HostPreparationAuthority>,Option<&WorkspaceMetadataFunding>)>(),
-        size_of::<(&ModelRuntime<MlxBackend<'_>>,&CopiedTextComponents,TextControllerWorkspace<'_>,Inputs,Option<&WorkspaceMetadataFunding>)>(),
-        size_of::<(&ModelRuntime<MlxBackend<'_>>,&CopiedTextComponents,TextGenerationConfig,TextControllerWorkspace<'_>,Traced,Option<&WorkspaceMetadataFunding>)>()];
+            Option<&eredu_core::HostPreparationAuthority>,Option<&HostMetadataFunding>)>(),
+        size_of::<(&ModelRuntime<MlxBackend<'_>>,&CopiedTextComponents,TextControllerWorkspace<'_>,Inputs,Option<&HostMetadataFunding>)>(),
+        size_of::<(&ModelRuntime<MlxBackend<'_>>,&CopiedTextComponents,TextGenerationConfig,TextControllerWorkspace<'_>,Traced,Option<&HostMetadataFunding>)>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }

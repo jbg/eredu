@@ -4,7 +4,7 @@ use derivre::{JsonQuoteOptions, Regex, RegexAst, RegexBuilder};
 const REL_FUEL: u64 = 1_000_000;
 
 fn mk_and(a: &str, b: &str, json: bool, fuel: u64) -> Result<Regex> {
-    let mut bld = RegexBuilder::new();
+    let mut bld = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let a = RegexAst::ExprRef(bld.mk_regex(a).unwrap());
     let b = RegexAst::ExprRef(bld.mk_regex(b).unwrap());
     let mut ast = RegexAst::And(vec![a, b]);
@@ -12,11 +12,11 @@ fn mk_and(a: &str, b: &str, json: bool, fuel: u64) -> Result<Regex> {
         ast = RegexAst::JsonQuote(Box::new(ast), JsonQuoteOptions::regular())
     }
     let r = bld.mk(&ast).unwrap();
-    bld.to_regex_limited(r, fuel)
+    Ok(bld.to_regex_limited(r, fuel)?)
 }
 
 fn is_contained_in(small: &str, big: &str) -> bool {
-    RegexBuilder::new()
+    RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap()
         // .unicode(false)
         // .utf8(false)
         .is_contained_in(small, big, REL_FUEL)
@@ -28,7 +28,7 @@ fn is_contained_in_prefixes(small: &str, big: &str) -> bool {
 }
 
 fn is_contained_in_prefixes_except(small: &str, big: &str, except: &str) -> bool {
-    let mut bld = RegexBuilder::new();
+    let mut bld = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     // bld.unicode(false).utf8(false);
     let mut big = RegexAst::Regex(big.to_string());
     if !except.is_empty() {
@@ -49,10 +49,10 @@ fn check_empty_limited(a: &str, b: &str, json: bool, fuel: u64) {
     let mut r = mk_and(a, b, json, fuel).unwrap();
     assert!(r.always_empty());
 
-    let mut r = Regex::new(a).unwrap();
+    let mut r = Regex::new(a, derivre::ParserAllocationFunding::unenforced()).unwrap();
     assert!(!r.always_empty());
 
-    let mut r = Regex::new(b).unwrap();
+    let mut r = Regex::new(b, derivre::ParserAllocationFunding::unenforced()).unwrap();
     assert!(!r.always_empty());
 }
 
@@ -63,10 +63,10 @@ fn check_empty_or_failing_limited(a: &str, b: &str, json: bool, fuel: u64) {
         assert!(r.always_empty());
     }
 
-    let mut r = Regex::new(a).unwrap();
+    let mut r = Regex::new(a, derivre::ParserAllocationFunding::unenforced()).unwrap();
     assert!(!r.always_empty());
 
-    let mut r = Regex::new(b).unwrap();
+    let mut r = Regex::new(b, derivre::ParserAllocationFunding::unenforced()).unwrap();
     assert!(!r.always_empty());
 }
 
@@ -179,10 +179,10 @@ fn test_contains() {
 
     // expecting this to be exponential
     // the actual cost is around 1M
-    let r = RegexBuilder::new().is_contained_in(r".*A.{8}", r".*[AB].{8}", 100_000);
+    let r = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap().is_contained_in(r".*A.{8}", r".*[AB].{8}", 100_000);
     assert!(r.is_err());
 
-    let r = RegexBuilder::new().is_contained_in(r".*A.{8}", r".*[AB].{8}", 5_000_000);
+    let r = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap().is_contained_in(r".*A.{8}", r".*[AB].{8}", 5_000_000);
     assert!(r.unwrap());
 }
 
@@ -286,14 +286,14 @@ fn test_emptiness_repeats() {
 #[test]
 fn test_multiple_of() {
     for d in 1..=300 {
-        let mut r = RegexBuilder::new();
+        let mut r = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let id = r.mk(&RegexAst::MultipleOf(d, 0)).unwrap();
-        let mut rx = r.to_regex(id);
-        assert!(!rx.is_match(""));
-        assert!(!rx.is_match("-1"));
+        let mut rx = r.to_regex(id).unwrap();
+        assert!(!rx.is_match("").unwrap());
+        assert!(!rx.is_match("-1").unwrap());
         for t in 0..(7 * d) {
             let s = format!("{}", t);
-            assert_eq!(rx.is_match(&s), t % d == 0, "{} % {} == {}", t, d, t % d);
+            assert_eq!(rx.is_match(&s).unwrap(), t % d == 0, "{} % {} == {}", t, d, t % d);
         }
     }
 }
@@ -302,11 +302,11 @@ fn test_multiple_of() {
 fn test_multiple_of_fractional() {
     for d in 1..=300 {
         for scale in 1..=5 {
-            let mut r = RegexBuilder::new();
+            let mut r = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
             let id = r.mk(&RegexAst::MultipleOf(d, scale)).unwrap();
-            let mut rx = r.to_regex(id);
-            assert!(!rx.is_match(""));
-            assert!(!rx.is_match("-1"));
+            let mut rx = r.to_regex(id).unwrap();
+            assert!(!rx.is_match("").unwrap());
+            assert!(!rx.is_match("-1").unwrap());
             let scale_factor = 10u32.pow(scale);
             for t in 0..(7 * d) {
                 let integer_part = t / scale_factor;
@@ -317,21 +317,21 @@ fn test_multiple_of_fractional() {
                     fractional_part,
                     width = scale as usize
                 );
-                assert_eq!(rx.is_match(&s), t % d == 0, "{} % {} == {}", t, d, t % d);
+                assert_eq!(rx.is_match(&s).unwrap(), t % d == 0, "{} % {} == {}", t, d, t % d);
             }
         }
     }
 }
 
 fn remainder_is_check(should_be_empty: bool, d: u32, s: u32, other_rx: &str) {
-    let mut bld = RegexBuilder::new();
+    let mut bld = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let id = bld
         .mk(&RegexAst::And(vec![
             RegexAst::Regex(other_rx.to_string()),
             RegexAst::MultipleOf(d, s),
         ]))
         .unwrap();
-    let mut rx = bld.to_regex(id);
+    let mut rx = bld.to_regex(id).unwrap();
     if rx.always_empty() != should_be_empty {
         panic!("empty({} % & {:?}) != {}", d, other_rx, should_be_empty);
     }

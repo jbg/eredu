@@ -1,16 +1,18 @@
 //! Paid actual lexical input attached to the same original grammar/slicer owner.
-mod forcing;
-mod copy;
 mod active;
 mod controller;
+mod copy;
+mod forcing;
 pub(crate) use controller::OriginalPreparedGrammarController;
 pub(in crate::runtime::chat::constraints) use controller::OriginalPreparedGrammarControllerError;
 mod startup;
-pub(in crate::runtime::chat::constraints) use active::{OriginalGrammarState, OriginalGrammarStateError, OriginalGrammarStateCopyError, OriginalGrammarStateConstructionError};
-pub(in crate::runtime::chat::constraints) use startup::OriginalGrammarStartupError;
-pub(in crate::runtime::chat::constraints) use copy::OriginalGrammarTokenParserCopyError;
 use super::{OriginalGrammarSlicer, OriginalGrammarVocabulary};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+pub(in crate::runtime::chat::constraints) use active::{
+    OriginalGrammarState, OriginalGrammarStateConstructionError, OriginalGrammarStateCopyError,
+    OriginalGrammarStateError,
+};
+pub(in crate::runtime::chat::constraints) use copy::OriginalGrammarTokenParserCopyError;
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 pub(in crate::runtime::chat::constraints) use forcing::{
     OriginalGrammarForcedTokens, OriginalGrammarForcingError,
 };
@@ -21,6 +23,7 @@ use llguidance::{
         LexerInputFailure, LexerRootPlan, LexerRootSource, LexerSpec, RegexVectorInput,
     },
 };
+pub(in crate::runtime::chat::constraints) use startup::OriginalGrammarStartupError;
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +31,7 @@ enum Cause {
     #[error("original lexical input control geometry overflow")]
     Overflow,
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Source(#[from] super::super::declaration::Cause),
     #[error(transparent)]
@@ -78,7 +81,7 @@ impl OriginalGrammarSlicer {
                 size_of::<Result<RegexVectorInput, LexerInputFailure>>(),
                 size_of::<Result<RegexVectorInput, Cause>>(),
                 size_of::<Result<OriginalGrammarLexerInputs, OriginalGrammarLexerInputError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<Result<usize, super::super::declaration::Cause>>(),
             ];
             funding.reserve_metadata(
@@ -128,10 +131,10 @@ impl OriginalGrammarLexerInputs {
 use llguidance::{
     api::ParserLimits,
     earley::regexvec::{
+        LexemeSet, StateID,
         prepared::{
             PreparedRegexVector, PreparedRegexVectorError, PreparedRegexVectorOperationError,
         },
-        LexemeSet, StateID,
     },
 };
 
@@ -140,26 +143,24 @@ enum VectorCause {
     #[error("original lexical vector control geometry overflow")]
     Overflow,
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error("{0}")]
     BackingFunding(
         #[from]
-        llguidance::derivre::raw::HashConsFundingPreparationError<WorkspaceMetadataFundingError>,
+        llguidance::derivre::raw::ParserAllocationPreparationError<HostMetadataFundingError>,
     ),
     #[error("{0}")]
-    Vector(#[from] PreparedRegexVectorError<WorkspaceMetadataFundingError>),
+    Vector(#[from] PreparedRegexVectorError<HostMetadataFundingError>),
     #[error(transparent)]
-    VectorOperation(#[from] PreparedRegexVectorOperationError<WorkspaceMetadataFundingError>),
+    VectorOperation(#[from] PreparedRegexVectorOperationError<HostMetadataFundingError>),
     #[error("{0}")]
-    Lexer(#[from] PreparedLexerError<WorkspaceMetadataFundingError>),
+    Lexer(#[from] PreparedLexerError<HostMetadataFundingError>),
     #[error(transparent)]
-    LexerOperation(#[from] PreparedLexerOperationError<WorkspaceMetadataFundingError>),
+    LexerOperation(#[from] PreparedLexerOperationError<HostMetadataFundingError>),
     #[error("{0}")]
-    Earley(#[from] llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>),
+    Earley(#[from] llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>),
     #[error(transparent)]
-    TokenParser(
-        #[from] llguidance::earley::PreparedTokenParserError<WorkspaceMetadataFundingError>,
-    ),
+    TokenParser(#[from] llguidance::earley::PreparedTokenParserError<HostMetadataFundingError>),
 }
 /// Actual initialized lexical state with original declaration/vocabulary/funding
 /// custody retained after every expression, root, mask and state destination.
@@ -191,26 +192,23 @@ impl OriginalGrammarLexerInputs {
                 size_of::<OriginalGrammarLexerVectorError>(),
                 size_of::<VectorCause>(),
                 size_of::<Option<RegexVectorInput>>(),
-                size_of::<WorkspaceMetadataFunding>(),
-                size_of::<llguidance::derivre::raw::PreparedHashConsFunding>(),
+                size_of::<HostMetadataFunding>(),
+                size_of::<llguidance::derivre::raw::ParserAllocationFunding>(),
                 size_of::<
                     Result<
-                        llguidance::derivre::raw::PreparedHashConsFunding,
-                        llguidance::derivre::raw::HashConsFundingPreparationError<
-                            WorkspaceMetadataFundingError,
+                        llguidance::derivre::raw::ParserAllocationFunding,
+                        llguidance::derivre::raw::ParserAllocationPreparationError<
+                            HostMetadataFundingError,
                         >,
                     >,
                 >(),
                 size_of::<&mut ParserLimits>(),
                 size_of::<ParserLimits>(),
                 size_of::<
-                    Result<
-                        PreparedRegexVector,
-                        PreparedRegexVectorError<WorkspaceMetadataFundingError>,
-                    >,
+                    Result<PreparedRegexVector, PreparedRegexVectorError<HostMetadataFundingError>>,
                 >(),
                 size_of::<Result<OriginalGrammarLexerVector, OriginalGrammarLexerVectorError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             source.vocabulary().funding.reserve_metadata(
                 frames
@@ -220,7 +218,7 @@ impl OriginalGrammarLexerInputs {
             )?;
             let funding = source.vocabulary().funding.clone();
             let backing =
-                llguidance::derivre::raw::PreparedHashConsFunding::prepare(move |bytes| {
+                llguidance::derivre::raw::ParserAllocationFunding::prepare(move |bytes| {
                     funding.reserve_metadata(bytes)
                 })?;
             Ok(PreparedRegexVector::prepare_with_backing(
@@ -255,30 +253,28 @@ impl OriginalGrammarLexerVector {
     where
         F: FnOnce(
             &mut PreparedRegexVector,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         )
-            -> Result<T, PreparedRegexVectorOperationError<WorkspaceMetadataFundingError>>,
+            -> Result<T, PreparedRegexVectorOperationError<HostMetadataFundingError>>,
     {
         let funding = &self.source.vocabulary().funding;
-        let result = (|| -> Result<T, VectorCause> {
+        let result = (|| -> Result<T, OperationCause> {
             let frames = [
                 size_of::<OriginalGrammarLexerOperationError>(),
-                size_of::<VectorCause>(),
-                size_of::<WorkspaceMetadataFunding>(),
+                size_of::<OperationCause>(),
+                size_of::<HostMetadataFunding>(),
                 size_of::<&mut Self>(),
                 size_of::<F>(),
                 size_of::<Result<T, OriginalGrammarLexerOperationError>>(),
-                size_of::<
-                    Result<T, PreparedRegexVectorOperationError<WorkspaceMetadataFundingError>>,
-                >(),
-                size_of::<Result<T, VectorCause>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<T, PreparedRegexVectorOperationError<HostMetadataFundingError>>>(),
+                size_of::<Result<T, OperationCause>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             funding.reserve_metadata(
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
-                    .ok_or(VectorCause::Overflow)?,
+                    .ok_or(OperationCause::Overflow)?,
             )?;
             Ok(run(&mut self.vector, funding)?)
         })();
@@ -352,12 +348,27 @@ impl OriginalGrammarLexerVector {
 }
 /// An escaped operation error may own a failed mask allocation. Its actual
 /// funding account remains live after the lexical owner itself is dropped.
+// Mutable operations retain their actual lexer/chart in the owning caller.
+// Cold constructor failures must not enlarge every token callback's transport.
+#[derive(Debug, thiserror::Error)]
+enum OperationCause {
+    #[error("original lexical operation control geometry overflow")]
+    Overflow,
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
+    #[error(transparent)]
+    Lexer(#[from] PreparedLexerOperationError<HostMetadataFundingError>),
+    #[error(transparent)]
+    TokenParser(#[from] llguidance::earley::PreparedTokenParserError<HostMetadataFundingError>),
+    #[error(transparent)]
+    Vector(#[from] PreparedRegexVectorOperationError<HostMetadataFundingError>),
+}
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarLexerOperationError {
     #[source]
-    cause: VectorCause,
-    funding: WorkspaceMetadataFunding,
+    cause: OperationCause,
+    funding: HostMetadataFunding,
 }
 
 use llguidance::earley::{
@@ -367,10 +378,12 @@ use llguidance::earley::{
 /// slicer and source funding. The already copied LexerSpec remains in that source.
 #[derive(Debug)]
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarLexer {
-    lexer: PreparedLexer,
+    // The existing constructor and independent copy admit this cell before allocation.
+    // Token operations move only its owner, never the full lexical tables.
+    lexer: Box<PreparedLexer>,
     limits: ParserLimits,
     source: std::sync::Arc<OriginalGrammarSlicer>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
@@ -394,18 +407,20 @@ impl OriginalGrammarLexerVector {
             let parts = [
                 size_of::<Self>(),
                 size_of::<OriginalGrammarLexer>(),
-                eredu_nn::workspace::WorkspaceContext::metadata_arc_bytes::<OriginalGrammarSlicer>()
-                    .ok_or(VectorCause::Overflow)?,
+                size_of::<PreparedLexer>(),
+                size_of::<Box<PreparedLexer>>(),
+                eredu_nn::workspace::WorkspaceContext::metadata_arc_bytes::<OriginalGrammarSlicer>(
+                )
+                .ok_or(VectorCause::Overflow)?,
                 size_of::<std::sync::Arc<OriginalGrammarSlicer>>(),
-                size_of::<WorkspaceMetadataFunding>(),
+                size_of::<HostMetadataFunding>(),
                 size_of::<OriginalGrammarLexerError>(),
                 size_of::<VectorCause>(),
                 size_of::<Option<PreparedRegexVector>>(),
-                size_of::<Result<PreparedLexer, PreparedLexerError<WorkspaceMetadataFundingError>>>(
-                ),
+                size_of::<Result<PreparedLexer, PreparedLexerError<HostMetadataFundingError>>>(),
                 size_of::<Result<PreparedLexer, VectorCause>>(),
                 size_of::<Result<OriginalGrammarLexer, OriginalGrammarLexerError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             let funding = &source.vocabulary().funding;
             funding.reserve_metadata(
@@ -423,12 +438,12 @@ impl OriginalGrammarLexerVector {
             Ok(lexer) => {
                 let funding = source.vocabulary().funding.clone();
                 Ok(OriginalGrammarLexer {
-                    lexer,
+                    lexer: Box::new(lexer),
                     limits,
                     source: std::sync::Arc::new(source),
                     funding,
                 })
-            },
+            }
             Err(cause) => Err(OriginalGrammarLexerError {
                 cause,
                 vector,
@@ -448,28 +463,28 @@ impl OriginalGrammarLexer {
     where
         F: FnOnce(
             &mut PreparedLexer,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
             &OriginalGrammarVocabulary,
-        ) -> Result<T, PreparedLexerOperationError<WorkspaceMetadataFundingError>>,
+        ) -> Result<T, PreparedLexerOperationError<HostMetadataFundingError>>,
     {
         let funding = &self.funding;
-        let result = (|| -> Result<T, VectorCause> {
+        let result = (|| -> Result<T, OperationCause> {
             let parts = [
                 size_of::<OriginalGrammarLexerOperationError>(),
-                size_of::<VectorCause>(),
-                size_of::<WorkspaceMetadataFunding>(),
+                size_of::<OperationCause>(),
+                size_of::<HostMetadataFunding>(),
                 size_of::<&mut Self>(),
                 size_of::<F>(),
                 size_of::<Result<T, OriginalGrammarLexerOperationError>>(),
-                size_of::<Result<T, PreparedLexerOperationError<WorkspaceMetadataFundingError>>>(),
-                size_of::<Result<T, VectorCause>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<T, PreparedLexerOperationError<HostMetadataFundingError>>>(),
+                size_of::<Result<T, OperationCause>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             funding.reserve_metadata(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
-                    .ok_or(VectorCause::Overflow)?,
+                    .ok_or(OperationCause::Overflow)?,
             )?;
             Ok(run(&mut self.lexer, funding, self.source.vocabulary())?)
         })();
@@ -551,17 +566,17 @@ impl OriginalGrammarLexer {
                 size_of::<OriginalGrammarEarleySeed>(),
                 size_of::<OriginalGrammarEarleySeedError>(),
                 size_of::<VectorCause>(),
-                size_of::<std::sync::Arc<llguidance::earley::CGrammar>>(),
+                size_of::<llguidance::earley::SharedGrammar>(),
                 size_of::<Result<llguidance::earley::PreparedEarleySeed, VectorCause>>(),
                 size_of::<
                     Result<
                         llguidance::earley::PreparedEarleySeed,
-                        llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
                     >,
                 >(),
                 size_of::<Result<OriginalGrammarEarleySeed, OriginalGrammarEarleySeedError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-                size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
+                size_of::<(&Self, &HostMetadataFunding)>(),
             ];
             let vocabulary = self.source.vocabulary();
             let funding = &self.funding;
@@ -597,12 +612,12 @@ impl OriginalGrammarEarleySeed {
                 size_of::<
                     Result<
                         llguidance::earley::PreparedEarleySeed,
-                        llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
                     >,
                 >(),
                 size_of::<Result<Self, OriginalGrammarEarleySeedError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-                size_of::<(&mut PreparedLexer, &WorkspaceMetadataFunding)>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
+                size_of::<(&mut PreparedLexer, &HostMetadataFunding)>(),
             ];
             let funding = &lexer.funding;
             funding.reserve_metadata(
@@ -633,11 +648,11 @@ impl OriginalGrammarEarleySeed {
                 size_of::<
                     Result<
                         (llguidance::earley::PreparedEarleySeed, bool, usize),
-                        llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
                     >,
                 >(),
                 size_of::<Option<u8>>(),
-                size_of::<(&mut PreparedLexer, &WorkspaceMetadataFunding)>(),
+                size_of::<(&mut PreparedLexer, &HostMetadataFunding)>(),
             ];
             let vocabulary = lexer.source.vocabulary();
             let funding = &lexer.funding;
@@ -673,11 +688,11 @@ impl OriginalGrammarEarleySeed {
                 size_of::<
                     Result<
                         llguidance::earley::PreparedEarleySeed,
-                        llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
                     >,
                 >(),
                 size_of::<Result<llguidance::earley::PreparedEarleySeed, VectorCause>>(),
-                size_of::<(&mut PreparedLexer, &WorkspaceMetadataFunding, &[u8])>(),
+                size_of::<(&mut PreparedLexer, &HostMetadataFunding, &[u8])>(),
             ];
             let vocabulary = lexer.source.vocabulary();
             let funding = &lexer.funding;
@@ -742,10 +757,10 @@ impl OriginalGrammarEarleySeed {
             &mut PreparedLexer,
             &toktrie::TokTrie,
             &ParserLimits,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         ) -> Result<
             (llguidance::earley::PreparedEarleySeed, T),
-            llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+            llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
         >,
     {
         let Self { seed, mut lexer } = self;
@@ -760,15 +775,15 @@ impl OriginalGrammarEarleySeed {
                 size_of::<
                     Result<
                         (llguidance::earley::PreparedEarleySeed, T),
-                        llguidance::earley::PreparedEarleySeedError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedEarleySeedError<HostMetadataFundingError>,
                     >,
                 >(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<(
                     &mut PreparedLexer,
                     &toktrie::TokTrie,
                     &ParserLimits,
-                    &WorkspaceMetadataFunding,
+                    &HostMetadataFunding,
                 )>(),
             ];
             let vocabulary = lexer.source.vocabulary();
@@ -853,7 +868,7 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarTokenParser {
 #[error("{cause}")]
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarTokenParserError {
     #[source]
-    cause: VectorCause,
+    cause: OperationCause,
     unstarted: Option<llguidance::earley::PreparedEarleySeed>,
     pending: Option<llguidance::earley::PreparedTokenParser>,
     lexer: OriginalGrammarLexer,
@@ -864,28 +879,28 @@ impl OriginalGrammarEarleySeed {
     ) -> Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserError> {
         let Self { seed, mut lexer } = self;
         let mut unstarted = Some(seed);
-        let result = (|| -> Result<_, VectorCause> {
+        let result = (|| -> Result<_, OperationCause> {
             let parts = [
                 size_of::<Self>(),
                 size_of::<OriginalGrammarTokenParser>(),
                 size_of::<OriginalGrammarTokenParserError>(),
-                size_of::<VectorCause>(),
+                size_of::<OperationCause>(),
                 size_of::<Option<llguidance::earley::PreparedEarleySeed>>(),
-                size_of::<Result<llguidance::earley::PreparedTokenParser, VectorCause>>(),
+                size_of::<Result<llguidance::earley::PreparedTokenParser, OperationCause>>(),
                 size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserError>>(),
                 size_of::<
                     Result<
                         llguidance::earley::PreparedTokenParser,
-                        llguidance::earley::PreparedTokenParserError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedTokenParserError<HostMetadataFundingError>,
                     >,
                 >(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<(
                     &mut PreparedLexer,
                     &toktrie::TokTrie,
                     &ParserLimits,
                     Option<usize>,
-                    &WorkspaceMetadataFunding,
+                    &HostMetadataFunding,
                 )>(),
             ];
             let vocabulary = lexer.source.vocabulary();
@@ -894,7 +909,7 @@ impl OriginalGrammarEarleySeed {
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
-                    .ok_or(VectorCause::Overflow)?,
+                    .ok_or(OperationCause::Overflow)?,
             )?;
             Ok(llguidance::earley::PreparedTokenParser::prepare(
                 unstarted.take().expect("token session source"),
@@ -924,19 +939,19 @@ impl OriginalGrammarTokenParser {
             &mut PreparedLexer,
             &toktrie::TokTrie,
             &ParserLimits,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         ) -> Result<
             (llguidance::earley::PreparedTokenParser, T),
-            llguidance::earley::PreparedTokenParserError<WorkspaceMetadataFundingError>,
+            llguidance::earley::PreparedTokenParserError<HostMetadataFundingError>,
         >,
     {
         let Self { parser, mut lexer } = self;
         let mut pending = Some(parser);
-        let result = (|| -> Result<_, VectorCause> {
+        let result = (|| -> Result<_, OperationCause> {
             let parts = [
                 size_of::<Self>(),
                 size_of::<OriginalGrammarTokenParserError>(),
-                size_of::<VectorCause>(),
+                size_of::<OperationCause>(),
                 size_of::<F>(),
                 size_of::<T>(),
                 size_of::<Option<llguidance::earley::PreparedTokenParser>>(),
@@ -944,15 +959,15 @@ impl OriginalGrammarTokenParser {
                 size_of::<
                     Result<
                         (llguidance::earley::PreparedTokenParser, T),
-                        llguidance::earley::PreparedTokenParserError<WorkspaceMetadataFundingError>,
+                        llguidance::earley::PreparedTokenParserError<HostMetadataFundingError>,
                     >,
                 >(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<(
                     &mut PreparedLexer,
                     &toktrie::TokTrie,
                     &ParserLimits,
-                    &WorkspaceMetadataFunding,
+                    &HostMetadataFunding,
                 )>(),
             ];
             let vocabulary = lexer.source.vocabulary();
@@ -961,7 +976,7 @@ impl OriginalGrammarTokenParser {
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
-                    .ok_or(VectorCause::Overflow)?,
+                    .ok_or(OperationCause::Overflow)?,
             )?;
             Ok(run(
                 pending.take().expect("token session owner"),
@@ -1005,10 +1020,13 @@ impl OriginalGrammarTokenParser {
         tokens: usize,
     ) -> Result<Self, OriginalGrammarTokenParserError> {
         self.operation(|parser, lexer, trie, limits, funding| {
-            parser.rollback(lexer, trie, limits, tokens, &|bytes| {
-                funding.reserve_metadata(bytes)
-            }).map(|parser| (parser, ()))
-        }).map(|(owner, ())| owner)
+            parser
+                .rollback(lexer, trie, limits, tokens, &|bytes| {
+                    funding.reserve_metadata(bytes)
+                })
+                .map(|parser| (parser, ()))
+        })
+        .map(|(owner, ())| owner)
     }
     pub(in crate::runtime::chat::constraints) fn reset(
         self,

@@ -31,7 +31,7 @@ struct WriteBody {
     pin: PinnedCacheBlock,
     transfer: DiskWriteOccupancy,
     disk: Option<CachePoolReservation>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 struct Occupancy {
     reservation: Mutex<CachePoolReservation>,
@@ -42,7 +42,7 @@ struct Occupancy {
 #[derive(Clone)]
 pub(crate) struct DiskWriteOccupancy {
     inner: Arc<Occupancy>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for DiskWriteOccupancy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,7 +65,7 @@ struct WriteCompletion {
 #[derive(Clone)]
 pub(crate) struct PreparedDiskWriteOutput {
     inner: Arc<OnceLock<WriteCompletion>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DiskWriteFailure {
@@ -344,3 +344,5 @@ mod worker;
 pub(crate) use worker::{
     DiskWriteOperation, DiskWriteOperationFailure, InstalledDiskWorker, PreparedDiskWorker,
 };
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

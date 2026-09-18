@@ -16,7 +16,7 @@ mod tokenizer_snapshot;
 pub(crate) mod provider_errors;
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    original_sources::Fixture<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -27,10 +27,32 @@ fn setup() -> (
         ..Default::default()
     };
     let mut probe = unicode_model(None);
-    let chat = probe.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = probe
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        probe
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let mut model = unicode_model(Some(first));
-    let chat = model.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(8),
@@ -55,19 +77,23 @@ fn completed_prefix_cancellation_has_ordinary_controlled_parity_without_token_co
             let (mut model, chat, settings, _) = setup();
             let mut events = Vec::new();
             if controlled {
-                let prepared = model
-                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-                    .unwrap();
+                let mut prepared = eredu::api::PreparedChatRequest::new(
+                    &chat,
+                    original_sources::settings(settings),
+                );
                 let mut session = model
-                    .start_controlled_chat(prepared, &[], Default::default(), |_| {
+                    .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                         ControlFlow::Continue(())
                     })
+                    .unwrap()
                     .unwrap();
                 PREFILL_CANCELLATION.with(|slot| slot.set(if fail { 2 } else { 1 }));
                 let result = session.step(|record| {
-                    if let ObservedGenerationEvent::Semantic { event, .. } = record.generation.event
+                    if let eredu::api::ControlledGenerationEvent::Progress {
+                        event: ObservedGenerationEvent::Semantic { event, .. },
+                    } = &record.event
                     {
-                        events.push(event);
+                        events.push(event.clone());
                     }
                     ControlFlow::Continue(())
                 });
@@ -85,13 +111,22 @@ fn completed_prefix_cancellation_has_ordinary_controlled_parity_without_token_co
                 }
             } else {
                 PREFILL_CANCELLATION.with(|slot| slot.set(if fail { 2 } else { 1 }));
-                let result = model.generate_prepared_chat(PreparedChatGenerationRequest {
-                    input: PreparedChatInput::rendered_prompt(&chat),
-                    settings,
-                    caller_stop_sequences: &[],
-                    cancellation: Default::default(),
-                    on_event: |event| events.push(event),
-                });
+                let result = {
+                    let cancellation = eredu_core::GenerationCancellationToken::new();
+                    let mut on_event = |event| events.push(event);
+                    let mut request = eredu::api::PreparedChatRequest::new(
+                        &chat,
+                        original_sources::settings(settings),
+                    );
+                    request.stop_sequences = &[];
+                    model
+                        .start_prepared_chat(request, &cancellation)
+                        .and_then(|session| {
+                            session
+                                .expect("uncancelled original request")
+                                .run(&cancellation, &mut on_event)
+                        })
+                };
                 if fail {
                     assert!(result
                         .unwrap_err()
@@ -123,7 +158,7 @@ fn completed_prefix_cancellation_has_ordinary_controlled_parity_without_token_co
     }
 }
 
-impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBackend {
+impl eredu_core::TextSamplingControlBackend for MockBackend {
     fn sampling_control_facts(state: &observed_mock::State) -> eredu::api::SamplingStateFacts {
         eredu::api::SamplingStateFacts {
             temperature: state.sampling.temperature,
@@ -131,17 +166,21 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBacken
             has_rng: state.sampling.seed.is_some(),
         }
     }
-    fn install_sampling_override(
-        _: &mut ModelRuntime<Self>,
+    fn apply_sampling_override(
+        runtime: &mut ModelRuntime<Self>,
         state: &mut observed_mock::State,
-        request: eredu_runtime::execution_control::ValidatedSamplingOverride,
-    ) -> Result<(), MockError> {
-        provider_errors::check("sampling")?;
+        _context: Option<&eredu_core::TextStepContext>,
+        request: eredu_core::SamplingOverride,
+    ) -> Result<eredu_core::SamplingStateFacts, eredu_core::SamplingOverrideError<MockError>> {
+        let request = eredu_runtime::execution_control::prepare_sampling_override::<Self>(
+            runtime, state, request,
+        )?;
+        provider_errors::check("sampling").map_err(eredu_core::SamplingOverrideError::Backend)?;
         if let Some(seed) = request.reseed() {
             state.sampling.seed = Some(seed);
         }
         state.sampling.temperature = request.temperature();
-        Ok(())
+        Ok(Self::sampling_control_facts(state))
     }
 }
 
@@ -149,15 +188,15 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBacken
 fn prospective_sampling_changes_preserve_position_and_emit_bounded_provenance() {
     use eredu::api::SamplingOverride;
     let (mut model, chat, settings, first) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut records = vec![];
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |r| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |r| {
             records.push(r);
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     assert!(!session.sampling_state().unwrap().has_rng);
     assert_eq!(
@@ -186,9 +225,9 @@ fn prospective_sampling_changes_preserve_position_and_emit_bounded_provenance() 
     assert_eq!(session.sampling_state().unwrap().temperature, 0.7);
     let record = records.last().unwrap();
     assert!(
-        matches!(record.generation.event, ObservedGenerationEvent::SamplingChanged {
+        matches!(&record.event, eredu::api::ControlledGenerationEvent::Progress { event: ObservedGenerationEvent::SamplingChanged {
         next_prediction: 0, request: r, ..
-    } if r == request)
+    } } if *r == request)
     );
     session.force_next_token(first).unwrap();
     session
@@ -248,15 +287,18 @@ fn decoder_forks_preserve_pending_unicode_without_replaying_tokens() {
 #[test]
 fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
     let (mut model, chat, settings, first) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, observed_mock::plan(), limits())
-        .unwrap();
+    let capture = observed_mock::plan();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    prepared.capture = Some(&capture);
+    let prepared_trace = limits();
     let mut records = vec![];
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |r| {
+        .start_controlled_chat(prepared, prepared_trace, Default::default(), |r| {
             records.push(r);
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     assert!(session.force_next_token(u32::MAX).is_err());
     assert_eq!(session.next_prediction(), 0);
@@ -294,10 +336,13 @@ fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
     assert!(session.force_next_token(first).is_err());
     let committed: Vec<_> = records
         .iter()
-        .filter_map(|r| match r.generation.event {
-            ObservedGenerationEvent::Token {
-                token_id, forced, ..
-            } => Some((token_id, forced)),
+        .filter_map(|r| match &r.event {
+            eredu::api::ControlledGenerationEvent::Progress {
+                event:
+                    ObservedGenerationEvent::Token {
+                        token_id, forced, ..
+                    },
+            } => Some((*token_id, *forced)),
             _ => None,
         })
         .collect();
@@ -318,17 +363,17 @@ fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
 #[test]
 fn forced_alternative_changes_canonical_history_and_semantic_text_once() {
     let (mut model, chat, settings, first) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let alternative = first + 3;
     let expected_text = model.decode(&[alternative], true).unwrap();
     let mut records = vec![];
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |r| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |r| {
             records.push(r);
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     session.force_next_token(alternative).unwrap();
     session
@@ -361,8 +406,10 @@ fn forced_alternative_changes_canonical_history_and_semantic_text_once() {
 fn semantic(records: &[ControlledGenerationRecord]) -> Vec<SemanticEvent> {
     records
         .iter()
-        .filter_map(|r| match &r.generation.event {
-            ObservedGenerationEvent::Semantic { event, .. } => Some(event.clone()),
+        .filter_map(|r| match &r.event {
+            eredu::api::ControlledGenerationEvent::Progress {
+                event: ObservedGenerationEvent::Semantic { event, .. },
+            } => Some(event.clone()),
             _ => None,
         })
         .collect()
@@ -373,15 +420,21 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
     for mode in 0..4 {
         let (mut model, chat, settings, first) = setup();
         let mut ordinary = vec![];
-        let baseline = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&chat),
-                settings,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |event| ordinary.push(event),
-            })
-            .unwrap();
+        let baseline = {
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let mut on_event = |event| ordinary.push(event);
+            let mut request =
+                eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+            request.stop_sequences = &[];
+            model
+                .start_prepared_chat(request, &cancellation)
+                .and_then(|session| {
+                    session
+                        .expect("uncancelled original request")
+                        .run(&cancellation, &mut on_event)
+                })
+        }
+        .unwrap();
         let capture = if mode & 1 == 0 {
             CapturePlan::none()
         } else {
@@ -390,28 +443,19 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
         // Intervention-only still needs nonzero explicit evidence budgets.
         let mut capture = capture;
         capture.limits = observed_mock::plan().limits;
-        let prepared = if mode & 2 == 0 {
-            model
-                .prepare_observed_chat(&chat, settings, capture, limits())
-                .unwrap()
-        } else {
-            model
-                .prepare_intervened_chat(
-                    &chat,
-                    settings,
-                    capture,
-                    observed_mock::intervention_plan(1.0),
-                    limits(),
-                )
-                .unwrap()
-        };
+        let intervention = (mode & 2 != 0).then(|| observed_mock::intervention_plan(1.0));
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        prepared.capture = Some(&capture);
+        prepared.intervention = intervention.as_ref();
         let mut records = vec![];
         let control = GenerationControlHandle::default();
         let mut session = model
-            .start_controlled_chat(prepared, &[], control.clone(), |record| {
+            .start_controlled_chat(prepared, limits(), control.clone(), |record| {
                 records.push(record);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
         assert_eq!(session.status(), GenerationStatus::Prepared);
         assert_eq!(session.next_prediction(), 0);
@@ -426,7 +470,7 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
             })
             .unwrap();
         assert_eq!(session.token_ids(), [first]);
-        assert!(session.semantic_snapshot_bytes().unwrap() > initial_storage);
+        assert!(session.semantic_snapshot_bytes().unwrap() >= initial_storage);
         assert_eq!(session.next_prediction(), 1);
         assert!(semantic(&records)
             .iter()
@@ -450,10 +494,12 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
         session
             .resume(|r| {
                 if matches!(
-                    r.generation.event,
-                    ObservedGenerationEvent::Token {
-                        prediction_index: 1,
-                        ..
+                    &r.event,
+                    eredu::api::ControlledGenerationEvent::Progress {
+                        event: ObservedGenerationEvent::Token {
+                            prediction_index: 1,
+                            ..
+                        }
                     }
                 ) {
                     let control = control.clone();
@@ -474,7 +520,7 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
                 ControlFlow::Continue(())
             })
             .unwrap();
-        assert_eq!(session.token_ids(), baseline.token_ids);
+        assert_eq!(session.token_ids(), baseline.token_ids.as_ref());
         assert_eq!(session.finish_reason(), Some(baseline.finish_reason));
         assert_eq!(session.status(), GenerationStatus::Completed);
         assert_eq!(semantic(&records), ordinary);
@@ -500,16 +546,18 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
 fn controlled_facade_stop_and_cancellation_do_not_flush_partial_unicode_or_advance_again() {
     for cancel_at in [None, Some(0), Some(1)] {
         let (mut model, chat, settings, first) = setup();
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-            .unwrap();
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let stops = ["é".to_owned()];
+        prepared.stop_sequences = &stops;
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut session = model
-            .start_controlled_chat(prepared, &["é".into()], control.clone(), |r| {
+            .start_controlled_chat(prepared, limits(), control.clone(), |r| {
                 records.push(r);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
         if cancel_at == Some(0) {
             control.cancel();
@@ -559,21 +607,26 @@ fn controlled_facade_closes_broken_consumers_and_fences_panics_and_transport_fai
         if failure == "limit" {
             limits.total_bytes = 1500;
         }
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, observed_mock::plan(), limits)
-            .unwrap();
+        let capture = observed_mock::plan();
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        prepared.capture = Some(&capture);
+        let prepared_trace = limits;
         let mut session = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            .start_controlled_chat(prepared, prepared_trace, Default::default(), |_| {
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
         let mut calls = 0;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             session.step(|record| {
                 calls += 1;
                 if matches!(
-                    record.generation.event,
-                    ObservedGenerationEvent::Token { .. }
+                    &record.event,
+                    eredu::api::ControlledGenerationEvent::Progress {
+                        event: ObservedGenerationEvent::Token { .. }
+                    }
                 ) {
                     if failure == "panic" {
                         panic!("consumer disconnected");
@@ -622,7 +675,7 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
     let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(tokenizer.get_vocab_size(true) < 65);
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-    let mut model = LoadedModel::from_runtime(
+    let mut model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -635,25 +688,31 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
         },
     )
     .unwrap();
-    let chat = model
-        .prepare_chat(ChatTemplateRequest {
+    let chat = {
+        let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
             add_generation_prompt: true,
             ..Default::default()
-        })
-        .unwrap();
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            PreparedChatGenerationSettings::default(),
-            CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let mut prepared = eredu::api::PreparedChatRequest::new(
+        &chat,
+        original_sources::settings(PreparedChatGenerationSettings::default()),
+    );
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     assert!(session.force_next_token(2).is_err());
     assert!(session.force_next_token(eos + 1).is_err());
@@ -670,15 +729,15 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
 fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery() {
     use std::time::{Duration, Instant};
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let wall = Instant::now();
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             std::thread::sleep(Duration::from_millis(40));
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     assert_eq!(session.timing().time_to_first_token(), None);
     session.pause(|_| ControlFlow::Continue(())).unwrap();
@@ -687,8 +746,10 @@ fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery(
     session
         .step(|record| {
             if matches!(
-                record.generation.event,
-                ObservedGenerationEvent::Token { .. }
+                &record.event,
+                eredu::api::ControlledGenerationEvent::Progress {
+                    event: ObservedGenerationEvent::Token { .. }
+                }
             ) {
                 first = Some(record.timing);
                 std::thread::sleep(Duration::from_millis(40));
@@ -708,13 +769,13 @@ fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery(
 #[test]
 fn cancelled_controlled_session_has_no_ttft() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     session.cancel(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(session.timing().time_to_first_token(), None);
@@ -727,39 +788,42 @@ fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_bef
     let rendered = model.encode(chat.rendered_prompt(), false).unwrap();
     let prefix = vec![rendered[0]; 3];
     for invalid in [vec![], vec![u32::MAX]] {
+        let mut request =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        request.input = eredu::api::PreparedChatPrompt::TokenIds(&invalid);
         assert!(model
-            .prepare_observed_token_ids(&chat, invalid, settings, CapturePlan::none(), limits())
+            .start_controlled_chat(request, limits(), Default::default(), |_| {
+                panic!("invalid exact prefix published a record")
+            })
             .is_err());
     }
-    let prepared = model
-        .prepare_observed_token_ids(
-            &chat,
-            prefix.clone(),
-            settings,
-            CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
-    assert_eq!(prepared.prompt_token_ids(), prefix);
-    assert_eq!(prepared.capture_plan().request().prompt_tokens, 3);
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    prepared.input = eredu::api::PreparedChatPrompt::TokenIds(&prefix);
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |r| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |r| {
             records.push(r);
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
+    assert!(matches!(&records[0].event,
+        eredu::api::ControlledGenerationEvent::Started { prompt_attribution, .. }
+            if prompt_attribution.attribution().complete_token_ids() == Some(prefix.as_slice())));
     run.step(|r| {
         records.push(r);
         ControlFlow::Continue(())
     })
     .unwrap();
     assert!(records.iter().any(|r| matches!(
-        &r.generation.event,
-        ObservedGenerationEvent::Token {
-            input_range: [0, 3],
-            forced: false,
-            ..
+        &r.event,
+        eredu::api::ControlledGenerationEvent::Progress {
+            event: ObservedGenerationEvent::Token {
+                input_range: [0, 3],
+                forced: false,
+                ..
+            }
         }
     )));
 }

@@ -3,20 +3,63 @@
 //! declared coefficient parameters and execution boundaries.
 use super::*;
 use eredu_core::{
+    ObservationPosition, SymbolicDimension, TensorAxis,
     capture::CaptureError,
     component::{ComponentStreamBase, ComponentStreamCoefficients, ComponentStreamResidual},
-    ObservationPosition, SymbolicDimension, TensorAxis,
 };
 
 pub(super) fn register(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     streams: &ComponentStreamResidual,
     owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
     base: (bool, ObservationHookSite),
     head: (bool, ObservationHookSite),
 ) -> Result<(), ComponentPartitionError> {
-    let invalid = || CaptureError::Invalid("invalid stream-residual declaration".into());
+    worker(
+        observations,
+        descriptor,
+        streams,
+        owns,
+        base,
+        head,
+        Destination(None),
+    )
+}
+fn same_axes(actual: Option<&[TensorAxis]>, expected: &[(&str, SymbolicDimension)]) -> bool {
+    actual.is_some_and(|axes| {
+        axes.len() == expected.len()
+            && axes
+                .iter()
+                .zip(expected)
+                .all(|(actual, (name, dimension))| {
+                    actual.name == *name && actual.dimension == *dimension
+                })
+    })
+}
+pub(super) fn worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    streams: &ComponentStreamResidual,
+    owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+    base: (bool, ObservationHookSite),
+    head: (bool, ObservationHookSite),
+    allocation: Destination<'_>,
+) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &ComponentStreamResidual,
+        (bool, ObservationHookSite),
+        (bool, ObservationHookSite),
+        [(&str, SymbolicDimension); 14],
+        &str,
+        bool,
+        usize,
+    )>()?;
+    allocation.controls_of(&owns)?;
+    let invalid =
+        || allocation.capture_invalid(format_args!("invalid stream-residual declaration"));
     if streams.streams == 0 {
         return Err(invalid().into());
     }
@@ -29,7 +72,7 @@ pub(super) fn register(
         .points
         .iter()
         .find(|p| p.path == *base_path)
-        .ok_or_else(|| CaptureError::MissingPath(base_path.clone()))?;
+        .ok_or_else(|| allocation.capture_missing(base_path))?;
     let hidden = match base_point.axes.as_deref().and_then(|axes| axes.last()) {
         Some(TensorAxis {
             name,
@@ -42,33 +85,30 @@ pub(super) fn register(
         .streams
         .checked_mul(streams.streams)
         .ok_or_else(invalid)?;
-    let mut vector = vec![
-        TensorAxis {
-            name: "batch".into(),
-            dimension: SymbolicDimension::Batch,
-        },
-        TensorAxis {
-            name: "sequence".into(),
-            dimension: SymbolicDimension::Sequence,
-        },
-        TensorAxis {
-            name: "hidden".into(),
-            dimension: SymbolicDimension::Known(hidden),
-        },
+    // These expected axes are finite borrowed declarations. Their former
+    // owning strings/vectors served only equality checks, in every profile.
+    let hidden_axes = [
+        ("batch", SymbolicDimension::Batch),
+        ("sequence", SymbolicDimension::Sequence),
+        ("hidden", SymbolicDimension::Known(hidden)),
     ];
-    let hidden_axes = vector.clone();
-    vector[2] = TensorAxis {
-        name: "stream".into(),
-        dimension: SymbolicDimension::Known(streams.streams),
-    };
-    let mut residual = vector.clone();
-    residual.push(hidden_axes[2].clone());
-    let mut matrix = vector.clone();
-    matrix[2].name = "input_stream".into();
-    matrix.push(TensorAxis {
-        name: "output_stream".into(),
-        dimension: SymbolicDimension::Known(streams.streams),
-    });
+    let vector = [
+        ("batch", SymbolicDimension::Batch),
+        ("sequence", SymbolicDimension::Sequence),
+        ("stream", SymbolicDimension::Known(streams.streams)),
+    ];
+    let residual = [
+        ("batch", SymbolicDimension::Batch),
+        ("sequence", SymbolicDimension::Sequence),
+        ("stream", SymbolicDimension::Known(streams.streams)),
+        ("hidden", SymbolicDimension::Known(hidden)),
+    ];
+    let matrix = [
+        ("batch", SymbolicDimension::Batch),
+        ("sequence", SymbolicDimension::Sequence),
+        ("input_stream", SymbolicDimension::Known(streams.streams)),
+        ("output_stream", SymbolicDimension::Known(streams.streams)),
+    ];
     let coefficient_owner = |parameters: &ComponentStreamCoefficients| {
         let local = owns(&parameters.function)?;
         if owns(&parameters.base)? != local || owns(&parameters.scale)? != local {
@@ -76,7 +116,8 @@ pub(super) fn register(
         }
         Ok::<_, ComponentPartitionError>(local)
     };
-    let mut add = |path: &str, axes: &[TensorAxis], axis: &str, local, site| {
+    allocation.controls_of(&coefficient_owner)?;
+    let mut add = |path: &str, axes: &[(&str, SymbolicDimension)], axis: &str, local, site| {
         // Effective paths are an explicit public observation convention. Check
         // their catalog timing and geometry before pairing them with originals.
         let point = descriptor
@@ -84,7 +125,7 @@ pub(super) fn register(
             .points
             .iter()
             .find(|p| p.path == path)
-            .ok_or_else(|| CaptureError::MissingPath(path.into()))?;
+            .ok_or_else(|| allocation.capture_missing(path))?;
         if path.ends_with(".effective") && point.position != ObservationPosition::AfterIntervention
         {
             return Err(invalid().into());
@@ -94,7 +135,7 @@ pub(super) fn register(
         } else {
             path
         };
-        if point.axes.as_deref() != Some(axes) {
+        if !same_axes(point.axes.as_deref(), axes) {
             return Err(invalid().into());
         }
         let original_point = descriptor
@@ -102,8 +143,8 @@ pub(super) fn register(
             .points
             .iter()
             .find(|p| p.path == original)
-            .ok_or_else(|| CaptureError::MissingPath(original.into()))?;
-        if original_point.axes.as_deref() != Some(axes)
+            .ok_or_else(|| allocation.capture_missing(original))?;
+        if !same_axes(original_point.axes.as_deref(), axes)
             || (original != path
                 && original_point.position != ObservationPosition::BeforeIntervention)
         {
@@ -113,16 +154,25 @@ pub(super) fn register(
             .observations
             .points
             .iter()
-            .find(|p| p.path == format!("{original}.effective"))
+            .find(|p| p.path.strip_suffix(".effective") == Some(original))
         {
-            if effective.axes.as_deref() != Some(axes)
+            if !same_axes(effective.axes.as_deref(), axes)
                 || effective.position != ObservationPosition::AfterIntervention
             {
                 return Err(invalid().into());
             }
         }
-        replicated_observation(observations, descriptor, original, axis, local, site)
+        observations::replicated(
+            observations,
+            descriptor,
+            original,
+            axis,
+            local,
+            site,
+            allocation,
+        )
     };
+    allocation.controls_of(&add)?;
     add(
         base_path,
         if broadcast { &hidden_axes } else { &residual },
@@ -192,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn stream_source_refuses_each_destination_on_the_original_worker() {
+        let descriptor = descriptor();
+        let streams = descriptor
+            .component_readout
+            .as_ref()
+            .unwrap()
+            .stream_residual
+            .as_ref()
+            .unwrap();
+        construction::tests::verify(|allocation| {
+            let mut result = SourceMap::new();
+            worker(
+                &mut result,
+                &descriptor,
+                streams,
+                &|_| Ok(true),
+                (true, ObservationHookSite::Input),
+                (true, ObservationHookSite::Readout),
+                allocation,
+            )?;
+            Ok(result)
+        });
+    }
+
+    #[test]
     fn stream_capture_follows_invocations_and_keeps_complete_writes_disjoint() {
         let descriptor = descriptor();
         let streams = descriptor
@@ -224,7 +299,7 @@ mod tests {
                         .flatten(),
                 )
                 .collect::<Vec<_>>();
-            let mut observations = BTreeMap::new();
+            let mut observations = SourceMap::new();
             register(
                 &mut observations,
                 &descriptor,
@@ -308,7 +383,7 @@ mod tests {
                 }
             }
             let result = register(
-                &mut BTreeMap::new(),
+                &mut SourceMap::new(),
                 &descriptor,
                 streams,
                 &|name| Ok(failure != 3 || name != streams.cycles[0].coefficients.base),

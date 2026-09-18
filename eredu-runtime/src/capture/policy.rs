@@ -31,9 +31,6 @@ pub enum CaptureProtocolError {
     /// The hook has no matching active transaction.
     #[error("capture hook has no matching pending transaction")]
     Transaction,
-    /// The same sequencing rejection with an allocation-free callback stage.
-    #[error("capture hook has no matching pending transaction during {0}")]
-    TransactionPhase(&'static str),
     /// A selected observation was emitted more than once.
     #[error("selected observation emitted twice")]
     Duplicate,
@@ -44,7 +41,7 @@ pub enum CaptureProtocolError {
     #[error("selected prefill tensor capture requires prompt-span attribution")]
     PrefillAttribution,
 }
-pub(super) fn legacy_error(error: CaptureProtocolError) -> CaptureError {
+pub(super) fn public_error(error: CaptureProtocolError) -> CaptureError {
     CaptureError::Invalid(error.to_string())
 }
 impl CaptureSession {
@@ -127,6 +124,12 @@ pub(super) fn reserve_required(
     }
     Ok(())
 }
+pub(super) fn frame_usage() -> Result<CaptureUsage, CaptureError> {
+    let host_bytes = eredu_core::capture::PreparedCapturedStep::retained_control_bytes::<eredu_core::HostPreparationAuthority>()
+        .ok_or(CaptureError::Overflow)?;
+    Ok(CaptureUsage { host_bytes, ..CaptureUsage::default() })
+}
+
 pub(super) fn reserve_metadata(
     ledger: &mut CaptureLedger,
     selection: &CaptureSelection,
@@ -406,6 +409,7 @@ impl<'a> CaptureObservationStep<'a> {
     /// Reserve all required record envelopes after the caller begins its one
     /// logical step. A skipped metadata envelope is still a typed limit error.
     pub fn reserve_metadata(&self, ledger: &mut CaptureLedger) -> Result<(), CaptureError> {
+        reserve_required(ledger, frame_usage()?)?;
         for (selection, point) in self
             .source
             .plan()
@@ -536,7 +540,7 @@ impl<'a> CaptureObservationStep<'a> {
         }
         Ok(())
     }
-    /// Add the unchanged legacy creation charge for every accepted selection,
+    /// Add the logical source construction charge for each accepted selection,
     /// even when one generated value is reused within the hook.
     pub fn generated_usage(
         &self,

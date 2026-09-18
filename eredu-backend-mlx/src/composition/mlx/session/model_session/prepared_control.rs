@@ -137,8 +137,7 @@ impl PreparedControlInputBackend for MlxBackend<'_> {
             let model = session.payload.model.erased();
             model.validate_prepared_control_binding(&input.binding)?;
             if session
-                .loaded_partition_capture()
-                .map_err(Error::observation)?
+                .loaded_partition_capture().map_err(Error::observation)?
                 .is_some()
             {
                 return Err(Error::Other(Box::new(
@@ -148,7 +147,7 @@ impl PreparedControlInputBackend for MlxBackend<'_> {
             let paths = model
                 .shared_observation_paths()
                 .ok_or_else(|| Error::Other(Box::new(Rejection::InstrumentationUnavailable)))?;
-            model.validate_prepared_observation_paths(paths)?;
+            model.validate_prepared_observation_paths(paths, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())?;
             let selection = paths
                 .prepare_media_capture_selection(&source)
                 .map_err(|e| Error::Other(Box::new(e)))?;
@@ -279,7 +278,7 @@ pub(super) fn install_capture(
         let paths = model
             .shared_observation_paths()
             .ok_or_else(|| Error::Other(Box::new(Rejection::SourceMismatch)))?;
-        model.validate_prepared_observation_paths(paths)?;
+        model.validate_prepared_observation_paths(paths, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())?;
         request
             .validate(model.inference_execution_identity(), binding.geometry())
             .map_err(|error| Error::Other(Box::new(error)))?;
@@ -369,12 +368,12 @@ impl MlxModelInput {
             original
                 .validate(source.source(), paths, current.geometry())
                 .map_err(Error::observation)?;
-            model.validate_prepared_observation_paths(paths)?;
+            model.validate_prepared_observation_paths(paths, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())?;
             let mut expected = original.geometry();
             expected.max_output_tokens = destination.geometry().max_output_tokens;
             if expected != destination.geometry()
                 || !capture
-                    .and_then(|c| c.shared_plan_source())
+                    .map(|c| c.shared_plan_source())
                     .is_some_and(|s| s.same_storage(destination.source()))
             {
                 return Err(mismatch());

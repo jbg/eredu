@@ -614,27 +614,11 @@ impl Config for ModelArgs {
     fn routed_observation_points(
         &self,
         unit: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        if !self.is_sparse_layer(layer) {
-            return None;
-        }
-        let points = eredu_runtime::RoutedObservationPoints::new(
-            ExpertBank::FeedForward.id(),
-            format!("{unit}.mlp"),
-            self.num_experts,
-        );
-        Some(if self.is_mova_layer(layer) {
-            points
-                .with_bank(
-                    ExpertBank::AttentionValue.id(),
-                    format!("{unit}.self_attn.values"),
-                    self.mova_num_experts,
-                )
-                .expect("distinct K2 bank identities")
-        } else {
-            points
-        })
+        layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+if !self.is_sparse_layer(layer){return Ok(None);}
+        let points=eredu_runtime::RoutedObservationPoints::new(ExpertBank::FeedForward.id(),format_args!("{unit}.mlp"),self.num_experts,metadata_context)?;
+        Ok(Some(if self.is_mova_layer(layer){points.with_bank(ExpertBank::AttentionValue.id(),format_args!("{unit}.self_attn.values"),self.mova_num_experts,metadata_context)?}else{points}))
     }
     fn hidden_size(&self) -> i32 {
         self.hidden_size

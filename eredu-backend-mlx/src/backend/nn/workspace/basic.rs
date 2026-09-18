@@ -179,6 +179,9 @@ pub(super) fn emit(
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     use WorkspaceOperationKindView as Kind;
+    if matches!(operation.kind, Kind::Elementwise("masked_scatter")) {
+        return super::masked_scatter::emit(operation, allocation, sink);
+    }
     let bound = match &operation.kind {
         Kind::IndexedElementSelect | Kind::IndexedElementUpdate => {
             if !indexed_elements(operation) { return invalid(); }
@@ -214,27 +217,7 @@ pub(super) fn emit(
             }
             sink.finish(0, format_args!("completion preserves supplied value storage; exact native traversal and source admission are separate"))?
         }
-        Kind::ParameterPlaceholder => {
-            let output = one_output(operation)?;
-            if !operation.inputs.is_empty() || !output.shape().is_empty() {
-                return invalid();
-            }
-            // Pinned MLX zeros(shape, dtype) constructs array(0, dtype) eagerly;
-            // array::init allocates exactly one scalar before the lazy Full /
-            // broadcast graph is built. Binding replaces that graph without
-            // evaluating a logical weight tensor. Every constructor has its
-            // own seed; no allocation or donation sharing is assumed.
-            one(
-                sink,
-                allocation,
-                Output::Allocate(buffer_capacity(allocation, output.dtype().bytes())?),
-                0,
-                format_args!(
-                    "{}",
-                    "unloaded parameter construction eagerly copies one dtype-sized scalar into shared native storage; logical weight fill stays unevaluated until replaced by binding"
-                ),
-            )?
-        }
+        Kind::ParameterPlaceholder => emit_parameter_placeholder(operation, allocation, sink)?,
         Kind::Pad(mode) => {
             let output = one_output(operation)?;
             let Some([input]) = operation.inputs.array() else {
@@ -354,7 +337,7 @@ pub(super) fn emit(
         Kind::View(name) => {
             if !matches!(
                 *name,
-                "broadcast" | "transpose" | "squeeze" | "expand_dims" | "reshape"
+                "broadcast" | "squeeze" | "expand_dims" | "reshape"
             ) {
                 return Ok(None);
             }
@@ -681,7 +664,10 @@ pub(super) fn emit(
             if operation.inputs.len() != arity {
                 return invalid();
             }
-            if matches!(*name, "equal_i32" | "maximum_i32")
+            if *name == "equal_i32" && one_output(operation)?.dtype() != WorkspaceDtype::Bool {
+                return invalid();
+            }
+            if *name == "maximum_i32"
                 && operation.inputs.get(0).unwrap().dtype() == WorkspaceDtype::Uint32
             {
                 return Ok(None);
@@ -834,6 +820,49 @@ fn invalid<T>() -> FactResult<T> {
         "invalid Metal basic-operation workspace descriptor",
     ))
 }
+
+fn parameter_placeholder_output(
+    operation: WorkspaceOperationView<'_>,
+) -> FactResult<WorkspaceLayoutView<'_>> {
+    if !matches!(operation.kind, WorkspaceOperationKindView::ParameterPlaceholder)
+        || !operation.inputs.is_empty()
+        || operation.outputs.len() != 1
+        || !operation.outputs.get(0).unwrap().shape().is_empty()
+    {
+        return Err(MlxWorkspaceFactError::descriptor(
+            "invalid unloaded parameter scalar source descriptor",
+        ));
+    }
+    Ok(operation.outputs.get(0).unwrap())
+}
+
+/// The eager scalar constructor is shared by CPU and Metal. This describes its
+/// backing only: a retained constructor inventory must still certify the lazy
+/// Broadcast/Full graph, which strict parameter binding replaces before Eval.
+pub(super) fn emit_parameter_placeholder(
+    operation: WorkspaceOperationView<'_>,
+    allocation: MetalAllocationFacts,
+    sink: &mut Emitter<'_>,
+) -> FactResult<WorkspaceOperationFacts> {
+    let output = parameter_placeholder_output(operation)?;
+    // Pinned zeros(shape, dtype) constructs array(0, dtype) eagerly on either
+    // device. Each constructor owns one seed; no donation sharing is assumed.
+    sink.output(Output::Allocate(buffer_capacity(allocation, output.dtype().bytes())?))?;
+    sink.finish(0, format_args!(
+        "unloaded parameter construction eagerly copies one dtype-sized scalar into shared native storage; logical weight fill stays unevaluated until replaced by binding; page={} bytes with bounded oversized cache reuse",
+        allocation.page_size(),
+    ))
+}
+
+pub(super) fn emit_parameter_placeholder_host(
+    operation: WorkspaceOperationView<'_>,
+    sink: &mut facts::HostEmitter<'_>,
+) -> FactResult<WorkspaceHostFacts> {
+    parameter_placeholder_output(operation)?;
+    sink.finish(0, format_args!(
+        "the stack scalar is copied directly into the already-priced shared native allocation; lazy fill/shape descriptors have no disjoint host numerical payload",
+    ))
+}
 fn one_output(operation: WorkspaceOperationView<'_>) -> FactResult<WorkspaceLayoutView<'_>> {
     if operation.outputs.len() != 1 {
         return invalid();
@@ -872,8 +901,19 @@ fn pointwise(
         .try_fold(output.elements()?, |largest, input| {
             Ok::<_, MlxWorkspaceFactError>(largest.max(input.elements()?))
         })?;
+    // Vendored dtype.cpp promotes U32 plus an eager I32 scalar to I64.
+    // ops.cpp equal casts both operands before broadcasting and produces Bool.
+    // Preserve those eight-byte intermediate allocations even though the
+    // neutral result is Bool; wider-result integer equations remain rejected.
+    let element_bytes = if matches!(
+        operation.kind, WorkspaceOperationKindView::Elementwise("equal_i32")
+    ) && operation.inputs.get(0).is_some_and(|input| input.dtype() == WorkspaceDtype::Uint32) {
+        8
+    } else {
+        4
+    };
     // Empty broadcasts can still have a scalar backing allocation.
-    let bytes = buffer_capacity(allocation, mul(elements.max(1), 4)?)?;
+    let bytes = buffer_capacity(allocation, mul(elements.max(1), element_bytes)?)?;
     Ok(one(
         sink,
         allocation,
@@ -886,10 +926,10 @@ fn pointwise(
         },
         add(
             mul(buffers - 1, bytes)?,
-            mul(scalars, buffer_capacity(allocation, 4)?)?,
+            mul(scalars, buffer_capacity(allocation, element_bytes)?)?,
         )?,
         format_args!(
-            "pointwise equation: at most {buffers} four-byte tensor buffers and {scalars} scalar buffers; includes casts/contiguous copies; retains all intermediates"
+            "pointwise equation: at most {buffers} tensor buffers and {scalars} scalar buffers with {element_bytes}-byte elements; includes casts/contiguous copies; retains all intermediates"
         ),
     )?)
 }

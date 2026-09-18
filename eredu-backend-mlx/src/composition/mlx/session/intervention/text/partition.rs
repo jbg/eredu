@@ -71,11 +71,11 @@ impl PreparedTextInterventions {
     /// sequence. Remote descriptors cannot supply a floating witness.
     pub(crate) fn partition_evidence_scalar(&self,phase:CapturePhase,prediction:u64,
         operation:usize,side:eredu_core::capture::InterventionEvidenceSide,
-        metadata:&WorkspaceMetadataFunding)
+        metadata:&HostMetadataFunding)
         ->std::result::Result<Option<eredu_nn::workspace::WorkspaceFloatingType>,eredu_nn::Error> {
         use eredu_nn::workspace::WorkspaceFloatingType;
         metadata.reserve_metadata(size_of::<(&Self,CapturePhase,u64,usize,
-            eredu_core::capture::InterventionEvidenceSide,&WorkspaceMetadataFunding)>()
+            eredu_core::capture::InterventionEvidenceSide,&HostMetadataFunding)>()
             +size_of::<(Option<bool>,Option<WorkspaceFloatingType>,Option<WorkspaceFloatingType>,usize)>()
             +size_of::<std::result::Result<Option<WorkspaceFloatingType>,eredu_nn::Error>>()
             +size_of::<std::result::Result<Option<&super::super::PreparedPartitionModelIntervention>,Failure>>()
@@ -112,7 +112,7 @@ impl PreparedTextInterventions {
         &self,
         phase: CapturePhase,
         prediction: u64,
-        metadata: &WorkspaceMetadataFunding,
+        metadata: &HostMetadataFunding,
     ) -> std::result::Result<
         Vec<Option<eredu_runtime::capture::partition::PreparedPartitionInterventionSource>>,
         eredu_nn::Error,
@@ -233,7 +233,7 @@ fn source_control_bytes() -> Option<usize> {
             &PreparedTextInterventions,
             CapturePhase,
             u64,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         )>(),
         size_of::<
             std::result::Result<Vec<Option<PreparedPartitionInterventionSource>>, eredu_nn::Error>,
@@ -243,3 +243,5 @@ fn source_control_bytes() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&frames), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

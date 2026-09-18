@@ -4,7 +4,7 @@ use std::sync::Arc;
 mod source;
 pub(crate) use source::RetainedParallelModelSource;
 
-use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+use eredu_core::AttentionPolicy;
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
     Error, GroupedGatedProductOperator, GroupedNeuralBackend, NormalizationOperator, Parameterized,
@@ -15,7 +15,6 @@ use eredu_runtime::{
     LayeredPartitionOutput, ModelStateIdentity, ParallelLayeredArchitecture,
     ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout, StateSegmentLifetime,
-    StateSegmentSpec,
 };
 
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
@@ -480,7 +479,7 @@ where
     fn prepare_construction_units(&self, banks: Option<&crate::routed_text::RetainedRoutedBanks>, context: &<B::Tensor as Tensor>::Context)
         -> Result<Option<crate::routed_text::RetainedRoutedUnits>, Error> {
         crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
-        let count = self.groups.unit_count(0)?;
+        let count = self.groups.unit_count(0, None)?;
         let selected = banks.map(|banks| banks.get(&eredu_runtime::RoutedBankId::new(0))
             .and_then(|bank| bank.plan().gated())
             .ok_or_else(|| Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)))
@@ -491,7 +490,7 @@ where
     }
     fn install_construction_units(&mut self, source: Option<crate::routed_text::RetainedRoutedUnits>) -> Result<(), Error> {
         if let Some(source) = &source {
-            if source.v3()?.len() != self.groups.unit_count(0)? {
+            if source.v3()?.len() != self.groups.unit_count(0, None)? {
                 return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
             }
         }
@@ -507,45 +506,37 @@ where
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
 
-    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+    fn state_layout(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
         -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
         match &self.parallel_geometry {
             Some(geometry) => geometry.state_layout().clone_workspace(context),
             None => state_layout_with_metadata(&self.args, context),
         }
-    }
-    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+    }, None => {
+        self.state_layout_impl()
+    } }
+}
+    fn state_identity(&self, state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
         state_identity_with_metadata(&self.args, state.layout(), state.global_layer_offset(), topology, context)
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+    }, None => {
         state_identity(
             &self.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
         )
-    }
+    } }
+}
 
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::v3_parameter_description(&self.args).map_err(Error::backend)
-    }
 
-    fn parameter_description_with_metadata(&self,
+
+    fn parameter_description(&self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
         match &self.construction_parameters {
@@ -557,7 +548,9 @@ where
             None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
                 Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
             }
-            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+            None => (|| {
+        super::parallel::v3_parameter_description(&self.args).map_err(Error::backend)
+    })().map(std::borrow::Cow::Owned),
         }
     }
 
@@ -720,7 +713,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     }
 
     fn target_unit_source(&self, index: usize, selected_plan: Option<&crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>) -> Result<super::block::V3BlockSpec, Error> {
-        self.groups.unit_count(0)?;
+        self.groups.unit_count(0, None)?;
         let args = self.unit_construction_args();
         let realization = selected_plan.or(self.expert_realization.as_deref());
         let selected = realization.and_then(|source| source.unit_spec("target", index)).cloned();
@@ -750,7 +743,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             }
         }
 
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         let args = self.unit_construction_args();
         let owner_group = if group == 0 {
             "target".to_owned()
@@ -1404,7 +1397,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_with_provider(
                 hidden,
@@ -1464,7 +1457,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel_with_provider(
                 hidden,
@@ -1648,31 +1641,32 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // Ordinary target MLA is causal at the retained cache offset; projections,
         // normalization and dense/routed feed-forward equations act per token.
         // Prediction groups keep their separate observation availability contract.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 0)?;
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 0, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index)),
-            true,
-        )?;
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index, metadata_context)),
+            true, metadata_context)?;
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
-            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index)?;
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index, metadata_context)?;
             match self.args.layer_schedule.get(index) {
                 Some(crate::deepseek::LayerPolicy::DenseMlp) => {
                     crate::decoder::append_dense_component_prefill_observations(
-                        &mut declarations, &format!("{path}.feed_forward"));
+                        &mut declarations, &metadata.format(format_args!("{path}.feed_forward"))?, metadata_context)?;
                 }
                 Some(crate::deepseek::LayerPolicy::SparseMoe) => {
-                    crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.feed_forward"));
+                    crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.feed_forward"))?, metadata_context)?;
                     // forward_shared uses the same per-token gate/up product
                     // and down projection before combining the TP terms. Its
                     // additive provenance is retained by component placement.
                     crate::decoder::append_dense_component_prefill_observations(
-                        &mut declarations, &format!("{path}.feed_forward.shared"));
+                        &mut declarations, &metadata.format(format_args!("{path}.feed_forward.shared"))?, metadata_context)?;
                 }
                 None => return Err(Error::backend("target layer has no feed-forward policy")),
             }
@@ -1753,24 +1747,23 @@ where
         )
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.groups.execution_graph()
     }
-    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.groups.execution_graph_with_metadata(context)
-    }
-    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<usize, Self::Error> {
-        self.groups.unit_count_with_metadata(group, context)
+
+
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        self.groups.unit_count(group, metadata_context)
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.groups.unit_count(group)
-    }
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.groups.unit_path(group, index)
+        self.groups.unit_path(group, index, metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -1919,7 +1912,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let cache = state
@@ -2234,7 +2227,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel(
                 hidden,
@@ -2311,7 +2304,14 @@ where
 
     type Boundary = TargetBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(TargetBoundarySchema::from_args(self.args()))
     }
 

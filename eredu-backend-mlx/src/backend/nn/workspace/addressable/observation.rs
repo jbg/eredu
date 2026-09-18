@@ -4,7 +4,7 @@ use super::parameters::ParameterRows;
 use crate::backend::runtime::residency::parameter_bank::IndexedBankSource;
 
 pub(super) fn source_groups(source:WorkspaceAddressableRegionView<'_>,inputs:&[WorkspaceLayout],
-    mechanism:ResidentExecutionMechanisms,funding:&WorkspaceMetadataFunding,owner:&WorkspaceContext)
+    mechanism:ResidentExecutionMechanisms,funding:&HostMetadataFunding,owner:&WorkspaceContext)
     ->Result<WorkspaceLayout,Error>{
     let context=WorkspaceContext::new_with_metadata_funding(mechanism,funding.clone())?;
     let value=inputs.get(1).ok_or(WorkspaceMetadataError::Unqualified)?;
@@ -16,7 +16,7 @@ pub(super) fn source_groups(source:WorkspaceAddressableRegionView<'_>,inputs:&[W
 }
 
 pub(super) fn inspect(bank:&IndexedBankSource,source:WorkspaceAddressableRegionView<'_>,
-    inputs:&[WorkspaceLayout],mechanism:ResidentExecutionMechanisms,funding:&WorkspaceMetadataFunding)
+    inputs:&[WorkspaceLayout],mechanism:ResidentExecutionMechanisms,funding:&HostMetadataFunding)
     ->Result<WorkspaceAddressableObservationLayout,Error>{
     let context=WorkspaceContext::new_with_metadata_funding(mechanism,funding.clone())?;
     context.charge_metadata(size_of::<(ParameterRows,AddressableChildSource,WorkspaceAddressableObservationLayout,
@@ -58,10 +58,10 @@ mod tests{
     use super::*;
     use std::sync::atomic::{AtomicUsize,Ordering};
     #[derive(Debug,Default)]struct Account(AtomicUsize);
-    impl WorkspaceMetadataAccount for Account{
-        fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+    impl HostMetadataAccount for Account{
+        fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
             self.0.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|total|total.checked_add(bytes))
-                .map(|_|()).map_err(|_|WorkspaceMetadataFundingError::Overflow)
+                .map(|_|()).map_err(|_|HostMetadataFundingError::Overflow)
         }
     }
     fn projection(name:&str)->eredu_nn::GroupedProjectionSpec{
@@ -72,7 +72,7 @@ mod tests{
     fn addressable_child_keeps_full_route_source_across_compact_cardinalities(){
         let _sources=crate::tests::support::test_utils::initialize_original_sources();
         let mechanism=ResidentExecutionMechanisms::Metal(MlxMetalWorkspaceMechanisms::current_host().unwrap());
-        let funding=WorkspaceMetadataFunding::new(Account::default()).unwrap();
+        let funding=HostMetadataFunding::new(Account::default()).unwrap();
         let context=WorkspaceContext::new_with_metadata_funding(mechanism,funding.clone()).unwrap();
         let spec=eredu_nn::GroupedGatedProductSpec::new(2,32,32,32,eredu_nn::GatedProductPolicy::ordinary_silu(),
             eredu_nn::GatedProductGroupLayout::Packed{gate_up:projection("read"),down:projection("write")}).unwrap();
@@ -109,7 +109,7 @@ mod tests{
     fn addressable_sequential_child_qualifies_the_actual_compact_reduction() {
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let mechanism = ResidentExecutionMechanisms::Metal(MlxMetalWorkspaceMechanisms::current_host().unwrap());
-        let funding = WorkspaceMetadataFunding::new(Account::default()).unwrap();
+        let funding = HostMetadataFunding::new(Account::default()).unwrap();
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone()).unwrap();
         let spec = eredu_nn::GroupedGatedProductSpec::new(2, 16, 6, 16,
             eredu_nn::GatedProductPolicy::ordinary_silu(),
@@ -144,3 +144,5 @@ mod tests{
     }
 
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

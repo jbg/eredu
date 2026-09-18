@@ -110,6 +110,15 @@ fn prepared_rotary_preserves_native_buffers_and_removes_only_generated_host_vect
         let mechanisms = mechanisms();
         let before = mechanisms.operation_bound(&ordinary).unwrap().unwrap();
         let after = mechanisms.operation_bound(&prepared).unwrap().unwrap();
+        for operation in [&ordinary, &prepared] {
+            for output in 0..2 {
+                assert_eq!(
+                    mechanisms.output_representation(operation.as_view(), output),
+                    Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false))
+                );
+            }
+            assert!(mechanisms.output_representation(operation.as_view(), 2).is_none());
+        }
         assert_eq!(before.outputs, after.outputs);
         assert_eq!(before.scratch_bytes, after.scratch_bytes);
         assert!(after.scratch_bytes > 0);
@@ -216,9 +225,15 @@ fn positional_workspace_rejects_invalid_geometry_and_unknown_input_domains() {
         let mut op = rotary_op(&[1], rotary_spec.clone(), WorkspaceDtype::Int32);
         op.inputs[0] = layout(&shape, WorkspaceDtype::Int32);
         assert!(mechanisms().operation_bound(&op).is_err());
+        assert!(mechanisms().output_representation(op.as_view(), 0).is_none());
     }
     let op = rotary_op(&[2], rotary_spec, WorkspaceDtype::Float32);
     assert!(mechanisms().operation_bound(&op).unwrap().is_none());
+    assert!(mechanisms().output_representation(op.as_view(), 0).is_none());
+    let mut wrong = rotary_op(&[2], spec(&[4, 8], MultiAxisRotaryLayout::SplitHalves), WorkspaceDtype::Int32);
+    wrong.outputs[1] = layout(&[2, 11], WorkspaceDtype::Float32);
+    assert!(mechanisms().operation_bound(&wrong).is_err());
+    assert!(mechanisms().output_representation(wrong.as_view(), 0).is_none());
     let large = spec(
         &[2, 2, 2, i32::MAX - 7],
         MultiAxisRotaryLayout::RoundRobinSections,
@@ -227,6 +242,80 @@ fn positional_workspace_rejects_invalid_geometry_and_unknown_input_domains() {
     // Section*axis_count exceeds I32, but metadata and native selection use
     // widened arithmetic. Cold pricing does not iterate billions of columns.
     assert!(mechanisms().operation_bound(&op).unwrap().is_some());
+}
+
+#[test]
+fn actual_vision_block_preserves_rotary_scalar_facts_through_attention_and_projection() {
+    use eredu_architectures::qwen::vision::{VisionBlock, VisionConfigSource};
+    use eredu_nn::{multimodal::PreparedMultiAxisRotary, ParameterVisitorMut, Parameterized};
+
+    struct Bind<'c>(&'c WorkspaceContext);
+    impl<'a> ParameterVisitorMut<'a, WorkspaceTensor> for Bind<'_> {
+        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut WorkspaceTensor) {
+            *value = WorkspaceTensor::existing(
+                layout(value.shape(), WorkspaceDtype::Float32).with_representation(Some(
+                    WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false),
+                )), self.0,
+            ).unwrap();
+        }
+    }
+    for activation in ["gelu", "gelu_pytorch_tanh", "silu"] {
+        let config: VisionConfigSource = serde_json::from_value(serde_json::json!({
+            "depth": 1, "hidden_size": 16, "intermediate_size": 32,
+            "num_heads": 2, "num_position_embeddings": 16, "in_channels": 3,
+            "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 1,
+            "out_hidden_size": 16, "deepstack_visual_indexes": [],
+            "hidden_act": activation,
+        })).unwrap();
+        let config = config.normalize_qwen3_vl().unwrap();
+        for prepared in [false, true] {
+            let context = WorkspaceContext::new(mechanisms());
+            let mut block = VisionBlock::<WorkspaceBackend>::new(&config, 0, &context).unwrap();
+            block.visit_parameters_mut(&mut Bind(&context));
+            let hidden = WorkspaceTensor::existing(
+                layout(&[4, 16], WorkspaceDtype::Float32).with_representation(Some(
+                    WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false),
+                )), &context,
+            ).unwrap();
+            let positions = WorkspaceTensor::existing(layout(&[4, 2], WorkspaceDtype::Int32), &context).unwrap();
+            let policy = spec(&[4, 4], MultiAxisRotaryLayout::SplitHalves);
+            let mut frequencies = vec![0.; policy.as_ref().frequency_count().unwrap()];
+            policy.as_ref().fill_frequencies(&mut frequencies).unwrap();
+            context.begin_span();
+            let (cosine, sine) = if prepared {
+                WorkspaceTensor::multi_axis_rotary_embeddings_prepared(&positions,
+                    PreparedMultiAxisRotary::new(policy.as_ref(), &frequencies).unwrap(), &context)
+            } else {
+                WorkspaceTensor::multi_axis_rotary_embeddings(&positions, &policy, &context)
+            }.unwrap();
+            let output = block.forward(&hidden, &[2, 2], &cosine, &sine, &context).unwrap();
+            assert_eq!(output.shape(), [4, 16]);
+            assert_eq!(output.layout().representation().map(WorkspaceRepresentation::dtype),
+                Some(WorkspaceFloatingType::Float32), "{activation}, prepared={prepared}");
+            let report = context.report(&[output]).unwrap();
+            assert!(report.tensor_buffers.total_bytes.is_some());
+            let mut projections = 0;
+            let mut attention = 0;
+            for operation in &report.operations {
+                match operation.kind {
+                    WorkspaceOperationKind::Projection(_) => projections += 1,
+                    WorkspaceOperationKind::Attention { .. } => attention += 1,
+                    _ => continue,
+                }
+                assert_eq!(mechanisms().output_representation(operation.as_view(), 0)
+                    .map(WorkspaceRepresentation::dtype), Some(WorkspaceFloatingType::Float32),
+                    "{activation}, prepared={prepared}: {:?}", operation.kind);
+            }
+            assert_eq!(projections, 4);
+            assert_eq!(attention, 2);
+
+            // Logical F32 geometry alone still cannot authorize the downstream
+            // collective. Use the same family worker with an unknown table.
+            let unknown = WorkspaceTensor::existing(layout(cosine.shape(), WorkspaceDtype::Float32), &context).unwrap();
+            let output = block.forward(&hidden, &[2, 2], &unknown, &sine, &context).unwrap();
+            assert!(output.layout().representation().is_none());
+        }
+    }
 }
 
 #[test]

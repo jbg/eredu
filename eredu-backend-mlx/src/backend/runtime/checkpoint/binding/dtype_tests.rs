@@ -10,22 +10,29 @@ use eredu_runtime::{
 };
 use safemlx::{Device, DeviceType, Dtype};
 
-struct Parameter(crate::MlxTensor);
+struct Parameter(crate::MlxTensor, ParameterSpec);
+impl Parameter {
+    fn new(value: crate::MlxTensor) -> Self { Self(value, ParameterSpec::trainable("weight").unwrap()) }
+}
 
 impl Parameterized<crate::MlxTensor> for Parameter {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, crate::MlxTensor>>(&'a self, visitor: &mut V) {
-        visitor.visit(
-            ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true),
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, crate::MlxTensor>>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+        visitor.parameter(
+            eredu_nn::ParameterMetadataView::from_spec(&self.1, true),
             &self.0,
         );
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, crate::MlxTensor>>(
         &'a mut self,
         visitor: &mut V,
     ) {
         visitor.visit_mut(
-            ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true),
+            eredu_nn::ParameterMetadataView::from_spec(&self.1, true),
             &mut self.0,
         );
     }
@@ -103,7 +110,7 @@ fn floating_slots_preserve_selected_f16_bf16_and_f32_storage() {
         ),
     ] {
         let (_directory, store) = source(stored, &bytes);
-        let mut parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
+        let mut parameter = Parameter::new(crate::MlxTensor::from_array(Array::from_slice(
             &[0.0f32; 4],
             &[1, 4],
         )));
@@ -129,7 +136,7 @@ fn byte_slots_preserve_fp8_values_and_exponent_scales() {
     let bytes = [0x38_u8, 0x40, 0xb8, 0];
     for stored in [safetensors::Dtype::F8_E4M3, safetensors::Dtype::F8_E8M0] {
         let (_directory, store) = source(stored, &bytes);
-        let mut parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
+        let mut parameter = Parameter::new(crate::MlxTensor::from_array(Array::from_slice(
             &[0_u8; 4],
             &[1, 4],
         )));
@@ -161,7 +168,7 @@ fn byte_slots_preserve_fp8_values_and_exponent_scales() {
 
 #[test]
 fn floating_slots_reject_integer_and_unsupported_f64_sources() {
-    let parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
+    let parameter = Parameter::new(crate::MlxTensor::from_array(Array::from_slice(
         &[0.0f32; 4],
         &[1, 4],
     )));
@@ -183,7 +190,7 @@ fn floating_slots_reject_integer_and_unsupported_f64_sources() {
 
 #[test]
 fn packed_integer_slots_retain_exact_dtype_matching() {
-    let parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
+    let parameter = Parameter::new(crate::MlxTensor::from_array(Array::from_slice(
         &[0u32; 4],
         &[1, 4],
     )));

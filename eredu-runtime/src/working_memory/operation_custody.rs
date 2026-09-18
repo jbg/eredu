@@ -11,7 +11,7 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct OriginalOperationMetadataCustody(Custody);
 #[derive(Debug, Clone)]
-enum Custody {
+pub(in crate::working_memory) enum Custody {
     Text(OriginalTextMetadataCustody),
     Speculative(OriginalSpeculativeBudgetCustody),
     Realtime(OriginalRealtimeBudgetCustody),
@@ -30,6 +30,20 @@ impl From<OriginalRealtimeBudgetCustody> for OriginalOperationMetadataCustody {
     fn from(value:OriginalRealtimeBudgetCustody)->Self {Self(Custody::Realtime(value))}
 }
 impl OriginalOperationMetadataCustody {
+    pub(in crate::working_memory) fn same_host_account(
+        &self,
+        other: &super::OriginalHostMetadataCustody,
+    ) -> bool {
+        other.matches_operation(&self.0)
+    }
+
+    pub(in crate::working_memory) fn host_account_control_bytes() -> Option<usize> {
+        super::OriginalHostMetadataCustody::operation_origin_control_bytes()?
+            .checked_add(std::mem::size_of::<(&Self, &super::OriginalHostMetadataCustody)>())?
+            .checked_add(std::mem::size_of::<&Custody>())?
+            .checked_add(std::mem::size_of::<bool>())
+    }
+
     /// Exact retained accounting owner, not merely the shared pool.
     pub fn same_account(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
@@ -62,6 +76,37 @@ impl OriginalOperationMetadataCustody {
             Custody::Realtime(value) => value.pool().shared_storage_domain().same_identity(domain),
         }
     }
+    /// Read-only health and pool validation for an already retained origin.
+    /// Closed healthy accounts remain valid while their actual source custody
+    /// survives. This creates no storage, receipt, registration or permission.
+    pub fn validate_retained_origin(
+        &self,
+        pool: &super::WorkingMemoryPool,
+    ) -> Result<(), WorkingMemoryError> {
+        let usage = pool.0.usage.lock().map_err(|_| WorkingMemoryError::Poisoned)?;
+        match &self.0 {
+            Custody::Text(value) => value.validate_retained_origin_locked(pool, &usage),
+            Custody::Speculative(value) => value.validate_copy_source(pool, &usage),
+            Custody::Realtime(value) => value.validate_copy_source(pool, &usage),
+        }
+    }
+
+    /// Concrete synchronous origin-validation frames, with no new owner.
+    pub fn retained_origin_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(&Self, &super::WorkingMemoryPool)>(),
+            size_of::<std::sync::MutexGuard<'static, super::Usage>>(),
+            size_of::<Result<std::sync::MutexGuard<'static, super::Usage>,
+                std::sync::PoisonError<std::sync::MutexGuard<'static, super::Usage>>>>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
+            size_of::<(&OriginalTextMetadataCustody, &super::WorkingMemoryPool, &super::Usage)>(),
+            size_of::<(&OriginalSpeculativeBudgetCustody, &super::WorkingMemoryPool, &super::Usage)>(),
+            size_of::<(&OriginalRealtimeBudgetCustody, &super::WorkingMemoryPool, &super::Usage)>(),
+        ];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
     /// Validate the already-attached metadata against this retained account.
     pub fn validate_metadata(
         &self,

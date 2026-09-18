@@ -7,7 +7,7 @@ use crate::capture::partition::{PartitionCaptureBuffer, PartitionCaptureEncoding
 enum EncodeCause {
     #[error("contiguous producer source, payload or charge differs")]
     Source,
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Memory(#[from] WorkingMemoryError),
     #[error(transparent)] Encoding(#[from] PartitionCaptureEncodingError),
     #[error(transparent)] Destination(#[from] eredu_nn::Error),
@@ -17,18 +17,18 @@ enum EncodeCause {
 #[error("contiguous capture producer: {cause}")]
 pub(crate) struct PartitionFragmentEncodingError {
     #[source] cause:EncodeCause,
-    _source:SharedCapturePlan,_custody:CaptureTensorCustody,_metadata:WorkspaceMetadataFunding,
+    _source:SharedCapturePlan,_custody:CaptureTensorCustody,_metadata:HostMetadataFunding,
 }
 impl PreparedPartitionFragmentDestinations {
     /// Lend only this rank's actual completed contiguous fragment, or its real
     /// empty source. The surrounding exchange owns unique-rank submission and
     /// voting; encoding grants no native completion or final assembly evidence.
     pub(crate) fn encode_contiguous_producer(&self,receipt:&PartitionCaptureReceiptPlan,
-        empty_dtype:Option<&TensorDtype>,funding:&WorkspaceMetadataFunding)
+        empty_dtype:Option<&TensorDtype>,funding:&HostMetadataFunding)
         ->Result<PartitionCaptureBuffer<u8>,PartitionFragmentEncodingError> {
         let error=|cause|PartitionFragmentEncodingError{cause,_source:self.source.clone(),
             _custody:self.custody.share_scheduled(),_metadata:funding.clone()};
-        let parts=[size_of::<(&Self,&PartitionCaptureReceiptPlan,Option<&TensorDtype>,&WorkspaceMetadataFunding)>(),
+        let parts=[size_of::<(&Self,&PartitionCaptureReceiptPlan,Option<&TensorDtype>,&HostMetadataFunding)>(),
             CaptureRecordWire::control_bytes(),size_of::<CaptureOutcome>(),size_of::<Option<CaptureRecordWire<'_>>>(),
             size_of::<Option<(TensorDtype,CaptureUsage,CaptureUsage)>>(),size_of::<(TensorDtype,CaptureUsage,CaptureUsage)>(),
             size_of::<Option<&PartitionFragmentValue>>(),size_of::<Option<&CaptureSlicePartition>>(),
@@ -80,10 +80,10 @@ impl PreparedPartitionFragmentDestinations {
 
 impl PreparedPartitionFragmentDestinations {
     fn encode_routed_producer(&self,receipt:&PartitionCaptureReceiptPlan,empty_dtype:Option<&TensorDtype>,
-        funding:&WorkspaceMetadataFunding)->Result<PartitionCaptureBuffer<u8>,PartitionFragmentEncodingError> {
+        funding:&HostMetadataFunding)->Result<PartitionCaptureBuffer<u8>,PartitionFragmentEncodingError> {
         let error=|cause|PartitionFragmentEncodingError{cause,_source:self.source.clone(),
             _custody:self.custody.share_scheduled(),_metadata:funding.clone()};
-        let parts=[size_of::<(&Self,&PartitionCaptureReceiptPlan,Option<&TensorDtype>,&WorkspaceMetadataFunding)>(),
+        let parts=[size_of::<(&Self,&PartitionCaptureReceiptPlan,Option<&TensorDtype>,&HostMetadataFunding)>(),
             size_of::<Vec<CaptureRecordWire<'_>>>(),CaptureRecordWire::control_bytes(),
             size_of::<Option<&TensorDtype>>(),size_of::<Option<(TensorDtype,CaptureUsage,CaptureUsage)>>(),
             size_of::<(TensorDtype,CaptureUsage,CaptureUsage)>(),size_of::<CaptureOutcome>(),
@@ -125,3 +125,5 @@ impl PreparedPartitionFragmentDestinations {
             .map_err(|e|error(e.into()))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

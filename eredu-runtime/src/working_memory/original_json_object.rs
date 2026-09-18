@@ -1,7 +1,7 @@
 //! Paid object fields over the same cursor used by the ordinary tool parser.
 use super::{OriginalJsonValue, OriginalJsonValueError, OriginalJsonValueKind};
 use eredu_core::{HostPreparationAuthority, SemanticText, SpeculativeBuffer};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_text::json_fragments::{JsonFieldNames, JsonFieldError, ObjectContext, ObjectCursor, ObjectSyntaxError};
 use std::{
     mem::{size_of, size_of_val},
@@ -12,7 +12,7 @@ use std::{
 enum Cause {
     #[error(transparent)] Field(#[from] JsonFieldError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Buffer(#[from] eredu_core::SpeculativeBufferAllocationError),
     #[error(transparent)]
@@ -55,7 +55,7 @@ impl OriginalJsonField {
 struct Data {
     raw: SpeculativeBuffer<u8>,
     fields: SpeculativeBuffer<OriginalJsonField>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Data {
     fn source(&self) -> &str {
@@ -145,7 +145,7 @@ pub struct OriginalJsonObjectError {
     #[source]
     cause: Cause,
     prefix: Option<OriginalJsonObject>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalJsonObject {
     fn controls() -> Option<usize> {
@@ -164,9 +164,9 @@ impl OriginalJsonObject {
             size_of::<Result<(Self, usize, bool), OriginalJsonObjectError>>(),
             size_of::<Result<(usize, bool), Cause>>(),
             size_of::<Result<(), Cause>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Result<(), eredu_core::GenerationError>>(),
-            size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &HostMetadataFunding)>(),
             size_of::<(&mut Data, Range<usize>, usize)>(),
             size_of::<[u8; 4]>(),
             size_of::<std::str::Bytes<'_>>(),
@@ -185,13 +185,13 @@ impl OriginalJsonObject {
         SpeculativeBuffer::<T>::retained_control_bytes(capacity)
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .and_then(|n| n.checked_add(size_of::<Result<SpeculativeBuffer<T>, Cause>>()))
-            .and_then(|n| n.checked_add(size_of::<(usize, &WorkspaceMetadataFunding)>()))
+            .and_then(|n| n.checked_add(size_of::<(usize, &HostMetadataFunding)>()))
     }
-    fn buffer<T>(capacity: usize, funding: &WorkspaceMetadataFunding) -> Result<SpeculativeBuffer<T>, Cause> {
+    fn buffer<T>(capacity: usize, funding: &HostMetadataFunding) -> Result<SpeculativeBuffer<T>, Cause> {
         let bytes = Self::buffer_bytes::<T>(capacity).ok_or(Cause::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(SpeculativeBuffer::try_new_retained(
@@ -203,7 +203,7 @@ impl OriginalJsonObject {
     /// least one input byte, so input_bytes also bounds the retained field rows.
     pub fn prepare(
         input_bytes: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalJsonObjectError> {
         let mut owner = Self {
             cursor: ObjectCursor::default(),
@@ -299,17 +299,17 @@ impl OriginalJsonObject {
     /// text aliases retain their original account as well as the new copy owner.
     pub fn try_copy(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalJsonObjectError> {
         let bytes = self.copy_bytes().ok_or_else(|| OriginalJsonObjectError { cause: Cause::Overflow, prefix: None, funding: funding.clone() })?;
         funding.reserve_metadata(bytes).map_err(|cause| OriginalJsonObjectError { cause: cause.into(), prefix: None, funding: funding.clone() })?;
         self.copy_prepaid(HostPreparationAuthority::retain(funding.clone()), funding)
     }
-    pub(super) fn rebind_funding(&mut self, funding: &WorkspaceMetadataFunding) {
+    pub(super) fn rebind_funding(&mut self, funding: &HostMetadataFunding) {
         self.data.funding = funding.clone();
     }
     /// Same fixed-destination copy worker after its owner has prepaid copy_bytes.
-    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &WorkspaceMetadataFunding) -> Result<Self, OriginalJsonObjectError> {
+    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &HostMetadataFunding) -> Result<Self, OriginalJsonObjectError> {
         let mut copy = Self {
             cursor: self.cursor.clone(), complete: self.complete,
             data: Data { raw: SpeculativeBuffer::default(), fields: SpeculativeBuffer::default(), funding: funding.clone() },
@@ -328,7 +328,7 @@ impl OriginalJsonObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_nn::workspace::WorkspaceMetadataAccount;
+    use eredu_nn::workspace::HostMetadataAccount;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -338,10 +338,10 @@ mod tests {
         refused: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             if self.refused.load(Ordering::SeqCst) {
-                Err(WorkspaceMetadataFundingError::Capacity {
+                Err(HostMetadataFundingError::Capacity {
                     required: bytes as u64,
                     available: 0,
                 })
@@ -355,11 +355,11 @@ mod tests {
             self.retired.store(true, Ordering::SeqCst);
         }
     }
-    fn funding() -> (WorkspaceMetadataFunding, Arc<AtomicBool>, Arc<AtomicBool>) {
+    fn funding() -> (HostMetadataFunding, Arc<AtomicBool>, Arc<AtomicBool>) {
         let refused = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         (
-            WorkspaceMetadataFunding::new(Account {
+            HostMetadataFunding::new(Account {
                 refused: refused.clone(),
                 retired: retired.clone(),
             })
@@ -394,6 +394,7 @@ mod tests {
                     OriginalJsonNumber::I64(value) => Value::from(value),
                     OriginalJsonNumber::U64(value) => Value::from(value),
                     OriginalJsonNumber::F64(value) => Value::from(value),
+                    OriginalJsonNumber::Exact(value)=>Value::Number(value.clone()),
                 },
                 OriginalJsonValueKind::Bool => Value::Bool(node.boolean().unwrap()),
                 OriginalJsonValueKind::Null => Value::Null,
@@ -423,8 +424,8 @@ mod tests {
             tree.root().get("z").unwrap().storage_identity()
         );
         assert_eq!(
-            tree.root().get("n").unwrap().number(),
-            Some(OriginalJsonNumber::F64(-0.0))
+            to_value(tree.root().get("n").unwrap()),
+            serde_json::from_str::<serde_json::Value>("-0.0").unwrap()
         );
         drop(payer);
         assert!(!retired.load(Ordering::SeqCst));

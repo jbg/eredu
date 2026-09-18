@@ -27,6 +27,7 @@ impl CacheResidencyManager {
                 .try_visit_retained_storage(&mut |entry| {
                     match entry {
                         RetainedStorageRef::Array(array) => storage.include_array(array),
+                        RetainedStorageRef::CanonicalArray(cell) => storage.include_canonical_array(cell),
                         RetainedStorageRef::Host(host) => storage.include_host(Arc::clone(host)),
                         RetainedStorageRef::RetainedHost(host) => {
                             storage.include_retained_host(host.clone())

@@ -162,8 +162,8 @@ struct Populate<'a>(
     BTreeMap<String, Vec<usize>>,
 );
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         let original = self.0.get(name).unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(value.shape, original.shape, "{name}");
         value.data.clone_from(&original.data);
@@ -186,15 +186,14 @@ fn make_model(
     PreparedLayeredObservationPaths,
 ) {
     let architecture = Architecture::new(f.args.clone(), context).unwrap();
-    let declarations=<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(&architecture).unwrap();
+    let declarations=<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(&architecture, None).unwrap();
     let count = f.args.text_config.num_hidden_layers as usize;
     assert_eq!(declarations.len(), 11 + 4 * count);
     for index in 0..count {
         let path = <Architecture as LayeredArchitecture<NumericBackend, State>>::unit_path(
             &architecture,
             2,
-            index,
-        )
+            index, None)
         .unwrap();
         assert_eq!(path, format!("model.layers.{index}"));
         for suffix in ["input", "input.effective", "output", "output.effective"] {
@@ -214,8 +213,7 @@ fn make_model(
     let prepared = Prepared::new(architecture);
     assert_eq!(
         <Prepared as LayeredArchitecture<NumericBackend, State>>::prefill_observation_declarations(
-            &prepared
-        )
+            &prepared, None)
         .unwrap(),
         declarations
     );
@@ -232,7 +230,7 @@ fn make_model(
         .architecture()
         .inner()
         .parameter_description(context)
-        .unwrap();
+        .unwrap().into_owned();
     let expected = description
         .groups()
         .iter()

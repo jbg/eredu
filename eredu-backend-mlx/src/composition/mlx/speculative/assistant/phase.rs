@@ -11,7 +11,7 @@ use eredu_architectures::{ExternalAssistantArchitecture,
     external_assistant::{ExternalOperationResult, invocation::ExternalAssistantOperation},
     speculative_execution::PreparedEmbeddedEvidence};
 use eredu_core::{HostPreparationAuthority, speculative::SamplingPlacement};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{InferenceWorkspaceReport, OriginalExternalSpeculativeRole,
     OriginalSpeculativeBudgetCustody, SpeculativeInvocationRequirements, WorkingMemoryError};
 use safemlx::{OriginalBufferBudget, SubmissionScope};
@@ -40,24 +40,24 @@ struct Work<'work, 'args, A: ExternalAssistantArchitecture, I: ExternalAssistant
     prior: &'work [PreparedEmbeddedEvidence],
     completed: Option<PreparedEmbeddedEvidence>,
 }
-fn charge(funding: &WorkspaceMetadataFunding, parts: &[usize]) -> Result<(), Error> {
+fn charge(funding: &HostMetadataFunding, parts: &[usize]) -> Result<(), Error> {
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)
 }
-fn host(funding: &WorkspaceMetadataFunding) -> Result<HostPreparationAuthority, Error> {
-    charge(funding, &[HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+fn host(funding: &HostMetadataFunding) -> Result<HostPreparationAuthority, Error> {
+    charge(funding, &[HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         size_of::<HostPreparationAuthority>(), size_of::<Result<HostPreparationAuthority, Error>>()])?;
     Ok(HostPreparationAuthority::retain(funding.clone()))
 }
 fn prior_sources<'a>(prior: &'a [PreparedEmbeddedEvidence],
-    context:SpeculativeExecutionStreams<'_>, funding:&WorkspaceMetadataFunding,
+    context:SpeculativeExecutionStreams<'_>, funding:&HostMetadataFunding,
 ) -> Result<Vec<&'a CompletedResidentSource>, Error> {
     charge(funding, &[size_of::<Vec<&CompletedResidentSource>>(),
         size_of::<std::slice::Iter<'_, PreparedEmbeddedEvidence>>(),
         size_of::<Result<Vec<&CompletedResidentSource>, Error>>(),
-        size_of::<(&[PreparedEmbeddedEvidence],SpeculativeExecutionStreams<'_>,&WorkspaceMetadataFunding)>()])?;
+        size_of::<(&[PreparedEmbeddedEvidence],SpeculativeExecutionStreams<'_>,&HostMetadataFunding)>()])?;
     let mut result = funding.metadata_vec(prior.len()).map_err(Error::Neural)?;
     for evidence in prior {
         validate_input_evidence(evidence,context,SamplingPlacement::Draft,funding)?;
@@ -66,12 +66,12 @@ fn prior_sources<'a>(prior: &'a [PreparedEmbeddedEvidence],
     Ok(result)
 }
 fn validate_registered(prior: &[PreparedEmbeddedEvidence], storage: &ProjectedNativeStorage,
-    funding:&WorkspaceMetadataFunding,
+    funding:&HostMetadataFunding,
 ) -> Result<(), Error> {
     charge(funding,&[
         size_of::<super::super::tensor_sources::RegisteredTensorSources<'_>>(),
         size_of::<std::slice::Iter<'_,PreparedEmbeddedEvidence>>(),size_of::<Result<(),Error>>(),
-        size_of::<(&[PreparedEmbeddedEvidence],&ProjectedNativeStorage,&WorkspaceMetadataFunding)>()])?;
+        size_of::<(&[PreparedEmbeddedEvidence],&ProjectedNativeStorage,&HostMetadataFunding)>()])?;
     for evidence in prior {
         for source in registered_tensor_sources(evidence) {
             // prior_sources authenticated every declaration before this exact
@@ -254,3 +254,5 @@ where A: ExternalAssistantArchitecture, I: ExternalAssistantOperation<A> {
     })();
     result.map_err(|cause| sources.retain_startup_error(AssistantEquationFailure { stage: phase.get(), cause }))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

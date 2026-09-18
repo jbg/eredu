@@ -2,17 +2,17 @@
 use super::OriginalPreparedGrammarController;
 use crate::runtime::chat::constraints::{ConstraintController, ConstraintRuntime};
 use eredu_core::{
+    HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority, SharedStorageOwner,
+    SharedTokenFilter, SpeculativeTokenFilterController,
     speculative::{
         PlainControllerHistory, PreparedGrammarController, PreparedGrammarInstallCause,
         PreparedGrammarInstallError, PreparedGrammarSource,
     },
-    HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority, SharedStorageOwner,
-    SharedTokenFilter, SpeculativeTokenFilterController,
 };
 use std::{
     alloc::Layout,
     mem::{size_of, size_of_val},
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 type Failure = PreparedGrammarInstallError<OriginalPreparedGrammarController>;
 
@@ -49,7 +49,9 @@ fn controls() -> Option<usize> {
         .try_fold(size_of_val(&parts), usize::checked_add)
 }
 impl ConstraintController {
-    pub(in crate::runtime::chat::constraints) fn original_grammar_replacement_bytes(&self) -> Option<usize> {
+    pub(in crate::runtime::chat::constraints) fn original_grammar_replacement_bytes(
+        &self,
+    ) -> Option<usize> {
         self.prepared_grammar()?;
         PreparedGrammarSource::control_bytes()?.checked_add(controls()?)
     }
@@ -82,6 +84,7 @@ impl ConstraintController {
             committed_tokens: PlainControllerHistory::default(),
             validity,
             authority: HostPreparationAuthority::retain(funding.clone()),
+            preparation: None,
         })
     }
     pub(in crate::runtime::chat::constraints) fn replace_original_grammar(
@@ -107,6 +110,8 @@ impl ConstraintController {
                 funding,
             ));
         }
-        Self::from_prepared_grammar(grammar, funding)
+        let mut successor = Self::from_prepared_grammar(grammar, funding)?;
+        successor.preparation = self.preparation.clone();
+        Ok(successor)
     }
 }

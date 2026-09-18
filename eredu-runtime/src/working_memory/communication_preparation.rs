@@ -35,6 +35,9 @@ pub trait CommunicationPreparationProducer:Sized {
     /// All managed native/backing/control storage born in this one producer.
     /// Independently retained host planning/source holds remain separate.
     fn required_storage_bytes(&self)->Result<usize,WorkingMemoryError>;
+    /// Optional enclosing operation policy. This can only refuse; the same
+    /// independent source/domain admission below remains required.
+    fn check_preparation_policy(&self, _pool: &WorkingMemoryPool, _bytes: u64) -> Result<(), WorkingMemoryError> { Ok(()) }
     /// Execute once after comparison. Native aliases must keep the supplied
     /// custody independently of the returned wrapper, also on failure/unwind.
     fn produce(self,custody:CommunicationPreparationCustody)->Result<Self::Output,Self::Error>;
@@ -158,6 +161,7 @@ impl WorkingMemoryPool {
         let bytes=match Self::communication_preparation_required_bytes(&plan){
             Ok(bytes)=>bytes,Err(cause)=>return Err(CommunicationPreparationError::rejected(plan,cause)),
         };
+        if let Err(cause)=plan.check_preparation_policy(self,bytes){return Err(CommunicationPreparationError::rejected(plan,cause));}
         let allowance=match self.admit_source_compiler(bytes){
             Ok(value)=>value,Err(cause)=>return Err(CommunicationPreparationError::rejected(plan,cause)),
         };

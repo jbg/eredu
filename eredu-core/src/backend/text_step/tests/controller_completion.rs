@@ -125,7 +125,7 @@ fn detached_queries_do_not_change_pending_input_allowance_or_completed_boundary(
         // Asking does not implicitly drain the exact pending completion.
         unchanged_queries(&facts, &queries, || state.controller_is_complete(), false);
         assert!(state.require_quiescent().is_err());
-        assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+        assert!(driver.take_completed_delivery(&mut state).unwrap().is_none());
         state.require_quiescent().unwrap();
         assert_eq!(
             facts.borrow().contexts[attempt].policy_identity(),
@@ -177,7 +177,7 @@ fn completion_query_returns_original_typed_error_without_formatting_or_policy_ch
             assert!(Arc::ptr_eq(&identity, &original.identity));
             assert_eq!(formats.load(Ordering::SeqCst), 0);
             assert_eq!(driver.advance(&mut state).unwrap().unwrap().token_id(), 7);
-            driver.take_completed_step(&mut state).unwrap();
+            driver.take_completed_delivery(&mut state).unwrap();
         } else {
             let mut run =
                 ControlledTextGeneration::new(&mut runtime, vec![1], config(), controller).unwrap();

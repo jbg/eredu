@@ -16,7 +16,7 @@ use eredu_checkpoint::{
 use eredu_gguf::{MetadataArray, MetadataValue};
 use eredu_nn::{
     Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
+    NormalizationOperator, Parameterized, RotaryOperator, RotaryPosition,
     RotarySpec, Tensor,
 };
 use serde::Deserialize;

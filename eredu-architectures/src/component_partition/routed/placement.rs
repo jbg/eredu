@@ -50,11 +50,50 @@ pub(in crate::component_partition) fn derive_observations(
     topology: eredu_core::ParallelRankTopology,
     owned_groups: &[crate::partitioned_execution::PartitionedGroupRequirements],
     selected: &crate::SelectedRoutedTextRealization,
-) -> Result<BTreeMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
+) -> Result<SourceMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
+    worker(
+        descriptor,
+        parameters,
+        layout,
+        topology,
+        owned_groups,
+        selected,
+        Destination(None),
+    )
+}
+pub(in crate::component_partition) fn prediction_observations(
+    descriptor: &ArchitectureDescriptor,
+    components: &[RoutedComponentGroup],
+    layout: &LocalModelLayout,
+) -> Result<SourceMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
+    prediction_worker(descriptor, components, layout, Destination(None))
+}
+pub(in crate::component_partition) fn worker(
+    descriptor: &ArchitectureDescriptor,
+    parameters: &ArchitectureParameterDescription,
+    layout: &LocalModelLayout,
+    topology: eredu_core::ParallelRankTopology,
+    owned_groups: &[crate::partitioned_execution::PartitionedGroupRequirements],
+    selected: &crate::SelectedRoutedTextRealization,
+    allocation: Destination<'_>,
+) -> Result<SourceMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
     use crate::routed_text::RoutedGroupedPlan;
-    let mut observations = BTreeMap::new();
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &ArchitectureParameterDescription,
+        &LocalModelLayout,
+        eredu_core::ParallelRankTopology,
+        &[crate::partitioned_execution::PartitionedGroupRequirements],
+        &crate::SelectedRoutedTextRealization,
+        SourceMap<String, PartitionedRoutedObservation>,
+        Vec<usize>,
+        Option<RoutedUnitCaptureOwnership>,
+        RoutedUnitGeometry,
+        PartitionedRoutedObservation,
+    )>()?;
+    let mut observations = SourceMap::new();
     for component in &descriptor.routed_components {
-        let invalid = || ComponentPartitionError::InvalidPlacement(component.id.clone());
+        let invalid = || allocation.invalid(&component.id);
         let node = descriptor.node(&component.node_id).ok_or_else(invalid)?;
         // RoutedExperts is a child operation whose parameter ownership is
         // explicitly inherited from its enclosing MixtureOfExperts invocation.
@@ -75,7 +114,7 @@ pub(in crate::component_partition) fn derive_observations(
         };
         let eredu_runtime::ParameterGroupOwner::ExecutionUnit {
             group, global_unit, ..
-        } = super::super::node_invocation_owner(descriptor, parameters, &invocation.id)?
+        } = super::super::invocations::owner(descriptor, parameters, &invocation.id, allocation)?
         else {
             return Err(invalid());
         };
@@ -87,7 +126,8 @@ pub(in crate::component_partition) fn derive_observations(
         if bank.owner_group() != group {
             continue;
         }
-        let (cache_unit, distribution) = catalog_invocation(component, bank, group, *global_unit)?;
+        let (cache_unit, distribution) =
+            invocation_worker(component, bank, group, *global_unit, allocation)?;
         let dimensions = match bank.plan() {
             RoutedGroupedPlan::Gated(plan) => {
                 let spec = plan
@@ -141,7 +181,7 @@ pub(in crate::component_partition) fn derive_observations(
             units_per_expert: component.units_per_expert as u64,
             routes_per_token: routes as u64,
         };
-        geometry.components()?;
+        allocation.routed_geometry(geometry)?;
         let local = owned_groups
             .iter()
             .any(|owned| owned.group() == group && owned.units().contains(global_unit));
@@ -151,14 +191,25 @@ pub(in crate::component_partition) fn derive_observations(
                 if bank.plan().global_group_count() != component.expert_count {
                     return Err(invalid());
                 }
-                bank.plan()
-                    .project_local_groups(topology)
-                    .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?
+                let range = bank
+                    .plan()
+                    .project_local_group_range(topology)
+                    .map_err(|error| {
+                        allocation.diagnostic(
+                            ComponentPartitionError::ParameterLayout,
+                            format_args!("invalid expert realization topology: {error}"),
+                        )
+                    })?;
+                let mut groups = allocation.vector(range.len())?;
+                groups.extend(range);
+                groups
             } else {
-                (0..component.expert_count).collect()
+                let mut groups = allocation.vector(component.expert_count)?;
+                groups.extend(0..component.expert_count);
+                groups
             };
             Some(RoutedUnitCaptureOwnership {
-                coordinates: derive_coordinates_for_experts(component, layout, &groups)?,
+                coordinates: super::experts_worker(component, layout, &groups, allocation)?,
                 // The selected partition driver replicates each logical input on
                 // the EP axis. Publish one source peer's routes, while budgeting
                 // and validating all peers that contribute received native rows.
@@ -192,20 +243,21 @@ pub(in crate::component_partition) fn derive_observations(
             {
                 return Err(invalid());
             }
-            if observations
-                .insert(
-                    path.clone(),
-                    PartitionedRoutedObservation {
-                        routing: component.routing.clone(),
-                        effective,
-                        geometry,
-                        input_width: component.input_width as u64,
-                        ownership: ownership.clone(),
-                    },
-                )
+            let placement = PartitionedRoutedObservation {
+                routing: allocation.text(&component.routing)?,
+                effective,
+                geometry,
+                input_width: component.input_width as u64,
+                ownership: ownership
+                    .as_ref()
+                    .map(|value| allocation.routed_ownership(value))
+                    .transpose()?,
+            };
+            if allocation
+                .insert(&mut observations, allocation.text(path)?, placement)?
                 .is_some()
             {
-                return Err(ComponentPartitionError::DuplicateIdentity(path.clone()));
+                return Err(allocation.duplicate(path));
             }
         }
     }
@@ -215,15 +267,24 @@ pub(in crate::component_partition) fn derive_observations(
 /// Join a logical component to its exact retained provider address. Multiple
 /// invocations may belong to the same decoder unit and bank, with independent
 /// cache keys and expert-axis distribution (for example an always-on branch).
-fn catalog_invocation(
+fn invocation_worker(
     component: &RoutedComponentGroup,
     bank: &crate::SelectedRoutedBank,
     owner: &eredu_runtime::ExecutionGroupId,
     owner_unit: usize,
+    allocation: Destination<'_>,
 ) -> Result<(usize, crate::ExpertResidencyDistribution), ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(component.id.clone());
+    allocation.controls::<(
+        &RoutedComponentGroup,
+        &crate::SelectedRoutedBank,
+        &eredu_runtime::ExecutionGroupId,
+        usize,
+        SourceMap<usize, ()>,
+        Option<(usize, crate::ExpertResidencyDistribution)>,
+    )>()?;
+    let invalid = || allocation.invalid(&component.id);
     let mut invocation = None;
-    let mut members = std::collections::BTreeSet::new();
+    let mut members = SourceMap::new();
     for unit in bank
         .catalog()
         .units()
@@ -249,7 +310,7 @@ fn catalog_invocation(
         if u32::try_from(key.bank()).ok() != Some(component.bank)
             || key.member() >= component.expert_count
             || invocation.is_some_and(|previous| previous != address)
-            || !members.insert(key.member())
+            || allocation.insert(&mut members, key.member(), ())?.is_some()
         {
             return Err(invalid());
         }
@@ -264,20 +325,28 @@ fn catalog_invocation(
 /// Prediction units carry resident banks on every execution replica. Their local
 /// write layout still shards scalar columns on the tensor axis; no EP exchange
 /// or target-bank policy participates in this invocation.
-pub(in crate::component_partition) fn prediction_observations(
+pub(in crate::component_partition) fn prediction_worker(
     descriptor: &ArchitectureDescriptor,
     components: &[eredu_core::component::RoutedComponentGroup],
     layout: &LocalModelLayout,
-) -> Result<BTreeMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
-    let mut observations = BTreeMap::new();
+    allocation: Destination<'_>,
+) -> Result<SourceMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &[RoutedComponentGroup],
+        &LocalModelLayout,
+        SourceMap<String, PartitionedRoutedObservation>,
+        Vec<usize>,
+        RoutedUnitCaptureOwnership,
+        PartitionedRoutedObservation,
+    )>()?;
+    let mut observations = SourceMap::new();
     for component in components {
-        let invalid = || ComponentPartitionError::InvalidPlacement(component.id.clone());
+        let invalid = || allocation.invalid(&component.id);
+        let mut experts = allocation.vector(component.expert_count)?;
+        experts.extend(0..component.expert_count);
         let ownership = RoutedUnitCaptureOwnership {
-            coordinates: derive_coordinates_for_experts(
-                component,
-                layout,
-                &(0..component.expert_count).collect::<Vec<_>>(),
-            )?,
+            coordinates: super::experts_worker(component, layout, &experts, allocation)?,
             source_peer: None,
             source_peers: 1,
         };
@@ -308,21 +377,19 @@ pub(in crate::component_partition) fn prediction_observations(
             {
                 return Err(invalid());
             }
-            geometry.components()?;
-            if observations
-                .insert(
-                    path.clone(),
-                    PartitionedRoutedObservation {
-                        routing: routing.clone(),
-                        geometry: *geometry,
-                        effective,
-                        input_width: component.input_width as u64,
-                        ownership: Some(ownership.clone()),
-                    },
-                )
+            allocation.routed_geometry(*geometry)?;
+            let placement = PartitionedRoutedObservation {
+                routing: allocation.text(routing)?,
+                geometry: *geometry,
+                effective,
+                input_width: component.input_width as u64,
+                ownership: Some(allocation.routed_ownership(&ownership)?),
+            };
+            if allocation
+                .insert(&mut observations, allocation.text(path)?, placement)?
                 .is_some()
             {
-                return Err(ComponentPartitionError::DuplicateIdentity(path.clone()));
+                return Err(allocation.duplicate(path));
             }
         }
     }
@@ -354,7 +421,8 @@ impl ComponentPartitionLayouts {
             return Err(invalid("routed producer bound is zero"));
         }
         let point = &plan.points()[index];
-        let source = self.routed_capture_source(&selection.path)
+        let source = self
+            .routed_capture_source(&selection.path)
             .map_err(|cause| cause.legacy(&selection.path))?;
         if !matches!(
             selection.transform,
@@ -389,14 +457,18 @@ impl ComponentPartitionLayouts {
         let mut producers = Vec::new();
         let mut fragments = 0usize;
         for rank in 0..source.world_size() {
-            let Some(local) = source.rank(rank) else { continue; };
+            let Some(local) = source.rank(rank) else {
+                continue;
+            };
             let ownership = local.ownership;
             sources.push(PartitionRoutedCaptureSource {
                 rank,
                 ownership: ownership.clone(),
                 input_width: source.input_width(),
             });
-            if !local.produces { continue; }
+            if !local.produces {
+                continue;
+            }
             let map = &ownership.coordinates;
             if producers.len() == limits.max_producers {
                 return Err(invalid("routed producer count exceeds its bound"));

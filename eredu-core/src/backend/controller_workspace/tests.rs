@@ -53,6 +53,26 @@ fn different_filter_mechanisms_require_a_different_quote() {
 }
 
 #[test]
+fn sampling_projection_keeps_capacity_without_authorizing_new_decisions() {
+    let witness = mask(257, &[true, false, false, false]);
+    let bound = contract(&witness, 19);
+    let capacity = capacity_bytes(&witness).unwrap();
+    drop(witness);
+    let projection = bound.sampling_workspace_bound().unwrap();
+    projection.validate_output_width(4).unwrap();
+    assert_eq!(projection.mask_capacity_bytes().unwrap(), capacity);
+    assert_eq!(
+        bound.validate_decision(&TokenSamplingDecision::new(TokenFilter::All)),
+        Err(TextControllerContractError::FilterMechanismMismatch),
+    );
+    assert_eq!(bound.additional_host_bytes(), 19);
+    assert_eq!(
+        contract(&TokenFilter::All, 0).sampling_workspace_bound().unwrap(),
+        TextFilterWorkspace::Exact(&TokenFilter::All),
+    );
+}
+
+#[test]
 fn retained_spare_capacity_cannot_hide_behind_equal_mask_values() {
     let witness = mask(4, &[true, false, false, false]);
     let actual = mask(257, &[true, false, false, false]);

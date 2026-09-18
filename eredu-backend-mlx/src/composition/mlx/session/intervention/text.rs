@@ -7,7 +7,7 @@ mod remote;
 pub(crate) use owner::PreparedTextInterventionsOwner;
 use crate::backend::array_copy::{CaptureNativePopulation, CaptureTensorNativeError as Failure};
 use eredu_core::capture::{CaptureLedger, CapturePhase, CaptureSkipReason};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceTensor};
+use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor};
 use eredu_runtime::{capture::CaptureProtocolError, working_memory::OriginalInterventionSource};
 use std::mem::{size_of, size_of_val};
 
@@ -29,7 +29,7 @@ pub(crate) struct PreparedTextInterventions {
     active: Option<usize>,
     source: OriginalInterventionSource,
     // Every row and source alias retires before this preparation account.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedTextInterventions {
     /// Select a contiguous subset of the exact admitted ordinary request. The
@@ -181,7 +181,7 @@ impl PreparedTextInterventions {
     }
     pub(crate) fn control_bytes() -> Option<usize> {
         let frames = [size_of::<Self>(), size_of::<Option<Self>>(), size_of::<Result<Self>>(),
-            size_of::<Result<()>>(), size_of::<Option<usize>>(), size_of::<WorkspaceMetadataFunding>(),
+            size_of::<Result<()>>(), size_of::<Option<usize>>(), size_of::<HostMetadataFunding>(),
             size_of::<Vec<PreparedModelInterventions>>(),
             prefill::control_bytes()?, partition::control_bytes()?, size_of::<Vec<[Option<CaptureSkipReason>; 2]>>(),
             size_of::<(&OriginalInterventionSource, &[bool], u64, u64, &WorkspaceContext)>(),
@@ -233,3 +233,5 @@ impl std::fmt::Debug for PreparedTextInterventions {
             .field("active", &self.active).finish_non_exhaustive()
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -20,7 +20,7 @@ fn source_envelope_covers_duplicate_added_id_visits_and_whole_token_bytelevel_fa
     drop(input);
     assert_eq!(prepared.token_id(spelling), Some(2));
     assert_eq!(prepared.spelling(2), Some(spelling));
-    let actual = DecodeCompilePlan::prepare_hf(&prepared.tokenizer)
+    let actual = DecodeCompilePlan::prepare_hf(&prepared.root().tokenizer)
         .unwrap()
         .requirements();
     assert_eq!(actual.id_slots(), 3);
@@ -43,7 +43,7 @@ fn source_envelope_covers_duplicate_added_id_visits_and_whole_token_bytelevel_fa
     );
     storage.finish(prepared.decode_source()).unwrap();
     assert_eq!(
-        prepared.tokenizer.decode(&[2, 0], false).unwrap(),
+        prepared.root().tokenizer.decode(&[2, 0], false).unwrap(),
         format!("{spelling}a")
     );
     // Largest sparse ID changes neither visit count nor destination population.
@@ -192,10 +192,12 @@ fn original_fallback_components_preserve_all_shared_orders_and_streaming_byte_bo
             let admitted = plan.requirements();
             let prepared = plan.compile().unwrap();
             let ordinary = tokenizers::Tokenizer::from_bytes(input.as_bytes()).unwrap();
+            let selected=crate::tokenizer::Tokenizer::from_bytes(input.as_bytes()).unwrap();
+            assert!(prepared.matches_configuration(&selected));
             drop(input);
             assert!(admitted.buffer_bytes() > 4);
             assert_eq!(
-                serde_json::to_string(&prepared.tokenizer.get_decoder()).unwrap(),
+                serde_json::to_string(&prepared.root().tokenizer.get_decoder()).unwrap(),
                 serde_json::to_string(&ordinary.get_decoder()).unwrap()
             );
             for skip in [false, true] {
@@ -259,7 +261,7 @@ fn original_fallback_components_preserve_all_shared_orders_and_streaming_byte_bo
                 assert_eq!(storage.finish(prepared.decode_source()), expected_finish);
                 assert_eq!(storage.candidate(), remaining);
                 assert_eq!(
-                    prepared.tokenizer.decode(&ids, skip).unwrap(),
+                    prepared.root().tokenizer.decode(&ids, skip).unwrap(),
                     ordinary.decode(&ids, skip).unwrap()
                 );
             }
@@ -292,7 +294,7 @@ fn original_special_splitting_flag_preserves_actual_added_matcher_encoding() {
         let mut ordinary = tokenizers::Tokenizer::from_bytes(input.as_bytes()).unwrap();
         ordinary.set_encode_special_tokens(enabled);
         drop(input);
-        assert_eq!(prepared.tokenizer.get_encode_special_tokens(), enabled);
+        assert_eq!(prepared.root().tokenizer.get_encode_special_tokens(), enabled);
         for skip in [false, true] {
             let ids = [0, 1, 2, 4, 3];
             let mut destination =
@@ -354,7 +356,7 @@ fn original_bare_bytelevel_ids_share_full_span_mapping_and_special_matching() {
         let all: String = (0u8..=255).map(char::from).collect();
         for text in ["Hello hi", "hi<S> hi", "é e\u{301} 🙂", "\0\n\t", "", &all] {
             let plan =
-                tokenizers::EncodeIdsPlan::prepare(&prepared.tokenizer, text, false).unwrap();
+                tokenizers::EncodeIdsPlan::prepare(&prepared.root().tokenizer, text, false).unwrap();
             let geometry = plan.requirements();
             assert_eq!(geometry.mapped_capacity(), 2 * text.len());
             assert_eq!(geometry.regex_delegate_count(), 0);
@@ -367,7 +369,7 @@ fn original_bare_bytelevel_ids_share_full_span_mapping_and_special_matching() {
             assert_eq!(actual.mapped_capacity(), geometry.mapped_capacity());
         }
         assert_eq!(
-            tokenizers::EncodeIdsPlan::prepare(&prepared.tokenizer, "Hello hi", false)
+            tokenizers::EncodeIdsPlan::prepare(&prepared.root().tokenizer, "Hello hi", false)
                 .unwrap()
                 .encode()
                 .unwrap()
@@ -382,4 +384,43 @@ fn original_bare_bytelevel_ids_share_full_span_mapping_and_special_matching() {
         tokenizers::EncodeIdsPlan::prepare(&ordinary, "hi", false),
         Err(tokenizers::EncodeIdsError::PipelineProfile)
     ));
+}
+
+#[test]
+fn wordlevel_source_authenticates_unknown_policy_and_whitespace_without_serialization() {
+    let mut value=source();
+    value["model"]=json!({"type":"WordLevel","vocab":{"[UNK]":0,"other":1,"é":5},"unk_token":"[UNK]"});
+    value["pre_tokenizer"]=json!({"type":"Whitespace"});
+    let bytes=serde_json::to_vec(&value).unwrap();
+    let prepared=TokenizerPlan::prepare_json(&bytes).unwrap().compile().unwrap();
+    let selected=crate::tokenizer::Tokenizer::from_bytes(&bytes).unwrap();
+    assert!(prepared.matches_configuration(&selected));
+    assert!(prepared.input_prefix_removal_is_identity());
+    for change in 0..3 {
+        let mut different=value.clone();
+        match change {0=>different["model"]["unk_token"]=json!("other"),1=>different["pre_tokenizer"]=serde_json::Value::Null,_=>different["model"]["vocab"]["é"]=json!(7)}
+        let other=crate::tokenizer::Tokenizer::from_bytes(serde_json::to_vec(&different).unwrap()).unwrap();
+        assert!(!prepared.matches_configuration(&other),"changed policy {change}");
+    }
+}
+
+#[test]
+fn unigram_authentication_compares_scores_unknown_and_fallback_policy() {
+    let mut value = source();
+    value["model"] = json!({"type":"Unigram", "unk_id":0, "byte_fallback":false,
+        "vocab":[["<unk>",-9.0],["a",-1.0],["ab",-1.0]]});
+    value["pre_tokenizer"] = serde_json::Value::Null;
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let prepared = TokenizerPlan::prepare_json(&bytes).unwrap().compile().unwrap();
+    let selected = crate::tokenizer::Tokenizer::from_bytes(&bytes).unwrap();
+    assert!(prepared.matches_configuration(&selected));
+    assert!(prepared.tokenization_is_canonical());
+    for change in 0..3 {
+        let mut value = value.clone();
+        match change { 0 => value["model"]["unk_id"] = serde_json::Value::Null,
+            1 => value["model"]["byte_fallback"] = json!(true),
+            _ => value["model"]["vocab"][2][1] = json!(-0.75) }
+        let other = crate::tokenizer::Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(!prepared.matches_configuration(&other), "changed scored model policy {change}");
+    }
 }

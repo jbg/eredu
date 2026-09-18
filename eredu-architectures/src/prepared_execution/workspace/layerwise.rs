@@ -7,6 +7,8 @@ use eredu_runtime::{
     LayerwisePolicy, LayerwiseRuntime,
 };
 use std::{borrow::Cow, collections::BTreeMap};
+mod error;
+pub(super) use error::QuoteError;
 
 /// Cold parameter backing from the exact selected host or disk population.
 ///
@@ -21,6 +23,10 @@ use std::{borrow::Cow, collections::BTreeMap};
 /// Parameter/window residency and transfer work are priced separately; returning
 /// metadata values does not certify a complete materialization bound.
 pub trait WorkspaceLayerwiseParameters {
+    /// Exact selected independently populated parameter identities. Ordinary
+    /// and paid cold binding use the same selection as the native unit source.
+    fn excludes_parameter(&self, _name: &str) -> bool { false }
+
     /// Exact group identifiers, unit counts and ordinal/address mapping.
     fn layout(&self) -> &ExecutionUnitLayout;
 
@@ -108,29 +114,30 @@ where
             ResidentRuntime<A,WorkspaceBackend,ResidentState>,
             Option<&eredu_runtime::SharedLayeredObservationPaths>,
             Option<eredu_runtime::PreparedLayeredObservationPaths>,
+            &WorkspaceContext,
             Result<Self,Error>,
         )>(context)?;
         // The shared resident constructor recursively builds each actual unit.
         // Its Result extraction, observation binding and final enum transport
         // run only after that constructor returns, in the helper below.
-        Self::finish_resident_result(ResidentRuntime::new_workspace(architecture,context),paths)
+        Self::finish_resident_result(ResidentRuntime::new_workspace(architecture,context),paths,context)
     }
     #[inline(never)]
     fn finish_resident_result(result:Result<ResidentRuntime<A,WorkspaceBackend,ResidentState>,Error>,
-        paths:Option<&eredu_runtime::SharedLayeredObservationPaths>)->Result<Self,Error> {
+        paths:Option<&eredu_runtime::SharedLayeredObservationPaths>,context:&WorkspaceContext)->Result<Self,Error> {
         let runtime=result?;
-        let binding=paths.map(|paths|runtime.bind_observation_paths(paths))
-            .transpose().map_err(Error::backend_source)?;
+        let binding=paths.map(|paths|runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
+            .transpose().map_err(|cause| cause.into_quote_error(context))?;
         Ok(Self::Resident(runtime,binding,None))
     }
     #[inline(never)]
     fn new_layerwise(architecture: A, parameters: &'a dyn WorkspaceLayerwiseParameters,
         context: &WorkspaceContext, paths: Option<&eredu_runtime::SharedLayeredObservationPaths>) -> Result<Self, Error> {
 
-                let graph = architecture.execution_graph()?;
+                let graph = architecture.execution_graph()?.into_owned_with_metadata(context)?;
                 let mut counts = context.metadata_vec(graph.groups().len())?;
                 for group in 0..graph.groups().len() {
-                    counts.push(architecture.group_unit_count(group)?);
+                    counts.push(architecture.group_unit_count(group, Some(context))?);
                 }
                 let layout = ExecutionUnitLayout::new_with_metadata(&graph, &counts, context)?;
                 if parameters.layout() != &layout {
@@ -141,9 +148,9 @@ where
                 let policy = WorkspaceLayerwisePolicy::new(parameters, layout)?;
                 let runtime = LayerwiseRuntime::new(architecture, policy);
                 let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths))
+                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
                     .transpose()
-                    .map_err(Error::backend_source)?;
+                    .map_err(|cause| cause.into_quote_error(context))?;
                 Ok(Self::Layerwise(runtime, binding, None))
     }
 
@@ -205,9 +212,9 @@ where
                     context,
                 )?;
                 let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths))
+                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
                     .transpose()
-                    .map_err(|cause| context.metadata_source(cause))?;
+                    .map_err(|cause| cause.into_quote_error(context))?;
                 Ok(Self::Resident(runtime, binding, source_architecture))
     }
     #[inline(never)]
@@ -231,9 +238,9 @@ where
                 let runtime =
                     LayerwiseRuntime::new_with_prepared_geometry(architecture, policy, geometry);
                 let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths))
+                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
                     .transpose()
-                    .map_err(|cause| context.metadata_source(cause))?;
+                    .map_err(|cause| cause.into_quote_error(context))?;
                 Ok(Self::Layerwise(runtime, binding, source_architecture))
     }
 
@@ -288,7 +295,7 @@ where
                 source.forward_resident_observed(runtime, span, state, context, hook, observer, paths),
             (Self::Layerwise(runtime, Some(paths), _), Some(observer)) => source
                 .forward_layerwise_observed(runtime, span, state, context, hook, observer, paths)
-                .map_err(Error::backend_source),
+                .map_err(|cause| cause.into_quote_error(context)),
             (_, Some(_)) => Err(context.metadata_error(format_args!(
                 "media observation requires the runtime's prepared path source"))),
             (Self::Resident(runtime, _, _), None) => {
@@ -296,7 +303,7 @@ where
             }
             (Self::Layerwise(runtime, _, _), None) => source
                 .forward_layerwise(runtime, span, state, context, hook)
-                .map_err(Error::backend_source),
+                .map_err(|cause| cause.into_quote_error(context)),
         }
     }
 
@@ -324,7 +331,7 @@ where
                 source.forward_resident_routed_observed(runtime, span, state, context, hook, provider, observer, paths),
             (Self::Layerwise(runtime, Some(paths), _), Some(observer)) => source
                 .forward_layerwise_routed_observed(runtime, span, state, context, hook, provider, observer, paths)
-                .map_err(Error::backend_source),
+                .map_err(|cause| cause.into_quote_error(context)),
             (_, Some(_)) => Err(context.metadata_error(format_args!(
                 "media observation requires the runtime's prepared path source"))),
             (Self::Resident(runtime, _, _), None) => {
@@ -332,11 +339,11 @@ where
             }
             (Self::Layerwise(runtime, _, _), None) => source
                 .forward_layerwise_routed(runtime, span, state, context, hook,provider)
-                .map_err(Error::backend_source),
+                .map_err(|cause| cause.into_quote_error(context)),
         }
     }
 
-    pub(super) fn observation_host_peak_bytes(&self) -> Result<u64, Error> {
+    pub(super) fn observation_host_peak_bytes(&self, context: &WorkspaceContext) -> Result<u64, Error> {
         let binding = match self {
             Self::Resident(_, binding, _) | Self::Layerwise(_, binding, _) => binding,
         };
@@ -344,7 +351,7 @@ where
             .as_ref()
             .map(|binding| {
                 binding.traversal_host_peak_bytes().ok_or_else(|| {
-                    Error::backend_source(
+                    context.metadata_source(
                         eredu_runtime::working_memory::InferenceObservationError::Overflow,
                     )
                 })
@@ -445,15 +452,15 @@ where
             (Self::Resident(runtime, Some(paths), _),Some(observer)) => runtime
                 .forward_serial_routed_with_prepared_paths(
                     input, state, pass, provider, context, observer, paths, demand)
-                .map_err(|cause|context.metadata_source(cause))?,
+                .map_err(|cause|cause.into_quote_error(context))?,
             (Self::Layerwise(runtime, Some(paths), _),Some(observer)) => runtime
                 .forward_serial_routed_with_prepared_paths(
                     input, state, pass, provider, context, observer, paths, demand)
-                .map_err(|cause| context.metadata_source(cause))?,
+                .map_err(|cause| cause.into_quote_error(context))?,
             (Self::Resident(runtime,_,_),None)=>runtime.forward_serial_routed_with_traversal_hook_with_readout(
-                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|context.metadata_source(cause))?,
+                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|cause.into_quote_error(context))?,
             (Self::Layerwise(runtime,_,_),None)=>runtime.forward_serial_routed_with_traversal_hook_with_readout(
-                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|context.metadata_source(cause))?,
+                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|cause.into_quote_error(context))?,
             _ => return Err(workspace_message(context,
                 format_args!("observed routed equation runtime lacks its prepared path binding"))),
         };
@@ -481,24 +488,12 @@ where
                     .forward_with_prepared_observer_and_context_with_readout(
                         input, state, context, observer, paths, demand,
                     )
-                    .map_err(|cause| {
-                        if context.uses_checked_metadata() {
-                            context.metadata_source(cause)
-                        } else {
-                            Error::backend_source(cause)
-                        }
-                    }),
+                    .map_err(|cause| cause.into_quote_error(context)),
                 Self::Layerwise(runtime, Some(paths), _) => runtime
                     .forward_with_prepared_observer_and_context_with_readout(
                         input, state, context, observer, paths, demand,
                     )
-                    .map_err(|cause| {
-                        if context.uses_checked_metadata() {
-                            context.metadata_source(cause)
-                        } else {
-                            Error::backend_source(cause)
-                        }
-                    }),
+                    .map_err(|cause| cause.into_quote_error(context)),
                 _ => Err(workspace_message(
                     context,
                     format_args!("observed equation runtime lacks its prepared path binding"),
@@ -521,13 +516,7 @@ where
                         &mut EquationTraversal,
                         demand,
                     )
-                    .map_err(|cause| {
-                        if context.uses_checked_metadata() {
-                            context.metadata_source(cause)
-                        } else {
-                            Error::backend(cause)
-                        }
-                    }),
+                    .map_err(|cause| cause.into_quote_error(context)),
             }
         }?;
         Ok(output)
@@ -574,7 +563,7 @@ impl<'a> WorkspaceLayerwisePolicy<'a> {
         context.charge_metadata(std::mem::size_of::<(Self,Result<Self,Error>,
             &A,&[ExecutionUnitAddress],eredu_runtime::ExecutionGraph,Vec<usize>,ExecutionUnitLayout,
             Result<ExecutionUnitLayout,Error>,usize)>())?;
-        let graph=architecture.execution_graph_with_metadata(context)?.into_owned_with_metadata(context)?;
+        let graph=architecture.execution_graph()?.into_owned_with_metadata(context)?;
         let mut counts=context.metadata_vec(graph.groups().len())?;
         counts.resize(graph.groups().len(),0usize);
         for (ordinal,&address) in addresses.iter().enumerate() {
@@ -681,7 +670,8 @@ impl<U: Parameterized<WorkspaceTensor>> LayerwisePolicy<WorkspaceBackend, U>
         } else {
             let values = self.parameters.parameters(ordinal, address, context)
                 .map_err(LayerwiseAcquireError::Policy)?;
-            eredu_runtime::working_memory::bind_workspace_parameters(&mut unit, values)
+            eredu_runtime::working_memory::bind_workspace_parameters(&mut unit, values,
+                |id| self.parameters.excludes_parameter(id.as_str()))
                 .map_err(LayerwiseAcquireError::Policy)?;
         }
         Ok(Box::new(unit))

@@ -1,14 +1,19 @@
 //! Muse-Glimmer's behavior-probed ATEM channel and tool protocol.
 
-use llguidance::api::TopLevelGrammar;
+use super::grammar_text::{
+    Error as GrammarError, Literal, Quoted, StructuralTokens, Text, is_required, repeated_rule,
+};
+use crate::runtime::chat::tool_schema::ToolDefinition;
+use llguidance::derivre::ParserAllocationFunding;
 use serde_json::{Map, Value};
+use std::fmt::{self, Write as _};
 
 use super::{
-    constraints::{parse_tools, tool_call_bounds},
+    ParallelToolCallPolicy, ToolChoice,
+    constraints::tool_call_bounds,
     dialect::{
         ConstraintConfiguration, DialectParameters, FormatDialect, GenerationPromptBehavior,
     },
-    ParallelToolCallPolicy, ToolChoice,
 };
 use crate::runtime::generation::streaming::{ProtocolParser, SemanticEventSink};
 
@@ -35,157 +40,132 @@ impl AtemDialect {
     }
 
     fn grammar(
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         token_ids: &[u32],
-    ) -> Result<String, String> {
-        if token_ids.len() != STRUCTURAL_TOKENS.len() {
-            return Err(format!(
-                "ATEM declares {} structural tokens but {} tokenizer IDs were resolved",
-                STRUCTURAL_TOKENS.len(),
-                token_ids.len()
-            ));
-        }
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
+        let structural = StructuralTokens::new(STRUCTURAL_TOKENS, token_ids)?;
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
-        let structural = |token: &str| structural_literal(token, token_ids);
-        let start = structural(START)?;
-        let message = structural(MESSAGE)?;
-        let eom = structural(EOM)?;
-        let eot = structural(EOT)?;
-        let reasoning = format!(
-            "{} {} ATEM_CHANNEL_TEXT* {} {}",
-            json_literal(" to=self"),
-            message,
-            eom,
-            start
+        let start = structural.literal(START);
+        let message = structural.literal(MESSAGE);
+        let eom = structural.literal(EOM);
+        let eot = structural.literal(EOT);
+        let reasoning = format_args!(
+            "{} {message} ATEM_CHANNEL_TEXT* {eom} {start}",
+            Literal(" to=self")
         );
-
-        let mut grammar = String::new();
+        let mut grammar = Text::new(funding)?;
         match tool_choice {
-            ToolChoice::None => grammar.push_str(&format!(
-                "start: {reasoning} visible | direct_visible\n\
-                 visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
+            ToolChoice::None => grammar.push_fmt(format_args!(
+                "start: {reasoning} visible | direct_visible\n"
+            ))?,
+            ToolChoice::Auto => grammar.push_fmt(format_args!(
+                "start: {reasoning} (visible | tool_collection) | direct_visible | direct_tool_collection\n"
+            ))?,
+            ToolChoice::Required => grammar.push_fmt(format_args!(
+                "start: {reasoning} tool_collection | direct_tool_collection\n"
+            ))?,
+        }
+        if tool_choice != ToolChoice::Required {
+            grammar.push_fmt(format_args!(
+                "visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
                  direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
-                json_literal("assistant to=user"),
-                json_literal(" to=user"),
-            )),
-            ToolChoice::Auto => grammar.push_str(&format!(
-                "start: {reasoning} (visible | tool_collection) | direct_visible | direct_tool_collection\n\
-                 visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
-                 direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
-                json_literal("assistant to=user"),
-                json_literal(" to=user"),
-            )),
-            ToolChoice::Required => {
-                grammar.push_str(&format!(
-                    "start: {reasoning} tool_collection | direct_tool_collection\n"
-                ))
-            }
+                Literal("assistant to=user"),
+                Literal(" to=user"),
+            ))?;
         }
         grammar.push_str(
             "ATEM_CHANNEL_TEXT: /[^<]|<[^|]/\n\
              ATEM_STRING: /[^<&]|&amp;|&lt;|&gt;|&quot;|&apos;/\n\
              ATEM_INTEGER: /-?(0|[1-9][0-9]*)/\n\
              ATEM_NUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\n",
-        );
-
-        let tools = parse_tools(tools)?;
-        if tools.is_empty() {
-            grammar.push_str("tool_collection: \"__eredu_unreachable_atem_call__\"\n");
-            return Ok(grammar);
+        )?;
+        if tools.is_empty() || tool_choice == ToolChoice::None {
+            grammar.push_str("tool_collection: \"__eredu_unreachable_atem_call__\"\n")?;
+            return Ok(grammar.finish());
         }
-        grammar.push_str(&format!(
-            "tool_call: {}\ndirect_tool_call: {}\n",
-            (0..tools.len())
-                .map(|index| format!("tool_call_{index}"))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            (0..tools.len())
-                .map(|index| format!("direct_tool_call_{index}"))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
+        for prefix in ["tool_call", "direct_tool_call"] {
+            grammar.push_fmt(format_args!("{prefix}: "))?;
+            for index in 0..tools.len() {
+                if index != 0 {
+                    grammar.push_str(" | ")?;
+                }
+                grammar.push_fmt(format_args!("{prefix}_{index}"))?;
+            }
+            grammar.push_str("\n")?;
+        }
         for (index, tool) in tools.iter().enumerate() {
-            let properties = tool
-                .parameters
-                .get("properties")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let required = tool
-                .parameters
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<std::collections::HashSet<_>>()
-                })
-                .unwrap_or_default();
-            let mut parameters = Vec::new();
-            for (parameter_index, (name, schema)) in properties.iter().enumerate() {
-                let value_rule =
-                    parameter_value_rule(index, parameter_index, schema, &mut grammar)?;
-                let parameter = format!(
-                    "{} {value_rule} {}",
-                    json_literal(&format!("<atem:parameter name=\"{}\">", xml_escape(name))),
-                    json_literal("</atem:parameter>\n")
-                );
-                parameters.push(if required.contains(name.as_str()) {
-                    parameter
-                } else {
-                    format!("({parameter})?")
-                });
+            // Both channel forms borrow this one prospectively funded sequence.
+            let mut parameters = Text::new(funding)?;
+            if crate::runtime::chat::tool_schema::has_simple_properties(tool.parameters) {
+                let properties = tool.parameters.get("properties").and_then(Value::as_object);
+                for (parameter_index, (name, schema)) in properties
+                    .into_iter()
+                    .flat_map(|properties| properties.iter())
+                    .enumerate()
+                {
+                    if parameter_index != 0 {
+                        parameters.push_str(" ")?;
+                    }
+                    let rule = parameter_value_rule(index, parameter_index, schema, &mut grammar)?;
+                    let required = is_required(tool.parameters, name);
+                    if !required {
+                        parameters.push_str("(")?;
+                    }
+                    parameters.push_fmt(format_args!(
+                        "{} {rule} {}",
+                        Quoted(format_args!(
+                            "<atem:parameter name=\"{}\">",
+                            XmlEscape(name)
+                        )),
+                        Literal("</atem:parameter>\n"),
+                    ))?;
+                    if !required {
+                        parameters.push_str(")?")?;
+                    }
+                }
+            } else {
+                grammar.push_fmt(format_args!(
+                    "atem_any_parameter_{index}: {} ATEM_STRING+ {} ATEM_STRING* {}\n",
+                    Literal("<atem:parameter name=\""),
+                    Literal("\">"),
+                    Literal("</atem:parameter>\n"),
+                ))?;
+                parameters.push_fmt(format_args!("atem_any_parameter_{index}*"))?;
             }
-            if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
-                let parameter = format!("atem_any_parameter_{index}");
-                grammar.push_str(&format!(
-                    "{parameter}: {} ATEM_STRING+ {} ATEM_STRING* {}\n",
-                    json_literal("<atem:parameter name=\""),
-                    json_literal("\">"),
-                    json_literal("</atem:parameter>\n"),
-                ));
-                parameters.clear();
-                parameters.push(format!("{parameter}*"));
+            let parameters = parameters.finish();
+            for (rule, header) in [("tool_call", "assistant to="), ("direct_tool_call", " to=")] {
+                grammar.push_fmt(format_args!(
+                    "{rule}_{index}: {} {message} {} {parameters} {}\n",
+                    Quoted(format_args!("{header}{}", tool.name)),
+                    Quoted(format_args!(
+                        "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
+                        XmlEscape(tool.name)
+                    )),
+                    Literal("</atem:invoke>\n</atem:function_calls>"),
+                ))?;
             }
-            grammar.push_str(&format!(
-                "tool_call_{index}: {} {} {} {}\n\
-                 direct_tool_call_{index}: {} {} {} {}\n",
-                json_literal(&format!("assistant to={}", tool.name)),
-                message,
-                json_literal(&format!(
-                    "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
-                    xml_escape(&tool.name)
-                )),
-                parameters.join(" ")
-                    + " "
-                    + &json_literal("</atem:invoke>\n</atem:function_calls>"),
-                json_literal(&format!(" to={}", tool.name)),
-                message,
-                json_literal(&format!(
-                    "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
-                    xml_escape(&tool.name)
-                )),
-                parameters.join(" ")
-                    + " "
-                    + &json_literal("</atem:invoke>\n</atem:function_calls>"),
-            ));
         }
-        let separator = format!("{eom} {start}");
-        let collection = repeated_rule("tool_call", &separator, 1, maximum);
-        let direct_tail = match maximum {
+        let mut separator = Text::new(funding)?;
+        separator.push_fmt(format_args!("{eom} {start}"))?;
+        let separator = separator.finish();
+        let collection = repeated_rule("tool_call", &separator, 1, maximum, funding)?;
+        grammar.push_fmt(format_args!(
+            "tool_collection: {collection} {eot}\ndirect_tool_collection: direct_tool_call"
+        ))?;
+        match maximum {
             Some(0) => return Err("ATEM tool collection requires at least one call".into()),
-            Some(1) => String::new(),
-            Some(maximum) => format!(" ({separator} tool_call){{0,{}}}", maximum - 1),
-            None => format!(" ({separator} tool_call)*"),
-        };
-        grammar.push_str(&format!(
-            "tool_collection: {collection} {eot}\n\
-             direct_tool_collection: direct_tool_call{direct_tail} {eot}\n"
-        ));
-        Ok(grammar)
+            Some(1) => {}
+            Some(maximum) => grammar.push_fmt(format_args!(
+                " ({separator} tool_call){{0,{}}}",
+                maximum - 1
+            ))?,
+            None => grammar.push_fmt(format_args!(" ({separator} tool_call)*"))?,
+        }
+        grammar.push_fmt(format_args!(" {eot}\n"))?;
+        Ok(grammar.finish())
     }
 }
 
@@ -218,19 +198,24 @@ impl FormatDialect for AtemDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::validate_parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<()>()?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(Self::grammar(
-                tools,
-                tool_choice,
-                parallel_tool_calls,
-                resolved_structural_token_ids,
-            )?),
+            grammar: crate::runtime::chat::grammar_text::lark(
+                Self::grammar(
+                    tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    resolved_structural_token_ids,
+                    funding,
+                )?,
+                funding,
+            )?,
         })
     }
 
@@ -267,36 +252,57 @@ impl FormatDialect for AtemDialect {
     }
 }
 
-fn parameter_value_rule(
-    tool: usize,
-    parameter: usize,
-    schema: &Value,
-    grammar: &mut String,
-) -> Result<String, String> {
-    let name = format!("atem_value_{tool}_{parameter}");
-    let kind = schema.get("type").and_then(Value::as_str);
-    match kind {
-        Some("string") => Ok("ATEM_STRING*".into()),
-        Some("integer") => Ok("ATEM_INTEGER".into()),
-        Some("number") => Ok("ATEM_NUMBER".into()),
-        Some("boolean") => Ok("(\"true\" | \"false\")".into()),
-        Some("null") => Ok("\"null\"".into()),
-        _ => {
-            let serialized = serde_json::to_string(schema)
-                .map_err(|error| format!("failed to serialize ATEM parameter schema: {error}"))?;
-            grammar.push_str(&format!("{name}: %json {serialized}\n"));
-            Ok(name)
+enum ParameterValueRule {
+    Builtin(&'static str),
+    Schema { tool: usize, parameter: usize },
+}
+impl fmt::Display for ParameterValueRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin(rule) => f.write_str(rule),
+            Self::Schema { tool, parameter } => write!(f, "atem_value_{tool}_{parameter}"),
         }
     }
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn parameter_value_rule(
+    tool: usize,
+    parameter: usize,
+    schema: &Value,
+    grammar: &mut Text<'_>,
+) -> Result<ParameterValueRule, GrammarError> {
+    let rule = match schema.get("type").and_then(Value::as_str) {
+        Some("string") => "ATEM_STRING*",
+        Some("integer") => "ATEM_INTEGER",
+        Some("number") => "ATEM_NUMBER",
+        Some("boolean") => "(\"true\" | \"false\")",
+        Some("null") => "\"null\"",
+        _ => {
+            let rule = ParameterValueRule::Schema { tool, parameter };
+            grammar.push_fmt(format_args!("{rule}: %json "))?;
+            grammar.push_json(schema)?;
+            grammar.push_str("\n")?;
+            return Ok(rule);
+        }
+    };
+    Ok(ParameterValueRule::Builtin(rule))
+}
+
+struct XmlEscape<'a>(&'a str);
+impl fmt::Display for XmlEscape<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for ch in self.0.chars() {
+            match ch {
+                '&' => f.write_str("&amp;")?,
+                '<' => f.write_str("&lt;")?,
+                '>' => f.write_str("&gt;")?,
+                '"' => f.write_str("&quot;")?,
+                '\'' => f.write_str("&apos;")?,
+                ch => f.write_char(ch)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 fn xml_unescape(value: &str) -> Result<String, String> {
@@ -460,7 +466,7 @@ impl AtemParser {
     }
 }
 
-use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+use crate::runtime::generation::storage::{SnapshotStorage, snapshot_fields};
 snapshot_fields!(AtemParser {
     state,
     header,
@@ -499,7 +505,7 @@ impl ProtocolParser for AtemParser {
             AtemState::Tool { payload, .. } => payload.push_str(text),
             AtemState::AwaitStart if text.is_empty() => {}
             AtemState::AwaitStart => {
-                return Err("ordinary ATEM output appeared between channel frames".into())
+                return Err("ordinary ATEM output appeared between channel frames".into());
             }
         }
         Ok(())
@@ -550,36 +556,59 @@ impl ProtocolParser for AtemParser {
     }
 }
 
-fn json_literal(text: &str) -> String {
-    serde_json::to_string(text).expect("strings serialize as ATEM Lark literals")
-}
-
-fn structural_literal(text: &str, token_ids: &[u32]) -> Result<String, String> {
-    let index = STRUCTURAL_TOKENS
-        .iter()
-        .position(|candidate| *candidate == text)
-        .ok_or_else(|| format!("unknown ATEM structural token {text:?}"))?;
-    Ok(format!("<[{}]>", token_ids[index]))
-}
-
-fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<usize>) -> String {
-    let tail = format!("({separator} {item})");
-    let required = std::iter::once(item.to_owned())
-        .chain(std::iter::repeat_n(tail.clone(), minimum.saturating_sub(1)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    match maximum {
-        Some(maximum) if maximum == minimum => required,
-        Some(maximum) => format!("{required} {tail}{{0,{}}}", maximum - minimum),
-        None => format!("{required} {tail}*"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::generation::streaming::ToolRuntimeParser;
     use eredu_core::generation::{FinishReason, SemanticEvent};
+
+    #[test]
+    fn borrowed_xml_literals_preserve_every_entity_and_unicode() {
+        let text = "a<&>\"'\n水";
+        let escaped = XmlEscape(text).to_string();
+        assert_eq!(escaped, "a&lt;&amp;&gt;&quot;&apos;\n水");
+        assert_eq!(xml_unescape(&escaped).unwrap(), text);
+        let literal =
+            Quoted(format_args!("<atem:invoke name=\"{}\">\n", XmlEscape(text))).to_string();
+        let decoded: String = serde_json::from_str(&literal).unwrap();
+        assert_eq!(decoded, format!("<atem:invoke name=\"{escaped}\">\n"));
+    }
+
+    #[test]
+    fn parameter_grammar_preserves_required_optional_and_embedded_schema() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "properties": {
+                "n<&": {"type":"integer"},
+                "optional": {"type":"boolean"},
+                "structured": {"type":"array", "items":{"type":"number"}}
+            },
+            "required":["n<&", "structured"], "additionalProperties":false
+        });
+        let grammar = AtemDialect::grammar(
+            &[ToolDefinition {
+                name: "measure<&",
+                parameters: &schema,
+            }],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+            &[101, 102, 103, 104],
+            &ParserAllocationFunding::unenforced(),
+        )
+        .unwrap();
+        let embedded = grammar
+            .lines()
+            .find_map(|line| line.split_once(": %json "))
+            .unwrap();
+        let actual: Value = serde_json::from_str(embedded.1).unwrap();
+        assert_eq!(actual, schema["properties"]["structured"]);
+        assert!(grammar.contains("n&lt;&amp;"));
+        assert!(grammar.contains("measure&lt;&amp;"));
+        assert!(grammar.contains("ATEM_INTEGER"));
+        assert!(grammar.contains("(\"true\" | \"false\")"));
+        assert!(grammar.contains(")?"));
+        assert!(grammar.contains("direct_tool_collection: direct_tool_call <[104]>"));
+    }
 
     #[test]
     fn eom_is_a_channel_boundary_and_atem_arguments_are_typed() {
@@ -658,8 +687,10 @@ mod tests {
         parser.push("direct answer").unwrap();
         parser.push_structural(2, EOT).unwrap();
         parser.finish(FinishReason::StopSequence).unwrap();
-        assert!(parser
-            .take_events()
-            .contains(&SemanticEvent::TextDelta("direct answer".into())));
+        assert!(
+            parser
+                .take_events()
+                .contains(&SemanticEvent::TextDelta("direct answer".into()))
+        );
     }
 }

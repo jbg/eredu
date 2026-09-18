@@ -41,12 +41,12 @@ fn gemma_completed_source_borrows_exact_graph_and_refuses_equal_replacement_conf
     type State=eredu_runtime::DeviceState<WorkspaceBackend,eredu_runtime::working_memory::WorkspaceResidentLayerState>;
     let context=WorkspaceContext::new(Facts);
     let mut initial=Model::new(config(),&context).unwrap();
-    let expected=initial.parameter_description(&context).unwrap();
-    let state=initial.state_layout().unwrap();
+    let expected=initial.parameter_description(&context).unwrap().into_owned();
+    let state=initial.state_layout(None).unwrap();
     let source=initial.prepare_source(&context).unwrap();
     let cold=Model::new_with_source(source.clone(),&context).unwrap();
     assert!(std::ptr::eq(&*initial.args,&*cold.args));
-    let description=cold.parameter_description_with_metadata(&context).unwrap();
+    let description=cold.parameter_description(&context).unwrap();
     assert!(matches!(&description,std::borrow::Cow::Borrowed(_)));
     assert_eq!(description.graph(),expected.graph());
     assert_eq!(description.groups(),expected.groups());
@@ -61,5 +61,5 @@ fn gemma_completed_source_borrows_exact_graph_and_refuses_equal_replacement_conf
     let mut replaced=Model::new_with_source(source,&context).unwrap();
     replaced.args=SharedCompositeConfig::new(config(),None).unwrap();
     assert!(replaced.checked_graph(Metadata::new(None)).is_err());
-    assert!(replaced.parameter_description_with_metadata(&context).is_err());
+    assert!(replaced.parameter_description(&context).is_err());
 }

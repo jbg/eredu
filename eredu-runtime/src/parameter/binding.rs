@@ -5,13 +5,12 @@ use std::{alloc::Layout, mem::size_of};
 
 trait Values<W, E> {
     type Error;
-    fn strict(&self) -> bool {
-        false
-    }
+    fn source(error: eredu_nn::ParameterSourceError) -> Self::Error;
+
     fn ignore_remaining(&self) -> bool {
         false
     }
-    fn unavailable(&self) -> Self::Error;
+
     fn read(&mut self, id: &ParameterId) -> Result<&W, Self::Error>;
     fn read_complete(&self) -> Result<(), Self::Error>;
     fn mutable(&mut self, id: &ParameterId) -> Result<(), Self::Error>;
@@ -35,11 +34,6 @@ struct Pass<'a, P, W, E, S: Values<W, E>> {
     phase: Phase,
 }
 impl<P, W, E, S: Values<W, E>> Pass<'_, P, W, E, S> {
-    fn unavailable(&mut self) {
-        if self.error.is_none() {
-            self.error = Some(self.values.unavailable());
-        }
-    }
     fn read(&mut self, id: &ParameterId, value: &P) {
         if self.error.is_some() || (self.excluded)(id) {
             return;
@@ -62,39 +56,13 @@ impl<P, W, E, S: Values<W, E>> Pass<'_, P, W, E, S> {
     }
 }
 impl<'v, P: 'v, W, E, S: Values<W, E>> ParameterVisitor<'v, P> for Pass<'_, P, W, E, S> {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'v P) {
-        if self.values.strict() {
-            self.unavailable();
-        } else {
-            self.read(&metadata.id, value);
-        }
-    }
-    fn visit_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'v P) {
+    fn visit(&mut self, metadata: ParameterMetadataView<'_>, value: &'v P) {
         self.read(metadata.id(), value);
-    }
-    fn requires_borrowed_metadata(&self) -> bool {
-        self.values.strict()
-    }
-    fn borrowed_metadata_unavailable(&mut self) {
-        self.unavailable();
     }
 }
 impl<'v, P: 'v, W, E, S: Values<W, E>> ParameterVisitorMut<'v, P> for Pass<'_, P, W, E, S> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'v mut P) {
-        if self.values.strict() {
-            self.unavailable();
-        } else {
-            self.mutate(&metadata.id, value);
-        }
-    }
-    fn visit_mut_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'v mut P) {
+    fn visit_mut(&mut self, metadata: ParameterMetadataView<'_>, value: &'v mut P) {
         self.mutate(metadata.id(), value);
-    }
-    fn requires_borrowed_metadata(&self) -> bool {
-        self.values.strict()
-    }
-    fn borrowed_metadata_unavailable(&mut self) {
-        self.unavailable();
     }
 }
 fn bind_values<P: 'static, W, E, M: Parameterized<P>, S: Values<W, E>>(
@@ -112,7 +80,7 @@ fn bind_values<P: 'static, W, E, M: Parameterized<P>, S: Values<W, E>>(
         error: None,
         phase: Phase::Read,
     };
-    module.visit_parameters(&mut pass);
+    module.visit_parameters(&mut pass).map_err(S::source)?;
     if let Some(error) = pass.error {
         return Err(error);
     }
@@ -140,12 +108,11 @@ struct Ordinary<W> {
 }
 impl<W, E: std::error::Error + Send + Sync + 'static> Values<W, E> for Ordinary<W> {
     type Error = ParameterOrchestrationError<E>;
+    fn source(error: eredu_nn::ParameterSourceError) -> Self::Error { ParameterOrchestrationError::Source(error) }
     fn ignore_remaining(&self) -> bool {
         self.duplicate.is_some()
     }
-    fn unavailable(&self) -> Self::Error {
-        unreachable!("ordinary binding accepts owned metadata")
-    }
+
     fn read(&mut self, id: &ParameterId) -> Result<&W, Self::Error> {
         if self.read.insert(id.clone(), ()).is_some() {
             return Err(ParameterOrchestrationError::DuplicateParameter {
@@ -260,9 +227,10 @@ impl<'a, W> PreparedParameterBinding<'a, W> {
 /// Fixed prepublication failures for a finite binding source.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedParameterBindingError<E> {
-    /// A legacy participant could not supply retained borrowed metadata.
-    #[error("borrowed parameter binding metadata unavailable")]
-    MetadataUnavailable,
+    /// Canonical source traversal failed before binding publication.
+    #[error(transparent)]
+    Source(#[from] eredu_nn::ParameterSourceError),
+
     /// The source repeated an identity.
     #[error("duplicate prepared binding at row {row}")]
     DuplicateBinding {
@@ -294,12 +262,8 @@ pub enum PreparedParameterBindingError<E> {
 struct Prepared<'a, 'name, W>(&'a mut [PreparedParameterBinding<'name, W>]);
 impl<W, E> Values<W, E> for Prepared<'_, '_, W> {
     type Error = PreparedParameterBindingError<E>;
-    fn strict(&self) -> bool {
-        true
-    }
-    fn unavailable(&self) -> Self::Error {
-        PreparedParameterBindingError::MetadataUnavailable
-    }
+    fn source(error: eredu_nn::ParameterSourceError) -> Self::Error { PreparedParameterBindingError::Source(error) }
+
     fn read(&mut self, id: &ParameterId) -> Result<&W, Self::Error> {
         let (index, row) = self
             .0

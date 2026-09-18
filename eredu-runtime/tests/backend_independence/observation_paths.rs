@@ -14,6 +14,7 @@ impl PathsFixture {
     fn new() -> Self {
         Self {
             inner: GroupedFixture {
+                graph: grouped_graph(),
                 static_modules: FakeOperator,
                 trace: Vec::new(),
             },
@@ -27,20 +28,21 @@ impl PathsFixture {
 }
 impl ArchitectureParameters<FakeBackend> for PathsFixture {
     type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.inner.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+        self.inner.state_layout(metadata)
     }
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.inner.state_identity(state, topology)
+        self.inner.state_identity(state, topology, metadata)
     }
     fn parameter_description(
         &self,
         context: &(),
-    ) -> Result<ArchitectureParameterDescription, Error> {
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.inner.parameter_description(context)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -78,29 +80,29 @@ impl LayeredArchitecture<FakeBackend, State> for PathsFixture {
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         self.inner.state_partition_plan(layout)
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         if self.changed_graph {
-            ExecutionGraph::new(vec![ExecutionGroupSpec::root("replacement")], "replacement")
+            eredu_runtime::ArchitectureExecutionGraph::single("replacement")
                 .map_err(Error::backend)
         } else {
             self.inner.execution_graph()
         }
     }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.inner.group_unit_count(group)
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        self.inner.group_unit_count(group, metadata_context)
     }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
         self.declarations.set(self.declarations.get() + 1);
-        Ok(format!("{}.{group}.unit.{index}", self.namespace))
+        architecture_metadata::text(format_args!("{}.{group}.unit.{index}", self.namespace), metadata_context)
     }
     fn observes_unit_boundaries(&self, _: usize, _: usize) -> bool {
         self.owns_boundaries
     }
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
-        self.inner.group_input_observation_path(group)
+    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Error> {
+        self.inner.group_input_observation_path(group, metadata_context)
     }
-    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
-        self.inner.group_output_observation_path(group)
+    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Error> {
+        self.inner.group_output_observation_path(group, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
         self.inner.static_modules()
@@ -169,7 +171,7 @@ impl LayeredArchitecture<FakeBackend, State> for PathsFixture {
         let input = if self.owns_boundaries {
             eredu_runtime::observe_and_intervene(
                 observer,
-                &eredu_core::UnitObservation::Input.path(&self.unit_path(group, index)?),
+                &eredu_core::UnitObservation::Input.path(&self.unit_path(group, index, None)?),
                 hidden,
             )?
         } else {
@@ -187,7 +189,7 @@ impl LayeredArchitecture<FakeBackend, State> for PathsFixture {
         if self.owns_boundaries {
             output = eredu_runtime::observe_and_intervene(
                 observer,
-                &eredu_core::UnitObservation::Output.path(&self.unit_path(group, index)?),
+                &eredu_core::UnitObservation::Output.path(&self.unit_path(group, index, None)?),
                 &output,
             )?;
         }
@@ -261,7 +263,7 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
         self.values.push((path.to_owned(), value.clone()));
         self.pointers.push(path.as_ptr() as usize);
         if self.fail == Some(path) {
-            return Err(Error::backend_source(std::io::Error::new(
+            return Err(Error::backend_retained_source(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "prepared observer sentinel",
             )));
@@ -303,7 +305,7 @@ fn prepared_resident_and_layerwise_reuse_paths_and_ordinary_observed_equations()
         let prepared = resident.prepare_observation_paths().unwrap();
         let source = prepared.source().clone();
         let mut bounded = layerwise();
-        let rebound = bounded.bind_observation_paths(&source).unwrap();
+        let rebound = bounded.bind_observation_paths(&source, None).unwrap();
         assert!(rebound.source().same_storage(&source));
         let resident_calls = resident.architecture().declarations.get();
         let bounded_calls = bounded.architecture().declarations.get();
@@ -436,13 +438,13 @@ fn foreign_and_invalidated_bindings_reject_before_observer_or_state_work() {
         Err(PreparedError::BindingMismatch)
     ));
     assert!(matches!(
-        first.bind_observation_paths(&source),
+        first.bind_observation_paths(&source, None),
         Err(PreparedError::SemanticMismatch)
     ));
     assert!(first.policy().addresses.is_empty());
     assert!(state.as_ref().iter().all(|layer| layer.0 == 0));
     first.architecture_mut().namespace = "group";
-    let fresh = first.bind_observation_paths(&source).unwrap();
+    let fresh = first.bind_observation_paths(&source, None).unwrap();
     first
         .forward_with_prepared_observer_and_context_with_readout(
             None,
@@ -485,7 +487,7 @@ fn resident_cached_graph_cannot_be_rebound_after_semantic_mutation() {
     let prepared = runtime.prepare_observation_paths().unwrap();
     runtime.architecture_mut().changed_graph = true;
     assert!(matches!(
-        runtime.bind_observation_paths(prepared.source()),
+        runtime.bind_observation_paths(prepared.source(), None),
         Err(PreparedError::SemanticMismatch)
     ));
     assert!(matches!(
@@ -627,7 +629,7 @@ fn selected_generated_hooks_and_owned_boundaries_preserve_exact_internal_dispatc
         other.namespace = "other";
         let other = ResidentRuntime::<_, FakeBackend, State>::new(other, &()).unwrap();
         assert!(matches!(
-            other.bind_observation_paths(prepared.source()),
+            other.bind_observation_paths(prepared.source(), None),
             Err(PreparedError::SemanticMismatch)
         ));
     }
@@ -858,3 +860,6 @@ fn custom_unit_executor_adapters_emit_each_original_and_effective_boundary_once(
 
 #[path = "observation_paths/prediction_operations.rs"]
 mod prediction_operations;
+
+#[path = "observation_paths/funded_binding.rs"]
+mod funded_binding;

@@ -109,7 +109,7 @@ fn k2_components_declare_real_routed_reads_and_capture_shared_and_sparse_units()
             let architecture =
                 family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
             let mut state = DeviceState::<NumericBackend, _>::create(
-                architecture.state_layout().unwrap(),
+                architecture.state_layout(None).unwrap(),
                 |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
             )
             .unwrap();
@@ -119,8 +119,8 @@ fn k2_components_declare_real_routed_reads_and_capture_shared_and_sparse_units()
             let mut weights = BTreeMap::new();
             struct Weights<'a>(&'a mut BTreeMap<String, NumericTensor>);
             impl<'a> ParameterVisitor<'a, NumericTensor> for Weights<'_> {
-                fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-                    self.0.insert(metadata.id.to_string(), value.clone());
+                fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+                    self.0.insert(metadata.id().to_string(), value.clone());
                 }
             }
             for unit in &units {
@@ -736,7 +736,7 @@ fn nemotron_non_gated_discovery_matches_actual_parameters_and_hooks() {
     let args = nemotron_h::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let model = nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let description = model.parameter_description(&context).unwrap();
+    let description = model.parameter_description(&context).unwrap().into_owned();
     let mut runtime = LayerwiseRuntime::new(model, RebuildingUnitPolicy::default());
     let mut state = DeviceState::<NumericBackend, _>::create(
         nemotron_h::state_layout(&args).unwrap(),
@@ -812,7 +812,7 @@ fn lfm2_discovery_matches_mixed_component_and_routed_observations() {
         let args = lfm2::model_args_from_config_value(&config).unwrap();
         let context = NumericContext::default();
         let model = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-        let description = model.parameter_description(&context).unwrap();
+        let description = model.parameter_description(&context).unwrap().into_owned();
         let parameters: std::collections::BTreeSet<_> = description
             .groups()
             .iter()

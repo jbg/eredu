@@ -1,30 +1,41 @@
-use std::sync::LazyLock;
+use crate::tokenizer::{pattern::Invert, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use crate::utils::{macro_rules_attribute, SysRegex};
 
-use regex::Regex;
+pub(crate) const PATTERN: &str = r"\w+|[^\w\s]+";
 
-use crate::tokenizer::{
-    pattern::Invert, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
-};
-use crate::utils::macro_rules_attribute;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[macro_rules_attribute(impl_serde_type!)]
-pub struct Whitespace;
-
+/// Unicode words and punctuation, using one retained regex source.
+#[derive(Clone, Debug)]
+pub struct Whitespace { regex: SysRegex }
 impl Default for Whitespace {
-    fn default() -> Self {
-        Self
+    fn default() -> Self { Self { regex: SysRegex::new(PATTERN).expect("valid Whitespace pattern") } }
+}
+impl PartialEq for Whitespace { fn eq(&self, _: &Self) -> bool { true } }
+impl Eq for Whitespace {}
+impl Whitespace {
+    #[cfg(feature="fancy-regex")]
+    pub(crate) fn from_regex(regex: SysRegex) -> Self { Self { regex } }
+    #[cfg(feature="fancy-regex")]
+    pub(crate) fn workspace_plan(&self) -> Option<std::result::Result<fancy_regex::workspace::Plan<'_>, fancy_regex::workspace::PlanError>> { self.regex.workspace_plan() }
+}
+impl serde::Serialize for Whitespace {
+    fn serialize<S: serde::Serializer>(&self, serializer:S)->std::result::Result<S::Ok,S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out=serializer.serialize_struct("Whitespace",1)?;
+        out.serialize_field("type","Whitespace")?; out.end()
     }
 }
-
+impl<'de> serde::Deserialize<'de> for Whitespace {
+    fn deserialize<D:serde::Deserializer<'de>>(de:D)->std::result::Result<Self,D::Error> {
+        #[derive(serde::Deserialize)] enum Kind { Whitespace }
+        #[derive(serde::Deserialize)] struct Input { #[serde(rename="type")] _kind:Kind }
+        let _=Input::deserialize(de)?;
+        Ok(Self::default())
+    }
+}
 impl PreTokenizer for Whitespace {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
-        static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+|[^\w\s]+").unwrap());
-        let re_ref: &Regex = &RE;
-
-        pretokenized.split(|_, normalized| {
-            normalized.split(Invert(re_ref), SplitDelimiterBehavior::Removed)
-        })
+        let matcher=self.regex.matcher()?;
+        pretokenized.split(|_, normalized| normalized.split(Invert(&matcher), SplitDelimiterBehavior::Removed))
     }
 }
 
@@ -64,7 +75,7 @@ mod tests {
             ),
             ("\n", vec![]),
         ];
-        let pretok = Whitespace {};
+        let pretok = Whitespace::default();
         for (s, res) in tests {
             let mut pretokenized = PreTokenizedString::from(s);
             pretok.pre_tokenize(&mut pretokenized).unwrap();

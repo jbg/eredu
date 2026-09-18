@@ -223,10 +223,10 @@ fn conditional_hybrid_target_declarations_preserve_all_existing_mtp_hook_gates()
                 &NumericContext::default(),
             )
             .unwrap();
-            let d = <Hybrid as LayeredArchitecture<NumericBackend, State>>::prefill_observation_declarations(&a).unwrap();
+            let d = <Hybrid as LayeredArchitecture<NumericBackend, State>>::prefill_observation_declarations(&a, None).unwrap();
             assert_eq!(d.len(), 18);
             let prediction =
-                <Hybrid as LayeredArchitecture<NumericBackend, State>>::unit_path(&a, 2, 0)
+                <Hybrid as LayeredArchitecture<NumericBackend, State>>::unit_path(&a, 2, 0, None)
                     .unwrap();
             assert!(d.iter().all(|d| !d.path().starts_with(&prediction)));
             let hooks = [

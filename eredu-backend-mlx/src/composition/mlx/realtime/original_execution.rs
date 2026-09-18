@@ -7,7 +7,7 @@ use super::{input_source::{RealtimeInputSource,RealtimeInputSourceError,Realtime
 use crate::{backend::{nn::workspace::SpeculativeNumericalRecipe,
     submission_recovery::native_role::{self,NativeRoleCapacity,realtime::RealtimeRoleContext}},
     composition::moshi::{OriginalRealtimeModelLease,RealtimeOperationRecipe}};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::{RealtimePayloadContract,RealtimeIngressContract,RealtimeFrameCoordinatorError,
     working_memory::{OriginalRealtimeFrame,OriginalHostSourceBank,InferenceExecutionIdentity,WorkingMemoryError}};
 use safemlx::{PreparedInputRuntime,PreparedPipelineCachePlan,OriginalBufferBudget};
@@ -26,7 +26,7 @@ pub(super) struct FrameNativeLayout {
 #[error("original realtime frame: {cause}")]
 struct FrameFailure {
     #[source] cause:Error,
-    _funding:Option<WorkspaceMetadataFunding>,
+    _funding:Option<HostMetadataFunding>,
     _custody:eredu_runtime::working_memory::OriginalRealtimeBudgetCustody,
 }
 // The portable coordinator deliberately has a compact model-error display.
@@ -48,14 +48,14 @@ impl std::fmt::Display for ModelExecutionFailure {
 impl std::error::Error for ModelExecutionFailure {
     fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(&self.cause)}
 }
-fn coordinator_failure(cause:CoordinatorError,funding:&WorkspaceMetadataFunding)->Error {
+fn coordinator_failure(cause:CoordinatorError,funding:&HostMetadataFunding)->Error {
     match cause {
         CoordinatorError::Model(cause)=>Error::Neural(funding.metadata_source(ModelExecutionFailure{cause})),
         cause=>Error::Neural(funding.metadata_source(cause)),
     }
 }
 fn retain(cause:Error,custody:eredu_runtime::working_memory::OriginalRealtimeBudgetCustody,
-    funding:Option<WorkspaceMetadataFunding>)->Error {
+    funding:Option<HostMetadataFunding>)->Error {
     Error::retained_original(eredu_core::SharedBackendFailure::new(eredu_core::BackendFailureKind::Other,
         FrameFailure{cause,_funding:funding,_custody:custody}),false)
 }
@@ -74,7 +74,7 @@ struct Invocation {
     resources:Arc<neutral_moshi::SelectedRealtimeResources>,
     // Cold-account custody retires after all ingress/policy/source descriptors.
     sources:RetainedFrameSources,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Move-only scheduler preparation. The source issuer and complete native
 /// invocation remain together until the scheduler lends this actual branch.
@@ -118,7 +118,7 @@ fn wrapper_controls()->Option<usize> {
         .checked_add(size_of::<Option<&(dyn std::error::Error+'static)>>())?
         .checked_add(size_of::<&mut std::fmt::Formatter<'_>>())?
         .checked_add(size_of::<std::fmt::Result>())?
-        .checked_add(size_of::<(CoordinatorError,&WorkspaceMetadataFunding)>())?
+        .checked_add(size_of::<(CoordinatorError,&HostMetadataFunding)>())?
         .checked_add(WorkspaceContext::metadata_source_bytes::<CoordinatorError>()?.max(
             WorkspaceContext::metadata_source_bytes::<ModelExecutionFailure>()?))?
         .checked_add(WorkspaceContext::metadata_source_bytes::<RealtimeInputSourceError>()?)
@@ -170,7 +170,7 @@ impl PreparedOriginalRealtimeFrame {
         layout:FrameNativeLayout,payload:RealtimePayloadContract,model:&MlxRealtimeExecution)
         ->Result<Self,Error> {
         let custody=account.budget_custody();
-        let funding:WorkspaceMetadataFunding=account.metadata_funding()
+        let funding:HostMetadataFunding=account.metadata_funding()
             .map_err(|cause|retain(Error::WorkspacePlanning(cause),custody.clone(),None))?.into();
         let failure_funding=funding.clone();
         let result=(|| {
@@ -191,7 +191,7 @@ impl PreparedOriginalRealtimeFrame {
         })();
         result.map_err(|cause|retain(cause,custody,Some(failure_funding)))
     }
-    pub(super) fn funding(&self)->&WorkspaceMetadataFunding {&self.invocation.funding}
+    pub(super) fn funding(&self)->&HostMetadataFunding {&self.invocation.funding}
     /// Preparation copy uses the same frame's independent one-use native phase.
     pub(super) fn claim_preparation(&mut self)
         ->Result<eredu_runtime::working_memory::OriginalRealtimeNative,Error> {
@@ -280,3 +280,5 @@ fn equation_callback<'a,'source:'a,'input:'source,'role:'source>(mut equation:Op
 }
 fn identity()->Error{Error::PrefillControl(WorkingMemoryError::IdentityMismatch)}
 fn overflow()->Error{Error::PrefillControl(WorkingMemoryError::Overflow)}
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -1,0 +1,87 @@
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -461,6 +461,7 @@
+       resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
+       resident_primitive_control<ScatterAxis>(), resident_primitive_control<Partition>(),
+       resident_primitive_control<Scan>(),
++      resident_primitive_control<MaskedScatter>(),
+       resident_primitive_control<RandomBits>(), resident_primitive_control<Log>(),
+       resident_primitive_control<GatherMM>(), resident_primitive_control<Reduce>(),
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -731,7 +731,12 @@
+   const std::string kernel_name =
+       fmt::format("{}_{}_{}", kBaseName, dtype_tag, contiguous);
+ 
+-  auto lib = d.get_library_borrowed(kernel_name, [&]() {
++  const bool original = d.original_precompiled_kernel_required();
++  if (original && out.dtype() != bool_ && out.dtype() != uint8 &&
++      out.dtype() != int32 && out.dtype() != uint32 && out.dtype() != float16 &&
++      out.dtype() != bfloat16 && out.dtype() != float32)
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto lib = original ? d.precompiled_library() : d.get_library_borrowed(kernel_name, [&]() {
+     std::string source = metal::utils();
+     source += metal::masked_scatter();
+     source +=
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -37,6 +37,7 @@
+ constexpr size_t gather_axis = text("gather_axis_int64_tncnc") + 2 * dtype_tag;
+ constexpr size_t scatter_axis = text("scatter_axis_none_int64_tncnc") + 2 * dtype_tag;
+ constexpr size_t scan = text("strided_scan_reverse_exclusive_logaddexp__") + 2 * dtype_tag;
++constexpr size_t masked_assign = text("masked_assign__false") + dtype_tag;
+ constexpr size_t single_index = text("scatter_none_1_updc_false_nwork1_int64_t") + 2 * dtype_tag;
+ constexpr size_t sort_name = text("partition_mbsort__bn_tn") + 2 * dtype_tag + 2 * integer;
+ constexpr size_t gathered_rhs = text("steel_gather_mm_rhs_nax_n") + 1 +
+@@ -71,7 +72,7 @@
+ constexpr size_t convolution_depthwise = text("depthwise_conv_2d__ker_h__ker_w__str_h__str_w__tgp_h__tgp_w__do_flip_") + dtype_tag + 6 * integer + 1;
+ constexpr size_t convolution_separable = text("depthwise_conv_1d__large") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+-    attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, single_index, sort_name, gathered_rhs,
++    attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, masked_assign, single_index, sort_name, gathered_rhs,
+     pointwise, rope, normalization, quantized_vector, quantized_gather, quantized_quad,
+     quantized_matrix, quantized_split, quantized_vector_split,
+     convolution_implicit, convolution_depthwise, convolution_separable});
+@@ -106,6 +107,8 @@
+ // depthwise 2D retains its base and specialized name plus the by-value base
+ // loan (15 arguments). The precompiled get_steel_conv_kernel branch returns
+ // before JIT ownership. No JIT builder body runs in this profile.
++// MaskedScatter retains one fmt name and inline dtype/value/contiguity strings;
++// its scan selector runs before it. Both fit the same actual selector envelope.
+ constexpr size_t name_owners = 3;
+ // SDPA's first two-pass kernel has six boolean constants plus blocks (integer).
+ // Dense GEMM has six; RoPE three; depthwise 2D convolution seven. All are direct vector initializer lists,
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -185,6 +185,7 @@
+   build_kernel(fp_quantized fp4.h fp8.h fp_quantized.h quantized_utils.h
+                ${STEEL_HEADERS})
+   build_kernel(indexing/scatter_axis indexing/scatter_axis.h reduction/ops.h atomic.h)
++  build_kernel(indexing/masked_scatter indexing/masked_scatter.h)
+   build_kernel(scan scan.h)
+   build_kernel(softmax softmax.h)
+   build_kernel(logsumexp logsumexp.h)
+diff --git a/mlx/backend/metal/kernels/indexing/masked_scatter.metal b/mlx/backend/metal/kernels/indexing/masked_scatter.metal
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/kernels/indexing/masked_scatter.metal
+@@ -0,0 +1,14 @@
++// Copyright © 2025 Apple Inc.
++// Static instantiations of the unchanged upstream masked row assignment.
++#include "mlx/backend/metal/kernels/utils.h"
++#include "mlx/backend/metal/kernels/indexing/masked_scatter.h"
++#define MASKED_ASSIGN_TYPE(name, type) \
++  instantiate_kernel("masked_assign_" #name "_true", masked_assign_impl, type, true) \
++  instantiate_kernel("masked_assign_" #name "_false", masked_assign_impl, type, false)
++MASKED_ASSIGN_TYPE(bool_, bool)
++MASKED_ASSIGN_TYPE(uint8, uint8_t)
++MASKED_ASSIGN_TYPE(int32, int32_t)
++MASKED_ASSIGN_TYPE(uint32, uint32_t)
++MASKED_ASSIGN_TYPE(float16, half)
++MASKED_ASSIGN_TYPE(bfloat16, bfloat16_t)
++MASKED_ASSIGN_TYPE(float32, float)

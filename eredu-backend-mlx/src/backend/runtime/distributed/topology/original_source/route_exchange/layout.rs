@@ -10,7 +10,7 @@ pub(crate) struct OriginalRouteLayoutRound<'a> {
     round: usize,
     submission_order: SubmissionOrder,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalRouteExchange<'_> {
     /// Queries the exact existing route peers and immutable frame layout. No
@@ -28,20 +28,20 @@ impl OriginalRouteExchange<'_> {
 }
 impl<'a> OriginalRouteLayoutRound<'a> {
     pub(super) fn query(source:&'a OriginalCommunicationSource<'_>,retained:&RetainedCommunicationSource,
-        funding:&WorkspaceMetadataFunding,plan:LogicalExchangePlan<'a>,selection:ExchangeSelection,
+        funding:&HostMetadataFunding,plan:LogicalExchangePlan<'a>,selection:ExchangeSelection,
         submission_order:SubmissionOrder,round:usize,shape:&'a [i32],dtype:safemlx::Dtype)
         ->Result<Self,Error>{
         Self::query_asymmetric(source, retained, funding, plan, selection, submission_order,
             round, shape, shape, dtype)
     }
     pub(super) fn query_asymmetric(source: &'a OriginalCommunicationSource<'_>, retained: &RetainedCommunicationSource,
-        funding: &WorkspaceMetadataFunding, plan: LogicalExchangePlan<'a>, selection: ExchangeSelection,
+        funding: &HostMetadataFunding, plan: LogicalExchangePlan<'a>, selection: ExchangeSelection,
         submission_order: SubmissionOrder, round: usize, shape: &'a [i32], receive_shape: &'a [i32], dtype: safemlx::Dtype)
         -> Result<Self, Error> {
         let group=plan.group();
-        let overflow=||Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+        let overflow=||Error::WorkspacePlanning(HostMetadataFundingError::Overflow);
         let controls=[size_of::<Self>(),size_of::<Result<Self,Error>>(),
-            size_of::<(&OriginalCommunicationSource<'_>,&RetainedCommunicationSource,&WorkspaceMetadataFunding,
+            size_of::<(&OriginalCommunicationSource<'_>,&RetainedCommunicationSource,&HostMetadataFunding,
                 LogicalExchangePlan<'_>,ExchangeSelection,SubmissionOrder,usize,&[i32],&[i32],safemlx::Dtype)>(),
             size_of::<(usize,usize)>(),size_of::<(i32,i32)>(),
             size_of::<[OriginalCommunicatorPersistent<'_>;2]>(),
@@ -90,11 +90,11 @@ impl<'a> OriginalRouteLayoutRound<'a> {
         let controls=[size_of::<Self>(),size_of::<usize>(),size_of::<Result<usize,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&PreparedInputRuntime)>(),size_of::<(usize,usize)>(),
             size_of::<Option<usize>>(),
-            self.native.send().backing_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            self.native.receive().backing_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.send().backing_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            self.native.receive().backing_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         if !self.source.same_source(source.source()) {return Err(failure(Cause::Identity,&self.source,&self.funding));}
         let send=self.native.send().backing_capacity(runtime).map_err(|cause|failure(Cause::Buffer(cause),&self.source,&self.funding))?;
@@ -107,10 +107,10 @@ impl<'a> OriginalRouteLayoutRound<'a> {
         ->Result<OriginalRouteRound<'input>,Error> where 'a:'input {
         let parts=[size_of::<Self>(),size_of::<OriginalRouteRound<'input>>(),
             size_of::<Result<OriginalRouteRound<'input>,Error>>(),size_of::<(&OriginalCommunicationSource<'_>,&Array)>(),
-            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         if !self.source.same_source(source.source()) {
             return Err(failure(Cause::Identity,&self.source,&self.funding));
@@ -131,17 +131,17 @@ pub(crate) struct OwnedOriginalExchangeLayoutRound {
     backing: usize,
     owner: super::super::parallel::OriginalParallelSource,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalRouteLayoutRound<'_> {
     pub(crate) fn try_into_owned(self,owner:&super::super::parallel::OriginalParallelSource)->Result<OwnedOriginalExchangeLayoutRound,Error> {
         let controls=[size_of::<Self>(),size_of::<OwnedOriginalExchangeLayoutRound>(),
             size_of::<Result<OwnedOriginalExchangeLayoutRound,Error>>(),
             size_of::<super::super::parallel::OriginalParallelSource>(),
-            self.native.ownership_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.ownership_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         if !owner.declaration_source().same_source(&self.source) || !owner.funding().same_account(&self.funding) {
             return Err(failure(Cause::Identity,&self.source,&self.funding));
         }
@@ -171,10 +171,10 @@ impl OwnedOriginalExchangeLayoutRound {
         let controls=[size_of::<Self>(),size_of::<OriginalRouteRound<'a>>(),
             size_of::<(&Self, &OriginalCommunicationSource<'_>, &Array, &Array)>(),
             size_of::<Result<OriginalRouteRound<'a>,Error>>(),
-            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         let group=self.selection.group(source)?;
         if !source.source().same_source(&self.source)

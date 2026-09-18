@@ -2,7 +2,7 @@
 use super::*;
 use eredu_core::BackendFailure;
 use eredu_nn::workspace::{
-    WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug)]
@@ -11,19 +11,19 @@ struct Account {
     limit: usize,
     _custody: ResetCustody,
 }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let mut previous = self.spent.load(Ordering::Acquire);
         loop {
             let next = previous
                 .checked_add(bytes)
-                .ok_or(WorkspaceMetadataFundingError::Overflow)?;
+                .ok_or(HostMetadataFundingError::Overflow)?;
             if next > self.limit {
-                return Err(WorkspaceMetadataFundingError::Capacity {
+                return Err(HostMetadataFundingError::Capacity {
                     required: u64::try_from(next)
-                        .map_err(|_| WorkspaceMetadataFundingError::Overflow)?,
+                        .map_err(|_| HostMetadataFundingError::Overflow)?,
                     available: u64::try_from(self.limit)
-                        .map_err(|_| WorkspaceMetadataFundingError::Overflow)?,
+                        .map_err(|_| HostMetadataFundingError::Overflow)?,
                 });
             }
             match self.spent.compare_exchange_weak(
@@ -44,11 +44,11 @@ pub(super) fn control_bytes(bytes: usize) -> Option<usize> {
     }
     let frames = [
         bytes,
-        WorkspaceMetadataFunding::constructor_bytes::<Account>()?,
+        HostMetadataFunding::constructor_bytes::<Account>()?,
         size_of::<Account>(),
-        size_of::<Option<WorkspaceMetadataFunding>>(),
-        size_of::<Result<Option<WorkspaceMetadataFunding>, BackendFailure>>(),
-        BackendFailure::source_retention_peak_bytes::<WorkspaceMetadataFundingError>()?,
+        size_of::<Option<HostMetadataFunding>>(),
+        size_of::<Result<Option<HostMetadataFunding>, BackendFailure>>(),
+        BackendFailure::source_retention_peak_bytes::<HostMetadataFundingError>()?,
         size_of::<(usize, usize, usize)>(),
         size_of::<Result<usize, usize>>(),
     ];
@@ -59,14 +59,14 @@ pub(super) fn control_bytes(bytes: usize) -> Option<usize> {
 pub(super) fn prepare(
     bytes: usize,
     custody: &ResetCustody,
-) -> Result<Option<WorkspaceMetadataFunding>, BackendFailure> {
+) -> Result<Option<HostMetadataFunding>, BackendFailure> {
     if bytes == 0 {
         return Ok(None);
     }
-    let limit = WorkspaceMetadataFunding::constructor_bytes::<Account>()
+    let limit = HostMetadataFunding::constructor_bytes::<Account>()
         .and_then(|n| n.checked_add(bytes))
         .ok_or_else(|| BackendFailure::from_error(WorkingMemoryError::Overflow))?;
-    WorkspaceMetadataFunding::new(Account {
+    HostMetadataFunding::new(Account {
         spent: AtomicUsize::new(0),
         limit,
         _custody: custody.clone(),

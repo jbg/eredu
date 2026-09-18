@@ -1,6 +1,9 @@
 //! Module for reference resolution.
 
-use crate::imp::{Meta, Ri, RiMaybeRef, RmrRef};
+use crate::{
+    allocation::{Allocation, AllocationError, Buffer, Unenforced},
+    imp::{Meta, Ri, RiMaybeRef, RmrRef},
+};
 use alloc::string::String;
 use borrow_or_share::Bos;
 use core::{fmt, num::NonZeroUsize};
@@ -8,6 +11,8 @@ use core::{fmt, num::NonZeroUsize};
 /// An error occurred when resolving a URI/IRI reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolveError {
+    /// A prospective storage request failed.
+    Allocation(AllocationError),
     /// The base has a fragment.
     BaseWithFragment,
     /// The base has no authority and its path is rootless, but the reference
@@ -19,9 +24,16 @@ pub enum ResolveError {
     PathUnderflow,
 }
 
+impl From<AllocationError> for ResolveError {
+    fn from(error: AllocationError) -> Self {
+        Self::Allocation(error)
+    }
+}
+
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
+            Self::Allocation(error) => return error.fmt(f),
             Self::BaseWithFragment => "base should not have fragment",
             Self::InvalidReferenceAgainstOpaqueBase => {
                 "when base has a rootless path and no authority, reference should either have scheme, be empty or start with '#'"
@@ -108,10 +120,20 @@ where
         &self,
         reference: &R::Ref<T>,
     ) -> Result<R::WithVal<String>, ResolveError> {
+        self.resolve_with_allocations(reference, &Unenforced)
+    }
+
+    /// Resolves through the same worker, admitting storage before each allocation.
+    pub fn resolve_with_allocations<T: Bos<str>>(
+        &self,
+        reference: &R::Ref<T>,
+        allocation: &dyn Allocation,
+    ) -> Result<R::WithVal<String>, ResolveError> {
         resolve(
             self.base.make_ref(),
             reference.make_ref(),
             self.allow_path_underflow,
+            allocation,
         )
         .map(RiMaybeRef::from_pair)
     }
@@ -121,6 +143,7 @@ pub(crate) fn resolve(
     base: RmrRef<'_, '_>,
     /* reference */ r: RmrRef<'_, '_>,
     allow_path_underflow: bool,
+    allocation: &dyn Allocation,
 ) -> Result<(String, Meta), ResolveError> {
     assert!(base.has_scheme());
 
@@ -192,34 +215,37 @@ pub(crate) fn resolve(
     }
     t_fragment = r_fragment;
 
-    // Calculate the output length.
-    let mut len = t_scheme.as_str().len() + 1;
-    if let Some(authority) = t_authority {
-        len += authority.as_str().len() + 2;
-    }
-    len += t_path.0.len() + t_path.1.map_or(0, |s| s.len());
-    if let Some(query) = t_query {
-        len += query.len() + 1;
-    }
-    if let Some(fragment) = t_fragment {
-        len += fragment.len() + 1;
-    }
-
-    let mut buf = String::with_capacity(len);
+    // Account for every selected component without overflowing a layout.
+    let lengths = [
+        t_scheme.as_str().len(),
+        1,
+        t_authority.map_or(0, |a| a.as_str().len()),
+        if t_authority.is_some() { 2 } else { 0 },
+        t_path.0.len(),
+        t_path.1.map_or(0, str::len),
+        t_query.map_or(0, |q| q.len()),
+        usize::from(t_query.is_some()),
+        t_fragment.map_or(0, |f| f.len()),
+        usize::from(t_fragment.is_some()),
+    ];
+    let len = lengths.iter().try_fold(0usize, |sum, &len| {
+        sum.checked_add(len).ok_or(AllocationError::SizeOverflow)
+    })?;
+    let mut buf = Buffer::new(len, allocation)?;
     let mut meta = Meta::default();
 
-    buf.push_str(t_scheme.as_str());
+    buf.push_str(t_scheme.as_str())?;
     meta.scheme_end = NonZeroUsize::new(buf.len());
-    buf.push(':');
+    buf.push(':')?;
 
     if let Some(authority) = t_authority {
         let mut auth_meta = authority.meta();
-        buf.push_str("//");
+        buf.push_str("//")?;
 
         auth_meta.host_bounds.0 += buf.len();
         auth_meta.host_bounds.1 += buf.len();
 
-        buf.push_str(authority.as_str());
+        buf.push_str(authority.as_str())?;
         meta.auth_meta = Some(auth_meta);
     }
 
@@ -230,38 +256,42 @@ pub(crate) fn resolve(
         let path = [t_path.0, t_path.1.unwrap_or("")];
         let path = &path[..t_path.1.is_some() as usize + 1];
 
-        let underflow_occurred = remove_dot_segments(&mut buf, path_start, path);
+        let underflow_occurred = remove_dot_segments(&mut buf, path_start, path)?;
         if underflow_occurred && !allow_path_underflow {
             return Err(ResolveError::PathUnderflow);
         }
     } else {
-        buf.push_str(t_path.0);
+        buf.push_str(t_path.0)?;
     }
 
     // Close the loophole in the original algorithm.
     if t_authority.is_none() && buf[path_start..].starts_with("//") {
-        buf.insert_str(path_start, "/.");
+        buf.insert_str(path_start, "/.")?;
     }
 
     meta.path_bounds.1 = buf.len();
 
     if let Some(query) = t_query {
-        buf.push('?');
-        buf.push_str(query.as_str());
+        buf.push('?')?;
+        buf.push_str(query.as_str())?;
         meta.query_end = NonZeroUsize::new(buf.len());
     }
 
     if let Some(fragment) = t_fragment {
-        buf.push('#');
-        buf.push_str(fragment.as_str());
+        buf.push('#')?;
+        buf.push_str(fragment.as_str())?;
     }
 
     debug_assert!(buf.len() <= len);
 
-    Ok((buf, meta))
+    Ok((buf.finish(), meta))
 }
 
-pub(crate) fn remove_dot_segments(buf: &mut String, start: usize, path: &[&str]) -> bool {
+pub(crate) fn remove_dot_segments(
+    buf: &mut Buffer<'_>,
+    start: usize,
+    path: &[&str],
+) -> Result<bool, AllocationError> {
     let mut underflow_occurred = false;
     for seg in path.iter().flat_map(|s| s.split_inclusive('/')) {
         let seg_stripped = seg.strip_suffix('/').unwrap_or(seg);
@@ -274,10 +304,10 @@ pub(crate) fn remove_dot_segments(buf: &mut String, start: usize, path: &[&str])
                     underflow_occurred = true;
                 }
             }
-            SegKind::Normal => buf.push_str(seg),
+            SegKind::Normal => buf.push_str(seg)?,
         }
     }
-    underflow_occurred
+    Ok(underflow_occurred)
 }
 
 enum SegKind {

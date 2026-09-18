@@ -6,18 +6,10 @@ struct SourceContext<'a> {
     error: Option<Error>,
 }
 impl<'v> ParameterVisitor<'v, WorkspaceTensor> for SourceContext<'_> {
-    fn requires_borrowed_metadata(&self) -> bool {
-        true
-    }
-    fn borrowed_metadata_unavailable(&mut self) {
-        if self.error.is_none() {
-            self.error = Some(failure(self.context, SourceError::Metadata));
-        }
-    }
-    fn visit(&mut self, _: ParameterMetadata, _: &'v WorkspaceTensor) {
-        self.borrowed_metadata_unavailable();
-    }
-    fn visit_borrowed(&mut self, _: ParameterMetadataView<'_>, value: &'v WorkspaceTensor) {
+
+
+
+    fn visit(&mut self, _: ParameterMetadataView<'_>, value: &'v WorkspaceTensor) {
         if self.error.is_none() {
             self.error = self.context.validate_values([value]).err();
         }
@@ -144,7 +136,7 @@ impl<U: Parameterized<WorkspaceTensor>>
             context: self.context,
             error: None,
         };
-        self.source.visit_parameters(&mut source);
+        self.source.visit_parameters(&mut source).map_err(|error| self.context.metadata_source(error))?;
         if let Some(cause) = source.error {
             return Err(cause);
         }
@@ -204,6 +196,7 @@ impl<U: Parameterized<WorkspaceTensor>>
             self.local,
             &mut rows,
             self.context,
+            |_| false,
         )?;
         self.bound = true;
         Ok(())

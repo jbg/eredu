@@ -17,11 +17,12 @@ use std::collections::BTreeMap;
 pub fn bind_workspace_parameters<M: Parameterized<WorkspaceTensor>>(
     module: &mut M,
     weights: BTreeMap<ParameterId, WorkspaceTensor>,
+    excluded: impl Fn(&ParameterId) -> bool,
 ) -> Result<(), Error> {
     crate::parameter::bind_parameter_values(
         module,
         weights,
-        |_| false,
+        excluded,
         |parameter: &WorkspaceTensor, weight: &WorkspaceTensor| {
             validate_workspace_binding(parameter, weight).map_err(|cause| match cause {
                 PreparedWorkspaceBindingCause::Shape => Error::backend(format!(
@@ -39,7 +40,7 @@ pub fn bind_workspace_parameters<M: Parameterized<WorkspaceTensor>>(
         },
         |parameter, weight| *parameter = weight,
     )
-    .map_err(Error::backend_source)
+    .map_err(Error::backend_retained_source)
 }
 
 #[cfg(test)]
@@ -72,14 +73,21 @@ fn validate_workspace_binding(parameter: &WorkspaceTensor, weight: &WorkspaceTen
 }
 
 /// Finite caller-owned rows through the same prepublication parameter traversal.
+/// `excluded` must describe explicitly selected, independently owned parameters;
+/// absent rows alone never authorize excluding a module slot.
 /// The caller pays row storage, retains source/control custody, and supplies the
 /// actual context. Neither this function nor matching geometry grants source
 /// residency, native execution, or completion authority.
-pub fn bind_prepared_workspace_parameters<M: Parameterized<WorkspaceTensor>>(
+pub fn bind_prepared_workspace_parameters<M, F>(
     module: &mut M,
     rows: &mut [crate::PreparedParameterBinding<'_, WorkspaceTensor>],
     context: &eredu_nn::workspace::WorkspaceContext,
-) -> Result<(), Error> {
+    excluded: F,
+) -> Result<(), Error>
+where
+    M: Parameterized<WorkspaceTensor>,
+    F: Fn(&ParameterId) -> bool,
+{
     use eredu_nn::workspace::WorkspaceMetadataError;
     use std::mem::{size_of, size_of_val};
     let all = crate::prepared_parameter_binding_control_bytes::<
@@ -91,10 +99,11 @@ pub fn bind_prepared_workspace_parameters<M: Parameterized<WorkspaceTensor>>(
         .map_err(|_| WorkspaceMetadataError::Overflow)?.size();
     let frames = [all.checked_sub(row_bytes).ok_or(WorkspaceMetadataError::Overflow)?,
         size_of::<&mut M>(), size_of::<&mut [crate::PreparedParameterBinding<'_, WorkspaceTensor>]>(),
-        size_of::<Result<(), Error>>()];
+        size_of::<Result<(), Error>>(), size_of_val(&excluded),
+        size_of::<(&F, &ParameterId, bool)>()];
     context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
         .ok_or(WorkspaceMetadataError::Overflow)?)?;
-    crate::bind_prepared_parameter_values(module, rows, |_| false,
+    crate::bind_prepared_parameter_values(module, rows, excluded,
         validate_workspace_binding, |parameter, weight| *parameter = weight)
         .map_err(|cause| context.metadata_source(cause))
 }

@@ -1,6 +1,6 @@
 //! Paid immutable slice construction with the exact vocabulary/recipe owner.
 use super::{GenerationRuntimePlan, OriginalGrammarVocabulary};
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use llguidance::earley::{SlicerConstructionFailure, SlicerConstructionPlan, SlicerProgram};
 use std::mem::{size_of, size_of_val};
 
@@ -11,7 +11,7 @@ enum Cause {
     #[error("grammar slicer control geometry overflow")]
     Overflow,
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Construction(#[from] SlicerConstructionFailure),
 }
@@ -64,7 +64,7 @@ impl OriginalGrammarVocabulary {
                 size_of::<Result<SlicerProgram, SlicerConstructionFailure>>(),
                 size_of::<Result<SlicerProgram, Cause>>(),
                 size_of::<Result<OriginalGrammarSlicer, OriginalGrammarSlicerError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<&Self>(),
             ];
             self.funding.reserve_metadata(
@@ -100,7 +100,7 @@ enum StepCause {
     #[error("grammar slicer step geometry overflow")]
     Overflow,
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Construction(#[from] llguidance::earley::SlicerStepFailure),
 }
@@ -131,7 +131,7 @@ impl OriginalGrammarSlicer {
                 size_of::<Result<llguidance::earley::SlicerStep<'_>, StepCause>>(),
                 size_of::<Result<OriginalGrammarSlicerStep<'_>, OriginalGrammarSlicerStepError<'_>>>(
                 ),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             self.vocabulary.funding.reserve_metadata(
                 parts

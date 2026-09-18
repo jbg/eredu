@@ -1,7 +1,7 @@
 //! Actual B source construction, separate from native span-view admission.
 mod registered;
 use super::*;
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFundingError};
 use eredu_runtime::input::PreparedModelInputOwner;
 pub(crate) use registered::OriginalEmbeddedPrefillInput;
 use std::mem::{size_of, size_of_val};
@@ -31,6 +31,7 @@ where
         size_of::<MlxModelInput>(),
         size_of::<PreparedModelInputOwner<MlxTensor>>(),
         size_of::<WorkspaceContext>(),
+        size_of::<Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>>(),
         size_of::<Result<WorkspaceContext, eredu_nn::workspace::WorkspaceMetadataError>>(),
         size_of::<I::Prefill>(),
         size_of::<Result<I::Prefill, Error>>(),
@@ -38,14 +39,14 @@ where
         size_of::<SpeculativeExecutionStreams<'_>>(),
         size_of::<Option<eredu_runtime::SharedPreparedInputCacheIdentity>>(),
         size_of::<Result<(), Error>>(),
-        size_of::<WorkspaceMetadataFundingError>(),
-        size_of::<eredu_nn::workspace::WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFundingError>(),
+        size_of::<eredu_nn::workspace::HostMetadataFunding>(),
         size_of::<
             Result<
                 (
                     PreparedModelInputOwner<MlxTensor>,
                     WorkspaceContext,
-                    OriginalEmbeddedPrefillInput,
+                    Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
                 ),
                 Error,
             >,
@@ -64,7 +65,7 @@ where
         (
             PreparedModelInputOwner<MlxTensor>,
             WorkspaceContext,
-            OriginalEmbeddedPrefillInput,
+            Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
         ),
         Error,
     > = (|| {
@@ -74,7 +75,7 @@ where
                     .into_iter()
                     .try_fold(size_of_val(&controls), usize::checked_add)
                     .ok_or(Error::WorkspacePlanning(
-                        WorkspaceMetadataFundingError::Overflow,
+                        HostMetadataFundingError::Overflow,
                     ))?,
             )
             .map_err(Error::WorkspacePlanning)?;
@@ -88,20 +89,29 @@ where
         )
         .map_err(|cause| Error::Neural(cause.into()))?;
         // This is the original immutable owner clone, not Clone on MlxTensor.
-        let original = OriginalEmbeddedPrefillInput::prepare(&input, prepared, context)?;
-        Ok((prepared.clone(), metadata, original))
+        let media = input.with_borrowed(|view| match view.original_media() {
+            Some(input::OriginalMediaPacket::Original(packet)) => Some(packet.semantics()),
+            _ => None,
+        });
+        Ok((prepared.clone(), metadata, media))
     })();
     let result = match prepared {
-        Ok((prepared, metadata, original)) => {
-            let scoped = context
-                .with_original_prefill_input(&original)
-                .map_err(|cause| sources.retain_error(cause))?;
+        Ok((prepared, metadata, media)) => {
             lowerer.with_prefill_source_with_metadata(
-                input,
-                prepared,
-                scoped.target(),
-                &metadata,
-                |source| operation(source, scoped),
+                input, prepared.clone(), context.target(), &metadata,
+                |source| match source {
+                    Ok(source) => {
+                        // Every failure enters the same source-agreement callback.
+                        match OriginalEmbeddedPrefillInput::prepare::<A, S, I::Prefill>(&source, &prepared, media, context) {
+                            Ok(original) => match context.with_original_prefill_input(&original) {
+                                Ok(scoped) => operation(Ok(source), scoped),
+                                Err(cause) => operation(Err(sources.retain_error(cause)), context),
+                            },
+                            Err(cause) => operation(Err(cause), context),
+                        }
+                    }
+                    Err(cause) => operation(Err(cause), context),
+                },
             )
         }
         Err(cause) => {

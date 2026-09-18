@@ -49,8 +49,9 @@ impl<U: 'static> MlxResidentPolicy<U> {
     pub(crate) fn original_neural_plan(
         &self,
         geometry: eredu_core::InferenceGeometry,
+        groups: eredu_runtime::GroupSubmissionMechanism,
     ) -> Result<original_operations::ResidentNeuralPlan<U>, Error> {
-        self.original_neural.plan(&self.layout, geometry)
+        self.original_neural.plan(&self.layout, geometry, groups)
     }
 
     pub(crate) fn submit_neural(

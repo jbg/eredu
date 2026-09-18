@@ -24,12 +24,12 @@ impl Drop for Cause {
     }
 }
 
-struct Armed {
+pub(crate) struct Armed {
     source: SharedBackendFailure,
     drops: Arc<AtomicUsize>,
 }
 impl Armed {
-    fn new(at: &'static str) -> Self {
+    pub(crate) fn new(at: &'static str) -> Self {
         let drops = Arc::new(AtomicUsize::new(0));
         let source = SharedBackendFailure::new(BackendFailureKind::Busy, Cause(drops.clone()));
         FAILURE.with(|slot| {
@@ -38,17 +38,10 @@ impl Armed {
         });
         Self { source, drops }
     }
-    fn assert_error(&self, error: &ControlledGenerationError) {
-        let neutral = match error {
-            ControlledGenerationError::Sampling(SamplingOverrideError::Backend(error)) => error,
-            ControlledGenerationError::Continuation(
-                eredu_core::TextContinuationError::Generation(
-                    eredu_core::ControlledTextGenerationError::Backend(error),
-                ),
-            ) => error,
-            ControlledGenerationError::Snapshot(TextSnapshotError::Backend(error)) => error,
-            _ => panic!("provider error changed its typed branch: {error}"),
-        };
+    pub(crate) fn assert_error(&self, error: &ControlledGenerationError) {
+        let neutral = error
+            .backend_failure()
+            .expect("original provider classification");
         assert_eq!(neutral.kind(), BackendFailureKind::Busy);
         assert_eq!(neutral.operation(), "conformance-retained-hook");
         let actual = neutral.source().unwrap().downcast_ref::<Cause>().unwrap();
@@ -105,11 +98,11 @@ fn branch_options() -> GenerationBranchOptions {
 #[test]
 fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branch() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), ignore)
+        .start_controlled_chat(prepared, limits(), Default::default(), ignore)
+        .unwrap()
         .unwrap();
     let armed = Armed::new("sampling");
     // This invalid policy is checked before the backend callback. It must keep
@@ -123,10 +116,11 @@ fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branc
             no_record,
         )
         .unwrap_err();
-    assert!(matches!(
-        invalid,
-        ControlledGenerationError::Sampling(SamplingOverrideError::Invalid(_))
-    ));
+    assert!(invalid
+        .session_failure()
+        .unwrap()
+        .sampling_rejection()
+        .is_some());
     assert_eq!(run.status(), GenerationStatus::Prepared);
     let error = run
         .override_sampling(
@@ -138,7 +132,7 @@ fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branc
         )
         .unwrap_err();
     armed.assert_error(&error);
-    assert_eq!(run.status(), GenerationStatus::Failed);
+    assert_eq!(run.status(), GenerationStatus::Prepared);
     assert_eq!(run.next_prediction(), 0);
     assert!(run.token_ids().is_empty());
     let drops = armed.drops.clone();
@@ -151,24 +145,26 @@ fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branc
 }
 
 #[test]
-fn snapshot_estimate_capture_restore_and_branch_preserve_retained_provider_cause() {
-    for at in ["estimate", "capture", "copy", "growth"] {
+fn snapshot_capture_restore_and_branch_preserve_retained_provider_cause() {
+    for at in ["capture", "copy", "growth"] {
         let (mut model, chat, settings, _) = super::snapshots::snapshot_setup();
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-            .unwrap();
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), ignore)
+            .start_controlled_chat(prepared, limits(), Default::default(), ignore)
+            .unwrap()
             .unwrap();
-        let saved = if at == "estimate" {
-            None
-        } else {
-            run.enable_snapshots(copy_limits()).unwrap();
+        let saved = {
+            run.enable_snapshots(
+                copy_limits(),
+                original_sources::CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+            )
+            .unwrap();
             Some(run.snapshot(ignore).unwrap())
         };
         let armed = Armed::new(at);
         let error = match at {
-            "estimate" => run.enable_snapshots(copy_limits()),
             "capture" => run.snapshot(no_record).map(|_| ()),
             "copy" => run.restore(saved.as_ref().unwrap(), no_record),
             "growth" => run
@@ -192,42 +188,46 @@ fn snapshot_estimate_capture_restore_and_branch_preserve_retained_provider_cause
 }
 
 #[test]
-fn generic_control_conversions_keep_default_classification_and_typed_host_failures() {
-    let error = ControlledGenerationError::from(SamplingOverrideError::Backend(
-        std::io::Error::from(std::io::ErrorKind::InvalidInput),
-    ));
-    let ControlledGenerationError::Sampling(SamplingOverrideError::Backend(error)) = error else {
-        panic!("wrong sampling branch")
-    };
-    assert_eq!(error.kind(), BackendFailureKind::InvalidInput);
-    assert!(error.source().unwrap().is::<std::io::Error>());
-    let error = ControlledGenerationError::from(TextSnapshotError::<std::io::Error>::Host(
-        "host marker".into(),
+fn neutral_control_conversions_keep_classification_and_typed_host_failures() {
+    let original =
+        BackendFailure::from_error(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    let error = ControlledGenerationError::Backend(original);
+    assert_eq!(
+        error.backend_failure().unwrap().kind(),
+        BackendFailureKind::InvalidInput
+    );
+    assert!(error
+        .backend_failure()
+        .unwrap()
+        .source()
+        .unwrap()
+        .is::<std::io::Error>());
+    let error = ControlledGenerationError::Snapshot(eredu::api::GenerationSnapshotError::from(
+        TextSnapshotError::<BackendFailure>::Host("host marker".into()),
     ));
     assert!(
-        matches!(error, ControlledGenerationError::Snapshot(TextSnapshotError::Host(message)) if message == "host marker")
+        matches!(error,ControlledGenerationError::Snapshot(error) if matches!(error.cause(),TextSnapshotError::Host(message) if message=="host marker"))
     );
-    let original = BackendFailure::new(
-        BackendFailureKind::Busy,
-        std::io::Error::other("host preparation"),
-    );
-    let error = ControlledGenerationError::from(
-        TextSnapshotError::<std::io::Error>::HostPreparation(original),
-    );
-    assert!(
-        matches!(error, ControlledGenerationError::Snapshot(TextSnapshotError::HostPreparation(error)) if error.kind() == BackendFailureKind::Busy)
+    let error = ControlledGenerationError::Snapshot(eredu::api::GenerationSnapshotError::from(
+        TextSnapshotError::<BackendFailure>::HostPreparation(BackendFailure::new(
+            BackendFailureKind::Busy,
+            std::io::Error::other("host preparation"),
+        )),
+    ));
+    assert_eq!(
+        error.backend_failure().unwrap().kind(),
+        BackendFailureKind::Busy
     );
 }
 
 #[test]
 fn controlled_start_preserves_retained_provider_cause_after_model_drop() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let armed = Armed::new("start");
     let error = model
-        .start_controlled_chat(prepared, &[], Default::default(), no_record)
+        .start_controlled_chat(prepared, limits(), Default::default(), no_record)
         .err()
         .unwrap();
     armed.assert_error(&error);

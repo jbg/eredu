@@ -66,7 +66,7 @@ fn fresh(
         ))
     ));
     assert_eq!(mechanism.calls.get(), 0);
-    let (_, probe, accepted_probe) = sealed_plan(pool, &q, exact).unwrap();
+    let (probe, accepted_probe) = sealed_plan(pool, &q, exact).unwrap();
     drop((probe, accepted_probe));
     // Subsequent A and B share the domain's full ceiling, as separate requests.
     let (r, run, accepted) = accept(pool, q);

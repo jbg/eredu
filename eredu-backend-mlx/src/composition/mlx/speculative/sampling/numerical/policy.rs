@@ -135,7 +135,7 @@ fn process_policy_inner<S: SpeculativeSampler<MlxSamplingBackend>>(
     let funding = &logits.value().funding;
     let result = (|| {
         let controls = control_bytes::<S>().ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
         funding
             .reserve_metadata(controls)
@@ -342,7 +342,7 @@ pub(super) fn bound_controller_choice<'a, S: SpeculativeSampler<MlxSamplingBacke
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     funding
         .reserve_metadata(bytes)

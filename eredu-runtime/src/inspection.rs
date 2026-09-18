@@ -13,6 +13,8 @@ mod error_bridge;
 pub use error_bridge::ObserverErrorBridge;
 mod intervention_projection;
 pub use intervention_projection::{validate_static_intervention_declarations,validate_static_intervention_declarations_with_phases,validate_activation_intervention_declarations_with_phases,static_intervention_validation_control_bytes};
+pub use intervention_projection::{prepare_intervention_discovery, intervention_discovery_preparation_bytes,
+    FundedInterventionDiscovery, InterventionDiscoveryPreparationError};
 mod speculative;
 pub use speculative::{SpeculativeActivationObserver, with_speculative_activation};
 
@@ -95,12 +97,7 @@ pub fn intervention_support(
 ) -> eredu_core::intervention::InterventionDiscovery {
     use eredu_core::intervention::*;
     for point in &mut points {
-        let path = if point.routing.is_some() {
-            eredu_core::RoutingObservationField::SelectedExperts.path(&point.path)
-        } else {
-            point.path.clone()
-        };
-        let support=capture.support.points.iter().find(|p|p.path==path);
+        let support=intervention_projection::support_for(point, &capture.support.points);
         intervention_projection::apply(point,support,mechanisms.borrowed());
     }
     InterventionDiscovery {
@@ -149,38 +146,58 @@ pub fn observation_support_with_partition(
     context: ObservationExecutionContext,
     mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
 ) -> eredu_core::ObservationSupportReport {
-    eredu_core::ObservationSupportReport {
-        schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
-        capture: Default::default(),
-        points: catalog
-            .points
-            .iter()
-            .map(|point| eredu_core::ObservationSupport {
-                path: point.path.clone(),
-                prefill: point_support(point, point.prefill, context, &mut partition),
-                decode: point_support(point, point.decode, context, &mut partition),
-                floating_to_f32: context.mechanisms.floating_to_f32,
-            })
-            .collect(),
+    observation_support_with_partition_source(catalog, context,
+        eredu_core::capture::CaptureSourceConstruction::new(None),
+        |point, _| Ok(partition(point))).expect("ordinary support source construction")
+}
+
+/// Same selected support worker with prospective source destinations. The
+/// callback must construct its own status under the supplied policy; the caller
+/// retains that policy's actual account in the enclosing source and all errors.
+pub fn observation_support_with_partition_source(
+    catalog: &eredu_core::ObservationCatalog,
+    context: ObservationExecutionContext,
+    construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    mut partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
+        -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+) -> Result<eredu_core::ObservationSupportReport, eredu_core::capture::CaptureError> {
+    use eredu_core::{ObservationSupport, ObservationSupportReport};
+    construction.controls(observation_phase_validation_control_bytes()
+        .and_then(|n| n.checked_add(std::mem::size_of::<(ObservationSupportReport, ObservationSupport,
+            &eredu_core::ObservationCatalog, ObservationExecutionContext)>() ))
+        .and_then(|n| n.checked_add(std::mem::size_of_val(&partition)))
+        .ok_or(eredu_core::capture::CaptureError::Overflow)?)?;
+    let mut points = construction.vector(catalog.points.len())?;
+    for point in &catalog.points {
+        points.push(ObservationSupport {
+            path: construction.text(&point.path)?,
+            prefill: point_support(point, point.prefill, context, construction, &mut partition)?,
+            decode: point_support(point, point.decode, context, construction, &mut partition)?,
+            floating_to_f32: context.mechanisms.floating_to_f32,
+        });
     }
+    Ok(ObservationSupportReport { schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
+        capture: Default::default(), points })
 }
 
 fn point_support(
     point: &eredu_core::ObservationPoint,
     phase_available: bool,
     context: ObservationExecutionContext,
-    partition: &mut impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
-) -> eredu_core::ObservationSupportStatus {
+    construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    partition: &mut impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
+        -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
     if let Some(status) = point_support_before_partition(point, phase_available, context, false) {
-        return status.owned();
+        return status.owned(construction);
     }
     if context.partitioned {
-        match partition(point) {
+        match partition(point, construction)? {
             eredu_core::ObservationSupportStatus::Supported => {}
-            status => return status,
+            status => return Ok(status),
         }
     }
-    point_support_after_partition(point, false).owned()
+    point_support_after_partition(point, false).owned(construction)
 }
 
 #[derive(Clone, Copy)]
@@ -191,14 +208,14 @@ enum BorrowedPointSupport {
     Unverified(&'static str),
 }
 impl BorrowedPointSupport {
-    fn owned(self) -> eredu_core::ObservationSupportStatus {
+    fn owned(self, construction: eredu_core::capture::CaptureSourceConstruction<'_>) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
         use eredu_core::ObservationSupportStatus as S;
-        match self {
+        Ok(match self {
             Self::Supported => S::Supported,
-            Self::Conditional(reason) => S::Conditional(reason.into()),
-            Self::Unsupported(reason) => S::Unsupported(reason.into()),
-            Self::Unverified(reason) => S::Unverified(reason.into()),
-        }
+            Self::Conditional(reason) => S::Conditional(construction.text(reason)?),
+            Self::Unsupported(reason) => S::Unsupported(construction.text(reason)?),
+            Self::Unverified(reason) => S::Unverified(construction.text(reason)?),
+        })
     }
     fn admissible(self) -> bool {
         matches!(self, Self::Supported | Self::Conditional(_))
@@ -444,6 +461,18 @@ pub enum RoutingUnmodifiedInterest {
 
 /// Statically dispatched activation observation and intervention contract.
 pub trait ActivationObserver<T, E> {
+    /// Whether activation paths, generated evidence, or interventions are consumed.
+    /// Returning false permits the same equations to omit activation-only hooks;
+    /// lifecycle, cancellation, transport, and retained-media callbacks still run.
+    fn observes_activations(&self) -> bool {
+        true
+    }
+    /// Observes the actual compact media roots at the encoder/decoder cut.
+    /// This borrowed notification grants no source, copy or execution authority.
+    fn retained_media_cut(&mut self, _visit: &mut dyn FnMut(&mut dyn FnMut(&T))) -> Result<(), E> {
+        Ok(())
+    }
+
     /// Requires the executor's already prepared, borrowed traversal paths.
     /// This requirement stays fixed through one forward. It grants no funding,
     /// admission or completion authority. Missing/stale bindings must reject
@@ -719,6 +748,12 @@ pub struct BorrowedActivationObserver<'a, O: ?Sized>(pub &'a mut O);
 impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     for BorrowedActivationObserver<'_, O>
 {
+    fn observes_activations(&self) -> bool {
+        self.0.observes_activations()
+    }
+    fn retained_media_cut(&mut self, visit: &mut dyn FnMut(&mut dyn FnMut(&T))) -> Result<(), E> {
+        self.0.retained_media_cut(visit)
+    }
     fn requires_prepared_traversal(&self) -> bool {
         self.0.requires_prepared_traversal()
     }
@@ -990,6 +1025,9 @@ where
 pub struct NoopObserver;
 
 impl<T, E> ActivationObserver<T, E> for NoopObserver {
+    fn observes_activations(&self) -> bool {
+        false
+    }
     fn supports_prefill_context(&self) -> bool {
         true
     }

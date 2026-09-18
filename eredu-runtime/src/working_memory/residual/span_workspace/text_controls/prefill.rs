@@ -1,7 +1,7 @@
 //! Finite prefill controls from the same original text comparison and active run.
 use super::*;
 use crate::{
-    prefill::{PrefillControlPlan, PrefillControlRole, PrefillSpanControlPhase},
+    prefill::{PrefillControlPlan, PrefillControlRole},
     working_memory::{InferenceRequest, InferenceTextStep, funding::RawSpanHostOwner},
 };
 
@@ -114,7 +114,7 @@ impl TextPrefillScopeFacts {
     fn populations(self) -> [u64; 7] {
         let n = self.plan.span_count();
         [
-            1,
+            u64::from(n != 0),
             n,
             n,
             n,

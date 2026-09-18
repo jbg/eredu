@@ -267,6 +267,13 @@ impl OriginalReadSources {
     pub(super) fn read_output(&self, index: usize) -> Option<&RecipeMetadata> {
         self.reads.output(index)
     }
+    #[cfg(test)]
+    pub(in crate::backend::runtime::residency::manager) fn detached_physical_read_bytes(
+        &self,
+        source: usize,
+    ) -> Option<u64> {
+        self.reads.physical_read_bytes(source)
+    }
     pub(super) fn read_slice(
         &self,
         range: std::ops::Range<usize>,

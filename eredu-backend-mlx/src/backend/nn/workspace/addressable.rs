@@ -7,6 +7,7 @@ use std::mem::{size_of,size_of_val};
 mod child;
 mod observation;
 mod parameters;
+mod row_candidates;
 mod sources;
 mod facts;
 pub(crate) use sources::{AddressableSources,AddressableQuoteRef,AddressableInvocation};
@@ -30,7 +31,7 @@ impl AddressableParentSource {
         inputs: &[WorkspaceLayout],
         child_outputs: &[WorkspaceLayout],
         mechanism: ResidentExecutionMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
         context.charge_metadata(size_of::<(
@@ -155,3 +156,8 @@ impl AddressableParentSource {
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
+
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod tests;

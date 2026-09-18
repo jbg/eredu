@@ -45,8 +45,8 @@ fn project(value:&Array,context:&WorkspaceContext)->WorkspaceTensor {
 }
 struct BindQuote<'a>{sources:&'a BTreeMap<String,Array>,count:usize,context:&'a WorkspaceContext}
 impl<'a> ParameterVisitorMut<'a,WorkspaceTensor> for BindQuote<'_>{
-    fn visit_mut(&mut self,metadata:ParameterMetadata,value:&'a mut WorkspaceTensor){
-        let source=self.sources.get(metadata.id.as_str()).expect("actual retained parameter binding");
+    fn visit_mut(&mut self,metadata:eredu_nn::ParameterMetadataView<'_>,value:&'a mut WorkspaceTensor){
+        let source=self.sources.get(metadata.id().as_str()).expect("actual retained parameter binding");
         assert_eq!(value.shape(),source.shape());*value=project(source,self.context);self.count+=1;
     }
 }

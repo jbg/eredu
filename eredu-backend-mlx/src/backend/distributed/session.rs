@@ -118,7 +118,7 @@ impl MlxDistributedSession {
     /// creates no communicator, transport, completion, or original work grant.
     pub(crate) fn original_communication_source<'a>(
         &'a self, selected: &eredu_runtime::CommunicationManifest,
-        world: &NativeGroup, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        world: &NativeGroup, funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<crate::backend::runtime::distributed::topology::OriginalCommunicationSource<'a>, Error> {
         self.communicators.bind_original_source(selected, world, &self.authority, funding)
     }
@@ -128,7 +128,7 @@ impl MlxDistributedSession {
     /// descriptor is rebuilt from a manifest.
     pub(crate) fn original_communication_owner(
         &self, selected: &eredu_runtime::CommunicationManifest,
-        world: &NativeGroup, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        world: &NativeGroup, funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<crate::backend::runtime::distributed::topology::OriginalCommunicationOwner, Error> {
         crate::backend::runtime::distributed::topology::OriginalCommunicationOwner::bind(
             &self.communicators, selected, world, &self.authority, funding)
@@ -138,7 +138,7 @@ impl MlxDistributedSession {
     /// tensor source for one complete frame. It creates no communicator.
     pub(crate) fn original_initialized_tensor_source(&self,id:eredu_core::CollectiveGroupId,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        funding:&eredu_nn::workspace::HostMetadataFunding)
         ->Result<crate::backend::runtime::distributed::topology::original_source::parallel::OriginalParallelSource,Error> {
         self.original_communication_owner(&self.manifest,&self.world,funding)?
             .prepare_initialized_parallel_source(id,pool)
@@ -710,14 +710,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureTransport for MlxDistrib
     fn capture_wait(
         &self,
     ) -> Result<eredu_core::BoundedCompletionWait, eredu_core::capture::CaptureError> {
-        self.authority
-            .completion_policy()
-            .map(|policy| policy.bounded_wait())
-            .ok_or_else(|| {
-                eredu_core::capture::CaptureError::Unsupported(
-                    "capture transport needs selected bounded completion".into(),
-                )
-            })
+        self.capture_wait_source(eredu_core::capture::CaptureSourceConstruction::new(None))
     }
 
     fn ensure_capture_active(&self) -> Result<(), eredu_core::BackendFailure> {
@@ -844,13 +837,41 @@ impl MlxDistributedSession {
         members: &[usize],
     ) -> Result<&eredu_runtime::CommunicationGroupDescriptor, eredu_core::capture::CaptureError>
     {
-        Self::capture_hook_source(self.communicators.global_group_descriptors(),members)
-            .ok_or_else(|| {
-                eredu_core::capture::CaptureError::Unsupported(
-                    "capture hook group has no selected exact failure agreement".into(),
-                )
-            })
+        self.capture_hook_descriptor_source(members, eredu_core::capture::CaptureSourceConstruction::new(None))
     }
+    pub(crate) fn capture_wait_source(&self, construction: eredu_core::capture::CaptureSourceConstruction<'_>)
+        -> Result<eredu_core::BoundedCompletionWait, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::CaptureError;
+        construction.controls(std::mem::size_of::<(&Self, Option<eredu_core::BoundedCompletionWait>, CaptureError)>())?;
+        match self.authority.completion_policy() {
+            Some(policy) => Ok(policy.bounded_wait()),
+            None => Err(CaptureError::Unsupported(construction.text("capture transport needs selected bounded completion")?)),
+        }
+    }
+    fn capture_hook_descriptor_source(&self, members: &[usize], construction: eredu_core::capture::CaptureSourceConstruction<'_>)
+        -> Result<&eredu_runtime::CommunicationGroupDescriptor, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::CaptureError;
+        construction.controls(std::mem::size_of::<(&Self, &[usize], Option<&eredu_runtime::CommunicationGroupDescriptor>, CaptureError,
+            std::slice::Iter<'_, eredu_runtime::CommunicationGroupDescriptor>,
+            std::slice::Iter<'_, eredu_runtime::CommunicationOperationRequirement>,
+            Option<&eredu_runtime::CommunicationOperationRequirement>, bool)>())?;
+        match Self::capture_hook_source(self.communicators.global_group_descriptors(), members) {
+            Some(value) => Ok(value),
+            None => Err(CaptureError::Unsupported(construction.text("capture hook group has no selected exact failure agreement")?)),
+        }
+    }
+    pub(crate) fn estimate_capture_hook_source(&self, members: &[usize], construction: eredu_core::capture::CaptureSourceConstruction<'_>)
+        -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::CaptureError;
+        let usage = Self::capture_hook_usage_source(self.manifest.world_size(), members, construction)?;
+        if members.len() == 1 { return Ok(usage); }
+        let descriptor = self.capture_hook_descriptor_source(members, construction)?;
+        if descriptor.local_index().is_some() && self.communicators.communication_group(descriptor.id()).is_none() {
+            return Err(CaptureError::Invalid(construction.text("selected capture hook group was not realized")?));
+        }
+        Ok(usage)
+    }
+
 }
 
 impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDistributedSession {
@@ -858,21 +879,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDis
 
     fn estimate_capture_hook(&self,members:&[usize])
         ->Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError> {
-        use eredu_core::capture::CaptureError;
-        let usage=Self::capture_hook_usage(self.manifest.world_size(),members)?;
-        if members.len()==1 {return Ok(usage);}
-        let descriptor=self.capture_hook_descriptor(members)?;
-        if descriptor.local_index().is_some()
-            && self
-                .communicators
-                .communication_group(descriptor.id())
-                .is_none()
-        {
-            return Err(CaptureError::Invalid(
-                "selected capture hook group was not realized".into(),
-            ));
-        }
-        Ok(usage)
+        self.estimate_capture_hook_source(members, eredu_core::capture::CaptureSourceConstruction::new(None))
     }
 
     fn submit_capture_hook(
@@ -925,7 +932,15 @@ impl MlxDistributedSession {
     /// original transports. This is a source fact and grants no native work.
     pub(crate) fn capture_hook_usage(world:usize,members:&[usize])
         ->Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError> {
+        Self::capture_hook_usage_source(world, members, eredu_core::capture::CaptureSourceConstruction::new(None))
+    }
+    pub(crate) fn capture_hook_usage_source(world: usize, members: &[usize],
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
         use eredu_core::capture::{add, mul, CaptureError, CaptureUsage};
+        construction.controls(std::mem::size_of::<(usize, &[usize], CaptureUsage, CaptureError,
+            std::slice::Windows<'_, usize>, std::slice::Iter<'_, usize>, std::ops::Range<usize>,
+            Option<usize>, usize, usize, bool, Result<i32, std::num::TryFromIntError>)>())?;
         if members.is_empty()
             || members.windows(2).any(|pair| pair[0] >= pair[1])
             || members
@@ -933,7 +948,7 @@ impl MlxDistributedSession {
                 .any(|rank| *rank >= world)
         {
             return Err(CaptureError::Invalid(
-                "capture hook membership exceeds selected world".into(),
+                construction.text("capture hook membership exceeds selected world")?,
             ));
         }
         // A singleton requires no collective or native status tensor.
@@ -946,8 +961,7 @@ impl MlxDistributedSession {
         );
         if !independent {
             return Err(CaptureError::Unsupported(
-                "selected native subgroup requires a world participation wave for status agreement"
-                    .into(),
+                construction.text("selected native subgroup requires a world participation wave for status agreement")?,
             ));
         }
         i32::try_from(members.len()).map_err(|_| CaptureError::Overflow)?;

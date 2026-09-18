@@ -5,6 +5,8 @@ mod grammar;
 pub(crate) use grammar::GrammarChoiceIdentity;
 pub use grammar::{PreparedGrammarChoice, PreparedGrammarChoiceCause, PreparedGrammarChoiceError};
 mod prepared;
+mod original;
+pub use original::PreparedTokenChoiceError;
 pub(crate) use prepared::ControllerChoiceIdentity;
 pub use prepared::{PreparedControllerCause, PreparedControllerDecision, PreparedControllerSource};
 mod forbidden;
@@ -38,6 +40,19 @@ pub enum TokenChoiceError<E: std::error::Error + 'static> {
         /// The ID returned by the backend.
         actual: u32,
     },
+}
+
+impl<E: std::error::Error + 'static> TokenChoiceError<E> {
+    /// Fixed choice-policy refusal, excluding the controller's retained cause.
+    pub fn rejection(&self) -> Option<TokenChoiceError<std::convert::Infallible>> {
+        Some(match self {
+            Self::Constraint(_) => return None,
+            Self::InvalidToken(token) => TokenChoiceError::InvalidToken(*token),
+            Self::Forbidden(token) => TokenChoiceError::Forbidden(*token),
+            Self::AlreadyPending => TokenChoiceError::AlreadyPending,
+            Self::UnexpectedCommit { expected, actual } => TokenChoiceError::UnexpectedCommit { expected: *expected, actual: *actual },
+        })
+    }
 }
 
 /// Adds a one-decision restriction to an existing canonical constraint owner.
@@ -258,6 +273,20 @@ impl<C: TokenFilterController> TokenFilterController for TokenChoiceController<C
     }
 }
 impl<C: SnapshotTokenController> SnapshotTokenController for TokenChoiceController<C> {
+    fn original_snapshot_storage_bytes(&self) -> Option<u64> {
+        self.inner.original_snapshot_storage_bytes()?.checked_add(
+            u64::try_from(std::mem::size_of::<Self>().checked_sub(std::mem::size_of::<C>())?).ok()?,
+        )
+    }
+    fn fork_original_snapshot(&self) -> Option<Self> {
+        Some(Self {
+            inner: self.inner.fork_original_snapshot()?,
+            domain: self.domain,
+            pending: self.pending,
+            last_forced: self.last_forced,
+            pending_position: self.pending_position,
+        })
+    }
     fn snapshot_storage_bytes(&self) -> Option<u64> {
         self.inner
             .snapshot_storage_bytes()?

@@ -14,7 +14,7 @@ use eredu_core::{
     SpeculativeDraft, SpeculativeExecutor, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
-    SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
+    SpeculativeSemanticConstraint, SemanticState, SpeculativeTokenFilterController,
     generation::{GenerationCancellationToken, SemanticEvent, SpeculativeConfig},
 };
 use eredu_runtime::{ConstrainedSampler, SpeculativeSampler};
@@ -940,7 +940,7 @@ struct MlxSpeculativeLaneRuntime<'a, C> {
     config: eredu_core::SpeculativeConfiguration,
     prng_key: Option<MlxSpeculativeSeed>,
     sampler: MlxPreparedSampler<C>,
-    semantic: eredu_core::SpeculativeSemanticOwner,
+    semantic: eredu_core::SemanticStateOwner,
     cancellation: GenerationCancellationToken,
     on_event: eredu_core::SpeculativeEventCallback<'a>,
     memory_owner: Option<NativeMemoryOwner>,
@@ -1557,21 +1557,21 @@ fn prepare_speculative_callback<'a>(
         return Ok(SpeculativeCallbackPublisher::semantic_callback(callback));
     };
     use eredu_core::HostPreparationAuthority;
-    use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+    use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
     use std::mem::{size_of, size_of_val};
     let parts = [
         size_of::<eredu_core::SpeculativeEventCallback<'a>>(),
         size_of::<Result<SpeculativeCallbackPublisher<'a>, Error>>(),
         size_of::<HostPreparationAuthority>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
         size_of::<Option<usize>>(),
         SpeculativeCallbackPublisher::prepared_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     let bytes = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     sources.metadata_funding().reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
     let host = HostPreparationAuthority::retain(sources.metadata_funding().clone());
     Ok(SpeculativeCallbackPublisher::semantic_prepared_callback(callback, host))

@@ -82,6 +82,7 @@ mod slot_bounds;
 pub(crate) mod snapshot_estimate;
 pub(crate) use slot_bounds::NativeStateSlotCounts;
 
+mod paged_reset;
 mod key_value;
 pub(crate) use key_value::{
     RealtimeKvBranchPlan,

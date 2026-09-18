@@ -154,7 +154,7 @@ fn prepared_node_handoff_tracks_real_cpu_work_and_keeps_constructor_custody_unti
         &[4., 9., 25.]
     );
     drop((event, output, input));
-    active.finish();
+    active.finish().unwrap();
     while drops.get() == 0 || native.load(Ordering::SeqCst) == 0 {
         reap();
         // Settled native records still own Scope references until this pass.

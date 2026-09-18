@@ -29,7 +29,7 @@ where B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAt
         let parameters = match &self.construction_parameters {
             Some(source) => source.clone(),
             None => RetainedRoutedDescription::from_completed(
-                eredu_runtime::ArchitectureParameters::parameter_description(self, context)?),
+                eredu_runtime::ArchitectureParameters::parameter_description(self, context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description, B::construction_metadata(context)))?),
         };
         let units = match &self.construction_units {
             Some(source) => Some(source.clone()),

@@ -77,7 +77,7 @@ fn candidate(
     ids: &Vec<u32>,
     controller: &disk::Controller,
 ) -> (u64, u64, u64) {
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), source).unwrap();
+    let capture = CaptureAdmission::new(runtime.session(), geometry(), source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
     let h = capture.host.initialization_peak_bytes();
     let c = capture.new_source_bytes;
     let (_, _, mut outside) = super::super::enclosing_components(
@@ -418,7 +418,7 @@ fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() 
 
 struct Slots;
 impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadata, _: &mut crate::MlxTensor) {}
+    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut crate::MlxTensor) {}
 }
 #[test]
 fn original_capture_bank_checks_actual_current_path_token_before_consumption() {

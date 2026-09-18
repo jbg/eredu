@@ -174,7 +174,7 @@ pub struct PreparedCaptureStep<'a> {
         Vec<Option<super::interventions::evidence::PreparedInterventionEvidence<'a>>>,
     pub(in crate::working_memory) prefill:
         Option<crate::working_memory::capture_tensor::prefill::PrefillTargets>,
-    pub(in crate::working_memory) partition_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(in crate::working_memory) partition_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
     pub(super) plan: CaptureStepHostPlan<'a>,
     pub(super) custody: CaptureTensorCustody,
 }

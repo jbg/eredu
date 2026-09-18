@@ -1,8 +1,8 @@
 use super::*;
 use eredu_core::cache::CacheRepresentation;
 use eredu_nn::workspace::{
-    WorkspaceMechanisms, WorkspaceMetadataAccount, WorkspaceMetadataFunding,
-    WorkspaceMetadataFundingError, WorkspaceOperation, WorkspaceOperationBound,
+    WorkspaceMechanisms, HostMetadataAccount, HostMetadataFunding,
+    HostMetadataFundingError, WorkspaceOperation, WorkspaceOperationBound,
 };
 use std::sync::{
     Arc, Mutex,
@@ -16,13 +16,13 @@ struct AccountState {
 }
 #[derive(Debug)]
 struct Account(Arc<AccountState>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let mut remaining = self.0.remaining.lock().unwrap();
         *remaining =
             remaining
                 .checked_sub(bytes)
-                .ok_or(WorkspaceMetadataFundingError::Capacity {
+                .ok_or(HostMetadataFundingError::Capacity {
                     required: bytes as u64,
                     available: *remaining as u64,
                 })?;
@@ -49,7 +49,7 @@ fn context() -> (WorkspaceContext, Arc<AccountState>) {
         remaining: Mutex::new(usize::MAX),
         retired: AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     (
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding).unwrap(),
         state,
@@ -275,8 +275,8 @@ fn empty_pool_tables_retire_copy_funding_after_unlock_and_preserve_live_rows() {
         pool: CacheResidencyPool,
         unlocked: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for PoolAccount {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for PoolAccount {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             self.account.reserve_metadata(bytes)
         }
     }
@@ -293,7 +293,7 @@ fn empty_pool_tables_retire_copy_funding_after_unlock_and_preserve_live_rows() {
             retired: AtomicBool::new(false),
         });
         let unlocked = Arc::new(AtomicBool::new(false));
-        let funding = WorkspaceMetadataFunding::new(PoolAccount {
+        let funding = HostMetadataFunding::new(PoolAccount {
             account: Account(account.clone()),
             pool: pool.clone(),
             unlocked: unlocked.clone(),

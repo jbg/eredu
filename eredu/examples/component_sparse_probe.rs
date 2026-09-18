@@ -2,15 +2,15 @@
 //! Pair with eredu-evaluation/scripts/component_sparse_reference.py.
 mod component_sparse_analysis;
 mod component_sparse_scores;
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    capture::*, component::*, execution_control::SnapshotLimits, intervention::*, parameters::*,
-    ArchitectureDescriptor, ExecutionPlan, GenerationConfigOverrides,
+    ArchitectureDescriptor, ExecutionPlan, GenerationConfigOverrides, capture::*, component::*,
+    execution_control::SnapshotLimits, intervention::*, parameters::*,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, ops::ControlFlow};
 
 fn dense_group<'a>(
@@ -144,25 +144,25 @@ fn parameter_selection<'a>(
 }
 
 fn record_step(
-    event: ObservedGenerationRecord,
+    event: ControlledGenerationRecord,
     paths: &BTreeMap<String, (String, &str)>,
     precision: &mut BTreeMap<String, eredu_core::checkpoint::TensorDtype>,
     steps: &mut BTreeMap<u64, Value>,
     measure_precision: bool,
 ) -> ControlFlow<()> {
-    if let ObservedGenerationEvent::Token {
+    if let Some(ObservedGenerationEvent::Token {
         prediction_index,
         token_id,
         forced,
         captures: Some(step),
         ..
-    } = event.event
+    }) = event.event.progress()
     {
         assert!(!forced);
-        let entry = steps.entry(prediction_index).or_insert_with(
+        let entry = steps.entry(*prediction_index).or_insert_with(
             || json!({"prediction":prediction_index,"token":token_id,"captures":{}}),
         );
-        for record in step.records {
+        for record in &step.records {
             if matches!(
                 record.outcome,
                 CaptureOutcome::Skipped {
@@ -173,11 +173,11 @@ fn record_step(
             }
             assert_eq!(record.outcome, CaptureOutcome::Captured, "{record:?}");
             if measure_precision {
-                if let Some(dtype) = record.source_dtype {
-                    precision.insert(record.path.clone(), dtype);
+                if let Some(dtype) = &record.source_dtype {
+                    precision.insert(record.path.clone(), dtype.clone());
                 }
             }
-            match record.payload {
+            match &record.payload {
                 Some(CapturePayload::Tensor(tensor)) => {
                     let eredu_core::TensorObservationData::F32(values) = tensor.data() else {
                         panic!("host float values")
@@ -662,15 +662,34 @@ fn main() -> anyhow::Result<()> {
             total_bytes: 128 << 20,
         }
     };
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .context("cancelled before source compilation")?;
+    let policy = ChatTemplateRequest {
         messages: vec![json!({"role":"user","content":"reference output contract"})],
         add_generation_prompt: true,
         ..Default::default()
-    })?;
+    };
+    let chat = model
+        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(0.),
             max_new_tokens: Some(4),
+            ..Default::default()
+        },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
             ..Default::default()
         },
         seed: 17,
@@ -770,16 +789,13 @@ fn main() -> anyhow::Result<()> {
             schema_version: INTERVENTION_SCHEMA_VERSION,
             operations,
         };
-        let prepared = model.prepare_intervened_token_ids(
-            &chat,
-            prefix.clone(),
-            settings,
-            capture.clone(),
-            intervention.clone(),
-            trace,
-        )?;
+        let mut request = PreparedChatRequest::new(&chat, settings);
+        request.input = PreparedChatPrompt::TokenIds(&prefix);
+        request.output_mode = PreparedChatOutputMode::Text;
+        request.capture = Some(&capture);
+        request.intervention = Some(&intervention);
         let mut steps = BTreeMap::<u64, Value>::new();
-        model.generate_observed_text(prepared, &[], Default::default(), |event| {
+        let mut collect = |event| {
             record_step(
                 event,
                 &paths,
@@ -787,7 +803,12 @@ fn main() -> anyhow::Result<()> {
                 &mut steps,
                 trial == "baseline",
             )
-        })?;
+        };
+        let mut run = model
+            .start_controlled_chat(request, trace, Default::default(), &mut collect)?
+            .context("cancelled before sparse reference trial")?;
+        run.run(&mut collect)?;
+        drop(run);
         output["trials"][trial] = json!(steps.into_values().collect::<Vec<_>>());
         if score_mode {
             let mut reports = vec![];
@@ -836,19 +857,17 @@ fn main() -> anyhow::Result<()> {
         )?;
         if args.iter().skip(3).any(|arg| arg == "controlled") {
             model.reset()?;
-            let prepared = model.prepare_intervened_token_ids(
-                &chat,
-                prefix.clone(),
-                settings,
-                capture.clone(),
-                intervention,
-                trace,
-            )?;
+            let mut request = PreparedChatRequest::new(&chat, settings);
+            request.input = PreparedChatPrompt::TokenIds(&prefix);
+            request.output_mode = PreparedChatOutputMode::Text;
+            request.capture = Some(&capture);
+            request.intervention = Some(&intervention);
             let mut steps = BTreeMap::new();
-            let mut run =
-                model.start_controlled_text(prepared, &[], Default::default(), |event| {
-                    record_step(event.generation, &paths, &mut precision, &mut steps, false)
-                })?;
+            let mut run = model
+                .start_controlled_chat(request, trace, Default::default(), |event| {
+                    record_step(event, &paths, &mut precision, &mut steps, false)
+                })?
+                .context("cancelled before controlled sparse trial")?;
             let child_trace = TraceLimits {
                 per_record_bytes: trace.per_record_bytes,
                 total_bytes: trace.total_bytes / 4,
@@ -861,24 +880,24 @@ fn main() -> anyhow::Result<()> {
                 .checked_mul(std::mem::size_of::<eredu_core::SemanticEvent>() as u64 + 1)
                 .and_then(|bytes| bytes.checked_add(1 << 30))
                 .context("snapshot reservation overflow")?;
-            run.enable_snapshots(SnapshotLimits {
-                max_snapshots: 2,
-                max_branches: 1,
-                retained_bytes: snapshot_retention,
-                cumulative_copy_bytes: 4 << 30,
-            })?;
+            run.enable_snapshots(
+                SnapshotLimits {
+                    max_snapshots: 2,
+                    max_branches: 1,
+                    retained_bytes: snapshot_retention,
+                    cumulative_copy_bytes: 4 << 30,
+                },
+                CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
+            )?;
             let initial = run
                 .snapshot(|_| ControlFlow::Continue(()))
                 .context("initial snapshot")?;
-            run.step(|event| {
-                record_step(event.generation, &paths, &mut precision, &mut steps, false)
-            })?;
+            run.step(|event| record_step(event, &paths, &mut precision, &mut steps, false))?;
             let cached = run
                 .snapshot(|_| ControlFlow::Continue(()))
                 .context("cached snapshot")?;
-            run.run(|event| {
-                record_step(event.generation, &paths, &mut precision, &mut steps, false)
-            })?;
+            run.run(|event| record_step(event, &paths, &mut precision, &mut steps, false))?;
             let expected = output["trials"][trial]
                 .as_array()
                 .context("ordinary evidence")?;
@@ -888,9 +907,7 @@ fn main() -> anyhow::Result<()> {
             );
             let mut replay = BTreeMap::new();
             run.restore(&cached, |_| ControlFlow::Continue(()))?;
-            run.run(|event| {
-                record_step(event.generation, &paths, &mut precision, &mut replay, false)
-            })?;
+            run.run(|event| record_step(event, &paths, &mut precision, &mut replay, false))?;
             ensure!(
                 replay.into_values().collect::<Vec<_>>() == expected[1..],
                 "cached replay {trial} differs"
@@ -909,15 +926,7 @@ fn main() -> anyhow::Result<()> {
                 .context("fork initial snapshot")?;
             run.exchange(&mut child, |_| ControlFlow::Continue(()))?;
             let mut sibling = BTreeMap::new();
-            run.run(|event| {
-                record_step(
-                    event.generation,
-                    &paths,
-                    &mut precision,
-                    &mut sibling,
-                    false,
-                )
-            })?;
+            run.run(|event| record_step(event, &paths, &mut precision, &mut sibling, false))?;
             ensure!(
                 sibling.into_values().collect::<Vec<_>>() == *expected,
                 "sibling {trial} differs"
@@ -925,9 +934,7 @@ fn main() -> anyhow::Result<()> {
             run.exchange(&mut child, |_| ControlFlow::Continue(()))?;
             run.restore(&cached, |_| ControlFlow::Continue(()))?;
             let mut parent = BTreeMap::new();
-            run.run(|event| {
-                record_step(event.generation, &paths, &mut precision, &mut parent, false)
-            })?;
+            run.run(|event| record_step(event, &paths, &mut precision, &mut parent, false))?;
             ensure!(
                 parent.into_values().collect::<Vec<_>>() == expected[1..],
                 "parent after sibling {trial} differs"

@@ -14,7 +14,7 @@ use derivre::raw::{
     ExprSetCopyFailure, ExprSetPreparedSourcePlan, HashConsCapacityError, HashConsCopyFailure,
     HashConsEmptySourcePlan, PreparedExprError, PreparedExprSet, PreparedExpressionFailure,
     PreparedExpressionMachine, PreparedExpressionOperationError, PreparedExpressionPlan,
-    PreparedHashConsFunding, PreparedRelevanceError, PreparedVecHashCons, PreparedWeightError,
+    ParserAllocationFunding, PreparedRelevanceError, PreparedVecHashCons, PreparedWeightError,
 };
 use std::{
     alloc::Layout,
@@ -194,7 +194,7 @@ impl fmt::Debug for PreparedRegexVector {
 fn allocation_bytes<T>(total: usize) -> Option<usize> {
     Some(Layout::array::<T>(total).ok()?.size())
 }
-fn grow<T, F: Fn(usize) -> Result<(), E>, E>(
+fn grow<T, F: crate::earley::PreparedFunding<Error = E>, E>(
     values: &mut Vec<T>,
     total: usize,
     reserve: &F,
@@ -203,7 +203,7 @@ fn grow<T, F: Fn(usize) -> Result<(), E>, E>(
         return Ok(());
     }
     let bytes = allocation_bytes::<T>(total).ok_or(Cause::Overflow)?;
-    reserve(bytes).map_err(Cause::Funding)?;
+    reserve.reserve(bytes).map_err(Cause::Funding)?;
     values
         .try_reserve_exact(total - values.len())
         .map_err(Cause::Allocation)?;
@@ -212,9 +212,9 @@ fn grow<T, F: Fn(usize) -> Result<(), E>, E>(
     }
     Ok(())
 }
-fn mask<F: Fn(usize) -> Result<(), E>, E>(bits: usize, reserve: &F) -> Result<LexemeSet, Cause<E>> {
+fn mask<F: crate::earley::PreparedFunding<Error = E>, E>(bits: usize, reserve: &F) -> Result<LexemeSet, Cause<E>> {
     let plan = TokenMaskConstructionPlan::zeroed(bits).map_err(Cause::MaskSource)?;
-    reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+    reserve.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
     Ok(LexemeSet {
         vob: plan.compile().map_err(Cause::Mask)?,
     })
@@ -224,18 +224,18 @@ struct Expressions<'a, F, E> {
     reserve: &'a F,
     marker: PhantomData<E>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> construction::Expressions for Expressions<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> construction::Expressions for Expressions<'_, F, E> {
     type Error = Cause<E>;
     fn source(&self) -> &ExprSet {
         self.machine.source()
     }
     fn non_empty(&mut self, root: ExprRef, fuel: u64) -> Result<bool, Self::Error> {
         self.machine
-            .is_non_empty(root, fuel, self.reserve)
+            .is_non_empty(root, fuel, &|bytes| self.reserve.reserve(bytes))
             .map_err(Cause::Relevance)
     }
     fn has_repeat(&mut self, root: ExprRef) -> Result<bool, Self::Error> {
-        (self.reserve)(
+        self.reserve.reserve(
             PreparedExpressionMachine::weight_operation_control_bytes().ok_or(Cause::Overflow)?,
         )
         .map_err(Cause::Funding)?;
@@ -248,7 +248,7 @@ struct Descriptor<'a, F, E> {
     reserve: &'a F,
     marker: PhantomData<E>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> descriptor::Context for Descriptor<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> descriptor::Context for Descriptor<'_, F, E> {
     type Error = Cause<E>;
     fn source(&self) -> &ExprSet {
         self.source
@@ -283,13 +283,13 @@ struct Advance<'a, F, E> {
     reserve: &'a F,
     marker: PhantomData<E>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> transition::Context for Advance<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> transition::Context for Advance<'_, F, E> {
     type Error = Cause<E>;
     fn cost(&self) -> u64 {
         self.machine.source().cost()
     }
     fn derivative(&mut self, root: ExprRef, byte: u8) -> Result<ExprRef, Self::Error> {
-        (self.reserve)(
+        self.reserve.reserve(
             PreparedExpressionMachine::operation_control_bytes().ok_or(Cause::Overflow)?,
         )
         .map_err(Cause::Funding)?;
@@ -299,7 +299,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> transition::Context for Advance<'_, F, E>
     }
     fn non_empty(&mut self, root: ExprRef, fuel: u64) -> Result<bool, Self::Error> {
         self.machine
-            .is_non_empty(root, fuel, self.reserve)
+            .is_non_empty(root, fuel, &|bytes| self.reserve.reserve(bytes))
             .map_err(Cause::Relevance)
     }
     fn is_fuel(error: &Self::Error) -> bool {
@@ -315,7 +315,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> transition::Context for Advance<'_, F, E>
         Ok(())
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> subsumption::Context for Advance<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> subsumption::Context for Advance<'_, F, E> {
     type Error = Cause<E>;
     fn cost(&self) -> u64 {
         self.machine.source().cost()
@@ -328,7 +328,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> subsumption::Context for Advance<'_, F, E
         cache_failures: bool,
     ) -> Result<bool, Self::Error> {
         self.machine
-            .is_contained_in_prefixes(small, big, fuel, cache_failures, self.reserve)
+            .is_contained_in_prefixes(small, big, fuel, cache_failures, &|bytes| self.reserve.reserve(bytes))
             .map_err(Cause::Relevance)
     }
     fn recover_refusal(error: Self::Error) -> Result<bool, Self::Error> {
@@ -364,8 +364,8 @@ impl PreparedRegexVector {
             size_of::<LexemeSet>(),
             size_of::<MatchingLexemes>() * 3,
             size_of::<PendingState>(),
-            size_of::<Option<PreparedHashConsFunding>>(),
-            size_of::<PreparedHashConsFunding>(),
+            size_of::<Option<ParserAllocationFunding>>(),
+            size_of::<ParserAllocationFunding>(),
             size_of::<Result<(), PreparedExprError>>(),
             size_of::<descriptor::Selection>(),
             size_of::<Expressions<'_, F, E>>(),
@@ -408,7 +408,7 @@ impl PreparedRegexVector {
     }
     /// Consumes actual compiled lexical input and the same caller-selected
     /// limits. Every allocated destination is reserved before construction.
-    pub fn prepare<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn prepare<F: crate::earley::PreparedFunding<Error = E>, E>(
         input: RegexVectorInput,
         limits: &mut ParserLimits,
         reserve: &F,
@@ -418,10 +418,10 @@ impl PreparedRegexVector {
     /// Same source constructor, with a separately paid actual backing owner.
     /// It permits reached word/scratch allocations, never unchecked entry-table
     /// growth, an ordinary source alias, or lexer/parser admission.
-    pub fn prepare_with_backing<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn prepare_with_backing<F: crate::earley::PreparedFunding<Error = E>, E>(
         input: RegexVectorInput,
         limits: &mut ParserLimits,
-        backing: Option<PreparedHashConsFunding>,
+        backing: Option<ParserAllocationFunding>,
         reserve: &F,
     ) -> Result<Self, PreparedRegexVectorError<E>> {
         let mut owner = Self {
@@ -443,7 +443,7 @@ impl PreparedRegexVector {
             input,
         };
         let result = (|| -> Result<(), ConstructionCause<E>> {
-            reserve(Self::construction_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
+            reserve.reserve(Self::construction_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
                 .map_err(Cause::Funding)?;
             limits
                 .validate_lexer_state_limit()
@@ -463,7 +463,7 @@ impl PreparedRegexVector {
                 .expressions
                 .prepared_source_plan()
                 .map_err(ConstructionCause::Expressions)?;
-            reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+            reserve.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
             owner.prepared = Some(plan.compile().map_err(ConstructionCause::Expressions)?);
             if let Some(funding) = &backing {
                 owner
@@ -477,7 +477,7 @@ impl PreparedRegexVector {
                 PreparedExpressionPlan::prepare(owner.prepared.take().expect("prepared source"))
                     .map_err(ConstructionCause::Machine)?,
             );
-            reserve(
+            reserve.reserve(
                 owner
                     .plan
                     .as_ref()
@@ -524,7 +524,7 @@ impl PreparedRegexVector {
                 .expressions
                 .empty_table_source_plan(width)
                 .map_err(ConstructionCause::TableSource)?;
-            reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+            reserve.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
             owner.table = Some(plan.compile().map_err(ConstructionCause::TableSource)?);
             if let Some(funding) = &backing {
                 owner
@@ -584,7 +584,7 @@ impl PreparedRegexVector {
             }),
         }
     }
-    fn finish_descriptor<F: Fn(usize) -> Result<(), E>, E>(
+    fn finish_descriptor<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         words: &[u32],
         reserve: &F,
@@ -612,7 +612,10 @@ impl PreparedRegexVector {
     /// any operation walks selected roots or touches its paid destinations.
     pub fn state_operation_control_bytes<F, E>() -> Option<usize> {
         let parts = [
-            size_of::<Self>(),
+            // State operations retain the vector in place. Its owned machine,
+            // source and table controls were paid by prepare, not moved onto
+            // every transition's stack.
+            size_of::<&mut Self>(),
             size_of::<PreparedRegexVectorOperationError<E>>(),
             size_of::<Cause<E>>(),
             size_of::<PendingState>(),
@@ -650,7 +653,7 @@ impl PreparedRegexVector {
     }
     /// Builds the actual selected-root DFA state under paid candidate/descriptor
     /// storage. Existing intern hits keep their state ID and lowest-match bit.
-    pub fn initial_state<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn initial_state<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         selected: &LexemeSet,
         reserve: &F,
@@ -662,8 +665,8 @@ impl PreparedRegexVector {
         }
         self.failed = true;
         let result = (|| -> Result<StateID, Cause<E>> {
-            reserve(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
-                .map_err(Cause::Funding)?;
+            let _frame = reserve.frame(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
+                .map_err(Cause::frame)?;
             if selected.len() != self.input.roots.len() || self.pending.is_some() {
                 return Err(Cause::Source);
             }
@@ -693,7 +696,7 @@ impl PreparedRegexVector {
             Err(cause) => Err(PreparedRegexVectorOperationError { cause }),
         }
     }
-    fn publish_candidate<F: Fn(usize) -> Result<(), E>, E>(
+    fn publish_candidate<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         reserve: &F,
     ) -> Result<StateID, Cause<E>> {
@@ -779,7 +782,7 @@ impl PreparedRegexVector {
     }
     /// Computes one real DFA edge with the same derivative/relevance ordering.
     /// A refusal retains the source, candidate and any completed publication.
-    pub fn transition<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn transition<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         byte: u8,
@@ -792,8 +795,8 @@ impl PreparedRegexVector {
         }
         self.failed = true;
         let result = (|| -> Result<StateID, Cause<E>> {
-            reserve(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
-                .map_err(Cause::Funding)?;
+            let _frame = reserve.frame(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
+                .map_err(Cause::frame)?;
             if state.as_u32() == StateID::MISSING.as_u32()
                 || state.as_usize() >= self.states.len()
                 || self.pending.is_some()
@@ -867,7 +870,7 @@ impl PreparedRegexVector {
     }
     /// Uses the ordinary budget/cache-failure selection and containment worker.
     /// Fuel alone is recoverable; funding/source/equation failures are terminal.
-    pub fn check_subsume<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn check_subsume<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         lexeme: LexemeIdx,
@@ -881,8 +884,8 @@ impl PreparedRegexVector {
         }
         self.failed = true;
         let result = (|| -> Result<bool, Cause<E>> {
-            reserve(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
-                .map_err(Cause::Funding)?;
+            let _frame = reserve.frame(Self::state_operation_control_bytes::<F, E>().ok_or(Cause::Overflow)?)
+                .map_err(Cause::frame)?;
             if !self.subsume_geometry(state) || self.pending.is_some() {
                 return Err(Cause::Source);
             }
@@ -921,7 +924,7 @@ impl PreparedRegexVector {
         run: G,
     ) -> Result<T, PreparedRegexVectorOperationError<E>>
     where
-        F: Fn(usize) -> Result<(), E>,
+        F: crate::earley::PreparedFunding<Error = E>,
         G: FnOnce(&mut Self, &F) -> Result<T, Cause<E>>,
     {
         if self.failed {
@@ -938,13 +941,13 @@ impl PreparedRegexVector {
                 size_of::<Result<T, PreparedRegexVectorOperationError<E>>>(),
                 size_of::<(&mut Self, &F)>(),
             ];
-            reserve(
+            let _frame = reserve.frame(
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
                     .ok_or(Cause::Overflow)?,
             )
-            .map_err(Cause::Funding)?;
+            .map_err(Cause::frame)?;
             run(self, reserve)
         })();
         match result {
@@ -962,7 +965,7 @@ impl PreparedRegexVector {
         .then_some(state.as_usize())
     }
     /// Same cached maximal hidden/lookahead length over actual state expressions.
-    pub fn possible_lookahead_len<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn possible_lookahead_len<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -985,7 +988,7 @@ impl PreparedRegexVector {
         })
     }
     /// Same first accepting lookahead length, retaining the ordinary optional cache.
-    pub fn lookahead_len_for_state<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn lookahead_len_for_state<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -1013,7 +1016,7 @@ impl PreparedRegexVector {
         })
     }
     /// Same next-byte approximation, with paid reached expression-cache slots.
-    pub fn next_byte<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn next_byte<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -1042,7 +1045,7 @@ impl PreparedRegexVector {
     }
     /// Same actual state subset, published through the shared fixed intern and
     /// descriptor path; no caller-provided row or root replaces the source.
-    pub fn limit_state_to<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn limit_state_to<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         allowed: &LexemeSet,
@@ -1079,7 +1082,7 @@ impl PreparedRegexVector {
         })
     }
     /// Same source-qualified weight used by the existing large-lexeme precompute policy.
-    pub fn lexeme_weight<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn lexeme_weight<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         lexeme: LexemeIdx,
         reserve: &F,
@@ -1090,7 +1093,7 @@ impl PreparedRegexVector {
                 .roots
                 .get(lexeme.as_usize())
                 .ok_or(Cause::Source)?;
-            reserve(
+            reserve.reserve(
                 PreparedExpressionMachine::weight_operation_control_bytes()
                     .ok_or(Cause::Overflow)?,
             )
@@ -1129,6 +1132,7 @@ impl PreparedRegexVector {
 
 #[cfg(test)]
 mod tests {
+    use crate::earley::PreparedFunding;
     use super::*;
     use crate::earley::{
         lexerspec::LexerRootSource,
@@ -1137,7 +1141,7 @@ mod tests {
     use derivre::RegexBuilder;
     use std::cell::Cell;
     fn input() -> RegexVectorInput {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let mut rows = Vec::new();
         for (pattern, lazy) in [
             ("[ab]{0,2}", false),
@@ -1198,7 +1202,7 @@ mod tests {
         let mut limits = ParserLimits::default();
         let mut expected_limits = limits.clone();
         let mut ordinary = RegexVec::new_with_input(input(), &mut expected_limits).unwrap();
-        let mut prepared = PreparedRegexVector::prepare(input(), &mut limits, &reserve).unwrap();
+        let mut prepared = PreparedRegexVector::prepare_with_backing(input(), &mut limits, Some(ParserAllocationFunding::unenforced()), &reserve).unwrap();
         let constructor_calls = calls.get();
         assert_eq!(
             limits.initial_lexer_fuel,
@@ -1261,7 +1265,7 @@ mod tests {
         );
         assert_eq!(
             prepared.lexeme_weight(LexemeIdx::new(0), &reserve).unwrap(),
-            ordinary.lexeme_weight(LexemeIdx::new(0))
+            ordinary.lexeme_weight(LexemeIdx::new(0)).unwrap()
         );
         let selected = selection(prepared.roots().len(), &[0]);
         let mut state = prepared.initial_state(&selected, &reserve).unwrap();
@@ -1322,7 +1326,7 @@ mod tests {
                 if calls.get() == fail_at {
                     Err("constructor destination")
                 } else {
-                    reserve(bytes)
+                    reserve.reserve(bytes)
                 }
             };
             let failure =
@@ -1349,7 +1353,7 @@ mod tests {
             if calls.get() == 5 {
                 Err("descriptor destination")
             } else {
-                reserve(bytes)
+                reserve.reserve(bytes)
             }
         };
         let failure = failed.initial_state(&selected, &reject).unwrap_err();
@@ -1366,8 +1370,7 @@ mod tests {
             Cause::Failed
         ));
         assert_eq!(spent.get(), before);
-        let mut exhausted =
-            PreparedRegexVector::prepare(input(), &mut ParserLimits::default(), &reserve).unwrap();
+        let mut exhausted = PreparedRegexVector::prepare_with_backing(input(), &mut ParserLimits::default(), Some(ParserAllocationFunding::unenforced()), &reserve).unwrap();
         let selected = selection(exhausted.roots().len(), &[0]);
         let start = exhausted.initial_state(&selected, &reserve).unwrap();
         exhausted.set_fuel(0);
@@ -1391,4 +1394,8 @@ mod tests {
         assert!(failed.expressions().is_valid(failed.roots()[0]));
         assert!(!prepared.failed);
     }
+}
+
+impl<E> Cause<E> {
+ fn frame(error: crate::earley::FrameError<E>) -> Self { match error { crate::earley::FrameError::Overflow => Self::Overflow, crate::earley::FrameError::Funding(error) => Self::Funding(error) } }
 }

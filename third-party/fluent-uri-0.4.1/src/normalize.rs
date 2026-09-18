@@ -1,6 +1,7 @@
 //! Module for normalization.
 
 use crate::{
+    allocation::{Allocation, AllocationError, Buffer, Unenforced},
     component::Scheme,
     imp::{HostMeta, Meta, RiMaybeRef, RmrRef},
     parse,
@@ -13,23 +14,29 @@ use crate::{
 };
 use alloc::string::String;
 use borrow_or_share::Bos;
-use core::{
-    fmt::{self, Write},
-    num::NonZeroUsize,
-};
+use core::{fmt, num::NonZeroUsize};
 
 /// An error occurred when normalizing a URI/IRI (reference).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NormalizeError {
+    /// A prospective storage request failed.
+    Allocation(AllocationError),
     /// An underflow occurred in path normalization.
     ///
     /// Used only when [`Normalizer::allow_path_underflow`] is set to `false`.
     PathUnderflow,
 }
 
+impl From<AllocationError> for NormalizeError {
+    fn from(error: AllocationError) -> Self {
+        Self::Allocation(error)
+    }
+}
+
 impl fmt::Display for NormalizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
+            Self::Allocation(error) => return error.fmt(f),
             Self::PathUnderflow => "underflow occurred in path resolution",
         };
         f.write_str(msg)
@@ -121,11 +128,24 @@ impl Normalizer {
     where
         R::Val: Bos<str>,
     {
+        self.normalize_with_allocations(r, &Unenforced)
+    }
+
+    /// Normalizes through the same worker, admitting storage before each allocation.
+    pub fn normalize_with_allocations<R: RiMaybeRef>(
+        &self,
+        r: &R,
+        allocation: &dyn Allocation,
+    ) -> Result<R::WithVal<String>, NormalizeError>
+    where
+        R::Val: Bos<str>,
+    {
         normalize(
             r.make_ref(),
             R::CONSTRAINTS.ascii_only,
             self.allow_path_underflow,
             self.default_port_f,
+            allocation,
         )
         .map(RiMaybeRef::from_pair)
     }
@@ -142,13 +162,13 @@ pub(crate) fn normalize(
     ascii_only: bool,
     allow_path_underflow: bool,
     default_port_f: fn(&Scheme) -> Option<u16>,
+    allocation: &dyn Allocation,
 ) -> Result<(String, Meta), NormalizeError> {
-    // For "a://[::ffff:5:9]/" the capacity is not enough,
-    // but it's fine since this rarely happens.
-    let mut buf = String::with_capacity(r.as_str().len());
+    // IPv6 formatting can exceed the input length; Buffer admits that growth too.
+    let mut buf = Buffer::new(r.as_str().len(), allocation)?;
 
     let path = r.path().as_str();
-    let mut path_buf = String::with_capacity(path.len());
+    let mut path_buf = Buffer::new(path.len(), allocation)?;
 
     let data_table = if ascii_only {
         Data::TABLE
@@ -157,9 +177,9 @@ pub(crate) fn normalize(
     };
 
     if r.has_scheme() && path.starts_with('/') {
-        normalize_estr(&mut buf, path, false, data_table);
+        normalize_estr(&mut buf, path, false, data_table)?;
 
-        let underflow_occurred = resolve::remove_dot_segments(&mut path_buf, 0, &[&buf]);
+        let underflow_occurred = resolve::remove_dot_segments(&mut path_buf, 0, &[&buf])?;
         if underflow_occurred && !allow_path_underflow {
             return Err(NormalizeError::PathUnderflow);
         }
@@ -167,49 +187,49 @@ pub(crate) fn normalize(
         buf.clear();
     } else {
         // Don't remove dot segments from relative reference or rootless path.
-        normalize_estr(&mut path_buf, path, false, data_table);
+        normalize_estr(&mut path_buf, path, false, data_table)?;
     }
 
     let mut meta = Meta::default();
 
     if let Some(scheme) = r.scheme_opt() {
-        buf.push_str(scheme.as_str());
+        buf.push_str(scheme.as_str())?;
         buf.make_ascii_lowercase();
         meta.scheme_end = NonZeroUsize::new(buf.len());
-        buf.push(':');
+        buf.push(':')?;
     }
 
     if let Some(auth) = r.authority() {
-        buf.push_str("//");
+        buf.push_str("//")?;
 
         if let Some(userinfo) = auth.userinfo() {
-            normalize_estr(&mut buf, userinfo.as_str(), false, data_table);
-            buf.push('@');
+            normalize_estr(&mut buf, userinfo.as_str(), false, data_table)?;
+            buf.push('@')?;
         }
 
         let mut auth_meta = auth.meta();
         auth_meta.host_bounds.0 = buf.len();
         match auth_meta.host_meta {
             // An IPv4 address is always canonical.
-            HostMeta::Ipv4(..) => buf.push_str(auth.host()),
+            HostMeta::Ipv4(..) => buf.push_str(auth.host())?,
             #[cfg(feature = "net")]
-            HostMeta::Ipv6(addr) => write!(buf, "[{addr}]").unwrap(),
+            HostMeta::Ipv6(addr) => write!(buf, "[{addr}]")?,
             #[cfg(not(feature = "net"))]
             HostMeta::Ipv6() => {
-                buf.push('[');
-                write_v6(&mut buf, parse::parse_v6(&auth.host().as_bytes()[1..]));
-                buf.push(']');
+                buf.push('[')?;
+                write_v6(&mut buf, parse::parse_v6(&auth.host().as_bytes()[1..]))?;
+                buf.push(']')?;
             }
             HostMeta::IpvFuture => {
                 let start = buf.len();
-                buf.push_str(auth.host());
+                buf.push_str(auth.host())?;
 
                 buf[start..].make_ascii_lowercase();
             }
             HostMeta::RegName => {
                 let start = buf.len();
                 let host = auth.host();
-                normalize_estr(&mut buf, host, true, data_table);
+                normalize_estr(&mut buf, host, true, data_table)?;
 
                 if buf.len() < start + host.len() {
                     // Only reparse when the length is less than before.
@@ -229,8 +249,8 @@ pub(crate) fn normalize(
                     }
                 }
                 if !eq_default {
-                    buf.push(':');
-                    buf.push_str(port.as_str());
+                    buf.push(':')?;
+                    buf.push_str(port.as_str())?;
                 }
             }
         }
@@ -239,63 +259,78 @@ pub(crate) fn normalize(
     meta.path_bounds.0 = buf.len();
     // Make sure that the output is a valid URI/IRI reference.
     if r.has_scheme() && !r.has_authority() && path_buf.starts_with("//") {
-        buf.push_str("/.");
+        buf.push_str("/.")?;
     }
-    buf.push_str(&path_buf);
+    buf.push_str(&path_buf)?;
     meta.path_bounds.1 = buf.len();
 
     if let Some(query) = r.query() {
-        buf.push('?');
+        buf.push('?')?;
 
         const IQUERY_DATA: &Table = &IData::TABLE.or_iprivate();
         let query_data_table = if ascii_only { Data::TABLE } else { IQUERY_DATA };
 
-        normalize_estr(&mut buf, query.as_str(), false, query_data_table);
+        normalize_estr(&mut buf, query.as_str(), false, query_data_table)?;
         meta.query_end = NonZeroUsize::new(buf.len());
     }
 
     if let Some(fragment) = r.fragment() {
-        buf.push('#');
-        normalize_estr(&mut buf, fragment.as_str(), false, data_table);
+        buf.push('#')?;
+        normalize_estr(&mut buf, fragment.as_str(), false, data_table)?;
     }
 
-    Ok((buf, meta))
+    Ok((buf.finish(), meta))
 }
 
-fn normalize_estr(buf: &mut String, s: &str, to_ascii_lowercase: bool, table: &Table) {
+fn normalize_estr(
+    buf: &mut Buffer<'_>,
+    s: &str,
+    to_ascii_lowercase: bool,
+    table: &Table,
+) -> Result<(), AllocationError> {
     if table.allows_non_ascii() {
-        Decode::new(s).decode_utf8(|chunk| match chunk {
-            DecodedUtf8Chunk::Unencoded(s) => {
-                let i = buf.len();
-                buf.push_str(s);
-                if to_ascii_lowercase {
-                    buf[i..].make_ascii_lowercase();
-                }
+        let mut outcome = Ok(());
+        Decode::new(s).decode_utf8(|chunk| {
+            if outcome.is_err() {
+                return;
             }
-            DecodedUtf8Chunk::Decoded { valid, invalid } => {
-                for chunk in Encode::new(table, valid) {
-                    match chunk {
-                        EncodedChunk::Unencoded(s) => {
-                            let i = buf.len();
-                            buf.push_str(s);
-                            if to_ascii_lowercase {
-                                buf[i..].make_ascii_lowercase();
+            outcome = (|| {
+                match chunk {
+                    DecodedUtf8Chunk::Unencoded(s) => {
+                        let i = buf.len();
+                        buf.push_str(s)?;
+                        if to_ascii_lowercase {
+                            buf[i..].make_ascii_lowercase();
+                        }
+                    }
+                    DecodedUtf8Chunk::Decoded { valid, invalid } => {
+                        for chunk in Encode::new(table, valid) {
+                            match chunk {
+                                EncodedChunk::Unencoded(s) => {
+                                    let i = buf.len();
+                                    buf.push_str(s)?;
+                                    if to_ascii_lowercase {
+                                        buf[i..].make_ascii_lowercase();
+                                    }
+                                }
+                                EncodedChunk::PctEncoded(s) => buf.push_str(s)?,
                             }
                         }
-                        EncodedChunk::PctEncoded(s) => buf.push_str(s),
+                        for &x in invalid {
+                            buf.push_str(pct_enc::encode_byte(x))?;
+                        }
                     }
                 }
-                for &x in invalid {
-                    buf.push_str(pct_enc::encode_byte(x));
-                }
-            }
+                Ok(())
+            })();
         });
+        outcome?;
     } else {
         for chunk in Decode::new(s) {
             match chunk {
                 DecodedChunk::Unencoded(s) => {
                     let i = buf.len();
-                    buf.push_str(s);
+                    buf.push_str(s)?;
                     if to_ascii_lowercase {
                         buf[i..].make_ascii_lowercase();
                     }
@@ -305,23 +340,24 @@ fn normalize_estr(buf: &mut String, s: &str, to_ascii_lowercase: bool, table: &T
                         if to_ascii_lowercase {
                             x.make_ascii_lowercase();
                         }
-                        buf.push(x as char);
+                        buf.push(x as char)?;
                     } else {
-                        buf.push_str(pct_enc::encode_byte(x));
+                        buf.push_str(pct_enc::encode_byte(x))?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 // Taken from `impl Display for Ipv6Addr`.
 #[cfg(not(feature = "net"))]
-fn write_v6(buf: &mut String, segments: [u16; 8]) {
+fn write_v6(buf: &mut Buffer<'_>, segments: [u16; 8]) -> Result<(), AllocationError> {
     if let [0, 0, 0, 0, 0, 0xffff, ab, cd] = segments {
         let [a, b] = ab.to_be_bytes();
         let [c, d] = cd.to_be_bytes();
-        write!(buf, "::ffff:{a}.{b}.{c}.{d}").unwrap();
+        write!(buf, "::ffff:{a}.{b}.{c}.{d}")?;
     } else {
         #[derive(Copy, Clone, Default)]
         struct Span {
@@ -355,21 +391,23 @@ fn write_v6(buf: &mut String, segments: [u16; 8]) {
 
         /// Write a colon-separated part of the address
         #[inline]
-        fn write_subslice(buf: &mut String, chunk: &[u16]) {
+        fn write_subslice(buf: &mut Buffer<'_>, chunk: &[u16]) -> Result<(), AllocationError> {
             if let Some((first, tail)) = chunk.split_first() {
-                write!(buf, "{first:x}").unwrap();
+                write!(buf, "{first:x}")?;
                 for segment in tail {
-                    write!(buf, ":{segment:x}").unwrap();
+                    write!(buf, ":{segment:x}")?;
                 }
             }
+            Ok(())
         }
 
         if zeroes.len > 1 {
-            write_subslice(buf, &segments[..zeroes.start]);
-            buf.push_str("::");
-            write_subslice(buf, &segments[zeroes.start + zeroes.len..]);
+            write_subslice(buf, &segments[..zeroes.start])?;
+            buf.push_str("::")?;
+            write_subslice(buf, &segments[zeroes.start + zeroes.len..])?;
         } else {
-            write_subslice(buf, &segments);
+            write_subslice(buf, &segments)?;
         }
     }
+    Ok(())
 }

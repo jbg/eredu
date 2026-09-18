@@ -27,6 +27,10 @@ pub(super) use observed::quote_completed_input;
 #[cfg(test)]
 pub(super) use original_prepared::take_original_cold_facts;
 mod prediction;
+mod sampling_revision;
+mod control;
+mod branch;
+pub(in crate::composition::mlx::session::model_session) use branch::exchange as exchange_branch;
 mod preparation;
 pub(crate) fn prediction_scope_facts()
 -> Result<eredu_runtime::working_memory::TextPredictionScopeFacts, Error> {
@@ -139,6 +143,7 @@ pub(in crate::composition::mlx::session) struct TextExecutionQuote {
     prefill_scopes: Option<RefCell<eredu_runtime::working_memory::OriginalTextPrefillScopes>>,
     record_quota: Option<safemlx::SubmissionRecordQuota>,
     graph_quota: Option<safemlx::SubmissionGraphQuota>,
+    sampling_revision: RefCell<Option<sampling_revision::SamplingRevisionOwner>>,
     native_recipe: Option<crate::backend::nn::workspace::ResidentNativeRecipe>,
     native_storage: Option<crate::backend::runtime::residency::storage::native_storage::BankOwner>,
     parallel_control: Option<crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlOwner>,
@@ -159,7 +164,7 @@ pub(in crate::composition::mlx::session) struct TextExecutionQuote {
     // Last: the source token retires before its historical generation Q.
     original_table: Option<original_table::Owned>,
     // The cold quote and any shared plan aliases retain their own host account.
-    planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl TextExecutionQuote {
@@ -248,6 +253,15 @@ impl TextExecutionQuote {
         )
     }
 
+    pub(super) fn activate_operation_bank(
+        &self,
+        step: &eredu_runtime::working_memory::InferenceTextStep,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::OriginalOperationActivation>, Error> {
+        self.request.validate_same_request(step.request()).map_err(memory)?;
+        self.operation_banks.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?
+            .as_ref().map(|bank| bank.activate()).transpose()
+    }
+
     pub(super) fn model_execution_preparation(
         &self,
         step: &eredu_runtime::working_memory::InferenceTextStep,
@@ -298,11 +312,10 @@ impl TextExecutionQuote {
         self.request
             .validate_same_request(step.request())
             .map_err(Error::PrefillControl)?;
-        let sampling = self
-            .native_recipe
-            .as_ref()
-            .map(|recipe| recipe.completion_for_sampling_step(step))
-            .transpose()?;
+        let revision = self.sampling_revision.try_borrow().map_err(|_| Error::PredictionScopeReentrant)?;
+        let sampling = if revision.is_some() { None } else {
+            self.native_recipe.as_ref().map(|recipe| recipe.completion_for_sampling_step(step)).transpose()?
+        };
         let paged = self
             .paged_sources
             .try_borrow()
@@ -315,10 +328,13 @@ impl TextExecutionQuote {
                 let set = bank.claim(step)?;
                 let source = self.parallel_control.as_ref()
                     .map(|owner| owner.sampling_source(step)).transpose()?;
-                Ok::<_, Error>(set.with_operations(self.operation_registration.clone(), step.request().clone())
+                let set = set.with_operations(self.operation_registration.clone(), step.request().clone())
                     .with_sampling(sampling)
-                    .with_sampling_source(source)
-                    .with_paged_sources(paged, step.attempt()))
+                    .with_paged_sources(paged, step.attempt());
+                match revision.as_ref() {
+                    Some(revision) => set.with_sampling_replacement(revision.claim(step, source)?).map_err(memory),
+                    None => Ok(set.with_sampling_source(source)),
+                }
             })
             .transpose()
     }
@@ -478,6 +494,11 @@ impl TextExecutionQuote {
                 projection,
             ))
         })
+    }
+
+    pub(in crate::composition::mlx::session) fn saved_sampling_input(&self)
+        -> Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan> {
+        self.native_recipe.as_ref()?.sampling_program().input()
     }
 
     pub(in crate::composition::mlx::session) fn has_capture(&self) -> bool {
@@ -702,6 +723,10 @@ impl TextExecutionQuote {
     }
     pub(in crate::composition::mlx::session) fn config(&self) -> TextGenerationConfig {
         self.config
+    }
+
+    pub(super) fn parameter_epoch(&self) -> u64 {
+        self.parameter_epoch
     }
 
     pub(in crate::composition::mlx::session) fn contract(&self) -> &TextControllerContract {
@@ -1034,6 +1059,7 @@ fn admit_inner<C: TokenFilterController>(
     intervention_source: Option<&eredu_core::intervention::SharedInterventionPlan>,
 ) -> Result<(InferenceTextPreparation, TextExecutionQuoteOwner), AdmissionFailure> {
     let mut planning_metadata = None;
+    let mut capture_metadata = None;
     let result: Result<_, AdmissionFailure> = (|| {
         // Token and authenticated media inputs use the same original row
         // owner. Legacy entries have no matching native source installation.
@@ -1227,12 +1253,26 @@ fn admit_inner<C: TokenFilterController>(
             return Err(unknown().into());
         }
         model.erased().validate_text_frontier(cached_positions)?;
+        if original_native && capture_source.is_some() {
+            // A precompiled declaration does not run the raw declaration hook.
+            // Qualify the same retained source here before either input form
+            // revalidates it or a cold candidate borrows its partition layouts.
+            let funding = session.payload.memory_pool.prepare_workspace_metadata(
+                model.erased().inference_execution_identity(), capacity,
+            ).map_err(Error::WorkspacePlanning)?;
+            capture_metadata = Some(funding);
+            session.original_partition_capture(capture_metadata.as_ref().expect("created account"))?;
+        }
+        let capture_destination = capture_metadata.as_ref().map_or(
+            eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+            eredu_runtime::working_memory::WorkspaceReportMetadata::with_funding,
+        );
         let capture = capture_source
             .map(|source| {
                 let prepared = if matches!(input, TextPreparationInput::OriginalPrepared(_)) {
-                    CaptureAdmission::new_media(session, geometry, source)
+                    CaptureAdmission::new_media(session, geometry, source, capture_destination)
                 } else {
-                    CaptureAdmission::new(session, geometry, source)
+                    CaptureAdmission::new(session, geometry, source, capture_destination)
                 };
                 prepared.and_then(|capture| {
                     let capture = if let Some(interventions) = intervention_source {
@@ -1265,6 +1305,7 @@ fn admit_inner<C: TokenFilterController>(
                 .inference_storage()
                 .original_token_domain()
                 .is_none()
+            && !matches!(controller.inference_storage(), eredu_core::TextControllerStorage::RunOwnedWithPreparedSemantic { .. })
             && !controller
                 .inference_storage()
                 .shared_sources()
@@ -1278,6 +1319,7 @@ fn admit_inner<C: TokenFilterController>(
             .inference_storage()
             .original_token_domain()
             .is_some()
+            || matches!(controller.inference_storage(), eredu_core::TextControllerStorage::RunOwnedWithPreparedSemantic { .. })
         {
             let claim = sequence_claim.ok_or_else(|| {
                 AdmissionFailure::Sequence(
@@ -1289,6 +1331,7 @@ fn admit_inner<C: TokenFilterController>(
                 controller,
                 workspace,
                 runtime.backend().memory_pool(),
+                model.erased().inference_execution_identity(),
                 claim,
             )
             .map_err(AdmissionFailure::Sequence)?
@@ -1355,7 +1398,7 @@ fn admit_inner<C: TokenFilterController>(
         // candidate subsequently borrows its unchanged original descriptor only.
         let mut decoder_source = sequence_claim
         .map(|claim| {
-            eredu_runtime::working_memory::OriginalGenerationDecoderSource::take_original_for_pool(
+            eredu_runtime::working_memory::OriginalGenerationDecoderSource::take_original(
                 claim,
                 runtime.backend().memory_pool(),
             )
@@ -1464,7 +1507,7 @@ fn admit_inner<C: TokenFilterController>(
         }
         .install(runtime, controller, decoder_staging)
     })();
-    result.map_err(|cause| match (cause, planning_metadata) {
+    result.map_err(|cause| match (cause, planning_metadata.or(capture_metadata)) {
         (AdmissionFailure::Native(cause), Some(funding)) => AdmissionFailure::Native(
             crate::composition::mlx::model::retain_planning_error(cause, funding),
         ),
@@ -1564,15 +1607,9 @@ fn quote_incremental_with_sequence(
                     .ok_or_else(unknown)?
                     .selected();
                 let manifest = selected.communication_manifest().ok_or_else(unknown)?;
-                // Absence is the architecture's pure-PP neural policy. The
-                // retained source still needs exact publication/control resources.
-                let tensor_group = selected.execution().partitioned_tensor_group();
-                let agreement_group = selected.partitioned_session_group().ok_or_else(unknown)?;
-                let distributed = session
-                    .payload
-                    .distributed
-                    .as_ref()
-                    .expect("checked distributed source");
+                let capture_layouts = if capture.is_some() {
+                    Some(session.partition_capture_source().ok_or_else(unknown)?)
+                } else { None };
                 let funded = session
                     .payload
                     .model
@@ -1587,26 +1624,9 @@ fn quote_incremental_with_sequence(
                             .ok_or_else(unknown)?,
                         capture.map(CaptureAdmission::prepared_selection),
                         capture.and_then(CaptureAdmission::intervention_quote),
-                        if capture.is_some() {
-                            let loaded = session.partition_capture.get().and_then(|loaded| loaded.as_ref().ok())
-                                .ok_or_else(unknown)?;
-                            Some((loaded.layouts(), manifest.rank()))
-                        } else { None },
+                        capture_layouts.as_ref().map(|loaded| (loaded.layouts(), manifest.rank())),
                         retained_sources,
-                        |funding| {
-                            distributed
-                                .original_communication_owner(
-                                    manifest,
-                                    distributed.native_world(),
-                                    funding,
-                                )?
-                                .prepare_model_parallel_source(
-                                    tensor_group,
-                                    agreement_group,
-                                    selected.execution().partitioned_output_publication().ok_or_else(unknown)?,
-                                    &session.payload.memory_pool,
-                                )
-                        },
+                        |funding| session.original_workspace_parallel_source(funding)?.ok_or_else(unknown),
                     )?;
                 let (generation, storage, recipe, sources, context, funding) = funded.into_parts();
                 paged_sources = sources;
@@ -2074,3 +2094,5 @@ pub(super) fn record_tracking_admission(preparation: &MlxTextPreparation) -> boo
 ))]
 #[path = "text_quote/prefill_tests.rs"]
 mod prefill_tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

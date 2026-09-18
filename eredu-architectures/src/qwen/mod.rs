@@ -237,15 +237,19 @@ where
 
     fn append_component_prefill_observations(
         args: &ModelArgs, unit_path: &str, _layer: usize,
-        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
-    ) {
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(),Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&str,usize,&mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>)>()?;
+
         // Same selected Dense/Routed branch as this factory's FeedForward.
         // Sparse units retain the separately declared routed bank semantics.
         if !args.is_moe() {
             <Mlp<B> as crate::decoder::DecoderProjectionOperator<B>>::append_component_prefill_observations(
-                unit_path, declarations);
+                unit_path, declarations, metadata_context)?;
         }
-    }
+
+Ok(())
+}
 
     fn validate_with_metadata(
         _config: &ModelArgs,

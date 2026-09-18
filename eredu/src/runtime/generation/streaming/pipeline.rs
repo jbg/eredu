@@ -21,7 +21,10 @@ pub(super) trait CursorPipeline<S: CursorStorage> {
         reason: FinishReason,
         emit: &mut impl for<'a> FnMut(Self::Event<'a>),
     ) -> Result<(), CommittedTokenPipelineError<Self::DecoderError>>;
-    fn cancel(&mut self, emit: &mut impl for<'a> FnMut(Self::Event<'a>));
+    fn cancel(
+        &mut self,
+        emit: &mut impl for<'a> FnMut(Self::Event<'a>),
+    ) -> Result<(), CommittedTokenPipelineError<Self::DecoderError>>;
 }
 impl<S: CursorStorage, D: TokenDecoderBackend> CursorPipeline<S> for CommittedTokenPipeline<D> {
     type DecoderError = D::Error;
@@ -49,8 +52,12 @@ impl<S: CursorStorage, D: TokenDecoderBackend> CursorPipeline<S> for CommittedTo
             None => CommittedTokenPipeline::finish(self, reason, emit),
         }
     }
-    fn cancel(&mut self, emit: &mut impl for<'a> FnMut(Self::Event<'a>)) {
+    fn cancel(
+        &mut self,
+        emit: &mut impl for<'a> FnMut(Self::Event<'a>),
+    ) -> Result<(), CommittedTokenPipelineError<D::Error>> {
         CommittedTokenPipeline::cancel(self, emit);
+        Ok(())
     }
 }
 impl CursorPipeline<RetainedGenerationSequenceStorage> for GenerationPlainTextProjection {
@@ -90,9 +97,54 @@ impl CursorPipeline<RetainedGenerationSequenceStorage> for GenerationPlainTextPr
         }
         Ok(())
     }
-    fn cancel(&mut self, emit: &mut impl for<'a> FnMut(Self::Event<'a>)) {
+    fn cancel(
+        &mut self,
+        emit: &mut impl for<'a> FnMut(Self::Event<'a>),
+    ) -> Result<(), CommittedTokenPipelineError<GenerationDecoderError>> {
         for event in GenerationPlainTextProjection::cancel(self) {
             emit(event);
         }
+        Ok(())
+    }
+}
+
+impl<S: CursorStorage> CursorPipeline<S> for eredu_core::SemanticStateOwner {
+    type DecoderError = eredu_core::SpeculativeOutputError;
+    type Event<'a> = SemanticEvent;
+
+    fn push(
+        &mut self,
+        _sequence: &mut GenerationSequence<S>,
+        id: u32,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(bool, bool), CommittedTokenPipelineError<Self::DecoderError>> {
+        let matched = self
+            .push_token(id)
+            .map_err(CommittedTokenPipelineError::Decoder)?;
+        self.publish_events(emit);
+        Ok((matched, cancellation.is_cancelled()))
+    }
+
+    fn finish(
+        &mut self,
+        _sequence: &mut GenerationSequence<S>,
+        reason: FinishReason,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedTokenPipelineError<Self::DecoderError>> {
+        eredu_core::SemanticStateOwner::finish(self, reason)
+            .map_err(CommittedTokenPipelineError::Decoder)?;
+        self.publish_events(emit);
+        Ok(())
+    }
+
+    fn cancel(
+        &mut self,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedTokenPipelineError<Self::DecoderError>> {
+        eredu_core::SemanticStateOwner::cancel(self)
+            .map_err(CommittedTokenPipelineError::Decoder)?;
+        self.publish_events(emit);
+        Ok(())
     }
 }

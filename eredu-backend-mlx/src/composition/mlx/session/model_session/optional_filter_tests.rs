@@ -232,7 +232,7 @@ fn optional_choice_forced_then_unfiltered_matches_ordinary_and_controlled_native
             while let Some(token) = driver.advance(&mut continuation).unwrap() {
                 outputs.push(token.into_output());
                 assert!(driver
-                    .take_completed_step(&mut continuation)
+                    .take_completed_delivery(&mut continuation)
                     .unwrap()
                     .is_none());
             }

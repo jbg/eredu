@@ -89,10 +89,14 @@ fn chat_request() -> ChatTemplateRequest {
         ..Default::default()
     }
 }
-fn first_usage(events: &[ObservedGenerationRecord]) -> CaptureUsage {
+fn first_usage(events: &[ControlledGenerationRecord]) -> CaptureUsage {
+    usage_from_events(events.iter().filter_map(|event| event.event.progress()))
+}
+fn usage_from_events<'a>(
+    mut events: impl Iterator<Item = &'a ObservedGenerationEvent>,
+) -> CaptureUsage {
     events
-        .iter()
-        .find_map(|event| match &event.event {
+        .find_map(|event| match event {
             ObservedGenerationEvent::Token {
                 captures: Some(step),
                 ..
@@ -143,58 +147,78 @@ fn verify_public_capture_failures(device: LocalDevice) {
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &healthy.0, &execution)
                 .unwrap()
                 .into_parts();
-        let chat = model.prepare_chat(chat_request()).unwrap();
+        let chat = model.source_chat(chat_request()).unwrap();
         // Measure the complete charged step through an ordinary public run, then
         // admit exactly that cumulative allowance for a controlled replay.
-        let prepared = model
-            .prepare_observed_token_ids(
-                &chat,
-                vec![1, 2, 5, 7],
-                settings(),
-                capture(false, budgets()),
-                trace(),
-            )
-            .unwrap();
+        let prepared_prefix = vec![1, 2, 5, 7];
+        let prepared_capture = capture(false, budgets());
+        let prepared_trace = trace();
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings()));
+        prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&prepared_capture);
         let mut events = Vec::new();
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |event| {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |event| {
                 events.push(event);
                 ControlFlow::Continue(())
-            })
-            .unwrap();
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap();
         let usage = first_usage(&events);
         let baseline = super::components::tensors(&events);
         assert!(baseline.values().flatten().any(|value| value.abs() > 1e-6));
         model.reset().unwrap();
-        let prepared = model
-            .prepare_observed_token_ids(
-                &chat,
-                vec![1, 2, 5, 7],
-                settings(),
-                capture(false, usage),
-                trace(),
-            )
-            .unwrap();
+        let prepared_prefix = vec![1, 2, 5, 7];
+        let prepared_capture = capture(false, usage);
+        let prepared_trace = trace();
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings()));
+        prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&prepared_capture);
         {
             let mut records = Vec::new();
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    Default::default(),
+                    collect(&mut records),
+                )
+                .unwrap()
                 .unwrap();
-            run.enable_snapshots(SnapshotLimits {
-                max_snapshots: 2,
-                max_branches: 1,
-                retained_bytes: 64 << 20,
-                cumulative_copy_bytes: 256 << 20,
-            })
+            run.enable_snapshots(
+                SnapshotLimits {
+                    max_snapshots: 2,
+                    max_branches: 1,
+                    retained_bytes: 64 << 20,
+                    cumulative_copy_bytes: 256 << 20,
+                },
+                ORIGINAL_CAPACITY,
+                copy_limits(),
+            )
             .unwrap();
             let initial = run.snapshot(collect(&mut records)).unwrap();
             run.run(collect(&mut records)).unwrap();
-            let observed = records
-                .iter()
-                .map(|record| record.generation.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(super::components::tensors(&observed), baseline);
-            assert_eq!(first_usage(&observed), usage);
+            assert_eq!(
+                super::components::tensors_from_events(
+                    records.iter().filter_map(|record| record.event.progress())
+                ),
+                baseline
+            );
+            assert_eq!(
+                usage_from_events(records.iter().filter_map(|record| record.event.progress())),
+                usage
+            );
             run.restore(&initial, collect(&mut records)).unwrap();
             let before = records.len();
             let error = run.run(collect(&mut records)).unwrap_err();
@@ -209,8 +233,8 @@ fn verify_public_capture_failures(device: LocalDevice) {
                 "{error:?}"
             );
             assert!(!records[before..].iter().any(|record| matches!(
-                record.generation.event,
-                ObservedGenerationEvent::Token { .. }
+                record.event.progress(),
+                Some(ObservedGenerationEvent::Token { .. })
             )));
         }
         model.reset().unwrap();
@@ -219,36 +243,50 @@ fn verify_public_capture_failures(device: LocalDevice) {
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &invalid.0, &execution)
                 .unwrap()
                 .into_parts();
-        let chat = model.prepare_chat(chat_request()).unwrap();
+        let chat = model.source_chat(chat_request()).unwrap();
         let mut expected = None;
         for controlled in [false, true] {
             model.reset().unwrap();
-            let prepared = model
-                .prepare_observed_token_ids(
-                    &chat,
-                    vec![1, 2, 5, 7],
-                    settings(),
-                    capture(true, budgets()),
-                    trace(),
-                )
-                .unwrap();
+            let prepared_prefix = vec![1, 2, 5, 7];
+            let prepared_capture = capture(true, budgets());
+            let prepared_trace = trace();
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings()));
+            prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+            prepared.output_mode = PreparedChatOutputMode::Text;
+            prepared.capture = Some(&prepared_capture);
             let mut events = Vec::new();
             let error: Box<dyn std::error::Error> = if controlled {
                 let mut records = Vec::new();
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+                    .start_controlled_chat(
+                        prepared,
+                        prepared_trace,
+                        Default::default(),
+                        collect(&mut records),
+                    )
+                    .unwrap()
                     .unwrap();
                 let error = run.run(collect(&mut records)).unwrap_err();
-                events.extend(records.into_iter().map(|record| record.generation));
+                events.extend(records);
                 Box::new(error)
             } else {
                 Box::new(
-                    model
-                        .generate_observed_text(prepared, &[], Default::default(), |event| {
+                    (|| -> Result<_, ControlledGenerationError> {
+                        let mut emit = |event| {
                             events.push(event);
                             ControlFlow::Continue(())
-                        })
-                        .unwrap_err(),
+                        };
+                        let mut run = model
+                            .start_controlled_chat(
+                                prepared,
+                                prepared_trace,
+                                GenerationControlHandle::new(Default::default()),
+                                &mut emit,
+                            )?
+                            .expect("live fixture control");
+                        run.run(&mut emit)
+                    })()
+                    .unwrap_err(),
                 )
             };
             let original = native_cause(error.as_ref());
@@ -262,9 +300,10 @@ fn verify_public_capture_failures(device: LocalDevice) {
             } else {
                 expected = Some(original);
             }
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event.event, ObservedGenerationEvent::Token { .. })));
+            assert!(!events.iter().any(|event| matches!(
+                event.event.progress(),
+                Some(ObservedGenerationEvent::Token { .. })
+            )));
         }
         model.reset().unwrap();
     }

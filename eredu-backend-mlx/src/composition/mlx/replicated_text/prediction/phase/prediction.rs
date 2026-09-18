@@ -25,7 +25,7 @@ use crate::composition::mlx::speculative::{
 };
 use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
 use eredu_core::{HostPreparationAuthority, OutputDemand};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
 use eredu_runtime::{
     speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     working_memory::{
@@ -54,7 +54,7 @@ struct Payload {
     report: InferenceWorkspaceReport,
     bindings: SourceBindings,
     context: WorkspaceContext,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
 // Ownership moves across the cold quote/native bank boundary. Keeping the
@@ -115,9 +115,9 @@ where
     }
 }
 
-pub(super) fn host(funding: &WorkspaceMetadataFunding) -> Result<HostPreparationAuthority, Error> {
+pub(super) fn host(funding: &HostMetadataFunding) -> Result<HostPreparationAuthority, Error> {
     let parts = [
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
             .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?,
         size_of::<HostPreparationAuthority>(),
         size_of::<Result<HostPreparationAuthority, Error>>(),
@@ -136,7 +136,7 @@ pub(super) fn host(funding: &WorkspaceMetadataFunding) -> Result<HostPreparation
 pub(super) fn priors<'a>(
     branch: Option<&'a PreparedEmbeddedEvidence>,
     context: SpeculativeExecutionStreams<'a>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<Vec<&'a CompletedResidentSource>, Error> {
     let (sources, environment) = context
         .original_numerical()
@@ -326,7 +326,7 @@ where
         |quote_context, storage| {
             crate::composition::mlx::speculative::validate_registered_tensor_inputs(context, storage[2]).map_err(|cause| cause.at_speculative_stage("prediction registered input sources"))?;
             let prior = priors(lane.evidence(), context, funding).map_err(|cause| cause.at_speculative_stage("prediction prior sources"))?;
-            SourceBindings::prepare(quote_context, storage, &prior, environment, funding, host)
+            SourceBindings::prepare(quote_context, storage, None, &prior, environment, funding, host)
                 .map_err(|cause| sources.retain_error(cause.at_speculative_stage("prediction source binding")))
         },
     ).map_err(|cause| sources.retain_error(cause))?;
@@ -715,3 +715,5 @@ where
         .unwrap_or_else(|never| match never {})
         .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

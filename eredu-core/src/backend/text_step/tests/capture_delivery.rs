@@ -8,7 +8,7 @@ use std::sync::{
 
 #[derive(Debug, Default)]
 pub(super) struct CaptureFacts {
-    ready: Option<CapturedStepDelivery>,
+    ready: Option<SharedCapturedStep>,
     pub(super) pending: bool,
     armed: bool,
     pub(super) no_output: bool,
@@ -30,7 +30,7 @@ pub(super) fn submitted(facts: &mut Facts) {
         facts.capture.pending = true;
     }
 }
-pub(super) fn drain(facts: &Rc<RefCell<Facts>>) -> Result<Option<CapturedStepDelivery>, io::Error> {
+pub(super) fn drain(facts: &Rc<RefCell<Facts>>) -> Result<Option<SharedCapturedStep>, io::Error> {
     let mut facts = facts.borrow_mut();
     if !facts.capture.armed {
         return Ok(None);
@@ -122,11 +122,11 @@ fn arm(
     let source = SharedCapturedStep::retain(frame(outcome), Retired(retired.clone()));
     let mut facts = facts.borrow_mut();
     facts.capture.armed = true;
-    facts.capture.ready = Some(CapturedStepDelivery::Shared(source.clone()));
+    facts.capture.ready = Some(source.clone());
     (source, retired)
 }
-fn same(delivery: &CapturedStepDelivery, source: &SharedCapturedStep) {
-    let actual = delivery.shared().unwrap();
+fn same(delivery: &SharedCapturedStep, source: &SharedCapturedStep) {
+    let actual = delivery;
     assert!(actual.same_storage(source));
     assert_eq!(actual.records().as_ptr(), source.records().as_ptr());
     assert_eq!(
@@ -143,7 +143,7 @@ fn io_fault(error: &io::Error, at: &'static str) {
 }
 
 #[test]
-fn ordinary_and_controlled_legacy_parking_preserves_exact_shared_payload_and_blocks_advance() {
+fn ordinary_and_controlled_pending_capture_preserves_payload_and_blocks_advance() {
     for controlled in [false, true] {
         let (mut runtime, facts) = fixture();
         let (source, retired) = arm(&facts, CaptureStepOutcome::Committed);
@@ -158,9 +158,8 @@ fn ordinary_and_controlled_legacy_parking_preserves_exact_shared_payload_and_blo
             .unwrap();
             drop(run.next().unwrap().unwrap());
             assert!(run.capture_pending());
-            assert!(run.take_captured_step().unwrap().is_none());
-            assert!(run.take_captured_step().unwrap().is_none());
-            assert_eq!(facts.borrow().capture.drains, 1);
+            assert!(run.capture_pending());
+            assert_eq!(facts.borrow().capture.drains, 0);
             assert!(matches!(
                 run.next().unwrap(),
                 Err(ControlledTextGenerationError::Preparation(_))
@@ -180,9 +179,8 @@ fn ordinary_and_controlled_legacy_parking_preserves_exact_shared_payload_and_blo
         } else {
             let mut run = TextGeneration::new(&mut runtime, vec![1, 2], config()).unwrap();
             drop(run.next().unwrap().unwrap());
-            assert!(run.take_captured_step().unwrap().is_none());
-            assert!(run.take_captured_step().unwrap().is_none());
-            assert_eq!(facts.borrow().capture.drains, 1);
+            assert!(run.capture_pending());
+            assert_eq!(facts.borrow().capture.drains, 0);
             assert!(run
                 .next()
                 .unwrap()
@@ -195,7 +193,6 @@ fn ordinary_and_controlled_legacy_parking_preserves_exact_shared_payload_and_blo
             run.take_captured_delivery().unwrap().unwrap()
         };
         same(&delivered, &source);
-        let delivered = delivered.into_legacy().unwrap_err();
         assert_eq!(delivered.as_step().records.as_ptr(), ptr);
         drop((runtime, facts, source));
         assert_eq!(retired.load(Ordering::SeqCst), 0);
@@ -236,11 +233,7 @@ fn detached_no_output_and_aborted_frame_do_not_create_a_drained_boundary() {
             ));
             facts.borrow_mut().capture.empty_pending = false;
         }
-        assert!(driver.take_completed_step(&mut state).unwrap().is_none());
-        assert!(matches!(
-            state.require_quiescent(),
-            Err(TextContinuationError::NotQuiescent)
-        ));
+        assert!(driver.capture_pending(&state).unwrap());
         let delivered = driver.take_completed_delivery(&mut state).unwrap().unwrap();
         same(&delivered, &source);
         assert_eq!(delivered.as_step().outcome, CaptureStepOutcome::Aborted);
@@ -334,12 +327,12 @@ fn polling_and_wait_failures_retain_exact_completion_until_positive_retry_before
 }
 
 #[test]
-fn completion_error_keeps_parked_frame_until_machine_and_external_aliases_retire() {
+fn completion_error_keeps_pending_frame_until_machine_and_external_aliases_retire() {
     let (mut runtime, facts) = fixture();
     let (source, retired) = arm(&facts, CaptureStepOutcome::Committed);
     let mut run = TextGeneration::new(&mut runtime, vec![1, 2], config()).unwrap();
     drop(run.next().unwrap().unwrap());
-    assert!(run.take_captured_step().unwrap().is_none());
+    assert!(run.capture_pending());
     // Another retained completion is a distinct unresolved backend obligation.
     facts.borrow_mut().outstanding_completions += 1;
     run.inner.completions.push(Pending {
@@ -353,8 +346,11 @@ fn completion_error_keeps_parked_frame_until_machine_and_external_aliases_retire
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     facts.borrow_mut().capture.fail_wait = false;
     drop(run);
-    assert_eq!(retired.load(Ordering::SeqCst), 1);
     assert_eq!(facts.borrow().outstanding_completions, 0);
+    // The test backend deliberately exposes its state through these aliases.
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    drop((runtime, facts));
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -467,18 +463,14 @@ fn detached_pending_block_preserves_input_and_attempt_until_retained_frame_drain
 }
 
 #[test]
-fn ordinary_raw_and_retained_capture_errors_use_provider_hook_without_consuming_frame() {
-    for legacy in [false, true] {
+fn capture_errors_use_provider_hook_without_consuming_frame() {
+    {
         let (mut runtime, facts) = fixture();
         let (source, retired) = arm(&facts, CaptureStepOutcome::Committed);
         let mut run = TextGeneration::new(&mut runtime, vec![1, 2], config()).unwrap();
         drop(run.next().unwrap().unwrap());
         facts.borrow_mut().capture.fail_provider_drain = true;
-        let error = if legacy {
-            run.take_captured_step().unwrap_err()
-        } else {
-            run.take_captured_delivery().unwrap_err()
-        };
+        let error = run.take_captured_delivery().unwrap_err();
         assert_eq!(error.kind(), BackendFailureKind::Busy);
         assert_eq!(error.operation(), "step-provider-hook");
         io_fault(

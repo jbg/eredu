@@ -40,7 +40,7 @@ pub(crate) struct ForegroundDiskReadPlan<'a> {
 pub(crate) struct PreparedForegroundDiskRead {
     source: ForegroundDiskDescriptors,
     unit: usize,
-    ready: Vec<ImmutableHostTransferBuffer>,
+    ready: Vec<publication::PublishedHostSource>,
     names: Vec<String>,
     named: Vec<(String, RetainedHostBuffer)>,
     initializer: &'static InitializedInputAllocator,
@@ -126,7 +126,7 @@ impl ForegroundDiskDescriptors {
             Layout::array::<publication::Pending>(count)
                 .map_err(|_| overflow())?
                 .size(),
-            Layout::array::<ImmutableHostTransferBuffer>(count)
+            Layout::array::<publication::PublishedHostSource>(count)
                 .map_err(|_| overflow())?
                 .size(),
             Layout::array::<String>(count)
@@ -145,7 +145,7 @@ impl ForegroundDiskDescriptors {
             size_of::<
                 std::iter::Zip<
                     std::vec::Drain<'_, String>,
-                    std::vec::Drain<'_, ImmutableHostTransferBuffer>,
+                    std::vec::Drain<'_, publication::PublishedHostSource>,
                 >,
             >(),
             size_of::<std::slice::Iter<'_, WeightBinding>>(),
@@ -473,7 +473,8 @@ impl PreparedForegroundDiskIo {
                 pending.completed_mut().freeze().map_err(|_| ReadCause::Identity)?;
             }
             for pending in self.filling.drain(..) {
-                let (buffer, allocation) = publication::finish(pending)?;
+                let buffer = publication::finish(pending)?;
+                let allocation = buffer.allocation();
                 let bytes = u64::try_from(allocation.bytes()).map_err(|_| ReadCause::Identity)?;
                 self.read.completed_capacity_bytes = self.read.completed_capacity_bytes
                     .checked_add(bytes).ok_or(ReadCause::Identity)?;
@@ -543,7 +544,7 @@ impl ReadForegroundDiskBatch {
         for (name, buffer) in self.0.names.drain(..).zip(self.0.ready.drain(..)) {
             self.0.named.push((
                 name,
-                RetainedHostBuffer::request(buffer, self.0._custody.metadata_custody()),
+                RetainedHostBuffer::request(buffer),
             ));
         }
         let rows = rows::Rows::from_sorted(std::mem::take(&mut self.0.named));

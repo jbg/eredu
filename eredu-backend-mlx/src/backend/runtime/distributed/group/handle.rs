@@ -598,7 +598,7 @@ impl Group {
     }
     /// The prepared publication group is an alias of the exact Q invocation.
     pub(crate) fn with_prepared_publication_group<T,E,F>(&self,ordinary:&Group,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,stream:&Stream,run:F)
+        funding:&eredu_nn::workspace::HostMetadataFunding,stream:&Stream,run:F)
         ->std::result::Result<std::result::Result<T,E>,crate::backend::error::Error>
     where F:FnOnce(Option<&Group>)->std::result::Result<T,E> {
         match &self.original_parallel {
@@ -625,13 +625,13 @@ impl Group {
     pub(crate) fn with_original_parallel(mut self,binding:super::super::topology::original_source::parallel::OriginalParallelBinding)->Self {
         self.original_parallel=Some(binding);self
     }
-    pub(crate) fn model_funding(&self)->Option<&eredu_nn::workspace::WorkspaceMetadataFunding> {
+    pub(crate) fn model_funding(&self)->Option<&eredu_nn::workspace::HostMetadataFunding> {
         self.original_parallel.as_ref().map(|binding|binding.funding())
     }
     pub(crate) fn model_gather_error(&self,cause:eredu_nn::ParallelGatherError)->eredu_nn::Error {
         match &self.original_parallel {
             Some(binding)=>binding.error(super::super::topology::original_source::Cause::Gather(cause)),
-            None=>eredu_nn::Error::backend_source(cause),
+            None=>eredu_nn::Error::backend_retained_source(cause),
         }
     }
     pub(crate) fn model_embedding_error(&self,cause:eredu_nn::EmbeddingValidationError)->eredu_nn::Error {
@@ -649,13 +649,13 @@ impl Group {
     pub(crate) fn model_vocabulary_error(&self,cause:eredu_nn::VocabularyRangeError)->eredu_nn::Error {
         match &self.original_parallel {
             Some(binding)=>binding.error(super::super::topology::original_source::Cause::Vocabulary(cause)),
-            None=>eredu_nn::Error::backend_source(cause),
+            None=>eredu_nn::Error::backend_retained_source(cause),
         }
     }
     pub(crate) fn model_native_error(&self,cause:Exception)->eredu_nn::Error {
         match &self.original_parallel {
             Some(binding)=>binding.error(super::super::topology::original_source::Cause::Native(cause)),
-            None=>eredu_nn::Error::backend_source(cause),
+            None=>eredu_nn::Error::backend_retained_source(cause),
         }
     }
     pub(crate) fn gather_model_first(&self,input:&Array,stream:&Stream,axis:usize,widths:&[usize])->std::result::Result<Array,eredu_nn::Error> {
@@ -666,7 +666,7 @@ impl Group {
                 record_original_model_collective_submission(self);
                 Ok(output)
             },
-            None=>super::all_gather_unchecked(input,self,stream).map_err(eredu_nn::Error::backend_source),
+            None=>super::all_gather_unchecked(input,self,stream).map_err(eredu_nn::Error::backend_retained_source),
         }
     }
     /// Ordinary model Sum or the explicitly bound occurrence in this exact
@@ -679,7 +679,7 @@ impl Group {
                 record_original_model_collective_submission(self);
                 Ok(output)
             },
-            None=>super::all_sum(input,self,stream).map_err(eredu_nn::Error::backend_source),
+            None=>super::all_sum(input,self,stream).map_err(eredu_nn::Error::backend_retained_source),
         }
     }
 }

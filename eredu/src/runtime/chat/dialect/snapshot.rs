@@ -65,28 +65,12 @@ impl SnapshotStorage for DeclarativeParserState {
             }
             Self::JsonPayload(value) => value.heap_bytes(),
             Self::NamedJsonPayload { json, emitted: _ } => json.heap_bytes(),
-            Self::TaggedParameterOrEnd { tool, arguments }
-            | Self::TaggedParameterName { tool, arguments } => {
-                tool.heap_bytes()?.checked_add(arguments.heap_bytes()?)
-            }
-            Self::TaggedParameterValue {
-                tool,
-                parameter,
-                arguments,
-                declared_type,
-                header_consumed: _,
-            } => tool
-                .heap_bytes()?
-                .checked_add(parameter.heap_bytes()?)?
-                .checked_add(arguments.heap_bytes()?)?
-                .checked_add(declared_type.heap_bytes()?),
+            Self::Tagged(call) => u64::try_from(call.retained_bytes()?).ok(),
             Self::StructuralPayload { normalizer } => normalizer.heap_bytes(),
             Self::Outside
             | Self::ToolStart
             | Self::JsonEnvelopeStart
             | Self::NamedJsonName
-            | Self::TaggedFunctionPrefix
-            | Self::TaggedFunctionName
             | Self::StructuralName { prefix_consumed: _ }
             | Self::AfterJsonFunctionSuffix
             | Self::AfterPayload

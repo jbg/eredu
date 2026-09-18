@@ -157,35 +157,14 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
     }
 
     /// Builds the target execution graph.
-    pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+    pub fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         match &self.groups {
             HybridExecutionGroups::Target(group) => group.execution_graph(),
             HybridExecutionGroups::TargetAndPrediction(groups) => groups.execution_graph(),
         }
     }
 
-    pub(crate) fn execution_graph_with_metadata(
-        &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(group) => group.execution_graph_with_metadata(context),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.execution_graph_with_metadata(context),
-        }
-    }
 
-    pub(crate) fn group_unit_count_with_metadata(
-        &self,
-        group: usize,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<usize, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(target) => {
-                target.unit_count_with_metadata(group, context)
-            }
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_count_with_metadata(group, context),
-        }
-    }
 
     /// Returns the number of prediction depths declared by the constructed graph.
     pub fn prediction_count(&self) -> usize {
@@ -206,18 +185,24 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
     }
 
     /// Returns the number of units in the target group.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+    pub fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         match &self.groups {
-            HybridExecutionGroups::Target(target) => target.unit_count(group),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_count(group),
+            HybridExecutionGroups::Target(target) => target.unit_count(group, metadata_context),
+            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_count(group, metadata_context),
         }
     }
 
     /// Returns one stable family-owned parameter path after validating its address.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+    pub fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         match &self.groups {
-            HybridExecutionGroups::Target(target) => target.unit_path(group, index),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_path(group, index),
+            HybridExecutionGroups::Target(target) => target.unit_path(group, index, metadata_context),
+            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_path(group, index, metadata_context),
         }
     }
 

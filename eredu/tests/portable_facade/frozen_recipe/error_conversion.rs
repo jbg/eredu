@@ -1,10 +1,14 @@
 use super::*;
 use std::error::Error as _;
 fn converted(error: &(dyn std::error::Error + 'static)) {
-    let neutral = cause::<eredu_core::BackendFailure>(error).unwrap();
+    let neutral = cause::<eredu_core::BackendFailure>(error)
+        .unwrap_or_else(|| panic!("neutral backend cause missing: {error:?}"));
     assert_eq!(neutral.kind(), eredu_core::BackendFailureKind::Busy);
     assert_eq!(neutral.operation(), "portable-provider-hook");
-    assert!(neutral.source().unwrap().is::<MockError>());
+    assert!(
+        cause::<MockError>(neutral).is_some(),
+        "the retained cursor must preserve the original provider error"
+    );
 }
 #[test]
 fn generated_token_public_observation_uses_provider_hook() {
@@ -17,7 +21,7 @@ fn generated_token_public_observation_uses_provider_hook() {
         })
         .unwrap();
     let token = model
-        .generate_tokens(vec![0], TextGenerationConfig::new(config))
+        .generate_tokens(vec![0].into(), TextGenerationConfig::new(config))
         .unwrap()
         .next()
         .unwrap()
@@ -39,31 +43,55 @@ fn controlled_and_uninterrupted_facade_errors_use_provider_hook() {
     for controlled in [false, true] {
         let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut model, calls, _) = fixture(&pool, true);
-        let chat = model.prepare_chat(request()).unwrap();
-        let prepared = model
-            .prepare_observed_token_ids(&chat, vec![0], settings(), CapturePlan::none(), limits())
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let source = model.chat_source(false, &cancel).unwrap().unwrap();
+        let chat = model
+            .prepare_chat(&source, &request(), original_sources::CAPACITY, &cancel)
+            .unwrap()
             .unwrap();
         calls.borrow_mut().reject_submission = true;
-        if controlled {
-            let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-            let error = run.step(|_| ControlFlow::Continue(())).unwrap_err();
-            converted(&error);
-            assert!(run.token_ids().is_empty());
+        let run = model
+            .start_prepared_chat(PreparedChatRequest::new(&chat, settings()), &cancel)
+            .unwrap()
+            .unwrap();
+        let error = if controlled {
+            run.advance(&cancel, &mut |_| {})
+                .err()
+                .expect("submission failure")
         } else {
-            let error = model
-                .generate_observed_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap_err();
-            converted(&error);
-        }
+            run.run(&cancel, &mut |_| {}).unwrap_err()
+        };
+        assert_eq!(
+            error.backend_failure().unwrap().kind(),
+            eredu_core::BackendFailureKind::Busy
+        );
+        converted(&error);
         assert!(
             calls.borrow().filters.is_empty(),
             "submission failure precedes sampling"
         );
     }
+}
+
+#[test]
+fn prepared_chat_startup_preserves_provider_classification_and_source() {
+    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let (mut model, calls, _) = fixture(&pool, true);
+    let cancel = eredu_core::GenerationCancellationToken::new();
+    let source = model.chat_source(false, &cancel).unwrap().unwrap();
+    let chat = model
+        .prepare_chat(&source, &request(), original_sources::CAPACITY, &cancel)
+        .unwrap()
+        .unwrap();
+    calls.borrow_mut().reject_sampling = true;
+    let error = model
+        .start_prepared_chat(PreparedChatRequest::new(&chat, settings()), &cancel)
+        .err()
+        .expect("sampling preparation must fail before submission");
+    converted(&error);
+    assert_eq!(
+        error.backend_failure().unwrap().kind(),
+        eredu_core::BackendFailureKind::Busy
+    );
+    assert!(calls.borrow().filters.is_empty());
 }

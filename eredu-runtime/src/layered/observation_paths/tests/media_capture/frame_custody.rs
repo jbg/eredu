@@ -46,11 +46,10 @@ fn ordinary_frame_retains_tensor_metadata_empty_skip_and_failed_diagnostics_afte
         };
         let success = advance(&mut run, &mut backend, None, case != 4);
         assert_eq!(success, case != 3);
-        assert!(run.ordinary_shared_delivery_pending());
-        assert!(run.take_step().is_none());
-        assert!(run.ordinary_shared_delivery_pending());
-        let frame = run.take_ordinary_shared_step().unwrap();
-        assert!(!run.ordinary_shared_delivery_pending());
+        assert!(run.has_pending_step());
+        assert!(run.has_pending_step());
+        let frame = run.take_shared_step().unwrap();
+        assert!(!run.has_pending_step());
         assert_eq!(
             frame.outcome(),
             if case >= 3 {
@@ -112,8 +111,7 @@ fn ordinary_empty_frame_control_exact_short_is_required_even_under_skip() {
             assert_eq!(advance(&mut run, &mut backend, None, true), !short);
             assert_eq!(backend.validates.get(), 0);
             assert_eq!(backend.copies.get(), 0);
-            assert!(run.take_step().is_none());
-            let frame = run.take_ordinary_shared_step();
+            let frame = run.take_shared_step();
             assert_eq!(frame.is_some(), !short);
             assert_eq!(
                 run.cumulative_usage().host_bytes,
@@ -146,7 +144,7 @@ fn ordinary_empty_frame_control_exact_short_is_required_even_under_skip() {
     assert!(!advance(&mut run, &mut backend, None, true));
     assert_eq!(backend.validates.get(), 0);
     assert_eq!(backend.copies.get(), 0);
-    assert!(run.take_ordinary_shared_step().is_none());
+    assert!(run.take_shared_step().is_none());
     assert_eq!(run.cumulative_usage().host_bytes, control);
     drop(run);
     assert_eq!(retired.load(Ordering::SeqCst), 1);
@@ -157,12 +155,11 @@ fn ordinary_installed_mode_decode_guard_and_restore_preserve_frame_controls() {
     let d = discovery(&selected);
     let (mut run, retired) = owned(selected);
     let saved = run.checkpoint(&d).unwrap();
-    assert!(!run.ordinary_shared_delivery_pending());
+    assert!(!run.has_pending_step());
     assert!(advance(&mut run, &mut Backend::default(), None, true));
-    let prefill = run.take_ordinary_shared_step().unwrap();
+    let prefill = run.take_shared_step().unwrap();
     let first = run.cumulative_usage();
     assert!(run.ordinary_prefill_capture().is_none());
-    assert!(run.uses_ordinary_shared_delivery());
     let epoch = DistributedCommitEpoch::FIRST
         .next()
         .unwrap()
@@ -172,16 +169,15 @@ fn ordinary_installed_mode_decode_guard_and_restore_preserve_frame_controls() {
         .unwrap();
     run.prepare_step_transaction(epoch, crate::ExpertPass::Decode, 1)
         .unwrap();
-    assert!(run.ordinary_shared_delivery_pending());
-    assert!(run.take_step().is_none());
-    assert!(run.take_ordinary_shared_step().is_none());
+    assert!(run.has_pending_step());
+    assert!(run.take_shared_step().is_none());
     assert!(run
         .prepare_step_transaction(epoch.next().unwrap(), crate::ExpertPass::Decode, 2)
         .is_err());
     run.complete_transaction(epoch).unwrap();
-    assert!(run.take_ordinary_shared_step().is_none());
+    assert!(run.take_shared_step().is_none());
     run.finish_transaction(epoch, true);
-    let decoded = run.take_ordinary_shared_step().unwrap();
+    let decoded = run.take_shared_step().unwrap();
     assert_eq!(decoded.phase(), CapturePhase::Decode);
     assert_eq!(decoded.prediction_index(), 1);
     assert_eq!(decoded.step_usage(), prefill.step_usage());
@@ -197,7 +193,7 @@ fn ordinary_installed_mode_decode_guard_and_restore_preserve_frame_controls() {
 fn ordinary_frame_concurrent_final_aliases_keep_actual_host_until_last() {
     let (mut run, retired) = owned(binding(false, true, limits()));
     assert!(advance(&mut run, &mut Backend::default(), None, true));
-    let frame = run.take_ordinary_shared_step().unwrap();
+    let frame = run.take_shared_step().unwrap();
     drop(run);
     let gate = Arc::new(std::sync::Barrier::new(5));
     let threads: Vec<_> = (0..4)
@@ -242,7 +238,7 @@ fn ordinary_pre_frame_error_and_poisoned_checkpoint_outlive_actual_source() {
             .unwrap_err()
         };
         assert!(matches!(error.cause(), CaptureError::Invalid(_)));
-        assert!(!run.ordinary_shared_delivery_pending());
+        assert!(!run.has_pending_step());
         let alias = error.clone();
         drop((run, saved, error));
         assert_eq!(retired.load(Ordering::SeqCst), 0);
@@ -269,7 +265,7 @@ fn ordinary_refused_frame_control_returns_retained_typed_limit_without_refund_or
                 cumulative: false
             }
         ));
-        assert!(run.take_ordinary_shared_step().is_none());
+        assert!(run.take_shared_step().is_none());
         assert_eq!(run.cumulative_usage().host_bytes, 0);
         drop(run);
         assert_eq!(retired.load(Ordering::SeqCst), 0);
@@ -282,7 +278,7 @@ fn ordinary_after_frame_error_and_frame_aliases_have_independent_final_custody()
     for keep_error in [false, true] {
         let (mut run, retired) = owned(binding(false, true, limits()));
         assert!(advance(&mut run, &mut Backend::default(), None, true));
-        let frame = run.take_ordinary_shared_step().unwrap();
+        let frame = run.take_shared_step().unwrap();
         assert!(run.ordinary_prefill_capture().is_none());
         let error = run.begin_step(CapturePhase::Decode, u64::MAX).unwrap_err();
         drop(run);

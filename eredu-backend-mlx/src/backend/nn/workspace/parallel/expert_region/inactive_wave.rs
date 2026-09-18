@@ -60,7 +60,7 @@ impl ExpertInactiveWaveQuote {
             extra_parents.push(report.operations.pop().ok_or_else(invalid)?);
         }
         let parent_completions=declaration.transfers.len().checked_add(metadata).ok_or_else(invalid)?;
-        let aggregate=ExpertRegionAggregate{child_bytes:bytes,child_births:births,host_bytes:0,parent_completions,
+        let aggregate=ExpertRegionAggregate{child_bytes:bytes,child_births:births,host_bytes:0,parent_completions,indexed_parent:false,
             empty_slices:metadata,empty_slice,extra_parents,output_bytes:Vec::new()};
         Ok(Self{declaration,counts,transport,provider,aggregate,source:source.clone()})
     }

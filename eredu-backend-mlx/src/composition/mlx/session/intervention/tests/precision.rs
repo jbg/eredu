@@ -200,6 +200,8 @@ fn verify(device: safemlx::DeviceType) {
             );
             assert_eq!(read_bits(input.as_array()), source_bits, "source changed");
 
+            #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+            {
             let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
             let context = WorkspaceContext::new(mechanism);
             let source = WorkspaceTensor::existing(
@@ -278,6 +280,7 @@ fn verify(device: safemlx::DeviceType) {
                 let plan =
                     crate::backend::nn::workspace::OriginalComponentTestPlan::from_report(report);
                 assert_eq!(plan.completion.nested_completions, 0);
+            }
             }
         }
         let bad = InterventionAction::Replace {

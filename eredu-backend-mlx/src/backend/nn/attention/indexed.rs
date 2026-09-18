@@ -78,7 +78,7 @@ fn failure(cause: Failure) -> Exception {
 }
 fn error(cause: Exception) -> Error {
     match OriginalScopeObserver::try_current() {
-        Ok(None) => Error::backend_source(cause),
+        Ok(None) => Error::backend_retained_source(cause),
         _ => Error::backend_retained_source(cause),
     }
 }
@@ -366,7 +366,7 @@ pub(in crate::backend::nn) fn control_bytes(masks: usize, sinks: bool) -> Option
         size_of::<Result<Option<OriginalScopeObserver>, Exception>>(),
         OriginalScopeObserver::control_bytes()?,
         Exception::retained_source_control_bytes::<OriginalFailure>()?,
-        Error::retained_source_control_bytes::<Exception>()?,
+        Error::retained_source_construction_bytes::<Exception>()?,
         ops::concatenate_axis_control_bytes()?,
     ];
     sizes

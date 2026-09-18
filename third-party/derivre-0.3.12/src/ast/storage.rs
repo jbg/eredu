@@ -5,35 +5,20 @@ use crate::hashcons::{
 };
 use std::{fmt, ops::Deref};
 
-pub(super) enum ExpressionStorage {
-    Ordinary(VecHashCons),
-    Prepared(PreparedVecHashCons),
-}
+pub(super) struct ExpressionStorage(pub(super) PreparedVecHashCons);
 impl Deref for ExpressionStorage {
     type Target = VecHashCons;
-    fn deref(&self) -> &VecHashCons {
-        match self {
-            Self::Ordinary(source) => source,
-            Self::Prepared(source) => source.source(),
-        }
-    }
+    fn deref(&self) -> &VecHashCons { self.0.source() }
 }
 impl ExpressionStorage {
-    pub(super) fn prepared_source_plan(
-        &self,
-    ) -> Result<HashConsPreparedSourcePlan<'_>, HashConsCopyFailure> {
-        match self {
-            Self::Ordinary(source) => source.prepared_source_plan(),
-            Self::Prepared(source) => source.prepared_source_plan(),
-        }
+    pub(super) fn new(funding: crate::ParserAllocationFunding) -> Result<Self, crate::raw::HashConsCapacityError> {
+        PreparedVecHashCons::empty_with_funding(funding).map(Self)
     }
-    pub(super) fn ordinary_mut(&mut self) -> &mut VecHashCons {
-        match self {
-            Self::Ordinary(source) => source,
-            Self::Prepared(_) => {
-                panic!("ordinary growth cannot mutate a prepared expression owner")
-            }
-        }
+    pub(super) fn copied(source: VecHashCons, words: usize, encoding: usize, funding: crate::ParserAllocationFunding) -> Self {
+        Self(PreparedVecHashCons::from_copied_source(source, words, encoding, funding))
+    }
+    pub(super) fn prepared_source_plan(&self) -> Result<HashConsPreparedSourcePlan<'_>, HashConsCopyFailure> {
+        self.0.prepared_source_plan()
     }
 }
 
@@ -61,11 +46,9 @@ impl PreparedExprSet {
     /// Copies retain their independent storage policy and do not inherit it.
     pub fn bind_backing_funding(
         &mut self,
-        funding: crate::hashcons::PreparedHashConsFunding,
+        funding: crate::ParserAllocationFunding,
     ) -> Result<(), PreparedExprError> {
-        let ExpressionStorage::Prepared(storage) = &mut self.inner.exprs else {
-            return Err(PreparedExprError::Storage);
-        };
+        let storage = &mut self.inner.exprs.0;
         storage
             .bind_backing_funding(funding)
             .map_err(|e| PreparedExprError::Encoding(ExprEncodingError::Storage(e)))
@@ -79,6 +62,8 @@ impl PreparedExprSet {
 /// A checked mutation could not use its exact prepared expression destination.
 #[derive(Debug)]
 pub enum PreparedExprError {
+    /// A reached source-construction allocation retained its actual refusal.
+    Allocation(crate::ParserStorageError),
     /// The owner does not hold the required finite storage.
     Storage,
     /// An expression references a child outside this exact arena.
@@ -89,14 +74,13 @@ pub enum PreparedExprError {
     Capacity,
     /// The operation scope retains a failed mutation prefix.
     Failed,
-    /// This source requests the separate optimized prefix-tree producer.
-    Optimized,
     /// Encoding or fixed insertion failed, preserving committed expressions.
     Encoding(ExprEncodingError),
 }
 impl fmt::Display for PreparedExprError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Allocation(error) => fmt::Display::fmt(error, f),
             Self::Storage => f.write_str("expression owner has no prepared mutation storage"),
             Self::Source => f.write_str("expression child is outside the prepared arena"),
             Self::Cost => f.write_str("expression operation cost overflow"),
@@ -104,9 +88,6 @@ impl fmt::Display for PreparedExprError {
                 f.write_str("expression workspace exceeds its prepared source destinations")
             }
             Self::Failed => f.write_str("expression operation scope retains a failed prefix"),
-            Self::Optimized => {
-                f.write_str("expression source requires the optimized prefix-tree producer")
-            }
             Self::Encoding(e) => fmt::Display::fmt(e, f),
         }
     }
@@ -114,20 +95,25 @@ impl fmt::Display for PreparedExprError {
 impl std::error::Error for PreparedExprError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Allocation(error) => Some(error),
             Self::Encoding(e) => Some(e),
             _ => None,
         }
     }
 }
+impl From<crate::ParserStorageError> for PreparedExprError {
+    fn from(error: crate::ParserStorageError) -> Self { Self::Allocation(error) }
+}
 impl ExprSet {
+    pub(crate) fn construction_funding(&self) -> Result<&crate::ParserAllocationFunding, PreparedExprError> {
+        self.exprs.0.backing_funding().ok_or(PreparedExprError::Storage)
+    }
     pub(crate) fn grow_prepared_workspace<T>(
         &self,
         values: &mut Vec<T>,
         total: usize,
     ) -> Result<(), PreparedExprError> {
-        let ExpressionStorage::Prepared(storage) = &self.exprs else {
-            return Err(PreparedExprError::Storage);
-        };
+        let storage = &self.exprs.0;
         storage
             .grow_workspace(values, total)
             .map_err(|e| PreparedExprError::Encoding(ExprEncodingError::Storage(e)))
@@ -167,22 +153,9 @@ impl ExprSet {
             .prepared_source_plan()?
             .empty_destination(encoding_words)
     }
-    pub(crate) fn prepared_extents(&self) -> Result<(usize, usize, usize), PreparedExprError> {
-        match &self.exprs {
-            ExpressionStorage::Prepared(storage) => Ok((
-                storage.max_words(),
-                storage.max_entries(),
-                storage.max_encoded_words(),
-            )),
-            ExpressionStorage::Ordinary(_) => Err(PreparedExprError::Storage),
-        }
-    }
-    pub(crate) fn require_prepared(&self) -> Result<(), PreparedExprError> {
-        if matches!(&self.exprs, ExpressionStorage::Prepared(_)) {
-            Ok(())
-        } else {
-            Err(PreparedExprError::Storage)
-        }
+    pub(crate) fn storage_extents(&self) -> (usize, usize, usize) {
+        let storage = &self.exprs.0;
+        (storage.max_words(), storage.max_entries(), storage.max_encoded_words())
     }
     /// Private emission is used only by shared constructors that compute their
     /// own flags. Raw caller encodings cannot introduce arbitrary ExprRefs.
@@ -193,9 +166,7 @@ impl ExprSet {
         if expression.args().iter().any(|&child| !self.is_valid(child)) {
             return Err(PreparedExprError::Source);
         }
-        let ExpressionStorage::Prepared(storage) = &mut self.exprs else {
-            return Err(PreparedExprError::Storage);
-        };
+        let storage = &mut self.exprs.0;
         let id = expression
             .try_intern_encoded(storage)
             .map_err(PreparedExprError::Encoding)?;

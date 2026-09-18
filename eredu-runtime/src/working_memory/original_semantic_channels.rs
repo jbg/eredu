@@ -1,12 +1,13 @@
 //! Immutable literal program and actual structural-token rows, admitted before copy.
 use super::{
-    OriginalForbiddenSource, OriginalTokenTrieSource, OriginalTokenizer, WorkingMemoryError, WorkingMemoryPool,
+    OriginalForbiddenSource, OriginalTokenTrieSource, OriginalTokenizer, OriginalControllerCompilation, WorkingMemoryError, WorkingMemoryPool,
     original_declaration_source::Account,
 };
 use eredu_core::{HostPreparationAuthority, SpeculativeBuffer, SpeculativeBufferAllocationError,
     SharedTokenFilter, SharedControllerBytes, SharedControllerDeclaration};
 use eredu_core::speculative::{PreparedGrammarController, PreparedGrammarSource};
 use eredu_text::semantic_channels::{ChannelProgram, DelimitedChannel, JsonEnvelope, JsonToolLayout, JsonToolProgram, JsonToolShape};
+use eredu_text::semantic_channels::tagged::{TaggedToolProgram, TaggedEncoding, ToolProgram};
 use eredu_text::json_fragments::{JsonCallId, JsonFieldNames};
 use std::{
     alloc::Layout,
@@ -19,6 +20,17 @@ use std::{
 /// Validation uses the ordinary validator, paying every reached scratch worker;
 /// it must refuse before an unqualified worker and retain its first failure.
 pub trait OriginalToolValidation: std::fmt::Debug + Send + Sync {
+    /// Whether this exact source retains tagged parameter semantics for a tool.
+    fn contains_tagged_tool(&self, _name: &str) -> bool { false }
+    /// Check the original required field list against actual consumed names.
+    fn tagged_missing_required(&self, _name: &str, _parameters: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool { true }
+    /// Interpret one tagged value through the shared text worker and its actual
+    /// original parameter validator. JSON-only sources do not provide this capability.
+    fn parse_tagged_parameter(&self, _name: &str, _parameter: &str, _declared: Option<&str>, _raw: &str,
+        _allocation: &dyn serde_json::allocation::Allocation, _funding: &eredu_nn::workspace::HostMetadataFunding)
+        -> Result<serde_json::Value, eredu_core::BackendFailure> {
+        Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure())
+    }
     /// Compare exact source/controller/pool identity without reconstruction or
     /// allocation. The source's retained census covers this fixed query.
     fn validate_source(&self, controller: OriginalSemanticControllerSource<'_>, pool: &WorkingMemoryPool)
@@ -29,7 +41,7 @@ pub trait OriginalToolValidation: std::fmt::Debug + Send + Sync {
     fn failure_control_bytes(&self) -> Option<usize>;
     /// Validate one complete raw argument object under the supplied invocation
     /// payer. No grammar acceptance is a substitute for the original full schema.
-    fn validate(&self, name: &str, arguments: &str, funding: &eredu_nn::workspace::WorkspaceMetadataFunding)
+    fn validate(&self, name: &str, arguments: &str, funding: &eredu_nn::workspace::HostMetadataFunding)
         -> Result<(), eredu_core::BackendFailure>;
 }
 
@@ -59,6 +71,8 @@ impl OriginalSemanticControllerSource<'_> {
                     .ok_or(WorkingMemoryError::IdentityMismatch)?.clone(),
                 validity: source.validity().clone(), recipe: source.recipe().clone(),
                 declaration: source.declaration().clone(),
+                compilation: source.compilation().downcast_ref::<OriginalControllerCompilation>()
+                    .ok_or(WorkingMemoryError::IdentityMismatch)?.clone(),
             },
         })
     }
@@ -67,40 +81,42 @@ impl OriginalSemanticControllerSource<'_> {
 enum ControllerSource {
     Forbidden(OriginalForbiddenSource),
     Grammar { trie: OriginalTokenTrieSource, validity: SharedTokenFilter,
-        recipe: SharedControllerBytes, declaration: SharedControllerDeclaration },
+        recipe: SharedControllerBytes, declaration: SharedControllerDeclaration, compilation: OriginalControllerCompilation },
 }
 impl ControllerSource {
     fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Forbidden(source) => source.validate_pool(pool),
-            Self::Grammar { trie, validity, recipe, declaration } =>
-                trie.validate_grammar_inputs(validity, recipe, declaration, pool),
+            Self::Grammar { trie, validity, recipe, declaration, compilation } =>
+                trie.validate_grammar_inputs(validity, recipe, declaration, compilation, pool),
         }
     }
     fn matches<C: eredu_core::SpeculativeTokenFilterController>(
         &self, controller: &C, pool: &WorkingMemoryPool,
     ) -> Result<(), WorkingMemoryError> {
-        match self {
-            Self::Forbidden(source) => {
-                if controller.prepared_grammar().is_some() { return Err(WorkingMemoryError::IdentityMismatch); }
-                source.validate_controller(controller.prepared_forbidden_source()
-                    .ok_or(WorkingMemoryError::IdentityMismatch)?, pool)
-            }
-            Self::Grammar { trie, validity, recipe, declaration } => {
-                if controller.prepared_forbidden_source().is_some() || controller.prepared_plain_source().is_some() {
-                    return Err(WorkingMemoryError::IdentityMismatch);
-                }
-                let actual = controller.prepared_grammar().ok_or(WorkingMemoryError::IdentityMismatch)?
-                    .prepared_grammar_source();
+        let source = match (controller.prepared_grammar(), controller.prepared_forbidden_source(), controller.prepared_plain_source()) {
+            (Some(grammar), None, None) => eredu_core::PreparedControllerSource::Grammar(grammar.prepared_grammar_source()),
+            (None, Some(source), None) => eredu_core::PreparedControllerSource::Forbidden(source),
+            _ => return Err(WorkingMemoryError::IdentityMismatch),
+        };
+        self.matches_source(source, pool)
+    }
+    fn matches_source(&self, actual: eredu_core::PreparedControllerSource<'_>, pool: &WorkingMemoryPool)
+        -> Result<(), WorkingMemoryError> {
+        match (self, actual) {
+            (Self::Forbidden(source), eredu_core::PreparedControllerSource::Forbidden(actual)) =>
+                source.validate_controller(actual, pool),
+            (Self::Grammar { trie, validity, recipe, declaration, compilation }, eredu_core::PreparedControllerSource::Grammar(actual)) => {
                 trie.validate_grammar_source(actual, pool)?;
-                let supplied = actual.tokenizer().downcast_ref::<OriginalTokenTrieSource>()
-                    .ok_or(WorkingMemoryError::IdentityMismatch)?;
-                if !trie.same_source(supplied) || !validity.same_storage(actual.validity())
-                    || !recipe.same_storage(actual.recipe()) || !declaration.same_storage(actual.declaration()) {
+                if !actual.compilation().downcast_ref::<OriginalControllerCompilation>()
+                    .is_some_and(|actual| compilation.same_compilation(actual)) {
                     return Err(WorkingMemoryError::IdentityMismatch);
                 }
+                if !validity.same_storage(actual.validity()) || !recipe.same_storage(actual.recipe())
+                    || !declaration.same_storage(actual.declaration()) { return Err(WorkingMemoryError::IdentityMismatch); }
                 Ok(())
             }
+            _ => Err(WorkingMemoryError::IdentityMismatch),
         }
     }
 }
@@ -129,6 +145,10 @@ struct JsonTools {
     shape: JsonToolShape,
     layout: JsonToolLayout,
 }
+#[derive(Debug, Clone, Copy)]
+struct TaggedTools { literals: [Span; 13], has_type: bool, strip_framing: bool }
+#[derive(Debug, Clone, Copy)]
+enum Tools { Json(JsonTools), Tagged(TaggedTools) }
 #[derive(Debug)]
 struct Payload {
     bytes: SpeculativeBuffer<u8>,
@@ -137,7 +157,7 @@ struct Payload {
     text: Option<Channel>,
     tool: Span,
     tool_is_json: bool,
-    json_tools: Option<JsonTools>,
+    tools: Option<Tools>,
     validation: Option<Arc<dyn OriginalToolValidation>>,
     tokenizer: OriginalTokenizer,
     controller: ControllerSource,
@@ -187,7 +207,7 @@ impl OriginalSemanticChannelSource {
     /// Exact field and framing bytes from this same paid immutable source.
     /// Schema validation and mutable event storage require separate consumers.
     pub fn json_tools(&self) -> Option<JsonToolProgram<'_>> {
-        let t = self.payload().json_tools?;
+        let Tools::Json(t) = self.payload().tools? else { return None; };
         let literal = |index| self.text(t.literals[index]);
         Some(JsonToolProgram {
             output: JsonEnvelope { prefix: literal(0), suffix: literal(1) },
@@ -197,6 +217,18 @@ impl OriginalSemanticChannelSource {
                 call_id: t.id_length.map(|length| JsonCallId { field: literal(8), length }) },
             shape: t.shape, separator: literal(9), layout: t.layout,
         })
+    }
+    /// Borrow the exact tagged declaration from this source's paid literals.
+    pub fn tagged_tools(&self) -> Option<TaggedToolProgram<'_>> {
+        let Tools::Tagged(t) = self.payload().tools? else { return None; };
+        let l = |i| self.text(t.literals[i]);
+        Some(TaggedToolProgram { output: JsonEnvelope { prefix:l(0), suffix:l(1) },
+            call: JsonEnvelope { prefix:l(2), suffix:l(3) },
+            encoding: TaggedEncoding { function_prefix:l(4), function_name_suffix:l(5),
+                parameter_prefix:l(6), parameter_name_suffix:l(7),
+                parameter_type:t.has_type.then(|| JsonEnvelope { prefix:l(8), suffix:l(9) }),
+                parameter_value_prefix:l(10), parameter_suffix:l(11), function_suffix:l(12),
+                strip_value_framing:t.strip_framing } })
     }
     pub(super) fn tool_validation(&self) -> Option<&Arc<dyn OriginalToolValidation>> {
         self.payload().validation.as_ref()
@@ -246,6 +278,12 @@ impl OriginalSemanticChannelSource {
     }
     /// Authenticates the same immutable controller inputs after independent
     /// history copies; no mutable parser or original account is retained here.
+    pub(in crate::working_memory) fn validate_controller_source(
+        &self, source: eredu_core::PreparedControllerSource<'_>, pool: &WorkingMemoryPool,
+    ) -> Result<(), WorkingMemoryError> {
+        self.payload().controller.matches_source(source, pool)
+    }
+    /// Authenticates the same immutable inputs after an independent controller copy.
     pub fn validate_controller<C: eredu_core::SpeculativeTokenFilterController>(
         &self, controller: &C, pool: &WorkingMemoryPool,
     ) -> Result<(), WorkingMemoryError> {
@@ -258,6 +296,8 @@ impl OriginalSemanticChannelSource {
             OriginalForbiddenSource::validation_control_bytes()?,
             OriginalTokenTrieSource::grammar_validation_control_bytes()?,
             size_of::<ControllerSource>(), size_of::<OriginalSemanticControllerSource<'_>>(),
+            size_of::<eredu_core::PreparedControllerSource<'_>>(),
+            size_of::<(&ControllerSource, eredu_core::PreparedControllerSource<'_>, &WorkingMemoryPool)>(),
             size_of::<Result<ControllerSource, WorkingMemoryError>>(),
             size_of::<(&ControllerSource, &WorkingMemoryPool)>(),
             size_of::<(&WorkingMemoryPool, &OriginalTokenizer, &OriginalForbiddenSource, ChannelProgram<'_>, &[(u32, &str, bool)])>(),
@@ -269,12 +309,12 @@ impl OriginalSemanticChannelSource {
             size_of::<(&dyn OriginalToolValidation, OriginalSemanticControllerSource<'_>, &WorkingMemoryPool)>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             JsonFieldNames::control_bytes()?,
-            size_of::<Option<JsonToolProgram<'_>>>(), size_of::<Option<JsonTools>>(),
-            size_of::<[&str; 10]>(), size_of::<[Span; 10]>(),
-            size_of::<std::array::IntoIter<&str, 10>>(),
-            size_of::<std::iter::Enumerate<std::array::IntoIter<&str, 10>>>(),
-            size_of::<Result<Option<JsonTools>, Cause>>(),
-            size_of::<(&mut SpeculativeBuffer<u8>, Option<JsonToolProgram<'_>>)>(),
+            size_of::<Option<ToolProgram<'_>>>(), size_of::<Option<Tools>>(),
+            size_of::<[&str; 13]>(), size_of::<[Span; 13]>(),
+            size_of::<std::array::IntoIter<&str, 13>>(),
+            size_of::<std::iter::Enumerate<std::array::IntoIter<&str, 13>>>(),
+            size_of::<Result<Option<Tools>, Cause>>(),
+            size_of::<(&mut SpeculativeBuffer<u8>, Option<ToolProgram<'_>>)>(),
             size_of::<ChannelProgram<'static>>(),
             size_of::<Option<(&str, bool)>>(),
             size_of::<Result<(), WorkingMemoryError>>(),
@@ -367,7 +407,7 @@ impl WorkingMemoryPool {
     /// controller and structural source. Descriptors supply no admission.
     pub fn compile_semantic_channel_source_with_tools(
         &self, tokenizer: &OriginalTokenizer, controller: OriginalSemanticControllerSource<'_>,
-        program: ChannelProgram<'_>, structural: &[(u32, &str, bool)], tools: Option<JsonToolProgram<'_>>,
+        program: ChannelProgram<'_>, structural: &[(u32, &str, bool)], tools: Option<ToolProgram<'_>>,
     ) -> Result<OriginalSemanticChannelSource, OriginalSemanticChannelSourceError> {
         self.compile_semantic_channel_source_with_validation(tokenizer, controller, program, structural, tools, None)
     }
@@ -375,7 +415,7 @@ impl WorkingMemoryPool {
     /// The callback authenticates its exact controller and source pool before use.
     pub fn compile_semantic_channel_source_with_validation(
         &self, tokenizer: &OriginalTokenizer, controller: OriginalSemanticControllerSource<'_>,
-        program: ChannelProgram<'_>, structural: &[(u32, &str, bool)], tools: Option<JsonToolProgram<'_>>,
+        program: ChannelProgram<'_>, structural: &[(u32, &str, bool)], tools: Option<ToolProgram<'_>>,
         validation: Option<Arc<dyn OriginalToolValidation>>,
     ) -> Result<OriginalSemanticChannelSource, OriginalSemanticChannelSourceError> {
         if let Some(source) = &validation {
@@ -388,7 +428,9 @@ impl WorkingMemoryPool {
         controller
             .validate(self)
             .map_err(OriginalSemanticChannelSourceError::rejected)?;
-        if !program.is_valid() {
+        if !program.is_valid()
+            || matches!(tools, Some(ToolProgram::Tagged(t)) if !t.encoding.is_valid())
+        {
             return Err(OriginalSemanticChannelSourceError::rejected(Cause::Source));
         }
         let overflow =
@@ -445,7 +487,7 @@ impl WorkingMemoryPool {
                 OriginalSemanticControllerSource<'_>,
                 ChannelProgram<'_>,
                 &[(u32, &str, bool)],
-                Option<JsonToolProgram<'_>>,
+                Option<ToolProgram<'_>>,
                 Option<Arc<dyn OriginalToolValidation>>,
             )>(),
             size_of::<std::slice::Iter<'_, (u32, &str, bool)>>(),
@@ -478,10 +520,15 @@ impl WorkingMemoryPool {
             let reasoning = append_channel(destination, program.reasoning_channel)?;
             let text = append_channel(destination, program.text_channel)?;
             let tool = append(destination, program.tool_delimiter)?;
-            let json_tools = tools.map(|tools| {
-                let mut literals = [Span { start: 0, end: 0 }; 10];
+            let tools = tools.map(|tools| {
+                let mut literals = [Span { start: 0, end: 0 }; 13];
                 for (index, value) in tools.literals().into_iter().enumerate() { literals[index] = append(destination, value)?; }
-                Ok::<_, Cause>(JsonTools { literals, id_length: tools.fields.call_id.map(|id| id.length), shape: tools.shape, layout: tools.layout })
+                Ok::<_, Cause>(match tools {
+                    ToolProgram::Json(t) => Tools::Json(JsonTools { literals: literals[..10].try_into().expect("fixed JSON literals"),
+                        id_length: t.fields.call_id.map(|id| id.length), shape:t.shape, layout:t.layout }),
+                    ToolProgram::Tagged(t) => Tools::Tagged(TaggedTools { literals, has_type:t.encoding.parameter_type.is_some(),
+                        strip_framing:t.encoding.strip_value_framing }),
+                })
             }).transpose()?;
             for &(id, spelling, stop) in structural {
                 let spelling = append(destination, spelling)?;
@@ -500,7 +547,7 @@ impl WorkingMemoryPool {
                 text,
                 tool,
                 tool_is_json: program.tool_is_json,
-                json_tools,
+                tools,
                 validation: validation.clone(),
                 tokenizer: tokenizer.clone(),
                 controller: controller.retain()?,
@@ -534,7 +581,7 @@ impl OriginalTokenizer {
     /// Compile the shared channel/field source with its full-schema callback.
     pub fn compile_semantic_channel_source_with_validation(
         &self, controller: OriginalSemanticControllerSource<'_>, program: ChannelProgram<'_>,
-        structural: &[(u32, &str, bool)], tools: Option<JsonToolProgram<'_>>,
+        structural: &[(u32, &str, bool)], tools: Option<ToolProgram<'_>>,
         validation: Option<Arc<dyn OriginalToolValidation>>,
     ) -> Result<OriginalSemanticChannelSource, OriginalSemanticChannelSourceError> {
         self.pool().compile_semantic_channel_source_with_validation(self, controller, program, structural, tools, validation)
@@ -543,7 +590,7 @@ impl OriginalTokenizer {
     /// original source pool, together with the selected controller and channels.
     pub fn compile_semantic_channel_source_with_tools(
         &self, controller: OriginalSemanticControllerSource<'_>, program: ChannelProgram<'_>,
-        structural: &[(u32, &str, bool)], tools: Option<JsonToolProgram<'_>>,
+        structural: &[(u32, &str, bool)], tools: Option<ToolProgram<'_>>,
     ) -> Result<OriginalSemanticChannelSource, OriginalSemanticChannelSourceError> {
         self.pool().compile_semantic_channel_source_with_tools(self, controller, program, structural, tools)
     }

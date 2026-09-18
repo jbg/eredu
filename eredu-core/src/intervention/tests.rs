@@ -1,6 +1,61 @@
 use super::*;
 use crate::{ObservationSupportStatus as S, SymbolicDimension as D};
 
+#[test]
+fn prepared_admission_preserves_canonical_identity_for_both_geometry_modes() {
+    let raw = plan(vec![operation(InterventionAction::Scale {
+        dtype: InterventionDtype::Float32, factor: -0.75,
+    })]);
+    let catalog = discovery(false);
+    for (bounds, origin) in [
+        (None, CaptureTextOrigin::default()),
+        (None, CaptureTextOrigin { cached_positions: 9 }),
+        (Some(CaptureInvocationBounds { batch: 1, max_sequence: 3,
+            max_context: Some(7), max_predictions: 4 }), CaptureTextOrigin::default()),
+    ] {
+        let prepared = PreparedInterventionAdmission::inspect(&raw, &catalog, request(), bounds,
+            origin, "child-λ").unwrap();
+        assert!(prepared.required_bytes() > raw.operations[0].id.len());
+        let admitted = prepared.construct(&crate::HostPreparationAuthority::unmanaged()).unwrap();
+        fn independent(prefix: &str, value: &impl Serialize) -> String {
+            let digest = Sha256::digest(serde_json::to_vec(value).unwrap());
+            format!("{prefix}-{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+        }
+        // Serialize the protocol tuple directly, independently of admission's
+        // streaming writer and fixed ASCII destination.
+        let base = independent(IDENTITY_PREFIX, &(
+            &raw, &catalog.points, request(), &catalog.artifact_identity,
+            &catalog.session_identity, "child-λ",
+        ));
+        let expected = if let Some(bounds) = bounds {
+            independent(IDENTITY_PREFIX, &("invocation", &base, bounds))
+        } else if origin != CaptureTextOrigin::default() {
+            independent(IDENTITY_PREFIX, &("text_origin", &base, origin))
+        } else { base };
+        assert_eq!(admitted.identity(), expected);
+        assert_eq!(admitted.plan(), &raw);
+        assert_ne!(admitted.plan().operations[0].id.as_ptr(), raw.operations[0].id.as_ptr());
+        assert_ne!(admitted.points()[0].axes.as_ptr(), catalog.points[0].axes.as_ptr());
+    }
+}
+
+#[test]
+fn prepared_admission_rejects_duplicate_ids_and_unknown_targets_without_owned_diagnostics() {
+    let catalog = discovery(false);
+    let duplicate = plan(vec![zero(), zero()]);
+    let error = PreparedInterventionAdmission::inspect(&duplicate, &catalog, request(), None,
+        CaptureTextOrigin::default(), "child").unwrap()
+        .construct(&crate::HostPreparationAuthority::unmanaged()).unwrap_err();
+    assert!(matches!(error, InterventionAdmissionError::Declaration(CaptureError::Intervention(
+        InterventionDeclarationError::Invalid(_)))));
+    let mut unknown = zero(); unknown.target = "absent.target".into();
+    let raw = plan(vec![unknown]);
+    let error = PreparedInterventionAdmission::inspect(&raw, &catalog, request(), None,
+        CaptureTextOrigin::default(), "child").unwrap_err();
+    assert!(matches!(error, InterventionAdmissionError::Declaration(CaptureError::Intervention(
+        InterventionDeclarationError::MissingPath { operation: 0 }))));
+}
+
 fn request() -> CaptureRequestShape {
     CaptureRequestShape {
         batch: 1,

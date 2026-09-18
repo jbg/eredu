@@ -1,5 +1,5 @@
 use super::*;
-use eredu::api::{GenerationBranchOptions, PreparedObservedGeneration};
+use eredu::api::GenerationBranchOptions;
 use eredu::runtime::chat::{CapabilitySupport, SemanticSupport, ToolChoice};
 
 // Deliberately unlike any recognized protocol, including updated LFM templates.
@@ -14,16 +14,38 @@ fn request() -> ChatTemplateRequest {
 }
 
 fn text_setup() -> (
-    LoadedModel<MockBackend>,
+    original_sources::Fixture<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
 ) {
     let mut probe = unicode_model_with_template(None, 64, TEMPLATE);
-    let chat = probe.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = probe
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        probe
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let mut model = unicode_model_with_template(Some(first), 64, TEMPLATE);
-    let chat = model.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(8),
@@ -35,32 +57,34 @@ fn text_setup() -> (
     (model, chat, settings, first)
 }
 
-fn prepare(
-    model: &LoadedModel<MockBackend>,
-    chat: &PreparedChat,
-    settings: PreparedChatGenerationSettings,
-    mode: u8,
-) -> PreparedObservedGeneration {
+struct Instrumentation {
+    capture: CapturePlan,
+    intervention: Option<eredu_core::intervention::InterventionPlan>,
+}
+fn declarations(mode: u8) -> Instrumentation {
     let mut capture = if mode & 1 == 0 {
         CapturePlan::none()
     } else {
         observed_mock::plan()
     };
     capture.limits = observed_mock::plan().limits;
-    if mode & 2 == 0 {
-        model
-            .prepare_observed_chat(chat, settings, capture, limits())
-            .unwrap()
-    } else {
-        model
-            .prepare_intervened_chat(
-                chat,
-                settings,
-                capture,
-                observed_mock::intervention_plan(1.0),
-                limits(),
-            )
-            .unwrap()
+    Instrumentation {
+        capture,
+        intervention: (mode & 2 != 0).then(|| observed_mock::intervention_plan(1.0)),
+    }
+}
+impl Instrumentation {
+    fn request<'a>(
+        &'a self,
+        chat: &'a PreparedChat,
+        settings: PreparedChatGenerationSettings,
+    ) -> eredu::api::PreparedChatRequest<'a, Prompt> {
+        let mut request =
+            eredu::api::PreparedChatRequest::new(chat, original_sources::settings(settings));
+        request.capture = Some(&self.capture);
+        request.intervention = self.intervention.as_ref();
+        request.output_mode = eredu::api::PreparedChatOutputMode::Text;
+        request
     }
 }
 
@@ -77,32 +101,47 @@ fn collect(
 fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_plans() {
     for mode in 0..4 {
         let (mut model, chat, settings, _) = text_setup();
-        let prepared = prepare(&model, &chat, settings, mode);
+        let instrumentation = declarations(mode);
+        let mut prepared = instrumentation.request(&chat, settings);
         let mut ordinary = vec![];
-        let output = model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
-                ordinary.push(record);
-                ControlFlow::Continue(())
-            })
-            .unwrap();
+        let output = {
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    limits(),
+                    Default::default(),
+                    collect(&mut ordinary),
+                )
+                .unwrap()
+                .unwrap();
+            run.run(collect(&mut ordinary)).unwrap();
+            (run.token_ids().to_vec(), run.finish_reason().unwrap())
+        };
         model.reset().unwrap();
-        let prepared = prepare(&model, &chat, settings, mode);
+        let instrumentation = declarations(mode);
+        let mut prepared = instrumentation.request(&chat, settings);
         let mut controlled = vec![];
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), collect(&mut controlled))
+            .start_controlled_chat(
+                prepared,
+                limits(),
+                Default::default(),
+                collect(&mut controlled),
+            )
+            .unwrap()
             .unwrap();
         run.run(collect(&mut controlled)).unwrap();
-        assert_eq!(run.token_ids(), output.token_ids);
-        assert_eq!(run.finish_reason(), Some(output.finish_reason));
+        assert_eq!(run.token_ids(), output.0.as_slice());
+        assert_eq!(run.finish_reason(), Some(output.1));
         let events: Vec<_> = ordinary
             .iter()
-            .filter_map(|r| match &r.event {
-                ObservedGenerationEvent::Semantic { event, .. } => Some(event.clone()),
+            .filter_map(|r| match r.event.progress() {
+                Some(ObservedGenerationEvent::Semantic { event, .. }) => Some(event.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(events, semantic(&controlled));
-        let evidence = |record: &eredu::api::ObservedGenerationRecord| match &record.event {
+        let evidence = |event: &eredu::api::ObservedGenerationEvent| match event {
             ObservedGenerationEvent::Token {
                 forced, captures, ..
             } => {
@@ -116,10 +155,13 @@ fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_
             _ => None,
         };
         assert_eq!(
-            ordinary.iter().filter_map(evidence).collect::<Vec<_>>(),
+            ordinary
+                .iter()
+                .filter_map(|r| r.event.progress().and_then(evidence))
+                .collect::<Vec<_>>(),
             controlled
                 .iter()
-                .filter_map(|r| evidence(&r.generation))
+                .filter_map(|r| r.event.progress().and_then(evidence))
                 .collect::<Vec<_>>()
         );
     }
@@ -139,33 +181,48 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         );
         assert_eq!(chat.rendered_prompt(), "user says: hello\nreply begins: ");
         assert_eq!(chat.generation_prompt(), "reply begins: ");
-        let prepared = prepare(&model, &chat, settings, mode);
-        let prompt = prepared.prompt_token_ids().to_vec();
+        let instrumentation = declarations(mode);
+        let mut prepared = instrumentation.request(&chat, settings);
+        let prompt = model.encode(chat.rendered_prompt(), false).unwrap();
+        prepared.output_mode = eredu::api::PreparedChatOutputMode::Semantic;
         assert_eq!(prompt, model.encode(chat.rendered_prompt(), false).unwrap());
         let error = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                 panic!("rejected chat emitted")
             })
             .err()
             .unwrap();
-        assert!(error.to_string().contains("executable semantic plan"));
-        let prepared = prepare(&model, &chat, settings, mode);
-        let capture_id = prepared.capture_plan().identity().to_owned();
-        let intervention_id = prepared
-            .intervention_plan()
-            .map(|p| p.identity().to_owned());
-        let resolved = prepared.generation_config();
+        assert!(matches!(
+            error.session_failure().unwrap().semantic_output_rejection(),
+            Some(SemanticSupport::Unsupported { .. })
+        ));
+        let instrumentation = declarations(mode);
+        let mut prepared = instrumentation.request(&chat, settings);
+        let resolved = model.resolve_generation_config(settings.overrides).unwrap();
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut run = model
-            .start_controlled_text(prepared, &[], control.clone(), collect(&mut records))
+            .start_controlled_chat(prepared, limits(), control.clone(), collect(&mut records))
+            .unwrap()
             .unwrap();
+        let (capture_id, intervention_id) = match &records[0].instrumentation {
+            eredu::api::PreparedInstrumentationRecord::Captured { plan_id } => {
+                (plan_id.clone(), None)
+            }
+            eredu::api::PreparedInstrumentationRecord::Intervened {
+                capture_plan_id,
+                intervention_plan_id,
+            } => (capture_plan_id.clone(), Some(intervention_plan_id.clone())),
+            _ => panic!("requested source was not retained"),
+        };
+        assert!(!capture_id.is_empty());
+        assert_eq!(intervention_id.is_some(), mode & 2 != 0);
         assert_eq!(run.status(), GenerationStatus::Prepared);
         assert!(run.token_ids().is_empty());
         assert_eq!(run.next_prediction(), 0);
         assert_eq!(records.len(), 1);
         assert!(
-            matches!(&records[0].generation.event, ObservedGenerationEvent::Started { prompt_token_ids, generation, seed } if prompt_token_ids == &prompt && generation == &resolved && *seed == 17)
+            matches!(&records[0].event, eredu::api::ControlledGenerationEvent::Started { prompt_attribution, generation, seed } if prompt_attribution.attribution().complete_token_ids() == Some(prompt.as_slice()) && generation == &resolved && *seed == 17)
         );
         assert_eq!(run.capabilities().step, ControlSupport::Supported);
         run.step(collect(&mut records)).unwrap();
@@ -177,10 +234,12 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         assert_eq!(run.token_ids(), [first]);
         run.resume(|record| {
             if matches!(
-                record.generation.event,
-                ObservedGenerationEvent::Token {
-                    prediction_index: 1,
-                    ..
+                &record.event,
+                eredu::api::ControlledGenerationEvent::Progress {
+                    event: ObservedGenerationEvent::Token {
+                        prediction_index: 1,
+                        ..
+                    }
                 }
             ) {
                 control.request_pause();
@@ -206,13 +265,30 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         assert!(run.step(|_| panic!("completed run emitted")).is_err());
         for (sequence, record) in records.iter().enumerate() {
             assert_eq!(record.sequence, sequence as u64);
-            assert_eq!(record.generation.capture_plan_id, capture_id);
-            assert_eq!(record.generation.intervention_plan_id, intervention_id);
-            if let ObservedGenerationEvent::Token {
-                captures,
-                committed,
-                ..
-            } = &record.generation.event
+            match &record.instrumentation {
+                eredu::api::PreparedInstrumentationRecord::Captured { plan_id } => {
+                    assert_eq!(plan_id, &capture_id);
+                    assert!(intervention_id.is_none());
+                }
+                eredu::api::PreparedInstrumentationRecord::Intervened {
+                    capture_plan_id,
+                    intervention_plan_id,
+                } => {
+                    assert_eq!(capture_plan_id, &capture_id);
+                    assert_eq!(Some(intervention_plan_id), intervention_id.as_ref());
+                }
+                eredu::api::PreparedInstrumentationRecord::Unobserved => {
+                    panic!("capture owner lost")
+                }
+            }
+            if let eredu::api::ControlledGenerationEvent::Progress {
+                event:
+                    ObservedGenerationEvent::Token {
+                        captures,
+                        committed,
+                        ..
+                    },
+            } = &record.event
             {
                 assert!(*committed);
                 assert_eq!(captures.is_some(), mode != 0);
@@ -246,16 +322,15 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
 fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
     for cancel_at in [None, Some(0), Some(1)] {
         let (mut model, chat, settings, first) = text_setup();
-        let prepared = prepare(&model, &chat, settings, 1);
+        let instrumentation = declarations(1);
+        let mut prepared = instrumentation.request(&chat, settings);
+        let stops = ["é".into()];
+        prepared.stop_sequences = &stops;
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut run = model
-            .start_controlled_text(
-                prepared,
-                &["é".into()],
-                control.clone(),
-                collect(&mut records),
-            )
+            .start_controlled_chat(prepared, limits(), control.clone(), collect(&mut records))
+            .unwrap()
             .unwrap();
         if cancel_at == Some(0) {
             control.cancel();
@@ -276,11 +351,13 @@ fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
         assert_eq!(semantic(&records), [SemanticEvent::Finished { reason }]);
     }
     let (mut model, chat, settings, _) = text_setup();
-    let prepared = prepare(&model, &chat, settings, 0);
+    let instrumentation = declarations(0);
+    let mut prepared = instrumentation.request(&chat, settings);
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     let mut calls = 0;
     run.step(|_| {
@@ -298,15 +375,20 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
     for mode in 0..4 {
         for stop in ["never", "é!"] {
             let (mut model, chat, settings, first) = text_setup();
-            let prepared = prepare(&model, &chat, settings, mode);
+            let pool = model.original_pool().clone();
+            let instrumentation = declarations(mode);
+            let mut prepared = instrumentation.request(&chat, settings);
+            let stops = [stop.into()];
+            prepared.stop_sequences = &stops;
             let mut records = vec![];
             let mut run = model
-                .start_controlled_text(
+                .start_controlled_chat(
                     prepared,
-                    &[stop.into()],
+                    limits(),
                     Default::default(),
                     collect(&mut records),
                 )
+                .unwrap()
                 .unwrap();
             let bounds = SnapshotLimits {
                 max_snapshots: 1,
@@ -314,7 +396,12 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
                 retained_bytes: 64_000_000,
                 cumulative_copy_bytes: 256_000_000,
             };
-            run.enable_snapshots(bounds).unwrap();
+            run.enable_snapshots(
+                bounds,
+                original_sources::CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+            )
+            .unwrap();
             run.step(collect(&mut records)).unwrap();
             // Save either partial UTF-8 or decoded text held back by a caller stop.
             if stop == "é!" {
@@ -348,7 +435,7 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
                     }
                 ]
             );
-            let parent_id = run.output_checkpoint().run_id;
+            let parent_id = run.output_checkpoint().unwrap().run_id.clone();
             let usage = run.snapshot_usage().unwrap();
             run.restore(&saved, collect(&mut records)).unwrap();
             assert!(
@@ -365,10 +452,17 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
             assert_eq!(semantic(&records[before..]), continuation);
             assert_eq!(run.token_ids(), [first, first + 1, first + 2]);
             run.exchange(&mut left, collect(&mut records)).unwrap();
-            assert_eq!(run.output_checkpoint().run_id, parent_id);
+            assert_eq!(run.output_checkpoint().unwrap().run_id, parent_id);
             assert_eq!(run.status(), GenerationStatus::Completed);
             drop((left, right, saved));
-            assert_eq!(run.snapshot_usage().unwrap().retained_bytes, 0);
+            // The restored parent and escaping semantic aliases still retain
+            // independently copied destinations after saved handles retire.
+            assert!(run.snapshot_usage().unwrap().retained_bytes > 0);
+            drop(records);
+            assert!(run.snapshot_usage().unwrap().retained_bytes > 0);
+            drop(run);
+            drop((continuation, chat, model));
+            assert_eq!(pool.used_bytes().unwrap(), 0);
         }
     }
 }
@@ -378,18 +472,32 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
     for template in [TEMPLATE, QWEN_TEMPLATE] {
         let mut model = unicode_model_with_template(None, 512, template);
         for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {
-            let chat = model.prepare_chat(ChatTemplateRequest {
-                tools: vec![serde_json::json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}})],
-                tool_choice: choice,
-                ..request()
-            }).unwrap();
+            let chat = {
+                let request = ChatTemplateRequest {
+                    tools: vec![
+                        serde_json::json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
+                    ],
+                    tool_choice: choice,
+                    ..request()
+                };
+                let cancellation = eredu_core::GenerationCancellationToken::new();
+                let source = model
+                    .chat_source(!request.tools.is_empty(), &cancellation)
+                    .unwrap()
+                    .unwrap();
+                model
+                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                    .unwrap()
+                    .unwrap()
+            };
             assert!(matches!(
                 chat.text_generation_support(),
                 CapabilitySupport::Unsupported { .. }
             ));
-            let prepared = prepare(&model, &chat, Default::default(), 0);
+            let instrumentation = declarations(0);
+            let mut prepared = instrumentation.request(&chat, Default::default());
             let error = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
+                .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                     panic!("rejected request emitted")
                 })
                 .err()
@@ -398,36 +506,65 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
         }
     }
     let (mut model, _, settings, _) = text_setup();
+    let requested = ChatTemplateRequest {
+        enable_thinking: Some(true),
+        ..request()
+    };
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let source = model.chat_source(false, &cancellation).unwrap().unwrap();
     assert!(model
-        .prepare_chat(ChatTemplateRequest {
-            enable_thinking: Some(true),
-            ..request()
-        })
+        .prepare_chat(
+            &source,
+            &requested,
+            original_sources::CAPACITY,
+            &cancellation
+        )
         .is_err());
-    let required = model
-        .prepare_chat(ChatTemplateRequest {
+    let required = {
+        let request = ChatTemplateRequest {
             tool_choice: ToolChoice::Required,
             ..request()
-        })
-        .unwrap();
-    let prepared = prepare(&model, &required, settings, 0);
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let instrumentation = declarations(0);
+    let mut prepared = instrumentation.request(&required, settings);
     assert!(model
-        .start_controlled_text(prepared, &[], Default::default(), |_| panic!(
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| panic!(
             "required tools admitted"
         ))
         .is_err());
-    let raw = model
-        .prepare_chat(ChatTemplateRequest {
+    let raw = {
+        let request = ChatTemplateRequest {
             enable_thinking: Some(true),
             allow_unparsed_reasoning: true,
             ..request()
-        })
-        .unwrap();
-    let prepared = prepare(&model, &raw, settings, 0);
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let instrumentation = declarations(0);
+    let mut prepared = instrumentation.request(&raw, settings);
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     run.run(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(run.finish_reason(), Some(FinishReason::Eos));
@@ -442,7 +579,7 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
     vocab.remove("ordinary_1"); // Hole at ID 2.
     vocab.insert("<|im_end|>".into(), serde_json::json!(65));
     let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
-    let mut model = LoadedModel::from_runtime(
+    let mut model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -455,9 +592,20 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
         },
     )
     .unwrap();
-    let chat = model.prepare_chat(request()).unwrap();
-    let prepared = prepare(
-        &model,
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let instrumentation = declarations(0);
+    let mut prepared = instrumentation.request(
         &chat,
         PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
@@ -467,12 +615,12 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
             seed: 17,
             ..Default::default()
         },
-        0,
     );
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
     for id in [2, 66, u32::MAX] {
         assert!(run.force_next_token(id).is_err());
@@ -503,7 +651,7 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
         .add_special_tokens([AddedToken::from("<hidden>", true).normalized(false)])
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-    let mut model = LoadedModel::from_runtime(
+    let mut model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -516,11 +664,29 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
         },
     )
     .unwrap();
-    let chat = model.prepare_chat(request()).unwrap();
-    let prepared = prepare(&model, &chat, Default::default(), 0);
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let instrumentation = declarations(0);
+    let mut prepared = instrumentation.request(&chat, Default::default());
     let mut records = vec![];
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled_chat(
+            prepared,
+            limits(),
+            Default::default(),
+            collect(&mut records),
+        )
+        .unwrap()
         .unwrap();
     for id in [1, 3, 2, eos] {
         run.force_next_token(id).unwrap();

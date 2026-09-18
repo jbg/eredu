@@ -337,15 +337,13 @@ where
             &mut instrumentation,
             reduce,
             |feed_forward, normalized, source, context, reduce, instrumentation| {
-                feed_forward.forward_tensor_parallel_resident_observed(
-                    &format!("{path}.feed_forward"),
-                    normalized,
-                    source,
-                    ExpertPass::Decode,
-                    context,
-                    instrumentation.observer().expect("observed V4 block"),
-                    reduce,
-                )
+                match instrumentation.observer() {
+                    Some(observer) => feed_forward.forward_tensor_parallel_resident_observed(
+                        &format!("{path}.feed_forward"), normalized, source,
+                        ExpertPass::Decode, context, observer, reduce,
+                    ),
+                    None => reduce(feed_forward.forward(normalized, source, context)?, context),
+                }
             },
         )?;
         instrumentation.apply("output", output)
@@ -385,16 +383,15 @@ where
             &mut instrumentation,
             reduce,
             |feed_forward, normalized, source, context, reduce, instrumentation| {
-                feed_forward.forward_tensor_parallel_with_provider_observed(
-                    &format!("{path}.feed_forward"),
-                    normalized,
-                    source,
-                    pass,
-                    provider,
-                    context,
-                    instrumentation.observer().expect("observed V4 block"),
-                    reduce,
-                )
+                match instrumentation.observer() {
+                    Some(observer) => feed_forward.forward_tensor_parallel_with_provider_observed(
+                        &format!("{path}.feed_forward"), normalized, source,
+                        pass, provider, context, observer, reduce,
+                    ),
+                    None => feed_forward.forward_tensor_parallel_with_provider(
+                        normalized, source, pass, provider, context, reduce,
+                    ),
+                }
             },
         )?;
         instrumentation.apply("output", output)
@@ -526,15 +523,15 @@ where
             &mut instrumentation,
             |value, _| Ok(value),
             |feed_forward, normalized, source, context, _, instrumentation| {
-                feed_forward.forward_with_provider_observed(
-                    &format!("{path}.feed_forward"),
-                    normalized,
-                    source,
-                    pass,
-                    provider,
-                    context,
-                    instrumentation.observer().expect("observed V4 block"),
-                )
+                match instrumentation.observer() {
+                    Some(observer) => feed_forward.forward_with_provider_observed(
+                        &format!("{path}.feed_forward"), normalized, source,
+                        pass, provider, context, observer,
+                    ),
+                    None => feed_forward.forward_with_provider(
+                        normalized, source, pass, provider, context,
+                    ),
+                }
             },
         )?;
         instrumentation.apply("output", output)
@@ -997,17 +994,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                     instrumentation.apply("feed_forward.output", write)
                 }
                 V3FeedForward::Routed(moe) => {
-                    let output = moe.forward_tensor_parallel_resident_observed(
-                        &format!("{path}.feed_forward"),
-                        input,
-                        RouteSource::Learned,
-                        ExpertPass::Decode,
-                        context,
-                        instrumentation
-                            .observer()
-                            .expect("observed V3 block retains its observer"),
-                        reduce,
-                    )?;
+                    let output = match instrumentation.observer() {
+                        Some(observer) => moe.forward_tensor_parallel_resident_observed(
+                            &format!("{path}.feed_forward"), input, RouteSource::Learned,
+                            ExpertPass::Decode, context, observer, reduce,
+                        )?,
+                        None => reduce(moe.forward(input, RouteSource::Learned, context)?, context)?,
+                    };
                     instrumentation.apply("feed_forward.contribution", output)
                 }
             },
@@ -1096,18 +1089,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                     instrumentation.apply("feed_forward.output", write)
                 }
                 V3FeedForward::Routed(moe) => {
-                    let output = moe.forward_tensor_parallel_with_provider_observed(
-                        &format!("{path}.feed_forward"),
-                        input,
-                        RouteSource::Learned,
-                        pass,
-                        provider,
-                        context,
-                        instrumentation
-                            .observer()
-                            .expect("observed V3 block retains its observer"),
-                        reduce,
-                    )?;
+                    let output = match instrumentation.observer() {
+                        Some(observer) => moe.forward_tensor_parallel_with_provider_observed(
+                            &format!("{path}.feed_forward"), input, RouteSource::Learned,
+                            pass, provider, context, observer, reduce,
+                        )?,
+                        None => moe.forward_tensor_parallel_with_provider(
+                            input, RouteSource::Learned, pass, provider, context, reduce,
+                        )?,
+                    };
                     instrumentation.apply("feed_forward.contribution", output)
                 }
             },
@@ -1160,6 +1150,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
+        if !observer.observes_activations() {
+            return self.forward_internal_observed_with_provider(
+                path, input, mask, cache, pass, provider, context, observer,
+            );
+        }
         let input = observe_and_intervene(observer, &format!("{path}.input"), input)?;
         let output = self.forward_internal_observed_with_provider(
             path, &input, mask, cache, pass, provider, context, observer,
@@ -1201,17 +1196,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                     mlp.forward_instrumented(normalized, context, instrumentation)
                 }
                 V3FeedForward::Routed(moe) => {
-                    let output = moe.forward_with_provider_observed(
-                        &format!("{path}.feed_forward"),
-                        normalized,
-                        RouteSource::Learned,
-                        pass,
-                        provider,
-                        context,
-                        instrumentation
-                            .observer()
-                            .expect("observed V3 block retains its observer"),
-                    )?;
+                    let output = match instrumentation.observer() {
+                        Some(observer) => moe.forward_with_provider_observed(
+                            &format!("{path}.feed_forward"), normalized, RouteSource::Learned,
+                            pass, provider, context, observer,
+                        )?,
+                        None => moe.forward_with_provider(
+                            normalized, RouteSource::Learned, pass, provider, context,
+                        )?,
+                    };
                     instrumentation.apply("feed_forward.contribution", output)
                 }
             },

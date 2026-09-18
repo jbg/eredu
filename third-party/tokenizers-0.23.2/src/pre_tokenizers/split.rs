@@ -24,81 +24,86 @@ impl From<&str> for SplitPattern {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
+/// Borrowed source spelling and its literal/regex interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SplitPatternRef<'a> { String(&'a str), Regex(&'a str) }
+
+#[derive(Debug, Clone)]
 pub struct Split {
-    pub pattern: SplitPattern,
-    #[serde(skip)]
-    pub regex: SysRegex,
+    literal: Option<String>,
+    regex: SysRegex,
     pub behavior: SplitDelimiterBehavior,
     pub invert: bool,
 }
-
-impl<'de> Deserialize<'de> for Split {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        enum Type {
-            Split,
+impl Serialize for Split {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct View<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            pattern: SplitPatternRef<'a>,
+            behavior: SplitDelimiterBehavior,
+            invert: bool,
         }
-
+        View { kind: "Split", pattern: self.pattern(), behavior: self.behavior, invert: self.invert }
+            .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Split {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
-        pub struct SplitHelper {
+        enum Type { Split }
+        #[derive(Deserialize)]
+        struct Input {
             #[serde(rename = "type")]
             _type: Type,
             pattern: SplitPattern,
             behavior: SplitDelimiterBehavior,
             invert: bool,
         }
-
-        let helper = SplitHelper::deserialize(deserializer)?;
-        Self::new(helper.pattern, helper.behavior, helper.invert).map_err(serde::de::Error::custom)
+        let input = Input::deserialize(deserializer)?;
+        Self::new(input.pattern, input.behavior, input.invert).map_err(serde::de::Error::custom)
     }
 }
-
-impl Clone for Split {
-    fn clone(&self) -> Self {
-        Self::new(self.pattern.clone(), self.behavior, self.invert).unwrap()
-    }
-}
-
 impl PartialEq for Split {
     fn eq(&self, other: &Self) -> bool {
-        self.pattern == other.pattern
-            && self.behavior == other.behavior
-            && self.invert == other.invert
+        self.pattern() == other.pattern() && self.behavior == other.behavior && self.invert == other.invert
     }
 }
-
 impl Split {
-    pub fn new<I: Into<SplitPattern>>(
-        pattern: I,
-        behavior: SplitDelimiterBehavior,
-        invert: bool,
-    ) -> Result<Self> {
-        let pattern: SplitPattern = pattern.into();
-        let regex = match &pattern {
-            SplitPattern::String(s) => SysRegex::new(&regex::escape(s))?,
-            SplitPattern::Regex(r) => SysRegex::new(r)?,
+    pub fn new<I: Into<SplitPattern>>(pattern: I, behavior: SplitDelimiterBehavior, invert: bool) -> Result<Self> {
+        let (literal, regex) = match pattern.into() {
+            SplitPattern::String(s) => { let regex = SysRegex::new(&regex::escape(&s))?; (Some(s), regex) }
+            SplitPattern::Regex(s) => (None, SysRegex::new(&s)?),
         };
-
-        Ok(Self {
-            pattern,
-            regex,
-            behavior,
-            invert,
-        })
+        Ok(Self { literal, regex, behavior, invert })
+    }
+    /// Borrows the immutable spelling actually used by this regex program.
+    pub fn pattern(&self) -> SplitPatternRef<'_> {
+        match &self.literal { Some(value) => SplitPatternRef::String(value), None => SplitPatternRef::Regex(self.regex.pattern()) }
+    }
+    #[cfg(feature = "fancy-regex")]
+    pub(crate) fn from_regex(regex: SysRegex) -> Self {
+        Self { literal: None, regex, behavior: SplitDelimiterBehavior::Isolated, invert: false }
+    }
+    #[cfg(feature = "fancy-regex")]
+    pub(crate) fn workspace_plan(&self) -> Option<std::result::Result<fancy_regex::workspace::Plan<'_>, fancy_regex::workspace::PlanError>> {
+        if self.literal.is_some() || self.invert || self.behavior != SplitDelimiterBehavior::Isolated { return None; }
+        self.regex.workspace_plan()
+    }
+    #[cfg(feature = "fancy-regex")]
+    pub(crate) fn compiled_control_bytes() -> Option<usize> {
+        SysRegex::control_bytes()?.checked_add(std::mem::size_of::<Self>())
     }
 }
 
 impl PreTokenizer for Split {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        let matcher = self.regex.matcher()?;
         if self.invert {
-            pretokenized.split(|_, normalized| normalized.split(Invert(&self.regex), self.behavior))
+            pretokenized.split(|_, normalized| normalized.split(Invert(&matcher), self.behavior))
         } else {
-            pretokenized.split(|_, normalized| normalized.split(&self.regex, self.behavior))
+            pretokenized.split(|_, normalized| normalized.split(&matcher, self.behavior))
         }
     }
 }

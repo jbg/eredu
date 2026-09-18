@@ -201,7 +201,7 @@ impl TensorPipelineCollectiveWaves {
                 .map(|_| ())
                 .map_err(|cause| match metadata {
                     Some(metadata) => metadata.metadata_source(cause),
-                    None => eredu_nn::Error::backend_source(cause),
+                    None => eredu_nn::Error::backend_retained_source(cause),
                 })
         };
         if wave == 0 {
@@ -242,9 +242,57 @@ impl TensorPipelineCollectiveWaves {
                 .all_gather_uneven_with_parallel(value, &tensor.vocabulary_widths, 2, self.group, executor, parallel)
                 .map_err(|cause| match metadata {
                     Some(metadata) => metadata.metadata_source(cause),
-                    None => eredu_nn::Error::backend_source(cause),
+                    None => eredu_nn::Error::backend_retained_source(cause),
                 })?;
         }
         Ok(())
+    }
+}
+
+
+/// The real inactive wave destination, admitted before placeholder construction.
+/// Both cold metadata and live original contexts use this same source census.
+pub(super) fn prepare_sum_wave<B, F>(
+    operations: &[crate::composite_execution::CompositeTensorCollective],
+    allocator: &mut F, activation_dtype: PipelineActivationDtype,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    parallel: Option<&B::ParallelContext>,
+) -> Result<Vec<B::Tensor>, eredu_nn::Error>
+where B: eredu_runtime::CommunicationBackend,
+    F: PartitionTensorAllocator<B>,
+{
+    use eredu_nn::workspace::{HostMetadataFunding, WorkspaceMetadataError};
+    let mut construct = |funding: Option<&HostMetadataFunding>| {
+        let metadata = B::construction_metadata(context);
+        let context_funding = metadata.and_then(|context| context.metadata_funding());
+        if let Some(funding) = funding.or(context_funding.as_ref()) {
+            let bytes = operations.len().checked_mul(std::mem::size_of::<B::Tensor>())
+                .and_then(|rows| rows.checked_add(std::mem::size_of::<(
+                    &[crate::composite_execution::CompositeTensorCollective], &mut F,
+                    PipelineActivationDtype, &<B::Tensor as eredu_nn::Tensor>::Context,
+                    Option<&B::ParallelContext>, Vec<B::Tensor>,
+                    Option<&HostMetadataFunding>, Option<HostMetadataFunding>,
+                    Option<&eredu_nn::workspace::WorkspaceContext>,
+                    std::slice::Iter<'_, crate::composite_execution::CompositeTensorCollective>,
+                    Result<B::Tensor, eredu_nn::Error>, Result<Vec<B::Tensor>, eredu_nn::Error>,
+                )>())).ok_or(WorkspaceMetadataError::Overflow)?;
+            funding.reserve_metadata(bytes).map_err(WorkspaceMetadataError::Funding)?;
+        }
+        let mut values = Vec::with_capacity(operations.len());
+        for operation in operations {
+            match operation {
+                crate::composite_execution::CompositeTensorCollective::Sum { shape } => {
+                    values.push(allocator.tensor_placeholder(shape,
+                        eredu_runtime::BoundaryTensorDtype::Activation, activation_dtype, context)?);
+                }
+            }
+        }
+        Ok(values)
+    };
+    match parallel {
+        Some(parallel) => B::with_parallel_control_context(parallel,
+            |prepared| construct(prepared.map(|(_, funding)| funding)))
+            .map_err(eredu_nn::Error::backend_retained_source)?,
+        None => construct(None),
     }
 }

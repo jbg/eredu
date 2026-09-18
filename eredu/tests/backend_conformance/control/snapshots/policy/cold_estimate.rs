@@ -30,7 +30,7 @@ pub(in super::super) fn preparation_bytes() -> Option<u64> {
 }
 pub(in super::super) fn estimate(
     runtime: &ModelRuntime<MockBackend>,
-    pending: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+    pending: Option<PendingTextInput<&Prompt, &MockToken>>,
 ) -> Option<[SnapshotEstimate; 3]> {
     let known = PROBE.with(Cell::get)?;
     COLD_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -51,6 +51,13 @@ pub(in super::super) fn estimate(
         retained_bytes: bytes,
         copy_bytes: bytes,
     }))
+}
+
+pub(in super::super) fn probe_estimate(
+    runtime: &ModelRuntime<MockBackend>,
+    pending: Option<PendingTextInput<&Prompt, &MockToken>>,
+) -> Option<Option<[SnapshotEstimate; 3]>> {
+    PROBE.with(Cell::get).map(|_| estimate(runtime, pending))
 }
 
 struct RefusingHost<'a>(&'a Cell<bool>);
@@ -83,7 +90,7 @@ fn original_estimates_bypass_ordinary_hooks_and_keep_budget_admission_order() {
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = ManagedTextContinuation::root(
             driver
-                .start(vec![11, 7, 3], config(), Controller::default())
+                .start(vec![11, 7, 3].into(), config(), Controller::default())
                 .unwrap(),
         );
         assert!(advance(&mut state, &mut driver).is_some());

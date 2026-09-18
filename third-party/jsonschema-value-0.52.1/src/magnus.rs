@@ -62,11 +62,12 @@ impl Json for Magnus {
         f(RbNode::new(value))
     }
 
-    fn prepare_key(key: &str) -> PreparedKey {
+    fn prepare_key_with_allocations(key: &str, allocations: &dyn serde_json::allocation::Allocation) -> Result<PreparedKey, crate::KeyPreparationError> {
+        if allocations.is_enforced() { return Err(crate::KeyPreparationError::Unqualified("Ruby interned string")); }
         let mut cache = PREPARED_KEYS.lock().unwrap_or_else(PoisonError::into_inner);
         let cache = cache.get_or_insert_with(AHashMap::new);
         if let Some(prepared) = cache.get(key) {
-            return *prepared;
+            return Ok(*prepared);
         }
         // Interning raw bytes assumes US-ASCII and raises above that range, so name the encoding.
         let id =
@@ -78,7 +79,7 @@ impl Json for Magnus {
         unsafe { rb_gc_register_mark_object(string) };
         let prepared = PreparedKey { string, symbol };
         cache.insert(key.into(), prepared);
-        prepared
+        Ok(prepared)
     }
 }
 

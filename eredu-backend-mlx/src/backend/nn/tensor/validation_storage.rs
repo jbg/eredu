@@ -45,7 +45,7 @@ impl TokenValidationIngress {
     /// is still required by begin; custody alone cannot enter or replace it.
     pub(crate) fn prepare_realtime(recipe:crate::backend::nn::workspace::ResidentCompletionRecipe,
         custody:eredu_runtime::working_memory::OriginalRealtimeBudgetCustody,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)->Result<Self,Error> {
+        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<Self,Error> {
         funding.reserve_metadata(usize::try_from(Self::realtime_control_bytes(recipe)?)
             .map_err(|_|Error::PrefillControl(WorkingMemoryError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;

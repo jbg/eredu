@@ -81,7 +81,7 @@ impl RoutedUnitObserver<NumericTensor> for Observer {
         }
         self.rows = Some(rows);
         if self.fail("start") {
-            return Err(Error::backend_source(UnitSentinel));
+            return Err(Error::backend_retained_source(UnitSentinel));
         }
         Ok(())
     }
@@ -101,7 +101,7 @@ impl RoutedUnitObserver<NumericTensor> for Observer {
         }
         self.callbacks += 1;
         if self.fail("units") {
-            return Err(Error::backend_source(UnitSentinel));
+            return Err(Error::backend_retained_source(UnitSentinel));
         }
         Ok(())
     }
@@ -118,7 +118,7 @@ impl RoutedUnitObserver<NumericTensor> for Observer {
             .filter(|event| event.operation == NumericOpaqueOperation::VariableAllToAll)
             .count();
         if fail {
-            return Err(Error::backend_source(UnitSentinel));
+            return Err(Error::backend_retained_source(UnitSentinel));
         }
         if !accepted {
             return Err(Error::backend("another local invocation failed"));
@@ -163,7 +163,7 @@ fn prepared_gated_and_relu2_idle_ep_owners_finish_before_reverse_exchange_on_fai
             )
             .unwrap()
             .parameter_description(&NumericContext::default())
-            .unwrap()
+            .unwrap().into_owned()
         } else {
             nemotron_h::LayeredModel::<NumericBackend>::new(
                 nemotron_h::model_args_from_config_value(&config).unwrap(),
@@ -171,7 +171,7 @@ fn prepared_gated_and_relu2_idle_ep_owners_finish_before_reverse_exchange_on_fai
             )
             .unwrap()
             .parameter_description(&NumericContext::default())
-            .unwrap()
+            .unwrap().into_owned()
         };
         for residency in [
             eredu_core::ResidencyPlan::FullyResident,

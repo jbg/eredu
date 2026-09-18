@@ -121,7 +121,7 @@ pub(super) fn parameters<B: eredu_nn::NeuralBackend, A: RoutedConstructionParame
                 .map_err(RoutedTextPreparationError::Metadata)?;
             let source_units = source.as_ref().map(|source| source.prepare_construction_units(None, context))
                 .transpose().map_err(RoutedTextPreparationError::Metadata)?.flatten();
-            let target = target.parameter_description(context).map_err(|cause| {
+            let target = target.parameter_description(context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(context))).map_err(|cause| {
                 preparation(config_source::constructor_error::<
                     B,
                     std::convert::Infallible,
@@ -129,7 +129,7 @@ pub(super) fn parameters<B: eredu_nn::NeuralBackend, A: RoutedConstructionParame
             })?;
             let source = source
                 .as_ref()
-                .map(|source| source.parameter_description(context))
+                .map(|source| source.parameter_description(context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(context))))
                 .transpose()
                 .map_err(|cause| {
                     preparation(config_source::constructor_error::<

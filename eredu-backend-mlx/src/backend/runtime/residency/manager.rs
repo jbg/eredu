@@ -58,7 +58,7 @@ pub(crate) use construction::{
 };
 mod owner;
 mod rows;
-pub(crate) use owner::ManagerCustody;
+pub(crate) use owner::{ManagerCustody};
 use owner::ManagerOwner;
 pub use owner::{ManagerWeak, ResidentHostOwner, RetainedHostBuffer};
 
@@ -207,6 +207,9 @@ pub enum ResidencyError {
     /// the actual native cause without allocating a residency ID or message.
     #[error("original residency operation: {0}")]
     OriginalNative(#[source] safemlx::error::Exception),
+    /// Exact post-payload registered-role retirement refusal.
+    #[error("original residency retirement: {0}")]
+    OriginalRetirement(#[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause),
     /// Fixed cache-origin refusal. It does not certify streams, sources or rows.
     #[error("original converted-cache owner: {0}")]
     OriginalCache(#[source] eredu_runtime::working_memory::WorkingMemoryError),
@@ -614,8 +617,12 @@ impl ResidencyManager {
                 for buffer in device.arrays.host_sources() {
                     storage.include_retained_host(buffer.clone())?;
                 }
-                for array in device.arrays.values() {
-                    storage.include_array(array)?;
+                for array in device.arrays.retained_values() {
+                    match array {
+                        super::storage::RetainedStorageRef::CanonicalArray(cell) => storage.include_canonical_array(cell)?,
+                        super::storage::RetainedStorageRef::Array(array) => storage.include_array(array)?,
+                        _ => unreachable!("array iterator"),
+                    }
                 }
             }
         }
@@ -808,6 +815,8 @@ impl ResidencyManager {
         let failed_transfer = owner::FailureFlag::new(custody.clone());
         Ok(Self {
             inner: ManagerOwner::new(ManagerInner {
+                parameter_exclusions: None,
+                parameter_constructors: None,
                 sources,
                 host_workspace: std::sync::OnceLock::new(),
                 dense_controller: std::sync::OnceLock::new(),
@@ -1297,6 +1306,29 @@ impl ResidencyManager {
         Ok(())
     }
 
+    /// Drops completed device copies outside the selected unit window, keeping
+    /// the exact persistent alias owners of the admitted source. Callers first
+    /// settle preceding consumers and replace their group-window protection.
+    pub(crate) fn trim_device_units(
+        &self, units: &[OffloadUnitId], active: &[OffloadUnitId],
+    ) -> Result<(), ResidencyError> {
+        if let Some(persistent) = self.original_foreground_persistent_units() {
+            for id in units {
+                if !active.contains(id) && !persistent.clone().any(|owner| owner == id) {
+                    self.evict(id, MemoryTier::Device)?;
+                }
+            }
+        } else {
+            let persistent = self.admitted_disk_persistent_units();
+            for id in units {
+                if !active.contains(id) && !persistent.contains(id) {
+                    self.evict(id, MemoryTier::Device)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Explicitly evicts one host or device copy.
     ///
     /// Evicting an absent copy is an idempotent success returning `false`.
@@ -1336,6 +1368,16 @@ impl ResidencyManager {
             state.control.ledger_mut().sample_process_metrics();
         }
         Ok(())
+    }
+
+    /// Borrows the actual detached payload counter, independently of the
+    /// metadata-only catalog diagnostics returned by `report`.
+    #[cfg(test)]
+    pub(crate) fn detached_physical_read_bytes(&self, source: usize) -> Option<u64> {
+        match &self.inner.sources {
+            ResidencySources::Original(owner) => owner.detached_physical_read_bytes(source),
+            ResidencySources::Ordinary { .. } => None,
+        }
     }
 
     /// Returns an immutable point-in-time residency and storage report.
@@ -1500,6 +1542,7 @@ pub(crate) use named_arrays::{
     NameCatalogOwner, NamePreparationError, NamedPreparationSource, NamedStorageLayout,
 };
 pub use named_arrays::{NamedArrayError, ResidentArraysOwner};
+pub(crate) use named_arrays::CanonicalArrayOwner;
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;
 pub(crate) use materialization::original_host_copy_control_bytes;

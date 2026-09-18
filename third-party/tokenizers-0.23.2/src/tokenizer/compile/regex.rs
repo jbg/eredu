@@ -1,16 +1,15 @@
 //! One exact decoded-pattern selection in the borrowed root, never a family ID.
 use super::*;
 #[cfg(feature = "fancy-regex")]
-use crate::pre_tokenizers::{
-    compiled_byte_level::CompiledByteLevel, compiled_split::CompiledRegexSplit,
-};
+use crate::{pre_tokenizers::split::Split, utils::SysRegex};
 #[cfg(feature = "fancy-regex")]
 use fancy_regex::workspace::construction;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Origin {
     ExplicitSplit,
-    ImplicitByteLevel(ByteLevel),
+    Whitespace,
+    ImplicitByteLevel(ByteLevelSettings),
 }
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RegexSelection {
@@ -41,7 +40,7 @@ pub(super) fn selection(input: &str, span: Span, role: Role) -> Result<RegexSele
         let mut reader = Reader::new(input, pattern);
         let text = reader.string()?;
         reader.finish()?;
-        let source = construction::patterns()
+        let source = SysRegex::declared_patterns()
             .find(|source| text.is(source))
             .ok_or_else(|| err(K::RegexProfile, pattern.start))?;
         Ok(RegexSelection {
@@ -52,13 +51,30 @@ pub(super) fn selection(input: &str, span: Span, role: Role) -> Result<RegexSele
     }
 }
 impl RegexSelection {
+    pub(super) fn is_whitespace(&self) -> bool {
+        matches!(self.origin, Origin::Whitespace)
+    }
     pub(super) fn is_implicit(&self) -> bool {
         matches!(self.origin, Origin::ImplicitByteLevel(_))
     }
 }
+pub(super) fn whitespace(span: Span) -> Result<RegexSelection, Error> {
+    #[cfg(feature = "fancy-regex")]
+    {
+        Ok(RegexSelection {
+            pattern: crate::pre_tokenizers::whitespace::PATTERN,
+            span,
+            origin: Origin::Whitespace,
+        })
+    }
+    #[cfg(not(feature = "fancy-regex"))]
+    {
+        Err(err(K::RegexProfile, span.start))
+    }
+}
 pub(super) fn implicit_byte_level(
     span: Span,
-    settings: ByteLevel,
+    settings: ByteLevelSettings,
 ) -> Result<RegexSelection, Error> {
     #[cfg(not(feature = "fancy-regex"))]
     {
@@ -67,7 +83,7 @@ pub(super) fn implicit_byte_level(
     }
     #[cfg(feature = "fancy-regex")]
     {
-        if settings.add_prefix_space || !settings.use_regex {
+        if !settings.use_regex {
             return Err(err(K::RegexProfile, span.start));
         }
         Ok(RegexSelection {
@@ -78,19 +94,19 @@ pub(super) fn implicit_byte_level(
     }
 }
 #[derive(Debug)]
-pub(super) struct RegexState {
+struct RegexOne {
     selected: Option<RegexSelection>,
     #[cfg(feature = "fancy-regex")]
     plan: Option<construction::Plan<'static>>,
     #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
     failure: Option<construction::ConstructionFailure>,
 }
-impl RegexState {
+impl RegexOne {
     pub(super) fn plan(selected: Option<RegexSelection>) -> Result<Self, Error> {
         #[cfg(feature = "fancy-regex")]
         let plan = selected
             .map(|selection| {
-                construction::Plan::new(selection.pattern).map_err(|error| {
+                SysRegex::construction_plan(selection.pattern).map_err(|error| {
                     err(
                         if matches!(error, construction::PlanError::Overflow) {
                             K::Overflow
@@ -122,13 +138,13 @@ impl RegexState {
         if let Some(plan) = &self.plan {
             return [
                 plan.required_bytes(),
-                CompiledRegexSplit::control_bytes().ok_or_else(|| err(K::Overflow, 0))?,
+                Split::compiled_control_bytes().ok_or_else(|| err(K::Overflow, 0))?,
                 size_of::<Self>(),
                 size_of::<Result<Self, Error>>(),
                 size_of::<RegexSelection>(),
                 size_of::<Origin>(),
                 if self.selected.is_some_and(|selected| selected.is_implicit()) {
-                    CompiledByteLevel::wrapper_control_bytes().ok_or_else(|| err(K::Overflow, 0))?
+                    size_of::<ByteLevel>()
                 } else {
                     0
                 },
@@ -182,13 +198,113 @@ impl RegexState {
                     .map(|_| unreachable!("fixed failure target succeeded"))
                     .map_err(Cause::Regex);
             }
-            let split = CompiledRegexSplit::compile(plan).map_err(Cause::Regex)?;
+            let regex = SysRegex::compile_selected(plan, actual.pattern).map_err(Cause::Regex)?;
             Ok(match selected.origin {
-                Origin::ExplicitSplit => PreTokenizerWrapper::CompiledRegexSplit(split),
-                Origin::ImplicitByteLevel(settings) => PreTokenizerWrapper::CompiledByteLevel(
-                    CompiledByteLevel::from_parts(settings, split),
+                Origin::ExplicitSplit => PreTokenizerWrapper::Split(Split::from_regex(regex)),
+                Origin::Whitespace => PreTokenizerWrapper::Whitespace(
+                    crate::pre_tokenizers::whitespace::Whitespace::from_regex(regex),
                 ),
+                Origin::ImplicitByteLevel(settings) => {
+                    PreTokenizerWrapper::ByteLevel(settings.build().with_compiled_regex(regex))
+                }
             })
         }
+    }
+}
+
+/// Borrowed ordered source inventory. Every constructor is the same RegexOne
+/// worker, selected in source order; its retained heap is summed before C.
+#[derive(Debug)]
+pub(super) struct RegexState<'a> {
+    input: &'a str,
+    component: Component,
+    next: usize,
+    buffers: usize,
+    controls: usize,
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+    failure: Option<(usize, construction::ConstructionFailure)>,
+}
+impl<'a> RegexState<'a> {
+    fn visit(
+        input: &str,
+        component: Component,
+        mut visit: impl FnMut(RegexSelection) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let Some(span) = component.value else {
+            return Ok(());
+        };
+        if let Some(array) = component.array {
+            let mut items = pre::Items::new(input, array, Role::Pre)?;
+            while let Some(span) = items.next()? {
+                if let Inline::Regex(selected) = inline(input, span, Role::Pre)? {
+                    visit(selected)?;
+                }
+            }
+        } else if let Inline::Regex(selected) = inline(input, span, Role::Pre)? {
+            visit(selected)?;
+        }
+        Ok(())
+    }
+    pub(super) fn plan(input: &'a str, component: Component) -> Result<Self, Error> {
+        let mut buffers = 0;
+        let mut controls = add(size_of::<Self>(), size_of::<Result<Self, Error>>())?;
+        controls = add(controls, pre::controls()?)?;
+        Self::visit(input, component, |selected| {
+            let plan = RegexOne::plan(Some(selected))?;
+            buffers = add(buffers, plan.buffer_bytes())?;
+            controls = add(
+                controls,
+                plan.required_bytes()?
+                    .checked_sub(plan.buffer_bytes())
+                    .ok_or_else(|| err(K::Overflow, 0))?,
+            )?;
+            Ok(())
+        })?;
+        Ok(Self {
+            input,
+            component,
+            next: 0,
+            buffers,
+            controls,
+            #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+            failure: None,
+        })
+    }
+    pub(super) fn buffer_bytes(&self) -> usize {
+        self.buffers
+    }
+    pub(super) fn required_bytes(&self) -> Result<usize, Error> {
+        add(self.buffers, self.controls)
+    }
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+    pub(super) fn fail(&mut self, target: construction::ConstructionFailure) {
+        self.fail_at(0, target);
+    }
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+    pub(super) fn fail_at(&mut self, ordinal: usize, target: construction::ConstructionFailure) {
+        self.failure = Some((ordinal, target));
+    }
+    pub(super) fn compile(
+        &mut self,
+        selected: RegexSelection,
+    ) -> Result<PreTokenizerWrapper, Cause> {
+        let mut at = 0;
+        let mut actual = None;
+        Self::visit(self.input, self.component, |item| {
+            if at == self.next {
+                actual = Some(item);
+            }
+            at += 1;
+            Ok(())
+        })?;
+        let mut plan = RegexOne::plan(actual)?;
+        self.next += 1;
+        #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+        if let Some((ordinal, target)) = self.failure {
+            if ordinal + 1 == self.next {
+                plan.fail(target);
+            }
+        }
+        plan.compile(selected)
     }
 }

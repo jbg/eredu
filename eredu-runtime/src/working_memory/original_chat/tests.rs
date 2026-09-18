@@ -118,7 +118,7 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
     let c = tokenizer(&pool);
     let j = pool.compile_chat_template(source_plan()).unwrap();
     let h = pool
-        .chat_render_required_bytes(&j, &c, ChatMessages::from_text(&input), consumer())
+        .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
         .unwrap();
     let source_bytes = c.original_bytes() + j.original_bytes();
     drop((j, c));
@@ -132,7 +132,7 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
         .render_plan(ChatMessages::from_text(&input))
         .unwrap();
     let error = short
-        .render_original_chat_plan(&j, &c, plan, consumer(), || {
+        .render_original_chat_plan(&j, &c, plan, || {
             panic!("short H entered constructor")
         })
         .unwrap_err();
@@ -152,7 +152,7 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
         .render_plan(ChatMessages::from_text(&input))
         .unwrap();
     let render = pool
-        .render_original_chat_plan(&j, &c, plan, consumer(), || {
+        .render_original_chat_plan(&j, &c, plan, || {
             assert_eq!(pool.used_bytes().unwrap(), source_bytes + h);
             assert!(matches!(
                 pool.acquire_unquoted(),
@@ -161,7 +161,6 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
         })
         .unwrap();
     assert!(render.has_sources(&j, &c));
-    assert!(render.accepts_consumer(&consumer()));
     assert!(render.prompt(false).contains("Héllo 世界\0\n"));
     assert_eq!(render.generation_suffix(), "<|im_start|>assistant\n");
     drop(pool.acquire_unquoted().unwrap());
@@ -170,7 +169,7 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
     let j2 = other.compile_chat_template(source_plan()).unwrap();
     assert!(!render.has_sources(&j2, &c2));
     let foreign = other
-        .render_original_chat(&j, &c2, ChatMessages::from_text(&input), consumer())
+        .render_original_chat(&j, &c2, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
         .unwrap_err();
     assert!(matches!(
         foreign.accounting_failure(),
@@ -209,7 +208,7 @@ fn original_h_six_actual_reserve_frontiers_retain_j_c_and_full_h() {
         let j = pool.compile_chat_template(source_plan()).unwrap();
         let base = c.original_bytes() + j.original_bytes();
         let h = pool
-            .chat_render_required_bytes(&j, &c, ChatMessages::from_text(&input), consumer())
+            .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
             .unwrap();
         let plan = j
             .payload()
@@ -218,7 +217,7 @@ fn original_h_six_actual_reserve_frontiers_retain_j_c_and_full_h() {
             .unwrap()
             .fail_reservation(buffer);
         let error = pool
-            .render_original_chat_plan(&j, &c, plan, consumer(), || {})
+            .render_original_chat_plan(&j, &c, plan, || {})
             .unwrap_err();
         assert_eq!(error.retained_bytes(), h);
         assert_eq!(pool.used_bytes().unwrap(), base + h);
@@ -242,7 +241,7 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
     let c = tokenizer(&probe);
     let j = probe.compile_chat_template(source_plan()).unwrap();
     let h = probe
-        .chat_render_required_bytes(&j, &c, ChatMessages::from_text(&input), consumer())
+        .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
         .unwrap();
     let base = c.original_bytes() + j.original_bytes();
     drop((c, j));
@@ -270,7 +269,7 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
                         .source
                         .render_plan(ChatMessages::from_text(input))
                         .unwrap();
-                    pool.render_original_chat_plan(j, c, plan, consumer(), || {
+                    pool.render_original_chat_plan(j, c, plan, || {
                         notified = true;
                         let _ = ready.send(true);
                         let _ = release_recv.recv();
@@ -293,7 +292,7 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
                     pool.acquire_unquoted(),
                     Err(WorkingMemoryError::ReservedWorkActive)
                 ),
-                pool.render_original_chat(&j, &c, ChatMessages::from_text(&input), consumer()),
+                pool.render_original_chat(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input))),
             )
         }));
         drop(releases);
@@ -406,9 +405,9 @@ fn generic_chat_compiler_j_precedes_decode_and_retains_failed_prefix() {
     drop(peer);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 
-    // Real unsupported syntax constructs its packed AST under J and returns an
+    // Invalid source constructs its parser storage under J and returns an
     // owning fixed failure; no borrowed parser storage escapes the account.
-    let text = String::from("{{ messages | length }}");
+    let text = String::from("{% if %}");
     let plan = ChatTemplatePlan::prepare_utf8(&text, "general").unwrap();
     let j = WorkingMemoryPool::chat_template_required_bytes(&plan).unwrap();
     let pool = WorkingMemoryPool::new(j, 0).unwrap();
@@ -425,7 +424,7 @@ fn original_numeric_chat_parser_and_error_remain_under_source_custody() {
     let source = serde_json::to_string(SOURCE).unwrap();
     for number in ["1.25", "1e999"] {
         let config = format!("{{\"unused\":{number},\"chat_template\":{source}}}");
-        let plan = || ChatTemplatePlan::prepare_config(config.as_bytes(), "numeric").unwrap();
+        let plan = || ChatTemplatePlan::prepare_config(config.as_bytes(), "numeric", false).unwrap();
         let j = WorkingMemoryPool::chat_template_required_bytes(&plan()).unwrap();
         let short = WorkingMemoryPool::new(j - 1, 0).unwrap();
         let error = short

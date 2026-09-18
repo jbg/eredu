@@ -30,7 +30,7 @@ fn cases() -> Vec<Case> {
 }
 struct Bind<'w, T>(&'w T);
 impl<'a, T: Tensor + 'a> ParameterVisitorMut<'a, T> for Bind<'_, T> {
-    fn visit_mut(&mut self, _: ParameterMetadata, value: &'a mut T) {
+    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut T) {
         *value = self.0.clone();
     }
 }

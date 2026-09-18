@@ -119,14 +119,14 @@ pub(crate) fn run<D: Destination>(
     }
     Ok(value)
 }
-pub(super) struct Ordinary;
-impl Destination for Ordinary {
-    type Error = anyhow::Error;
-    fn push(&mut self, todo: &mut Vec<Task>, task: Task) -> anyhow::Result<()> {
-        todo.push(task);
+pub(super) struct Ordinary<'a>(pub(super) &'a crate::ParserAllocationFunding);
+impl Destination for Ordinary<'_> {
+    type Error = crate::ParserError;
+    fn push(&mut self, todo: &mut Vec<Task>, task: Task) -> crate::ParserResult<()> {
+        self.0.try_push(todo, task)?;
         Ok(())
     }
-    fn add(&mut self, left: usize, right: usize) -> anyhow::Result<usize> {
-        Ok(left + right)
+    fn add(&mut self, left: usize, right: usize) -> crate::ParserResult<usize> {
+        Ok(left.checked_add(right).ok_or_else(|| self.0.storage_overflow())?)
     }
 }

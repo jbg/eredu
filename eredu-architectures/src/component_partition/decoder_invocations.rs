@@ -2,21 +2,44 @@
 //! storage aliases, child component paths, or input/output name conventions.
 use super::*;
 use eredu_core::{
-    capture::CaptureError, speculative::SpeculativeCaptureScope, ArchitectureNodeKind,
-    ObservationValueType,
+    ArchitectureNodeKind, ObservationValueType, capture::CaptureError,
+    speculative::SpeculativeCaptureScope,
 };
 
 pub(super) fn register(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     parameters: &ArchitectureParameterDescription,
     owns: impl Fn(&eredu_runtime::ParameterGroupOwner) -> bool,
 ) -> Result<(), ComponentPartitionError> {
-    let mut visited = std::collections::BTreeSet::new();
+    worker(
+        observations,
+        descriptor,
+        parameters,
+        owns,
+        Destination(None),
+    )
+}
+pub(super) fn worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    parameters: &ArchitectureParameterDescription,
+    owns: impl Fn(&eredu_runtime::ParameterGroupOwner) -> bool,
+    allocation: Destination<'_>,
+) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &ArchitectureParameterDescription,
+        SourceMap<&str, ()>,
+        Option<bool>,
+    )>()?;
+    allocation.controls_of(&owns)?;
+    let mut visited = SourceMap::new();
     for group in &descriptor.layer_groups {
         for execution in group.passes.iter().flat_map(|pass| &pass.executions) {
             let invalid = || {
-                CaptureError::Invalid(format!(
+                allocation.capture_invalid(format_args!(
                     "invalid declared decoder invocation: {}",
                     execution.node_id
                 ))
@@ -24,13 +47,13 @@ pub(super) fn register(
             let node = descriptor.node(&execution.node_id).ok_or_else(&invalid)?;
             if node.kind != ArchitectureNodeKind::DecoderBlock
                 || execution.physical_layer_index >= group.physical_layer_count
-                || !visited.insert(node.id.as_str())
+                || allocation
+                    .insert(&mut visited, node.id.as_str(), ())?
+                    .is_some()
             {
                 return Err(invalid().into());
             }
-            if crate::speculative_execution::speculative_capture_scope(descriptor, &node.id)?
-                != SpeculativeCaptureScope::Target
-            {
+            if allocation.scope(descriptor, &node.id)? != SpeculativeCaptureScope::Target {
                 continue;
             }
             let mut local = None;
@@ -38,7 +61,7 @@ pub(super) fn register(
                 let point = descriptor
                     .observations
                     .get(path)
-                    .ok_or_else(|| CaptureError::MissingPath(path.clone()))?;
+                    .ok_or_else(|| allocation.capture_missing(path))?;
                 if point.node_id != node.id {
                     return Err(invalid().into());
                 }
@@ -53,21 +76,24 @@ pub(super) fn register(
                 let local = match local {
                     Some(value) => value,
                     None => {
-                        let value = owns(node_invocation_owner(descriptor, parameters, &node.id)?);
+                        let value = owns(invocations::owner(
+                            descriptor, parameters, &node.id, allocation,
+                        )?);
                         local = Some(value);
                         value
                     }
                 };
                 // The other axes (including V4 streams) remain in the catalog.
                 // Existing placements must agree; no overwrite or suffix pairing.
-                let placement = replicated_placement(
+                let placement = observations::placement(
                     descriptor,
                     path,
                     "hidden",
                     local,
                     ObservationHookSite::Unit,
+                    allocation,
                 )?;
-                insert_observation(observations, path, placement)?;
+                observations::insert(observations, path, placement, allocation)?;
             }
         }
     }

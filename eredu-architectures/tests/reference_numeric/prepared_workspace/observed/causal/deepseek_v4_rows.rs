@@ -102,14 +102,13 @@ fn make_model(
 ) {
     let architecture = Architecture::new(args.clone(), context).unwrap();
     let declarations = <Architecture as LayeredArchitecture<NumericBackend, V4State>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 13 + 4 * args.num_hidden_layers as usize);
     for index in 0..args.num_hidden_layers as usize {
         let path = <Architecture as LayeredArchitecture<NumericBackend, V4State>>::unit_path(
             &architecture,
             0,
-            index,
-        )
+            index, None)
         .unwrap();
         for suffix in ["input", "input.effective", "output", "output.effective"] {
             assert!(declarations
@@ -126,8 +125,8 @@ fn make_model(
         experts: usize,
     }
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Load {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let name = metadata.id().as_str();
             let kind = if name.ends_with(".ape") {
                 0
             } else if name.ends_with(".attn_sink") {
@@ -695,7 +694,7 @@ fn v4_target_declarations_do_not_expand_mtp_dspark_or_intervention_policy() {
         }
         let args = deepseek::parse_v4_config(&value).unwrap();
         let model = Architecture::new(args, &NumericContext::default()).unwrap();
-        let declarations = <Architecture as LayeredArchitecture<NumericBackend, V4State>>::prefill_observation_declarations(&model).unwrap();
+        let declarations = <Architecture as LayeredArchitecture<NumericBackend, V4State>>::prefill_observation_declarations(&model, None).unwrap();
         assert_eq!(declarations.len(), 25);
         assert!(declarations
             .iter()

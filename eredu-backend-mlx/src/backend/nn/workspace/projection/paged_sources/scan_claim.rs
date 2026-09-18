@@ -54,7 +54,7 @@ impl OriginalPagedScanSource<'_> {
     pub(crate) fn context(&self) -> &WorkspaceContext {
         self.context
     }
-    pub(crate) fn funding(&self) -> Option<WorkspaceMetadataFunding> {
+    pub(crate) fn funding(&self) -> Option<HostMetadataFunding> {
         self.context.metadata_funding()
     }
     pub(crate) fn publication_controls(&self) -> usize {

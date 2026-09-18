@@ -2,29 +2,9 @@
 use eredu_core::{
     ModelRuntime, TextContinuationBoundary, TextGenerationBackend, TokenFilterController,
 };
-use serde::{Deserialize, Serialize};
-
-/// Supported changes to future sampling only. Omitting `reseed` retains the exact
-/// inherited RNG stream. Sampler strategy, adaptive counters, penalties and token
-/// history remain unchanged; incompatible strategy transitions are not exposed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub struct SamplingOverride {
-    /// New temperature; zero selects greedy standard sampling.
-    pub temperature: Option<f32>,
-    /// Explicit new native RNG seed. Does not reset adaptive or penalty history.
-    pub reseed: Option<u64>,
-}
-
-/// Native facts consumed by shared validation; contains no mutable native handle.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct SamplingStateFacts {
-    /// Current effective temperature.
-    pub temperature: f32,
-    /// The retained sampler requires strictly positive temperature (Mirostat).
-    pub requires_positive_temperature: bool,
-    /// An exact resumable RNG stream exists, including while temporarily greedy.
-    pub has_rng: bool,
-}
+pub use eredu_core::{
+    SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
+};
 
 /// Validated native action. Only the shared policy constructs this value.
 #[derive(Debug, Clone, Copy)]
@@ -41,32 +21,6 @@ impl ValidatedSamplingOverride {
     pub fn reseed(self) -> Option<u64> {
         self.reseed
     }
-}
-
-/// Minimal native mechanism; ordinary sampling and snapshot state keep their
-/// existing owners. Errors must preserve the previous logical sampling state.
-pub trait TextSamplingControlBackend: TextGenerationBackend {
-    /// Side-effect-free facts for the installed sampling state.
-    fn sampling_control_facts(state: &Self::TextGenerationState) -> SamplingStateFacts;
-    /// Prepares any replacement key and proves completion through the existing
-    /// recovery owner before installing temperature/key together. Consumes no RNG
-    /// draw, submits no model prediction and leaves all sampler history intact.
-    fn install_sampling_override(
-        runtime: &mut ModelRuntime<Self>,
-        state: &mut Self::TextGenerationState,
-        request: ValidatedSamplingOverride,
-    ) -> Result<(), Self::Error>;
-}
-
-/// Invalid policy is rejected before any native operation or state change.
-#[derive(Debug, thiserror::Error)]
-pub enum SamplingOverrideError<E: std::error::Error + 'static> {
-    /// Invalid or incompatible temperature/RNG policy.
-    #[error("invalid sampling override: {0}")]
-    Invalid(&'static str),
-    /// Native replacement preparation failed, preserving the prior logical state.
-    #[error("native sampling override failed: {0}")]
-    Backend(#[source] E),
 }
 
 /// Shared prospective-temperature and RNG admission for ordinary and speculative runs.
@@ -103,8 +57,7 @@ pub fn apply_sampling_override<B: TextSamplingControlBackend, C: TokenFilterCont
     boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
     request: SamplingOverride,
 ) -> Result<SamplingStateFacts, SamplingOverrideError<B::Error>> {
-    let (runtime, state, _) = boundary.mechanism_parts();
-    apply_prepared_sampling_override(runtime, state, request)
+    boundary.sampling_boundary().apply(request)
 }
 
 /// Validates a prospective change on detached, independently prepared generation
@@ -116,6 +69,17 @@ pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
     state: &mut B::TextGenerationState,
     request: SamplingOverride,
 ) -> Result<SamplingStateFacts, SamplingOverrideError<B::Error>> {
+    B::apply_sampling_override(runtime, state, None, request)
+}
+
+/// Shared policy validation before a backend prepares any native replacement.
+/// This grants no storage or submission authority; the concrete installer must
+/// admit its exact revised program before publishing the new facts.
+pub fn prepare_sampling_override<B: TextSamplingControlBackend>(
+    runtime: &ModelRuntime<B>,
+    state: &B::TextGenerationState,
+    request: SamplingOverride,
+) -> Result<ValidatedSamplingOverride, SamplingOverrideError<B::Error>> {
     if let eredu_core::execution_control::ControlSupport::Unsupported { .. } =
         B::text_sampling_control_support(runtime)
     {
@@ -123,9 +87,7 @@ pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
             "loaded execution does not support sampling overrides",
         ));
     }
-    let action = validate_sampling_override(B::sampling_control_facts(state), request)?;
-    B::install_sampling_override(runtime, state, action).map_err(SamplingOverrideError::Backend)?;
-    Ok(B::sampling_control_facts(state))
+    validate_sampling_override(B::sampling_control_facts(state), request)
 }
 
 #[cfg(test)]
@@ -165,28 +127,32 @@ mod tests {
         };
         assert_eq!(check(retained, stochastic).unwrap().reseed(), None);
         for invalid in [f32::NAN, f32::INFINITY, -1.0] {
-            assert!(check(
-                retained,
-                SamplingOverride {
-                    temperature: Some(invalid),
-                    reseed: None
-                }
-            )
-            .is_err());
+            assert!(
+                check(
+                    retained,
+                    SamplingOverride {
+                        temperature: Some(invalid),
+                        reseed: None
+                    }
+                )
+                .is_err()
+            );
         }
         let adaptive = SamplingStateFacts {
             temperature: 0.8,
             requires_positive_temperature: true,
             has_rng: true,
         };
-        assert!(check(
-            adaptive,
-            SamplingOverride {
-                temperature: Some(0.0),
-                reseed: None
-            }
-        )
-        .is_err());
+        assert!(
+            check(
+                adaptive,
+                SamplingOverride {
+                    temperature: Some(0.0),
+                    reseed: None
+                }
+            )
+            .is_err()
+        );
         assert_eq!(
             check(adaptive, SamplingOverride::default())
                 .unwrap()

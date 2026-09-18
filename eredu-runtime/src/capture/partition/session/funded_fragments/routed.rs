@@ -26,7 +26,7 @@ impl PreparedPartitionFragmentAllowance {
     /// The ordinary global/local receipt cost equation with exact sparse inputs.
     /// Native loans remain unavailable until this typed source is coordinated.
     pub fn prepare_routed<T:PartitionCaptureTransport>(transport:&T,receipt:&mut PartitionCaptureReceiptPlan,
-        sources:&[PartitionCaptureRoutedFragmentSource<'_>],metadata:&WorkspaceMetadataFunding,
+        sources:&[PartitionCaptureRoutedFragmentSource<'_>],metadata:&HostMetadataFunding,
         ledger:&mut dyn CaptureReservation)->Result<Self,PartitionCaptureFragmentAllowanceError>
     where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
         Self::prepare_sources(transport,receipt,Sources::RoutedTyped(sources),metadata,ledger)

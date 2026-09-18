@@ -31,7 +31,7 @@ fn admitted_source_program_preserves_independent_peaks_paged_partitions_and_spen
     let exact = 64 + quote.incremental_bytes();
     assert!(matches!(sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded { .. }))));
-    let (_, reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &reservation).unwrap();
     let held = span.protected_host_bytes();

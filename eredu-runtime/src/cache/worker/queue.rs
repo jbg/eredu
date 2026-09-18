@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::{
     collections::VecDeque,
@@ -16,7 +16,7 @@ struct Storage<Task, Output> {
     maximum: usize,
     prepared: bool,
     // Every queued task retires before this destination's source custody.
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 struct State<Task, Output> {
     storage: Storage<Task, Output>,

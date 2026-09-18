@@ -11,27 +11,124 @@ use serde::ser::{Impossible, Serialize};
 impl Serialize for Value {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
-    where
-        S: ::serde::Serializer,
-    {
-        match self {
+    where S: ::serde::Serializer {
+        ValueRef { value: self, context: None }.serialize(serializer)
+    }
+}
+struct ValueRef<'a> {
+    value: &'a Value,
+    context: Option<&'a Serialization<'a>>,
+}
+impl Serialize for ValueRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
+    where S: ::serde::Serializer {
+        if let Some(context) = self.context {
+            let parts = [
+                core::mem::size_of::<Self>(), core::mem::size_of::<S>(),
+                core::mem::size_of::<S::SerializeSeq>(), core::mem::size_of::<S::SerializeMap>(),
+                core::mem::size_of::<result::Result<S::Ok, S::Error>>(),
+                core::mem::size_of::<crate::map::Iter<'_>>(),
+                core::mem::size_of::<core::slice::Iter<'_, Value>>(),
+                core::mem::size_of::<(&str, &Value)>(),
+            ];
+            let control = parts.iter().try_fold(core::mem::size_of_val(&parts), |a,b| a.checked_add(*b));
+            let result = control.ok_or(crate::allocation::AllocationError::SizeOverflow)
+                .and_then(|bytes| context.funding.reserve(bytes));
+            if let Err(error) = result {
+                context.failure.set(Some(error));
+                // This wrapper is used with the paid writer only. Its next write
+                // returns the pre-admitted fixed I/O error without a diagnostic.
+                return serializer.serialize_unit();
+            }
+        }
+        match self.value {
             Value::Null => serializer.serialize_unit(),
             Value::Bool(b) => serializer.serialize_bool(*b),
             Value::Number(n) => n.serialize(serializer),
             Value::String(s) => serializer.serialize_str(s),
-            Value::Array(v) => v.serialize(serializer),
+            Value::Array(values) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = tri!(serializer.serialize_seq(Some(values.len())));
+                for value in values {
+                    tri!(seq.serialize_element(&ValueRef { value, context: self.context }));
+                }
+                seq.end()
+            }
             #[cfg(any(feature = "std", feature = "alloc"))]
-            Value::Object(m) => {
+            Value::Object(values) => {
                 use serde::ser::SerializeMap;
-                let mut map = tri!(serializer.serialize_map(Some(m.len())));
-                for (k, v) in m {
-                    tri!(map.serialize_entry(k, v));
+                let mut map = tri!(serializer.serialize_map(Some(values.len())));
+                for (key, value) in values {
+                    tri!(map.serialize_entry(key, &ValueRef { value, context: self.context }));
                 }
                 map.end()
             }
             #[cfg(not(any(feature = "std", feature = "alloc")))]
             Value::Object(_) => unreachable!(),
         }
+    }
+}
+struct Serialization<'a> {
+    funding: &'a dyn crate::allocation::Allocation,
+    failure: core::cell::Cell<Option<crate::allocation::AllocationError>>,
+}
+/// A serialization refusal retains no unfunded owned diagnostic.
+#[derive(Debug)]
+pub enum ValueWriteError {
+    /// The caller refused a reached writer or traversal producer.
+    Allocation(crate::allocation::AllocationError),
+    /// The ordinary serializer rejected the value.
+    Serialization(Error),
+}
+impl core::fmt::Display for ValueWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self { Self::Allocation(e) => e.fmt(f), Self::Serialization(e) => e.fmt(f) }
+    }
+}
+#[cfg(feature = "std")]
+impl std::error::Error for ValueWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self { Self::Allocation(e) => e, Self::Serialization(e) => e })
+    }
+}
+#[cfg(feature = "std")]
+impl Value {
+    /// Serialize through the ordinary Value/serde worker with prospective
+    /// traversal controls and output growth. The enclosing owner retains funding.
+    pub fn to_string_with_allocations(&self, funding: &dyn crate::allocation::Allocation)
+        -> result::Result<String, ValueWriteError>
+    {
+        use crate::allocation::{AllocationError, Allocator};
+        struct Writer<'a> { context: &'a Serialization<'a>, bytes: Vec<u8> }
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let result = if let Some(error) = self.context.failure.get() { Err(error) }
+                else {
+                    self.bytes.len().checked_add(bytes.len()).ok_or(AllocationError::SizeOverflow)
+                        .and_then(|n| Allocator::new(self.context.funding).grow(&mut self.bytes, n))
+                };
+                if let Err(error) = result {
+                    self.context.failure.set(Some(error));
+                    return Err(std::io::ErrorKind::Other.into());
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let controls = [Error::io_storage_bytes(), core::mem::size_of::<Serialization<'_>>(),
+            core::mem::size_of::<Writer<'_>>(), core::mem::size_of::<ValueWriteError>(),
+            core::mem::size_of::<crate::Serializer<&mut Writer<'_>>>(),
+            core::mem::size_of::<result::Result<String, ValueWriteError>>()];
+        let controls = controls.iter().try_fold(core::mem::size_of_val(&controls), |a,b| a.checked_add(*b))
+            .ok_or(ValueWriteError::Allocation(AllocationError::SizeOverflow))?;
+        funding.reserve(controls).map_err(ValueWriteError::Allocation)?;
+        let context = Serialization { funding, failure: core::cell::Cell::new(None) };
+        let mut writer = Writer { context: &context, bytes: Vec::new() };
+        let result = crate::to_writer(&mut writer, &ValueRef { value: self, context: Some(&context) });
+        if let Some(error) = context.failure.get() { return Err(ValueWriteError::Allocation(error)); }
+        result.map_err(ValueWriteError::Serialization)?;
+        Ok(String::from_utf8(writer.bytes).expect("serde serialized UTF-8"))
     }
 }
 

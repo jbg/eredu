@@ -62,7 +62,7 @@ where
     type Telemetry = SpeculativeComponentTimings;
     type Error = Error;
 
-    fn request_context<'a>(request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error>{external_flow_stage("request-context");context.request_context(request)}
+    fn request_context<'a>(request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error>{context.request_context(request)}
     fn coordinate_speculative_buffer(
         local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
         context: Self::Context<'_>,
@@ -116,7 +116,7 @@ where
                 std::mem::size_of::<eredu_architectures::external_assistant::ExternalOperationResult<MlxTensor>>(),
                 std::mem::size_of::<(&Packet<MlxTensor>,ExternalAssistantTransfer,Self::Context<'_>)>()];
             funding.reserve_metadata(controls.into_iter().try_fold(std::mem::size_of_val(&controls),usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
                 .map_err(Error::WorkspacePlanning)?;
             if context.original_external().is_none(){return Err(<Self as ExternalAssistantExecutionMechanisms<A>>::state_refusal(context));}
             match context.topology(){
@@ -149,7 +149,6 @@ where
         assistant: &mut Self::Assistant, arguments: I::Arguments<'_, Self::Tensor>,
         context: Self::Context<'_>,
     ) -> Result<eredu_architectures::external_assistant::ExternalOperationResult<I::Output<Self::Tensor>>, Self::Error> {
-        external_flow_stage("assistant-operation");
         if context.original_external().is_some() {
             return super::assistant::execute_original_assistant::<A,I>(assistant, arguments, context)
                 .map_err(Error::from);
@@ -223,8 +222,6 @@ where
     }
 
     fn with_prepared_input_cache_identity<R>(input:&Self::Input,run:impl FnOnce(&eredu_runtime::PreparedInputCacheIdentity)->R)->Result<R,Self::Error>{
-        external_flow_stage("prepared-input-identity");
-        if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some(){eprintln!("EXTERNAL_INPUT_HAS_IDENTITY {}",input.cache_identity().is_some());}
         input.cache_identity().map(run).ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))
     }
     fn identity_text(arguments:std::fmt::Arguments<'_>,context:Self::Context<'_>)->Result<eredu_runtime::SpeculativeIdentity,Self::Error>{
@@ -236,7 +233,6 @@ where
         }else{eredu_runtime::SpeculativeIdentity::new(arguments.to_string()).map_err(|cause|ordinary_error(cause.to_string()))}
     }
     fn checkpoint_native_with_context(cache:&Self::NativeCache,context:Self::Context<'_>)->Result<Self::NativeCacheCheckpoint,Self::Error>{
-        external_flow_stage("checkpoint-cache");
         if context.original_external().is_some(){original_cache_copy(cache,context)}else{cache.deep_clone().map_err(Error::from)}
     }
 
@@ -313,7 +309,6 @@ where
         eredu_runtime::replicated_session::PrefillSourceProgress<Option<Self::Tensor>>,
         Self::Error,
     > {
-        external_flow_stage("target-prefill-spans");
         target.prefill_external_prediction_spans(input,request,cache,receiver,cancellation,context)
     }
     fn supports_prefill_observation(assistant: &Self::Assistant, context_values: bool) -> bool {
@@ -635,7 +630,6 @@ where
     fn state_buffer_bytes<T>(capacity:usize)->Option<usize>{super::autoregressive::host_containers::buffer_bytes::<T>(capacity)}
     fn state_dimension<'a>(value:&Self::Tensor,axis:usize,context:Self::Context<'a>)->Result<usize,Self::Error>{state::dimension(value,axis,context)}
     fn state_refusal<'a>(context:Self::Context<'a>)->Self::Error{
-        external_flow_stage("state-refusal");
         let cause=eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch;
         match context.original_numerical(){Some((sources,_))=>sources.retain_startup_error(cause),None=>Error::PrefillControl(cause)}
     }
@@ -648,7 +642,7 @@ where
         let parts=[std::mem::size_of::<I>(),std::mem::size_of::<I::IntoIter>(),
             std::mem::size_of::<Result<Self::Completion,Error>>(),std::mem::size_of::<Self::Context<'_>>()];
         sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let values=values.into_iter();
         // The repeatable source traversal validates each exact completed backing.
         let evidence=state::join(|f|{for value in values.clone(){f(value)}},evidence,context)?.ok_or_else(||sources.retain_startup_error(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
@@ -678,8 +672,4 @@ fn original_cache_copy(cache:&MlxPredictionTargetState,context:SpeculativeExecut
         .map_err(|cause|sources.retain_error(cause))
 }
 
-// Temporary attribution only. Disabled in ordinary builds and removed after
-// the reached original external source mismatch is localized.
-fn external_flow_stage(stage:&'static str){
-    if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some(){eprintln!("EXTERNAL_FLOW_STAGE {stage}");}
-}
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

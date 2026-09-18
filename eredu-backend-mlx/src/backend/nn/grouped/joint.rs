@@ -12,7 +12,7 @@ use safemlx::{
     Array, Stream,
 };
 fn compute<T>(value: Result<T, Exception>) -> Result<T, ComputeError> {
-    value.map_err(ComputeError::backend_source)
+    value.map_err(ComputeError::backend_retained_source)
 }
 pub(crate) fn joint_selection(
     input: JointGroupSelectionInput<'_, MlxTensor>,
@@ -43,7 +43,7 @@ pub(crate) fn joint_selection(
     let coefficients = compute(nn::log_sigmoid(all_logits, context))?;
     let coefficients = compute(softmax_axis(coefficients, -1, true, context))?;
     let coefficients = compute(coefficients.multiply(
-        Array::try_from_f32(input.coefficient_scale()).map_err(ComputeError::backend_source)?,
+        Array::try_from_f32(input.coefficient_scale()).map_err(ComputeError::backend_retained_source)?,
         context,
     ))?;
     let coefficients = compute(coefficients.multiply(input.global_scale().as_array(), context))?;

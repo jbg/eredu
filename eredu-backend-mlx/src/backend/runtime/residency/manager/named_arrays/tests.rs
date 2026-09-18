@@ -25,6 +25,33 @@ pub(crate) struct FirstNamedOwners {
     first: ResidentArraysOwner,
     second: ResidentArraysOwner,
 }
+impl FirstNamedOwners {
+    pub(crate) fn collect_plain_before_canonical(
+        &self,
+    ) -> super::super::super::storage::CanonicalCollectionFixture {
+        use super::super::super::storage::{CanonicalCollectionFixture, RetainedStorageRef};
+        let cell = self
+            .first
+            .arrays
+            .arrays
+            .retained_values()
+            .find_map(|value| match value {
+                RetainedStorageRef::CanonicalArray(cell)
+                    if std::ptr::eq(
+                        cell.array(),
+                        self.first.arrays.arrays.get("own_a").unwrap(),
+                    ) =>
+                {
+                    Some(cell)
+                }
+                _ => None,
+            })
+            .expect("actual prepared canonical destination");
+        let collected = CanonicalCollectionFixture::new(cell);
+        collected.assert_values();
+        collected
+    }
+}
 impl NamedArraysFixture {
     /// Every stream, source and reference numerical value is prepared before
     /// entering either original request's Source role.
@@ -254,6 +281,7 @@ impl NamedArraysFixture {
     pub(crate) fn second_request(
         &mut self,
         old: FirstNamedOwners,
+        mut collected: super::super::super::storage::CanonicalCollectionFixture,
         controls: &OriginalTextControlGuard,
         old_pool: &WorkingMemoryPool,
     ) {
@@ -295,7 +323,6 @@ impl NamedArraysFixture {
             warm_alias.arrays.arrays.get("other_b").unwrap(),
             ordinary_owner.arrays.arrays.get("own_b").unwrap()
         ));
-        drop(warm_alias);
         let mut second = window.take_unit(&self.manager.inner, unit).unwrap();
         second
             .arrays
@@ -325,6 +352,20 @@ impl NamedArraysFixture {
             .publish(&self.manager.inner, unit)
             .unwrap_or_else(|_| panic!("complete second table"));
         drop(state);
+        // A different genuine prepared cell contains the same physical Array,
+        // but has this later request's custody. It must not replace A's proof
+        // source merely because its native allocation key is equal.
+        let conflicting = warm_alias
+            .arrays
+            .arrays
+            .retained_values()
+            .find_map(|value| match value {
+                super::super::super::storage::RetainedStorageRef::CanonicalArray(cell) => Some(cell),
+                _ => None,
+            })
+            .expect("later request canonical cell");
+        collected.reject_conflict(conflicting);
+        drop(warm_alias);
         drop(old);
         assert!(
             old_pool.used_bytes().unwrap() > 0,
@@ -335,6 +376,13 @@ impl NamedArraysFixture {
             old_a
         );
         drop(second);
+        collected.assert_values();
+        let with_original_cell = old_pool.used_bytes().unwrap();
+        drop(collected);
+        assert!(
+            old_pool.used_bytes().unwrap() < with_original_cell,
+            "retiring the last upgraded row releases A while B remains live"
+        );
         // The composition caller performs the final ordinary pool settlement
         // after this distinct original role also tears down. No global reap is
         // used as evidence while the old cell is live.

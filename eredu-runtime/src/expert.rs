@@ -874,7 +874,7 @@ impl<T> Clone for IndexedInvocationRequest<'_, T> {
 /// Neither this loan nor the marker creates execution authority.
 pub trait IndexedInvocationCallback<T: Tensor, M> {
     fn movement(&mut self) -> &mut M;
-    fn run(&mut self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+    fn run(&mut self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>)
         -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>;
 }
 
@@ -882,12 +882,12 @@ pub trait IndexedInvocationCallback<T: Tensor, M> {
 pub struct BorrowedIndexedInvocation<'a, P, M, T: Tensor> {
     owner: &'a mut P,
     movement: fn(&mut P) -> &mut M,
-    run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+    run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::HostMetadataFunding>)
         -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>,
 }
 impl<'a, P, M, T: Tensor> BorrowedIndexedInvocation<'a, P, M, T> {
     pub fn new(owner: &'a mut P, movement: fn(&mut P) -> &mut M,
-        run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::HostMetadataFunding>)
             -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>) -> Self {
         Self { owner, movement, run }
     }
@@ -895,7 +895,7 @@ impl<'a, P, M, T: Tensor> BorrowedIndexedInvocation<'a, P, M, T> {
 }
 impl<P, M, T: Tensor> IndexedInvocationCallback<T, M> for BorrowedIndexedInvocation<'_, P, M, T> {
     fn movement(&mut self) -> &mut M { (self.movement)(self.owner) }
-    fn run(&mut self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+    fn run(&mut self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>)
         -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()> { (self.run)(self.owner, funding) }
 }
 
@@ -1010,13 +1010,13 @@ where
 #[derive(Clone, Copy)]
 pub struct PreparedExpertMovementLoan<'a> {
     source: &'a dyn std::any::Any,
-    funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: &'a eredu_nn::workspace::HostMetadataFunding,
 }
 impl<'a> PreparedExpertMovementLoan<'a> {
     pub fn new(source: &'a dyn std::any::Any,
-        funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding) -> Self { Self { source, funding } }
+        funding: &'a eredu_nn::workspace::HostMetadataFunding) -> Self { Self { source, funding } }
     pub fn source<T: std::any::Any>(&self) -> Option<&'a T> { self.source.downcast_ref() }
-    pub fn funding(&self) -> &'a eredu_nn::workspace::WorkspaceMetadataFunding { self.funding }
+    pub fn funding(&self) -> &'a eredu_nn::workspace::HostMetadataFunding { self.funding }
 }
 
 /// A present original source requires an actual movement producer.
@@ -1616,7 +1616,7 @@ where
 }
 
 /// Stable bank-specific routing observation metadata.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RoutedObservationPoint {
     path: String,
     expert_count: i32,
@@ -1632,52 +1632,8 @@ impl RoutedObservationPoint {
     }
 }
 
-/// Independently identified routed observation points within one logical layer.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RoutedObservationPoints(
-    std::collections::BTreeMap<RoutedBankId, RoutedObservationPoint>,
-);
-impl RoutedObservationPoints {
-    /// Declares the first routing bank in a logical layer.
-    pub fn new(bank: RoutedBankId, path: impl Into<String>, expert_count: i32) -> Self {
-        Self(std::collections::BTreeMap::from([(
-            bank,
-            RoutedObservationPoint {
-                path: path.into(),
-                expert_count,
-            },
-        )]))
-    }
-    /// Adds a distinct bank without replacing an existing observation identity.
-    pub fn with_bank(
-        mut self,
-        bank: RoutedBankId,
-        path: impl Into<String>,
-        expert_count: i32,
-    ) -> Result<Self, eredu_nn::Error> {
-        if self.0.contains_key(&bank) {
-            return Err(eredu_nn::Error::backend(
-                "duplicate routed observation bank",
-            ));
-        }
-        self.0.insert(
-            bank,
-            RoutedObservationPoint {
-                path: path.into(),
-                expert_count,
-            },
-        );
-        Ok(self)
-    }
-    /// Borrow every actual bank identity in stable bank order without cloning paths.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (RoutedBankId, &RoutedObservationPoint)> {
-        self.0.iter().map(|(bank, point)| (*bank, point))
-    }
-    /// Resolves one bank's canonical path and global cardinality.
-    pub fn bank(&self, bank: RoutedBankId) -> Option<&RoutedObservationPoint> {
-        self.0.get(&bank)
-    }
-}
+mod observation_points;
+pub use observation_points::RoutedObservationPoints;
 
 /// Failure from either canonical expert execution or its observation hook.
 #[derive(Debug)]
@@ -1737,7 +1693,7 @@ impl<P: std::error::Error + Send + Sync + 'static> ObservedExpertProviderError<P
     pub fn into_neural_error(self) -> eredu_nn::Error {
         match self {
             Self::Unit(error) | Self::Observer(error) => error,
-            other => eredu_nn::Error::backend_source(other),
+            other => eredu_nn::Error::backend_retained_source(other),
         }
     }
 }
@@ -1880,11 +1836,9 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let point = self
-            .point
-            .bank(request.bank)
-            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
-            .clone();
+        let points = self.point.clone();
+        let point = points.bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?;
         let routes = request.routes;
         let output = with_routed_unit_observer(self.observer, point.path(), request, |request| {
             self.provider
@@ -1906,11 +1860,9 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let point = self
-            .point
-            .bank(request.bank)
-            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
-            .clone();
+        let points = self.point.clone();
+        let point = points.bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?;
         let routes = request.routes;
         let output = self
             .provider
@@ -1926,11 +1878,9 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let point = self
-            .point
-            .bank(request.bank)
-            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
-            .clone();
+        let points = self.point.clone();
+        let point = points.bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?;
         let routes = request.routes;
         let output = with_routed_unit_observer(self.observer, point.path(), request, |request| {
             self.provider
@@ -2204,7 +2154,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         if request.unit_observer.is_some() {
-            return Err(eredu_nn::Error::backend_source(
+            return Err(eredu_nn::Error::backend_retained_source(
                 eredu_nn::GroupedUnitError::Unavailable,
             ));
         }

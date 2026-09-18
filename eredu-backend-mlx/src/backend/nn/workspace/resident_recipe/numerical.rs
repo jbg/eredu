@@ -81,8 +81,12 @@ impl SpeculativeNumericalRecipe {
         let invalid = || context.metadata_error(format_args!("CPU range source differs from its exact alias equation"));
         let [operation] = report.operations.as_slice() else { return Err(invalid()); };
         let operation = operation.as_view();
-        if !matches!(operation.kind, eredu_nn::workspace::WorkspaceOperationKindView::Index { selected_axes: 0 })
-            || operation.inputs.len() != 1 || operation.outputs.len() != 1 { return Err(invalid()); }
+        let eredu_nn::workspace::WorkspaceOperationKindView::StaticSlice { strides, .. } = operation.kind else {
+            return Err(invalid());
+        };
+        if !super::basic::is_static_slice(operation) || strides.iter().any(|&step| step != 1) {
+            return Err(invalid());
+        }
         let input = operation.inputs.get(0).ok_or_else(invalid)?;
         let output = operation.outputs.get(0).ok_or_else(invalid)?;
         let rank = input.shape().len();

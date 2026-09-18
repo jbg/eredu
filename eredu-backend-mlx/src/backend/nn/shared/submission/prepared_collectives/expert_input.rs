@@ -1,13 +1,13 @@
 //! Lexical completed-ID loan under an explicitly retained model context.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error("expert route source is not a selected rank-two integer tensor")]
     Geometry,
     #[error("expert route source readout funding: {0}")]
-    Funding(#[source] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    Funding(#[source] eredu_nn::workspace::HostMetadataFundingError),
     #[error("expert route source readout allocation: {0}")]
     Allocation(#[source] std::collections::TryReserveError),
     #[error("expert route source has no active original observer")]
@@ -24,31 +24,31 @@ enum Cause {
 struct Failure {
     #[source]
     cause: Cause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
-fn retain(cause: Cause, funding: &WorkspaceMetadataFunding) -> Error {
+fn retain(cause: Cause, funding: &HostMetadataFunding) -> Error {
     Error::Other(Box::new(Failure { cause, funding: funding.clone() }))
 }
 
 pub(in crate::backend::nn::shared::submission) fn with_indices<T,E,F>(value:&MlxTensor,context:&Group,stream:&Stream,run:F)
     ->Result<Result<T,E>,Error>
-where F:for<'loan> FnOnce(Option<(&'loan[i32],&'loan WorkspaceMetadataFunding)>)->Result<T,E> {
+where F:for<'loan> FnOnce(Option<(&'loan[i32],&'loan HostMetadataFunding)>)->Result<T,E> {
     MlxNeuralBackend::with_parallel_control_context(context, |prepared| {
         let Some((_, funding)) = prepared else { return Ok(run(None)); };
         let controls = [
             size_of::<(&MlxTensor,&Group,&Stream)>(), size_of::<F>(),
             size_of::<Result<T,E>>(), size_of::<Result<Result<T,E>,Error>>(),
             size_of::<Failure>(), size_of::<Cause>(), size_of::<Box<Failure>>(),
-            size_of::<Error>(), size_of::<WorkspaceMetadataFunding>(),
+            size_of::<Error>(), size_of::<HostMetadataFunding>(),
             size_of::<safemlx::OriginalScopeObserver>(),
             size_of::<Result<Option<safemlx::OriginalScopeObserver>,safemlx::error::Exception>>(),
             size_of::<safemlx::EvaluatedArray<'_>>(),
             size_of::<Result<safemlx::EvaluatedArray<'_>,safemlx::error::Exception>>(),
             size_of::<Option<Array>>(), size_of::<Result<Array,safemlx::error::Exception>>(),
             size_of::<Vec<i32>>(), size_of::<Result<(),std::collections::TryReserveError>>(),
-            size_of::<Result<(),eredu_nn::workspace::WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(),eredu_nn::workspace::HostMetadataFundingError>>(),
             size_of::<(usize,usize,Option<usize>)>(),
-            size_of::<Option<(&[i32],&WorkspaceMetadataFunding)>>(),
+            size_of::<Option<(&[i32],&HostMetadataFunding)>>(),
         ];
         let bytes = controls.iter().copied().try_fold(size_of_val(&controls),usize::checked_add)
             .and_then(|bytes|bytes.checked_add(safemlx::OriginalScopeObserver::control_bytes()?))

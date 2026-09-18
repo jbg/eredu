@@ -1,6 +1,6 @@
 //! Exact borrowed source of the already selected shared addressable cache.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::parameter_operations::PreparedBankParameterMember;
 use std::{mem::{size_of, size_of_val}, sync::{MutexGuard, TryLockError}};
 
@@ -15,7 +15,7 @@ pub(crate) enum AddressableSourceCause {
     #[error("addressable source metadata accounting overflowed")]
     Overflow,
     #[error("addressable source metadata: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
 }
 
 /// A failed source query keeps its original metadata reservation alive.
@@ -25,7 +25,7 @@ pub(crate) struct AddressableSourceFailure {
     #[source]
     cause: AddressableSourceCause,
     source: SharedAddressableParameterBank,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for AddressableSourceFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,7 +102,7 @@ impl AddressableBankSourceLoan<'_> {
 impl SharedAddressableParameterBank {
     /// Runs a counted metadata census under one nonblocking immutable pool loan.
     /// The callback cannot return borrowed members or keep the lock alive.
-    pub(crate) fn with_workspace_source<T, E, F>(&self, funding: &WorkspaceMetadataFunding,
+    pub(crate) fn with_workspace_source<T, E, F>(&self, funding: &HostMetadataFunding,
         inspect: F) -> Result<Result<T, E>, AddressableSourceFailure>
     where F: for<'loan> FnOnce(AddressableBankSourceLoan<'loan>) -> Result<T, E> {
         let failure = |cause| AddressableSourceFailure { cause, source: self.clone(), funding: funding.clone() };
@@ -112,7 +112,7 @@ impl SharedAddressableParameterBank {
             size_of::<F>(), size_of::<Result<T, E>>(),
             size_of::<Result<Result<T, E>, AddressableSourceFailure>>(),
             size_of::<AddressableSourceFailure>(), size_of::<AddressableSourceCause>(),
-            size_of::<WorkspaceMetadataFunding>(), size_of::<Option<usize>>()];
+            size_of::<HostMetadataFunding>(), size_of::<Option<usize>>()];
         let bytes = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
             .ok_or_else(|| failure(AddressableSourceCause::Overflow))?;
         funding.reserve_metadata(bytes)

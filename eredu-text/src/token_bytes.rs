@@ -14,9 +14,6 @@ pub enum TokenByteError {
     /// No ByteLevel or ByteFallback component was present.
     #[error("token decoder has no lexical byte encoding")]
     Encoding,
-    /// A ByteLevel scalar has no inverse byte.
-    #[error("unmapped byte-level character {0:?}")]
-    Unmapped(char),
     /// Malformed byte-fallback spelling; the original integer cause is retained.
     #[error("invalid byte-fallback token")]
     Fallback(#[source] Option<std::num::ParseIntError>),
@@ -104,11 +101,24 @@ impl TokenByteEncoding {
     fn visit(self, token: &str, mut emit: impl FnMut(u8)) -> Result<(), TokenByteError> {
         match self.kind {
             Kind::ByteLevel => {
-                for character in token.chars() {
-                    emit(
-                        crate::decoder_storage::byte_for_char(character)
-                            .ok_or(TokenByteError::Unmapped(character))?,
-                    );
+                // ByteLevel decodes a whole token as raw UTF-8 when any scalar
+                // lies outside its alphabet. Added tokens commonly contain raw
+                // whitespace or Unicode; a per-scalar fallback would change
+                // mixed spellings such as a mapped space followed by an emoji.
+                if token
+                    .chars()
+                    .all(|c| crate::decoder_storage::byte_for_char(c).is_some())
+                {
+                    for character in token.chars() {
+                        emit(
+                            crate::decoder_storage::byte_for_char(character)
+                                .expect("checked complete byte-level alphabet"),
+                        );
+                    }
+                } else {
+                    for &byte in token.as_bytes() {
+                        emit(byte);
+                    }
                 }
             }
             Kind::Fallback(marker) => {

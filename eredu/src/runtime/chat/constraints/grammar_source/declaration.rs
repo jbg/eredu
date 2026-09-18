@@ -1,11 +1,9 @@
-//! Original immutable declaration destination from its exact historical source.
+//! Shared immutable grammar loan from its exact original declaration source.
 use super::super::{
-    declaration::HistoricalGrammarDeclaration, recipe::ConstraintRecipe, ConstraintBlueprint,
+    ConstraintBlueprint, declaration::HistoricalGrammarDeclaration, recipe::ConstraintRecipe,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
-use llguidance::earley::{
-    CGrammar, CompiledGrammarCopyFailure, CompiledGrammarCopyPlan, CompiledGrammarCopyRequirements,
-};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
+use llguidance::earley::{CGrammar, SharedGrammar};
 use std::{
     fmt,
     mem::{size_of, size_of_val},
@@ -17,21 +15,17 @@ enum Cause {
     Missing,
     #[error("original grammar declaration control population overflow")]
     Overflow,
-    #[error("original grammar declaration source geometry changed")]
-    Geometry,
     #[error(transparent)]
     Source(#[from] super::super::declaration::Cause),
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
-    #[error(transparent)]
-    Construction(#[from] CompiledGrammarCopyFailure),
+    Funding(#[from] HostMetadataFundingError),
 }
-/// Independently allocated declaration; it is not a mutable parser/controller.
+/// Shared original declaration; mutable parser/controller state is separate.
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarDeclaration {
-    grammar: std::sync::Arc<CGrammar>,
+    grammar: SharedGrammar,
     source: HistoricalGrammarDeclaration,
     recipe: ConstraintRecipe,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl fmt::Debug for OriginalGrammarDeclaration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -47,39 +41,29 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarDeclarationError
     cause: Cause,
     source: Option<HistoricalGrammarDeclaration>,
     recipe: ConstraintRecipe,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl ConstraintBlueprint {
     pub(in crate::runtime::chat::constraints) fn original_grammar_declaration(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<OriginalGrammarDeclaration, OriginalGrammarDeclarationError> {
-        let result = (|| -> Result<std::sync::Arc<CGrammar>, Cause> {
+        let result = (|| -> Result<SharedGrammar, Cause> {
             let parts = [
                 HistoricalGrammarDeclaration::inspection_control_bytes().ok_or(Cause::Overflow)?,
                 size_of::<Self>(),
                 size_of::<OriginalGrammarDeclaration>(),
                 size_of::<OriginalGrammarDeclarationError>(),
                 size_of::<Cause>(),
-                size_of::<CGrammar>(),
-                eredu_nn::workspace::WorkspaceContext::metadata_arc_bytes::<CGrammar>()
-                    .ok_or(Cause::Overflow)?,
-                size_of::<std::sync::Arc<CGrammar>>(),
+                size_of::<SharedGrammar>(),
                 size_of::<HistoricalGrammarDeclaration>(),
                 size_of::<Option<HistoricalGrammarDeclaration>>(),
                 size_of::<ConstraintRecipe>(),
-                size_of::<CompiledGrammarCopyPlan<'_>>(),
-                size_of::<CompiledGrammarCopyRequirements>(),
-                size_of::<Result<CompiledGrammarCopyPlan<'_>, CompiledGrammarCopyFailure>>(),
-                size_of::<Result<CGrammar, CompiledGrammarCopyFailure>>(),
-                size_of::<Result<std::sync::Arc<CGrammar>, Cause>>(),
+                size_of::<Result<SharedGrammar, Cause>>(),
+                size_of::<Result<SharedGrammar, super::super::declaration::Cause>>(),
                 size_of::<Result<OriginalGrammarDeclaration, OriginalGrammarDeclarationError>>(),
-                size_of::<Result<CompiledGrammarCopyRequirements, super::super::declaration::Cause>>(
-                ),
-                size_of::<Result<&CGrammar, super::super::declaration::Cause>>(),
-                size_of::<Result<bool, super::super::declaration::Cause>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-                size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
+                size_of::<(&Self, &HostMetadataFunding)>(),
             ];
             funding.reserve_metadata(
                 parts
@@ -88,16 +72,7 @@ impl ConstraintBlueprint {
                     .ok_or(Cause::Overflow)?,
             )?;
             let source = self.declaration.as_ref().ok_or(Cause::Missing)?;
-            let requirements = source.requirements(&self.recipe)?;
-            // Reserve actual historical inspection/recursive frames before the
-            // source walk. Its receipt is immutable, produced by the same worker.
-            funding.reserve_metadata(requirements.control_bytes())?;
-            let plan = source.grammar(&self.recipe)?.source_copy_plan()?;
-            if !source.matches_requirements(&self.recipe, plan.requirements())? {
-                return Err(Cause::Geometry);
-            }
-            funding.reserve_metadata(plan.requirements().required_bytes())?;
-            Ok(std::sync::Arc::new(plan.compile()?))
+            Ok(source.shared_grammar(&self.recipe)?)
         })();
         match result {
             Ok(grammar) => Ok(OriginalGrammarDeclaration {
@@ -116,7 +91,9 @@ impl ConstraintBlueprint {
     }
 }
 impl OriginalGrammarDeclaration {
-    pub(in crate::runtime::chat::constraints) fn historical_source(&self) -> &eredu_core::SharedControllerDeclaration {
+    pub(in crate::runtime::chat::constraints) fn historical_source(
+        &self,
+    ) -> &eredu_core::SharedControllerDeclaration {
         self.source.source()
     }
     pub(in crate::runtime::chat::constraints) fn source_copy_control_bytes(
@@ -127,8 +104,8 @@ impl OriginalGrammarDeclaration {
     pub(in crate::runtime::chat::constraints) fn grammar(&self) -> &CGrammar {
         &self.grammar
     }
-    pub(in crate::runtime::chat::constraints) fn grammar_owner(&self) -> std::sync::Arc<CGrammar> {
-        std::sync::Arc::clone(&self.grammar)
+    pub(in crate::runtime::chat::constraints) fn grammar_owner(&self) -> SharedGrammar {
+        self.grammar.clone()
     }
     pub(in crate::runtime::chat::constraints) fn matches_plan(
         &self,

@@ -44,12 +44,12 @@ pub(crate) struct CompletedNumericalPrefill {
     value: Array,
     stream: StateStream,
     custody: eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody,
-    funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: eredu_nn::workspace::HostMetadataFunding,
 }
 impl CompletedNumericalPrefill {
     pub(in crate::composition::mlx::speculative) fn funding(
         &self,
-    ) -> &eredu_nn::workspace::WorkspaceMetadataFunding {
+    ) -> &eredu_nn::workspace::HostMetadataFunding {
         &self.funding
     }
     pub(in crate::composition::mlx::speculative) fn into_parts(
@@ -58,7 +58,7 @@ impl CompletedNumericalPrefill {
         Array,
         StateStream,
         eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody,
-        eredu_nn::workspace::WorkspaceMetadataFunding,
+        eredu_nn::workspace::HostMetadataFunding,
     ) {
         (self.value, self.stream, self.custody, self.funding)
     }
@@ -314,7 +314,7 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         ];
         sources.metadata_funding().reserve_metadata(controls.into_iter()
             .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         sources.request().prepare_continuation(continuation, sources.metadata_funding())
             .map_err(|cause| sources.retain_startup_error(cause))
@@ -328,6 +328,10 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         state.native.generation().map(Some)
     }
     fn invocation_input_positions(input: &Self::Input) -> Result<Option<usize>, Error> {
+        if let Some([batch,positions])=input.with_borrowed(|input| input.original_media().map(|packet|packet.shape())) {
+            if batch!=1 {return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
+            return usize::try_from(positions).map(Some).map_err(|_|Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow));
+        }
         inspect_plain_input(input)
             .map(|source| source.map(|(positions, _)| positions))
             .map_err(Error::from)
@@ -367,6 +371,9 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
                         .ok_or(Error::PrefillScopeUnavailable)?;
                     Some(prefill_input::PreparedPrefillInput::prepare_copy(
                         input,
+                        model,
+                        state,
+                        sources,
                         environment,
                         &initialized,
                         mechanisms,
@@ -519,7 +526,7 @@ fn inspect_plain_input(
 // actual outer result/enum transports before either a row move or prefill work.
 // Successful original values retain the same funding; retained failures do too.
 fn reserve_logits_transport<T>(sources: &AutoregressiveSourcePair) -> Result<(), Error> {
-    use eredu_nn::workspace::WorkspaceMetadataFundingError;
+    use eredu_nn::workspace::HostMetadataFundingError;
     use std::mem::{size_of, size_of_val};
     let parts = [
         size_of::<T>(),
@@ -538,7 +545,7 @@ fn reserve_logits_transport<T>(sources: &AutoregressiveSourcePair) -> Result<(),
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     sources
         .metadata_funding()

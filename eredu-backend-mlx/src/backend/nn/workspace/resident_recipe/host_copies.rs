@@ -5,7 +5,8 @@ use crate::backend::runtime::residency::manager::{
     ForegroundDiskDescriptors, ForegroundDiskPopulation, HostCopyWorkspace,
 };
 use eredu_runtime::working_memory::WorkingMemoryError;
-use safemlx::{ImmutableHostTransferBuffer, OperationEvent};
+use safemlx::{DeviceType, ImmutableHostTransferBuffer, OperationEvent};
+use super::super::cpu::CpuPopulation;
 
 /// The actual consumer either constructs fresh units or rebinds retained slots.
 /// An unbound source copy recipe cannot establish either producer.
@@ -37,6 +38,7 @@ pub(super) struct HostTransfers {
 /// Exact immutable source and accepted slot populations retained by the recipe.
 /// Native copy/aggregate/wait populations stay in the shared HostCopies fields.
 pub(super) struct ForegroundCopies {
+    device: DeviceType,
     source: ForegroundDiskDescriptors,
     per_forward: ForegroundDiskPopulation,
     request: ForegroundDiskPopulation,
@@ -44,6 +46,7 @@ pub(super) struct ForegroundCopies {
 impl std::fmt::Debug for ForegroundCopies {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForegroundCopies")
+            .field("device", &self.device)
             .field("per_forward", &self.per_forward)
             .field("request", &self.request)
             .finish_non_exhaustive()
@@ -54,18 +57,35 @@ struct CopyLayout {
     rank: usize,
     controls: usize,
     direct_extent: usize,
+    cpu: CpuPopulation,
 }
 impl CopyLayout {
-    fn include(&mut self, rank: usize, dtype: safemlx::Dtype) -> Option<()> {
+    fn include(&mut self, rank: usize, dtype: safemlx::Dtype, device: DeviceType) -> Option<()> {
         let (controls, direct) = ImmutableHostTransferBuffer::original_copy_layout(rank, dtype)?;
         self.rank = self.rank.max(rank);
         self.controls = self.controls.max(controls);
         self.direct_extent = self.direct_extent.max(direct);
+        if device == DeviceType::Cpu {
+            let mut population = CpuPopulation::default();
+            population.copy(OperationEvent::cpu_host_transfer_layout(dtype, rank, false, false)?, 1)?;
+            // Each independently completed copy uses the largest actual source
+            // row's bank. Every scalar field bounds those same finite rows; no
+            // unsupported row is discarded and no source backing is a birth.
+            self.cpu.construction_entries = self.cpu.construction_entries.max(population.construction_entries);
+            self.cpu.primitives = self.cpu.primitives.max(population.primitives);
+            self.cpu.input_edges = self.cpu.input_edges.max(population.input_edges);
+            self.cpu.maximum_operands = self.cpu.maximum_operands.max(population.maximum_operands);
+            self.cpu.maximum_captures = self.cpu.maximum_captures.max(population.maximum_captures);
+            self.cpu.births = self.cpu.births.max(population.births);
+            self.cpu.extents = self.cpu.extents.max(population.extents);
+            self.cpu.controls = self.cpu.controls.max(population.controls);
+        }
         Some(())
     }
 }
 #[derive(Clone, Copy)]
 pub(super) struct PreparedSourceCopies {
+    device: DeviceType,
     pub(super) copies: HostCopies,
     pub(super) transfers: HostTransfers,
     pub(super) rank: usize,
@@ -80,10 +100,14 @@ impl PreparedSourceCopies {
             size_of::<(&crate::backend::runtime::residency::manager::SupplementaryResidencySource,usize)>(),
             size_of::<(usize,usize,usize,usize)>(),
             size_of::<Result<(usize,usize,usize,usize),Error>>(),
-            size_of::<[usize;5]>(), size_of::<HostCopies>()];
+            size_of::<[usize;5]>(), size_of::<HostCopies>(), size_of::<DeviceType>(),
+            size_of::<CpuPopulation>(), size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+            size_of::<safemlx::CpuCopyEvalLayout>(),
+            size_of::<(usize,safemlx::Dtype,DeviceType,&mut CopyLayout)>(),
+            size_of::<Result<(ResidentDispatchPopulation,usize),Error>>()];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
-    fn prepare(layout: CopyLayout, transfers: HostTransfers, additional_controls: usize)
+    fn prepare(layout: CopyLayout, transfers: HostTransfers, additional_controls: usize, device: DeviceType)
         -> Result<Self, Error> {
         let error = Error::PrefillControl;
         let unknown = || error(WorkingMemoryError::UnknownBound);
@@ -92,7 +116,7 @@ impl PreparedSourceCopies {
         let CopyLayout {
             rank,
             controls: per_copy_controls,
-            direct_extent,
+            direct_extent, cpu,
         } = layout;
         if count != 0 && (direct_extent == 0 || per_copy_controls == 0) {
             return Err(unknown());
@@ -122,25 +146,8 @@ impl PreparedSourceCopies {
                 captures: record.capture_slots().max(1),
             })
             .ok_or_else(unknown)?;
-        let worker = OperationEvent::resident_gpu_worker_layout(2, 2, 2, 3, 1, rank, 4)
+        let (dispatch, worker_controls) = copy_dispatch(device, traversal, rank, cpu)
             .ok_or_else(unknown)?;
-        let dispatch = ResidentDispatchPopulation {
-                cpu_model: None,
-            gpu_entries: 2,
-            gpu_input_edges: 2,
-            gpu_siblings: 2,
-            gpu_births: 1,
-            additional_sort_kernels: 0,
-            cpu_entries: 0,
-            cpu_input_edges: 0,
-            cpu_siblings: 0,
-            parallel_entries: 0,
-            parallel_graph_extents: 0,
-            worker_graph_extents: worker.allocation_extents(),
-            worker_rank: rank,
-            copy_rank_extents: 0,
-            kernel_attempts: worker.kernel_attempts(),
-        };
         let aggregate_record = OperationEvent::eval_record_layout(1, 1, 1).ok_or_else(unknown)?;
         let aggregate_traversal =
             OperationEvent::eval_traversal_layout(safemlx::OperationEvalTraversalLimits {
@@ -153,48 +160,24 @@ impl PreparedSourceCopies {
                 captures: aggregate_record.capture_slots().max(1),
             })
             .ok_or_else(unknown)?;
-        let aggregate_worker = OperationEvent::resident_gpu_worker_layout(
-            1,
-            transfers.roots,
-            1,
-            transfers.roots.checked_add(1).ok_or_else(overflow)?,
-            0,
-            rank,
-            4,
-        )
-        .ok_or_else(unknown)?;
-        let aggregate_dispatch = ResidentDispatchPopulation {
-                cpu_model: None,
-            gpu_entries: 1,
-            gpu_input_edges: transfers.roots,
-            gpu_siblings: 1,
-            gpu_births: 0,
-            additional_sort_kernels: 0,
-            cpu_entries: 0,
-            cpu_input_edges: 0,
-            cpu_siblings: 0,
-            parallel_entries: 0,
-            parallel_graph_extents: 0,
-            worker_graph_extents: aggregate_worker.allocation_extents(),
-            worker_rank: rank,
-            copy_rank_extents: 0,
-            kernel_attempts: aggregate_worker.kernel_attempts(),
-        };
+        let (aggregate_dispatch, aggregate_worker_controls) =
+            copy_dispatch(device, aggregate_traversal, rank, CpuPopulation::default())
+                .ok_or_else(unknown)?;
         controls = controls
             .checked_add(OperationEvent::nested_scheduled_control_bytes().ok_or_else(unknown)?)
             .and_then(|n| n.checked_add(aggregate_record.query_control_bytes()?))
             .and_then(|n| n.checked_add(aggregate_traversal.query_control_bytes()?))
-            .and_then(|n| n.checked_add(aggregate_worker.control_bytes()?))
+            .and_then(|n| n.checked_add(aggregate_worker_controls))
             .ok_or_else(overflow)?;
         controls = controls
             .checked_add(record.query_control_bytes().ok_or_else(unknown)?)
             .and_then(|n| n.checked_add(traversal.query_control_bytes()?))
-            .and_then(|n| n.checked_add(worker.control_bytes()?))
+            .and_then(|n| n.checked_add(worker_controls))
             .and_then(|n| n.checked_add(std::mem::size_of::<HostCopies>()))
             .ok_or_else(overflow)?;
         controls = controls.checked_add(Self::inspection_control_bytes().ok_or_else(overflow)?)
             .ok_or_else(overflow)?;
-        Ok(Self { copies: HostCopies { parameters: None, per_forward: count,
+        Ok(Self { device, copies: HostCopies { parameters: None, per_forward: count,
             traversal, dispatch, direct_graph_extents, aggregate_traversal, aggregate_dispatch },
             transfers, rank, controls })
     }
@@ -204,8 +187,9 @@ impl PreparedSourceCopies {
     )->Result<Self,Error> {
         let unknown=||Error::PrefillControl(WorkingMemoryError::UnknownBound);
         let overflow=||Error::PrefillControl(WorkingMemoryError::Overflow);
+        let device=source.destination_device_type();
         let mut layout=CopyLayout::default();
-        if !source.visit_native_copy_layouts(|rank,dtype|layout.include(rank,dtype).ok_or_else(unknown))? {
+        if !source.visit_native_copy_layouts(|rank,dtype|layout.include(rank,dtype,device).ok_or_else(unknown))? {
             return Err(unknown());
         }
         let mut transfers=0usize;let mut waits=0usize;let mut roots=0usize;
@@ -221,7 +205,7 @@ impl PreparedSourceCopies {
         }
         let transfers=HostTransfers::from_windows(1,transfers,waits,roots,
             attempts.unwrap_or(0),windows).ok_or_else(overflow)?;
-        Self::prepare(layout,transfers,0)
+        Self::prepare(layout,transfers,0,device)
     }
     pub(super) fn inspect(
         source: &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
@@ -233,15 +217,23 @@ impl PreparedSourceCopies {
         let overflow = || error(WorkingMemoryError::Overflow);
         if occurrences == 0 || window.requested == 0 { return Err(unknown()); }
         let mut layout = CopyLayout::default();
-        match (source.host(), source.foreground()) {
-            (Some(host), None) => for unit in host.units() { for copy in host.copies(unit) {
-                layout.include(copy.shape().len(), copy.dtype()).ok_or_else(unknown)?;
-            } },
-            (None, Some(disk)) => for (shape, dtype) in disk.source().native_reads() {
-                layout.include(shape.len(), dtype).ok_or_else(unknown)?;
+        let device = match (source.host(), source.foreground()) {
+            (Some(host), None) => {
+                let device = host.destination_device_type();
+                for unit in host.units() { for copy in host.copies(unit) {
+                    layout.include(copy.shape().len(), copy.dtype(), device).ok_or_else(unknown)?;
+                } }
+                device
+            },
+            (None, Some(disk)) => {
+                let device = disk.destination_device_type();
+                for (shape, dtype) in disk.source().native_reads() {
+                    layout.include(shape.len(), dtype, device).ok_or_else(unknown)?;
+                }
+                device
             },
             _ => return Err(unknown()),
-        }
+        };
         // One warm and one missing owner are the existing finite window worker.
         // Failed whole-unit retries may copy the physical closure twice.
         let (transfers, waits, roots, attempts) =
@@ -257,7 +249,88 @@ impl PreparedSourceCopies {
             binding_shells: per_window.binding_shells.checked_mul(occurrences).ok_or_else(overflow)?,
             bytes: per_window.bytes.checked_mul(u64::try_from(occurrences).map_err(|_|overflow())?).ok_or_else(overflow)?,
         };
-        Self::prepare(layout, transfers, 0)
+        Self::prepare(layout, transfers, 0, device)
+    }
+}
+
+fn copy_dispatch(device: DeviceType, traversal: safemlx::OperationEvalTraversalLayout,
+    rank: usize, cpu: CpuPopulation) -> Option<(ResidentDispatchPopulation, usize)> {
+    let limits = traversal.limits();
+    let (cpu_model, gpu_entries, gpu_edges, gpu_siblings, gpu_births,
+        cpu_entries, cpu_edges, cpu_siblings, extents, kernels, controls) = match device {
+        DeviceType::Cpu => {
+            if limits.streams != 1 || limits.tape_entries != cpu.primitives.checked_add(1)?
+                || limits.input_edges != cpu.input_edges.checked_add(limits.roots)? {
+                return None;
+            }
+            let completion = OperationEvent::cpu_completion_layout(limits.roots)?;
+            if completion.backing_births() != 0 || completion.worker_graph_allocation_extents() != 0 {
+                return None;
+            }
+            (Some(cpu), 0, 0, 0, 0, limits.tape_entries, limits.input_edges,
+                limits.tape_entries, 0, 0, cpu.controls.checked_add(completion.control_bytes()?)?)
+        }
+        DeviceType::Gpu => {
+            let births = limits.tape_entries.checked_sub(1)?;
+            let worker = OperationEvent::resident_gpu_worker_layout(limits.tape_entries,
+                limits.input_edges, limits.output_slots, limits.arrays, births, rank, 4)?;
+            (None, limits.tape_entries, limits.input_edges, limits.output_slots, births,
+                0, 0, 0, worker.allocation_extents(), worker.kernel_attempts(), worker.control_bytes()?)
+        }
+    };
+    let dispatch = ResidentDispatchPopulation { cpu_model,
+        gpu_entries, gpu_input_edges: gpu_edges, gpu_siblings, gpu_births,
+        additional_sort_kernels: 0, cpu_entries, cpu_input_edges: cpu_edges, cpu_siblings,
+        parallel_entries: 0, parallel_graph_extents: 0, worker_graph_extents: extents,
+        worker_rank: rank, copy_rank_extents: 0, kernel_attempts: kernels };
+    let frames = [controls, std::mem::size_of::<(DeviceType,safemlx::OperationEvalTraversalLayout,
+        usize,CpuPopulation,safemlx::OperationEvalTraversalLimits,ResidentDispatchPopulation)>(),
+        std::mem::size_of::<(Option<CpuPopulation>,usize,usize,usize,usize,usize,usize,usize,usize,usize,usize)>(),
+        std::mem::size_of::<Option<safemlx::CpuCopyEvalLayout>>(),std::mem::size_of::<safemlx::CpuCopyEvalLayout>(),
+        std::mem::size_of::<Option<safemlx::ResidentGpuWorkerLayout>>(),std::mem::size_of::<safemlx::ResidentGpuWorkerLayout>(),
+        std::mem::size_of::<Option<(ResidentDispatchPopulation,usize)>>()];
+    Some((dispatch, frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)?))
+}
+impl PreparedSourceCopies {
+    pub(super) fn expand_equation_dispatch(&self, mut dispatch: ResidentDispatchPopulation,
+        limits: safemlx::OperationEvalTraversalLimits, operands: usize)
+        -> Result<(ResidentDispatchPopulation,usize),Error> {
+        let unknown = || Error::PrefillControl(WorkingMemoryError::UnknownBound);
+        let overflow = || Error::PrefillControl(WorkingMemoryError::Overflow);
+        if (self.device == DeviceType::Cpu) != dispatch.cpu_model.is_some() {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        if dispatch.completion_streams() != Some(limits.streams) { return Err(unknown()); }
+        dispatch.worker_rank = dispatch.worker_rank.max(self.rank);
+        let worker_controls = match self.device {
+            DeviceType::Cpu => {
+                // CPU Eval population belongs to the unchanged equations. The
+                // additional completed arrays require traversal slots only.
+                0
+            }
+            DeviceType::Gpu => {
+                let worker = OperationEvent::resident_gpu_worker_layout_with_router(
+                    dispatch.gpu_entries, dispatch.gpu_input_edges, dispatch.gpu_siblings,
+                    limits.arrays, dispatch.gpu_births, dispatch.worker_rank, operands,
+                    dispatch.additional_sort_kernels,
+                    dispatch.cpu_entries.checked_sub(dispatch.parallel_entries).ok_or_else(unknown)?)
+                    .ok_or_else(unknown)?;
+                dispatch.worker_graph_extents = worker.allocation_extents()
+                    .checked_add(dispatch.copy_rank_extents)
+                    .and_then(|n|n.checked_add(dispatch.parallel_graph_extents)).ok_or_else(overflow)?;
+                dispatch.kernel_attempts = worker.kernel_attempts();
+                worker.control_bytes().ok_or_else(unknown)?
+            }
+        };
+        let frames = [worker_controls, ResidentDispatchPopulation::completion_stream_control_bytes(),
+            std::mem::size_of::<(&Self,ResidentDispatchPopulation,
+            safemlx::OperationEvalTraversalLimits,usize)>(),
+            std::mem::size_of::<safemlx::ResidentGpuWorkerLayout>(),
+            std::mem::size_of::<Option<safemlx::ResidentGpuWorkerLayout>>(),
+            std::mem::size_of::<Result<(ResidentDispatchPopulation,usize),Error>>()];
+        let controls = frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+            .ok_or_else(overflow)?;
+        Ok((dispatch,controls))
     }
 }
 
@@ -274,11 +347,11 @@ impl ResidentNativeRecipe {
         for unit in source.units() {
             for copy in source.copies(unit) {
                 layout
-                    .include(copy.shape().len(), copy.dtype())
+                    .include(copy.shape().len(), copy.dtype(), source.destination_device_type())
                     .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
             }
         }
-        self.bind_source_copies(layout, 0)
+        self.bind_source_copies(layout, 0, source.destination_device_type())
     }
 
     /// The actual disk slot plan supplies these populations. Canonical windows
@@ -289,6 +362,7 @@ impl ResidentNativeRecipe {
         source: &ForegroundDiskDescriptors,
         per_forward: ForegroundDiskPopulation,
         request: ForegroundDiskPopulation,
+        device: DeviceType,
     ) -> Result<(), Error> {
         let error = Error::PrefillControl;
         let unknown = || error(WorkingMemoryError::UnknownBound);
@@ -308,7 +382,7 @@ impl ResidentNativeRecipe {
         }
         let mut layout = CopyLayout::default();
         for (shape, dtype) in source.native_reads() {
-            layout.include(shape.len(), dtype).ok_or_else(unknown)?;
+            layout.include(shape.len(), dtype, device).ok_or_else(unknown)?;
         }
         if per_forward.maximum_rank > layout.rank {
             return Err(identity());
@@ -323,12 +397,15 @@ impl ResidentNativeRecipe {
             std::mem::size_of::<ForegroundDiskPopulation>(),
             std::mem::size_of::<Option<ForegroundDiskPopulation>>(),
             std::mem::size_of::<&ForegroundDiskDescriptors>(),
+            std::mem::size_of::<(DeviceType, &Self, &ForegroundDiskDescriptors,
+                ForegroundDiskPopulation, ForegroundDiskPopulation, bool)>(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(overflow)?;
-        self.bind_source_copies(layout, controls)?;
+        self.bind_source_copies(layout, controls, device)?;
         self.foreground_copies = Some(ForegroundCopies {
+            device,
             source: source.clone(),
             per_forward,
             request,
@@ -341,10 +418,11 @@ impl ResidentNativeRecipe {
         source: &ForegroundDiskDescriptors,
         per_forward: ForegroundDiskPopulation,
         request: ForegroundDiskPopulation,
+        device: DeviceType,
     ) -> bool {
         self.host_copies.is_some()
             && self.foreground_copies.as_ref().is_some_and(|copies| {
-                copies.source.same_source(source)
+                copies.device == device && copies.source.same_source(source)
                     && copies.per_forward == per_forward
                     && copies.request == request
                     && self
@@ -358,12 +436,13 @@ impl ResidentNativeRecipe {
     pub(crate) fn matches_foreground_disk_source(
         &self,
         source: &ForegroundDiskDescriptors,
+        device: DeviceType,
     ) -> bool {
         self.host_copies.is_some()
             && self
                 .foreground_copies
                 .as_ref()
-                .is_some_and(|copies| copies.source.same_source(source))
+                .is_some_and(|copies| copies.device == device && copies.source.same_source(source))
     }
 
     pub(crate) fn has_foreground_disk_copy_recipe(&self) -> bool {
@@ -383,6 +462,7 @@ impl ResidentNativeRecipe {
         &mut self,
         layout: CopyLayout,
         additional_controls: usize,
+        device: DeviceType,
     ) -> Result<(), Error> {
         let error = Error::PrefillControl;
         let unknown = || error(WorkingMemoryError::UnknownBound);
@@ -393,7 +473,7 @@ impl ResidentNativeRecipe {
         let transfers = self.host_transfers.ok_or_else(unknown)?;
         let count = transfers.copies;
         let bytes = transfers.bytes;
-        let source = PreparedSourceCopies::prepare(layout, transfers, additional_controls)?;
+        let source = PreparedSourceCopies::prepare(layout, transfers, additional_controls, device)?;
         let PreparedSourceCopies { copies, rank, controls, .. } = source;
         let HostCopies { traversal, dispatch, direct_graph_extents,
             aggregate_traversal, aggregate_dispatch, .. } = copies;
@@ -402,12 +482,8 @@ impl ResidentNativeRecipe {
             let mut limits = row.traversal.ok_or_else(unknown)?.limits();
             let graph = row.graph.ok_or_else(unknown)?;
             let storage = row.mutable_storage.as_mut().ok_or_else(unknown)?;
-            let mut equation_dispatch = row.dispatch.ok_or_else(unknown)?;
-            if equation_dispatch.cpu_model.is_some() { return Err(unknown()); }
-            let cpu = equation_dispatch.cpu_entries;
-            if limits.streams != 1 + usize::from(cpu != 0)
-                || (cpu != 0 && !completes_cpu_callbacks)
-            {
+            let equation_dispatch = row.dispatch.ok_or_else(unknown)?;
+            if equation_dispatch.cpu_entries != 0 && !completes_cpu_callbacks {
                 return Err(unknown());
             }
             // A later group can still visit submitted source descriptors. These
@@ -435,38 +511,11 @@ impl ResidentNativeRecipe {
                 )
                 .ok_or_else(unknown)?,
             );
-            // Copies complete on their original GPU source path. Their
-            // descriptors may later be visited by an enclosing mixed-stream
-            // frontier, whose shared nested worker finishes CPU callbacks before
-            // restoring the bank. Keep its actual CPU/GPU population and price
-            // the expanded array/rank frontier with the same source workers.
-            equation_dispatch.worker_rank = equation_dispatch.worker_rank.max(rank);
-            let equation_worker = OperationEvent::resident_gpu_worker_layout_with_router(
-                equation_dispatch.gpu_entries,
-                equation_dispatch.gpu_input_edges,
-                equation_dispatch.gpu_siblings,
-                limits.arrays,
-                equation_dispatch.gpu_births,
-                equation_dispatch.worker_rank,
-                row.graph.ok_or_else(unknown)?.maximum_operands(),
-                equation_dispatch.additional_sort_kernels,
-                cpu.checked_sub(equation_dispatch.parallel_entries).ok_or_else(unknown)?,
-            ).ok_or_else(unknown)?;
-            equation_dispatch.worker_graph_extents = equation_worker.allocation_extents()
-                .checked_add(equation_dispatch.copy_rank_extents)
-                .and_then(|n|n.checked_add(equation_dispatch.parallel_graph_extents)).ok_or_else(overflow)?;
-            equation_dispatch.kernel_attempts = equation_worker.kernel_attempts();
+            // Completed source descriptors extend the enclosing traversal;
+            // their native copy workers remain separately priced below.
+            let (equation_dispatch, equation_controls) = source.expand_equation_dispatch(
+                equation_dispatch, limits, row.graph.ok_or_else(unknown)?.maximum_operands())?;
             row.dispatch = Some(equation_dispatch);
-            let equation_controls = [
-                std::mem::size_of::<ResidentDispatchPopulation>(),
-                std::mem::size_of::<safemlx::ResidentGpuWorkerLayout>(),
-                std::mem::size_of::<usize>(),
-                std::mem::size_of::<bool>(),
-                equation_worker.control_bytes().ok_or_else(unknown)?,
-            ];
-            let equation_controls = equation_controls.into_iter().try_fold(
-                std::mem::size_of_val(&equation_controls), usize::checked_add,
-            ).ok_or_else(overflow)?;
             // Original Metal page padding is applied once downstream to this
             // raw requested total and the actual independent birth population.
             storage.mutable_bytes = storage
@@ -604,3 +653,6 @@ impl ResidentNativeRecipe {
                 )
     }
 }
+
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod tests;

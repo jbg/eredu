@@ -9,13 +9,12 @@ use std::{
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::{
     cache::{
-        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
-        StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
-use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
+use eredu_runtime::{StateLayout, StateSegmentLifetime};
 use serde::Deserialize;
 use serde_json::Value;
 

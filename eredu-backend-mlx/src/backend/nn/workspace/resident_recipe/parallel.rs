@@ -44,7 +44,11 @@ impl ParallelRecipeRecorder {
         self,
         plan: &InferenceSpanWorkspacePlan,
     ) -> Result<ResidentNativeRecipe, Error> {
-        self.recorder.finish(plan)
+        let mut recipe = self.recorder.finish(plan)?;
+        // Control placement is still required when the genuine equation range
+        // is empty, for example restoring an already terminal parallel branch.
+        recipe.parallel_source = Some(self.source);
+        Ok(recipe)
     }
     fn record(
         &mut self,
@@ -58,7 +62,7 @@ impl ParallelRecipeRecorder {
     ) -> Result<(), Error> {
         let invocation = self
             .source
-            .prepare_invocation_with_boundary(&report.operations,Some(self.mechanism))
+            .prepare_invocation_with_boundary(&report.operations,Some(self.mechanism),self.recorder.addressable_sources.as_ref())
             .map_err(|cause| self.source.neural_error(cause))?;
         let population=invocation.expert_capture_population().ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         self.recorder.record_equation_with_parallel(
@@ -127,6 +131,9 @@ impl InferenceEquationTraceObserver for ParallelRecipeRecorder {
             true,
         )
     }
+    fn observe_sampling_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+        self.recorder.record_sampling_input(input)
+    }
     fn observe_sampling(
         &mut self,
         phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
@@ -140,6 +147,20 @@ impl InferenceEquationTraceObserver for ParallelRecipeRecorder {
         report: &WorkspaceTraceReport,
         closing: WorkspaceStoragePopulation,
     ) -> Result<(), Error> {
+        self.recorder.record_sampling(phase, report, Some(closing))
+    }
+}
+
+impl eredu_runtime::working_memory::SamplingWorkspaceObserver for ParallelRecipeRecorder {
+    fn observe_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+        self.recorder.record_sampling_input(input)
+    }
+    fn observe(&mut self, phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
+        report: &WorkspaceTraceReport) -> Result<(), Error> {
+        self.recorder.record_sampling(phase, report, None)
+    }
+    fn observe_with_storage(&mut self, phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
+        report: &WorkspaceTraceReport, closing: WorkspaceStoragePopulation) -> Result<(), Error> {
         self.recorder.record_sampling(phase, report, Some(closing))
     }
 }

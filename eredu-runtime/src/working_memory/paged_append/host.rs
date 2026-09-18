@@ -83,6 +83,14 @@ struct Trace {
     entries: Vec<WorkspacePagedHostEntry>,
     loads: Vec<WorkspacePagedHostLoad>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("paged {operand} source lacks a physical floating representation")]
+struct MissingRepresentation {
+    operand: &'static str,
+    #[source]
+    cause: WorkspaceMetadataError,
+}
 /// Paid per-source trace of the maximal selected transfer path. Native policy,
 /// source authentication, allocation and completion remain separate consumers.
 #[derive(Clone, Debug)]
@@ -217,6 +225,7 @@ impl WorkspacePagedHostTrace {
             WorkspacePagedHostEntry,
             std::cell::RefMut<'_, Trace>,
             [WorkspaceFloatingType; 2],
+            MissingRepresentation,
             Result<usize, Error>,
         )>())?;
         if !context.shares_trace(&self.context) {
@@ -251,12 +260,18 @@ impl WorkspacePagedHostTrace {
                 values[0]
                     .layout()
                     .representation()
-                    .ok_or(WorkspaceMetadataError::Unqualified)?
+                    .ok_or_else(|| context.metadata_source(MissingRepresentation {
+                        operand: "key",
+                        cause: WorkspaceMetadataError::Unqualified,
+                    }))?
                     .dtype(),
                 values[1]
                     .layout()
                     .representation()
-                    .ok_or(WorkspaceMetadataError::Unqualified)?
+                    .ok_or_else(|| context.metadata_source(MissingRepresentation {
+                        operand: "value",
+                        cause: WorkspaceMetadataError::Unqualified,
+                    }))?
                     .dtype(),
             ];
             Source::Stored([

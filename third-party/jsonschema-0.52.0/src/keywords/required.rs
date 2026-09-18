@@ -12,6 +12,57 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
+pub(super) fn required_errors<'i, 'r, F: Json>(
+    required: impl IntoIterator<Item = (&'r str, &'r F::PreparedKey)>,
+    schema_path: &Location,
+    instance: &F::Node<'i>,
+    location: &LazyLocation,
+    tracker: Option<&RefTracker>,
+    ctx: &mut ValidationContext,
+    mut output: Option<&mut Vec<ValidationError<'i>>>,
+) -> Result<(), ValidationError<'i>> {
+    if ctx.workspace.failed() {
+        return Ok(());
+    }
+    let Some(object) = instance.as_object() else {
+        return Ok(());
+    };
+    let required = required.into_iter();
+    if !ctx.workspace.reserve(
+        std::mem::size_of_val(&required).checked_add(std::mem::size_of::<(
+            &str,
+            &F::PreparedKey,
+            Option<&mut Vec<ValidationError<'i>>>,
+            Result<(), ValidationError<'i>>,
+        )>()),
+    ) {
+        return Ok(());
+    }
+    for (name, key) in required {
+        if object.get(key).is_none() {
+            if let Err(error) =
+                ctx.diagnostic::<F>(instance, location, tracker, schema_path, |funding| {
+                    Ok(crate::error::ValidationErrorKind::Required {
+                        property: Value::String(funding.copy_str(name)?),
+                    })
+                })
+            {
+                if let Some(errors) = output.as_deref_mut() {
+                    if !ctx.workspace.push(errors, error) {
+                        return Ok(());
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+            if ctx.workspace.failed() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct RequiredValidator<F: Json = SerdeJson> {
     required: Vec<(String, F::PreparedKey)>,
     location: Location,
@@ -19,34 +70,51 @@ pub(crate) struct RequiredValidator<F: Json = SerdeJson> {
 
 impl RequiredValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        items: &[Value],
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        items: &'a [Value],
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        let mut required = Vec::with_capacity(items.len());
+    ) -> CompilationResult<'a, F> {
+        let mut required = Vec::new();
+        ctx.funding().grow(&mut required, items.len())?;
         for item in items {
             match item {
                 Value::String(string) => {
-                    required.push((string.clone(), F::prepare_key(string)));
+                    required.push((
+                        ctx.funding().copy_str(string)?,
+                        ctx.funding().key::<F>(string)?,
+                    ));
                 }
                 _ => {
-                    return Err(ValidationError::single_type_error(
+                    return Err(ValidationError::single_type_error_with_funding(
                         location.clone(),
                         location,
-                        Location::new(),
+                        Location::new_with_funding(ctx.funding())?,
                         Cow::Borrowed(item),
                         JsonType::String,
-                    ))
+                        ctx.funding(),
+                    )?
+                    .into())
                 }
             }
         }
-        Ok(Box::new(RequiredValidator { required, location }))
+        Ok(ctx
+            .funding()
+            .boxed(RequiredValidator { required, location })?)
     }
 }
 
 impl<F: Json> Validate<F> for RequiredValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.vector(&self.required)?; for (name, key) in &self.required { source.string(name)?; source.key(key)?; } source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.required)?;
+        for (name, key) in &self.required {
+            source.string(name)?;
+            source.key(key)?;
+        }
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -59,6 +127,9 @@ impl<F: Json> Validate<F> for RequiredValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             if object.len() < self.required.len() {
@@ -72,50 +143,40 @@ impl<F: Json> Validate<F> for RequiredValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(object) = instance.as_object() {
-            for (property_name, key) in &self.required {
-                if object.get(key).is_none() {
-                    return Err(ValidationError::required(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        location.into(),
-                        instance.to_value(),
-                        Value::String(property_name.clone()),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        required_errors::<F>(
+            self.required.iter().map(|(name, key)| (name.as_str(), key)),
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            None,
+        )
     }
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        if let Some(object) = instance.as_object() {
-            let eval_path = crate::paths::capture_evaluation_path(tracker, &self.location);
-            for (property_name, key) in &self.required {
-                if object.get(key).is_none() {
-                    errors.push(ValidationError::required(
-                        self.location.clone(),
-                        eval_path.clone(),
-                        location.into(),
-                        instance.to_value(),
-                        Value::String(property_name.clone()),
-                    ));
-                }
-            }
-        }
+        let _ = required_errors::<F>(
+            self.required.iter().map(|(name, key)| (name.as_str(), key)),
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            Some(errors),
+        );
     }
 }
 
@@ -127,37 +188,45 @@ pub(crate) struct SingleItemRequiredValidator<F: Json = SerdeJson> {
 
 impl SingleItemRequiredValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(value: &str, location: Location) -> CompilationResult<'_, F> {
-        Ok(Box::new(SingleItemRequiredValidator {
-            value: value.to_string(),
-            key: F::prepare_key(value),
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        value: &'a str,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(SingleItemRequiredValidator {
+            value: ctx.funding().copy_str(value)?,
+            key: ctx.funding().key::<F>(value)?,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for SingleItemRequiredValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.string(&self.value)?; source.key(&self.key)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.string(&self.value)?;
+        source.key(&self.key)?;
+        source.location(&self.location)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if !self.is_valid(instance, ctx) {
-            return Err(ValidationError::required(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                Value::String(self.value.clone()),
-            ));
-        }
-        Ok(())
+        required_errors::<F>(
+            [(self.value.as_str(), &self.key)],
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            None,
+        )
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -170,6 +239,9 @@ impl<F: Json> Validate<F> for SingleItemRequiredValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             if object.is_empty() {
@@ -195,23 +267,31 @@ pub(crate) struct Required2Validator<F: Json = SerdeJson> {
 impl Required2Validator {
     #[inline]
     pub(crate) fn compile<F: Json>(
+        ctx: &crate::compiler::Context<F>,
         first: String,
         second: String,
         location: Location,
     ) -> CompilationResult<'static, F> {
-        Ok(Box::new(Required2Validator {
-            first_key: F::prepare_key(&first),
-            second_key: F::prepare_key(&second),
+        Ok(ctx.funding().boxed(Required2Validator {
+            first_key: ctx.funding().key::<F>(&first)?,
+            second_key: ctx.funding().key::<F>(&second)?,
             first,
             second,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for Required2Validator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.string(&self.first)?; source.key(&self.first_key)?; source.string(&self.second)?; source.key(&self.second_key)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.string(&self.first)?;
+        source.key(&self.first_key)?;
+        source.string(&self.second)?;
+        source.key(&self.second_key)?;
+        source.location(&self.location)
     }
 
     #[inline]
@@ -225,6 +305,9 @@ impl<F: Json> Validate<F> for Required2Validator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             object.len() >= 2
@@ -235,65 +318,47 @@ impl<F: Json> Validate<F> for Required2Validator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(object) = instance.as_object() {
-            if object.get(&self.first_key).is_none() {
-                return Err(ValidationError::required(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                return Err(ValidationError::required(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
-            }
-        }
-        Ok(())
+        required_errors::<F>(
+            [
+                (self.first.as_str(), &self.first_key),
+                (self.second.as_str(), &self.second_key),
+            ],
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            None,
+        )
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        if let Some(object) = instance.as_object() {
-            let eval_path = crate::paths::capture_evaluation_path(tracker, &self.location);
-            if object.get(&self.first_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.location.clone(),
-                    eval_path.clone(),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.location.clone(),
-                    eval_path,
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
-            }
-        }
+        let _ = required_errors::<F>(
+            [
+                (self.first.as_str(), &self.first_key),
+                (self.second.as_str(), &self.second_key),
+            ],
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            Some(errors),
+        );
     }
 }
 
@@ -312,26 +377,36 @@ pub(crate) struct Required3Validator<F: Json = SerdeJson> {
 impl Required3Validator {
     #[inline]
     pub(crate) fn compile<F: Json>(
+        ctx: &crate::compiler::Context<F>,
         first: String,
         second: String,
         third: String,
         location: Location,
     ) -> CompilationResult<'static, F> {
-        Ok(Box::new(Required3Validator {
-            first_key: F::prepare_key(&first),
-            second_key: F::prepare_key(&second),
-            third_key: F::prepare_key(&third),
+        Ok(ctx.funding().boxed(Required3Validator {
+            first_key: ctx.funding().key::<F>(&first)?,
+            second_key: ctx.funding().key::<F>(&second)?,
+            third_key: ctx.funding().key::<F>(&third)?,
             first,
             second,
             third,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for Required3Validator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.string(&self.first)?; source.key(&self.first_key)?; source.string(&self.second)?; source.key(&self.second_key)?; source.string(&self.third)?; source.key(&self.third_key)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.string(&self.first)?;
+        source.key(&self.first_key)?;
+        source.string(&self.second)?;
+        source.key(&self.second_key)?;
+        source.string(&self.third)?;
+        source.key(&self.third_key)?;
+        source.location(&self.location)
     }
 
     #[inline]
@@ -345,6 +420,9 @@ impl<F: Json> Validate<F> for Required3Validator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             object.len() >= 3
@@ -356,83 +434,49 @@ impl<F: Json> Validate<F> for Required3Validator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(object) = instance.as_object() {
-            if object.get(&self.first_key).is_none() {
-                return Err(ValidationError::required(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                return Err(ValidationError::required(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
-            }
-            if object.get(&self.third_key).is_none() {
-                return Err(ValidationError::required(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.third.clone()),
-                ));
-            }
-        }
-        Ok(())
+        required_errors::<F>(
+            [
+                (self.first.as_str(), &self.first_key),
+                (self.second.as_str(), &self.second_key),
+                (self.third.as_str(), &self.third_key),
+            ],
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            None,
+        )
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        if let Some(object) = instance.as_object() {
-            let eval_path = crate::paths::capture_evaluation_path(tracker, &self.location);
-            if object.get(&self.first_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.location.clone(),
-                    eval_path.clone(),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.location.clone(),
-                    eval_path.clone(),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
-            }
-            if object.get(&self.third_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.location.clone(),
-                    eval_path,
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.third.clone()),
-                ));
-            }
-        }
+        let _ = required_errors::<F>(
+            [
+                (self.first.as_str(), &self.first_key),
+                (self.second.as_str(), &self.second_key),
+                (self.third.as_str(), &self.third_key),
+            ],
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+            Some(errors),
+        );
     }
 }
 
@@ -477,46 +521,65 @@ pub(crate) fn compile<'a, F: Json>(
             return None;
         }
     }
-    let location = ctx.location().join("required");
-    compile_with_path(schema, location)
+    let location =
+        crate::keywords::try_compile!(ctx.location().join_with_funding("required", ctx.funding()));
+    compile_with_path(ctx, schema, location)
 }
 
 #[inline]
-pub(crate) fn compile_with_path<F: Json>(
-    schema: &Value,
+pub(crate) fn compile_with_path<'a, F: Json>(
+    ctx: &compiler::Context<F>,
+    schema: &'a Value,
     location: Location,
-) -> Option<CompilationResult<'_, F>> {
+) -> Option<CompilationResult<'a, F>> {
     // IMPORTANT: If this function will ever return `None`, adjust `dependencies.rs` accordingly
     match schema {
         Value::Array(items) => match items.len() {
             1 => {
                 let item = &items[0];
                 if let Value::String(item) = item {
-                    Some(SingleItemRequiredValidator::compile(item, location))
+                    Some(SingleItemRequiredValidator::compile(ctx, item, location))
                 } else {
-                    Some(Err(ValidationError::single_type_error(
-                        location.clone(),
-                        location,
-                        Location::new(),
-                        Cow::Borrowed(item),
-                        JsonType::String,
-                    )))
+                    Some(Err(crate::keywords::try_compile!(
+                        ValidationError::single_type_error_with_funding(
+                            location.clone(),
+                            location,
+                            crate::keywords::try_compile!(Location::new_with_funding(
+                                ctx.funding()
+                            )),
+                            Cow::Borrowed(item),
+                            JsonType::String,
+                            ctx.funding()
+                        )
+                    )
+                    .into()))
                 }
             }
             2 => {
                 let (first, second) = (&items[0], &items[1]);
                 match (first, second) {
-                    (Value::String(first), Value::String(second)) => Some(
-                        Required2Validator::compile(first.clone(), second.clone(), location),
-                    ),
-                    (Value::String(_), other) | (other, _) => {
-                        Some(Err(ValidationError::single_type_error(
-                            location.clone(),
+                    (Value::String(first), Value::String(second)) => {
+                        Some(Required2Validator::compile(
+                            ctx,
+                            crate::keywords::try_compile!(ctx.funding().copy_str(first)),
+                            crate::keywords::try_compile!(ctx.funding().copy_str(second)),
                             location,
-                            Location::new(),
-                            Cow::Borrowed(other),
-                            JsonType::String,
-                        )))
+                        ))
+                    }
+                    (Value::String(_), other) | (other, _) => {
+                        Some(Err(crate::keywords::try_compile!(
+                            ValidationError::single_type_error_with_funding(
+                                location.clone(),
+                                location,
+                                crate::keywords::try_compile!(Location::new_with_funding(
+                                    ctx.funding()
+                                )),
+                                Cow::Borrowed(other),
+                                JsonType::String,
+                                ctx.funding()
+                            )
+                        )
+                        .into()))
                     }
                 }
             }
@@ -525,32 +588,43 @@ pub(crate) fn compile_with_path<F: Json>(
                 match (first, second, third) {
                     (Value::String(first), Value::String(second), Value::String(third)) => {
                         Some(Required3Validator::compile(
-                            first.clone(),
-                            second.clone(),
-                            third.clone(),
+                            ctx,
+                            crate::keywords::try_compile!(ctx.funding().copy_str(first)),
+                            crate::keywords::try_compile!(ctx.funding().copy_str(second)),
+                            crate::keywords::try_compile!(ctx.funding().copy_str(third)),
                             location,
                         ))
                     }
                     (Value::String(_), Value::String(_), other)
                     | (Value::String(_), other, _)
-                    | (other, _, _) => Some(Err(ValidationError::single_type_error(
-                        location.clone(),
-                        location,
-                        Location::new(),
-                        Cow::Borrowed(other),
-                        JsonType::String,
-                    ))),
+                    | (other, _, _) => Some(Err(crate::keywords::try_compile!(
+                        ValidationError::single_type_error_with_funding(
+                            location.clone(),
+                            location,
+                            crate::keywords::try_compile!(Location::new_with_funding(
+                                ctx.funding()
+                            )),
+                            Cow::Borrowed(other),
+                            JsonType::String,
+                            ctx.funding()
+                        )
+                    )
+                    .into())),
                 }
             }
-            _ => Some(RequiredValidator::compile(items, location)),
+            _ => Some(RequiredValidator::compile(ctx, items, location)),
         },
-        _ => Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::Array,
-        ))),
+        _ => Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::Array,
+                ctx.funding()
+            )
+        )
+        .into())),
     }
 }
 

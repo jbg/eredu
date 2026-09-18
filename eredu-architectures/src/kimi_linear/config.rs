@@ -5,8 +5,7 @@ use std::{collections::HashMap, io::Read};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
-        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
-        StateTensorPolicy, StateTensorRole,
+        MutableStateResidency, StateTensorDimension, StateTensorDtype, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
@@ -345,15 +344,10 @@ impl ModelArgs {
     pub fn routed_observation_points(
         &self,
         unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoints::new(
-                eredu_runtime::RoutedBankId::new(0),
-                format!("{unit_path}.mlp"),
-                self.num_experts,
-            )
-        })
+        layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+if !(self.layer_policy(layer).is_some_and(|policy|policy.feed_forward==FeedForwardPolicy::SparseMoe)){return Ok(None);}
+        eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0),format_args!("{unit_path}.mlp"),self.num_experts,metadata_context).map(Some)
     }
     /// Returns whether any layer uses routed experts.
     pub fn has_sparse_moe_layers(&self) -> bool {
@@ -871,6 +865,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::cache::LayerCachePolicy;
 
     fn fixture() -> Value {
         serde_json::json!({
@@ -907,9 +902,9 @@ mod tests {
             LayerCachePolicy::CompressedLatentRotary { .. }
         ));
         assert!(args
-            .routed_observation_points("model.layers.0", 0)
+            .routed_observation_points("model.layers.0", 0, None).expect("ordinary routed point construction")
             .is_none());
-        let point = args.routed_observation_points("model.layers.1", 1).unwrap();
+        let point = args.routed_observation_points("model.layers.1", 1, None).expect("ordinary routed point construction").unwrap();
         assert_eq!(
             point
                 .bank(eredu_runtime::RoutedBankId::new(0))

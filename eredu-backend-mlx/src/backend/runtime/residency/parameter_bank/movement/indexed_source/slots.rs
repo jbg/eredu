@@ -35,7 +35,7 @@ impl OriginalIndexedChunkSource {
             size_of::<std::cell::RefMut<'_,Option<Box<dyn IndexedResidency>>>>(),
             size_of::<OriginalOperationAccess<U>>(),size_of::<OriginalResidencyAttempt>(),
             Layout::new::<RegisteredResidency<U>>().size(),
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
         b.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or_else(||self.failure(Cause::Overflow))?).map_err(|cause|self.failure(Cause::Funding(cause)))?;
         let mut slot=b.residency.try_borrow_mut().map_err(|_|self.failure(Cause::Spent))?;
@@ -61,14 +61,14 @@ impl OriginalIndexedChunkSource {
         let frames=[size_of::<F>(),size_of::<R>(),size_of::<E>(),size_of::<Result<R,E>>(),
             size_of::<Result<Result<R,E>,Error>>(),size_of::<PreparedIndexedDemandLoan<'_>>(),
             size_of::<(&Self,&IndexedDemandSource)>(),
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
         b.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or_else(||self.failure(Cause::Overflow))?).map_err(|cause|self.failure(Cause::Funding(cause)))?;
         if b.residency.try_borrow().map_err(|_|self.failure(Cause::Spent))?.is_none(){return Err(self.failure(Cause::Identity));}
         Ok(run(Some(PreparedIndexedDemandLoan::new(self,&b.funding))))
     }
     pub(crate) fn acquire_from_demand(&self,request:ParameterBankAcquisition<'_>,demands:&IndexedDemandSource,
-        funding:&WorkspaceMetadataFunding,stream:&Stream)->Result<AcquiredParameterGroups,Error> {
+        funding:&HostMetadataFunding,stream:&Stream)->Result<AcquiredParameterGroups,Error> {
         self.validate_parent(stream)?;self.validate_demand(demands)?;
         let b=self.body();
         if request.access()!=b.identity.census.access() || b.route_copies.get()!=2 || !funding.same_account(&b.funding){return Err(self.failure(Cause::Identity));}

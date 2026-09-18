@@ -1,35 +1,73 @@
 //! Grouped write factors retain scalar ownership independently of latent rank.
 use super::*;
-use eredu_core::{component::ComponentGroupedWriteProjection, SymbolicDimension};
+use eredu_core::{SymbolicDimension, component::ComponentGroupedWriteProjection};
 
 fn latent_width(stage: &ComponentGroupedWriteProjection) -> Result<usize, ComponentPartitionError> {
-    stage
-        .groups
-        .checked_mul(stage.rank)
-        .filter(|n| *n > 0)
-        .ok_or_else(|| ComponentPartitionError::InvalidPlacement(stage.weight.clone()))
+    latent_width_worker(stage, Destination(None))
 }
-
 fn row_coordinates(
     stage: &ComponentGroupedWriteProjection,
     tensor: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let width = latent_width(stage)?;
-    if tensor.global_shape().first() != Some(&width) {
-        return Err(ComponentPartitionError::InvalidPlacement(
-            stage.weight.clone(),
-        ));
-    }
-    derive_matrix_axis_coordinates(&stage.weight, width, tensor, 0)
+    row_worker(stage, tensor, Destination(None))
 }
-
 pub(super) fn component_coordinates(
     count: usize,
     stage: &ComponentGroupedWriteProjection,
     tensor: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(stage.weight.clone());
-    let rows = row_coordinates(stage, tensor)?;
+    component_worker(count, stage, tensor, Destination(None))
+}
+fn latent_width_worker(
+    stage: &ComponentGroupedWriteProjection,
+    allocation: Destination<'_>,
+) -> Result<usize, ComponentPartitionError> {
+    allocation.controls::<(&ComponentGroupedWriteProjection, usize)>()?;
+    stage
+        .groups
+        .checked_mul(stage.rank)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| allocation.invalid(&stage.weight))
+}
+
+fn row_worker(
+    stage: &ComponentGroupedWriteProjection,
+    tensor: &LocalTensorLayout,
+    allocation: Destination<'_>,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    allocation.controls::<(
+        usize,
+        &ComponentGroupedWriteProjection,
+        &LocalTensorLayout,
+        ComponentCoordinateMap,
+        Vec<usize>,
+        std::ops::Range<usize>,
+        [usize; 4],
+    )>()?;
+    let width = latent_width_worker(stage, allocation)?;
+    if tensor.global_shape().first() != Some(&width) {
+        return Err(allocation.invalid(&stage.weight));
+    }
+    coordinates::matrix_worker(&stage.weight, width, tensor, 0, allocation)
+}
+
+pub(super) fn component_worker(
+    count: usize,
+    stage: &ComponentGroupedWriteProjection,
+    tensor: &LocalTensorLayout,
+    allocation: Destination<'_>,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    allocation.controls::<(
+        usize,
+        &ComponentGroupedWriteProjection,
+        &LocalTensorLayout,
+        ComponentCoordinateMap,
+        Vec<usize>,
+        std::ops::Range<usize>,
+        [usize; 4],
+    )>()?;
+    let invalid = || allocation.invalid(&stage.weight);
+    let rows = row_worker(stage, tensor, allocation)?;
     if count == 0 || !count.is_multiple_of(stage.groups) {
         return Err(invalid());
     }
@@ -57,9 +95,11 @@ pub(super) fn component_coordinates(
             return Err(invalid());
         }
         let first = first / stage.rank * per_group;
-        components.extend(first..first + per_group);
+        for index in first..first + per_group {
+            allocation.push(&mut components, index)?;
+        }
     }
-    ComponentCoordinateMap::indices(count, components).map_err(Into::into)
+    allocation.indices(count, components)
 }
 
 fn paired_coordinates(
@@ -68,8 +108,48 @@ fn paired_coordinates(
     first: &LocalTensorLayout,
     last: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let input = row_coordinates(stage, first)?;
-    let output = derive_matrix_axis_coordinates(output_name, latent_width(stage)?, last, 1)?;
+    paired_worker(stage, output_name, first, last, Destination(None))
+}
+pub(super) fn insert_observations(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    component: &ComponentGroup,
+    stage: &ComponentGroupedWriteProjection,
+    layout: Option<&LocalModelLayout>,
+) -> Result<(), ComponentPartitionError> {
+    worker(
+        observations,
+        descriptor,
+        component,
+        stage,
+        layout,
+        Destination(None),
+    )
+}
+fn paired_worker(
+    stage: &ComponentGroupedWriteProjection,
+    output_name: &str,
+    first: &LocalTensorLayout,
+    last: &LocalTensorLayout,
+    allocation: Destination<'_>,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    allocation.controls::<(
+        &ComponentGroupedWriteProjection,
+        &str,
+        &LocalTensorLayout,
+        &LocalTensorLayout,
+        ComponentCoordinateMap,
+        ComponentCoordinateMap,
+        bool,
+    )>()?;
+    let input = row_worker(stage, first, allocation)?;
+    let output = coordinates::matrix_worker(
+        output_name,
+        latent_width_worker(stage, allocation)?,
+        last,
+        1,
+        allocation,
+    )?;
     // Compare actual local order, accepting equivalent compact representations.
     let same = input.global_count() == output.global_count()
         && input.local_count() == output.local_count()
@@ -79,33 +159,39 @@ fn paired_coordinates(
                 .all(|i| input.local_to_global(i) == output.local_to_global(i)),
         };
     if !same {
-        return Err(ComponentPartitionError::InvalidPlacement(
-            output_name.into(),
-        ));
+        return Err(allocation.invalid(output_name));
     }
     Ok(input)
 }
 
-pub(super) fn insert_observations(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+pub(super) fn worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     component: &ComponentGroup,
     stage: &ComponentGroupedWriteProjection,
     layout: Option<&LocalModelLayout>,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
-    let width = latent_width(stage)?;
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &ComponentGroup,
+        &ComponentGroupedWriteProjection,
+        Option<&LocalModelLayout>,
+        Option<ComponentCoordinateMap>,
+        Option<ComponentCoordinateMap>,
+        usize,
+    )>()?;
+    let width = latent_width_worker(stage, allocation)?;
     let coordinates = layout
         .map(|layout| {
-            let tensor = |name: &str| {
-                layout
-                    .tensor(name)
-                    .ok_or_else(|| ComponentPartitionError::MissingWeight(name.into()))
-            };
-            paired_coordinates(
+            let tensor = |name: &str| layout.tensor(name).ok_or_else(|| allocation.missing(name));
+            paired_worker(
                 stage,
                 &component.write_weight,
                 tensor(&stage.weight)?,
                 tensor(&component.write_weight)?,
+                allocation,
             )
         })
         .transpose()?;
@@ -113,8 +199,8 @@ pub(super) fn insert_observations(
         .map(|layout| {
             let tensor = layout
                 .tensor(&stage.weight)
-                .ok_or_else(|| ComponentPartitionError::MissingWeight(stage.weight.clone()))?;
-            component_coordinates(stage.groups, stage, tensor)
+                .ok_or_else(|| allocation.missing(&stage.weight))?;
+            component_worker(stage.groups, stage, tensor, allocation)
         })
         .transpose()?;
     for (path, axis, count, coordinates) in [
@@ -125,7 +211,7 @@ pub(super) fn insert_observations(
         let point = descriptor
             .observations
             .get(path)
-            .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.clone()))?;
+            .ok_or_else(|| allocation.capture_missing(path))?;
         let mut axes = point
             .axes
             .iter()
@@ -136,20 +222,19 @@ pub(super) fn insert_observations(
             .is_some_and(|axis| axis.dimension == SymbolicDimension::Known(count))
             || axes.next().is_some()
         {
-            return Err(ComponentPartitionError::InvalidPlacement(
-                stage.weight.clone(),
-            ));
+            return Err(allocation.invalid(&stage.weight));
         }
-        super::insert_observation(
+        observations::insert(
             observations,
             path,
             PartitionedObservation {
-                axis: axis.into(),
-                coordinates: coordinates.clone(),
+                axis: allocation.text(axis)?,
+                coordinates: allocation.optional_coordinates(coordinates.as_ref())?,
                 exports: layout.is_some(),
                 site: ObservationHookSite::Unit,
                 combination: PartitionCaptureCombination::Disjoint,
             },
+            allocation,
         )?;
     }
     Ok(())

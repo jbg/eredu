@@ -28,7 +28,7 @@ use crate::composition::mlx::speculative::embedded_native::{
     ActiveEmbeddedNativeInvocation, EmbeddedNativeLayout,
 };
 use eredu_core::{HostPreparationAuthority, OutputDemand};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
 use eredu_runtime::{
     speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     working_memory::{
@@ -62,7 +62,7 @@ struct Payload {
     layerwise: Option<LayerwiseWorkspace>,
     _context: WorkspaceContext,
     _bindings: SourceBindings,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +156,7 @@ where
     let mut parts = PreparedTargetEquationQuote::inspect(
         session,
         tokens,
+        context.original_prefill_input(),
         workspace,
         sources,
         environment,
@@ -167,10 +168,10 @@ where
                 edits: &capture_edits,
             }
         }),
-        |quote_context, storage| {
+        |quote_context, storage, prepared| {
             crate::composition::mlx::speculative::validate_registered_tensor_inputs(context, storage[1])?;
             let prior = super::prediction::priors(evidence.evidence(), context, funding)?;
-            SourceBindings::prepare(quote_context, storage, &prior, environment, funding, host)
+            SourceBindings::prepare(quote_context, storage, prepared, &prior, environment, funding, host)
                 .map_err(|cause| sources.retain_error(cause))
         },
     ).map_err(|cause| sources.retain_error(cause))?
@@ -184,8 +185,8 @@ where
         size_of::<EmbeddedInvocationWorkspace>(),
         size_of::<Option<OriginalEmbeddedSpeculativeRole>>(),
         size_of::<binding::Binding<'_>>(),
-        size_of::<safemlx::StreamCopyPlan<WorkspaceMetadataFunding>>(),
-        size_of::<Result<safemlx::StreamCopyPlan<WorkspaceMetadataFunding>,safemlx::StreamCopyCause>>(),
+        size_of::<safemlx::StreamCopyPlan<HostMetadataFunding>>(),
+        size_of::<Result<safemlx::StreamCopyPlan<HostMetadataFunding>,safemlx::StreamCopyCause>>(),
     ];
     funding
         .reserve_metadata(
@@ -210,7 +211,7 @@ where
     let mut completion_distribution=funding.metadata_vec(1).map_err(Error::from)?;
     completion_distribution.push(completion_capacity);
     parts.recipe.bind_target_completion(completion_distribution).map_err(|cause|sources.retain_error(cause))?;
-    let completion_stream=safemlx::StreamCopyPlan::<WorkspaceMetadataFunding>::capture(environment.stream())
+    let completion_stream=safemlx::StreamCopyPlan::<HostMetadataFunding>::capture(environment.stream())
         .map_err(|cause|sources.retain_startup_error(cause))?;
     let completion_controls=NestedCompletionOwner::control_bytes(completion_roots,validation_roots,&completion_stream)
         .and_then(|n|n.checked_add(size_of::<(Option<&MlxTensor>,&S,
@@ -510,3 +511,5 @@ where
     output.visit_logits_roots(&mut |value| value.visit_native_roots(visitor));
     Ok(())
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

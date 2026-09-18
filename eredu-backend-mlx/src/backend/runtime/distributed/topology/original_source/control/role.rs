@@ -11,7 +11,7 @@ use safemlx::{OriginalBufferBudget,PreparedPrefillFailure,PreparedSubmissionGrap
 struct Custody {
     source:RetainedCommunicationSource,
     raw:OriginalTextMetadataCustody,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 struct Owner {
     request:OriginalParallelControlRequest,
@@ -69,6 +69,7 @@ impl OriginalParallelControlOwner {
     pub(crate) fn install(&self)->Result<(OriginalParallelControlInstallation,OriginalParallelControlProjection),Error>{
         reserve(&self.owner().custody.funding,&[size_of::<OriginalParallelControlProjection>(),
             size_of::<OriginalParallelControlInstallation>(),size_of::<Activation>(),
+            OriginalParallelControlProjection::retirement_control_bytes().ok_or_else(overflow)?,
             size_of::<Result<(OriginalParallelControlInstallation,OriginalParallelControlProjection),Error>>(),
             Layout::new::<[usize;2]>().extend(Layout::new::<Activation>()).map_err(|_|overflow())?.0.pad_to_align().size()])?;
         let active=Rc::new(Activation{active:Cell::new(true),custody:self.owner().custody.clone()});
@@ -110,6 +111,45 @@ impl Clone for OriginalParallelControlProjection {
     }
 }
 impl OriginalParallelControlProjection {
+    /// The actual outer operation closes this shared lexical installation at
+    /// callback exit. This fact cannot certify a native scope or retire an
+    /// escaped projection; it only identifies a stale session slot.
+    fn is_active(&self) -> bool {
+        self.active.as_ref().is_some_and(|active| active.active.get())
+    }
+    // The installation pays its future fixed cleanup frames before publishing
+    // the slot. Cleanup performs only reads/moves and never asks for late funds.
+    fn retirement_control_bytes() -> Option<usize> {
+        type Prefill = crate::backend::submission_recovery::prefill::PrefillControlProjection;
+        type Removed = (Option<Prefill>, Option<OriginalParallelControlProjection>);
+        type Loan = std::cell::RefMut<'static, Option<OriginalParallelControlProjection>>;
+        let parts = [
+            size_of::<Loan>(),
+            size_of::<Result<Loan, std::cell::BorrowMutError>>(),
+            size_of::<Option<Self>>(), // removed parallel local
+            size_of::<Option<Self>>(), // take_inactive return
+            size_of::<Removed>(), // closure return transport
+            size_of::<Result<Removed, Error>>(), // inspection result
+            size_of::<Result<
+                Result<Removed, Error>,
+                eredu_runtime::replicated_session::RuntimeInspectionBoundary,
+            >>(), // runtime inspection boundary transport
+            size_of::<Result<Result<Removed, Error>, Error>>(), // mapped boundary transport
+            size_of::<Removed>(), // owner outside all cell/session loans
+            size_of::<&mut Option<Self>>(),
+            size_of::<Option<&Self>>(), // optional slot predicate input
+            size_of::<&Self>(),
+            size_of::<bool>(),
+        ];
+        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+    }
+    pub(crate) fn take_inactive(slot: &mut Option<Self>) -> Option<Self> {
+        if slot.as_ref().is_some_and(|view| !view.is_active()) {
+            slot.take()
+        } else {
+            None
+        }
+    }
     pub(crate) fn alias_control_bytes()->Option<usize>{
         let parts=[size_of::<Self>(),size_of::<Weak<Owner>>(),size_of::<Option<Rc<Activation>>>(),
             size_of::<eredu_core::SharedBackendFailure>(),size_of::<Custody>(),size_of::<&Self>(),
@@ -137,10 +177,10 @@ impl OriginalParallelControlProjection {
     pub(crate) fn with_request_context<T,E,F>(&self,
         roots:Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>,
         binding:Option<super::super::parallel::OriginalParallelBinding>,run:F)->Result<Result<T,E>,Error>
-    where F:FnOnce(Option<(&mut Option<Box<Group>>,&WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&mut Option<Box<Group>>,&HostMetadataFunding)>)->Result<T,E>, {
         reserve(&self.custody.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),
             size_of::<Result<T,E>>(),size_of::<Result<Result<T,E>,Error>>(),
-            size_of::<Option<(&mut Option<Box<Group>>,&WorkspaceMetadataFunding)>>(),size_of::<Option<Box<Group>>>(),size_of::<Box<Group>>(),Layout::new::<Group>().size(),
+            size_of::<Option<(&mut Option<Box<Group>>,&HostMetadataFunding)>>(),size_of::<Option<Box<Group>>>(),size_of::<Box<Group>>(),Layout::new::<Group>().size(),
             size_of::<OriginalParallelControlOwner>(),size_of::<Result<Group,std::collections::TryReserveError>>(),
             CommunicationManifest::group_operation_control_bytes().ok_or_else(overflow)?,
             failure_control_bytes().ok_or_else(overflow)?])?;
@@ -165,10 +205,10 @@ impl OriginalParallelControlProjection {
         Ok(run(Some((&mut context,&self.custody.funding))))
     }
     pub(crate) fn with_context<T,E,F>(&self,prepared:&Group,run:F)->Result<Result<T,E>,Error>
-    where F:FnOnce(Option<(&Group,&WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&Group,&HostMetadataFunding)>)->Result<T,E>, {
         reserve(&self.custody.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),
             size_of::<Result<T,E>>(),size_of::<Result<Result<T,E>,Error>>(),
-            size_of::<Option<(&Group,&WorkspaceMetadataFunding)>>(),
+            size_of::<Option<(&Group,&HostMetadataFunding)>>(),
             size_of::<OriginalParallelControlOwner>(),failure_control_bytes().ok_or_else(overflow)?])?;
         let owner=self.upgrade().map_err(|cause|Error::with_original_control_source(cause,false))?;
         if prepared.has_original_parallel() {
@@ -231,12 +271,12 @@ impl OriginalParallelControlProjection {
     /// Internal PP boundaries use the same request cursor and role producer as
     /// outer phases. This projection is supplied by the exact model Group loan.
     pub(crate) fn with_group<T,E,F>(&self,event:ParallelControlEvent,group:&Group,
-        funding:&WorkspaceMetadataFunding,executor:&Stream,run:F)->Result<Result<T,E>,Error>
+        funding:&HostMetadataFunding,executor:&Stream,run:F)->Result<Result<T,E>,Error>
     where F:FnOnce(Option<&Group>)->Result<T,E>, {
         reserve(&self.custody.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),
             size_of::<Result<T,E>>(),size_of::<Result<Result<T,E>,Error>>(),
             size_of::<Result<Result<Result<T,E>,Error>,eredu_core::BackendFailure>>(),
-            size_of::<(ParallelControlEvent,&Group,&WorkspaceMetadataFunding,&Stream)>(),
+            size_of::<(ParallelControlEvent,&Group,&HostMetadataFunding,&Stream)>(),
             failure_control_bytes().ok_or_else(overflow)?])?;
         self.run_group(event,Some(group),executor,|prepared|{
             let Some((prepared,actual_funding))=prepared else {
@@ -266,12 +306,12 @@ impl OriginalParallelControlProjection {
     }
     pub(crate) fn run<T,E,F>(&self,event:ParallelControlEvent,stream:&Stream,run:F)
         ->Result<Result<T,E>,eredu_core::BackendFailure>
-    where F:FnOnce(Option<(&Group,&WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&Group,&HostMetadataFunding)>)->Result<T,E>, {
         self.run_group(event,None,stream,run)
     }
     fn run_group<T,E,F>(&self,event:ParallelControlEvent,target:Option<&Group>,stream:&Stream,run:F)
         ->Result<Result<T,E>,eredu_core::BackendFailure>
-    where F:FnOnce(Option<(&Group,&WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&Group,&HostMetadataFunding)>)->Result<T,E>, {
         let owner=self.upgrade()?;
         // The claim is spent before reentrancy, source or role admission can fail.
         let invocation=match owner.owner().request.prepare(event,target) {
@@ -294,7 +334,7 @@ impl Drop for Running<'_>{fn drop(&mut self){if std::thread::panicking(){self.fa
 fn run_role<T,E,F>(invocation:OriginalParallelControlInvocation,bank:&BankOwner,
     controls:&OriginalTextControlGuard,custody:&Custody,stream:&Stream,run:F)
     ->Result<Result<T,E>,eredu_core::BackendFailure>
-where F:FnOnce(&Group,&WorkspaceMetadataFunding)->Result<T,E>, {
+where F:FnOnce(&Group,&HostMetadataFunding)->Result<T,E>, {
     let capacity=invocation.capacity();
     run_native_role(invocation,capacity,bank,controls,custody,
         |invocation,active|invocation.with_context(active,stream,run))
@@ -352,3 +392,6 @@ mod expert_region;
 #[path = "role/expert_movement.rs"]
 mod expert_movement;
 pub(crate) use expert_movement::OriginalExpertMovementSource;
+
+#[cfg(test)]
+mod retirement_tests;

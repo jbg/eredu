@@ -222,7 +222,7 @@ pub(crate) fn constructor_error<B: NeuralBackend, E>(
 pub struct SharedConfig<C>(Option<std::sync::Arc<SharedConfigData<C>>>);
 struct SharedConfigData<C> {
     value: SharedConfigValue<C>,
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 // A projected owner keeps the exact immutable parent, not a copied child.
 // This private erasure releases its Box before the parent alias can retire.

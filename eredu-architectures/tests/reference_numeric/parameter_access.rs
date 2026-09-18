@@ -96,10 +96,10 @@ fn ordinary(
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Bind<'_> {
         fn visit_mut(
             &mut self,
-            metadata: eredu_nn::ParameterMetadata,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
             value: &'a mut NumericTensor,
         ) {
-            let id = metadata.alias_of.as_ref().unwrap_or(&metadata.id).as_str();
+            let id = metadata.alias_of().as_ref().unwrap_or(&metadata.id()).as_str();
             if let Some(expected) = self.0.get(id) {
                 *value = expected.clone();
             }
@@ -128,7 +128,7 @@ fn ordinary(
         .visit_static_parameters_mut(&mut Bind(values))
         .unwrap();
     let mut state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();

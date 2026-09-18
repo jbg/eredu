@@ -344,7 +344,7 @@ fn component_destinations_with_retained_account<T>(
         drop(exact);
         assert_eq!(pool.used_bytes().unwrap(), before);
     }
-    let (_, reservation, accepted) = plan_prefill_incremental_with_capacity(
+    let (reservation, accepted) = plan_prefill_incremental_with_capacity(
         &execution,
         &pool,
         &capabilities,

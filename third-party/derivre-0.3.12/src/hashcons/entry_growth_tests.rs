@@ -13,7 +13,7 @@ fn paid_entry_growth_preserves_staged_words_ids_and_duplicate_zero_spend() {
     let denied = Arc::new(AtomicBool::new(false));
     let owner = {
         let spent = spent.clone(); let denied = denied.clone();
-        PreparedHashConsFunding::prepare(move |bytes| {
+        ParserAllocationFunding::prepare(move |bytes| {
             if denied.load(Ordering::SeqCst) { Err(EntryDenied) }
             else { spent.fetch_add(bytes, Ordering::SeqCst); Ok(()) }
         }).unwrap()

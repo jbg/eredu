@@ -93,8 +93,18 @@ pub struct RoutedUnitGeometry {
 impl RoutedUnitGeometry {
     /// Number of virtual components. This does not allocate an expert-dense tensor.
     pub fn components(self) -> Result<u64, CaptureError> {
+        self.components_with(super::admission::allocation::Allocation(None))
+    }
+    /// Validates the same geometry and funds any semantic diagnostic before
+    /// construction. The enclosing source retains this account with the result.
+    pub fn components_with_metadata(self,funding:&crate::HostMetadataFunding)->Result<u64,CaptureError>{
+        funding.reserve_metadata(std::mem::size_of::<(Self,Result<u64,CaptureError>)>())
+            .map_err(super::admission::allocation::CaptureAdmissionStorageError::from)?;
+        self.components_with(super::admission::allocation::Allocation(Some(funding)))
+    }
+    pub(crate) fn components_with(self, allocation: super::admission::allocation::Allocation<'_>) -> Result<u64, CaptureError> {
         if self.experts == 0 || self.units_per_expert == 0 || self.routes_per_token == 0 {
-            return Err(CaptureError::Invalid("empty routed-unit geometry".into()));
+            return Err(CaptureError::Invalid(allocation.text("empty routed-unit geometry")?));
         }
         mul(self.experts, self.units_per_expert)
     }

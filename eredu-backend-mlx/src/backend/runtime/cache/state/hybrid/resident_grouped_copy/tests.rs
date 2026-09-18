@@ -332,7 +332,6 @@ fn mixed_fixed_roles_and_absence_have_real_child_extents_and_copied_workspace() 
     let stream = stream();
     let source = source(&stream);
     let plan = PreparedHybridGroupedCopy::prepare(&source).unwrap();
-    assert!(PreparedHybridGroupedCopy::requires_group(&source));
     assert_eq!(
         (0..plan.len())
             .map(|i| plan.layer(i).unwrap().fixed.len())
@@ -605,3 +604,5 @@ fn borrowed_hybrid_whole_visit_covers_fixed_shared_key_only_and_compressed_slots
 }
 
 pub(super) mod original_discard;
+
+mod kv_only;

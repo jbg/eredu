@@ -3,10 +3,10 @@ use eredu_nn::workspace::*;
 use std::{convert::Infallible,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
 #[derive(Debug)]
 struct Account {remaining:Arc<Mutex<usize>>,retired:Arc<AtomicBool>}
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
         let mut available=self.remaining.lock().unwrap();
-        let next=available.checked_sub(bytes).ok_or(WorkspaceMetadataFundingError::Capacity{
+        let next=available.checked_sub(bytes).ok_or(HostMetadataFundingError::Capacity{
             required:bytes as u64,available:*available as u64})?;
         *available=next;Ok(())
     }
@@ -25,7 +25,7 @@ impl WorkspaceFactMechanisms for NoTensorFacts {
 }
 fn context()->(WorkspaceContext,Arc<Mutex<usize>>,Arc<AtomicBool>){
     let remaining=Arc::new(Mutex::new(16*1024*1024));let retired=Arc::new(AtomicBool::new(false));
-    let funding=WorkspaceMetadataFunding::new(Account{remaining:remaining.clone(),retired:retired.clone()}).unwrap();
+    let funding=HostMetadataFunding::new(Account{remaining:remaining.clone(),retired:retired.clone()}).unwrap();
     (WorkspaceContext::new_with_metadata_funding(NoTensorFacts,funding).unwrap(),remaining,retired)
 }
 fn spec(role:&str,width:i32,context:&WorkspaceContext)->BoundaryTensorSpec{

@@ -12,17 +12,23 @@ mod metal {
         PreparedMetalKernelFamily,
     };
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         OnceLock,
+        atomic::{AtomicBool, Ordering},
     };
 
     pub(crate) type Definition = PreparedMetalKernelFamily<SharedNativeInitializationCustody>;
+    use crate::backend::managed_memory::kernel_family::UnenforcedFamilyCache;
+    static UNENFORCED: UnenforcedFamilyCache = UnenforcedFamilyCache::new();
+    pub(crate) const OUTPUT_DIMENSIONS: usize = 32;
     pub(crate) static PLAN: MetalKernelDefinitionPlan<'static, 1, 1> = MetalKernelDefinitionPlan {
         name: "f32_pointwise",
         inputs: ["input"],
         outputs: ["output"],
         source: "uint i=thread_position_in_grid.x; if(i>=threads_per_grid.x) return; float x=pointwise_value(input,i); float denominator=1.0f+stable_exp_f32(-x); output[i]=(OP==1 ? 1.0f : x)/denominator;",
-        header: concat!(include_str!("../nn/exp_f32.metal"), "\ninline float pointwise_value(constant const float& x, uint i) { return x; }\ninline float pointwise_value(constant const float* x, uint i) { return x[i]; }\ninline float pointwise_value(device const float* x, uint i) { return x[i]; }\n"),
+        header: concat!(
+            include_str!("../nn/exp_f32.metal"),
+            "\ninline float pointwise_value(constant const float& x, uint i) { return x; }\ninline float pointwise_value(constant const float* x, uint i) { return x[i]; }\ninline float pointwise_value(device const float* x, uint i) { return x[i]; }\n"
+        ),
         ensure_row_contiguous: true,
         atomic_outputs: false,
     };
@@ -63,6 +69,7 @@ mod metal {
     pub(crate) fn static_storage_bytes() -> usize {
         // These are actual fixed owners/literal bytes, not a per-request grant.
         std::mem::size_of_val(&INITIALIZED)
+            + std::mem::size_of_val(&UNENFORCED)
             + std::mem::size_of_val(&SOURCE_QUALIFIED)
             + std::mem::size_of_val(&INITIALIZING)
             + std::mem::size_of_val(&PLAN)
@@ -156,10 +163,51 @@ mod metal {
             .expect("exclusive pointwise definition initializer");
         Ok(())
     }
-    // No ordinary installation/promotion exists. Successful original cold entry
-    // has already validated this process domain; this borrow grants no credit.
-    pub(crate) fn definition() -> Option<&'static Definition> {
-        INITIALIZED.get().map(InitializedSharedNative::output)
+    pub(crate) fn apply(
+        input: &safemlx::Array,
+        operation: i32,
+        size: i32,
+        stream: &safemlx::Stream,
+    ) -> Result<safemlx::Array, safemlx::error::Exception> {
+        use safemlx::{OriginalScopeObserver, fast::BorrowedKernelOutput};
+        let observer = OriginalScopeObserver::try_current()?;
+        if let Some(observer) = &observer {
+            if input.ndim() > OUTPUT_DIMENSIONS || INITIALIZED.get().is_none() {
+                return Err(observer.capacity_error());
+            }
+        }
+        let flat = [size];
+        let reduced = input.ndim() > OUTPUT_DIMENSIONS;
+        let outputs = [BorrowedKernelOutput {
+            shape: if reduced { &flat } else { input.shape() },
+            dtype: safemlx::Dtype::Float32,
+        }];
+        let templates = [BorrowedKernelTemplate::Int(c"OP", operation)];
+        let [output] = if let Some(family) = INITIALIZED.get() {
+            family.output().apply_fixed_device(
+                [input],
+                outputs,
+                &templates,
+                [size, 1, 1],
+                [256, 1, 1],
+                stream,
+            )?
+        } else {
+            let family = UNENFORCED.get_or_try_init(|owner| FAMILY.realize(owner))?;
+            family.apply_fixed_device(
+                [input],
+                outputs,
+                &templates,
+                [size, 1, 1],
+                [256, 1, 1],
+                stream,
+            )?
+        };
+        if reduced {
+            output.reshape(input.shape(), stream)
+        } else {
+            Ok(output)
+        }
     }
     #[cfg(test)]
     mod tests {

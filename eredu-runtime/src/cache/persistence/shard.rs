@@ -1,7 +1,7 @@
 //! One immutable source/header layout for ordinary and paid live-cache I/O.
 use super::*;
 use eredu_checkpoint::safetensors::{SafetensorsHeaderError, SafetensorsHeaderPlan};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
 use safetensors::tensor::{Dtype, TensorInfo};
 use std::mem::{size_of, size_of_val};
 
@@ -29,7 +29,7 @@ pub enum CacheShardError {
 pub struct CacheShardMetadata {
     entries: [(&'static str, TensorInfo); 2],
     order: [usize; 2],
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 #[derive(Debug)]
 struct Layout {
@@ -43,8 +43,8 @@ struct Layout {
 #[derive(Clone, Debug)]
 pub struct CacheShardLayout {
     inner: Arc<Layout>,
-    source_funding: Option<WorkspaceMetadataFunding>,
-    header_funding: Option<WorkspaceMetadataFunding>,
+    source_funding: Option<HostMetadataFunding>,
+    header_funding: Option<HostMetadataFunding>,
 }
 /// Borrowed exact tensor payload selected by a retained writer layout.
 pub struct CacheShardTensor<'a> {
@@ -189,7 +189,7 @@ impl CacheShardMetadata {
             size_of::<Result<(), CacheShardError>>(),
             size_of::<Result<(), std::io::Error>>(),
             size_of::<[&[u8]; 2]>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             size_of::<[CacheShardTensor<'_>; 2]>(),
             size_of::<Result<[CacheShardTensor<'_>; 2], CacheShardError>>(),
         ];

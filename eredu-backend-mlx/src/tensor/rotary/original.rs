@@ -48,7 +48,7 @@ impl Execution {
                 cause,
                 _custody: observer.invalid_input_error(),
             }),
-            None => Error::backend_source(cause),
+            None => Error::backend_retained_source(cause),
         }
     }
     pub(super) fn observer(&self) -> Option<&OriginalScopeObserver> {
@@ -172,12 +172,12 @@ impl PreparedRotaryProfile {
         // selected cast/product, cos/cos-reshape and sin/sin-reshape (16).
         // Column locals: selected column, offset, addition, both signed
         // endpoints, saturation and minimum (7).
-        let failure = Error::retained_source_control_bytes::<Failure<Exception>>()?
-            .max(Error::retained_source_control_bytes::<
+        let failure = Error::retained_source_construction_bytes::<Failure<Exception>>()?
+            .max(Error::retained_source_construction_bytes::<
                 Failure<RotaryTableError>,
             >()?)
-            .max(Error::retained_source_control_bytes::<Failure<Invalid>>()?)
-            .max(Error::retained_source_control_bytes::<Exception>()?);
+            .max(Error::retained_source_construction_bytes::<Failure<Invalid>>()?)
+            .max(Error::retained_source_construction_bytes::<Exception>()?);
         let fixed = [
             size_of::<Self>(),
             size_of::<Execution>(),

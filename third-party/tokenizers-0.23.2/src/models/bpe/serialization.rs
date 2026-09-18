@@ -7,44 +7,65 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+pub(crate) struct Serialization<'a> {
+    source: &'a BPE,
+    merges: Vec<(&'a Pair, &'a u32)>,
+}
+impl BPE {
+    pub(crate) fn serialization_with_allocations<'a>(
+        &'a self,
+        policy: &dyn serde_json::allocation::Allocation,
+    ) -> std::result::Result<Serialization<'a>, serde_json::allocation::AllocationError> {
+        let allocator = serde_json::allocation::Allocator::new(policy);
+        allocator.reserve(
+            std::mem::size_of::<Serialization<'_>>()
+                + std::mem::size_of::<std::slice::Iter<'_, (&Pair, &u32)>>(),
+        )?;
+        let mut merges = Vec::new();
+        allocator.grow(&mut merges, self.storage.merge_len())?;
+        merges.extend(self.storage.merges().map(|(pair, (rank, _))| (pair, rank)));
+        merges.sort_unstable_by_key(|row| *row.1);
+        Ok(Serialization {
+            source: self,
+            merges,
+        })
+    }
+}
 impl Serialize for BPE {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialization_with_allocations(&serde_json::allocation::Unenforced)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+impl Serialize for Serialization<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let source = self.source;
         let mut model = serializer.serialize_struct("BPE", 8)?;
-
-        // Start by small fields
         model.serialize_field("type", "BPE")?;
-        model.serialize_field("dropout", &self.dropout)?;
-        model.serialize_field("unk_token", &self.unk_token)?;
-        model.serialize_field("continuing_subword_prefix", &self.continuing_subword_prefix)?;
-        model.serialize_field("end_of_word_suffix", &self.end_of_word_suffix)?;
-        model.serialize_field("fuse_unk", &self.fuse_unk)?;
-        model.serialize_field("byte_fallback", &self.byte_fallback)?;
-        model.serialize_field("ignore_merges", &self.ignore_merges)?;
-
-        // Then the large ones
-        let mut merges: Vec<(&Pair, &u32)> = self
-            .storage
-            .merges()
-            .map(|(pair, (rank, _))| (pair, rank))
-            .collect();
-        merges.sort_unstable_by_key(|k| *k.1);
-        let merges = merges
-            .into_iter()
-            .map(|(pair, _)| {
-                (
-                    self.storage.token(pair.0).expect("BPE merge ID").to_owned(),
-                    self.storage.token(pair.1).expect("BPE merge ID").to_owned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let ordered_vocab = OrderedStorage(&self.storage);
-
-        model.serialize_field("vocab", &ordered_vocab)?;
-        model.serialize_field("merges", &merges)?;
-
+        model.serialize_field("dropout", &source.dropout)?;
+        model.serialize_field("unk_token", &source.unk_token)?;
+        model.serialize_field(
+            "continuing_subword_prefix",
+            &source.continuing_subword_prefix,
+        )?;
+        model.serialize_field("end_of_word_suffix", &source.end_of_word_suffix)?;
+        model.serialize_field("fuse_unk", &source.fuse_unk)?;
+        model.serialize_field("byte_fallback", &source.byte_fallback)?;
+        model.serialize_field("ignore_merges", &source.ignore_merges)?;
+        model.serialize_field("vocab", &OrderedStorage(&source.storage))?;
+        struct Merges<'a, 's>(&'a Serialization<'s>);
+        impl Serialize for Merges<'_, '_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_seq(self.0.merges.iter().map(|(pair, _)| {
+                    (
+                        self.0.source.storage.token(pair.0).expect("BPE merge ID"),
+                        self.0.source.storage.token(pair.1).expect("BPE merge ID"),
+                    )
+                }))
+            }
+        }
+        model.serialize_field("merges", &Merges(self))?;
         model.end()
     }
 }
@@ -54,7 +75,7 @@ impl<'de> Deserialize<'de> for BPE {
     where
         D: Deserializer<'de>,
     {
-        Self::deserialize_with_cache_policy(deserializer, crate::ModelCachePolicy::Legacy)
+        Self::deserialize_with_cache_policy(deserializer, crate::ModelCachePolicy::default())
     }
 }
 

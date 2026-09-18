@@ -311,8 +311,7 @@ impl Parts {
             return Ok(value);
         }
         let (_, nodes, encoded) = source
-            .prepared_extents()
-            .map_err(PreparedRelevanceError::Expression)?;
+            .storage_extents();
         self.containment = Some(State::new(nodes, encoded));
         let cost_limit = source.cost().saturating_add(max_fuel);
         let result = containment::run(
@@ -371,36 +370,36 @@ mod tests {
 
     #[test]
     fn owning_containment_preserves_prefix_branches_lengths_cache_and_fuel_recovery() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let ab = source.mk_byte_set_or(&[a, b]);
-        let bc = source.mk_byte_set_or(&[b, c]);
-        let abc = source.mk_byte_set_or(&[a, b, c]);
-        let small = source.mk_repeat(ab, 1, 2);
-        let main = source.mk_repeat(abc, 1, 4);
-        let partial = source.mk_repeat(bc, 1, 4);
-        let tail = source.mk_repeat(ab, 0, 2);
-        let head_tail = source.mk_concat(ab, tail);
-        let main_tail = source.mk_repeat(abc, 0, 4);
-        let matching_head = source.mk_concat(ab, main_tail);
-        let prefix = source.mk_byte_literal(b"xy");
-        let prefixed_small = source.mk_concat(prefix, small);
-        let prefixed_big = source.mk_concat(prefix, main);
-        let short = source.mk_byte_literal(b"pq");
-        let choices = source.mk_or(&mut vec![short, c]);
-        let not_choices = source.mk_not(choices);
-        let excepted = source.mk_and2(main, not_choices);
-        let not_repeat = source.mk_not(partial);
-        let unbounded_except = source.mk_and2(main, not_repeat);
-        let suffix = source.mk_byte(b'z');
-        let main_suffix = source.mk_concat(main, suffix);
-        let except_suffix = source.mk_concat(choices, suffix);
-        let not_suffix = source.mk_not(except_suffix);
-        let suffixed = source.mk_and2(main_suffix, not_suffix);
-        let optional = source.mk_repeat(bc, 0, 1);
-        let optional_main = source.mk_concat(optional, main);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let ab = source.mk_byte_set_or(&[a, b]).unwrap();
+        let bc = source.mk_byte_set_or(&[b, c]).unwrap();
+        let abc = source.mk_byte_set_or(&[a, b, c]).unwrap();
+        let small = source.mk_repeat(ab, 1, 2).unwrap();
+        let main = source.mk_repeat(abc, 1, 4).unwrap();
+        let partial = source.mk_repeat(bc, 1, 4).unwrap();
+        let tail = source.mk_repeat(ab, 0, 2).unwrap();
+        let head_tail = source.mk_concat(ab, tail).unwrap();
+        let main_tail = source.mk_repeat(abc, 0, 4).unwrap();
+        let matching_head = source.mk_concat(ab, main_tail).unwrap();
+        let prefix = source.mk_byte_literal(b"xy").unwrap();
+        let prefixed_small = source.mk_concat(prefix, small).unwrap();
+        let prefixed_big = source.mk_concat(prefix, main).unwrap();
+        let short = source.mk_byte_literal(b"pq").unwrap();
+        let choices = source.mk_or(&mut vec![short, c]).unwrap();
+        let not_choices = source.mk_not(choices).unwrap();
+        let excepted = source.mk_and2(main, not_choices).unwrap();
+        let not_repeat = source.mk_not(partial).unwrap();
+        let unbounded_except = source.mk_and2(main, not_repeat).unwrap();
+        let suffix = source.mk_byte(b'z').unwrap();
+        let main_suffix = source.mk_concat(main, suffix).unwrap();
+        let except_suffix = source.mk_concat(choices, suffix).unwrap();
+        let not_suffix = source.mk_not(except_suffix).unwrap();
+        let suffixed = source.mk_and2(main_suffix, not_suffix).unwrap();
+        let optional = source.mk_repeat(bc, 0, 1).unwrap();
+        let optional_main = source.mk_concat(optional, main).unwrap();
         let cases = [
             (small, main, true),
             (small, partial, false),
@@ -414,14 +413,14 @@ mod tests {
         ];
         // This retained declaration supplies real initialized source backing;
         // reserve below changes only the existing ordinary table geometry.
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[main; 128]));
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[main; 128])).unwrap();
         let mut roots = Vec::new();
         for &(left, right, _) in &cases {
             roots.extend([left, right]);
         }
         roots.push(declaration);
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &roots);
-        source.reserve(128);
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &roots).unwrap();
+        source.reserve(128).unwrap();
         let spent = Cell::new(0usize);
         let reserve = |bytes: usize| -> Result<(), &'static str> {
             let next = spent.get().checked_add(bytes).ok_or("overflow")?;

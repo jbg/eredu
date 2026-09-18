@@ -1,5 +1,7 @@
 use super::*;
-use eredu::api::GenerationOutput;
+use eredu::api::{
+    GenerationOutput, PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest,
+};
 use eredu::runtime::chat::{SemanticSupport, ToolChoice};
 use eredu_core::GenerationCancellationToken;
 use std::time::{Duration, Instant};
@@ -14,11 +16,19 @@ fn request() -> ChatTemplateRequest {
     }
 }
 
-type Terminal = (eredu_core::SpeculativeTokenIds, FinishReason, Option<Duration>);
+type Terminal = (
+    eredu_core::SpeculativeTokenIds,
+    FinishReason,
+    Option<Duration>,
+);
 
 fn terminal<S, T: TerminalTokenStorage>(output: GenerationOutput<S, T>) -> Terminal {
     let ttft = output.timing().time_to_first_token();
-    (output.token_ids.into_terminal_tokens(), output.finish_reason, ttft)
+    (
+        output.token_ids.into_terminal_tokens(),
+        output.finish_reason,
+        ttft,
+    )
 }
 
 // Exercise all public text entry points against the neutral backend and real
@@ -26,30 +36,49 @@ fn terminal<S, T: TerminalTokenStorage>(output: GenerationOutput<S, T>) -> Termi
 // then accepts 11 and commits bonus 17.
 fn generate<F: FnMut(SemanticEvent)>(
     method: usize,
-    model: &mut LoadedModel<MockBackend>,
-    input: PreparedChatInput<'_, MockBackend>,
+    model: &mut original_sources::Fixture<MockBackend>,
+    chat: &PreparedChat,
+    input: PreparedChatPrompt<'_, <MockBackend as TextGenerationBackend>::Prompt>,
     stops: &[String],
     cancellation: GenerationCancellationToken,
     on_event: F,
 ) -> Result<Terminal, Box<dyn std::error::Error>> {
-    let settings = PreparedChatGenerationSettings {
+    let settings = original_sources::settings(PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(3),
             ..Default::default()
         },
         ..Default::default()
-    };
+    });
     Ok(match method {
-        0 => terminal(model.generate_prepared_text(PreparedChatGenerationRequest {
-            input,
-            settings,
-            caller_stop_sequences: stops,
-            cancellation,
-            on_event,
-        })?),
-        1 => terminal(model.generate_prepared_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        0 => {
+            let mut settings = settings;
+            settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+            let mut request = PreparedChatRequest::new(chat, settings);
+            request.input = input;
+            request.output_mode = PreparedChatOutputMode::Text;
+            request.stop_sequences = stops;
+            let mut on_event = on_event;
+            match model.start_prepared_chat(request, &cancellation)? {
+                Some(session) => terminal(session.run(&cancellation, &mut on_event)?),
+                None => {
+                    on_event(SemanticEvent::Finished {
+                        reason: FinishReason::Cancelled,
+                    });
+                    (
+                        Vec::<u32>::new().into_terminal_tokens(),
+                        FinishReason::Cancelled,
+                        None,
+                    )
+                }
+            }
+        }
+        1 => terminal(model.generate_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat,
                 input,
+                output_mode: PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -59,11 +88,14 @@ fn generate<F: FnMut(SemanticEvent)>(
             },
         )?),
         2 => {
-            let output = model.generate_prepared_text_speculative_batch(
+            let output = model.generate_prepared_chat_speculative_batch(
                 PreparedChatSpeculativeBatchRequest {
                     drafting: SpeculativeDraft::Embedded,
                     lanes: vec![PreparedChatSpeculativeBatchLane {
+                        chat,
                         input,
+                        output_mode: PreparedChatOutputMode::Text,
+                        skip_special_tokens: true,
                         settings,
                         max_draft_tokens: NonZeroUsize::new(2).unwrap(),
                         caller_stop_sequences: stops,
@@ -77,9 +109,12 @@ fn generate<F: FnMut(SemanticEvent)>(
             assert_eq!(lanes.len(), 1);
             terminal(lanes.remove(0).expect("one validated request"))
         }
-        3 => terminal(model.with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        3 => terminal(model.with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat,
                 input,
+                output_mode: PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -97,13 +132,27 @@ fn generate<F: FnMut(SemanticEvent)>(
     })
 }
 
-fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, Vec<u32>) {
+fn output_model(
+    method: usize,
+    pieces: [&str; 2],
+) -> (original_sources::Fixture<MockBackend>, Vec<u32>) {
     let tokenizer = unicode_tokenizer(None, 64);
     let mut value: serde_json::Value =
         serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
     let mut probe =
         unicode_model_from_tokenizer(ChatTokenizer::from_tokenizer(tokenizer), TEMPLATE);
-    let chat = probe.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = probe
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        probe
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let ids = if method == 0 {
         vec![first, first + 1, first + 2]
@@ -121,7 +170,7 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
     tokenizer
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
-    let model = LoadedModel::from_runtime(
+    let model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -149,7 +198,23 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                         ["<think>literal", "<tool_call>"]
                     };
                     let (mut model, expected) = output_model(method, pieces);
-                    let chat = model.prepare_chat(request()).unwrap();
+                    let chat = {
+                        let request = request();
+                        let cancellation = eredu_core::GenerationCancellationToken::new();
+                        let source = model
+                            .chat_source(!request.tools.is_empty(), &cancellation)
+                            .unwrap()
+                            .unwrap();
+                        model
+                            .prepare_chat(
+                                &source,
+                                &request,
+                                original_sources::CAPACITY,
+                                &cancellation,
+                            )
+                            .unwrap()
+                            .unwrap()
+                    };
                     assert!(matches!(
                         chat.semantic_support(),
                         SemanticSupport::Unsupported { .. }
@@ -158,9 +223,9 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                     assert_eq!(chat.rendered_prompt(), "user says: hello\nreply begins: ");
                     let prompt = model.encode(chat.rendered_prompt(), false).unwrap();
                     let input = if backend_input {
-                        PreparedChatInput::prepared_backend_input(&chat, prompt)
+                        PreparedChatPrompt::TokenIds(&prompt)
                     } else {
-                        PreparedChatInput::rendered_prompt(&chat)
+                        PreparedChatPrompt::Rendered
                     };
                     let stops = if stop {
                         vec![if unicode {
@@ -177,6 +242,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                     let (ids, reason, ttft) = generate(
                         method,
                         &mut model,
+                        &chat,
                         input,
                         &stops,
                         Default::default(),
@@ -225,7 +291,18 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
         for eos in [false, true] {
             for pre_cancel in [false, true] {
                 let mut model = unicode_model_with_template(eos.then_some(5), 64, TEMPLATE);
-                let chat = model.prepare_chat(request()).unwrap();
+                let chat = {
+                    let request = request();
+                    let cancellation = eredu_core::GenerationCancellationToken::new();
+                    let source = model
+                        .chat_source(!request.tools.is_empty(), &cancellation)
+                        .unwrap()
+                        .unwrap();
+                    model
+                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .unwrap()
+                        .unwrap()
+                };
                 let cancellation = GenerationCancellationToken::new();
                 if pre_cancel {
                     cancellation.cancel();
@@ -239,7 +316,8 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
                 let (ids, reason, ttft) = generate(
                     method,
                     &mut model,
-                    PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]),
+                    &chat,
+                    PreparedChatPrompt::TokenIds(&[0; 7]),
                     &stops,
                     cancellation,
                     |event| events.push(event),
@@ -261,12 +339,24 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
             }
         }
         let mut model = unicode_model_with_template(None, 64, TEMPLATE);
-        let chat = model.prepare_chat(request()).unwrap();
+        let chat = {
+            let request = request();
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancellation)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .unwrap()
+                .unwrap()
+        };
         let cancellation = GenerationCancellationToken::new();
         let (ids, reason, ttft) = generate(
             method,
             &mut model,
-            PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]),
+            &chat,
+            PreparedChatPrompt::TokenIds(&[0; 7]),
             &[],
             cancellation.clone(),
             |_| cancellation.cancel(),
@@ -284,15 +374,29 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
         for template in [TEMPLATE, QWEN_TEMPLATE] {
             let mut model = unicode_model_with_template(None, 64, template);
             for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {
-                let chat = model.prepare_chat(ChatTemplateRequest {
-                    tools: vec![serde_json::json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}})],
-                    tool_choice: choice,
-                    ..request()
-                }).unwrap();
+                let chat = {
+                    let request = ChatTemplateRequest {
+                        tools: vec![
+                            serde_json::json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
+                        ],
+                        tool_choice: choice,
+                        ..request()
+                    };
+                    let cancellation = eredu_core::GenerationCancellationToken::new();
+                    let source = model
+                        .chat_source(!request.tools.is_empty(), &cancellation)
+                        .unwrap()
+                        .unwrap();
+                    model
+                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .unwrap()
+                        .unwrap()
+                };
                 let error = generate(
                     method,
                     &mut model,
-                    PreparedChatInput::rendered_prompt(&chat),
+                    &chat,
+                    PreparedChatPrompt::Rendered,
                     &[],
                     Default::default(),
                     |_| panic!("rejected tools emitted"),
@@ -300,73 +404,137 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
                 .unwrap_err();
                 assert!(error.to_string().contains("tool declarations"));
             }
-            let required = model.prepare_chat(ChatTemplateRequest {
+            let requested = ChatTemplateRequest {
                 tool_choice: ToolChoice::Required,
                 ..request()
-            });
-            match required {
-                Ok(required) => assert!(generate(
-                    method,
-                    &mut model,
-                    PreparedChatInput::rendered_prompt(&required),
-                    &[],
-                    Default::default(),
-                    |_| panic!("required call admitted")
+            };
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let source = model.chat_source(false, &cancellation).unwrap().unwrap();
+            let required = model
+                .prepare_chat(
+                    &source,
+                    &requested,
+                    original_sources::CAPACITY,
+                    &cancellation,
                 )
-                .is_err()),
+                .map(|prepared| prepared.expect("uncancelled preparation"));
+            match required {
+                Ok(required) => assert!(
+                    generate(
+                        method,
+                        &mut model,
+                        &required,
+                        PreparedChatPrompt::Rendered,
+                        &[],
+                        Default::default(),
+                        |_| panic!("required call admitted")
+                    )
+                    .is_err()
+                ),
                 Err(error) => assert!(error.to_string().contains("no tools were supplied")),
             }
         }
         let mut model = unicode_model_with_template(None, 64, TEMPLATE);
-        assert!(model
-            .prepare_chat(ChatTemplateRequest {
-                enable_thinking: Some(true),
-                ..request()
-            })
-            .is_err());
-        let chat = model
-            .prepare_chat(ChatTemplateRequest {
+        let requested = ChatTemplateRequest {
+            enable_thinking: Some(true),
+            ..request()
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model.chat_source(false, &cancellation).unwrap().unwrap();
+        assert!(
+            model
+                .prepare_chat(
+                    &source,
+                    &requested,
+                    original_sources::CAPACITY,
+                    &cancellation
+                )
+                .is_err()
+        );
+        let chat = {
+            let request = ChatTemplateRequest {
                 enable_thinking: Some(true),
                 allow_unparsed_reasoning: true,
                 ..request()
-            })
-            .unwrap();
-        assert!(generate(
-            method,
-            &mut model,
-            PreparedChatInput::rendered_prompt(&chat),
-            &[],
-            Default::default(),
-            |_| {}
-        )
-        .is_ok());
+            };
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancellation)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            generate(
+                method,
+                &mut model,
+                &chat,
+                PreparedChatPrompt::Rendered,
+                &[],
+                Default::default(),
+                |_| {}
+            )
+            .is_ok()
+        );
     }
 }
 
 #[test]
 fn unrecognized_templates_still_require_explicit_text_generation() {
     let mut model = unicode_model_with_template(None, 64, TEMPLATE);
-    let chat = model.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let error = {
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let mut on_event = |_| panic!("unsupported chat emitted");
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(Default::default()),
+        );
+        request.stop_sequences = &[];
+        model
+            .start_prepared_chat(request, &cancellation)
+            .and_then(|session| {
+                session
+                    .expect("uncancelled original request")
+                    .run(&cancellation, &mut on_event)
+            })
+    }
+    .unwrap_err();
+    assert!(matches!(
+        error.semantic_output_rejection(),
+        Some(SemanticSupport::Unsupported { .. })
+    ));
+    let source = model.tokenizer_source().clone();
     let error = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(&chat),
-            settings: Default::default(),
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| panic!("unsupported chat emitted"),
-        })
-        .unwrap_err();
-    assert!(matches!(error, PreparedChatError::Semantic(_)));
-    let error = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(&chat),
+        .generate_prepared_chat_speculative(eredu::api::PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::Rendered,
             drafting: SpeculativeDraft::Embedded,
-            settings: Default::default(),
+            settings: original_sources::settings(Default::default()),
             options: Default::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| panic!("unsupported chat emitted"),
+            output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
         })
         .unwrap_err();
-    assert!(matches!(error, PreparedChatSpeculativeError::Semantic(_)));
+    assert!(matches!(
+        error.semantic_output_rejection(),
+        Some(SemanticSupport::Unsupported { .. })
+    ));
 }

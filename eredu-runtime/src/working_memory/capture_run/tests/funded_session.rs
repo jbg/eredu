@@ -192,7 +192,7 @@ fn exact_factory_and_legacy_prefill_decode_wire_quota_parity() {
     drop(short_run);
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
-    let mut legacy = CaptureSession::from_shared_plan(source.clone());
+    let mut legacy = CaptureSession::new(source.clone());
     let mut fb = Backend::default();
     let mut lb = Backend::default();
     for p in 0..4 {
@@ -610,9 +610,19 @@ fn empty_plan_uses_no_frame_but_still_requires_terminal_drain_and_fresh_phase() 
     let mut backend = Backend::default();
     forward(&mut funded, &mut backend, 0, true).unwrap();
     assert!(funded.has_pending_step());
+    assert!(funded.prepare_checkpoint().is_err());
     assert!(funded.take_shared_step().unwrap().is_none());
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),1);
+    assert!(funded.take_shared_step().unwrap().is_none());
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),1);
     forward(&mut funded, &mut backend, 1, true).unwrap();
     assert!(funded.take_shared_step().unwrap().is_none());
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),2);
+    forward(&mut funded,&mut backend,2,false).unwrap();
+    assert!(funded.take_shared_step().unwrap().is_none());
+    assert!(funded.prepare_checkpoint().is_err());
+    assert!(funded.take_shared_step().unwrap().is_none());
+    assert!(funded.prepare_checkpoint().is_err());
     assert_eq!(backend.calls, 0);
     assert_eq!(funded.spent_steps(), 0);
     assert_eq!(funded.usage(), CaptureUsage::default());
@@ -979,3 +989,133 @@ fn funded_capture_restore_keeps_post_snapshot_spending_and_fork_is_independent()
 }
 
 mod invocation;
+
+#[test]
+fn derived_child_limits_keep_saved_spending_and_reject_unrelated_parent() {
+    use eredu_core::capture::PreparedCapturePlanCopy;
+    let mut raw = raw();
+    raw.selections.truncate(1);
+    raw.limits.cumulative.captures = 1;
+    let source = admit(raw.clone(), point(), 4, false);
+    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let h = plan(&source).initialization_peak_bytes();
+    let (reservation, run) = fresh(&pool, h);
+    let mut parent = session(&source, &pool, &reservation, &run);
+    forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
+    drop(parent.take_shared_step().unwrap());
+    let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
+    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20).unwrap();
+    let mut limits = raw.limits.clone();
+    limits.cumulative.captures = 2;
+    let capabilities = CaptureCapabilities::default();
+    let revised = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
+        &source, limits.clone(), &capabilities).unwrap()).unwrap();
+    let child = saved.with_branch_capture_source(&revised, &pool, &funding).unwrap();
+    assert_eq!(child.inherited_usage().captures, 1);
+    assert_eq!(child.next_prediction(), 1);
+    let continuation = child.continuation_host_plan(4).unwrap();
+    let (child_reservation, child_run) = fresh(&pool, continuation.initialization_peak_bytes());
+    let bank = child_run.prepare_capture_run(&child_reservation, continuation).unwrap();
+    let mut installed = child.into_continuation(bank).unwrap();
+    let mut backend = Backend::default();
+    forward(&mut installed, &mut backend, 1, true).unwrap();
+    drop(installed.take_shared_step().unwrap());
+    assert_eq!(backend.calls, 1);
+    assert_eq!(installed.usage().captures, 2);
+    assert_eq!(parent.usage().captures, 1);
+    assert_eq!(saved.current_usage().unwrap().captures, 1);
+
+    // A fresh equal declaration is neither the snapshot's parent nor a grant.
+    let other = admit(raw, point(), 4, false);
+    let foreign = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
+        &other, limits.clone(), &capabilities).unwrap()).unwrap();
+    assert!(saved.with_branch_capture_source(&foreign, &pool, &funding).is_err());
+    limits.cumulative.captures = 0;
+    let short = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
+        &source, limits, &capabilities).unwrap()).unwrap();
+    assert!(saved.with_branch_capture_source(&short, &pool, &funding).is_err());
+    assert_eq!(saved.inherited_usage().captures, 1);
+    let restore_plan = child.continuation_host_plan(4).unwrap();
+    let (restore_reservation, restore_run) = fresh(&pool, restore_plan.initialization_peak_bytes());
+    let restore_bank = restore_run.prepare_capture_run(&restore_reservation, restore_plan).unwrap();
+    assert!(child.into_restoration(restore_bank).is_err());
+    drop((parent, installed, child, saved, revised, foreign, short, funding));
+    drop((run, child_run, restore_run, reservation, child_reservation, restore_reservation));
+    assert_eq!(ledger(&pool).0, 0);
+}
+
+#[test]
+fn terminal_capture_restore_has_no_claim_and_keeps_live_spending() {
+    let source = source();
+    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let (reservation, run) = fresh(&pool, plan(&source).initialization_peak_bytes());
+    let mut parent = session(&source, &pool, &reservation, &run);
+    for first in [0, 1] {
+        if first == 1 {
+            forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
+            drop(parent.take_shared_step().unwrap());
+        }
+        let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
+        let geometry = InferenceGeometry {
+            batch_size: 1, cached_positions: if first == 0 { 2 } else { 5 },
+            input_positions: 0, max_output_tokens: 0, prefill_chunk_positions: 0,
+            output: OutputDemand::StateOnly,
+        };
+        let terminal = saved.continuation_host_plan_for(geometry).unwrap();
+        let (copy_reservation, copy_run) = fresh(&pool, terminal.initialization_peak_bytes());
+        let mut bank = copy_run.prepare_capture_run(&copy_reservation, terminal).unwrap();
+        assert!(bank.begin_step(if first == 0 { CapturePhase::Prefill } else { CapturePhase::Decode }, first).is_err());
+        let restored = saved.into_restoration(bank).unwrap();
+        assert_eq!(restored.usage(), parent.usage());
+        assert_eq!(restored.spent_steps(), 0);
+        let mut wrong = geometry;
+        wrong.cached_positions += 1;
+        assert!(saved.continuation_host_plan_for(wrong).is_err());
+        drop((restored, copy_run, copy_reservation, saved));
+    }
+    drop((parent, run, reservation));
+    assert_eq!(ledger(&pool).0, 0);
+}
+
+#[test]
+fn child_intervention_source_keeps_absolute_frontier_and_exact_owner() {
+    use eredu_core::intervention::{InterventionDiscovery, InterventionPlan,
+        PreparedInterventionPlanCopy, INTERVENTION_SCHEMA_VERSION};
+    let source = source();
+    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let (reservation, run) = fresh(&pool, plan(&source).initialization_peak_bytes());
+    let mut parent = session(&source, &pool, &reservation, &run);
+    forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
+    drop(parent.take_shared_step().unwrap());
+    let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
+    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20).unwrap();
+    let discovery = InterventionDiscovery { schema_version: INTERVENTION_SCHEMA_VERSION,
+        artifact_identity: "fixture-artifact".into(), session_identity: Some("loaded-fixture".into()), points: vec![] };
+    let make = |request, origin, session| {
+        let admitted = InterventionPlan::none().admit_with_text_origin(&discovery, request, origin, session).unwrap();
+        pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&admitted).unwrap()).unwrap()
+    };
+    let capture = source.admission();
+    let edits = make(capture.request(), capture.text_origin().unwrap(), "child-one");
+    let child = saved.with_branch_intervention_source(&edits, &pool, &funding).unwrap();
+    assert!(child.intervention_source().unwrap().same_source(&edits));
+    assert_eq!(child.intervention_source().unwrap().plan().admission().session_id(), "child-one");
+    assert_eq!(child.next_prediction(), saved.next_prediction());
+    assert_eq!(child.inherited_usage(), saved.inherited_usage());
+    let foreign_origin = make(capture.request(), CaptureTextOrigin::default(), "child-one");
+    assert!(saved.with_branch_intervention_source(&foreign_origin, &pool, &funding).is_err());
+    let mut wrong_request = capture.request();
+    wrong_request.max_predictions += 1;
+    let foreign_shape = make(wrong_request, capture.text_origin().unwrap(), "child-one");
+    assert!(saved.with_branch_intervention_source(&foreign_shape, &pool, &funding).is_err());
+    let equal = make(capture.request(), capture.text_origin().unwrap(), "child-one");
+    let wrong_plan = CaptureRunHostPlan::prepare_range(child.source(), child.next_prediction(), 4, true)
+        .unwrap().with_interventions(&equal).unwrap();
+    let (wrong_reservation, wrong_run) = fresh(&pool, wrong_plan.initialization_peak_bytes());
+    let wrong_bank = wrong_run.prepare_capture_run(&wrong_reservation, wrong_plan).unwrap();
+    assert!(child.into_continuation(wrong_bank).is_err());
+    assert!(saved.intervention_source().is_none());
+    drop((parent, saved, child, edits, equal, foreign_origin, foreign_shape, funding));
+    drop((run, reservation, wrong_run, wrong_reservation));
+    assert_eq!(ledger(&pool).0, 0);
+}

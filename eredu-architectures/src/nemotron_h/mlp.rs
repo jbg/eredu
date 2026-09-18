@@ -193,7 +193,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 },
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         routed.add(&self.shared_experts.forward(input, context)?, context)
     }
 
@@ -406,7 +406,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let routed =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
         routed.add(

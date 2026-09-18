@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Node<'a, V> {
     Json(&'a Value),
+    JsonArray(&'a [Value]),
     Record(crate::bounded::input::RecordValue<'a>),
     Text(&'a str),
     Custom(V),
@@ -23,6 +24,7 @@ impl<V: Copy> Key<'_, V> {
 }
 pub(crate) enum Projection<'a> {
     Json(&'a Value),
+    JsonArray(&'a [Value]),
     Record(crate::bounded::input::RecordValue<'a>),
     Container { object: bool, length: usize },
     Scalar,
@@ -59,6 +61,11 @@ impl<'a, V> From<crate::bounded::input::record::ReadValue<'a>> for Node<'a, V> {
         match value {
             crate::bounded::input::record::ReadValue::Json(value) => Self::Json(value),
             crate::bounded::input::record::ReadValue::Record(value) => Self::Record(value),
+            crate::bounded::input::record::ReadValue::Array(value) => match value {
+                crate::bounded::input::InputArray::Json(values) => Self::JsonArray(values),
+                crate::bounded::input::InputArray::Record(values) =>
+                    Self::Record(crate::bounded::input::RecordValue::Array(values)),
+            },
         }
     }
 }
@@ -67,6 +74,11 @@ impl<'a> From<crate::bounded::input::record::ReadValue<'a>> for Projection<'a> {
         match value {
             crate::bounded::input::record::ReadValue::Json(value) => Self::Json(value),
             crate::bounded::input::record::ReadValue::Record(value) => Self::Record(value),
+            crate::bounded::input::record::ReadValue::Array(value) => match value {
+                crate::bounded::input::InputArray::Json(values) => Self::JsonArray(values),
+                crate::bounded::input::InputArray::Record(values) =>
+                    Self::Record(crate::bounded::input::RecordValue::Array(values)),
+            },
         }
     }
 }

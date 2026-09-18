@@ -35,20 +35,21 @@ struct BorrowedArchitecture(OrdinaryTextFixture);
 
 impl ArchitectureParameters<FakeBackend> for BorrowedArchitecture {
     type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.0.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+        self.0.state_layout(metadata)
     }
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.0.state_identity(state, topology)
+        self.0.state_identity(state, topology, metadata)
     }
     fn parameter_description(
         &self,
         context: &(),
-    ) -> Result<ArchitectureParameterDescription, Error> {
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.0.parameter_description(context)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -88,14 +89,14 @@ impl<'state> LayeredArchitecture<FakeBackend, BorrowedState<'state>> for Borrowe
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         self.0.state_partition_plan(layout)
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.0.execution_graph()
     }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.0.group_unit_count(group)
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        self.0.group_unit_count(group, metadata_context)
     }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.0.unit_path(group, index)
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        self.0.unit_path(group, index, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
         self.0.static_modules()
@@ -186,6 +187,10 @@ impl<'state>
         FakeTensorMetadata,
     > for BorrowedExecutor
 {
+    fn group_submission_mechanism(&self) -> eredu_runtime::GroupSubmissionMechanism {
+        self.0.group_submission_mechanism()
+    }
+
     type Pass<'input, 'control>
         = BorrowedPass<'input, 'control, 'state>
     where
@@ -316,7 +321,7 @@ fn static_partition_input_allows_borrowed_state_and_traversal_reborrow() {
     )
     .unwrap();
     let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
-    let layout = architecture.state_layout().unwrap();
+    let layout = architecture.state_layout(None).unwrap();
     let mut state = DeviceState::create(layout, |_, _| {
         Ok::<_, Error>(FakeLayerState(0, Some(FakeTensor(vec![13]))))
     })
@@ -330,7 +335,8 @@ fn static_partition_input_allows_borrowed_state_and_traversal_reborrow() {
     .unwrap();
     let mut executor = BorrowedExecutor(ReferencePartitionExecutor {
         architecture,
-        unit: FakeUnit { marker: 5 },
+        policy: RecordingPolicy::new(vec![FakeUnit { marker: 5 }]),
+        expose_policy: false,
         fail_after_state: Rc::new(Cell::new(false)),
     });
     {

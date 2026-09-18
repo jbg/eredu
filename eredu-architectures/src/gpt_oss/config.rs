@@ -149,13 +149,9 @@ impl ModelArgs {
     pub fn routed_observation_points(
         &self,
         unit_path: &str,
-        _layer: usize,
-    ) -> eredu_runtime::RoutedObservationPoints {
-        eredu_runtime::RoutedObservationPoints::new(
-            eredu_runtime::RoutedBankId::new(0),
-            format!("{unit_path}.mlp"),
-            self.num_local_experts,
-        )
+        _layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<eredu_runtime::RoutedObservationPoints,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0),format_args!("{unit_path}.mlp"),self.num_local_experts,metadata_context)
     }
 
     /// Returns the physical encoding for one ordinary canonical parameter.
@@ -277,9 +273,9 @@ impl Config for ModelArgs {
     fn routed_observation_points(
         &self,
         unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        Some(ModelArgs::routed_observation_points(self, unit_path, layer))
+        layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+ModelArgs::routed_observation_points(self,unit_path,layer,metadata_context).map(Some)
     }
 
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
@@ -1498,7 +1494,7 @@ mod tests {
             prompt_cache_architecture_fingerprint(&hf),
             prompt_cache_architecture_fingerprint(&gguf)
         );
-        let point = hf.routed_observation_points("model.layers.3", 3);
+        let point = hf.routed_observation_points("model.layers.3", 3, None).expect("ordinary routed point construction");
         assert_eq!(
             point
                 .bank(eredu_runtime::RoutedBankId::new(0))

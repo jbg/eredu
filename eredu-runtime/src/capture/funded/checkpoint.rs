@@ -22,6 +22,9 @@ pub enum FundedCaptureCheckpointError {
     /// Existing logical cumulative usage cannot fit the saved admission.
     #[error(transparent)]
     Admission(#[from] CaptureError),
+    /// Prospective fixed child-source descriptor construction was refused.
+    #[error(transparent)]
+    Metadata(#[from] eredu_core::HostMetadataFundingError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +57,8 @@ pub struct FundedCaptureCheckpoint {
     source: SharedCapturePlan,
     interventions: Option<crate::working_memory::OriginalInterventionSource>,
     lineage: crate::working_memory::CaptureRunLedger,
+    // A revised declaration can seed only a new independent child ledger.
+    branch_derived: bool,
     // Copied controls and the source alias retire before destination H.
     _host: HostPreparationAuthority,
 }
@@ -87,10 +92,7 @@ fn validate(session: &FundedCaptureSession) -> Result<(), FundedCaptureCheckpoin
         || inner.ordinary_prefill.is_some()
         || inner.invocation.is_some()
         || inner.invocation_window.is_some()
-        || !inner
-            .plan
-            .shared()
-            .is_some_and(|source| source.same_storage(session.source()))
+        || !inner.plan.same_storage(session.source())
     {
         return Err(FundedCaptureCheckpointError::Source);
     }
@@ -132,15 +134,59 @@ impl PreparedFundedCaptureCheckpoint<'_> {
             source: self.session.source().clone(),
             interventions: self.session.run.intervention_source().cloned(),
             lineage: self.session.lineage.clone(),
+            branch_derived: false,
             _host: host.clone(),
         })
     }
 }
 impl FundedCaptureCheckpoint {
+    /// Bind newly compiled limits to this exact saved source/frontier. The
+    /// source compiler proves the unchanged selectors and absolute coordinates;
+    /// the fresh native admission must revalidate current collector facts.
+    /// This copied descriptor cannot restore or rewrite the parent's ledger.
+    pub fn with_branch_capture_source(
+        &self, source: &crate::working_memory::OriginalCaptureSource,
+        pool: &crate::working_memory::WorkingMemoryPool,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, FundedCaptureCheckpointError> {
+        source.validate_pool(pool).map_err(CaptureRunHostError::from)?;
+        if !source.plan().is_limit_revision_of(&self.source) {
+            return Err(FundedCaptureCheckpointError::Source);
+        }
+        CaptureLedger::with_inherited_usage(source.plan().admission(), self.frontier.usage)?;
+        fund_branch_controls(funding)?;
+        Ok(Self {
+            partition_run: self.partition_run.clone(), frontier: self.frontier,
+            source: source.plan().clone(), interventions: self.interventions.clone(),
+            lineage: self.lineage.clone(), branch_derived: true,
+            _host: HostPreparationAuthority::retain(funding.clone()),
+        })
+    }
     /// Absolute next coordinate, retaining the original admission's origin.
     pub fn next_prediction(&self) -> u64 {
         self.frontier.next_prediction()
     }
+    /// Bind a freshly admitted child edit source to the unchanged absolute
+    /// capture geometry. The native provider must authenticate its actual
+    /// discovery and child session before quotation; no parent ledger is edited.
+    pub fn with_branch_intervention_source(
+        &self, source: &crate::working_memory::OriginalInterventionSource,
+        pool: &crate::working_memory::WorkingMemoryPool,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, FundedCaptureCheckpointError> {
+        source.validate_pool(pool).map_err(CaptureRunHostError::from)?;
+        let admitted = source.plan().admission();
+        let capture = self.source.admission();
+        if admitted.request() != capture.request() || admitted.text_origin() != capture.text_origin()
+            || admitted.invocation_bounds() != capture.invocation_bounds() {
+            return Err(FundedCaptureCheckpointError::Source);
+        }
+        fund_branch_controls(funding)?;
+        Ok(Self { partition_run: self.partition_run.clone(), frontier: self.frontier,
+            source: self.source.clone(), interventions: Some(source.clone()), lineage: self.lineage.clone(),
+            branch_derived: true, _host: HostPreparationAuthority::retain(funding.clone()) })
+    }
+
     /// Saved cumulative usage, including failed attempts before this boundary.
     pub fn inherited_usage(&self) -> CaptureUsage {
         self.frontier.usage
@@ -194,7 +240,9 @@ impl FundedCaptureCheckpoint {
             .checked_add(geometry.max_output_tokens)
             .ok_or(CaptureRunHostError::Memory(WorkingMemoryError::Overflow))?;
         if geometry.batch_size != request.batch
-            || geometry.input_positions != input
+            || (geometry.input_positions != input
+                && !(geometry.input_positions == 0 && geometry.max_output_tokens == 0
+                    && geometry.prefill_chunk_positions == 0 && geometry.output == eredu_core::OutputDemand::StateOnly))
             || geometry.cached_positions != cached
             || end > request.max_predictions
         {
@@ -240,6 +288,7 @@ impl FundedCaptureCheckpoint {
         &self,
         bank: PreparedCaptureRun,
     ) -> Result<FundedCaptureSession, FundedCaptureCheckpointError> {
+        if self.branch_derived { return Err(FundedCaptureCheckpointError::Source); }
         bank.validate_checkpoint_destination(&self.source, self.interventions.as_ref(), self.next_prediction())?;
         let current = self.lineage.borrow()?;
         let ledger = CaptureLedger::with_inherited_usage(self.source.admission(), current.usage())?;
@@ -313,4 +362,16 @@ pub(crate) fn continuation_control_bytes() -> Result<u64, WorkingMemoryError> {
     .try_fold(0usize, usize::checked_add)
     .and_then(|n| u64::try_from(n).ok())
     .ok_or(WorkingMemoryError::Overflow)
+}
+
+fn fund_branch_controls(funding: &eredu_core::HostMetadataFunding) -> Result<(), FundedCaptureCheckpointError> {
+    let bytes = [size_of::<FundedCaptureCheckpoint>(),
+        size_of::<Result<FundedCaptureCheckpoint, FundedCaptureCheckpointError>>(),
+        size_of::<HostPreparationAuthority>(),
+        HostPreparationAuthority::retention_bytes::<eredu_core::HostMetadataFunding>()
+            .ok_or(CaptureRunHostError::Memory(WorkingMemoryError::Overflow))?]
+        .into_iter().try_fold(0usize, usize::checked_add)
+        .ok_or(CaptureRunHostError::Memory(WorkingMemoryError::Overflow))?;
+    funding.reserve_metadata(bytes)?;
+    Ok(())
 }

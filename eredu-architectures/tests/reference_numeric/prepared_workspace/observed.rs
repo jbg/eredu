@@ -121,7 +121,7 @@ impl ActivationObserver<WorkspaceTensor, Error> for Observer {
         if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
             self.logits.push((self.current, value.shape().to_vec()));
             if self.failed {
-                return Err(Error::backend_source(std::io::Error::new(
+                return Err(Error::backend_retained_source(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "observed equation sentinel",
                 )));
@@ -155,6 +155,7 @@ impl InferenceWorkspaceObserver for Observer {
         let position = match span {
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.position,
             InferenceWorkspaceSpan::Decode { position, .. } => *position,
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
         };
         context.validate_values(self.retained.iter())?;
         self.spans.push((prediction, position));

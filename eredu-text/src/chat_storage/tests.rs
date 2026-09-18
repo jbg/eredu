@@ -15,10 +15,141 @@ fn ordinary() -> Tokenizer {
 }
 
 #[test]
+fn request_selected_sources_match_named_tool_rendering_and_reject_wrong_selection() {
+    use crate::tokenizer::ModelChatTemplate;
+    let plain = "{% for message in messages %}plain:{{ message.content }}{% endfor %}";
+    let tool =
+        "{% for message in messages %}tool:{{ message.content }}{% endfor %}|{{ tools|tojson }}";
+    let template = ModelChatTemplate::Named(std::collections::BTreeMap::from([
+        ("default".into(), plain.into()),
+        ("tool_use".into(), tool.into()),
+    ]));
+    let messages = vec![json!({"role":"user", "content":"λ<value>"})];
+    let declarations = vec![json!({"type":"function","function":{"name":"reading"}})];
+    for tools in [&[][..], declarations.as_slice()] {
+        let has_tools = !tools.is_empty();
+        let plan = ChatTemplatePlan::prepare_model(&template, "model.html", has_tools).unwrap();
+        let source = plan.compile().unwrap();
+        assert!(source.matches_configuration(&template, "model.html"));
+        assert!(source.matches_selection(&template, "model.html", has_tools));
+        assert!(!source.matches_selection(&template, "model.html", !has_tools));
+        let context = ChatRenderContext::from_json(&messages, None, None)
+            .unwrap()
+            .with_tools(ChatInputArray::Json(tools));
+        let rendered = source
+            .render_plan_with_context(context)
+            .unwrap()
+            .render()
+            .unwrap();
+        for generation in [false, true] {
+            let expected = ordinary()
+                .apply_chat_template_json(
+                    template.clone(),
+                    [messages.clone()],
+                    Some(tools),
+                    "model.html",
+                    generation,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(rendered.prompt(generation), expected[0]);
+        }
+    }
+    let fallback = ModelChatTemplate::Named(std::collections::BTreeMap::from([(
+        "default".into(),
+        plain.into(),
+    )]));
+    let source = ChatTemplatePlan::prepare_model(&fallback, "model", true)
+        .unwrap()
+        .compile()
+        .unwrap();
+    assert!(source.matches_selection(&fallback, "model", true));
+    assert!(source.matches_selection(&fallback, "model", false));
+    let missing = ModelChatTemplate::Named(std::collections::BTreeMap::from([(
+        "tool_use".into(),
+        tool.into(),
+    )]));
+    assert!(matches!(
+        ChatTemplatePlan::prepare_model(&missing, "model", false),
+        Err(ChatSourceError::MissingTemplate)
+    ));
+}
+
+#[test]
+fn config_selection_shares_named_policy_and_decoded_entry_identity() {
+    let plain = "plain:{{ messages[0].content }}";
+    let tool = "tools:{{ messages[0].content }}|{{ tools|tojson }}";
+    let messages = vec![json!({"role":"user", "content":"λ<value>"})];
+    let declarations = vec![json!({"type":"function","function":{"name":"reading"}})];
+    for entries in [
+        json!([{"name":"default","template":plain},{"name":"tool_use","template":tool}]),
+        json!([{"name":"tool_use","template":tool},{"name":"default","template":plain}]),
+        json!([{"name":"default","template":plain}]),
+        json!([{"name":"tool_use","template":tool}]),
+    ] {
+        // Source selection compares decoded keys/names without materializing
+        // config values; escaped spellings preserve the same ordinary identity.
+        let input = config(entries).replace("tool_use", "tool_\\u0075se");
+        let model = load_model_chat_template_from_str(&input).unwrap().unwrap();
+        for has_tools in [false, true] {
+            let tools = if has_tools {
+                declarations.as_slice()
+            } else {
+                &[]
+            };
+            let expected = model.select(Some(tools));
+            let planned = ChatTemplatePlan::prepare_config(input.as_bytes(), "named", has_tools);
+            let Ok(expected) = expected else {
+                assert!(matches!(planned, Err(ChatSourceError::MissingTemplate)));
+                continue;
+            };
+            let source = planned.unwrap().compile().unwrap();
+            assert!(source.matches_selection(&model, "named", has_tools));
+            assert!(source.matches_configuration(&model, "named"));
+            assert_eq!(source.inner.source(), expected.template());
+            let context = ChatRenderContext::from_json(&messages, None, None)
+                .unwrap()
+                .with_tools(ChatInputArray::Json(tools));
+            let rendered = source
+                .render_plan_with_context(context)
+                .unwrap()
+                .render()
+                .unwrap();
+            for generation in [false, true] {
+                let expected = ordinary()
+                    .apply_chat_template_json(
+                        model.clone(),
+                        [messages.clone()],
+                        Some(tools),
+                        "named",
+                        generation,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(rendered.prompt(generation), expected[0]);
+            }
+        }
+    }
+    // Invalid unselected entries remain invalid; tool selection is not a way
+    // to omit duplicate-name and schema validation for the rest of the file.
+    for has_tools in [false, true] {
+        let duplicate = config(json!([
+            {"name":"default","template":plain},
+            {"name":"tool_use","template":tool},
+            {"name":"tool_use","template":"other"},
+        ]));
+        assert!(matches!(
+            ChatTemplatePlan::prepare_config(duplicate.as_bytes(), "named", has_tools),
+            Err(ChatSourceError::DuplicateName)
+        ));
+    }
+}
+
+#[test]
 fn released_config_borrow_fresh_source_and_render_match_ordinary_chat_pipeline() {
     let input = RELEASED.to_owned();
     let model_template = load_model_chat_template_from_str(&input).unwrap().unwrap();
-    let plan = ChatTemplatePlan::prepare_config(input.as_bytes(), "smol").unwrap();
+    let plan = ChatTemplatePlan::prepare_config(input.as_bytes(), "smol", false).unwrap();
     match &plan.input {
         Input::Config { document, selected } => {
             assert_eq!(document.source().as_ptr(), input.as_ptr());
@@ -97,7 +228,7 @@ fn decoded_named_selection_and_invalid_metadata_follow_ordinary_contracts() {
             "chat.html::chat_template::default",
         ),
     ] {
-        let actual = ChatTemplatePlan::prepare_config(input.as_bytes(), model)
+        let actual = ChatTemplatePlan::prepare_config(input.as_bytes(), model, false)
             .unwrap()
             .compile()
             .unwrap();
@@ -118,7 +249,7 @@ fn decoded_named_selection_and_invalid_metadata_follow_ordinary_contracts() {
         let input = config(metadata);
         assert!(load_model_chat_template_from_str(&input).is_err());
         assert!(
-            match ChatTemplatePlan::prepare_config(input.as_bytes(), "chat") {
+            match ChatTemplatePlan::prepare_config(input.as_bytes(), "chat", false) {
                 Ok(plan) => plan.compile().is_err(),
                 Err(_) => true,
             }
@@ -133,12 +264,12 @@ fn decoded_named_selection_and_invalid_metadata_follow_ordinary_contracts() {
             .is_err()
     );
     assert!(matches!(
-        ChatTemplatePlan::prepare_config(missing.as_bytes(), "chat"),
+        ChatTemplatePlan::prepare_config(missing.as_bytes(), "chat", false),
         Err(ChatSourceError::MissingTemplate)
     ));
     let different = config(json!(format!("{} ", vm::supported_source())));
     assert!(load_model_chat_template_from_str(&different).is_ok());
-    let different_source = ChatTemplatePlan::prepare_config(different.as_bytes(), "chat")
+    let different_source = ChatTemplatePlan::prepare_config(different.as_bytes(), "chat", false)
         .unwrap()
         .compile()
         .unwrap();
@@ -147,7 +278,7 @@ fn decoded_named_selection_and_invalid_metadata_follow_ordinary_contracts() {
         format!("{} ", vm::supported_source())
     );
     assert!(matches!(
-        ChatTemplatePlan::prepare_config(single.as_bytes(), "chat.html"),
+        ChatTemplatePlan::prepare_config(single.as_bytes(), "chat.html", false),
         Err(ChatSourceError::Source(vm::SourceError::Settings))
     ));
 }
@@ -181,7 +312,7 @@ fn numeric_config_uses_ordinary_scalar_semantics_after_source_planning() {
             "{{\n  \"unused\": [0, {{\"nested\":{number}}}],\n \"chat_template\":{source}}}"
         );
         let expected = serde_json::from_str::<serde_json::Value>(&input);
-        let plan = ChatTemplatePlan::prepare_config(input.as_bytes(), "chat").unwrap();
+        let plan = ChatTemplatePlan::prepare_config(input.as_bytes(), "chat", false).unwrap();
         let required = plan.requirements().buffer_bytes();
         match expected {
             Ok(_) => {
@@ -220,7 +351,7 @@ fn numeric_config_uses_ordinary_scalar_semantics_after_source_planning() {
     // A numeric-looking key or string never enters the numeric scalar parser.
     let strings = format!("{{\"1e999\":\"-9223372036854775809\",\"chat_template\":{source}}}");
     assert!(
-        ChatTemplatePlan::prepare_config(strings.as_bytes(), "chat")
+        ChatTemplatePlan::prepare_config(strings.as_bytes(), "chat", false)
             .unwrap()
             .compile()
             .is_ok()
@@ -230,14 +361,14 @@ fn numeric_config_uses_ordinary_scalar_semantics_after_source_planning() {
         r#"{"unused":1e999}"#,
         r#"{"unused":1e999,"chat_template":42}"#,
     ] {
-        let failure = ChatTemplatePlan::prepare_config(input.as_bytes(), "chat")
+        let failure = ChatTemplatePlan::prepare_config(input.as_bytes(), "chat", false)
             .unwrap()
             .compile()
             .unwrap_err();
         assert!(failure.numeric_error().is_some());
     }
     let failure =
-        ChatTemplatePlan::prepare_config(br#"{"unused":1.25,"chat_template":42}"#, "chat")
+        ChatTemplatePlan::prepare_config(br#"{"unused":1.25,"chat_template":42}"#, "chat", false)
             .unwrap()
             .compile()
             .unwrap_err();
@@ -247,7 +378,7 @@ fn numeric_config_uses_ordinary_scalar_semantics_after_source_planning() {
     ));
     let invalid = format!("{{\"unused\":01,\"chat_template\":{source}}}");
     assert!(matches!(
-        ChatTemplatePlan::prepare_config(invalid.as_bytes(), "chat"),
+        ChatTemplatePlan::prepare_config(invalid.as_bytes(), "chat", false),
         Err(ChatSourceError::Json(_))
     ));
 }
@@ -263,7 +394,7 @@ fn text_adapters_retain_actual_source_and_render_reserve_prefix_errors() {
     .into_iter()
     .enumerate()
     {
-        let error = ChatTemplatePlan::prepare_config(RELEASED.as_bytes(), "chat")
+        let error = ChatTemplatePlan::prepare_config(RELEASED.as_bytes(), "chat", false)
             .unwrap()
             .fail_reservation(buffer)
             .compile()
@@ -274,7 +405,7 @@ fn text_adapters_retain_actual_source_and_render_reserve_prefix_errors() {
             matches!(error.cause(), Some(vm::CompileCause::Reserve(actual, _)) if *actual == buffer)
         );
     }
-    let source = ChatTemplatePlan::prepare_config(RELEASED.as_bytes(), "chat")
+    let source = ChatTemplatePlan::prepare_config(RELEASED.as_bytes(), "chat", false)
         .unwrap()
         .compile()
         .unwrap();
@@ -308,6 +439,8 @@ fn text_adapters_retain_actual_source_and_render_reserve_prefix_errors() {
 #[test]
 fn generic_source_compilation_matches_ordinary_selected_text_and_owns_decoded_source() {
     let sources = [
+        "{{ messages | length }}",
+        "{% for a in messages %}{% for b in messages %}{{ b.content }}{% endfor %}{% endfor %}",
         "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %} word3 word7{% endif %}",
         "前\n{%- for entry in messages %}{% if loop.first and entry.role != 'system' %}開始{% else %}|{% endif %}{{ entry['role'] + ':' + entry.content }}{% endfor %}{% if add_generation_prompt %}答:{% endif %}",
         "{% for a in messages %}{{ a.role }}{% endfor %}/{% for b in messages %}{{ b.content }}{% endfor %}{% if add_generation_prompt %}> {% endif %}",
@@ -317,7 +450,7 @@ fn generic_source_compilation_matches_ordinary_selected_text_and_owns_decoded_so
         let selected = load_model_chat_template_from_str(&encoded)
             .unwrap()
             .unwrap();
-        let plan = ChatTemplatePlan::prepare_config(encoded.as_bytes(), "general").unwrap();
+        let plan = ChatTemplatePlan::prepare_config(encoded.as_bytes(), "general", false).unwrap();
         let required = plan.requirements();
         let source = plan.compile().unwrap();
         drop(encoded);
@@ -356,21 +489,6 @@ fn generic_source_compilation_matches_ordinary_selected_text_and_owns_decoded_so
             }
         }
     }
-    // These are concrete unimplemented VM operations, not unknown literal text.
-    for text in [
-        "{{ messages | length }}",
-        "{% for a in messages %}{% for b in messages %}{{ b.content }}{% endfor %}{% endfor %}",
-    ] {
-        let error = ChatTemplatePlan::prepare_utf8(text, "general")
-            .unwrap()
-            .compile()
-            .unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            Some(vm::CompileCause::Source(vm::SourceError::Profile))
-        ));
-        assert!(error.retained_buffer_bytes() > 0);
-    }
     let invalid = ChatTemplatePlan::prepare_utf8("{% if %}", "general")
         .unwrap()
         .compile()
@@ -403,6 +521,7 @@ fn source_trim_filter_matches_ordinary_unicode_and_concatenated_text() {
     // Generic shapes used by released chat sources, including a filter before
     // and after concatenation. No complete template is selected by its text.
     let sources = [
+        "{{ 'x'|upper }}",
         "{% for message in messages %}{{ message['content']|trim }}{% endfor %}",
         "{% for message in messages %}{{ ' ' + message['content']|trim + '\\n' }}{% endfor %}",
         "{% for message in messages %}{{ ('\\t' + message['content'] + '\\n')|trim|trim }}{% endfor %}",
@@ -451,9 +570,8 @@ fn source_trim_filter_matches_ordinary_unicode_and_concatenated_text() {
             }
         }
     }
-    // Arbitrary filters and character trimming of concatenations still require
-    // their own storage profile. Ordinary rendering remains available.
-    for source in ["{{ ('x' + 'x')|trim('x') }}", "{{ 'x'|upper }}"] {
+    // Character trimming of a concatenation still requires a source profile.
+    for source in ["{{ ('x' + 'x')|trim('x') }}"] {
         let error = ChatTemplatePlan::prepare_utf8(source, "trim")
             .unwrap()
             .compile()

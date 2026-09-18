@@ -4,7 +4,7 @@ use crate::intervention::{InterventionPrefillWindow, PreparedPartitionInterventi
 use crate::working_memory::{CaptureInterventionClaim, OriginalInterventionSource};
 use eredu_core::{BoundedCompletion, BoundedCompletionWait};
 use eredu_nn::workspace::{
-    WorkspaceContext, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceContext, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::mem::{size_of, size_of_val};
 mod allowance;
@@ -24,7 +24,7 @@ enum Cause {
     #[error(transparent)]
     Capture(#[from] CaptureError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Metadata(#[from] eredu_nn::Error),
     #[error(transparent)]
@@ -42,7 +42,7 @@ pub struct PartitionInterventionSourceError {
     #[source]
     cause: Cause,
     _source: OriginalInterventionSource,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 #[derive(Debug)]
 struct Identity;

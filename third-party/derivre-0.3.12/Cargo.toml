@@ -80,6 +80,9 @@ version = "1.8.1"
 version = "0.17.1"
 default-features = false
 
+[dependencies.indexmap]
+version = "2.14.2"
+
 [dependencies.regex-syntax]
 version = "0.8.5"
 

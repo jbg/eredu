@@ -49,7 +49,7 @@ fn validate_tensor_inventory(
         std::mem::size_of::<Option<&OriginalCopyEnvironment<'_>>>(),
         std::mem::size_of::<Result<bool,Error>>(),std::mem::size_of::<Result<(),Error>>()];
     sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     sources.validate_environment(environment)?;
     if let Some(draft)=draft {sources.validate_environment(draft)?;}
@@ -101,13 +101,13 @@ pub(in crate::composition::mlx) fn registered_tensor_sources(evidence:&PreparedE
         .map_or(&[][..],|source|source.registered.as_slice()).iter()}
 }
 pub(super) fn registered_source_for_array<'a>(evidence:&'a PreparedEmbeddedEvidence,array:&safemlx::Array,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding)->Result<Option<&'a RegisteredTensorSource>,Error>{
+    funding:&eredu_nn::workspace::HostMetadataFunding)->Result<Option<&'a RegisteredTensorSource>,Error>{
     let parts=[std::mem::size_of::<RegisteredTensorSources<'_>>(),
         std::mem::size_of::<Option<&RegisteredTensorSource>>(),
         std::mem::size_of::<Result<Option<&RegisteredTensorSource>,Error>>(),
-        std::mem::size_of::<(&PreparedEmbeddedEvidence,&safemlx::Array,&eredu_nn::workspace::WorkspaceMetadataFunding)>()];
+        std::mem::size_of::<(&PreparedEmbeddedEvidence,&safemlx::Array,&eredu_nn::workspace::HostMetadataFunding)>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     let mut found=None;
     for source in registered_tensor_sources(evidence){
@@ -129,14 +129,14 @@ pub(in crate::composition::mlx) fn validate_registered_tensor_inputs(
 pub(in crate::composition::mlx) fn validate_registered_tensor_inputs_at(
     context:super::SpeculativeExecutionStreams<'_>,native:&crate::backend::nn::workspace::ProjectedNativeStorage,
     placement:eredu_core::speculative::SamplingPlacement,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<(),Error>{
     validate_registered_inputs(context,native,Some(placement),funding)
 }
 fn validate_registered_inputs(
     context:super::SpeculativeExecutionStreams<'_>,native:&crate::backend::nn::workspace::ProjectedNativeStorage,
     selected:Option<eredu_core::speculative::SamplingPlacement>,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<(),Error>{
     let (sources,environment)=context.original_numerical_for(selected.unwrap_or(eredu_core::speculative::SamplingPlacement::Target))
         .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
@@ -144,12 +144,12 @@ fn validate_registered_inputs(
         std::mem::size_of::<std::slice::Iter<'_,&PreparedEmbeddedEvidence>>(),
         std::mem::size_of::<Result<(),Error>>(),
         std::mem::size_of::<(super::SpeculativeExecutionStreams<'_>,&crate::backend::nn::workspace::ProjectedNativeStorage,
-            Option<eredu_core::speculative::SamplingPlacement>,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            Option<eredu_core::speculative::SamplingPlacement>,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<(super::SpeculativeExecutionStreams<'_>,&crate::backend::nn::workspace::ProjectedNativeStorage,
-            Option<eredu_core::speculative::SamplingPlacement>,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            Option<eredu_core::speculative::SamplingPlacement>,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<InputSource<'_>>(),std::mem::size_of::<Result<&OriginalCopyEnvironment<'_>,Error>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     for evidence in context.embedded_tensor_sources(){
         for source in registered_tensor_sources(evidence){
@@ -173,14 +173,14 @@ enum InputSource<'a> {
 }
 impl InputSource<'_> {
     fn matches(self, stream:&safemlx::Stream,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)->Result<bool,Error>{
+        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<bool,Error>{
         match self {
             Self::Completed(source)=>Ok(source.matches_completed_stream(stream,funding)?),
             Self::Registered(source)=>source.matches_completed_stream(stream,funding),
         }
     }
     fn validate(self, sources:&OriginalSpeculativeNumericalSources,
-        stream:&safemlx::Stream, funding:&eredu_nn::workspace::WorkspaceMetadataFunding)->Result<(),Error>{
+        stream:&safemlx::Stream, funding:&eredu_nn::workspace::HostMetadataFunding)->Result<(),Error>{
         match self {
             Self::Completed(source)=>Ok(source.validate_request_source(sources.request(),stream,funding)?),
             Self::Registered(source)=>source.validate(sources.request(),stream,funding),
@@ -189,11 +189,11 @@ impl InputSource<'_> {
 }
 fn input_environment<'a>(source:InputSource<'_>, context:super::SpeculativeExecutionStreams<'a>,
     placement:eredu_core::speculative::SamplingPlacement,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<&'a OriginalCopyEnvironment<'a>,Error>{
     use eredu_core::speculative::{SamplingPlacement,SpeculativeExecutionTopology};
     let parts=[std::mem::size_of::<(InputSource<'_>,super::SpeculativeExecutionStreams<'_>,
-            SamplingPlacement,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            SamplingPlacement,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<Option<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>)>>(),
         std::mem::size_of::<[(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>);2]>(),
         std::mem::size_of::<SamplingPlacement>(),std::mem::size_of::<Result<bool,Error>>(),
@@ -201,11 +201,11 @@ fn input_environment<'a>(source:InputSource<'_>, context:super::SpeculativeExecu
         std::mem::size_of::<Result<&OriginalCopyEnvironment<'_>,Error>>(),
         // Both closed dispatch helpers borrow the actual source; no retained
         // projection or new completed marker is allocated here.
-        std::mem::size_of::<(InputSource<'_>,&safemlx::Stream,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+        std::mem::size_of::<(InputSource<'_>,&safemlx::Stream,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<(InputSource<'_>,&OriginalSpeculativeNumericalSources,&safemlx::Stream,
-            &eredu_nn::workspace::WorkspaceMetadataFunding)>()];
+            &eredu_nn::workspace::HostMetadataFunding)>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     let invalid=||Error::PrefillControl(WorkingMemoryError::IdentityMismatch);
     let (sources,destination)=context.original_numerical_for(placement).ok_or_else(invalid)?;
@@ -233,13 +233,13 @@ fn input_environment<'a>(source:InputSource<'_>, context:super::SpeculativeExecu
 /// Descriptive completed origin loan for a source-preserving state projection.
 pub(super) fn completed_input_environment<'a>(source:&CompletedResidentSource,
     context:super::SpeculativeExecutionStreams<'a>,placement:eredu_core::speculative::SamplingPlacement,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<&'a OriginalCopyEnvironment<'a>,Error>{
     let parts=[std::mem::size_of::<(&CompletedResidentSource,super::SpeculativeExecutionStreams<'_>,
-        eredu_core::speculative::SamplingPlacement,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+        eredu_core::speculative::SamplingPlacement,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<Result<&OriginalCopyEnvironment<'_>,Error>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     input_environment(InputSource::Completed(source),context,placement,funding)
 }
@@ -248,16 +248,16 @@ pub(super) fn completed_input_environment<'a>(source:&CompletedResidentSource,
 /// The returned loan does not change evidence or authorize a new operation.
 pub(super) fn input_array_environment<'a>(evidence:&PreparedEmbeddedEvidence,array:&safemlx::Array,
     context:super::SpeculativeExecutionStreams<'a>,placement:eredu_core::speculative::SamplingPlacement,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<&'a OriginalCopyEnvironment<'a>,Error>{
     let parts=[std::mem::size_of::<(&PreparedEmbeddedEvidence,&safemlx::Array,
             super::SpeculativeExecutionStreams<'_>,eredu_core::speculative::SamplingPlacement,
-            &eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            &eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<Option<&RegisteredTensorSource>>(),std::mem::size_of::<InputSource<'_>>(),
         std::mem::size_of::<Result<&OriginalCopyEnvironment<'_>,Error>>(),
         std::mem::size_of::<Result<(),Error>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     let source=if let Some(source)=registered_source_for_array(evidence,array,funding)? {
         InputSource::Registered(source)
@@ -270,7 +270,7 @@ pub(super) fn input_array_environment<'a>(evidence:&PreparedEmbeddedEvidence,arr
         InputSource::Registered(source)=>source.validate_array(array,funding)?,
         InputSource::Completed(source)=>{
             funding.reserve_metadata(CompletedResidentSource::array_source_control_bytes()
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
                 .map_err(Error::WorkspacePlanning)?;
             source.array_source_account(array,funding)?;
         },
@@ -282,16 +282,16 @@ pub(super) fn input_array_environment<'a>(evidence:&PreparedEmbeddedEvidence,arr
 /// roots as part of this operation's actual native input projection.
 pub(in crate::composition::mlx) fn validate_input_evidence(evidence:&PreparedEmbeddedEvidence,
     context:super::SpeculativeExecutionStreams<'_>,placement:eredu_core::speculative::SamplingPlacement,
-    funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding:&eredu_nn::workspace::HostMetadataFunding,
 )->Result<(),Error>{
     let parts=[std::mem::size_of::<(&PreparedEmbeddedEvidence,super::SpeculativeExecutionStreams<'_>,
-            eredu_core::speculative::SamplingPlacement,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            eredu_core::speculative::SamplingPlacement,&eredu_nn::workspace::HostMetadataFunding)>(),
         std::mem::size_of::<RegisteredTensorSources<'_>>(),std::mem::size_of::<InputSource<'_>>(),
         std::mem::size_of::<Option<&CompletedResidentSource>>(),std::mem::size_of::<bool>(),
         std::mem::size_of::<Result<&OriginalCopyEnvironment<'_>,Error>>(),
         std::mem::size_of::<Result<(),Error>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     let mut known=false;
     if let Some(source)=completed_tensor_source(evidence){

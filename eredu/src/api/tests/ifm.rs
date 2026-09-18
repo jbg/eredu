@@ -43,7 +43,7 @@ fn ifm_released_templates_prepare_exact_prompts_and_recognize_all_formats() {
             .find(|(name, _)| *name == case["template"].as_str().unwrap())
             .unwrap()
             .1;
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             template.into(),
             "unrelated-model-name",
@@ -79,7 +79,7 @@ fn ifm_released_templates_prepare_exact_prompts_and_recognize_all_formats() {
 fn ifm_reasoning_disable_is_established_per_artifact_template() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     for (name, template) in TEMPLATES {
-        let result = prepare_chat_from_parts(
+        let result = inspect_chat_from_parts(
             &mut tokenizer(),
             template.into(),
             "unrelated",

@@ -4,17 +4,18 @@ use super::*;
 struct Chunked(OrdinaryTextFixture);
 impl ArchitectureParameters<FakeBackend> for Chunked {
     type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.0.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+        self.0.state_layout(metadata)
     }
     fn state_identity(
         &self,
         s: &eredu_runtime::PartitionState,
         t: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.0.state_identity(s, t)
+        self.0.state_identity(s, t, metadata)
     }
-    fn parameter_description(&self, c: &()) -> Result<ArchitectureParameterDescription, Error> {
+    fn parameter_description(&self, c: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.0.parameter_description(c)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -52,14 +53,14 @@ impl LayeredArchitecture<FakeBackend, State> for Chunked {
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         self.0.state_partition_plan(s)
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.0.execution_graph()
     }
-    fn group_unit_count(&self, g: usize) -> Result<usize, Error> {
-        self.0.group_unit_count(g)
+    fn group_unit_count(&self, g: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        self.0.group_unit_count(g, metadata_context)
     }
-    fn unit_path(&self, g: usize, i: usize) -> Result<String, Error> {
-        self.0.unit_path(g, i)
+    fn unit_path(&self, g: usize, i: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        self.0.unit_path(g, i, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
         self.0.static_modules()

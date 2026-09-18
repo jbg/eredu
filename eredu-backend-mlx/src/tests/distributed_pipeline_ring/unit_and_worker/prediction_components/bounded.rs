@@ -137,7 +137,7 @@ fn prove_bounded(device: DeviceType) {
                     .unwrap()
                 })
                 .collect();
-            let mut session = eredu_runtime::capture::CaptureSession::new(plan);
+            let mut session = eredu_runtime::capture::CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
             let mut edits = Vec::new();
             if mask {
                 let mut discovery = eredu_runtime::inspection::intervention_support(

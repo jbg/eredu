@@ -587,33 +587,38 @@ TEST_CASE("Host array alias preserves exact backing and failed attachment custod
   std::optional<array> output(array(input.shape(), input.dtype(),
       submission::make_graph_primitive<CopyToHostTransfer>(stream, host),
       {contiguous(input, false, stream)}));
-  mlx_original_buffer_info facts{};
+  mlx_immutable_host_transfer_info facts{};
   REQUIRE(mlx_host_transfer_array_alias_info(&facts, borrow(*output)) == MLX_ORIGINAL_BUFFER_OK);
-  CHECK_FALSE(facts.known); // no eager evaluation or readiness inference
+  CHECK_FALSE(facts.backing.known); // no eager evaluation or readiness inference
   output->eval();
   REQUIRE(mlx_host_transfer_array_alias_info(&facts, borrow(*output)) == MLX_ORIGINAL_BUFFER_OK);
-  REQUIRE(facts.known);
-  CHECK(facts.identity == host.allocation_identity());
-  CHECK(facts.charged_bytes == host.capacity());
+  REQUIRE(facts.backing.known);
+  CHECK_FALSE(facts.prepared_source);
+  CHECK(facts.backing.identity == host.allocation_identity());
+  CHECK(facts.backing.charged_bytes == host.capacity());
   CHECK(static_cast<float*>(host.data())[0] == 2.5f);
   CHECK(static_cast<float*>(host.data())[2] == -7.25f);
   auto state = std::make_shared<AttachmentState>();
   PreparedAttachment owner(state);
-  auto attach = [&](array& value, const mlx_original_buffer_info& expected) {
+  auto attach = [&](array& value, const mlx_immutable_host_transfer_info& expected) {
     const auto status = mlx_host_transfer_array_alias_attach(borrow(value), &expected,
         owner.node.get(), owner.payload.get(), retire_attachment);
     if (status == MLX_ORIGINAL_BUFFER_OK) { owner.node.release(); owner.payload.release(); }
     return status;
   };
+  auto wrong_kind = facts;
+  wrong_kind.prepared_source = true;
+  CHECK(attach(*output, wrong_kind) == MLX_ORIGINAL_BUFFER_CHANGED);
+  CHECK(owner.node); CHECK(owner.payload);
   auto wrong_capacity = facts;
-  ++wrong_capacity.charged_bytes;
+  ++wrong_capacity.backing.charged_bytes;
   CHECK(attach(*output, wrong_capacity) == MLX_ORIGINAL_BUFFER_CHANGED);
   CHECK(owner.node);
   CHECK(owner.payload);
   HostTransferBuffer unrelated(Shape{3}, float32, HostTransferPolicy::transfer);
   auto wrong_generation = facts;
-  wrong_generation.identity = unrelated.allocation_identity();
-  REQUIRE(wrong_generation.identity != facts.identity);
+  wrong_generation.backing.identity = unrelated.allocation_identity();
+  REQUIRE(wrong_generation.backing.identity != facts.backing.identity);
   CHECK(attach(*output, wrong_generation) == MLX_ORIGINAL_BUFFER_CHANGED);
   CHECK(owner.node);
   CHECK(attach(input, facts) == MLX_ORIGINAL_BUFFER_UNCERTIFIED);

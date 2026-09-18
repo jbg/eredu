@@ -8,7 +8,7 @@ use safemlx::{Array, PreparedArrayClone, PreparedNestedRoots};
 struct RootFailure {
     #[source]
     cause: safemlx::error::Exception,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
 pub(super) struct ModuleRoots {
@@ -17,7 +17,7 @@ pub(super) struct ModuleRoots {
     equation_limit: usize,
     validation_limit: usize,
     spent: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl ModuleRoots {
     pub(super) fn control_bytes(equation: usize, validations: usize) -> Option<usize> {
@@ -30,7 +30,7 @@ impl ModuleRoots {
             size_of::<PreparedArrayClone>(),
             size_of::<Result<PreparedArrayClone, safemlx::PreparedArrayCloneCause>>(),
             size_of::<Option<eredu_nn::Error>>(),
-            eredu_nn::Error::retained_source_control_bytes::<RootFailure>()?,
+            eredu_nn::Error::retained_source_construction_bytes::<RootFailure>()?,
             size_of::<safemlx::OriginalScopeObserver>(),
             size_of::<Result<(), safemlx::error::Exception>>(),
             size_of::<(&mut Self, &mut dyn FnMut(&mut dyn FnMut(&MlxTensor)))>(),
@@ -48,7 +48,7 @@ impl ModuleRoots {
     pub(super) fn prepare(
         equation: usize,
         validations: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let count = equation.checked_add(validations).ok_or_else(overflow)?;
         let mut values = Vec::new();

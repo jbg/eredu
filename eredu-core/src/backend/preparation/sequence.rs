@@ -21,6 +21,7 @@ pub struct GenerationSequenceRequest<'e> {
     eos_token_ids: &'e [u32],
     consumer: Option<&'e GenerationSequenceConsumerLayout>,
     decoder: Option<&'e dyn GenerationDecoderInput>,
+    semantic: Option<&'e crate::SemanticStateOwner>,
     input: Option<&'e TokenIdsInputPlan<'e>>,
 }
 
@@ -32,6 +33,7 @@ impl<'e> GenerationSequenceRequest<'e> {
             eos_token_ids,
             consumer: None,
             decoder: None,
+            semantic: None,
             input: None,
         }
     }
@@ -49,6 +51,7 @@ impl<'e> GenerationSequenceRequest<'e> {
             eos_token_ids: self.eos_token_ids,
             consumer: self.consumer,
             decoder: self.decoder,
+            semantic: self.semantic,
             input: Some(input),
         }
     }
@@ -70,6 +73,17 @@ impl<'e> GenerationSequenceRequest<'e> {
     pub fn with_decoder(mut self, decoder: &'e dyn GenerationDecoderInput) -> Self {
         self.decoder = Some(decoder);
         self
+    }
+    /// Borrows the actual independently prepared semantic decoder for original
+    /// admission. Source-aware backends authenticate its closed source and paid
+    /// state; this cannot be combined with a separate plain decoder input.
+    pub fn with_semantic_state(mut self, semantic: &'e crate::SemanticStateOwner) -> Self {
+        self.semantic = Some(semantic);
+        self
+    }
+    /// Actual semantic owner supplied before admission, without taking or copying it.
+    pub const fn semantic_state(&self) -> Option<&'e crate::SemanticStateOwner> {
+        self.semantic
     }
     /// Exact synchronous decoder input; no byte allowance or mutable owner exit.
     pub const fn decoder_input(&self) -> Option<&'e dyn GenerationDecoderInput> {

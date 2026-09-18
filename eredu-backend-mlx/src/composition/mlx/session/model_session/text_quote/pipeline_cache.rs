@@ -32,9 +32,10 @@ fn failure(cause: PipelineCacheCause, owner: FailureOwner) -> Error {
 }
 
 pub(super) fn control_bytes(recipe: &ResidentNativeRecipe) -> Result<Option<u64>, Error> {
-    let Some(attempts) = recipe.kernel_attempts() else {
-        return Ok(None);
-    };
+    control_bytes_for_attempts(recipe.kernel_attempts())
+}
+pub(super) fn control_bytes_for_attempts(attempts: Option<usize>) -> Result<Option<u64>, Error> {
+    let Some(attempts) = attempts else { return Ok(None); };
     let plan = PreparedPipelineCachePlan::new(attempts);
     let layout = match plan.layout::<OriginalTextMetadataCustody>() {
         Ok(layout) => layout,
@@ -76,7 +77,13 @@ pub(super) fn install(
     controls: &OriginalTextControlGuard,
     graph: &SubmissionGraphQuota,
 ) -> Result<(), Error> {
-    let attempts = recipe.kernel_attempts().ok_or_else(unknown)?;
+    install_for_attempts(recipe.kernel_attempts().ok_or_else(unknown)?, controls, graph)
+}
+pub(super) fn install_for_attempts(
+    attempts: usize,
+    controls: &OriginalTextControlGuard,
+    graph: &SubmissionGraphQuota,
+) -> Result<(), Error> {
     let cache = PreparedPipelineCachePlan::new(attempts)
         .realize(controls.metadata_custody())
         .map_err(|error| {

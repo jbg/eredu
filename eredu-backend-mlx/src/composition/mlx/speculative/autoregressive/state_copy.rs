@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
 use crate::backend::{OriginalCopyEnvironment, RetainedOriginalCopyEnvironment};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{OriginalSpeculativeSourceIdentity, WorkingMemoryError};
 use std::{
     alloc::Layout,
@@ -19,7 +19,7 @@ pub(super) struct StateCopyContext {
     mechanisms: MlxMetalWorkspaceMechanisms,
     identity: OriginalSpeculativeSourceIdentity,
     capacity: u64,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
@@ -27,7 +27,7 @@ struct CopyFailure {
     #[source]
     cause: Error,
     // The public source shell retires before this cause and its paying account.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl StateCopyContext {
     pub(super) fn prepare(
@@ -41,7 +41,7 @@ impl StateCopyContext {
             .map_err(|cause| sources.retain_startup_error(cause))?;
         let controls = [
             environment.control_bytes().ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
             size_of::<Self>(),
             size_of::<Option<Self>>(),
@@ -54,7 +54,7 @@ impl StateCopyContext {
                     .into_iter()
                     .try_fold(size_of_val(&controls), usize::checked_add)
                     .ok_or(Error::WorkspacePlanning(
-                        WorkspaceMetadataFundingError::Overflow,
+                        HostMetadataFundingError::Overflow,
                     ))?,
             )
             .map_err(Error::WorkspacePlanning)?;
@@ -96,7 +96,7 @@ impl StateCopyContext {
             .into_iter()
             .try_fold(size_of_val(&parts), |n, part| n.checked_add(part?))
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         self.funding
             .reserve_metadata(bytes)
@@ -155,7 +155,7 @@ impl StateCopyContext {
                         .into_iter()
                         .try_fold(size_of_val(&controls), usize::checked_add)
                         .ok_or(Error::WorkspacePlanning(
-                            WorkspaceMetadataFundingError::Overflow,
+                            HostMetadataFundingError::Overflow,
                         ))?,
                 )
                 .map_err(Error::WorkspacePlanning)?;
@@ -206,7 +206,7 @@ impl StateCheckpoint {
                 .ok()
                 .map(|layout| layout.0.pad_to_align().size())
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?;
             let parts = [
                 shared,
@@ -221,7 +221,7 @@ impl StateCheckpoint {
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?;
             original
                 .funding
@@ -231,3 +231,5 @@ impl StateCheckpoint {
         Ok(Self(Some(Rc::new(state))))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -29,7 +29,7 @@ where
 /// transports. It never wraps or moves the large model execution callback.
 pub(super) struct PhaseSource<'a> {
     source: &'a crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
-    funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: &'a eredu_nn::workspace::HostMetadataFunding,
     backend: std::cell::RefCell<Option<crate::composition::mlx::model::PreparedPlanningError<Error>>>,
     admission: std::cell::RefCell<Option<crate::composition::mlx::model::PreparedPlanningError<
         eredu_runtime::working_memory::SpeculativeRequestError>>>,
@@ -37,10 +37,10 @@ pub(super) struct PhaseSource<'a> {
 impl<'a> PhaseSource<'a> {
     pub(super) fn new(
         source: &'a crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
-        funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
-    ) -> Result<Self, eredu_nn::workspace::WorkspaceMetadataFundingError> {
+        funding: &'a eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<Self, eredu_nn::workspace::HostMetadataFundingError> {
         use crate::composition::mlx::model::PreparedPlanningError;
-        funding.reserve_metadata(std::mem::size_of::<(Self,Result<Self,eredu_nn::workspace::WorkspaceMetadataFundingError>,
+        funding.reserve_metadata(std::mem::size_of::<(Self,Result<Self,eredu_nn::workspace::HostMetadataFundingError>,
             Option<&dyn std::error::Error>, &Error, bool,
             std::cell::RefMut<'_,Option<PreparedPlanningError<Error>>>,
             std::cell::RefMut<'_,Option<PreparedPlanningError<eredu_runtime::working_memory::SpeculativeRequestError>>>,
@@ -71,13 +71,9 @@ impl<'a> PhaseSource<'a> {
             None=>crate::composition::mlx::model::retain_planning_error(cause,self.funding.clone()),
         }
     }
-    #[track_caller]
     pub(super) fn retain_startup_error<E: std::error::Error + Send + Sync + 'static>(
         &self, cause: E,
     ) -> Error {
-        if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some() {
-            eprintln!("EXTERNAL_PHASE_REFUSAL {}: {}", std::panic::Location::caller(), cause);
-        }
         let cause=crate::composition::mlx::model::retain_planning_error(cause,self.funding.clone());
         self.retain_error(cause)
     }

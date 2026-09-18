@@ -15,6 +15,8 @@ pub enum Component {
     MarkerReplace,
     /// Removes one leading ASCII space and no trailing characters.
     InitialSpaceStrip,
+    /// Ordinary Metaspace replacement and first-token removal policy.
+    Metaspace { replacement: char, remove_first: bool },
     /// Another component or parameter configuration.
     Other,
 }
@@ -25,6 +27,10 @@ impl Component {
             DecoderWrapper::ByteLevel(_) => Self::ByteLevel,
             DecoderWrapper::ByteFallback(_) => Self::ByteFallback,
             DecoderWrapper::Fuse(_) => Self::Fuse,
+            DecoderWrapper::Metaspace(value) => Self::Metaspace {
+                replacement: value.get_replacement(),
+                remove_first: value.get_prepend_scheme() != crate::pre_tokenizers::metaspace::PrependScheme::Never,
+            },
             DecoderWrapper::Replace(value)
                 if matches!(value.pattern(), ReplacePattern::String(pattern) if pattern == "▁")
                     && value.content == " " =>
@@ -57,6 +63,9 @@ pub enum Profile {
     Join,
     /// A single ByteLevel decoder.
     ByteLevel,
+    /// Replace markers in each retained token, removing them from the first
+    /// token when the original prepend policy selects that behavior.
+    Metaspace { replacement: char, remove_first: bool },
     /// One supported fallback ordering, optionally stripping its first space.
     Fallback {
         /// Position of literal replacement and optional ByteLevel conversion.
@@ -71,6 +80,9 @@ impl Profile {
         use Component::*;
         if components == [ByteLevel] {
             return Some(Self::ByteLevel);
+        }
+        if let [Metaspace { replacement, remove_first }] = components {
+            return Some(Self::Metaspace { replacement: *replacement, remove_first: *remove_first });
         }
         let (components, strip) = match components.split_last() {
             Some((InitialSpaceStrip, rest)) => (rest, true),
@@ -91,6 +103,7 @@ impl Profile {
         };
         match decoder {
             DecoderWrapper::ByteLevel(_) => Some(Self::ByteLevel),
+            DecoderWrapper::Metaspace(_) => Self::sequence(&[Component::from_decoder(decoder)]),
             DecoderWrapper::Sequence(sequence) => {
                 let values = sequence.get_decoders();
                 let mut components = [Component::Other; 5];

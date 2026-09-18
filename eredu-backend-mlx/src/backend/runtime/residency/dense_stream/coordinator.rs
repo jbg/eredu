@@ -3,7 +3,7 @@ use super::{BackgroundHostReadService, BackgroundHostServiceError};
 use crate::backend::{Error, runtime::residency::manager::{
     BackgroundSourceAttempt, PreparedBackgroundHostReads, PreparedBackgroundHostWindow, ResidencyError,
 }};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_core::residency::BackgroundPrefetchReport;
 use eredu_runtime::working_memory::{HostThreadStartupPlan, OriginalHostSourceCustody, WorkingMemoryReservation};
 use std::{alloc::Layout, cell::Cell, mem::{size_of, size_of_val}};
@@ -25,7 +25,7 @@ pub(crate) struct BackgroundHostCoordinator {
     failed: Cell<bool>,
     failure_issued: Cell<bool>,
     custody: OriginalHostSourceCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -45,7 +45,7 @@ pub struct BackgroundCoordinatorFailure {
     #[source]
     cause: Cause,
     custody: OriginalHostSourceCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 struct Step<'a> {
     failed: &'a Cell<bool>,
@@ -73,6 +73,9 @@ impl PreparedBackgroundForward {
     }
 }
 impl BackgroundHostCoordinator {
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.failed.get() && self.active.is_none()
+    }
     /// Final coordinator and failure/transition frames only. Source, queue,
     /// windows, Vec backing and the separate thread startup have their own
     /// producer queries and are not counted twice in this amount.
@@ -103,7 +106,7 @@ impl BackgroundHostCoordinator {
     pub(crate) fn from_prepared(
         forwards: Vec<Option<PreparedBackgroundForward>>,
         custody: OriginalHostSourceCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         // A funding refusal returns the fixed native planning error. It must
         // not allocate an unaccepted failure Box while reporting that refusal.
@@ -121,7 +124,7 @@ impl BackgroundHostCoordinator {
         cause: Cause,
         issued: &Cell<bool>,
         custody: &OriginalHostSourceCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Error {
         // Exactly one paid failure destination. Retrying a terminal coordinator
         // cannot allocate another Box while an earlier error remains alive.

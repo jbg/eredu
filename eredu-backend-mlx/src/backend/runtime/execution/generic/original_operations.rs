@@ -33,10 +33,12 @@ mod speculative;
 mod realtime;
 pub(crate) use realtime::{RealtimeLayerwisePlan,QualifiedRealtimeLayerwisePlan};
 mod registration;
+mod activation;
+pub(crate) use activation::OriginalOperationActivation;
 mod selected_access;
 pub(crate) use selected_access::{OriginalSelectedResidencyAccess,PreparedSelectedResidencyAccess};
 use registration::Registry;
-pub(crate) use registration::{OriginalOperationRegistration, RegisteredOriginalScope};
+pub(crate) use registration::{OriginalOperationRegistration, RegisteredOriginalScope, RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause};
 mod storage;
 use storage::{PreparedStorage, ResidencyPopulation};
 pub(super) use storage::{ForegroundDiskRequestPlan, PreparedSpeculativeForegroundSource};
@@ -145,7 +147,7 @@ pub(crate) struct OriginalOperationPlan<'source, U: 'static> {
     foreground_disk: Option<storage::ForegroundDiskRequestPlan>,
     foreground_disk_loan: Option<&'source storage::ForegroundDiskRequestPlan>,
     background: Option<storage::foreground_disk::BackgroundSelection>,
-    preparation_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    preparation_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OperationCounts {
@@ -194,9 +196,10 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         &self,
         geometry: eredu_core::InferenceGeometry,
         retained_sources: Option<&'source super::host_workspace::LayerwiseWorkspace>,
+        groups: eredu_runtime::GroupSubmissionMechanism,
     ) -> Result<OriginalOperationPlan<'source, U>, Error> {
         let counts=operation_counts(self.layout.len(),geometry)?;
-        let neural=NeuralPopulation::from_layout(&self.layout,geometry)?;
+        let neural=NeuralPopulation::from_execution(&self.layout,geometry,groups,true)?;
         let residency=ResidencyPopulation::from_policy(self,geometry)?;
         self.operation_plan_from_population(Some(geometry),counts,neural,residency,retained_sources)
     }
@@ -213,13 +216,6 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             return Err(unknown());
         }
 
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            eprintln!("HOST_PARALLEL_STORAGE_POLICY source_error={:?} window_source={} manager_source={} checkpoint_source={} retained={}",
-                self.operation_source.as_ref().err(), self.operation_source.is_ok(),
-                self.operation_source.as_ref().ok().and_then(|source| source.manager_owner()).is_some(),
-                self.residency.original_checkpoint_source().is_some(), retained_sources.is_some());
-        }
         let value = OriginalOperationPlan {
             retained_sources,
             owned_sources:None,
@@ -292,7 +288,8 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     ) {
         let source_owners = Arc::strong_count(&self.unit_ids);
         let slot_owners = Rc::strong_count(&self.original_operations);
-        let plan = self.original_operation_plan(geometry, None).unwrap();
+        let plan = self.original_operation_plan(geometry, None,
+            eredu_runtime::GroupSubmissionMechanism::LayeredGraph).unwrap();
         assert!(Arc::ptr_eq(&plan.sources, &self.unit_ids));
         assert!(Arc::ptr_eq(&plan.identity, &self.workspace_identity));
         assert_eq!(plan.sources.len(), self.layout.len());
@@ -358,7 +355,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
     /// Retain the actual cumulative host preparation account. Account-only Q
     /// custody cannot create this spending capability. It follows all cold
     /// declarations and the later background source/window producers.
-    pub(crate) fn with_preparation_funding(mut self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>) -> Self {
+    pub(crate) fn with_preparation_funding(mut self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Self {
         self.preparation_funding = funding.cloned();
         self
     }
@@ -506,6 +503,15 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             size_of::<OriginalResidencyAttempt>(),
             size_of::<Result<OriginalResidencyAttempt, Error>>(),
             size_of::<Option<OriginalResidencyAttempt>>(),
+            // The canonical acquisition worker lends prepaid rows through the
+            // same request representation used for ordinary owned rows. Funded
+            // calls never construct the owned variant or retry after refusal.
+            size_of::<std::borrow::Cow<'static, [(OffloadUnitId, u64)]>>(),
+            size_of::<super::bounded::AcquisitionRecovery>(),
+            // Added shared manager window frame; the caller's existing loop
+            // controls and finite eviction/source population are unchanged.
+            size_of::<(&ResidencyManager, &[OffloadUnitId], &[OffloadUnitId])>(),
+            size_of::<Result<(), crate::backend::runtime::residency::manager::ResidencyError>>(),
             size_of::<Rc<Registry>>(),
             size_of::<Result<PreparedStorage<U>, Error>>(),
             size_of::<Registry>(),
@@ -545,6 +551,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             .checked_add(Layout::new::<OwnedBank<U>>().size())?
             .checked_add(Layout::new::<PreparationFailure>().size().max(Layout::new::<PreparationFailure<eredu_runtime::working_memory::OriginalOperationMetadataCustody>>().size()))?;
         unit.checked_add(neural)?
+            .checked_add(u64::try_from(activation::typed_control_bytes::<U>()?).ok()?)?
             .checked_add(u64::try_from(eredu_core::BackendFailure::source_retention_peak_bytes::<neural::NeuralBoundaryFailure<OperationControls>>()?).ok()?)?
             .checked_add(
                 u64::try_from(
@@ -617,14 +624,6 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         self.neural_fit.requirement()
     }
     pub(crate) fn control_bytes(&self) -> Option<u64> {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            let payload = self.retained_source().and_then(|source| self.residency.as_ref()?.prepared_ready_host_payload_control_bytes(self.window_sources.as_ref()?, source, &self.manager));
-            eprintln!("HOST_PARALLEL_STORAGE_OPERATIONS stream={} retained={} disk={} known={:?} neural={:?} prepared_host={payload:?}",
-                self.selected_stream.is_some(), self.retained_source().is_some(),
-                self.foreground_disk_plan().is_some(), self.known_control_bytes(),
-                self.neural_fit.additional_control_bytes());
-        }
         self.selected_stream?;
         if self.retained_source().is_none() && self.foreground_disk_plan().is_none() {
             self.gguf_host_runtime.as_ref()?;
@@ -730,14 +729,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         }
         // Refuse replacement of live storage before any construction. A stale
         // weak installation can only be retired outside the slot's Cell access.
-        let previous = self.slot.take();
-        let busy = previous
-            .as_ref()
-            .is_some_and(|view| view.value.strong_count() != 0);
-        self.slot.set(previous);
-        if busy {
-            return Err(Error::PrefillScopeReentrant);
-        }
+        self.slot.require_bounded_idle()?;
         // The selected plan retained this actual cache owner. Check its admitted
         // birth and original pool without charging another context per request.
         let retained_sources = if let Some(source) = self.retained_source() {
@@ -784,6 +776,8 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             scope_limit: self.scopes,
             registered_scopes: Cell::new(0),
             active: Cell::new(true),
+            entered: Cell::new(false),
+            retirement_failure: Cell::new(None),
         });
         let background = prepared.background.take();
         let bank = Rc::new(Bank {
@@ -866,6 +860,9 @@ pub(crate) struct OriginalOperationBankOwner {
     controls: OperationControls,
 }
 trait ErasedOwner {
+    fn activate(&self, _controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
+        Err(identity())
+    }
     fn selected_residency_access(&self,_role:&SpeculativeOperationRole)->Result<OriginalSelectedResidencyAccess,Error> {
         Err(identity())
     }
@@ -876,6 +873,9 @@ struct OwnedBank<U: 'static> {
     registration: Option<OriginalOperationRegistration>,
 }
 impl<U: 'static> ErasedOwner for OwnedBank<U> {
+    fn activate(&self, controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
+        self.activate_text(controls)
+    }
     fn selected_residency_access(&self,role:&SpeculativeOperationRole)->Result<OriginalSelectedResidencyAccess,Error> {
         OriginalSelectedResidencyAccess::registered(self.bank.registry.clone(),OperationControls::Speculative(role.clone()))
     }
@@ -1197,7 +1197,7 @@ pub(crate) enum SelectedOriginalOperationPlan<'a, U: 'static> {
     Resident(crate::backend::runtime::execution::generic::ResidentNeuralPlan<U>),
 }
 impl<'a, U: 'static> SelectedOriginalOperationPlan<'a, U> {
-    pub(crate) fn with_preparation_funding(self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>) -> Self {
+    pub(crate) fn with_preparation_funding(self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Self {
         match self {
             Self::Bounded(plan) => Self::Bounded(plan.with_preparation_funding(funding)),
             resident => resident,
@@ -1300,8 +1300,24 @@ impl<'a, U: 'static> SelectedOriginalOperationPlan<'a, U> {
 }
 
 fn selected_plan_control_bytes<U: 'static>() -> Option<u64> {
+    // Descriptive source selection adds no retained owner. Price its actual
+    // borrowed hook/argument transports, including the partitioned forwarding
+    // branch and resident policy/slot branch maxima.
+    type Mechanism = eredu_runtime::GroupSubmissionMechanism;
+    let group_source = [
+        // Both actual receivers are thin loans of sized runtime/executor
+        // owners. The forwarding branch includes both hooks; direct uses one.
+        size_of::<(&(), Mechanism)>().max(
+            size_of::<(&(), Mechanism)>().checked_mul(2)?),
+        size_of::<Mechanism>(), // Selected policy's plan argument.
+        // Resident policy then slot, or the single bounded policy entry.
+        size_of::<Mechanism>().max(size_of::<Mechanism>().checked_mul(2)?),
+        size_of::<Mechanism>(), // NeuralPopulation::from_execution argument.
+    ].into_iter().try_fold(0usize, usize::checked_add)?;
     u64::try_from(
         size_of::<SelectedOriginalOperationPlan<'static, U>>()
+            .checked_add(group_source)?
+            .checked_add(size_of::<usize>())? // This query's group_source local.
             .checked_add(size_of::<Option<SelectedOriginalOperationPlan<'static, U>>>())?
             .checked_add(size_of::<
                 Result<SelectedOriginalOperationPlan<'static, U>, Error>,
@@ -1357,7 +1373,7 @@ impl<U:'static> OriginalOperationAccess<U> {
         roots:&[OffloadUnitId],bank:&mut eredu_runtime::working_memory::OriginalHostSourceBank,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,
         capacity:&crate::backend::runtime::residency::manager::ForegroundDiskSourceCapacity,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding:&eredu_nn::workspace::HostMetadataFunding,
     )->Result<OriginalSelectedResidencyAttempt,Error> {
         self.selected_residency_access()?.prepare(manager,source,roots,bank,Some((pool,capacity,funding)))
     }

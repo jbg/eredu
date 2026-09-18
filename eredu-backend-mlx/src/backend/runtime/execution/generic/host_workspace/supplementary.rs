@@ -74,6 +74,10 @@ impl LayerwiseWorkspace {
             identity: LayerwiseWorkspaceIdentity {
                 policy: source.policy_identity().clone(),
                 parameter_locations: None,
+                excluded: None,
+                // Supplementary ordinals address their own complete rows,
+                // never the main manager's execution-unit constructor table.
+                manager_unit_constructors: false,
                 geometry,
             },
             copies,

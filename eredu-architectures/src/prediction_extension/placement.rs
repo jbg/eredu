@@ -57,17 +57,63 @@ impl PreparedPredictionPlacement {
     /// Projects a peer through the same tensor-only placement compiler. Prediction
     /// units are replicated over the other axes by their prepared construction.
     pub fn layout_for_rank(&self, rank: usize) -> Result<Option<Arc<LocalModelLayout>>, String> {
+        self.layout_projection(
+            rank,
+            crate::partitioned_execution::source_allocation::Allocation(None),
+        )
+        .map(|value| {
+            value.map(|value| match value {
+                PredictionLayout::Retained(layout) => Arc::clone(layout),
+                PredictionLayout::Derived(layout) => Arc::new(layout),
+            })
+        })
+        .map_err(crate::partitioned_execution::source_allocation::Cause::ordinary)
+    }
+    pub(crate) fn layout_projection(
+        &self,
+        rank: usize,
+        allocation: crate::partitioned_execution::source_allocation::Allocation<'_>,
+    ) -> Result<Option<PredictionLayout<'_>>, crate::partitioned_execution::source_allocation::Cause>
+    {
+        allocation.controls::<(
+            &Self,
+            usize,
+            ParallelRankTopology,
+            Option<PredictionLayout<'_>>,
+        )>()?;
         let topology = ParallelRankTopology::new(self.topology.topology(), rank)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| allocation.error(format_args!("{error}")))?;
         if topology.tensor_parallel_rank() == self.topology.tensor_parallel_rank() {
-            return Ok(self.layout.clone());
+            return Ok(self.layout.as_ref().map(PredictionLayout::Retained));
         }
         let Some(parameters) = &self.parameters else {
             return Ok(None);
         };
-        let tensor = tensor_rank(topology).map_err(|error| error.to_string())?;
-        crate::partitioned_execution::derive_partitioned_local_layout(parameters, tensor)
-            .map(|layout| Some(Arc::new(layout)))
+        let tensor =
+            tensor_rank(topology).map_err(|error| allocation.error(format_args!("{error}")))?;
+        crate::partitioned_execution::local_layout::local_layout_worker(
+            parameters,
+            tensor.tensor_parallel_rank(),
+            tensor.tensor_parallel_size(),
+            tensor.expert_parallel_rank(),
+            tensor.expert_parallel_size(),
+            allocation,
+        )
+        .map(|layout| Some(PredictionLayout::Derived(layout)))
+    }
+}
+/// Temporary source projection: exact retained layout or newly produced peer.
+/// The enclosing constructor owns the account until this scratch retires.
+pub(crate) enum PredictionLayout<'a> {
+    Retained(&'a Arc<LocalModelLayout>),
+    Derived(LocalModelLayout),
+}
+impl PredictionLayout<'_> {
+    pub(crate) fn layout(&self) -> &LocalModelLayout {
+        match self {
+            Self::Retained(value) => value,
+            Self::Derived(value) => value,
+        }
     }
 }
 impl<B> PreparedPredictionExtension<B>

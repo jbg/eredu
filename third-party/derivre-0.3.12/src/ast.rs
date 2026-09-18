@@ -1,13 +1,11 @@
 use std::{
-    convert::Infallible,
     fmt::{self, Debug},
     hash::Hash,
     ops::{BitOr, RangeInclusive},
 };
 
-use crate::HashMap;
 use crate::{
-    hashcons::{HashConsCapacityError, PreparedInsertion, PreparedVecHashCons, VecHashCons},
+    hashcons::{HashConsCapacityError, PreparedInsertion, PreparedVecHashCons},
     pp::PrettyPrinter,
     simplify::OwnedConcatElement,
 };
@@ -128,20 +126,6 @@ trait ExprWordSink {
 
     fn push_u32(&mut self, word: u32) -> Result<(), Self::Error>;
     fn push_slice(&mut self, words: &[u32]) -> Result<(), Self::Error>;
-}
-
-impl ExprWordSink for VecHashCons {
-    type Error = Infallible;
-
-    fn push_u32(&mut self, word: u32) -> Result<(), Self::Error> {
-        VecHashCons::push_u32(self, word);
-        Ok(())
-    }
-
-    fn push_slice(&mut self, words: &[u32]) -> Result<(), Self::Error> {
-        VecHashCons::push_slice(self, words);
-        Ok(())
-    }
 }
 
 impl ExprWordSink for PreparedInsertion<'_> {
@@ -430,13 +414,6 @@ impl<'a> Expr<'a> {
         Ok(insertion.finish()?)
     }
 
-    fn serialize(&self, trg: &mut VecHashCons) {
-        match self.serialize_into(trg) {
-            Ok(()) => {}
-            Err(infallible) => match infallible {},
-        }
-    }
-
     fn serialize_into<S: ExprWordSink>(&self, trg: &mut S) -> Result<(), S::Error> {
         #[inline(always)]
         fn nary_serialize<S: ExprWordSink>(
@@ -541,49 +518,38 @@ impl Clone for ExprSet {
 const ATTR_HAS_REPEAT: u32 = 1;
 
 impl ExprSet {
-    pub fn new(alphabet_size: usize) -> Self {
-        let exprs = storage::ExpressionStorage::Ordinary(VecHashCons::new());
+    pub(crate) fn copy_for_construction(&self) -> crate::ParserResult<Self> {
+        let funding = self.construction_funding()?.clone();
+        let plan = self.source_copy_plan().map_err(|error| crate::ParserError::cause(error, &funding))?;
+        funding.reserve(plan.requirements().required_bytes())?;
+        plan.compile_with_funding(funding.clone()).map_err(|error| crate::ParserError::cause(error, &funding))
+    }
+
+    pub fn new(alphabet_size: usize, funding: crate::ParserAllocationFunding) -> Result<Self, PreparedExprError> {
+        if alphabet_size == 0 || alphabet_size > 256 { return Err(PreparedExprError::Source); }
+        let exprs = storage::ExpressionStorage::new(funding.clone())
+            .map_err(|error| PreparedExprError::Encoding(ExprEncodingError::Storage(error)))?;
         let alphabet_words = alphabet_size.div_ceil(32);
-        let mut r = ExprSet {
-            exprs,
-            expr_weight: vec![],
-            alphabet_size,
-            alphabet_words,
-            digits: [b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9'],
-            digit_dot: b'.',
-            cost: 0,
-            pp: PrettyPrinter::new_simple(alphabet_size),
-            optimize: true,
-            unicode_cache: UnicodeCache::default(),
-            any_unicode: ExprRef::INVALID,
-            any_unicode_non_nl: ExprRef::INVALID,
-            any_unicode_star: ExprRef::INVALID,
+        let mut result = ExprSet {
+            exprs, expr_weight: Vec::new(), alphabet_size, alphabet_words,
+            digits: *b"0123456789", digit_dot: b'.', cost: 0,
+            pp: PrettyPrinter::new_simple(alphabet_size, &funding)?, optimize: true,
+            unicode_cache: UnicodeCache::default(), any_unicode: ExprRef::INVALID,
+            any_unicode_non_nl: ExprRef::INVALID, any_unicode_star: ExprRef::INVALID,
         };
-
-        let id = r.exprs.ordinary_mut().insert(&[]);
-        assert!(id == 0);
-        let inserts = vec![
-            (r.mk(Expr::EmptyString), ExprRef::EMPTY_STRING),
-            (r.mk(Expr::NoMatch), ExprRef::NO_MATCH),
-            (
-                r.mk(Expr::ByteSet(&vec![0xffffffff; alphabet_words])),
-                ExprRef::ANY_BYTE,
-            ),
-            (
-                r.mk_repeat(ExprRef::ANY_BYTE, 0, u32::MAX),
-                ExprRef::ANY_BYTE_STRING,
-            ),
-            (
-                r.mk_repeat(ExprRef::ANY_BYTE, 1, u32::MAX),
-                ExprRef::NON_EMPTY_BYTE_STRING,
-            ),
+        let id = result.exprs.0.try_insert(&[])
+            .map_err(|error| PreparedExprError::Encoding(ExprEncodingError::Storage(error)))?;
+        assert_eq!(id, 0);
+        let all_bytes = [u32::MAX; 8];
+        let inserts = [
+            (result.emit_prepared(Expr::EmptyString)?, ExprRef::EMPTY_STRING),
+            (result.emit_prepared(Expr::NoMatch)?, ExprRef::NO_MATCH),
+            (result.emit_prepared(Expr::ByteSet(&all_bytes[..alphabet_words]))?, ExprRef::ANY_BYTE),
+            (result.try_mk_repeat(ExprRef::ANY_BYTE, 0, u32::MAX)?, ExprRef::ANY_BYTE_STRING),
+            (result.try_mk_repeat(ExprRef::ANY_BYTE, 1, u32::MAX)?, ExprRef::NON_EMPTY_BYTE_STRING),
         ];
-
-        for (x, y) in inserts {
-            assert!(x == y, "id: {x:?}, expected: {y:?}");
-        }
-
-        r
+        for (actual, expected) in inserts { assert_eq!(actual, expected); }
+        Ok(result)
     }
 
     /// If this returns true, then the regex will match only strings
@@ -593,17 +559,20 @@ impl ExprSet {
         if bytes.is_empty() {
             return true;
         }
-        let mut tmp = vec![];
-        for a in self.iter_concat(e) {
-            a.push_owned_to(&mut tmp);
-            if tmp.len() > 1 {
-                break;
+        let mut offset = 0;
+        for element in self.iter_concat(e) {
+            match element {
+                crate::simplify::ConcatElement::Bytes(part) => {
+                    let count = part.len().min(bytes.len() - offset);
+                    if part[..count] != bytes[offset..offset + count] { return false; }
+                    offset += count;
+                    if offset == bytes.len() { return true; }
+                }
+                crate::simplify::ConcatElement::Expr(ExprRef::EMPTY_STRING) => {}
+                _ => return false,
             }
         }
-        match tmp.first() {
-            Some(OwnedConcatElement::Bytes(b)) => b.starts_with(bytes),
-            _ => false,
-        }
+        false
     }
 
     pub fn set_pp(&mut self, pp: PrettyPrinter) {
@@ -648,25 +617,17 @@ impl ExprSet {
         self.exprs.num_bytes()
     }
 
-    fn compute_weight(&mut self, e: ExprRef) -> u32 {
-        let mut scratch = weights::Scratch::ordinary(e);
-        match weights::compute::<weights::Ordinary>(
-            &self.exprs,
-            &mut self.expr_weight,
-            &mut scratch,
-            e,
-        ) {
-            Ok(()) => 0,
-            Err(never) => match never {},
-        }
+    fn compute_weight(&mut self, root: ExprRef) -> Result<(), PreparedExprError> {
+        let funding = self.construction_funding()?.clone();
+        let mut scratch = weights::Scratch::empty();
+        weights::compute(&mut weights::Growing(&funding), &self.exprs, &mut self.expr_weight, &mut scratch, root)
     }
 
-    // When called outside ctor, one should also call self.pay()
-    pub(crate) fn mk(&mut self, e: Expr) -> ExprRef {
-        let storage = self.exprs.ordinary_mut();
-        storage.start_insert();
-        e.serialize(storage);
-        ExprRef(storage.finish_insert())
+    // Invalid-child fixtures exercise source validation; production builders
+    // use validated emission and cannot manufacture these encodings.
+    #[cfg(test)]
+    pub(crate) fn mk(&mut self, e: Expr) -> Result<ExprRef, PreparedExprError> {
+        e.try_intern_encoded(&mut self.exprs.0).map(ExprRef::new).map_err(PreparedExprError::Encoding)
     }
 
     fn get_cached_attrs(&self, id: ExprRef) -> (u32, u32) {
@@ -676,38 +637,38 @@ impl ExprSet {
             .unwrap_or((0, 0))
     }
 
-    fn get_attrs(&mut self, id: ExprRef) -> (u32, u32) {
+    fn get_attrs(&mut self, id: ExprRef) -> Result<(u32, u32), PreparedExprError> {
         let mut r = self.get_cached_attrs(id);
         if r.0 == 0 {
-            self.compute_weight(id);
+            self.compute_weight(id)?;
             r = self.get_cached_attrs(id);
         }
-        r
+        Ok(r)
     }
 
     pub(crate) fn cached_weight(&self, id: ExprRef) -> u32 {
         self.get_cached_attrs(id).0
     }
 
-    pub fn get_weight(&mut self, id: ExprRef) -> u32 {
-        self.get_attrs(id).0
+    pub fn get_weight(&mut self, id: ExprRef) -> Result<u32, PreparedExprError> {
+        Ok(self.get_attrs(id)?.0)
     }
 
-    fn get_attr_flags(&mut self, id: ExprRef) -> u32 {
-        self.get_attrs(id).1
+    fn get_attr_flags(&mut self, id: ExprRef) -> Result<u32, PreparedExprError> {
+        Ok(self.get_attrs(id)?.1)
     }
 
-    pub fn attr_has_repeat(&mut self, id: ExprRef) -> bool {
-        let w = self.get_attr_flags(id);
-        (w & ATTR_HAS_REPEAT) != 0
+    pub fn attr_has_repeat(&mut self, id: ExprRef) -> Result<bool, PreparedExprError> {
+        let w = self.get_attr_flags(id)?;
+        Ok((w & ATTR_HAS_REPEAT) != 0)
     }
 
     pub fn get(&self, id: ExprRef) -> Expr<'_> {
         Expr::from_slice(self.exprs.get(id.0))
     }
 
-    pub fn reserve(&mut self, size: usize) {
-        self.exprs.ordinary_mut().reserve(size);
+    pub fn reserve(&mut self, size: usize) -> Result<(), ExprEncodingError> {
+        self.exprs.0.reserve_additional(size).map_err(ExprEncodingError::Storage)
     }
 
     pub(crate) fn get_bytes(&self, id: ExprRef) -> Option<&[u8]> {
@@ -796,52 +757,20 @@ impl ExprSet {
         self.get_flags(id).is_positive()
     }
 
-    #[inline(always)]
-    pub fn simple_map<V: Clone>(
+    pub fn map<K: Eq + Hash, V: mapping::MappingValue>(
         &mut self,
         r: ExprRef,
-        process: impl FnMut(&mut ExprSet, &mut Vec<V>, ExprRef) -> V,
-    ) -> V {
-        let mut cache = HashMap::default();
-        let concat_nullable_check = false;
-        self.map(r, &mut cache, concat_nullable_check, |e| e, process)
-    }
-
-    #[inline(always)]
-    pub fn map<K: Eq + PartialEq + Hash, V: Clone>(
-        &mut self,
-        r: ExprRef,
-        cache: &mut HashMap<K, V>,
+        cache: &mut crate::SourceHashMap<K, V>,
         concat_nullable_check: bool,
         mk_key: impl Fn(ExprRef) -> K,
-        process: impl FnMut(&mut ExprSet, &mut Vec<V>, ExprRef) -> V,
-    ) -> V {
-        self.map_with_cache(r, cache, concat_nullable_check, mk_key, process)
-    }
-
-    pub(crate) fn map_with_cache<K: Eq + Hash, V: Clone>(
-        &mut self,
-        r: ExprRef,
-        cache: &mut impl MappingCache<K, V>,
-        concat_nullable_check: bool,
-        mk_key: impl Fn(ExprRef) -> K,
-        mut process: impl FnMut(&mut ExprSet, &mut Vec<V>, ExprRef) -> V,
-    ) -> V {
+        process: impl FnMut(&mut ExprSet, &mut Vec<V>, ExprRef) -> crate::ParserResult<V>,
+    ) -> crate::ParserResult<V> {
+        let funding = self.construction_funding()?.clone();
         let mut scratch = mapping::Scratch::new();
-        let result = self.try_map_with_storage(
-            r,
-            &mut mapping::OrdinaryCache(cache),
-            concat_nullable_check,
-            mk_key,
-            &mut scratch,
-            &mut mapping::OrdinaryMemory,
-            |expressions, mapped, node| Ok(process(expressions, mapped, node)),
-        );
-        match result {
-            Ok(value) => value,
-            Err(error) => match error {},
-        }
+        self.try_map_with_storage(r, &mut mapping::GrowingCache { values: cache, funding: &funding }, concat_nullable_check,
+            mk_key, &mut scratch, &mut mapping::GrowingMemory(&funding), process)
     }
+
 }
 
 /// Describes the "next byte" information for a given [`ExprRef`] or [`StateID`](crate::StateID).
@@ -951,34 +880,5 @@ impl BitOr for NextByte {
                 }
             }
         }
-    }
-}
-
-// This abstracts storage lookup only; expression traversal remains one worker.
-pub(crate) trait MappingCache<K, V> {
-    fn get(&self, key: &K) -> Option<&V>;
-    fn contains_key(&self, key: &K) -> bool;
-    fn insert(&mut self, key: K, value: V);
-}
-impl<K: Eq + Hash, V> MappingCache<K, V> for HashMap<K, V> {
-    fn get(&self, key: &K) -> Option<&V> {
-        HashMap::get(self, key)
-    }
-    fn contains_key(&self, key: &K) -> bool {
-        HashMap::contains_key(self, key)
-    }
-    fn insert(&mut self, key: K, value: V) {
-        HashMap::insert(self, key, value);
-    }
-}
-impl<K: Eq + Hash, V> MappingCache<K, V> for hashbrown::HashMap<K, V, crate::RandomState> {
-    fn get(&self, key: &K) -> Option<&V> {
-        hashbrown::HashMap::get(self, key)
-    }
-    fn contains_key(&self, key: &K) -> bool {
-        hashbrown::HashMap::contains_key(self, key)
-    }
-    fn insert(&mut self, key: K, value: V) {
-        hashbrown::HashMap::insert(self, key, value);
     }
 }

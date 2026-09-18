@@ -28,26 +28,26 @@ struct Native {producer:usize,fragment:usize,slice:ResolvedCaptureSlice,estimate
 pub struct PreparedPartitionRoutedSource {
     index:usize,coordinate:Coordinate,bank:RoutedUnitGeometry,source_tokens:u64,
     producers:Vec<Producer>,native:Vec<Native>,local:Option<LocalSource>,
-    source:SharedCapturePlan,metadata:WorkspaceMetadataFunding,
+    source:SharedCapturePlan,metadata:HostMetadataFunding,
 }
 impl PreparedPartitionRoutedSource {
     #[allow(clippy::too_many_arguments)]
     pub fn new_local_prefill(source:&SharedCapturePlan,index:usize,
         producers:&[PartitionCaptureRoutedProducerSource<'_>],native:&[PartitionCaptureRoutedFragmentGeometry<'_>],
-        local:Option<PartitionCaptureRoutedLocalSource<'_>>,inference:InferenceGeometry,metadata:&WorkspaceMetadataFunding)
+        local:Option<PartitionCaptureRoutedLocalSource<'_>>,inference:InferenceGeometry,metadata:&HostMetadataFunding)
         ->Result<Self,PartitionCaptureProgramError> {
         Self::new(source,index,producers,native,local,Coordinate::Prefill(inference),metadata)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn new_local_decode(source:&SharedCapturePlan,index:usize,
         producers:&[PartitionCaptureRoutedProducerSource<'_>],native:&[PartitionCaptureRoutedFragmentGeometry<'_>],
-        local:Option<PartitionCaptureRoutedLocalSource<'_>>,prediction:u64,metadata:&WorkspaceMetadataFunding)
+        local:Option<PartitionCaptureRoutedLocalSource<'_>>,prediction:u64,metadata:&HostMetadataFunding)
         ->Result<Self,PartitionCaptureProgramError> {
         Self::new(source,index,producers,native,local,Coordinate::Decode(prediction),metadata)
     }
     fn new(source:&SharedCapturePlan,index:usize,
         producers:&[PartitionCaptureRoutedProducerSource<'_>],native:&[PartitionCaptureRoutedFragmentGeometry<'_>],
-        local:Option<PartitionCaptureRoutedLocalSource<'_>>,coordinate:Coordinate,metadata:&WorkspaceMetadataFunding)
+        local:Option<PartitionCaptureRoutedLocalSource<'_>>,coordinate:Coordinate,metadata:&HostMetadataFunding)
         ->Result<Self,PartitionCaptureProgramError> {
         let error=|cause|PartitionCaptureProgramError{cause,_source:source.clone(),_metadata:metadata.clone()};
         metadata.reserve_metadata(Self::control_bytes().ok_or_else(||error(Cause::Source("sparse source controls overflow")))?)
@@ -166,22 +166,20 @@ impl PreparedPartitionRoutedSource {
             size_of::<Option<(usize,CaptureUsage)>>(),size_of::<Option<PreparedPartitionFragmentHostFunding>>(),
             size_of::<std::slice::Iter<'_,Producer>>(),size_of::<std::slice::Iter<'_,Native>>(),
             size_of::<(&SharedCapturePlan,usize,&[PartitionCaptureRoutedProducerSource<'_>],&[PartitionCaptureRoutedFragmentGeometry<'_>],
-                Option<PartitionCaptureRoutedLocalSource<'_>>,Coordinate,&WorkspaceMetadataFunding)>(),
+                Option<PartitionCaptureRoutedLocalSource<'_>>,Coordinate,&HostMetadataFunding)>(),
             eredu_core::capture::CaptureRoutedUnitsGeometry::partition_control_bytes()?,
             eredu_core::component::ComponentCoordinateMap::copy_control_bytes()?];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
 }
-fn copy_ownership(source:&RoutedUnitCaptureOwnership,metadata:&WorkspaceMetadataFunding)->Result<RoutedUnitCaptureOwnership,Cause> {
-    fn copy(source:&eredu_core::component::ComponentCoordinateMap,metadata:&WorkspaceMetadataFunding)
+fn copy_ownership(source:&RoutedUnitCaptureOwnership,metadata:&HostMetadataFunding)->Result<RoutedUnitCaptureOwnership,Cause> {
+    fn copy(source:&eredu_core::component::ComponentCoordinateMap,metadata:&HostMetadataFunding)
         ->Result<eredu_core::component::ComponentCoordinateMap,Cause> {
-        metadata.reserve_metadata(eredu_core::component::ComponentCoordinateMap::copy_control_bytes()
-            .ok_or(Cause::Source("sparse coordinate controls overflow"))?)?;
-        let n=source.copy_storage_elements();
-        source.copy_with_storage(metadata.metadata_vec(n)?,metadata.metadata_vec(n)?)
-            .map_err(|_|Cause::Source("sparse coordinate destination differs"))
+        source.try_clone_with_funding(metadata).map_err(Into::into)
     }
     Ok(RoutedUnitCaptureOwnership{coordinates:eredu_core::component::RoutedComponentCoordinateMap::new(
         copy(source.coordinates.experts(),metadata)?,copy(source.coordinates.units(),metadata)?),
         source_peer:source.source_peer,source_peers:source.source_peers})
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

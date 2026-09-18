@@ -108,11 +108,11 @@ pub(super) fn quote(
 // Both original media and token input use the same span-aware capture observer
 // and native recorder adapter. The operation census is emitted by the actual
 // observed equations, including generated tensors and completed output roots.
-fn with_capture_trace<T, E>(
+fn with_capture_trace<T, E, R: CaptureRecorder + ?Sized>(
     bound: BoundCaptureSelection<'_>,
     interventions: Option<TextInterventionQuote<'_>>,
     context: &WorkspaceContext,
-    recorder: &mut ResidentRecipeRecorder,
+    recorder: &mut R,
     metadata_error: fn(eredu_nn::workspace::WorkspaceMetadataError) -> E,
     neural_error: fn(eredu_nn::Error) -> E,
     worker: impl FnOnce(
@@ -121,10 +121,10 @@ fn with_capture_trace<T, E>(
     ) -> Result<T, E>,
 ) -> Result<T, E> {
     let controls = size_of::<(
-        Cell<CaptureNativePopulation>, Trace<'_, ResidentRecipeRecorder>,
+        Cell<CaptureNativePopulation>, Trace<'_, R>,
         crate::composition::mlx::session::capture_workspace::CaptureWorkspaceObserver<'_>,
         eredu_runtime::working_memory::CaptureRunHostPlan<'_>,
-        BoundCaptureSelection<'_>, Option<TextInterventionQuote<'_>>, &WorkspaceContext, &mut ResidentRecipeRecorder,
+        BoundCaptureSelection<'_>, Option<TextInterventionQuote<'_>>, &WorkspaceContext, &mut R,
         fn(eredu_nn::workspace::WorkspaceMetadataError) -> E,
         fn(eredu_nn::Error) -> E, Result<T, E>,
     )>().checked_add(size_of_val(&worker))
@@ -161,19 +161,24 @@ impl Executable {
         filter: TextFilterWorkspace<'_>,
         bound: BoundCaptureSelection<'_>,
         interventions: Option<TextInterventionQuote<'_>>,
-        recorder: &mut ResidentRecipeRecorder,
+        recorder: &mut dyn CaptureRecorder,
+        parallel: Option<ParallelSavedCaptureSource<'_>>,
     ) -> Result<eredu_architectures::prepared_execution::OriginalMediaWorkspaceReport, Error> {
-        validate(self, geometry, bound, context, None).map_err(Error::Neural)?;
+        validate(self, geometry, bound, context, parallel.map(|source|source.1)).map_err(Error::Neural)?;
         let blueprint = self.inference_blueprint().ok_or_else(||
             Error::Neural(context.metadata_source(WorkingMemoryError::UnknownBound)))?;
-        with_capture_trace(bound, interventions, context, recorder,
-            |cause| Error::Neural(cause.into()), Error::Neural,
-            |observer, trace| blueprint.quote_original_media_with_sampling_observed_and_trace(
-                input, current, geometry, state, context, None, config, filter,
-                bound.selection().paths(), observer, trace,
-            ).map_err(|cause| Error::Neural(context.metadata_source(cause.into_failure()))),
-        )
+        let worker = |observer: &mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver,
+            trace: &mut dyn InferenceEquationTraceObserver| blueprint.quote_original_media_with_sampling_observed_and_trace(
+                input,current,geometry,state,context,None,config,filter,bound.selection().paths(),observer,trace,
+                parallel.map(|source|source.0),
+            ).map_err(|cause|PreparedExecutionError::Backend(context.metadata_source(cause.into_failure())));
+        match parallel {
+            Some((communication,placement,_))=>with_partition_capture_trace(bound,interventions,context,recorder,communication,placement,worker),
+            None=>with_capture_trace(bound,interventions,context,recorder,
+                |cause|PreparedExecutionError::Metadata(cause.into()),PreparedExecutionError::Backend,worker),
+        }.map_err(|cause|Error::Neural(context.metadata_source(cause)))
     }
+
 }
 
 /// Prepared partition source calls this worker only after the enclosing native
@@ -188,7 +193,22 @@ pub(super) fn quote_partitioned(
     placement:(&eredu_architectures::component_partition::ComponentPartitionLayouts,usize),
     parameters:Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
 )->Result<PreparedTextGenerationWorkspace,PreparedExecutionError<eredu_nn::Error>> {
-    context.charge_metadata(size_of::<(Cell<CaptureNativePopulation>,Option<TextInterventionQuote<'_>>,Vec<Cell<Option<WorkspaceFloatingType>>>,Trace<'_,ParallelRecipeRecorder>,
+    with_partition_capture_trace(bound, interventions, context, recorder, communication, placement,
+        |observer,trace| blueprint.quote_partitioned_text_with_sampling_observed_and_trace(
+            geometry,state,context,config,filter,bound.selection().paths(),observer,trace,Some(communication),parameters))
+}
+
+fn with_partition_capture_trace<R: CaptureRecorder + ?Sized,T>(
+    bound: BoundCaptureSelection<'_>, interventions: Option<TextInterventionQuote<'_>>,
+    context: &WorkspaceContext, recorder: &mut R,
+    communication: &eredu_runtime::RetainedCommunicationSource,
+    placement: (&eredu_architectures::component_partition::ComponentPartitionLayouts,usize),
+    worker: impl FnOnce(&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver,
+        &mut dyn InferenceEquationTraceObserver)->Result<T,PreparedExecutionError<eredu_nn::Error>>,
+)->Result<T,PreparedExecutionError<eredu_nn::Error>> {
+    context.charge_metadata(size_of_val(&worker) + size_of::<Result<T,PreparedExecutionError<eredu_nn::Error>>>())
+        .map_err(|cause|PreparedExecutionError::Metadata(cause.into()))?;
+    context.charge_metadata(size_of::<(Cell<CaptureNativePopulation>,Option<TextInterventionQuote<'_>>,Vec<Cell<Option<WorkspaceFloatingType>>>,Trace<'_,R>,
         crate::composition::mlx::session::capture_workspace::CaptureWorkspaceObserver<'_>,
         eredu_runtime::working_memory::CaptureRunHostPlan<'_>,
         Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>)>())
@@ -212,8 +232,7 @@ pub(super) fn quote_partitioned(
             .map_err(PreparedExecutionError::Backend)?;
     }
     let mut trace=Trace{recorder,transfers:&transfers,scalar:Some(&scalar)};
-    blueprint.quote_partitioned_text_with_sampling_observed_and_trace(geometry,state,context,config,filter,
-        bound.selection().paths(),&mut observer,&mut trace,Some(communication),parameters)
+    worker(&mut observer,&mut trace)
 }
 
 fn validate_partition_selection(
@@ -245,7 +264,7 @@ pub(in crate::composition::mlx::model) fn quote_saved(
         selection, interventions, recorder, None, parameters)
 }
 
-type ParallelSavedCaptureSource<'a> = (
+pub(in crate::composition::mlx) type ParallelSavedCaptureSource<'a> = (
     &'a eredu_runtime::RetainedCommunicationSource,
     (&'a eredu_architectures::component_partition::ComponentPartitionLayouts, usize),
     Option<&'a dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
@@ -273,7 +292,7 @@ impl Executable {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn quote_saved_impl<R: CaptureRecorder>(
+fn quote_saved_impl<R: CaptureRecorder + ?Sized>(
     executable: &Executable, blueprint: &PreparedInferenceBlueprint,
     geometry: InferenceGeometry, state: &State, context: &WorkspaceContext,
     sampling: eredu_architectures::prepared_execution::BorrowedTextSamplingWorkspace<'_>,
@@ -298,7 +317,7 @@ fn quote_saved_impl<R: CaptureRecorder>(
 
 // Shared checkpoint observer, physical transformations and recorder. Both
 // sources keep the actual history and partial transfer population on failure.
-fn with_saved_capture_trace<R: CaptureRecorder, T>(
+fn with_saved_capture_trace<R: CaptureRecorder + ?Sized, T>(
     executable: &Executable,
     geometry: InferenceGeometry,
     context: &WorkspaceContext,
@@ -414,7 +433,8 @@ impl Executable {
         checkpoint: &eredu_runtime::capture::FundedCaptureCheckpoint,
         selection: &eredu_runtime::layered::PreparedCaptureSelection,
         interventions: Option<TextInterventionQuote<'_>>,
-        recorder: &mut ResidentRecipeRecorder,
+        recorder: &mut dyn CaptureRecorder,
+        parallel: Option<ParallelSavedCaptureSource<'_>>,
     ) -> Result<eredu_architectures::prepared_execution::OriginalMediaWorkspaceReport,
         PreparedExecutionError<eredu_nn::Error>> {
         let blueprint = self.inference_blueprint().ok_or_else(||
@@ -423,16 +443,16 @@ impl Executable {
             return Err(PreparedExecutionError::Backend(
                 context.metadata_source(WorkingMemoryError::IdentityMismatch)));
         }
-        with_saved_capture_trace(self, geometry, context, checkpoint, selection, interventions, recorder, None,
+        with_saved_capture_trace(self, geometry, context, checkpoint, selection, interventions, recorder, parallel,
             |observer, trace| blueprint.quote_original_media_with_existing_sampling_observed_and_trace(
                 input, current, geometry, state, context, None, sampling,
-                selection.paths(), observer, trace,
+                selection.paths(), observer, trace, parallel.map(|source|source.0),
             ).map_err(|cause| PreparedExecutionError::Backend(context.metadata_source(cause.into_failure()))),
         )
     }
 }
 
-trait CaptureRecorder: InferenceEquationTraceObserver {
+pub(in crate::composition::mlx) trait CaptureRecorder: InferenceEquationTraceObserver {
     fn capture_population(&mut self,population:CaptureNativePopulation)->Result<(),eredu_nn::Error>;
     fn capture_scalars(&mut self,_scalar:Option<&[Cell<Option<WorkspaceFloatingType>>]>)->Result<(),eredu_nn::Error> { Ok(()) }
 }
@@ -449,12 +469,12 @@ impl CaptureRecorder for ParallelRecipeRecorder {
         self.record_capture_population(population)
     }
 }
-struct Trace<'a,R:CaptureRecorder> {
+struct Trace<'a,R:CaptureRecorder + ?Sized> {
     recorder: &'a mut R,
     transfers: &'a Cell<CaptureNativePopulation>,
     scalar: Option<&'a [Cell<Option<WorkspaceFloatingType>>]>,
 }
-impl<R:CaptureRecorder> InferenceEquationTraceObserver for Trace<'_,R> {
+impl<R:CaptureRecorder + ?Sized> InferenceEquationTraceObserver for Trace<'_,R> {
     fn observe(
         &mut self,
         span: &InferenceWorkspaceSpan,
@@ -507,6 +527,9 @@ impl<R:CaptureRecorder> InferenceEquationTraceObserver for Trace<'_,R> {
         )?;
         self.recorder.capture_population(self.transfers.get())?;
         self.recorder.capture_scalars(self.scalar)
+    }
+    fn observe_sampling_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), eredu_nn::Error> {
+        self.recorder.observe_sampling_input(input)
     }
     fn observe_sampling(
         &mut self,

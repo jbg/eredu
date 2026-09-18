@@ -33,6 +33,11 @@ in order to confirm a match, you'll have to check all of the patterns by
 running the full regex engine.
 */
 
+#[cfg(feature = "alloc")]
+mod funding;
+#[cfg(feature = "alloc")]
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
+
 mod aho_corasick;
 mod byteset;
 mod memchr;
@@ -151,6 +156,19 @@ pub struct Prefilter {
 }
 
 impl Prefilter {
+    /// Visit the actual shared shell and retained backing allocations.
+    /// The caller owns identity deduplication; false skips repeated owners.
+    #[cfg(feature = "alloc")]
+    pub fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        if crate::util::source_storage::arc(&self.pre, 0, visitor)? {
+            self.pre.as_ref().visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+
     /// Create a new prefilter from a sequence of needles and a corresponding
     /// match semantics.
     ///
@@ -200,41 +218,48 @@ impl Prefilter {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn new<B: AsRef<[u8]>>(
-        kind: MatchKind,
-        needles: &[B],
-    ) -> Option<Prefilter> {
-        Choice::new(kind, needles).and_then(|choice| {
-            let max_needle_len =
-                needles.iter().map(|b| b.as_ref().len()).max().unwrap_or(0);
-            Prefilter::from_choice(choice, max_needle_len)
-        })
-    }
-
-    /// This turns a prefilter selection into a `Prefilter`. That is, in turns
-    /// the enum given into a trait object.
-    fn from_choice(
-        choice: Choice,
-        max_needle_len: usize,
-    ) -> Option<Prefilter> {
+    pub fn new<B: AsRef<[u8]>>(kind: MatchKind, needles: &[B]) -> Option<Prefilter> {
+        #[cfg(feature = "alloc")]
+        {
+            Self::new_with_allocations(kind, needles, &Unenforced)
+                .expect("ordinary prefilter construction allocation failed")
+        }
         #[cfg(not(feature = "alloc"))]
         {
             None
         }
-        #[cfg(feature = "alloc")]
-        {
-            let pre: Arc<dyn PrefilterI> = match choice {
-                Choice::Memchr(p) => Arc::new(p),
-                Choice::Memchr2(p) => Arc::new(p),
-                Choice::Memchr3(p) => Arc::new(p),
-                Choice::Memmem(p) => Arc::new(p),
-                Choice::Teddy(p) => Arc::new(p),
-                Choice::ByteSet(p) => Arc::new(p),
-                Choice::AhoCorasick(p) => Arc::new(p),
-            };
-            let is_fast = pre.is_fast();
-            Some(Prefilter { pre, is_fast, max_needle_len })
-        }
+    }
+
+    /// Select and construct the original prefilter with prospective source funding.
+    /// Intrinsic optimization misses remain optional; allocation refusals never
+    /// select a fallback engine. The caller retains authority for this source.
+    #[cfg(feature = "alloc")]
+    pub fn new_with_allocations<B: AsRef<[u8]>>(
+        kind: MatchKind,
+        needles: &[B],
+        funding: &dyn Allocation,
+    ) -> Result<Option<Prefilter>, AllocationError> {
+        let allocation = Allocator::new(funding);
+        allocation.reserve(core::mem::size_of::<Self>())?;
+        let Some(choice) = Choice::new_with_allocations(kind, needles, funding)? else {
+            return Ok(None);
+        };
+        let max_needle_len = needles.iter().map(|b| b.as_ref().len()).max().unwrap_or(0);
+        let pre: Arc<dyn PrefilterI> = match choice {
+            Choice::Memchr(p) => allocation.arc(p)?,
+            Choice::Memchr2(p) => allocation.arc(p)?,
+            Choice::Memchr3(p) => allocation.arc(p)?,
+            Choice::Memmem(p) => allocation.arc(p)?,
+            Choice::Teddy(p) => allocation.arc(p)?,
+            Choice::ByteSet(p) => allocation.arc(p)?,
+            Choice::AhoCorasick(p) => allocation.arc(p)?,
+        };
+        let is_fast = pre.is_fast();
+        Ok(Some(Prefilter {
+            pre,
+            is_fast,
+            max_needle_len,
+        }))
     }
 
     /// This attempts to extract prefixes from the given `Hir` expression for
@@ -306,10 +331,7 @@ impl Prefilter {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[cfg(feature = "syntax")]
-    pub fn from_hirs_prefix<H: Borrow<Hir>>(
-        kind: MatchKind,
-        hirs: &[H],
-    ) -> Option<Prefilter> {
+    pub fn from_hirs_prefix<H: Borrow<Hir>>(kind: MatchKind, hirs: &[H]) -> Option<Prefilter> {
         prefixes(kind, hirs)
             .literals()
             .and_then(|lits| Prefilter::new(kind, lits))
@@ -474,6 +496,13 @@ impl Prefilter {
 pub(crate) trait PrefilterI:
     Debug + Send + Sync + RefUnwindSafe + UnwindSafe + 'static
 {
+    /// Visit backing allocations, excluding the inline prefilter shell.
+    #[cfg(feature = "alloc")]
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error>;
+
     /// Return the name of this prefilter.
     fn name(&self) -> &'static str;
 
@@ -502,6 +531,17 @@ pub(crate) trait PrefilterI:
 
 #[cfg(feature = "alloc")]
 impl<P: PrefilterI + ?Sized> PrefilterI for Arc<P> {
+    #[cfg(feature = "alloc")]
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        if crate::util::source_storage::arc(self, 0, visitor)? {
+            (**self).visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         (**self).name()
     }
@@ -581,22 +621,37 @@ impl Choice {
     /// that limits which prefilters can be selected. Similarly, if
     /// `perf-literal-substring` isn't enabled, then nothing from the `memchr`
     /// crate can be returned.
-    pub(crate) fn new<B: AsRef<[u8]>>(
+    pub(crate) fn new<B: AsRef<[u8]>>(kind: MatchKind, needles: &[B]) -> Option<Choice> {
+        #[cfg(feature = "alloc")]
+        {
+            Self::new_with_allocations(kind, needles, &Unenforced)
+                .expect("ordinary prefilter choice allocation failed")
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            None
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(crate) fn new_with_allocations<B: AsRef<[u8]>>(
         kind: MatchKind,
         needles: &[B],
-    ) -> Option<Choice> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Choice>, AllocationError> {
+        Allocator::new(funding).reserve(core::mem::size_of::<Self>())?;
         // An empty set means the regex matches nothing, so no sense in
         // building a prefilter.
         if needles.len() == 0 {
             debug!("prefilter building failed: found empty set of literals");
-            return None;
+            return Ok(None);
         }
         // If the regex can match the empty string, then the prefilter
         // will by definition match at every position. This is obviously
         // completely ineffective.
         if needles.iter().any(|n| n.as_ref().is_empty()) {
             debug!("prefilter building failed: literals match empty string");
-            return None;
+            return Ok(None);
         }
         // BREADCRUMBS: Perhaps the literal optimizer should special case
         // sequences of length two or three if the leading bytes of each are
@@ -605,34 +660,34 @@ impl Choice {
         // Then well, perhaps we should use memchr2 or memchr3 in those cases?
         if let Some(pre) = Memchr::new(kind, needles) {
             debug!("prefilter built: memchr");
-            return Some(Choice::Memchr(pre));
+            return Ok(Some(Choice::Memchr(pre)));
         }
         if let Some(pre) = Memchr2::new(kind, needles) {
             debug!("prefilter built: memchr2");
-            return Some(Choice::Memchr2(pre));
+            return Ok(Some(Choice::Memchr2(pre)));
         }
         if let Some(pre) = Memchr3::new(kind, needles) {
             debug!("prefilter built: memchr3");
-            return Some(Choice::Memchr3(pre));
+            return Ok(Some(Choice::Memchr3(pre)));
         }
-        if let Some(pre) = Memmem::new(kind, needles) {
+        if let Some(pre) = Memmem::new_with_allocations(kind, needles, funding)? {
             debug!("prefilter built: memmem");
-            return Some(Choice::Memmem(pre));
+            return Ok(Some(Choice::Memmem(pre)));
         }
-        if let Some(pre) = Teddy::new(kind, needles) {
+        if let Some(pre) = Teddy::new_with_allocations(kind, needles, funding)? {
             debug!("prefilter built: teddy");
-            return Some(Choice::Teddy(pre));
+            return Ok(Some(Choice::Teddy(pre)));
         }
         if let Some(pre) = ByteSet::new(kind, needles) {
             debug!("prefilter built: byteset");
-            return Some(Choice::ByteSet(pre));
+            return Ok(Some(Choice::ByteSet(pre)));
         }
-        if let Some(pre) = AhoCorasick::new(kind, needles) {
+        if let Some(pre) = AhoCorasick::new_with_allocations(kind, needles, funding)? {
             debug!("prefilter built: aho-corasick");
-            return Some(Choice::AhoCorasick(pre));
+            return Ok(Some(Choice::AhoCorasick(pre)));
         }
         debug!("prefilter building failed: no strategy could be found");
-        None
+        Ok(None)
     }
 }
 
@@ -657,12 +712,30 @@ pub(crate) fn prefixes<H>(kind: MatchKind, hirs: &[H]) -> literal::Seq
 where
     H: core::borrow::Borrow<Hir>,
 {
+    prefixes_with_allocations(kind, hirs, &crate::util::allocation::Unenforced)
+        .expect("ordinary literal extraction")
+}
+
+#[cfg(feature = "syntax")]
+pub(crate) fn prefixes_with_allocations<H>(
+    kind: MatchKind,
+    hirs: &[H],
+    funding: &dyn crate::util::allocation::Allocation,
+) -> Result<literal::Seq, crate::util::allocation::AllocationError>
+where
+    H: core::borrow::Borrow<Hir>,
+{
+    let allocation = crate::util::allocation::Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
     let mut extractor = literal::Extractor::new();
     extractor.kind(literal::ExtractKind::Prefix);
 
     let mut prefixes = literal::Seq::empty();
     for hir in hirs {
-        prefixes.union(&mut extractor.extract(hir.borrow()));
+        prefixes.union_with_allocations(
+            &mut extractor.extract_with_allocations(hir.borrow(), syntax)?,
+            syntax,
+        )?;
     }
     debug!(
         "prefixes (len={:?}, exact={:?}) extracted before optimization: {:?}",
@@ -676,7 +749,7 @@ where
             prefixes.dedup();
         }
         MatchKind::LeftmostFirst => {
-            prefixes.optimize_for_prefix_by_preference();
+            prefixes.optimize_for_prefix_by_preference_with_allocations(syntax)?;
         }
     }
     debug!(
@@ -685,7 +758,7 @@ where
         prefixes.is_exact(),
         prefixes
     );
-    prefixes
+    Ok(prefixes)
 }
 
 /// Like `prefixes`, but for all suffixes of all matches for the given HIRs.
@@ -694,12 +767,30 @@ pub(crate) fn suffixes<H>(kind: MatchKind, hirs: &[H]) -> literal::Seq
 where
     H: core::borrow::Borrow<Hir>,
 {
+    suffixes_with_allocations(kind, hirs, &crate::util::allocation::Unenforced)
+        .expect("ordinary literal extraction")
+}
+
+#[cfg(feature = "syntax")]
+pub(crate) fn suffixes_with_allocations<H>(
+    kind: MatchKind,
+    hirs: &[H],
+    funding: &dyn crate::util::allocation::Allocation,
+) -> Result<literal::Seq, crate::util::allocation::AllocationError>
+where
+    H: core::borrow::Borrow<Hir>,
+{
+    let allocation = crate::util::allocation::Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
     let mut extractor = literal::Extractor::new();
     extractor.kind(literal::ExtractKind::Suffix);
 
     let mut suffixes = literal::Seq::empty();
     for hir in hirs {
-        suffixes.union(&mut extractor.extract(hir.borrow()));
+        suffixes.union_with_allocations(
+            &mut extractor.extract_with_allocations(hir.borrow(), syntax)?,
+            syntax,
+        )?;
     }
     debug!(
         "suffixes (len={:?}, exact={:?}) extracted before optimization: {:?}",
@@ -713,7 +804,7 @@ where
             suffixes.dedup();
         }
         MatchKind::LeftmostFirst => {
-            suffixes.optimize_for_suffix_by_preference();
+            suffixes.optimize_for_suffix_by_preference_with_allocations(syntax)?;
         }
     }
     debug!(
@@ -722,5 +813,8 @@ where
         suffixes.is_exact(),
         suffixes
     );
-    suffixes
+    Ok(suffixes)
 }
+
+#[cfg(all(test, feature = "alloc"))]
+mod allocation_tests;

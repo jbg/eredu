@@ -18,9 +18,16 @@ use std::mem::{size_of, size_of_val};
 #[derive(Debug, Clone)]
 pub struct OriginalForbiddenSource {
     inputs: ForbiddenControllerInputs,
+    tokenizer: Option<super::OriginalTokenizer>,
     account: Account,
 }
 impl OriginalForbiddenSource {
+    /// Exact tokenizer retained by the original lexical-byte compiler. Generic
+    /// packed sources have no tokenizer association and cannot claim one later.
+    pub fn matches_semantic_tokenizer(&self, tokenizer: &super::OriginalTokenizer) -> bool {
+        self.tokenizer.as_ref().is_some_and(|source| source.same_source(tokenizer))
+    }
+
     /// Actual fresh copied vocabulary and trigger, with original custody inside.
     pub fn inputs(&self) -> &ForbiddenControllerInputs {
         &self.inputs
@@ -52,7 +59,7 @@ impl OriginalForbiddenSource {
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<Result<(), eredu_core::SharedStorageAttachmentError<std::convert::Infallible>>>(
             ),
-            size_of::<Option<eredu_core::OriginalTokenDomainWitness<'_>>>(),
+            size_of::<Option<eredu_core::OriginalSourceWitness<'_>>>(),
         ];
         parts
             .into_iter()
@@ -139,7 +146,7 @@ impl WorkingMemoryPool {
                 })
             }
             Ok(inputs) => match account.finish() {
-                Ok(()) => Ok(OriginalForbiddenSource { inputs, account }),
+                Ok(()) => Ok(OriginalForbiddenSource { inputs, tokenizer: None, account }),
                 Err(cause) => Err(OriginalForbiddenSourceError {
                     cause: cause.into(),
                     settlement: None,

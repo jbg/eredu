@@ -36,7 +36,7 @@ macro_rules! ordinary {
             }
             let (tensor_group,wave_group)=self.execution.expert_provider_groups()?;
             let source = crate::partitioned_execution::partition_region_declaration::<WorkspaceBackend, _>(
-                realization, &request, group, None, tensor_group, wave_group, eredu_nn::workspace::WorkspaceExpertKernel::$variant)?;
+                realization, &request, group, None, tensor_group, wave_group, eredu_nn::workspace::WorkspaceExpertKernel::$variant, context)?;
             let interested=request.unit_observer.is_some();
             let mut observer=request.unit_observer;
             let mut observe=|source:eredu_nn::workspace::WorkspaceExpertObservationView<'_>| -> Result<eredu_nn::workspace::WorkspaceExpertObservationSource,eredu_nn::Error> {
@@ -81,7 +81,7 @@ macro_rules! parallel {
             }
             let (tensor_group,wave_group)=self.execution.expert_provider_groups()?;
             let source = crate::partitioned_execution::partition_region_declaration::<WorkspaceBackend, _>(
-                realization, &request, group, Some(partitions), tensor_group, wave_group, eredu_nn::workspace::WorkspaceExpertKernel::$variant)?;
+                realization, &request, group, Some(partitions), tensor_group, wave_group, eredu_nn::workspace::WorkspaceExpertKernel::$variant, context)?;
             let interested=request.unit_observer.is_some();
             let mut observer=request.unit_observer;
             let mut observe=|source:eredu_nn::workspace::WorkspaceExpertObservationView<'_>| -> Result<eredu_nn::workspace::WorkspaceExpertObservationSource,eredu_nn::Error> {

@@ -165,6 +165,7 @@ fn request_quote_prices_overlapping_cache_generations_and_rejects_the_old_undere
         .unwrap();
     let report = quote_inference_workspace(g, |span| {
         let count = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };
@@ -371,6 +372,7 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
         candidates.push(g.prefill_chunk_positions);
         let report = quote_inference_workspace(g, |span| {
             let bytes = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
                 InferenceWorkspaceSpan::Prefill(chunk) => match chunk.input.end - chunk.input.start
                 {
                     5 => 150,
@@ -657,4 +659,24 @@ fn native_completed_equation_envelope_carries_escaped_scores_and_late_unknowns()
             if unknown_decode { None } else { Some(395) }
         );
     }
+}
+
+#[test]
+fn terminal_copy_geometry_schedules_no_forward_or_sampling_attempt() {
+    let geometry = InferenceGeometry {
+        batch_size: 1, cached_positions: 7, input_positions: 0,
+        max_output_tokens: 0, prefill_chunk_positions: 0, output: OutputDemand::StateOnly,
+    };
+    geometry.validate_fixed().unwrap();
+    let report = quote_inference_workspace(geometry, |_| -> Result<WorkspaceTraceReport, Error> {
+        panic!("terminal state placement has no model equation");
+    }).unwrap();
+    assert_eq!(report.completed_spans, 0);
+    assert!(report.span_workspace_plan().records().is_empty());
+    assert_eq!(report.span_workspace_plan().generation_forward_count(), Some(0));
+    for invalid in [
+        InferenceGeometry { max_output_tokens: 1, ..geometry },
+        InferenceGeometry { prefill_chunk_positions: 1, ..geometry },
+        InferenceGeometry { output: OutputDemand::LastPosition, ..geometry },
+    ] { assert!(invalid.validate_fixed().is_err()); }
 }

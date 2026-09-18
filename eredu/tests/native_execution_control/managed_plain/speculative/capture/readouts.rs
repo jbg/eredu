@@ -20,7 +20,9 @@ pub(super) fn compare(row: &[f32], records: &[CaptureRecord]) {
     assert_eq!(scored.source, CandidateLogitsSource::Original);
     assert_eq!(candidates.source, CandidateLogitsSource::Original);
     let domain = Some(eredu_core::capture::CandidateDomain {
-        allowed_tokens: row.len() as u64, vocabulary: row.len() as u64, constrained: false,
+        allowed_tokens: row.len() as u64,
+        vocabulary: row.len() as u64,
+        constrained: false,
     });
     assert_eq!(scored.domain, domain);
     assert_eq!(candidates.domain, domain);

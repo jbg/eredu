@@ -14,13 +14,47 @@ use eredu_core::{
 };
 use eredu_runtime::working_memory::{
     OriginalTextSourceBudget, OriginalTextSourceError, OriginalTokenizer, OriginalTokenizerBackend,
+    OriginalTokenizerSourceError,
 };
+
+/// Actual input to fresh tokenizer source preparation.
+#[derive(Debug)]
+pub enum TokenizerSourceInput {
+    /// Read a consumed exact tokenizer JSON file under its original allowance.
+    File(std::fs::File),
+    /// Serialize this loaded model's complete retained tokenizer configuration.
+    RetainedConfiguration,
+}
+impl From<std::fs::File> for TokenizerSourceInput {
+    fn from(file: std::fs::File) -> Self { Self::File(file) }
+}
 
 /// An originally compiled tokenizer and decoder, authenticated against loaded metadata.
 /// Clones retain the same source account; no tokenizer, byte allowance or mutable handle escapes.
 #[derive(Clone, Debug)]
 #[repr(transparent)]
 pub struct ManagedPlainTextSource(OriginalTokenizer);
+
+/// A tokenizer source could not be compiled or matched to loaded metadata.
+/// Original compiler failures retain their complete source preparation custody.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedPlainTextSourceError {
+    /// Fixed loaded-model/source identity mismatch.
+    #[error(transparent)]
+    Input(#[from] TokenInputRejection),
+    /// File preparation or original source compilation failed.
+    #[error(transparent)]
+    Source(#[from] OriginalTokenizerSourceError),
+}
+impl ManagedPlainTextSourceError {
+    /// Fixed source refusal, when construction or matching rejected its identity.
+    pub fn input_rejection(&self) -> Option<TokenInputRejection> {
+        match self {
+            Self::Input(cause) | Self::Source(OriginalTokenizerSourceError::Domain(cause)) => Some(*cause),
+            _ => None,
+        }
+    }
+}
 impl ManagedPlainTextSource {
     pub(super) fn original(&self) -> &OriginalTokenizer {
         &self.0
@@ -82,9 +116,13 @@ pub struct ManagedPlainTextError {
     // Retain a failed source prefix's ceiling until its owning cause retires.
     source_budget: Option<OriginalTextSourceBudget>,
     // Raw input construction controls remain paid through a rejected handoff.
-    input_preparation: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    input_preparation: Option<eredu_runtime::input::OriginalModelInputCustody>,
 }
 impl ManagedPlainTextError {
+    pub(crate) fn from_step(cause: BackendFailure,
+        input_preparation: Option<eredu_runtime::input::OriginalModelInputCustody>) -> Self {
+        Self { cause: Cause::Backend(cause), source_budget: None, input_preparation }
+    }
     fn new(cause: Cause) -> Self {
         Self {
             cause,
@@ -163,7 +201,7 @@ impl<'a, B: TextGenerationBackend> ManagedPlainTextSession<'a, B> {
         self,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
-    ) -> Result<Self, BackendFailure> {
+    ) -> Result<Self, ManagedPlainTextError> {
         self.0.advance(cancellation, emit).map(Self)
     }
     /// Freezes terminal text and IDs without copying. Returns this session if still active.
@@ -175,27 +213,29 @@ impl<'a, B: TextGenerationBackend> ManagedPlainTextSession<'a, B> {
         self,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
-    ) -> Result<GenerationPlainTextOutput, BackendFailure> {
+    ) -> Result<GenerationPlainTextOutput, ManagedPlainTextError> {
         self.0.run(cancellation, emit)
     }
 }
 
 impl<B: OriginalTokenizerBackend> LoadedModel<B> {
-    /// Compiles a consumed tokenizer file under this backend's existing source account.
+    /// Compiles actual file bytes or this model's retained complete configuration
+    /// under the backend's existing source account.
     /// Opening the file and constructing the already-loaded model remain separate operations.
     /// The complete supported tokenizer configuration must match this loaded model;
     /// equal vocabulary IDs alone do not authorize a different merge or preprocessing policy.
     pub fn compile_managed_plain_text_source(
         &self,
-        file: std::fs::File,
-    ) -> Result<ManagedPlainTextSource, ManagedPlainTextError> {
-        let source =
-            crate::api::tokenizer::compile_original_text_tokenizer_file(&self.runtime, file)
-                .map_err(|e| ManagedPlainTextError::new(Cause::Source(e)))?;
+        input: impl Into<TokenizerSourceInput>,
+    ) -> Result<ManagedPlainTextSource, ManagedPlainTextSourceError> {
+        let source = match input.into() {
+            TokenizerSourceInput::File(file) => crate::api::tokenizer::compile_original_text_tokenizer_file(&self.runtime, file)?,
+            TokenizerSourceInput::RetainedConfiguration => B::compile_original_tokenizer_source_for_generation(
+                &self.runtime, eredu_runtime::working_memory::OriginalTokenizerInput::Configuration(&self.tokenizer),
+            )?,
+        };
         if !source.matches_configuration(&self.tokenizer) {
-            return Err(ManagedPlainTextError::new(Cause::Input(
-                TokenInputRejection::IdentityMismatch,
-            )));
+            return Err(TokenInputRejection::IdentityMismatch.into());
         }
         Ok(ManagedPlainTextSource(source))
     }
@@ -295,7 +335,6 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
             .map(|session| {
                 session
                     .run(cancellation, emit)
-                    .map_err(|e| ManagedPlainTextError::new(Cause::Backend(e)))
             })
             .transpose()
     }
@@ -330,10 +369,10 @@ impl<B: eredu_runtime::execution_control::TextSnapshotBackend> ManagedPlainTextS
 /// independently retained partial-copy custody. No native error type escapes.
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
-pub struct ManagedPlainTextSnapshotError(
-    #[from] eredu_runtime::execution_control::TextSnapshotError<BackendFailure>,
+pub struct GenerationSnapshotError(
+    #[from] pub(crate) eredu_runtime::execution_control::TextSnapshotError<BackendFailure>,
 );
-impl ManagedPlainTextSnapshotError {
+impl GenerationSnapshotError {
     /// Borrows the shared classified snapshot failure without copying its source.
     pub fn cause(&self) -> &eredu_runtime::execution_control::TextSnapshotError<BackendFailure> {
         &self.0
@@ -351,11 +390,11 @@ impl<B: eredu_runtime::execution_control::TextSnapshotBackend> ManagedPlainTextS
         budget: &eredu_runtime::execution_control::SnapshotBudget,
         host_capacity_bytes: u64,
         native: eredu_runtime::working_memory::WorkspaceCopyLimits,
-    ) -> Result<ManagedPlainTextSnapshot<B>, ManagedPlainTextSnapshotError> {
+    ) -> Result<ManagedPlainTextSnapshot<B>, GenerationSnapshotError> {
         self.0
             .snapshot(budget, host_capacity_bytes, native)
             .map(ManagedPlainTextSnapshot)
-            .map_err(ManagedPlainTextSnapshotError)
+            .map_err(GenerationSnapshotError)
     }
 }
 

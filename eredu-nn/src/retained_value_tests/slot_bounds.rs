@@ -29,7 +29,7 @@ fn explicit_optional_tensor_population_stays_inside_derived_bound() {
 
 #[test]
 fn unknown_children_remain_unknown_and_affine_future_fields_keep_their_bound() {
-    let opaque = Legacy {
+    let opaque = Incomplete {
         weight: parameter("w", 3),
         hidden: vec![5],
     };
@@ -49,7 +49,11 @@ fn unknown_children_remain_unknown_and_affine_future_fields_keep_their_bound() {
 
 struct Ceiling(usize);
 impl Parameterized<i32> for Ceiling {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, i32>>(&'a self, _: &mut V) {}
+    fn visit_parameter_sources<'a, V: crate::ParameterSourceVisitor<'a, i32>>(&'a self, _: &mut V) -> Result<(), crate::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, i32>>(&'a mut self, _: &mut V) {}
     fn set_trainable(&mut self, _: bool) {}
     fn retained_value_slot_bound(&self) -> Option<usize> {
@@ -94,7 +98,7 @@ fn absent_nested_modules_count_empty_topology_and_present_unknown_stays_unknown(
     children.push(Some(Some(parameter("appended", 23))));
     assert_eq!(children.retained_value_slot_bound(), Some(2));
     assert_eq!(retained(&children).1, [17, 23]);
-    let unknown = Some(Legacy {
+    let unknown = Some(Incomplete {
         weight: parameter("unknown", 29),
         hidden: vec![31],
     });

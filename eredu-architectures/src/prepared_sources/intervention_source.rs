@@ -1,6 +1,43 @@
 //! Borrowed validation from the actual retained selected declaration owner.
 use super::*;
 impl PreparedModelDiscovery {
+    /// Construct the raw edit admission's discovery input from retained semantic
+    /// declarations and current side-effect-free mechanism facts. Every copied
+    /// field is funded before construction; no artifact is reopened or hashed.
+    pub fn prepare_intervention_discovery(
+        &self, plan: &eredu_core::intervention::InterventionPlan,
+        facts: eredu_core::intervention::InterventionMechanismFacts<'_>, session: &str,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<eredu_runtime::inspection::FundedInterventionDiscovery,
+        eredu_runtime::inspection::InterventionDiscoveryPreparationError> {
+        use eredu_runtime::inspection::InterventionDiscoveryPreparationError as E;
+        if self.partition_selection.is_some() { return Err(E::identity(funding)); }
+        let artifact = self.identity.resolved_identity().ok_or_else(|| E::identity(funding))?;
+        eredu_runtime::inspection::prepare_intervention_discovery(plan, &self.intervention_points,
+            &self.support.points, facts, artifact, session, funding)
+    }
+
+    /// Same paid projection for the actual retained partition support/layout.
+    /// Placement and artifact identity are authenticated before destination work.
+    pub fn prepare_partitioned_intervention_discovery(
+        &self, plan: &eredu_core::intervention::InterventionPlan,
+        facts: eredu_core::intervention::InterventionMechanismFacts<'_>, session: &str,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        discovery: &eredu_core::capture::CaptureDiscovery, execution: &str,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<eredu_runtime::inspection::FundedInterventionDiscovery,
+        eredu_runtime::inspection::InterventionDiscoveryPreparationError> {
+        use eredu_runtime::inspection::InterventionDiscoveryPreparationError as E;
+        let artifact = self.identity.resolved_identity().ok_or_else(|| E::identity(funding))?;
+        if execution != self.execution_identity()
+            || self.partition_selection.as_ref().and_then(|source| source.parallel_topology())
+                .map(|rank| rank.topology()) != Some(layouts.topology())
+            || artifact.encoded().as_slice() != discovery.artifact_identity.as_bytes() {
+            return Err(E::identity(funding));
+        }
+        eredu_runtime::inspection::prepare_intervention_discovery(plan, &self.intervention_points,
+            &discovery.support.points, facts, artifact, session, funding)
+    }
     /// Revalidate an already admitted static plan without cloning discovery DTOs
     /// or reading artifact payloads. A caller must first have resolved the source
     /// through the normal discovery/admission path; this never hashes on demand.

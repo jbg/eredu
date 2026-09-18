@@ -1,7 +1,7 @@
 //! Actual mutable grammar controllers remain distinct from fixed token filters.
 use super::PlainControllerHistory;
 use crate::{
-    HostMetadataFunding, OriginalTokenDomainWitness, PackedTokenFilter, PackedTokenFilterError,
+    HostMetadataFunding, OriginalSourceWitness, PackedTokenFilter, PackedTokenFilterError,
     SharedControllerBytes, SharedControllerDeclaration, SharedTokenFilter,
 };
 use std::{
@@ -18,7 +18,8 @@ pub struct PreparedGrammarSource<'a> {
     validity: &'a SharedTokenFilter,
     recipe: &'a SharedControllerBytes,
     declaration: &'a SharedControllerDeclaration,
-    tokenizer: OriginalTokenDomainWitness<'a>,
+    tokenizer: OriginalSourceWitness<'a>,
+    compilation: OriginalSourceWitness<'a>,
     funding: &'a HostMetadataFunding,
 }
 impl<'a> PreparedGrammarSource<'a> {
@@ -29,7 +30,8 @@ impl<'a> PreparedGrammarSource<'a> {
         validity: &'a SharedTokenFilter,
         recipe: &'a SharedControllerBytes,
         declaration: &'a SharedControllerDeclaration,
-        tokenizer: OriginalTokenDomainWitness<'a>,
+        tokenizer: OriginalSourceWitness<'a>,
+        compilation: OriginalSourceWitness<'a>,
         funding: &'a HostMetadataFunding,
     ) -> Self {
         Self {
@@ -38,8 +40,13 @@ impl<'a> PreparedGrammarSource<'a> {
             recipe,
             declaration,
             tokenizer,
+            compilation,
             funding,
         }
+    }
+    /// Authenticates the actual retained history payer, without a replacement grant.
+    pub fn history_is_funded_by(self, funding: &crate::HostMetadataFunding) -> bool {
+        self.history.is_funded_by(funding)
     }
     /// Complete canonical committed history, including terminal aliases.
     pub fn history(self) -> &'a [u32] {
@@ -53,7 +60,7 @@ impl<'a> PreparedGrammarSource<'a> {
     pub fn validity(self) -> &'a SharedTokenFilter {
         self.validity
     }
-    /// Historical registered recipe; byte equality is insufficient.
+    /// Original compiled recipe; byte equality is insufficient.
     pub fn recipe(self) -> &'a SharedControllerBytes {
         self.recipe
     }
@@ -62,8 +69,13 @@ impl<'a> PreparedGrammarSource<'a> {
         self.declaration
     }
     /// Borrowed actual original tokenizer/trie source, still unauthenticated.
-    pub fn tokenizer(self) -> OriginalTokenDomainWitness<'a> {
+    pub fn tokenizer(self) -> OriginalSourceWitness<'a> {
         self.tokenizer
+    }
+    /// Borrowed provenance from the original immutable compilation. This is
+    /// unauthenticated evidence until the runtime checks its concrete owner.
+    pub fn compilation(self) -> OriginalSourceWitness<'a> {
+        self.compilation
     }
     /// Actual account paying mutable state and each subsequent operation.
     pub fn funding(self) -> &'a HostMetadataFunding {
@@ -75,6 +87,7 @@ impl<'a> PreparedGrammarSource<'a> {
             && self.recipe.same_storage(other.recipe)
             && self.declaration.same_storage(other.declaration)
             && self.tokenizer.same_borrowed_source(other.tokenizer)
+            && self.compilation.same_borrowed_source(other.compilation)
     }
     /// Checks a newly copied independent history and all immutable sources.
     /// A matching copy still needs the original consumer's source qualification.

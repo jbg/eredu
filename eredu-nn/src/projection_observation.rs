@@ -105,9 +105,10 @@ impl<'a> BlockFp8InputReconstructionPlan<'a> {
         }
         Ok(())
     }
-    /// Existing logical capture quota, preserved for wire/policy compatibility.
-    /// Physical allocator capacity is priced by the selected operation program;
-    /// this legacy quota is not allocation evidence or execution authority.
+    /// Logical buffers of the fixed reconstruction: padded repeated scales,
+    /// decoded values, trimmed scales and their product. Shape views add no
+    /// logical buffer. Physical backing, aliasing, controls and completion owners
+    /// are priced separately by the selected native operation program.
     pub fn logical_capture_source(
         self,
     ) -> Result<GeneratedTensorSource, ProjectionObservationError> {
@@ -119,7 +120,6 @@ impl<'a> BlockFp8InputReconstructionPlan<'a> {
                     .checked_mul(12)
                     .and_then(|values| n.checked_add(values))
             })
-            .and_then(|n| n.checked_add(4096))
             .ok_or(ProjectionObservationError::Overflow)?;
         Ok(GeneratedTensorSource {
             creation_bytes,

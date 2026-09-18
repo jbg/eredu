@@ -445,7 +445,7 @@ impl RegexVec {
     ) -> Result<bool> {
         assert!(self.subsume_possible(state));
         let small = self.get_rx(lexeme_idx);
-        subsumption::run(
+        Ok(subsumption::run(
             &mut subsumption::Ordinary {
                 source: &mut self.exprs,
                 derivative: &mut self.deriv,
@@ -455,7 +455,7 @@ impl RegexVec {
             &self.subsumable,
             small,
             budget,
-        )
+        )?)
     }
 
     /// Estimate the size of the regex tables in bytes.
@@ -531,9 +531,9 @@ impl RegexVec {
         self.exprs.cost()
     }
 
-    pub fn lexeme_weight(&mut self, lexeme_idx: LexemeIdx) -> u32 {
+    pub fn lexeme_weight(&mut self, lexeme_idx: LexemeIdx) -> anyhow::Result<u32> {
         let e = self.rx_list[lexeme_idx.as_usize()];
-        self.exprs.get_weight(e)
+        Ok(self.exprs.get_weight(e)?)
     }
 
     pub fn set_max_states(&mut self, max_states: usize) {

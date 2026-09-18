@@ -26,7 +26,7 @@ impl<F: Json> CustomKeyword<F> {
 }
 
 impl<F: Json> Validate<F> for CustomKeyword<F> {
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         instance_path: &LazyLocation,
@@ -44,7 +44,7 @@ impl<F: Json> Validate<F> for CustomKeyword<F> {
         self.inner.is_valid(instance.clone())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         instance_path: &LazyLocation,

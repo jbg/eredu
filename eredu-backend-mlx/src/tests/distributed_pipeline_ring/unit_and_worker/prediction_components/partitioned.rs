@@ -633,7 +633,7 @@ fn verify_fused_readout(
                     source[i / (streams * hidden) * hidden + i % hidden]
                 );
             }
-            r.captures.as_step().clone()
+            r.captures.clone()
         })
         .collect::<Vec<_>>();
     assert!(!steps.is_empty());

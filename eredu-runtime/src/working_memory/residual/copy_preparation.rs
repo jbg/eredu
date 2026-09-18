@@ -208,7 +208,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
             RegisteredStoragePin::new_metadata(self.source().registration().clone(), metadata)
                 .map_err(crate::working_memory::WorkspaceReportError::from)?;
         let proof = IncrementalInferenceQuote {
-            state: full,
+            state: super::QuoteDiagnostics::new(full, metadata)?,
             geometry,
             incremental_bytes,
             // The closed source discount applies only to the separate copy.

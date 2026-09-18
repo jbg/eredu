@@ -19,11 +19,8 @@ fn options(source: &SharedCapturePlan) -> TextPreparationOptions {
         interventions: None, capture: Some(source.clone()),
     }
 }
-fn shared(delivery: CapturedStepDelivery) -> SharedCapturedStep {
-    match delivery {
-        CapturedStepDelivery::Shared(frame) => frame,
-        CapturedStepDelivery::Legacy(_) => panic!("managed source must retain the original frame"),
-    }
+fn shared(delivery: SharedCapturedStep) -> SharedCapturedStep {
+    delivery
 }
 fn values(frame: &SharedCapturedStep) -> &[f32] {
     let payload = frame.records()[0].payload.as_ref().unwrap();
@@ -108,8 +105,6 @@ fn observed(
             tokens.push(token.token_id());
             drop(token);
             assert!(run.capture_pending());
-            // Legacy raw drain parks this exact shared owner, with no DTO copy.
-            assert!(run.take_captured_step().unwrap().is_none());
             assert!(run.capture_pending());
             let frame = shared(run.take_captured_delivery().unwrap().unwrap());
             assert!(!run.capture_pending());
@@ -133,7 +128,6 @@ fn observed(
             tokens.push(token.token_id().unwrap());
             drop(token);
             assert!(run.capture_pending());
-            assert!(run.take_captured_step().unwrap().is_none());
             assert!(run.capture_pending());
             let frame = shared(run.take_captured_delivery().unwrap().unwrap());
             assert!(!run.capture_pending());
@@ -377,7 +371,6 @@ fn undrained_shared_frame_blocks_work_and_initial_cancellation_emits_no_frame() 
             assert!(run.take_captured_delivery().unwrap().is_none());
         } else {
             drop(run.next().unwrap().unwrap());
-            assert!(run.take_captured_step().unwrap().is_none());
             assert!(run.capture_pending());
             let native = paths::snapshot();
             let error = run

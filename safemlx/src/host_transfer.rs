@@ -1,4 +1,6 @@
 use std::ffi::c_void;
+mod source_witness;
+pub use source_witness::ImmutableHostTransferWitness;
 mod prepared_source;
 pub use prepared_source::PreparedHostTransferPlan;
 mod prepared_destination;

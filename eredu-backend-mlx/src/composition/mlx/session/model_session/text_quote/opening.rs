@@ -3,7 +3,7 @@
 use eredu_runtime::working_memory::{
     InferenceRequest, InferenceRetention, InferenceStateRevision, WorkingMemoryError,
 };
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell, RefMut};
 
 #[derive(Debug)]
 struct Opening {
@@ -18,6 +18,7 @@ struct Opening {
 pub(super) struct OpeningSeal {
     opening: OnceCell<Opening>,
     before_install: Option<InferenceStateRevision>,
+    placement: RefCell<Option<InferenceStateRevision>>,
 }
 
 impl OpeningSeal {
@@ -32,6 +33,7 @@ impl OpeningSeal {
                 predecessor,
             }),
             before_install: None,
+            placement: RefCell::new(None),
         }
     }
 
@@ -41,6 +43,7 @@ impl OpeningSeal {
         Self {
             opening: OnceCell::new(),
             before_install: Some(retained.revision().clone()),
+            placement: RefCell::new(None),
         }
     }
 
@@ -70,15 +73,27 @@ impl OpeningSeal {
         retained: &InferenceRetention,
         cached_positions: u64,
     ) -> Result<(), WorkingMemoryError> {
+        self.validate_source(retained.revision(), retained.admission(), cached_positions)
+    }
+
+    pub(super) fn validate_source(&self, revision: &InferenceStateRevision,
+        admission: Option<&eredu_runtime::working_memory::InferenceStateAdmission>, cached_positions: u64)
+        -> Result<(), WorkingMemoryError> {
         let opening = self.get()?;
-        retained.validate_revision(&opening.revision)?;
-        match (&opening.predecessor, retained.admission()) {
+        let placement = self.placement.try_borrow().map_err(|_| WorkingMemoryError::PreparationNotReady)?;
+        if placement.as_ref().unwrap_or(&opening.revision) != revision { return Err(WorkingMemoryError::IdentityMismatch); }
+        match (&opening.predecessor, admission) {
             (None, None) => Ok(()),
             (Some(expected), Some(actual)) if actual.position() == cached_positions => {
                 actual.request().validate_same_request(expected)
             }
             _ => Err(WorkingMemoryError::IdentityMismatch),
         }
+    }
+
+    /// Reserve the private destination loan before the atomic native exchange.
+    pub(super) fn placement_slot(&self) -> Result<RefMut<'_, Option<InferenceStateRevision>>, WorkingMemoryError> {
+        self.placement.try_borrow_mut().map_err(|_| WorkingMemoryError::PreparationNotReady)
     }
 
     /// Only TextExecutionQuote's runtime-reading endpoint calls this after its

@@ -19,7 +19,7 @@ pub(crate) struct PreparedHostPublication {
     units: Vec<Unit>,
     source: ForegroundDiskDescriptors,
     custody: OriginalHostSourceCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum PublicationCause {
@@ -118,7 +118,7 @@ impl PreparedHostPublication {
         manager: &ResidencyManager,
         plan: &ForegroundDiskWindowPlan,
         custody: OriginalHostSourceCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, BackgroundHostReadFailure> {
         let fail = |cause| BackgroundHostReadFailure::Source {
             cause,

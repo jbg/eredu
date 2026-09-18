@@ -1,8 +1,8 @@
 use super::*;
-use crate::api::{ManagedChatPolicyRejection, ManagedChatRequest, PreparedChatGenerationSettings};
+use crate::api::PreparedChatGenerationSettings;
 
 #[test]
-fn public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_budget() {
+fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_budget() {
     let mut previous: Option<(String, Vec<u32>)> = None;
     for manual in [false, true] {
         let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
@@ -41,7 +41,7 @@ fn public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_b
         let mut template_file = tempfile::tempfile().unwrap();
         template_file.write_all(config.as_bytes()).unwrap();
         let source = model
-            .compile_managed_chat_source(&tokenizer, template_file, &cancellation)
+            .compile_managed_chat_source(&tokenizer, template_file, false, &cancellation)
             .unwrap()
             .unwrap();
         let cold = pool.used_bytes().unwrap();
@@ -60,7 +60,11 @@ fn public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_b
         // These permissions alone do not change ordinary text rendering.
         // Exercise both ordinary-driver and manually advanced public sessions.
         chat.parallel_tool_calls = crate::runtime::chat::ParallelToolCallPolicy::Enabled {
-            max_calls: if manual { std::num::NonZeroUsize::new(2) } else { None },
+            max_calls: if manual {
+                std::num::NonZeroUsize::new(2)
+            } else {
+                None
+            },
         };
         chat.allow_unparsed_reasoning = true;
         assert!(crate::api::request::text_chat_eligibility(&chat).is_ok());
@@ -91,12 +95,9 @@ fn public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_b
                 .checked_add(u64::try_from(settings.overrides.max_new_tokens.unwrap()).unwrap())
                 .unwrap(),
         );
-        let request = ManagedChatRequest::new(&chat, settings);
-        let mut short = request;
-        short.settings.inference.managed_memory_capacity_bytes = Some(1);
         assert!(
             model
-                .start_managed_chat(&source, short, &cancellation)
+                .prepare_chat(&source, &chat, 1, &cancellation)
                 .is_err()
         );
         assert_eq!(facts.borrow().chat_renders, 0);
@@ -107,100 +108,112 @@ fn public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_b
         cancelled.cancel();
         assert!(
             model
-                .start_managed_chat(&source, request, &cancelled)
+                .prepare_chat(&source, &chat, u64::MAX, &cancelled)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(facts.borrow().chat_renders, 0);
-
-        // The public model permits template mutation; every startup rechecks
-        // actual source/name rather than relying on the source handle's age.
         model.set_chat_template(Some(eredu_text::tokenizer::ModelChatTemplate::Single(
             "changed".into(),
         )));
-        let error = match model.start_managed_chat(&source, request, &cancellation) {
-            Err(error) => error,
-            Ok(_) => panic!("changed template must reject"),
-        };
+        let error = model
+            .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+            .unwrap_err();
+        assert_eq!(
+            error.input_rejection(),
+            Some(TokenInputRejection::IdentityMismatch)
+        );
+        drop(error);
+        model.set_chat_template(Some(selected.clone()));
+        assert_eq!(facts.borrow().chat_renders, 0);
+
+        let mut reasoning = chat.clone();
+        reasoning.enable_thinking = Some(true);
+        reasoning.allow_unparsed_reasoning = false;
+        let error = model
+            .prepare_chat(&source, &reasoning, u64::MAX, &cancellation)
+            .unwrap_err();
+        assert_eq!(facts.borrow().encodes, 0);
+        assert!(!facts.borrow().order.contains(&"submit"));
+        drop(error);
+        assert_eq!(pool.used_bytes().unwrap(), cold);
+
+        let prepared = model
+            .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+            .unwrap()
+            .unwrap();
+        let prepared_bytes = pool.used_bytes().unwrap();
+        assert!(prepared_bytes > cold);
+        assert!(
+            model
+                .start_prepared_chat(literal_request(&prepared, settings), &cancelled)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(facts.borrow().encodes, 0);
+        model.set_chat_template(Some(eredu_text::tokenizer::ModelChatTemplate::Single(
+            "changed".into(),
+        )));
+        let error =
+            match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation) {
+                Err(error) => error,
+                Ok(_) => panic!("changed template must reject at execution too"),
+            };
         assert_eq!(
             error.input_rejection(),
             Some(TokenInputRejection::IdentityMismatch)
         );
         drop(error);
         model.set_chat_template(Some(selected));
-        assert_eq!(facts.borrow().chat_renders, 0);
+        assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
 
-        let mut reasoning = chat.clone();
-        reasoning.enable_thinking = Some(true);
-        let error = match model.start_managed_chat(
-            &source,
-            ManagedChatRequest::new(&reasoning, settings),
-            &cancellation,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("unintegrated reasoning must reject"),
-        };
-        assert_eq!(
-            error.policy_rejection(),
-            Some(ManagedChatPolicyRejection::Reasoning)
-        );
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
-
-        // A post-render configuration mismatch retains the authentic H and its
-        // source ceiling in the existing private owner; public failures below
-        // exercise the same mapped owner on an actual preparation refusal.
         facts.borrow_mut().short = true;
-        let error = match model.start_managed_chat(&source, request, &cancellation) {
-            Err(error) => error,
-            Ok(_) => panic!("exact request one-short admission must refuse"),
-        };
-        assert!(pool.used_bytes().unwrap() > cold);
+        let error =
+            match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation) {
+                Err(error) => error,
+                Ok(_) => panic!("exact request one-short admission must refuse"),
+            };
+        assert!(pool.used_bytes().unwrap() > prepared_bytes);
+        assert!(!facts.borrow().order.contains(&"submit"));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
         facts.borrow_mut().short = false;
         facts.borrow_mut().ids.clear();
 
         let mut visible = String::new();
-        let mut emit = |event: GenerationPlainTextEvent<'_>| {
-            if let GenerationPlainTextEvent::TextDelta(text) = event {
-                visible.push_str(text);
+        let mut emit = |event: SemanticEvent| {
+            if let SemanticEvent::TextDelta(text) = event {
+                visible.push_str(&text);
             }
         };
+        let mut session = model
+            .start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+            .unwrap()
+            .unwrap();
         let output = if manual {
-            let mut session = model
-                .start_managed_chat(&source, request, &cancellation)
-                .unwrap()
-                .unwrap();
             while session.finish_reason().is_none() {
                 session = session.advance(&cancellation, &mut emit).unwrap();
             }
             session
                 .into_output()
-                .unwrap_or_else(|_| panic!("terminal managed chat"))
+                .unwrap_or_else(|_| panic!("terminal prepared chat"))
         } else {
-            model
-                .generate_managed_chat(&source, request, &cancellation, &mut emit)
-                .unwrap()
-                .unwrap()
+            session.run(&cancellation, &mut emit).unwrap()
         };
         assert_eq!(facts.borrow().ids, expected_ids.get_ids());
-        assert_eq!(output.text.as_str(), "h hih");
-        assert_eq!(output.text.as_str(), visible);
+        assert_eq!(visible, "h hih");
         assert_eq!(output.token_ids.as_ref(), &[0, 8, 0]);
         if let Some((text, ids)) = previous.take() {
-            assert_eq!(output.text.as_str(), text);
+            assert_eq!(visible, text);
             assert_eq!(output.token_ids.as_ref(), ids.as_slice());
         }
         previous = Some((visible, output.token_ids.as_ref().to_vec()));
-        drop(source);
-        drop(tokenizer);
-        drop(model);
+        drop((prepared, source, tokenizer, model));
         assert!(
             pool.used_bytes().unwrap() > 0,
-            "terminal output retains original owners"
+            "terminal token output retains original owners"
         );
-        assert_eq!(output.text.as_str(), "h hih");
+        assert_eq!(output.token_ids.as_ref(), &[0, 8, 0]);
         drop(output);
         assert_eq!(pool.used_bytes().unwrap(), 0);
     }

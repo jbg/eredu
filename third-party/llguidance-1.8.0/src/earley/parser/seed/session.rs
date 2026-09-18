@@ -97,7 +97,7 @@ struct Context<'a, 'b, F> {
     chart: &'a mut Chart<'b, F>,
     state: &'a mut State,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, '_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Context<'_, '_, F> {
     fn append_token(&mut self, token: TokenId) -> Result<(), Cause<E>> {
         let total = self
             .state
@@ -110,7 +110,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, '_, F> {
         Ok(())
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> progress::Context for Context<'_, '_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> progress::Context for Context<'_, '_, F> {
     type Error = Cause<E>;
     fn initialized(&self, _operation: &'static str) -> Result<(), Self::Error> {
         if self.state.stop == StopReason::NotStopped {
@@ -251,7 +251,7 @@ impl PreparedTokenParser {
         run: G,
     ) -> Result<(Self, T), PreparedTokenParserError<E>>
     where
-        F: Fn(usize) -> Result<(), E>,
+        F: crate::earley::PreparedFunding<Error = E>,
         G: FnOnce(&mut Context<'_, '_, F>) -> Result<T, Cause<E>>,
     {
         let Self { chart, mut state } = self;
@@ -278,7 +278,7 @@ impl PreparedTokenParser {
                 size_of::<std::iter::Enumerate<std::slice::Iter<'_, TokenId>>>(),
                 size_of::<std::ops::Range<usize>>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -304,7 +304,7 @@ impl PreparedTokenParser {
         run: G,
     ) -> Result<(Self, T), PreparedTokenParserError<E>>
     where
-        F: Fn(usize) -> Result<(), E>,
+        F: crate::earley::PreparedFunding<Error = E>,
         G: FnOnce(
             PreparedEarleySeed,
             &mut PreparedLexer,
@@ -330,7 +330,7 @@ impl PreparedTokenParser {
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add);
         let cause = match controls {
-            Some(bytes) => funding(bytes).err().map(Cause::Funding),
+            Some(bytes) => funding.reserve(bytes).err().map(Cause::Funding),
             None => Some(Cause::Overflow),
         };
         if let Some(cause) = cause {
@@ -349,7 +349,7 @@ impl PreparedTokenParser {
     }
     /// Commits deterministic bytes using the same underlying force worker,
     /// retaining token history separately until those bytes are consumed.
-    pub fn force_bytes<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn force_bytes<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -370,7 +370,7 @@ impl PreparedTokenParser {
         .map(|(owner, ())| owner)
     }
     /// Uses the actual speculative token-suffix chop without committing tokens.
-    pub fn chop_tokens<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn chop_tokens<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -395,7 +395,7 @@ impl PreparedTokenParser {
     /// `prefix` are the enclosing exact canonical forcing driver's result.
     /// Stopped sessions produce EOS aliases; live forced tokens produce a
     /// singleton, otherwise the actual Earley mask is copied then finalized.
-    pub fn compute_mask<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn compute_mask<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -436,7 +436,7 @@ impl PreparedTokenParser {
                     size_of::<std::slice::Iter<'_, TokenId>>(),
                     size_of::<(bool, bool, TokenId)>(),
                 ];
-                funding(
+                funding.reserve(
                     parts
                         .into_iter()
                         .try_fold(size_of_val(&parts), usize::checked_add)
@@ -466,7 +466,7 @@ impl PreparedTokenParser {
                     )
                 }
                 .map_err(Cause::MaskSource)?;
-                funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+                funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
                 let mut mask = plan.compile().map_err(Cause::Mask)?;
                 if !stopped {
                     if let Some(token) = first_forced {
@@ -492,7 +492,7 @@ impl PreparedTokenParser {
     /// Starts the ordinary no-prompt, no-backtracking Matcher state from an
     /// actual untouched initial chart. `max_tokens` is the exact grammar
     /// request's token limit, not a storage allowance or grammar capability.
-    pub fn prepare<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn prepare<F: crate::earley::PreparedFunding<Error = E>, E>(
         chart: PreparedEarleySeed,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -527,7 +527,7 @@ impl PreparedTokenParser {
     }
     /// Uses the same Matcher validation/consume/stop loop, returning the first
     /// invalid token's index without committing that token.
-    pub fn try_consume_tokens<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn try_consume_tokens<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -540,7 +540,7 @@ impl PreparedTokenParser {
         })
     }
     /// Same token-level acceptance predicate, excluding unapplied forced bytes.
-    pub fn is_accepting<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn is_accepting<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,

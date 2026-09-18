@@ -220,6 +220,13 @@ impl PreparedExecutionStreams {
             .map_err(MlxStreamOwnershipError::CpuWorker)?;
         self.execution.observe_idle(pool)
     }
+    #[cfg(test)]
+    pub(crate) fn retiring_wrapper_control_bytes(&self) -> u64 {
+        match &self.execution {
+            ExecutionStream::Cpu(execution) => execution.wrapper_control_bytes(),
+            ExecutionStream::Gpu(_) => 0,
+        }
+    }
     pub(crate) fn execution(&self) -> &Stream {
         self.execution.as_stream()
     }

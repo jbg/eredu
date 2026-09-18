@@ -111,9 +111,9 @@ fn repeated_source_query_errors_each_pay_retained_failure_and_keep_h() {
     use safemlx::{Array, distributed::GroupWorkerOperation};
     use std::sync::{Arc, atomic::{AtomicUsize,Ordering}};
     #[derive(Debug)]
-    struct Counted { inner: WorkspaceMetadataFunding, reserved: Arc<AtomicUsize> }
-    impl eredu_nn::workspace::WorkspaceMetadataAccount for Counted {
-        fn reserve_metadata(&self, bytes:usize)->Result<(),WorkspaceMetadataFundingError> {
+    struct Counted { inner: HostMetadataFunding, reserved: Arc<AtomicUsize> }
+    impl eredu_nn::workspace::HostMetadataAccount for Counted {
+        fn reserve_metadata(&self, bytes:usize)->Result<(),HostMetadataFundingError> {
             self.inner.reserve_metadata(bytes)?;
             self.reserved.fetch_add(bytes,Ordering::SeqCst);
             Ok(())
@@ -134,7 +134,7 @@ fn repeated_source_query_errors_each_pay_retained_failure_and_keep_h() {
     let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 20).unwrap();
     crate::backend::runtime::distributed::group::reset_native_collective_submissions();
     let reserved=Arc::new(AtomicUsize::new(0));
-    let funding=WorkspaceMetadataFunding::new(Counted {inner:funding,reserved:reserved.clone()}).unwrap();
+    let funding=HostMetadataFunding::new(Counted {inner:funding,reserved:reserved.clone()}).unwrap();
     let source=actual.bind_original_source(&manifest,&world,&authority,&funding).unwrap();
     let input=Array::from_slice(&[7_i32,-11,23],&[3]);
     let allowance=failure_control_bytes().unwrap();
@@ -164,9 +164,9 @@ fn repeated_source_query_errors_each_pay_retained_failure_and_keep_h() {
 fn retained_native_persistent_owners_are_paid_before_lending_and_keep_source_h(){
     use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
     #[derive(Debug)]
-    struct Counted{inner:WorkspaceMetadataFunding,reserved:Arc<AtomicUsize>}
-    impl eredu_nn::workspace::WorkspaceMetadataAccount for Counted{
-        fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+    struct Counted{inner:HostMetadataFunding,reserved:Arc<AtomicUsize>}
+    impl eredu_nn::workspace::HostMetadataAccount for Counted{
+        fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
             self.inner.reserve_metadata(bytes)?;self.reserved.fetch_add(bytes,Ordering::SeqCst);Ok(())
         }
     }
@@ -182,7 +182,7 @@ fn retained_native_persistent_owners_are_paid_before_lending_and_keep_source_h()
     let pool=WorkingMemoryPool::new(1<<20,0).unwrap();
     let raw=pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(),1<<20).unwrap();
     let reserved=Arc::new(AtomicUsize::new(0));
-    let funding=WorkspaceMetadataFunding::new(Counted{inner:raw,reserved:reserved.clone()}).unwrap();
+    let funding=HostMetadataFunding::new(Counted{inner:raw,reserved:reserved.clone()}).unwrap();
     let source=actual.bind_original_source(&manifest,&world,&authority,&funding).unwrap();
     let before=reserved.load(Ordering::SeqCst);
     let persistent=source.world_persistent().unwrap();

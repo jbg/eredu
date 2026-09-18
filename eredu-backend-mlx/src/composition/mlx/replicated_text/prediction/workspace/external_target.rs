@@ -28,7 +28,7 @@ use crate::{
 };
 use eredu_architectures::composite_execution::ExternalPredictionCaptureRequest;
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceDtype, WorkspaceMetadataFunding, WorkspaceTensor},
+    workspace::{WorkspaceContext, WorkspaceDtype, HostMetadataFunding, WorkspaceTensor},
     Parameterized, Tensor,
 };
 use eredu_runtime::{
@@ -47,21 +47,23 @@ pub(in crate::composition::mlx::replicated_text) struct ExternalTargetEquationQu
     pub layerwise: Option<LayerwiseWorkspace>,
     pub bindings: SourceBindings,
     pub context: WorkspaceContext,
-    pub funding: WorkspaceMetadataFunding,
+    pub funding: HostMetadataFunding,
 }
 impl ExternalTargetEquationQuote {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::composition::mlx::replicated_text) fn inspect<A, S, D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
         tokens: &MlxTensor,
+        prefill: Option<&crate::composition::mlx::prepared_speculative::OriginalEmbeddedPrefillInput>,
         invocation: ExternalInvocation,
         capture: Option<&ExternalPredictionCaptureRequest>,
         sources: &OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         bind_sources: impl FnOnce(
             &WorkspaceContext,
             &[&ProjectedNativeStorage],
+            Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
         ) -> Result<SourceBindings, Error>,
     ) -> Result<Self, Error>
     where
@@ -100,7 +102,7 @@ impl ExternalTargetEquationQuote {
                 &ExternalPredictionCaptureRequest,
                 &OriginalSpeculativeNumericalSources,
                 &OriginalCopyEnvironment<'_>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
         ];
         funding
@@ -169,7 +171,8 @@ impl ExternalTargetEquationQuote {
         valid.map_err(|cause| sources.retain_startup_error(cause))?;
             Some(paths)
         }else{None};
-        let bindings = bind_sources(&context, &[&target.storage, &inputs])?;
+        let media = prefill.map(|source| source.project_media(&context, sources)).transpose()?.flatten();
+        let bindings = bind_sources(&context, &[&target.storage, &inputs], media.as_ref().map(|input| input.source_storage()))?;
         let mut recorder = mechanism.recorder(geometry, &context)
             .map_err(|cause| sources.retain_startup_error(cause))?;
         if let Some(source)=addressable {
@@ -179,7 +182,7 @@ impl ExternalTargetEquationQuote {
         let mut completion = CompletionTrace::new(&mut recorder, &context)?;
         let report=match capture {
             Some(capture)=>sources.target_blueprint().quote_external_target_invocation(
-                invocation,capture,paths.expect("capture binds paths"),&input,
+                invocation,capture,paths.expect("capture binds paths"),&input,media,
                 &target.state,&context,None,&mut completion),
             None=>{
                 use eredu_architectures::composite_execution::ExternalPredictionTargetOperation as Operation;

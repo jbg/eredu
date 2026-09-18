@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 pub(crate) enum RetainedStorageRef<'a> {
     Array(&'a Array),
+    CanonicalArray(&'a super::super::manager::CanonicalArrayOwner),
     Host(&'a Arc<ImmutableHostTransferBuffer>),
     RetainedHost(&'a RetainedHostBuffer),
     Bytes(&'a Arc<[u8]>),

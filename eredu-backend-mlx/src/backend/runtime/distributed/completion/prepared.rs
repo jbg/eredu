@@ -5,7 +5,7 @@ use super::*;
 use super::destinations::Destination;
 use crate::backend::{runtime::distributed::topology::OriginalCommunicationSource,
     submission_recovery::PreparedRecovery};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::RetainedCommunicationSource;
 use std::{alloc::Layout, collections::TryReserveError, mem::{size_of, size_of_val}};
 
@@ -13,7 +13,7 @@ use std::{alloc::Layout, collections::TryReserveError, mem::{size_of, size_of_va
 #[derive(Clone, Debug)]
 pub(super) struct ResourceCustody {
     pub(super) source: RetainedCommunicationSource,
-    pub(super) funding: WorkspaceMetadataFunding,
+    pub(super) funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Cause {
@@ -22,7 +22,7 @@ pub(super) enum Cause {
     #[error("distributed completion host destination capacity failed: {0}")]
     Capacity(#[source] TryReserveError),
     #[error("distributed completion host payload funding failed: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
     #[error("distributed completion recovery preparation failed: {0}")]
     Recovery(#[source] safemlx::SubmissionScopeOwnerCause),
     #[error("distributed completion housekeeping registration failed: {0}")]
@@ -43,7 +43,7 @@ pub(super) fn error_control_bytes()->Option<usize> {
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?];
     controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
 }
-fn overflow() -> Error { Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow) }
+fn overflow() -> Error { Error::WorkspacePlanning(HostMetadataFundingError::Overflow) }
 
 /// Host populations supplied by the actual communication worker. These counts
 /// grant no native allocation credit and cannot open a distributed execution gate.

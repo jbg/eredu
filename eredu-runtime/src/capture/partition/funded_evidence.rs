@@ -1,13 +1,13 @@
 //! Paid provenance from the retained receipt, published only after delivery.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error("partition evidence source: {0}")]
     Source(&'static str),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Destination(#[from] eredu_nn::Error),
     #[error(transparent)] Capture(#[from] CaptureError),
     #[error(transparent)] Ownership(#[from] receipt::ReceiptConstructionCause),
@@ -16,8 +16,8 @@ enum Cause {
 #[error("prepared partition evidence: {cause}")]
 pub(crate) struct PartitionCaptureEvidenceError {
     #[source] cause: Cause,
-    _source: Option<SharedCapturePlan>,
-    _metadata: WorkspaceMetadataFunding,
+    _source: SharedCapturePlan,
+    _metadata: HostMetadataFunding,
 }
 
 /// Payload precedes its immutable source and physical metadata custody. Only
@@ -26,7 +26,7 @@ pub(crate) struct PartitionCaptureEvidenceError {
 pub(crate) struct PreparedPartitionCaptureEvidence {
     pub(crate) value: PartitionCaptureEvidence,
     pub(crate) source: SharedCapturePlan,
-    pub(crate) metadata: WorkspaceMetadataFunding,
+    pub(crate) metadata: HostMetadataFunding,
     // Exact final record charge from the closed complete or contiguous source.
     // A contribution row alone excludes the global dense-assembly worker.
     charged: CaptureUsage,
@@ -55,7 +55,7 @@ impl Charges<'_> {
 impl PreparedPartitionCaptureEvidence {
     pub(crate) fn charged(&self) -> CaptureUsage { self.charged }
     pub(crate) fn prepare(receipt: &PartitionCaptureReceiptPlan, charged: CaptureUsage,
-        metadata: &WorkspaceMetadataFunding, quota: &mut dyn CaptureReservation)
+        metadata: &HostMetadataFunding, quota: &mut dyn CaptureReservation)
         -> Result<Self, PartitionCaptureEvidenceError>
     {
         Self::prepare_sources(receipt, Charges::Complete { charged, quota }, metadata)
@@ -63,15 +63,15 @@ impl PreparedPartitionCaptureEvidence {
     /// The same contribution writer, using every actual source-bound fragment
     /// charge. Empty ranks remain producers with no invented contribution row.
     pub(crate) fn prepare_contiguous(receipt: &PartitionCaptureReceiptPlan,
-        allowance: &mut PreparedPartitionFragmentAllowance, metadata: &WorkspaceMetadataFunding)
+        allowance: &mut PreparedPartitionFragmentAllowance, metadata: &HostMetadataFunding)
         -> Result<Self, PartitionCaptureEvidenceError>
     {
         Self::prepare_sources(receipt, Charges::Contiguous(allowance), metadata)
     }
     fn prepare_sources(receipt: &PartitionCaptureReceiptPlan, mut charges: Charges<'_>,
-        metadata: &WorkspaceMetadataFunding) -> Result<Self, PartitionCaptureEvidenceError>
+        metadata: &HostMetadataFunding) -> Result<Self, PartitionCaptureEvidenceError>
     {
-        let source = receipt.shared_plan_source().cloned();
+        let source = receipt.shared_plan_source().clone();
         let error = |cause| PartitionCaptureEvidenceError { cause,
             _source: source.clone(), _metadata: metadata.clone() };
         let producers = receipt.producers();
@@ -80,10 +80,10 @@ impl PreparedPartitionCaptureEvidence {
             size_of::<PartitionCaptureRegion>() * 4, size_of::<PartitionCaptureContext>() * 2,
             size_of::<PartitionCaptureEvidenceError>(), size_of::<Cause>(),
             size_of::<Result<Self, PartitionCaptureEvidenceError>>(),
-            size_of::<(&PartitionCaptureReceiptPlan, CaptureUsage, &WorkspaceMetadataFunding,
+            size_of::<(&PartitionCaptureReceiptPlan, CaptureUsage, &HostMetadataFunding,
                 &mut dyn CaptureReservation)>(), size_of::<Option<(usize, &CaptureSlicePartition)>>(),
-            size_of::<(&PartitionCaptureReceiptPlan, &mut PreparedPartitionFragmentAllowance, &WorkspaceMetadataFunding)>(),
-            size_of::<(&PartitionCaptureReceiptPlan, Charges<'_>, &WorkspaceMetadataFunding)>(),
+            size_of::<(&PartitionCaptureReceiptPlan, &mut PreparedPartitionFragmentAllowance, &HostMetadataFunding)>(),
+            size_of::<(&PartitionCaptureReceiptPlan, Charges<'_>, &HostMetadataFunding)>(),
             size_of::<Charges<'_>>() * 2, size_of::<(usize, usize)>(),size_of::<Vec<bool>>(),
             size_of::<(&Self,&PartitionCaptureReceiptPlan)>(),size_of::<bool>(),
             size_of::<RoutedUnitCaptureOwnership>()*2,size_of::<RoutedUnitCaptureProvenance>()*2,
@@ -96,7 +96,7 @@ impl PreparedPartitionCaptureEvidence {
         metadata.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or_else(|| error(Cause::Source("constructor controls overflow")))?)
             .map_err(|cause| error(cause.into()))?;
-        let admitted = source.as_ref().ok_or_else(|| error(Cause::Source("shared admission missing")))?;
+        let admitted = &source;
         if receipt.context().invocation.is_some()
             || matches!(&charges, Charges::Contiguous(allowance) if !allowance.matches(receipt))
         { return Err(error(Cause::Source("contribution source differs"))); }
@@ -172,7 +172,7 @@ impl PreparedPartitionCaptureEvidence {
     /// Authenticate the original receipt while a local hook still accumulates
     /// routed ranges. Final delivery separately requires all provenance rows.
     pub(crate) fn matches_receipt(&self, receipt: &PartitionCaptureReceiptPlan) -> bool {
-        receipt.shared_plan_source().is_some_and(|source| source.same_storage(&self.source))
+        receipt.shared_plan_source().same_storage(&self.source)
             && &self.value.context == receipt.context()
             && self.value.receipt_plan_identity == receipt.identity()
             && self.value.combination == receipt.combination()
@@ -182,13 +182,13 @@ impl PreparedPartitionCaptureEvidence {
     pub(crate) fn record_routed_ranges(&mut self,receipt:&PartitionCaptureReceiptPlan,producer:usize,fragment:usize,ranges:&[[u64;2]])
         ->Result<(),PartitionCaptureEvidenceError> {
         let source=self.source.clone();let metadata=self.metadata.clone();
-        let error=|cause|PartitionCaptureEvidenceError{cause,_source:Some(source.clone()),_metadata:metadata.clone()};
+        let error=|cause|PartitionCaptureEvidenceError{cause,_source:source.clone(),_metadata:metadata.clone()};
         let parts=[size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,usize,&[[u64;2]])>(),
-            size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>(),size_of::<Option<usize>>(),
+            size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>(),size_of::<Option<usize>>(),
             size_of::<Result<(),PartitionCaptureEvidenceError>>(),size_of::<(usize,u64)>(),size_of::<std::slice::Iter<'_,[u64;2]>>()];
         metadata.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
             .ok_or_else(||error(Cause::Source("range binding controls overflow")))?).map_err(|e|error(e.into()))?;
-        if !receipt.shared_plan_source().is_some_and(|actual|actual.same_storage(&source))||self.value.receipt_plan_identity!=receipt.identity()
+        if !receipt.shared_plan_source().same_storage(&source)||self.value.receipt_plan_identity!=receipt.identity()
             ||&self.value.context!=receipt.context(){return Err(error(Cause::Source("range receipt differs")));}
         let index=self.value.contributions.iter().enumerate().filter(|(_,row)|row.producer_rank==producer).nth(fragment)
             .map(|(index,_)|index).ok_or_else(||error(Cause::Source("range fragment missing")))?;
@@ -205,7 +205,7 @@ impl PreparedPartitionCaptureEvidence {
         destination.source_token_ranges.extend_from_slice(ranges);Ok(())
     }
 }
-fn copy_region(source: &ResolvedCaptureSlice, metadata: &WorkspaceMetadataFunding)
+fn copy_region(source: &ResolvedCaptureSlice, metadata: &HostMetadataFunding)
     -> Result<PartitionCaptureRegion, eredu_nn::Error>
 {
     let mut starts = metadata.metadata_vec(source.starts.len())?;
@@ -216,3 +216,5 @@ fn copy_region(source: &ResolvedCaptureSlice, metadata: &WorkspaceMetadataFundin
     strides.extend_from_slice(&source.strides); shape.extend_from_slice(&source.shape);
     Ok(PartitionCaptureRegion { starts, ends, strides, shape })
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

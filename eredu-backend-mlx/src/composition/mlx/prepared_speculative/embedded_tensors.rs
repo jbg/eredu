@@ -128,3 +128,5 @@ pub(super) fn share(value:&EmbeddedPredictionTensor<MlxTensor>,context:Speculati
     })();
     result.map_err(|cause|sources.retain_error(cause))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -1,3 +1,4 @@
+use crate::util::allocation::{AllocationError, Allocator};
 use core::mem;
 
 use alloc::{vec, vec::Vec};
@@ -77,8 +78,8 @@ use crate::{
 /// expose the underlying finite state machine API, then could we use it? That
 /// would be super. If we could figure that out, it might also lend itself to
 /// more general composition of finite state machines.
-#[derive(Clone)]
-pub(crate) struct LiteralTrie {
+pub(crate) struct LiteralTrie<'a> {
+    allocation: Allocator<'a>,
     /// The set of trie states. Each state contains one or more chunks, where
     /// each chunk is a sparse set of transitions to other states. A leaf state
     /// is always a match state that contains only empty chunks (i.e., no
@@ -89,17 +90,25 @@ pub(crate) struct LiteralTrie {
     rev: bool,
 }
 
-impl LiteralTrie {
-    /// Create a new literal trie that adds literals in the forward direction.
-    pub(crate) fn forward() -> LiteralTrie {
-        let root = State::default();
-        LiteralTrie { states: vec![root], rev: false }
+impl<'a> LiteralTrie<'a> {
+    pub(crate) fn with_allocations(
+        rev: bool,
+        allocation: Allocator<'a>,
+    ) -> Result<Self, AllocationError> {
+        let mut states = Vec::new();
+        allocation.push(&mut states, State::default())?;
+        Ok(Self {
+            allocation,
+            states,
+            rev,
+        })
     }
 
-    /// Create a new literal trie that adds literals in reverse.
-    pub(crate) fn reverse() -> LiteralTrie {
-        let root = State::default();
-        LiteralTrie { states: vec![root], rev: true }
+    /// Create a new literal trie that adds literals in the forward direction.
+    #[cfg(test)]
+    pub(crate) fn forward() -> LiteralTrie<'static> {
+        LiteralTrie::with_allocations(false, Allocator::unenforced())
+            .expect("literal trie allocation")
     }
 
     /// Add the given literal to this trie.
@@ -113,7 +122,7 @@ impl LiteralTrie {
         while let Some(b) = if self.rev { it.next_back() } else { it.next() } {
             prev = self.get_or_add_state(prev, b)?;
         }
-        self.states[prev].add_match();
+        self.states[prev].add_match(self.allocation)?;
         Ok(())
     }
 
@@ -121,24 +130,21 @@ impl LiteralTrie {
     /// Otherwise, add the transition to `from` and point it to a new state.
     ///
     /// If a new state ID could not be allocated, then an error is returned.
-    fn get_or_add_state(
-        &mut self,
-        from: StateID,
-        byte: u8,
-    ) -> Result<StateID, BuildError> {
+    fn get_or_add_state(&mut self, from: StateID, byte: u8) -> Result<StateID, BuildError> {
         let active = self.states[from].active_chunk();
         match active.binary_search_by_key(&byte, |t| t.byte) {
             Ok(i) => Ok(active[i].next),
             Err(i) => {
                 // Add a new state and get its ID.
-                let next = StateID::new(self.states.len()).map_err(|_| {
-                    BuildError::too_many_states(self.states.len())
-                })?;
-                self.states.push(State::default());
+                let next = StateID::new(self.states.len())
+                    .map_err(|_| BuildError::too_many_states(self.states.len()))?;
+                self.allocation.push(&mut self.states, State::default())?;
                 // Offset our position to account for all transitions and not
                 // just the ones in the active chunk.
                 let i = self.states[from].active_chunk_start() + i;
                 let t = Transition { byte, next };
+                self.allocation
+                    .grow(&mut self.states[from].transitions, 1)?;
                 self.states[from].transitions.insert(i, t);
                 Ok(next)
             }
@@ -148,10 +154,7 @@ impl LiteralTrie {
     /// Compile this literal trie to the NFA builder given.
     ///
     /// This forwards any errors that may occur while using the given builder.
-    pub(crate) fn compile(
-        &self,
-        builder: &mut Builder,
-    ) -> Result<ThompsonRef, BuildError> {
+    pub(crate) fn compile(&self, builder: &mut Builder) -> Result<ThompsonRef, BuildError> {
         // Compilation proceeds via depth-first traversal of the trie.
         //
         // This is overall pretty brutal. The recursive version of this is
@@ -167,28 +170,34 @@ impl LiteralTrie {
         // 'end' is our match state for this trie, but represented in the the
         // NFA. Any time we see a match in the trie, we insert a transition
         // from the current state we're in to 'end'.
-        let end = builder.add_empty()?;
+        let end = builder.add_empty_with_allocations(self.allocation.policy())?;
         let mut stack = vec![];
         let mut f = Frame::new(&self.states[StateID::ZERO]);
         loop {
             if let Some(t) = f.transitions.next() {
                 if self.states[t.next].is_leaf() {
-                    f.sparse.push(thompson::Transition {
-                        start: t.byte,
-                        end: t.byte,
-                        next: end,
-                    });
+                    self.allocation.push(
+                        &mut f.sparse,
+                        thompson::Transition {
+                            start: t.byte,
+                            end: t.byte,
+                            next: end,
+                        },
+                    )?;
                 } else {
-                    f.sparse.push(thompson::Transition {
-                        start: t.byte,
-                        end: t.byte,
-                        // This is a little funny, but when the frame we create
-                        // below completes, it will pop this parent frame off
-                        // and modify this transition to point to the correct
-                        // state.
-                        next: StateID::ZERO,
-                    });
-                    stack.push(f);
+                    self.allocation.push(
+                        &mut f.sparse,
+                        thompson::Transition {
+                            start: t.byte,
+                            end: t.byte,
+                            // This is a little funny, but when the frame we create
+                            // below completes, it will pop this parent frame off
+                            // and modify this transition to point to the correct
+                            // state.
+                            next: StateID::ZERO,
+                        },
+                    )?;
+                    self.allocation.push(&mut stack, f)?;
                     f = Frame::new(&self.states[t.next]);
                 }
                 continue;
@@ -198,19 +207,22 @@ impl LiteralTrie {
             // which case, we don't do anything.
             if !f.sparse.is_empty() {
                 let chunk_id = if f.sparse.len() == 1 {
-                    builder.add_range(f.sparse.pop().unwrap())?
+                    builder.add_range_with_allocations(
+                        f.sparse.pop().unwrap(),
+                        self.allocation.policy(),
+                    )?
                 } else {
                     let sparse = mem::replace(&mut f.sparse, vec![]);
-                    builder.add_sparse(sparse)?
+                    builder.add_sparse_with_allocations(sparse, self.allocation.policy())?
                 };
-                f.union.push(chunk_id);
+                self.allocation.push(&mut f.union, chunk_id)?;
             }
             // Now we need to look to see if there are other chunks to visit.
             if let Some(chunk) = f.chunks.next() {
                 // If we're here, it means we're on the second (or greater)
                 // chunk, which implies there is a match at this point. So
                 // connect this state to the final end state.
-                f.union.push(end);
+                self.allocation.push(&mut f.union, end)?;
                 // Advance to the next chunk.
                 f.transitions = chunk.iter();
                 continue;
@@ -219,7 +231,7 @@ impl LiteralTrie {
             // this state. So turn our union of chunks into an NFA union
             // state, and add that union state to the parent state's current
             // sparse state. (If there is no parent, we're done.)
-            let start = builder.add_union(f.union)?;
+            let start = builder.add_union_with_allocations(f.union, self.allocation.policy())?;
             match stack.pop() {
                 None => {
                     return Ok(ThompsonRef { start, end });
@@ -275,7 +287,7 @@ impl LiteralTrie {
     }
 }
 
-impl core::fmt::Debug for LiteralTrie {
+impl core::fmt::Debug for LiteralTrie<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         writeln!(f, "LiteralTrie(")?;
         for (sid, state) in self.states.iter().with_state_ids() {
@@ -328,7 +340,12 @@ impl<'a> Frame<'a> {
         // every state has at least 1 chunk
         let chunk = chunks.next().unwrap();
         let transitions = chunk.iter();
-        Frame { chunks, transitions, union: vec![], sparse: vec![] }
+        Frame {
+            chunks,
+            transitions,
+            union: vec![],
+            sparse: vec![],
+        }
     }
 }
 
@@ -368,7 +385,7 @@ struct State {
 impl State {
     /// Mark this state as a match state and freeze the active chunk such that
     /// it can not be further mutated.
-    fn add_match(&mut self) {
+    fn add_match(&mut self, allocation: Allocator<'_>) -> Result<(), AllocationError> {
         // This is not strictly necessary, but there's no point in recording
         // another match by adding another chunk if the state has no
         // transitions. Note though that we only skip this if we already know
@@ -377,11 +394,11 @@ impl State {
         // but we'd end up pushing another chunk and potentially triggering an
         // alloc.
         if self.transitions.is_empty() && !self.chunks.is_empty() {
-            return;
+            return Ok(());
         }
         let chunk_start = self.active_chunk_start();
         let chunk_end = self.transitions.len();
-        self.chunks.push((chunk_start, chunk_end));
+        allocation.push(&mut self.chunks, (chunk_start, chunk_end))
     }
 
     /// Returns true if and only if this state is a leaf state. That is, a

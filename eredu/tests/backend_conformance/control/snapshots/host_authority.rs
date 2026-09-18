@@ -74,8 +74,21 @@ fn cause<'a, T: std::error::Error + 'static>(
     }
 }
 
-// A real zero-byte finite reservation is only an exclusion fixture. This mock
-// supplies no finite native/parser copy proof, and these tests claim none.
+fn assert_copy_funding_refusal(error: &ControlledGenerationError) {
+    if cause::<WorkingMemoryError>(error).is_some()
+        || cause::<eredu_core::HostMetadataFundingError>(error).is_some()
+        || matches!(
+            cause::<MockError>(error),
+            Some(MockError::Memory(_) | MockError::Metadata(_))
+        )
+    {
+        return;
+    }
+    panic!("expected retained original copy funding refusal: {error:?}");
+}
+
+// A separate low-level ordinary exclusion fixture. Canonical source tests above
+// use their original pool and exact retained copy producers instead.
 fn exclusion_admission() -> Admission {
     let geometry = InferenceGeometry {
         batch_size: 1,
@@ -121,247 +134,199 @@ fn exclusion_admission() -> Admission {
 }
 
 #[test]
-fn zero_finite_reservation_rejects_snapshot_restore_and_fork_without_work_or_budget() {
-    for operation in [
-        CopyOperation::Snapshot,
-        CopyOperation::Restore,
-        CopyOperation::Fork,
-    ] {
-        let (mut model, chat, settings, first) = super::super::setup();
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-            .unwrap();
-        let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), ignore)
-            .unwrap();
-        run.enable_snapshots(copy_limits()).unwrap();
-        run.step(ignore).unwrap();
-        let saved = run.snapshot(ignore).unwrap();
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let reservation = pool
-            .reserve_with_capacity(
-                &InferenceExecutionIdentity::default(),
-                &exclusion_admission(),
-                0,
-            )
-            .unwrap();
-        let probe = Guard::new(&pool);
-        let before = (run.status(), run.next_prediction(), run.snapshot_usage());
-        let accounting = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
-        let error = operation.reject(&mut run, &saved);
-        assert!(matches!(
-            &error,
-            ControlledGenerationError::Snapshot(TextSnapshotError::HostPreparation(_))
-        ));
-        assert_eq!(
-            cause::<WorkingMemoryError>(&error),
-            Some(&WorkingMemoryError::ReservedWorkActive)
-        );
-        assert_eq!(probe.update(|p| p.attempts), 1, "{operation:?}");
-        assert!(probe.update(|p| p.copies.is_empty()));
-        assert_eq!(
-            before,
-            (run.status(), run.next_prediction(), run.snapshot_usage())
-        );
-        assert_eq!(run.token_ids(), [first]);
-        assert_eq!(saved.token_ids(), [first]);
-        assert_eq!(
-            accounting,
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap())
-        );
-        assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-        drop(reservation);
-        run.step(ignore).unwrap();
-        assert_eq!(run.token_ids(), [first, first + 1]);
-        let retry = run.snapshot(ignore).unwrap();
-        assert!(pool.unquoted_owner_count().unwrap() > 0);
-        drop(retry);
-        assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    }
+fn original_host_capacity_refusal_preserves_live_state_and_budget() {
+    let (mut model, chat, settings, first) = snapshot_setup();
+    let pool = model.original_pool().clone();
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let mut run = model
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
+        .unwrap();
+    run.step(ignore).unwrap();
+    let before = (
+        run.status(),
+        run.next_prediction(),
+        run.token_ids().to_vec(),
+    );
+    run.enable_snapshots(
+        copy_limits(),
+        0,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
+    .unwrap();
+    let usage = run.snapshot_usage().unwrap();
+    let error = run.snapshot(unexpected_record).err().unwrap();
+    assert_copy_funding_refusal(&error);
+    assert_eq!(
+        (
+            run.status(),
+            run.next_prediction(),
+            run.token_ids().to_vec()
+        ),
+        before
+    );
+    let refused = run.snapshot_usage().unwrap();
+    assert_eq!(refused.snapshots, usage.snapshots);
+    assert_eq!(refused.retained_bytes, usage.retained_bytes);
+    assert!(refused.cumulative_copy_bytes > usage.cumulative_copy_bytes);
+    drop(error);
+    run.step(ignore).unwrap();
+    assert_eq!(run.token_ids(), [first, first + 1]);
+    drop(run);
+    drop(chat);
+    drop(model);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn each_host_admission_rejects_before_copy_and_preserves_partial_semantic_state() {
-    for operation in [
-        CopyOperation::Snapshot,
-        CopyOperation::Restore,
-        CopyOperation::Fork,
-    ] {
-        for reject_at in [1, 2] {
-            let (mut model, chat, settings, first) = snapshot_setup();
-            let prepared = model
-                .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-                .unwrap();
-            let mut run = model
-                .start_controlled_chat(prepared, &[], Default::default(), ignore)
-                .unwrap();
-            run.enable_snapshots(copy_limits()).unwrap();
-            run.step(ignore).unwrap();
-            let saved = run.snapshot(ignore).unwrap();
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let probe = Guard::new(&pool);
-            probe.update(|p| p.reject_at = Some(reject_at));
-            let before = (run.status(), run.next_prediction(), run.snapshot_usage());
-            let error = operation.reject(&mut run, &saved);
-            assert!(matches!(
-                &error,
-                ControlledGenerationError::Snapshot(TextSnapshotError::HostPreparation(_))
-            ));
-            assert!(
-                matches!(cause::<MockError>(&error), Some(MockError::Capture(message))
-                if message == "host snapshot preparation rejected")
-            );
-            assert_eq!(probe.update(|p| p.attempts), reject_at, "{operation:?}");
-            assert!(probe.update(|p| p.copies.is_empty()));
-            assert_eq!(
-                before,
-                (run.status(), run.next_prediction(), run.snapshot_usage())
-            );
-            assert_eq!(run.token_ids(), [first]);
-            assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-            assert_eq!(
-                (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
-                (0, 0)
-            );
-            probe.update(|p| p.reject_at = None);
-            let mut records = Vec::new();
-            run.run(collect(&mut records)).unwrap();
-            let text: String = semantic(&records)
-                .into_iter()
-                .filter_map(|event| match event {
-                    SemanticEvent::TextDelta(text) => Some(text.as_str().to_owned()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(text, "é");
-            assert_eq!(run.token_ids(), [first, first + 1, first + 2]);
-            assert_eq!(saved.token_ids(), [first]);
-        }
-    }
+fn original_native_copy_capacity_refusal_preserves_partial_semantic_state() {
+    let (mut model, chat, settings, first) = snapshot_setup();
+    let pool = model.original_pool().clone();
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let mut run = model
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
+        .unwrap();
+    run.step(ignore).unwrap();
+    run.enable_snapshots(
+        copy_limits(),
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(0),
+    )
+    .unwrap();
+    let before = run.snapshot_usage().unwrap();
+    let error = run.snapshot(unexpected_record).err().unwrap();
+    assert_copy_funding_refusal(&error);
+    assert_eq!(run.token_ids(), [first]);
+    let after = run.snapshot_usage().unwrap();
+    assert_eq!(after.snapshots, before.snapshots);
+    assert_eq!(after.retained_bytes, before.retained_bytes);
+    assert!(after.cumulative_copy_bytes >= before.cumulative_copy_bytes);
+    drop(error);
+    let mut records = Vec::new();
+    run.run(collect(&mut records)).unwrap();
+    let text: String = semantic(&records)
+        .into_iter()
+        .filter_map(|e| match e {
+            SemanticEvent::TextDelta(t) => Some(t.as_str().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "é");
+    assert_eq!(run.token_ids(), [first, first + 1, first + 2]);
+    drop(run);
+    drop(records);
+    drop(chat);
+    drop(model);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn snapshot_and_branch_authority_follows_payload_through_exchange_and_retirement() {
     let (mut model, chat, settings, first) = snapshot_setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let pool = model.original_pool().clone();
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), ignore)
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(copy_limits()).unwrap();
+    run.enable_snapshots(
+        copy_limits(),
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
+    .unwrap();
     run.step(ignore).unwrap();
-    let snapshot_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let branch_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let probe = Guard::new(&snapshot_pool);
     let saved = run.snapshot(ignore).unwrap();
-    assert!(snapshot_pool.unquoted_owner_count().unwrap() > 0);
-    probe.update(|p| p.pool = Some(branch_pool.clone()));
     let mut branch = run.fork(&saved, branch_options(), ignore).unwrap();
-    assert!(branch_pool.unquoted_owner_count().unwrap() > 0);
     run.step(ignore).unwrap();
     assert_eq!(run.token_ids(), [first, first + 1]);
     assert_eq!(branch.token_ids(), [first]);
-    let before = (
-        run.snapshot_usage(),
-        probe.update(|p| (p.attempts, p.copies.len())),
-    );
+    let usage = run.snapshot_usage();
     run.exchange(&mut branch, ignore).unwrap();
-    assert_eq!(
-        before,
-        (
-            run.snapshot_usage(),
-            probe.update(|p| (p.attempts, p.copies.len()))
-        )
-    );
+    assert_eq!(run.snapshot_usage(), usage);
     assert_eq!(run.token_ids(), [first]);
     assert_eq!(branch.token_ids(), [first, first + 1]);
     run.step(ignore).unwrap();
     assert_eq!(run.token_ids(), [first, first + 1]);
     drop(run);
-    drop(model);
     drop(chat);
-    // The branch now contains the original unmanaged state. Its former unquoted
-    // host custody moved into the active run and retired with that run.
-    assert_eq!(branch_pool.unquoted_owner_count().unwrap(), 0);
-    assert!(snapshot_pool.unquoted_owner_count().unwrap() > 0);
-    assert_eq!(saved.token_ids(), [first]);
+    drop(model);
+    assert!(pool.used_bytes().unwrap() > 0);
     drop(saved);
-    assert_eq!(snapshot_pool.unquoted_owner_count().unwrap(), 0);
+    assert!(pool.used_bytes().unwrap() > 0);
     assert_eq!(branch.token_ids(), [first, first + 1]);
     drop(branch);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn restore_installs_fresh_authority_and_retains_source_after_saved_handle_drops() {
-    let (mut model, chat, settings, first) = super::super::setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+fn restore_installs_fresh_account_and_retains_source_after_saved_handle_drops() {
+    let (mut model, chat, settings, first) = snapshot_setup();
+    let pool = model.original_pool().clone();
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), ignore)
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(copy_limits()).unwrap();
+    run.enable_snapshots(
+        copy_limits(),
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
+    .unwrap();
     run.step(ignore).unwrap();
-    let source_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let destination_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let probe = Guard::new(&source_pool);
     let saved = run.snapshot(ignore).unwrap();
     run.step(ignore).unwrap();
-    probe.update(|p| p.pool = Some(destination_pool.clone()));
+    let before = run.snapshot_usage().unwrap().cumulative_copy_bytes;
     run.restore(&saved, ignore).unwrap();
     drop(saved);
-    assert!(source_pool.unquoted_owner_count().unwrap() > 0);
-    assert!(destination_pool.unquoted_owner_count().unwrap() > 0);
+    assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > before);
     assert_eq!(run.token_ids(), [first]);
     run.step(ignore).unwrap();
     assert_eq!(run.token_ids(), [first, first + 1]);
     drop(run);
-    drop(model);
     drop(chat);
-    assert_eq!(source_pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(destination_pool.unquoted_owner_count().unwrap(), 0);
+    drop(model);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn post_admission_copy_failure_consumes_logical_allowance_and_releases_host_authority() {
-    let (mut model, chat, settings, first) = super::super::setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+fn post_admission_copy_failure_spends_logical_allowance_and_retains_exact_source() {
+    let (mut model, chat, settings, first) = snapshot_setup();
+    let pool = model.original_pool().clone();
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), ignore)
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(copy_limits()).unwrap();
+    run.enable_snapshots(
+        copy_limits(),
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
+    .unwrap();
     run.step(ignore).unwrap();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let probe = Guard::new(&pool);
-    probe.update(|p| p.fail_copy = Some("sampling copy"));
     let before = run.snapshot_usage().unwrap();
     let status = run.status();
+    let armed = super::super::provider_errors::Armed::new("capture");
     let error = run.snapshot(unexpected_record).err().unwrap();
-    assert!(matches!(
-        &error,
-        ControlledGenerationError::Snapshot(TextSnapshotError::Backend(_))
-    ));
-    assert!(
-        matches!(cause::<MockError>(&error), Some(MockError::Capture(message))
-        if message == "host snapshot copy failed")
-    );
-    assert_eq!(
-        probe.update(|p| p.copies.clone()),
-        ["input copy", "sampling copy"]
-    );
+    armed.assert_error(&error);
     let after = run.snapshot_usage().unwrap();
     assert!(after.cumulative_copy_bytes > before.cumulative_copy_bytes);
-    assert_eq!(after.retained_bytes, before.retained_bytes);
     assert_eq!(after.snapshots, before.snapshots);
+    assert_eq!(after.retained_bytes, before.retained_bytes);
     assert_eq!(run.status(), status);
     assert_eq!(run.token_ids(), [first]);
-    assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    probe.update(|p| p.fail_copy = None);
+    drop(armed);
     run.step(ignore).unwrap();
     assert_eq!(run.token_ids(), [first, first + 1]);
+    drop(run);
+    drop(chat);
+    drop(model);
+    assert!(pool.used_bytes().unwrap() > 0);
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -439,7 +404,9 @@ fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbac
             .unwrap(),
         );
         let mut state = ManagedTextContinuation::root(
-            driver.start(vec![11, 7, 3], config, controller).unwrap(),
+            driver
+                .start(vec![11, 7, 3].into(), config, controller)
+                .unwrap(),
         );
         let budget = SnapshotBudget::new(copy_limits());
         let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
@@ -522,7 +489,7 @@ fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbac
         }
         probe.update(|p| p.reject_at = None);
         assert!(state.advance(&mut driver).unwrap().is_some());
-        state.take_completed_step(&mut driver).unwrap();
+        state.take_completed_delivery(&mut driver).unwrap();
         assert_eq!(&state.controller().history[..2], &[19, 23]);
         assert_eq!(state.controller().history.len(), 3);
         drop(saved);

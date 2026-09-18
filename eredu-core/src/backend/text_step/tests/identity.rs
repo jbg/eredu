@@ -100,7 +100,7 @@ fn policy_exhaustion_is_terminal_before_prediction_and_survives_host_restore() {
         )
         .unwrap();
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     let attempt = state.context_for_test().attempt();
     let old_run = state.context_for_test().run_identity().clone();
     state.context_mut_for_test().policy.revision = u64::MAX;
@@ -254,7 +254,7 @@ fn continuation_identity_tracks_the_existing_run_across_restore_fork_and_retirem
     let identity = state.identity_for_test();
     let run = state.context_for_test().run_identity().clone();
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     let mut child = {
         let mut boundary = driver.quiescent(&mut state).unwrap();
         assert!(identity == boundary.identity());
@@ -291,7 +291,7 @@ fn continuation_identity_tracks_the_existing_run_across_restore_fork_and_retirem
     drop(state);
     assert!(identity != child.identity_for_test());
     driver.advance(&mut child).unwrap().unwrap();
-    driver.take_completed_step(&mut child).unwrap();
+    driver.take_completed_delivery(&mut child).unwrap();
     assert!(retained_child == driver.quiescent(&mut child).unwrap().identity());
     drop(child);
     let fresh = driver
@@ -303,4 +303,28 @@ fn continuation_identity_tracks_the_existing_run_across_restore_fork_and_retirem
         .unwrap();
     assert!(identity != fresh.identity_for_test());
     assert!(retained_child != fresh.identity_for_test());
+}
+
+#[test]
+fn exhausted_driver_remains_invalid_when_the_machine_issuer_recovers() {
+    let (mut runtime, facts) = fixture();
+    let mut driver = with_exhausted_run(|| TextGenerationDriver::new(&mut runtime));
+    let error = driver.start_input(TextGenerationInput::TokenIds(vec![1, 2]), config(),
+        controller(&facts, ControllerFailure::None)).err().unwrap();
+    let ControlledTextGenerationError::Preparation(error) = error else { panic!("driver identity refusal") };
+    assert_eq!(cause(&error), TextContextError::RunExhausted);
+    assert!(facts.borrow().preparation_events.is_empty());
+    assert!(facts.borrow().events.is_empty());
+}
+
+#[test]
+fn retired_driver_identity_cannot_attach_to_the_same_runtime_again() {
+    let (mut runtime, facts) = fixture();
+    let mut first = TextGenerationDriver::new(&mut runtime);
+    let mut state = first.start_input(TextGenerationInput::TokenIds(vec![1, 2]), config(),
+        controller(&facts, ControllerFailure::None)).unwrap();
+    drop(first);
+    let mut replacement = TextGenerationDriver::new(&mut runtime);
+    assert!(matches!(replacement.advance(&mut state), Err(TextContinuationError::IncompatibleDriver)));
+    assert!(facts.borrow().events.is_empty());
 }

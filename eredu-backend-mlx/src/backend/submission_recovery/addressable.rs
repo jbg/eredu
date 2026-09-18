@@ -24,7 +24,7 @@ use crate::{
     MlxTensor,
 };
 use eredu_nn::{
-    workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError},
+    workspace::{HostMetadataFunding, HostMetadataFundingError},
     TensorParallelGroupedOutput,
 };
 use eredu_runtime::{expert::IndexedInvocationRequest, working_memory::OriginalOperationMetadataCustody};
@@ -40,7 +40,7 @@ use std::{
 #[derive(Clone, Debug)]
 struct Custody {
     raw: OriginalOperationMetadataCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 struct Region {
     inputs: [Array; 4],
@@ -62,7 +62,7 @@ fn mismatch(stage: &'static str) -> Error {
     }
 }
 fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
 type Output = TensorParallelGroupedOutput<MlxTensor>;
 type Callback<'a> = dyn FnMut(OriginalIndexedResidencyFactory) -> Result<Output, Error> + 'a;
@@ -97,8 +97,12 @@ fn entry_control_bytes()->Option<usize> {
 /// Exact shared native wrapper population. Constructor partition directories
 /// and the request's shared reader program retain separate source declarations.
 pub(crate) fn control_bytes(quote:&AddressableQuote)->Result<usize,Error> {
-    let recipe=quote.numerical;
-    let capacity=NativeRoleCapacity{graph:quote.capacity.graph,records:quote.capacity.records,backing:quote.capacity.backing};
+    envelope_control_bytes(quote, quote.numerical, quote.capacity)
+}
+pub(crate) fn envelope_control_bytes(quote:&AddressableQuote,
+    recipe:crate::backend::nn::workspace::SpeculativeNumericalRecipe,
+    capacity:crate::backend::nn::workspace::BoundaryStageCapacity)->Result<usize,Error> {
+    let capacity=NativeRoleCapacity{graph:capacity.graph,records:capacity.records,backing:capacity.backing};
     let native=native_role::control_bytes::<Region,Custody>(capacity,
         Some(safemlx::PreparedPipelineCachePlan::new(recipe.kernels)))
         .map_err(|cause|Error::Neural(quote.identity().funding().metadata_source(cause)))?;
@@ -126,7 +130,7 @@ pub(crate) fn run_region(
     runtime: &PreparedInputRuntime,
     budget: &safemlx::OriginalBufferBudget,
     metadata: &OriginalOperationMetadataCustody,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     timeout: Option<std::time::Duration>,
     stream: &Stream,
     run: &mut Callback<'_>,
@@ -329,3 +333,5 @@ pub(crate) mod request_sources;
 
 mod speculative;
 pub(crate) use speculative::{SpeculativeAddressableSources,SpeculativeAddressableSpan};
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

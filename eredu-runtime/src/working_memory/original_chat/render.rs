@@ -1,15 +1,17 @@
+mod consumer;
 use super::*;
 use crate::working_memory::OriginalTokenizer;
+pub use consumer::{OriginalChatConsumer, OriginalChatConsumerError};
 use eredu_core::GenerationSequenceConsumerLayout;
 use eredu_text::chat_storage::{
-    ChatJsonCapacity, ChatMessages, ChatRenderContext, ChatRenderFailure, ChatRenderPlan,
-    ChatRenderPlanError, ChatTextCapacity, ChatValueCapacity, PreparedChatRender,
+    ChatJsonCapacity, ChatRenderContext, ChatRenderFailure, ChatRenderPlan, ChatRenderPlanError,
+    ChatTextCapacity, ChatValueCapacity, PreparedChatRender,
 };
+use std::mem::size_of_val;
 
 #[derive(Debug)]
 struct Payload {
     render: PreparedChatRender,
-    consumer: GenerationSequenceConsumerLayout,
     template: OriginalChatTemplate,
     tokenizer: OriginalTokenizer,
     allowance: Allowance,
@@ -20,9 +22,12 @@ impl OriginalRenderedChat {
     fn payload(&self) -> &Payload {
         self.0.as_deref().expect("live original chat render")
     }
-    /// Exact retained terminal consumer specialization selected before H admission.
-    pub fn accepts_consumer(&self, consumer: &GenerationSequenceConsumerLayout) -> bool {
-        self.payload().consumer == *consumer
+    /// Identity of the actual immutable rendering, not equality of prompt bytes.
+    pub fn same_render(&self, other: &Self) -> bool {
+        Arc::ptr_eq(
+            self.0.as_ref().expect("live render"),
+            other.0.as_ref().expect("live render"),
+        )
     }
     /// Selected immutable prompt inside the original H destination.
     pub fn prompt(&self, generation_prompt: bool) -> &str {
@@ -86,7 +91,6 @@ enum Cause {
     Accounting(WorkingMemoryError),
     Plan(ChatRenderPlanError),
     Domain,
-    Consumer,
     Render(ChatRenderFailure),
 }
 /// Closed H failure with all real partial/completed storage and source owners.
@@ -137,6 +141,17 @@ impl OriginalChatRenderError {
                 _ => false,
             }
     }
+    /// Template input failure suitable for a behavioral probe nonmatch. All
+    /// admission, settlement, allocation, geometry, and overflow failures remain
+    /// hard errors; inspecting this classification does not release custody.
+    pub fn is_template_rejection(&self) -> bool {
+        self.accounting_failure().is_none()
+            && match &self.cause {
+                Cause::Plan(cause) => cause.is_template_rejection(),
+                Cause::Render(cause) => cause.cause().is_template_rejection(),
+                _ => false,
+            }
+    }
     /// Whether this operation rejected a decoder-only C source before H admission.
     pub fn missing_generation_domain(&self) -> bool {
         matches!(self.cause, Cause::Domain)
@@ -163,7 +178,6 @@ impl fmt::Display for OriginalChatRenderError {
             Cause::Plan(error) => fmt::Display::fmt(error, f),
             Cause::Render(error) => fmt::Display::fmt(error, f),
             Cause::Domain => f.write_str("chat requires an original generation tokenizer domain"),
-            Cause::Consumer => f.write_str("chat requires a retained terminal-text consumer"),
         }
     }
 }
@@ -173,18 +187,14 @@ impl std::error::Error for OriginalChatRenderError {
             Cause::Accounting(error) => Some(error),
             Cause::Plan(error) => Some(error),
             Cause::Render(error) => Some(error),
-            Cause::Domain | Cause::Consumer => None,
+            Cause::Domain => None,
         }
     }
 }
-fn required(
-    plan: &ChatRenderPlan<'_>,
-    consumer: &GenerationSequenceConsumerLayout,
-) -> Result<u64, WorkingMemoryError> {
+fn required(plan: &ChatRenderPlan<'_>) -> Result<u64, WorkingMemoryError> {
     let controls = [
-        consumer.retention_peak_bytes(),
-        size_of::<GenerationSequenceConsumerLayout>(),
-        OriginalChatOperationError::render_controls().ok_or(WorkingMemoryError::Overflow)?,
+        size_of::<OriginalChatConsumerError>(),
+        OriginalChatRenderOperationError::render_controls().ok_or(WorkingMemoryError::Overflow)?,
         arc_bytes::<Payload>()?,
         size_of::<Payload>(),
         size_of::<Option<Payload>>(),
@@ -206,7 +216,6 @@ fn required(
             &OriginalChatTemplate,
             &OriginalTokenizer,
             ChatRenderContext<'_>,
-            GenerationSequenceConsumerLayout,
         )>(),
     ]
     .into_iter()
@@ -364,76 +373,33 @@ impl WorkingMemoryPool {
             }
         }
     }
-    /// Exact output layouts, using temporarily admitted source-sized measurement
-    /// scratch. The scratch retires before return; no output capacity is granted.
+    /// Measure the selected defaults/caller context with temporary admitted scratch
+    /// before any final render destination is born.
     pub fn chat_render_required_bytes(
         &self,
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
-        messages: ChatMessages<'_>,
-        consumer: GenerationSequenceConsumerLayout,
+        context: ChatRenderContext<'_>,
     ) -> Result<u64, OriginalChatRenderError> {
-        let plan = self.chat_render_plan(
-            template,
-            tokenizer,
-            ChatRenderContext::from_messages(messages),
-        )?;
-        if !consumer.terminal_text_output() {
-            return Err(OriginalChatRenderError::rejected(Cause::Consumer));
-        }
-        required(&plan, &consumer)
-            .map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))
+        let plan = self.chat_render_plan(template, tokenizer, context)?;
+        required(&plan).map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))
     }
-    /// Measure exact original J/input, admit H once, then construct and execute
-    /// both settings in the shared VM under the installed original allowance.
+    /// Same source validation, allowance and retained render/error worker with
+    /// borrowed ordinary-precedence context. No caller borrow escapes this call.
     pub fn render_original_chat(
         &self,
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
-        messages: ChatMessages<'_>,
-        consumer: GenerationSequenceConsumerLayout,
-    ) -> Result<OriginalRenderedChat, OriginalChatRenderError> {
-        let plan = self.chat_render_plan(
-            template,
-            tokenizer,
-            ChatRenderContext::from_messages(messages),
-        )?;
-        self.render_original_chat_plan(template, tokenizer, plan, consumer, || {})
-    }
-    /// Measure the selected defaults/caller context with temporary admitted scratch
-    /// before any final render destination is born.
-    pub fn chat_render_required_bytes_with_context(
-        &self,
-        template: &OriginalChatTemplate,
-        tokenizer: &OriginalTokenizer,
         context: ChatRenderContext<'_>,
-        consumer: GenerationSequenceConsumerLayout,
-    ) -> Result<u64, OriginalChatRenderError> {
-        let plan = self.chat_render_plan(template, tokenizer, context)?;
-        if !consumer.terminal_text_output() {
-            return Err(OriginalChatRenderError::rejected(Cause::Consumer));
-        }
-        required(&plan, &consumer)
-            .map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))
-    }
-    /// Same source validation, allowance and retained render/error worker with
-    /// borrowed ordinary-precedence context. No caller borrow escapes this call.
-    pub fn render_original_chat_with_context(
-        &self,
-        template: &OriginalChatTemplate,
-        tokenizer: &OriginalTokenizer,
-        context: ChatRenderContext<'_>,
-        consumer: GenerationSequenceConsumerLayout,
     ) -> Result<OriginalRenderedChat, OriginalChatRenderError> {
         let plan = self.chat_render_plan(template, tokenizer, context)?;
-        self.render_original_chat_plan(template, tokenizer, plan, consumer, || {})
+        self.render_original_chat_plan(template, tokenizer, plan, || {})
     }
     pub(super) fn render_original_chat_plan(
         &self,
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
         plan: ChatRenderPlan<'_>,
-        consumer: GenerationSequenceConsumerLayout,
         after_admission: impl FnOnce(),
     ) -> Result<OriginalRenderedChat, OriginalChatRenderError> {
         if !plan.is_for(&template.payload().source) {
@@ -441,11 +407,8 @@ impl WorkingMemoryPool {
                 WorkingMemoryError::IdentityMismatch,
             )));
         }
-        if !consumer.terminal_text_output() {
-            return Err(OriginalChatRenderError::rejected(Cause::Consumer));
-        }
-        let bytes = required(&plan, &consumer)
-            .map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))?;
+        let bytes =
+            required(&plan).map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))?;
         let mut allowance = self
             .admit_source_compiler(bytes)
             .map_err(|e| OriginalChatRenderError::rejected(Cause::Accounting(e)))?;
@@ -469,7 +432,6 @@ impl WorkingMemoryPool {
             Ok(render) => {
                 let mut owner = Arc::new(Payload {
                     render,
-                    consumer,
                     template,
                     tokenizer,
                     allowance,
@@ -483,7 +445,6 @@ impl WorkingMemoryPool {
                     Err(error) => {
                         let Payload {
                             render,
-                            consumer: _,
                             template,
                             tokenizer,
                             allowance,

@@ -757,7 +757,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
             |experts, request| {
                 provider
                     .forward_grouped(experts, request, context)
-                    .map_err(Error::backend_source)
+                    .map_err(Error::backend_retained_source)
             },
         )
     }
@@ -815,7 +815,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
                         B::parallel_size(parallel),
                         context,
                     )
-                    .map_err(Error::backend_source)?;
+                    .map_err(Error::backend_retained_source)?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(value, parallel, context)
             },
         )

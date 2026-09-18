@@ -4,7 +4,6 @@ use super::original_execution::PreparedOriginalRealtimeFrame;
 use crate::backend::{array_copy::RealtimeCopyPlan,
     runtime::cache::state::RealtimeKvBranchPlan};
 use eredu_core::{BackendFailure,HostMetadataFunding,HostMetadataFundingError};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
 use eredu_runtime::{RealtimePayloadState,RealtimeSessionState,Sampler,
     working_memory::{OriginalRealtimeNative,RealtimeNativeRequirements,WorkingMemoryError}};
 use safemlx::PreparedInputRuntime;
@@ -44,7 +43,7 @@ fn kv_callback<'a>(source:Option<RealtimeKvBranchPlan<'a>>,copy:Option<RealtimeC
     move |actual,funding| {
         let source=source.ok_or(HostMetadataFundingError::Unavailable)?;
         if !source.matches_source(actual){return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch).into_backend_failure());}
-        let funding:WorkspaceMetadataFunding=funding.clone().into();
+        let funding:HostMetadataFunding=funding.clone().into();
         source.prepare(copy,claim,runtime.ok_or(HostMetadataFundingError::Unavailable)?,
             stream.ok_or(HostMetadataFundingError::Unavailable)?,&funding,timeout)
     }
@@ -72,7 +71,7 @@ impl<'a> RealtimeBranchSource<'a> {
         let parts=[size_of::<Self>(),size_of::<Result<Self,Error>>(),size_of_val(&payload),
             size_of::<Result<MlxFrameSessionBranch<PreparedOriginalRealtimeFrame>,BackendFailure>>(),
             size_of::<Failure>(),size_of::<Option<OriginalRealtimeNative>>(),
-            size_of::<WorkspaceMetadataFunding>(),size_of::<HostMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),size_of::<HostMetadataFunding>(),
             size_of::<(&mut PreparedOriginalRealtimeFrame,Option<Duration>)>(),
             BackendFailure::source_retention_peak_bytes::<Failure>()?];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)

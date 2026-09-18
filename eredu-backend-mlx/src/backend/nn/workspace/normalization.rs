@@ -22,7 +22,14 @@ pub(super) fn emit(
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     use eredu_nn::NormalizationScale;
     let (name, groups) = match &operation.kind {
-        WorkspaceOperationKindView::Normalization(name, groups) => (*name, *groups),
+        WorkspaceOperationKindView::Normalization(name, groups)
+            if matches!(*name, "rms" | "l2" | "gated_group_rms_norm" | "silu_gated_group_rms_norm") => (*name, *groups),
+        WorkspaceOperationKindView::LayerNorm { weight, bias } => {
+            if operation.inputs.len() != 1 + usize::from(*weight) + usize::from(*bias) {
+                return invalid();
+            }
+            ("layer_norm", None)
+        },
         WorkspaceOperationKindView::ConstructedNormalization(spec) => {
             spec.validate_fixed()?;
             ("constructed_rms", spec.groups)

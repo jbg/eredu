@@ -1,12 +1,12 @@
 //! Closed native decoder-copy dispatch, distinct from runnable model state.
 
 use super::{
-    MlxHybridLayerState, MlxHybridState, MlxKeyValueLayerState, MlxKeyValueState,
+    MlxHybridState, MlxKeyValueLayerState, MlxKeyValueState,
     MlxPoolingAttentionCache, MlxPoolingAttentionState, PreparedResidentKvCopy,
     ResidentKvCopyError, SavedResidentKvCopy,
     hybrid::{
         InitializedHybridGroupCopy, PreparedHybridGroupHostCopy, PreparedHybridGroupedCopy,
-        PreparedHybridKvCopy, SavedHybridGroupedCopy, SavedHybridKvCopy,
+        SavedHybridGroupedCopy,
     },
     key_value::{
         InitializedPagedKvCopy, PagedKvPreparationError, PreparedPagedKvCopy,
@@ -95,7 +95,6 @@ pub(crate) struct PreparedResidentDecoderCopy<'a> {
 enum PreparedStorage<'a> {
     Paged(PreparedPagedKvCopy<'a>),
     KeyValue(PreparedResidentKvCopy<'a>),
-    HybridKvOnly(PreparedHybridKvCopy<'a>),
     HybridGrouped(PreparedHybridGroupedCopy<'a>),
     Pooling(PreparedResidentPoolingCopy<'a>),
     StatelessPooling(PreparedStatelessPoolingCopy<'a>),
@@ -119,7 +118,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         match self.storage {
             PreparedStorage::KeyValue(plan) => Some(plan),
             PreparedStorage::Paged(_)
-            | PreparedStorage::HybridKvOnly(_)
             | PreparedStorage::HybridGrouped(_)
             | PreparedStorage::Pooling(_)
             | PreparedStorage::StatelessPooling(_) => None,
@@ -132,19 +130,9 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         match &self.storage {
             PreparedStorage::KeyValue(plan) => Some(plan),
             PreparedStorage::Paged(_)
-            | PreparedStorage::HybridKvOnly(_)
             | PreparedStorage::HybridGrouped(_)
             | PreparedStorage::Pooling(_)
             | PreparedStorage::StatelessPooling(_) => None,
-        }
-    }
-
-    /// Actual copied child tables not covered by a separate funded table scope.
-    /// Grouped destinations retain all children through their own host scopes.
-    pub(crate) fn copy_publication_metadata_rows(&self) -> usize {
-        match &self.storage {
-            PreparedStorage::HybridKvOnly(plan) => plan.len(),
-            _ => 0,
         }
     }
 
@@ -155,7 +143,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         visitor: &mut dyn FnMut(&eredu_runtime::HostSlotMetadata) -> Result<(), Error>,
     ) -> Result<(), Error> {
         match &self.storage {
-            PreparedStorage::HybridKvOnly(plan) => plan.visit_empty_child_metadata(visitor),
             PreparedStorage::HybridGrouped(plan) => plan.visit_registered_child_metadata(visitor),
             _ => Ok(()),
         }
@@ -166,9 +153,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         visitor: &mut dyn FnMut(&eredu_runtime::HostSlotMetadata),
     ) {
         match &self.storage {
-            PreparedStorage::HybridKvOnly(plan) => {
-                plan.visit_empty_child_metadata_borrowed(visitor)
-            }
             PreparedStorage::HybridGrouped(plan) => {
                 plan.visit_registered_child_metadata_borrowed(visitor)
             }
@@ -185,9 +169,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
     ) -> Result<PreparedResidentDenseCopy<'a>, ResidentDecoderPreparationError> {
         match self.storage {
             PreparedStorage::KeyValue(plan) => Ok(PreparedResidentDenseCopy::KeyValue(plan)),
-            PreparedStorage::HybridKvOnly(plan) => {
-                Ok(PreparedResidentDenseCopy::HybridKvOnly(plan))
-            }
             PreparedStorage::HybridGrouped(plan) => {
                 Ok(PreparedResidentDenseCopy::HybridGrouped(plan))
             }
@@ -198,23 +179,7 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
     }
 
     pub(crate) fn hybrid(source: &'a MlxHybridState) -> Result<Self, Error> {
-        // Actual semantic/storage shape selects the reusable native mechanism.
-        // No model-family or configuration-name branch participates.
-        if PreparedHybridGroupedCopy::requires_group(source) {
-            Ok(Self {
-                storage: PreparedStorage::HybridGrouped(PreparedHybridGroupedCopy::prepare(
-                    source,
-                )?),
-            })
-        } else {
-            Self::hybrid_kv_only(source)
-        }
-    }
-
-    pub(crate) fn hybrid_kv_only(source: &'a MlxHybridState) -> Result<Self, Error> {
-        Ok(Self {
-            storage: PreparedStorage::HybridKvOnly(PreparedHybridKvCopy::prepare(source)?),
-        })
+        Self::hybrid_fixed(source).map_err(ResidentDecoderPreparationError::into_error)
     }
 
     pub(crate) fn key_value(source: &'a MlxKeyValueState) -> Result<Self, Error> {
@@ -280,7 +245,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         let registered = match &self.storage {
             PreparedStorage::Paged(plan) => plan.registered_source_tables(),
             PreparedStorage::KeyValue(plan) => plan.registered_source_tables(),
-            PreparedStorage::HybridKvOnly(plan) => plan.registered_source_tables(),
             PreparedStorage::HybridGrouped(plan) => plan.registered_source_tables()?,
             PreparedStorage::Pooling(plan) => plan.registered_source_tables(),
             PreparedStorage::StatelessPooling(_) => 0,
@@ -299,7 +263,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         Ok(match &self.storage {
             PreparedStorage::Paged(plan) => plan.host_copy_initialization_peak_bytes()?,
             PreparedStorage::KeyValue(plan) => plan.host_copy_initialization_peak_bytes()?,
-            PreparedStorage::HybridKvOnly(plan) => plan.host_copy_initialization_peak_bytes()?,
             PreparedStorage::HybridGrouped(plan) => plan.host_copy_initialization_peak_bytes()?,
             PreparedStorage::Pooling(plan) => plan.host_copy_initialization_peak_bytes()?,
             PreparedStorage::StatelessPooling(_) => 0,
@@ -312,7 +275,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         let tables = match &self.storage {
             PreparedStorage::Paged(plan) => plan.host_copy_preparation_bytes()?,
             PreparedStorage::KeyValue(plan) => plan.host_copy_preparation_bytes()?,
-            PreparedStorage::HybridKvOnly(plan) => plan.host_copy_preparation_bytes()?,
             PreparedStorage::HybridGrouped(plan) => plan.host_copy_preparation_bytes()?,
             PreparedStorage::Pooling(plan) => plan.host_copy_preparation_bytes()?,
             PreparedStorage::StatelessPooling(_) => 0,
@@ -370,9 +332,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
                     plan.host_copy_with_preparation(pool, preparation)
                         .map_err(kv_error)?,
                 ),
-                PreparedStorage::HybridKvOnly(plan) => {
-                    HostStorage::HybridKvOnly(plan.host_copy_with_preparation(pool, preparation)?)
-                }
                 PreparedStorage::HybridGrouped(plan) => {
                     HostStorage::HybridGrouped(plan.host_copy_with_preparation(pool, preparation)?)
                 }
@@ -397,7 +356,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
                 });
             }
             PreparedStorage::KeyValue(plan) => plan.visit_operands(visitor),
-            PreparedStorage::HybridKvOnly(plan) => plan.visit_operands(visitor),
             PreparedStorage::HybridGrouped(plan) => {
                 if plan.is_paged(){return plan.visit_paged_arrays(visitor);}
                 plan.visit_operands(visitor)
@@ -423,7 +381,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
                 });
             }
             PreparedStorage::KeyValue(plan) => plan.visit_operands(visitor),
-            PreparedStorage::HybridKvOnly(plan) => plan.visit_operands(visitor),
             PreparedStorage::HybridGrouped(plan) => {
                 if plan.is_paged(){return plan.visit_paged_arrays(visitor);}
                 plan.visit_retained_arrays(visitor)
@@ -438,7 +395,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         match &self.storage {
             PreparedStorage::Paged(plan) => Some(plan.shared_layout()),
             PreparedStorage::KeyValue(plan) => Some(plan.shared_layout()),
-            PreparedStorage::HybridKvOnly(plan) => Some(plan.shared_layout()),
             PreparedStorage::HybridGrouped(plan) => Some(plan.shared_layout()),
             PreparedStorage::Pooling(plan) => Some(plan.shared_layout()),
             PreparedStorage::StatelessPooling(plan) => plan.shared_layout(),
@@ -451,7 +407,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         match &self.storage {
             PreparedStorage::Paged(plan) => Some(plan.global_layer_start()),
             PreparedStorage::KeyValue(plan) => Some(plan.global_layer_start()),
-            PreparedStorage::HybridKvOnly(plan) => Some(plan.global_layer_start()),
             PreparedStorage::HybridGrouped(plan) => Some(plan.global_layer_start()),
             PreparedStorage::Pooling(_) | PreparedStorage::StatelessPooling(_) => None,
         }
@@ -487,17 +442,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
             &crate::backend::array_copy::PreparedSavedHostCopy,
         ) -> Result<(), Error>,
     ) -> Result<SavedResidentDecoderCopy, Error> {
-        self.copy_retained_with_preparation(slots, stream, roots, observe, observe_host, None)
-    }
-    pub(crate) fn copy_retained_with_preparation(
-        self,
-        slots: InitializedResidentDecoderCopy<'a>,
-        stream: &Stream,
-        roots: &RefCell<Vec<Array>>,
-        observe: &mut dyn FnMut(&Array) -> Result<(), Error>,
-        observe_host: &mut dyn FnMut(&crate::backend::array_copy::PreparedSavedHostCopy) -> Result<(), Error>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
-    ) -> Result<SavedResidentDecoderCopy, Error> {
         let storage = match (self.storage, slots.storage) {
             (PreparedStorage::Paged(plan), InitializedStorage::Paged(slots)) => {
                 SavedStorage::Paged(plan.copy_retained_with_host(
@@ -510,9 +454,6 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
             }
             (PreparedStorage::KeyValue(plan), InitializedStorage::KeyValue(slots)) => {
                 SavedStorage::KeyValue(plan.copy_retained(slots, stream, roots).map_err(kv_error)?)
-            }
-            (PreparedStorage::HybridKvOnly(plan), InitializedStorage::HybridKvOnly(slots)) => {
-                SavedStorage::HybridKvOnly(plan.copy_retained_with_preparation(slots, stream, roots, host)?)
             }
             (PreparedStorage::HybridGrouped(plan), InitializedStorage::HybridGrouped(slots)) => {
                 SavedStorage::HybridGrouped(plan.copy_retained_with(slots, stream, roots, observe, observe_host)?)
@@ -549,7 +490,6 @@ pub(crate) struct PreparedResidentDecoderHostCopy<'a> {
 enum HostStorage<'a> {
     Paged(PreparedPagedKvHostCopy<'a>),
     KeyValue(RegisteredDecoderHostCopy<'a, MlxKeyValueLayerState, StorageIdentity>),
-    HybridKvOnly(RegisteredDecoderHostCopy<'a, MlxHybridLayerState, StorageIdentity>),
     HybridGrouped(PreparedHybridGroupHostCopy<'a>),
     Pooling(RegisteredDecoderHostCopy<'a, MlxPoolingAttentionCache, StorageIdentity>),
     StatelessPooling(PreparedStatelessPoolingCopy<'a>),
@@ -559,7 +499,6 @@ impl<'a> PreparedResidentDecoderHostCopy<'a> {
         match &self.storage {
             HostStorage::Paged(plan) => plan.initialization_peak_bytes(),
             HostStorage::KeyValue(plan) => plan.initialization_peak_bytes(),
-            HostStorage::HybridKvOnly(plan) => plan.initialization_peak_bytes(),
             HostStorage::HybridGrouped(plan) => plan.initialization_peak_bytes(),
             HostStorage::Pooling(plan) => plan.initialization_peak_bytes(),
             HostStorage::StatelessPooling(_) => 0,
@@ -594,15 +533,6 @@ impl<'a> PreparedResidentDecoderHostCopy<'a> {
                     .copy_text_components(joined, limits)
                     .map_err(|error| Error::Other(Box::new(error)))?;
                 (sampler, InitializedStorage::KeyValue(slots), native)
-            }
-            HostStorage::HybridKvOnly(plan) => {
-                let joined = sampling
-                    .with_decoder_slots(plan, complete_source)
-                    .map_err(|e| Error::Other(Box::new(e)))?;
-                let (sampler, slots, native) = pool
-                    .copy_text_components(joined, limits)
-                    .map_err(|e| Error::Other(Box::new(e)))?;
-                (sampler, InitializedStorage::HybridKvOnly(slots), native)
             }
             HostStorage::HybridGrouped(plan) => {
                 let (sampler, slots, native) =
@@ -655,7 +585,6 @@ impl InitializedResidentDecoderCopy<'_> {
 enum InitializedStorage<'a> {
     Paged(InitializedPagedKvCopy),
     KeyValue(InitializedDecoderSlots<MlxKeyValueLayerState>),
-    HybridKvOnly(InitializedDecoderSlots<MlxHybridLayerState>),
     HybridGrouped(InitializedHybridGroupCopy),
     Pooling(InitializedDecoderSlots<MlxPoolingAttentionCache>),
     StatelessPooling(PreparedStatelessPoolingCopy<'a>),
@@ -669,7 +598,6 @@ pub(crate) struct SavedResidentDecoderCopy {
 enum SavedStorage {
     Paged(SavedPagedKvCopy),
     KeyValue(SavedResidentKvCopy),
-    HybridKvOnly(SavedHybridKvCopy),
     HybridGrouped(SavedHybridGroupedCopy),
     Pooling(SavedResidentPoolingCopy),
     StatelessPooling(SavedStatelessPoolingCopy),
@@ -695,9 +623,6 @@ impl SavedResidentDecoderCopy {
                 SavedStorage::KeyValue(saved) => {
                     PreparedStorage::KeyValue(saved.prepare_copy().map_err(kv_error)?)
                 }
-                SavedStorage::HybridKvOnly(saved) => {
-                    PreparedStorage::HybridKvOnly(saved.prepare_copy()?)
-                }
                 SavedStorage::HybridGrouped(saved) => {
                     PreparedStorage::HybridGrouped(saved.prepare_copy()?)
                 }
@@ -719,9 +644,6 @@ impl SavedResidentDecoderCopy {
                 SavedStorage::KeyValue(saved) => {
                     PreparedStorage::KeyValue(PreparedResidentKvCopy::prepare_saved_fixed(saved)?)
                 }
-                SavedStorage::HybridKvOnly(saved) => {
-                    PreparedStorage::HybridKvOnly(saved.prepare_copy_fixed()?)
-                }
                 SavedStorage::HybridGrouped(saved) => {
                     PreparedStorage::HybridGrouped(saved.prepare_copy_fixed()?)
                 }
@@ -738,7 +660,6 @@ impl SavedResidentDecoderCopy {
         match &self.storage {
             SavedStorage::Paged(saved) => Some(saved.shared_layout()),
             SavedStorage::KeyValue(saved) => Some(saved.shared_layout()),
-            SavedStorage::HybridKvOnly(saved) => Some(saved.shared_layout()),
             SavedStorage::HybridGrouped(saved) => Some(saved.shared_layout()),
             SavedStorage::Pooling(saved) => Some(saved.shared_layout()),
             SavedStorage::StatelessPooling(saved) => saved.shared_layout(),
@@ -748,7 +669,6 @@ impl SavedResidentDecoderCopy {
         match &self.storage {
             SavedStorage::Paged(saved) => Some(saved.global_layer_start()),
             SavedStorage::KeyValue(saved) => Some(saved.global_layer_start()),
-            SavedStorage::HybridKvOnly(saved) => Some(saved.global_layer_start()),
             SavedStorage::HybridGrouped(saved) => Some(saved.global_layer_start()),
             SavedStorage::Pooling(_) | SavedStorage::StatelessPooling(_) => None,
         }
@@ -757,7 +677,6 @@ impl SavedResidentDecoderCopy {
         match &self.storage {
             SavedStorage::Paged(saved) => saved.retained_slot_bytes(),
             SavedStorage::KeyValue(saved) => saved.retained_slot_bytes(),
-            SavedStorage::HybridKvOnly(saved) => saved.retained_slot_bytes(),
             SavedStorage::HybridGrouped(saved) => saved.retained_slot_bytes(),
             SavedStorage::Pooling(saved) => saved.retained_slot_bytes(),
             SavedStorage::StatelessPooling(_) => 0,
@@ -767,7 +686,6 @@ impl SavedResidentDecoderCopy {
         match &self.storage {
             SavedStorage::Paged(saved) => saved.protected_slot_bytes(),
             SavedStorage::KeyValue(saved) => saved.protected_slot_bytes(),
-            SavedStorage::HybridKvOnly(saved) => saved.protected_slot_bytes(),
             SavedStorage::HybridGrouped(saved) => saved.protected_slot_bytes(),
             SavedStorage::Pooling(saved) => saved.protected_slot_bytes(),
             SavedStorage::StatelessPooling(_) => 0,

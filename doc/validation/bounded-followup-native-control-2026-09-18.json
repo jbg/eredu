@@ -1,0 +1,871 @@
+{
+  "date": "2026-09-18",
+  "status": "Current CPU routing-source artifact passes all6 native Metal paged Device/Host/Disk control cases. Explicit64MiB debug test-thread stack; independent routed CLI findings remain separate.",
+  "binary": {
+    "path": "/private/tmp/eredu-current-control-native-receipts",
+    "sha256": "d36b209f05ce3caa6213cbfe6d232b5ceb13f44ef624a29bf481aca27b1e7752"
+  },
+  "rustc": "1.98.0-aarch64-apple-darwin",
+  "features": "mlx,metal,image,audio",
+  "environment": {
+    "RUST_MIN_STACK": "67108864"
+  },
+  "runs": [
+    {
+      "scope": "combined six paged cases",
+      "result": "4 passed; 2 failed",
+      "log": "/private/tmp/eredu-native-receipts-control-paged.log",
+      "log_sha256": "f33056499a4d521103ce428ba23aed3e46be4c1e66c390533a1a48d32e84ac58"
+    },
+    {
+      "scope": "host lifecycle alone",
+      "result": "1 passed; 0 failed",
+      "log": "/private/tmp/eredu-native-receipts-control-host-isolated.log",
+      "log_sha256": "86856bdfc737429caad6c7c6ddec4198441ea468c18ad367a6f57cbcb6a9d0df"
+    },
+    {
+      "scope": "device lifecycle alone",
+      "result": "1 passed; 0 failed",
+      "log": "/private/tmp/eredu-native-receipts-control-device-isolated.log",
+      "log_sha256": "e48010059a73df3e06a8211776f02dfc4aada473eed5d6d03e9c70fe08baf6b5"
+    }
+  ],
+  "followup_runs": [
+    {
+      "stage": "explicit_retirement",
+      "binary": {
+        "path": "/private/tmp/eredu-current-control-native-retirement",
+        "sha256": "3b9a79ad67f04a8812c6175a6f346ab44f22228fdd9ec82ba7ebe93e27327589"
+      },
+      "command": [
+        "/private/tmp/eredu-current-control-native-retirement",
+        "managed_plain::paged::",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "result": "6 passed; 0 failed; 5.54 seconds",
+      "log": "/private/tmp/eredu-native-retirement-control-paged.log",
+      "log_sha256": "6987b4a014648da4cef08b048469e47524b138b4c1669b3a5df248f88c2a5797",
+      "coverage": [
+        "device, host-layerwise and disk ordinary/controlled parity",
+        "snapshot restore fork and reset custody",
+        "real disk I/O and host transfer witnesses",
+        "fresh load after final escaped output drops and owner-thread cleanup"
+      ]
+    },
+    {
+      "stage": "shared_partition_media_loop_and_paid_reset",
+      "binary": {
+        "path": "/private/tmp/eredu-current-control-native-partition-reset",
+        "sha256": "b2bc0506a54c3b4efb33a3073b33e49abf7bb70eb0fff6de226e3408c42501ff"
+      },
+      "build_log": "/private/tmp/eredu-current-native-partition-reset-public-build.log",
+      "command": [
+        "/private/tmp/eredu-current-control-native-partition-reset",
+        "managed_plain::paged::",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "result": "6 passed; 0 failed; 5.22 seconds",
+      "log": "/private/tmp/eredu-native-partition-reset-control-paged.log",
+      "log_sha256": "6518f4540b02a9fd5ebd1e2d22943bc6f8fab10c98dd12e81f1cce7d7bca8c85",
+      "scope": "Actual device, host-layerwise and disk paged parity/lifecycle, after shared reset changes; does not establish distributed reset."
+    },
+    {
+      "stage": "clean-retirement-reset-public",
+      "build": {
+        "build_log": "/private/tmp/eredu-current-retirement-reset-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-retirement-reset",
+            "sha256": "72fe65d37663da33e9102d37541a520a3aaba21cc8dab2ab8615719f70e8545e",
+            "bytes": 869713376,
+            "unstripped_bytes": 2858373640
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-retirement-reset",
+            "sha256": "1298efba533d06388b817c1189c408dff59e6459221877dd44f13e3e3c622a72",
+            "bytes": 859001992,
+            "unstripped_bytes": 2829254904
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-retirement-reset",
+            "sha256": "b4fdb7f7446640caacf084beaf40184e230208792dae32a3952924d993b7ebc1",
+            "bytes": 902681584,
+            "unstripped_bytes": 2994238424
+          },
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-generate-retirement-reset",
+            "sha256": "6e9623b478e9a1f06cba6e36c27a78b125c16dc516c100b3b2470ee835a52c6c",
+            "bytes": 856053368,
+            "unstripped_bytes": 2810429176
+          }
+        ],
+        "scope": "Clean build after specific Host-spill backing retirement, grouped Hybrid copy consolidation, paged Hybrid reset, and inactive parallel-control retirement. Temporary alias probes removed."
+      },
+      "result": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-retirement-reset",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 101,
+        "seconds": 9.427964915987104,
+        "expected_cases": 6,
+        "expected_cases_passed": false,
+        "log": "/private/tmp/eredu-native-retirement-reset-control.log",
+        "log_sha256": "88740135d554acfdf2c2996904be38792b1ab9b205b031739c6f16609c255d54"
+      },
+      "scope": "Clean paged control run: 1 passed, 5 failed. Device ordinary/control passes. Host/Disk actual append authentication returns Source(Identity); later ReservedWorkActive fixture failures may cascade from retained failure custody. Diagnosis remains open."
+    },
+    {
+      "stage": "checked-host-view-retirement",
+      "build": {
+        "build_log": "/private/tmp/eredu-current-host-view-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-host-view",
+            "sha256": "50d22fb8ef599915f8ab6a88bbbe19bb6066a8ef1fbf650676c0c7f494e31a92",
+            "bytes": 858675488,
+            "unstripped_bytes": 2729774616
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-host-view",
+            "sha256": "5e705ca9f1ee8ea7a2fc4080ceae3d6e98c027ea2cd03d879bc6f426a38a146b",
+            "bytes": 901897768,
+            "unstripped_bytes": 2795028184
+          }
+        ],
+        "scope": "Clean control/CLI build after checked Host-backed Device-view retirement and typed capture-limit fixture correction. Earlier resident tool/media and released-checkpoint records remain separately scoped."
+      },
+      "result": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-host-view",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 21.160964250098914,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-host-view-control.log",
+        "log_sha256": "1bda682df0a533e76f803d39c67f44d88038e7cb436072d29136f275c8277351"
+      },
+      "scope": "All six paged device/Host/Disk ordinary-controlled and snapshot/restore/fork/reset cases pass together after checked Host-backed Device-view attachment. Limits unchanged. The Data generation scopes Device residency while persistent immutable Host backing remains reusable."
+    },
+    {
+      "stage": "checked-configured-sampling-public-control",
+      "build": {
+        "build_log": "/private/tmp/eredu-current-sampling-scope-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-sampling-scope",
+            "sha256": "afb8f7baa4993edf881bc0793191310346791c212c8efd0054c2485f53de9066",
+            "bytes": 869375360,
+            "unstripped_bytes": 2759001848
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-sampling-scope",
+            "sha256": "5b991189301f8a95dbdb23aebf317284d9f7fd649bf68e1508068063fffab41c",
+            "bytes": 858693016,
+            "unstripped_bytes": 2730099336
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-sampling-scope",
+            "sha256": "a740941c0963364f56b868214e9ec541bf18352f23d1d0df86a24173087c76e8",
+            "bytes": 901898072,
+            "unstripped_bytes": 2795095032
+          }
+        ],
+        "scope": "Final public test build after checked configured sampling phase transition; includes checked Host-backed Device-view retirement, canonical reset/copy, and inactive parallel-control cleanup."
+      },
+      "result": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-sampling-scope",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 11.569567499915138,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-sampling-scope-control.log",
+        "log_sha256": "adb573de6cfd468c0d6bad9f09d1a86927831eef87aad86486fb9693ee6eea84"
+      },
+      "scope": "All six device/Host/Disk public paged control tests pass with the shared configured-sampling phase transition and checked Host-backed Device-view retirement; unchanged limits."
+    },
+    {
+      "stage": "sealed-source-receipts-public-and-cli-native",
+      "build": {
+        "build_log": "/private/tmp/eredu-current-source-receipt-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-source-receipt",
+            "sha256": "15c117d46658e866cb9eab01183a3061b1a7f80aaa0d6c06551467488a52a13c",
+            "bytes": 871936944,
+            "unstripped_bytes": 2863004120
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-source-receipt",
+            "sha256": "61d3ac124354d33276a896277405acd38387610392301e7d26d1f82bbcb93630",
+            "bytes": 904011432,
+            "unstripped_bytes": 2908455608
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-source-receipt",
+            "sha256": "01e4eb8b99ed523cb87d53dd20350dc15c09d0040b89bfaa5dffaf9ce2359171",
+            "bytes": 860668808,
+            "unstripped_bytes": 2856627928
+          }
+        ],
+        "scope": "Public tools/image/audio, paged control and distributed CLI after canonical immutable Host publication loans, retained bank activation and completion-driven registration retirement."
+      },
+      "build_command": {
+        "command": [
+          "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/cargo",
+          "build",
+          "--offline",
+          "-p",
+          "eredu",
+          "-p",
+          "eredu-cli",
+          "--no-default-features",
+          "--features",
+          "eredu/mlx,eredu/metal,eredu/image,eredu/audio,eredu-cli/mlx,eredu-cli/metal",
+          "--test",
+          "prepared_chat_native",
+          "--test",
+          "native_execution_control",
+          "--test",
+          "k2_distributed_control"
+        ],
+        "environment": {
+          "RUSTC": "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/rustc",
+          "CARGO_INCREMENTAL": "0",
+          "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+          "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+          "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_TARGET_DIR": "/Users/jbg/dev/eredu/third-party/tokenizers-0.23.2/target"
+        },
+        "seconds": 221.50793212512508,
+        "exit": 0,
+        "log": "/private/tmp/eredu-current-source-receipt-public-build.log"
+      },
+      "source_sha256": {
+        "doc/backend-architecture.md": "27429128ac25f60ee5aa92a05430fa78c280881eed7f3839192c9b2d974f5ec7",
+        "eredu-backend-mlx/src/backend/runtime/checkpoint/store/materialization/gguf_prepared/tests/funded_component/publication.rs": "262c8f5964acc05e0721964701c359999e6058fa2432f35ecfcb4ac9a23be980",
+        "eredu-backend-mlx/src/backend/runtime/residency/manager/owner.rs": "a6706ec4c2317b4a7944939bcd47fffbf0ffacc24218c2a2e94471558bd9e353",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "0302365232979a99007717a2f9da23e68386eb54c4c11f312844e8fbd290d980",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication.rs": "2f51ea0f2c8197bdd2040228a36f679d84c1bca7f655c7414a3750db58fe86c9",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/native.rs": "83498955d54e2fd39519637dcc97dc16c6eef87c664ab2258193c7b86018406a",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/tests.rs": "bb65260ed24c532b8115245624707f28a0480231b03aaaa5ff912652916fb6cd",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/tests.rs": "a006989700cef54557295d0734d0ab660a80136bcc9884c507b76f504658d92b",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/filled_host.rs": "3c912f1b2219b9a2c55083b40ea044d5a18961b4494869492487f00fcf690875",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/native_storage.rs": "1b23f567e05c6080a1d9734c71e8052b6c65cf9d4ecfbed32b808ce505a43432",
+        "eredu-backend-mlx/src/backend/runtime/residency/storage/original.rs": "29b80754951b559dca35ca24b64717ff1d77663ed1fc2617693b23112ce6bde4",
+        "eredu-cli/tests/k2_distributed_control.rs": "f0b75684a171380ff06bc7661cd1a621b096516aad2bb3519f8c873c5121bade",
+        "eredu-runtime/src/working_memory/operation_custody.rs": "b0b312bc0ea9ed8472fa2ca777b4aff29d7be8ce2086b61daeee61df423768ad",
+        "eredu-runtime/src/working_memory/residual/span_workspace/text_controls.rs": "d8e8abbaeccbf9e070c9bbe18a2258d0d9aa182e3f0f084d780c191ac1fc2e41",
+        "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/native_storage.rs": "08b5c84cb9590f67d6b83e904a2ad3a12d7df8f29278ae7cecfedeef972110d5",
+        "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/native_storage/plan.rs": "413a78f478cd107975030d47bcfc78dde51eab8877f8249b5c04b1d6c57f118a",
+        "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/native_storage/prefill_envelope.rs": "dcad0a011ef7888b3fb5df33075f1b40892cb96b454f4f2ec4ec2dc1a7038715",
+        "eredu-runtime/src/working_memory/storage/native_publication.rs": "c5c97c656ef9fcb83347e08a33ba00f29d3e6d0dd52d3280f7cb39875d756e6c",
+        "eredu-runtime/src/working_memory/storage/native_publication/tests.rs": "207040a488a4ac8ed999c731182899dc13ca33e2f4f1923c6d0df5730fe1a181",
+        "eredu/tests/prepared_chat_native.rs": "b05b6ee3c093a7174e912c4a39725628425841921cf8eaf410001dc0c98d1604",
+        "eredu/tests/prepared_chat_native/audio.rs": "aa7f14edeab8d21bd6894538e8f60bdf36dda019c6c2d0b4623f2ef36aad8e1c",
+        "eredu/tests/prepared_chat_native/capture_lifecycle.rs": "38f0e30b0ae508ca67e14c8bb64fdc7f78e7332e4a9d4b37a43ff919c99a74f8",
+        "eredu/tests/prepared_chat_native/sampling.rs": "16c1505f16eb200011da494675b10ed1ae5c069d988c85103a6dc32eb94a9950",
+        "safemlx-sys/src/mlx-c/mlx/c/original_buffer.cpp": "489e1a29d3b9d0b2d048d645635439ddcad90f927d5a9943a3bd7026a2e16d44",
+        "safemlx-sys/src/mlx-c/mlx/c/original_buffer.h": "7d788cc1e568d520a4c7b2b90a85a9186690dac430da1ea318fe4055ceae3ca0",
+        "safemlx-sys/src/mlx-c/patches/mlx-host-transfer-source-witness.patch": "db498f583fc4c4665076f38d7f79c687ce9223bccc9a7153555fef1ce7663e00",
+        "safemlx/src/allocation_retention/host_alias.rs": "54bfccbe14aba9458486aba0bfa8755c89c33a27fe0a89ecc245f4907c24f9fd",
+        "safemlx/src/allocation_retention/prepared.rs": "c68ba12244cdf56069951c79521dbbe08ba0c7222517d0d67924209cc799a3a2",
+        "safemlx/src/host_transfer/source_witness.rs": "28ed14912989528f72094a39b8040773a81fde411b85402882e5e6d9d41d7fda",
+        "eredu-backend-mlx/src/backend/runtime/residency/manager/construction/foreground_disk/read.rs": "9146a40af9c28958711c4616ffa8dd5c2ff4bd6f353ac585af4a44a38397c32a",
+        "eredu-backend-mlx/src/backend/runtime/residency/manager/construction/foreground_disk/read/publication.rs": "4f3352d3974e4c29265c58aabbc853bfe3b15d12a2bfd2d1841d74afad644b4b",
+        "eredu-backend-mlx/src/backend/runtime/cache/residency/manager/source/disk_read/output.rs": "d2713ff6f87a1dd0ba0f9a23be2496e13087b64295854b89131810d7e5caf199",
+        "eredu-backend-mlx/src/backend/runtime/cache/residency/manager/source/disk_read/destination.rs": "ca9674faff338df6ef8cb31a5247f311834dd8a248e3a3d905dd892e2aea2447"
+      },
+      "environment": {
+        "RUST_MIN_STACK": "67108864",
+        "EREDU_TEST_RING_DEVICE": "gpu",
+        "RUST_BACKTRACE": "1"
+      },
+      "result": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-source-receipt",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 16.698807457927614,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-source-receipt-control.log",
+        "log_sha256": "239343535ed555d3544823a07d62ba2e70224500bb9e60094fb7edb3039e88bc"
+      },
+      "scope": "All6 device/Host/Disk paged controlled execution cases pass with unchanged limits."
+    },
+    {
+      "stage": "canonical-cell-receipts-public-and-paged-control",
+      "build": {
+        "command": [
+          "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/cargo",
+          "build",
+          "--offline",
+          "-p",
+          "eredu",
+          "-p",
+          "eredu-cli",
+          "--no-default-features",
+          "--features",
+          "eredu/mlx,eredu/metal,eredu/image,eredu/audio,eredu-cli/mlx,eredu-cli/metal",
+          "--test",
+          "prepared_chat_native",
+          "--test",
+          "native_execution_control",
+          "--test",
+          "k2_distributed_control"
+        ],
+        "environment": {
+          "RUSTC": "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/rustc",
+          "CARGO_INCREMENTAL": "0",
+          "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+          "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+          "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_TARGET_DIR": "/Users/jbg/dev/eredu/third-party/tokenizers-0.23.2/target"
+        },
+        "seconds": 224.2308442920912,
+        "exit": 0,
+        "log": "/private/tmp/eredu-current-canonical-cell-receipt-public-build.log"
+      },
+      "artifacts": {
+        "build_log": "/private/tmp/eredu-current-canonical-cell-receipt-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "sha256": "f395cd1607e81665bbd5f43035469a9d155269c423d31244a483a927e63b0041",
+            "bytes": 871783896,
+            "unstripped_bytes": 2818213080
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-canonical-cell-receipt",
+            "sha256": "4efc4cc7da22e00cd5aa878776ed670fbde4774d94f3af9ce7544d684e838261",
+            "bytes": 903754000,
+            "unstripped_bytes": 2889463208
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-canonical-cell-receipt",
+            "sha256": "834cb4eb872777619b5749a0e631a4e74ca00061dd8f4f56b32e92ce6f7697e6",
+            "bytes": 860592704,
+            "unstripped_bytes": 2805673304
+          }
+        ],
+        "scope": "Public tools/image/audio, paged control and distributed CLI after shared physical publication receipts for lazy Host sources and persistent canonical CPU Arrays; source instrumentation removed."
+      },
+      "public_runs": [
+        {
+          "name": "audio-tools",
+          "seconds": 9.899865625193343,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "audio::authenticated_image_audio_tools_preserve_ordinary_manual_and_recorded_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-audio-tools.log"
+        },
+        {
+          "name": "distributed-media",
+          "seconds": 6.307051499839872,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "media::distributed::two_rank_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-distributed-media.log"
+        },
+        {
+          "name": "pipeline-media",
+          "seconds": 10.214014958124608,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "media::distributed::two_rank_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-pipeline-media.log"
+        },
+        {
+          "name": "tensor-pipeline-media",
+          "seconds": 16.79980345792137,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "media::distributed::four_rank_tensor_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-tensor-pipeline-media.log"
+        },
+        {
+          "name": "media",
+          "seconds": 5.7289923338685185,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "media::authenticated_image_tools_refuse_foreign_chat_and_preserve_manual_and_speculative_parity",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-media.log"
+        },
+        {
+          "name": "media-snapshot",
+          "seconds": 4.275394749827683,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "media::authenticated_image_tool_snapshots_preserve_pending_branches_and_partial_events",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-media-snapshot.log"
+        },
+        {
+          "name": "ordinary",
+          "seconds": 2.9153087087906897,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-canonical-cell-receipt",
+            "ordinary_tool_capture_snapshot_restore_and_fork_preserve_committed_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-canonical-cell-receipt-ordinary.log"
+        }
+      ],
+      "paged_control": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-canonical-cell-receipt",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 12.04490950005129,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-canonical-cell-receipt-control.log",
+        "log_sha256": "550874ad28732cabcf8aaa5879454349365894d115f213c158b328bf4bbc5c33"
+      },
+      "scope": "Seven public native prepared-chat cases and all six native paged control cases pass on shared canonical Array/Host receipt production sources. Public scope includes genuine image/audio encoders, scripted semantic decoder, ordinary/manual/recorded Required/Auto, TP2, PP2 and combined TP2/PP2, source refusal, snapshots and child sampling. All native debug cases use64MiB test-thread stacks; prior default2MiB overflow diagnosis remains explicit. CLI Dense matrix closure and remaining routed source handoff are recorded separately."
+    },
+    {
+      "stage": "addressable-equation-source-public-and-paged-control",
+      "build": {
+        "build_log": "/private/tmp/eredu-current-addressable-equation-source-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "sha256": "89fb6eef11fa742b6b435a7b490fb666ba58c83a11b4adb6c46608cb70cdebcf",
+            "bytes": 872593648,
+            "unstripped_bytes": 2813280632
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-addressable-equation-source",
+            "sha256": "e81223befde03d69b03259659f2bfc6f77681517c9eee45e107b89dbd18c797a",
+            "bytes": 904719656,
+            "unstripped_bytes": 2863300456
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-addressable-equation-source",
+            "sha256": "645023fcb9f00523b8827cf56ef9fc71f8d31bd65b229ee532fcb51fd090bb5a",
+            "bytes": 861286736,
+            "unstripped_bytes": 2781286648
+          }
+        ],
+        "scope": "Public tools/image/audio, paged control and distributed CLI after completed routed partition source retention and exact independent expert-bank local request composition; shared physical publication receipts retained."
+      },
+      "build_command": {
+        "command": [
+          "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/cargo",
+          "build",
+          "--offline",
+          "-p",
+          "eredu",
+          "-p",
+          "eredu-cli",
+          "--no-default-features",
+          "--features",
+          "eredu/mlx,eredu/metal,eredu/image,eredu/audio,eredu-cli/mlx,eredu-cli/metal",
+          "--test",
+          "prepared_chat_native",
+          "--test",
+          "native_execution_control",
+          "--test",
+          "k2_distributed_control"
+        ],
+        "environment": {
+          "RUSTC": "/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/rustc",
+          "CARGO_INCREMENTAL": "0",
+          "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+          "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+          "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_TARGET_DIR": "/Users/jbg/dev/eredu/third-party/tokenizers-0.23.2/target"
+        },
+        "seconds": 244.73572975001298,
+        "exit": 0,
+        "log": "/private/tmp/eredu-current-addressable-equation-source-public-build.log"
+      },
+      "source_snapshot": {
+        "path": "/private/tmp/eredu-addressable-equation-source-worktree.json",
+        "sha256": "e0188aa4e76e582ccdc8f8a06c26bd83ac2aa0904b32ba2c3fbd0ee96f6ed81c"
+      },
+      "public_record": {
+        "path": "/private/tmp/eredu-prepared-addressable-equation-source-checks.json",
+        "sha256": "e115c6510ae4fe7e1840bb1f568c8dcab642127bf219901e99438773ec157a3e"
+      },
+      "public_runs": [
+        {
+          "name": "audio-tools",
+          "seconds": 8.919884416973218,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "audio::authenticated_image_audio_tools_preserve_ordinary_manual_and_recorded_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-audio-tools.log",
+          "log_sha256": "76fcc52ffad7497d0d35854990b522f2babaf426ce33235ecaff623165f2cbd9"
+        },
+        {
+          "name": "distributed-media",
+          "seconds": 5.5336356670595706,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "media::distributed::two_rank_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-distributed-media.log",
+          "log_sha256": "742ab7da13a72d6730269f333a706445369cae8e57eea519f52600034f7732f1"
+        },
+        {
+          "name": "pipeline-media",
+          "seconds": 8.946424667024985,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "media::distributed::two_rank_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-pipeline-media.log",
+          "log_sha256": "0cfb8d32f95b3096f2ae7c1ed3c0c58d32fdfb1de3941975afa53957932058e0"
+        },
+        {
+          "name": "tensor-pipeline-media",
+          "seconds": 15.198936457978562,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "media::distributed::four_rank_tensor_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-tensor-pipeline-media.log",
+          "log_sha256": "4288c86a6d7e47c223247b03d935885611fa634abbf06eec22723d94f2075f16"
+        },
+        {
+          "name": "media",
+          "seconds": 4.985433249967173,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "media::authenticated_image_tools_refuse_foreign_chat_and_preserve_manual_and_speculative_parity",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-media.log",
+          "log_sha256": "fdd371c4baea71f86aef4b3bbe89814ba3607b2a26382e8de757f522a71087c2"
+        },
+        {
+          "name": "media-snapshot",
+          "seconds": 3.7259698330890387,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "media::authenticated_image_tool_snapshots_preserve_pending_branches_and_partial_events",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-media-snapshot.log",
+          "log_sha256": "e3b8256c537bc66e9457ec9cffc7053be9c6434b581ba9cc11b9aee07673ce0d"
+        },
+        {
+          "name": "ordinary",
+          "seconds": 2.443091082852334,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-addressable-equation-source",
+            "ordinary_tool_capture_snapshot_restore_and_fork_preserve_committed_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-addressable-equation-source-ordinary.log",
+          "log_sha256": "98dca7c640a5b7e2c176b93e7e0348d54a925d02cff086230f3bff125cb1e7d8"
+        }
+      ],
+      "public_passed": 7,
+      "paged_control_run": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-addressable-equation-source",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 10.66973445797339,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-addressable-equation-source-control.log",
+        "log_sha256": "104cc160b3d581a9cd2042a7765da708e6763123f52393e923785772f85ee6d5"
+      },
+      "paged_control_passed": 6,
+      "qualification": [
+        "All fixtures select the actual Metal/GPU mechanism. Public cases retain Required/Auto, authenticated real image/audio encoders, ordinary/manual/recorded semantics, single/distributed media, combined TP2/PP2, foreign source refusal, independent speculative parity, snapshots and child sampling.",
+        "Paged device/Host/Disk control retains actual physical caps, spill/promotion witnesses, snapshots, escaped ownership and final retirement.",
+        "Unoptimized native tests retain the explicit64MiB thread-stack qualification; the previously documented default2MiB child-sampling overflow is not claimed fixed.",
+        "The same artifact completes three Dense CLI modes but routed CPU acceptance reaches missing physical reduction evidence and integer-vector multiplication quotation. Those results are recorded separately."
+      ]
+    },
+    {
+      "stage": "cpu-routing-source-public-and-paged-control",
+      "status": "PASS",
+      "artifacts": {
+        "build_log": "/private/tmp/eredu-current-cpu-routing-source-public-build.log",
+        "binaries": [
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "sha256": "3a57f042f0c86eb9587b2d1c20f54f6ed61dcc654cfdea000a2ecfd5582aef2a",
+            "bytes": 872884984,
+            "unstripped_bytes": 2895459256
+          },
+          {
+            "binary": "/private/tmp/eredu-current-cli-distributed-control-cpu-routing-source",
+            "sha256": "5296d7fbec15116738160b17b144222adf4dbb82ab6c28934412cfe988bdbc50",
+            "bytes": 861598184,
+            "unstripped_bytes": 2874171336
+          },
+          {
+            "binary": "/private/tmp/eredu-current-control-native-cpu-routing-source",
+            "sha256": "363e5ff11728163e74f45a59b6682d7291751a2160f1798c229b5c77c0e0a922",
+            "bytes": 905172336,
+            "unstripped_bytes": 3007566184
+          },
+          {
+            "binary": "/private/tmp/eredu-current-prepared-chat-generate-cpu-routing-source",
+            "sha256": "7b4ae36fafeaaf35f3307abbffb2641697d5e3927f567bd964896687306a8bac",
+            "bytes": 858661048,
+            "unstripped_bytes": 2863550040
+          }
+        ],
+        "scope": "Build after canonical zero prototypes, exact typed structural views, CPU row movement and routing source composition. Covers public tools/media, paged control, distributed CLI and released-checkpoint ordinary example."
+      },
+      "prepared_chat": [
+        {
+          "name": "audio-tools",
+          "seconds": 8.844516707817093,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "audio::authenticated_image_audio_tools_preserve_ordinary_manual_and_recorded_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-audio-tools.log",
+          "log_sha256": "298a3097240868ba60e3f359d6b5e75f5d3a8e9c14aaaa5a61858684abe46a5c"
+        },
+        {
+          "name": "distributed-media",
+          "seconds": 5.563069791067392,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "media::distributed::two_rank_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-distributed-media.log",
+          "log_sha256": "742ab7da13a72d6730269f333a706445369cae8e57eea519f52600034f7732f1"
+        },
+        {
+          "name": "pipeline-media",
+          "seconds": 8.950055167078972,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "media::distributed::two_rank_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-pipeline-media.log",
+          "log_sha256": "0cfb8d32f95b3096f2ae7c1ed3c0c58d32fdfb1de3941975afa53957932058e0"
+        },
+        {
+          "name": "tensor-pipeline-media",
+          "seconds": 15.17974462499842,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "media::distributed::four_rank_tensor_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-tensor-pipeline-media.log",
+          "log_sha256": "ffe52211ef9260f94918090d4361398f38becba5661c3bf73b113438e97ef60e"
+        },
+        {
+          "name": "media",
+          "seconds": 4.912174749886617,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "media::authenticated_image_tools_refuse_foreign_chat_and_preserve_manual_and_speculative_parity",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-media.log",
+          "log_sha256": "29f63eb5a9068136db8c4bc39767c2d966dd88646564a0ccc9ef4d0baf971b3b"
+        },
+        {
+          "name": "media-snapshot",
+          "seconds": 3.699427292216569,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "media::authenticated_image_tool_snapshots_preserve_pending_branches_and_partial_events",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-media-snapshot.log",
+          "log_sha256": "7c61c5a5a5b92e9905d5df922c8c2f4b03c67d02e8cdd0d6bc472a10d9d7dc76"
+        },
+        {
+          "name": "ordinary",
+          "seconds": 2.4484159171115607,
+          "command": [
+            "/private/tmp/eredu-current-prepared-chat-native-cpu-routing-source",
+            "ordinary_tool_capture_snapshot_restore_and_fork_preserve_committed_semantics",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "--ignored"
+          ],
+          "returncode": 0,
+          "one_case_passed": true,
+          "log": "/private/tmp/eredu-native-cpu-routing-source-ordinary.log",
+          "log_sha256": "3f845bb13d467f426325b1f42e77482a7d68dfffd5395f6d6faee510eb0e6bce"
+        }
+      ],
+      "paged_control": {
+        "command": [
+          "/private/tmp/eredu-current-control-native-cpu-routing-source",
+          "managed_plain::paged::",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "returncode": 0,
+        "seconds": 10.619115167064592,
+        "expected_cases": 6,
+        "expected_cases_passed": true,
+        "log": "/private/tmp/eredu-native-cpu-routing-source-control.log",
+        "log_sha256": "37ddcf198a64654ddb1a406ee79f136049f2d6f09e179b6887df011273748d28"
+      },
+      "scope": "Current canonical typed-zero/Transpose trace source passes all7 public tool/media tests and all6 paged Device/Host/Disk control tests. Explicit64MiB debug test-thread stack. Image/audio fixtures use real encoders and scripted semantic decoder; speculative parity is independent evidence. Distributed routed CPU CLI acceptance remains separate and pending."
+    }
+  ]
+}

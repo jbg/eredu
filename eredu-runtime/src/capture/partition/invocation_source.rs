@@ -69,7 +69,7 @@ impl<'a> PartitionInvocationCaptureGeometry<'a> {
     pub fn from_receipt(receipt:&'a PartitionCaptureReceiptPlan,producer:usize,fragment:usize)
         ->Result<Self,PartitionInvocationCaptureSourceError> {
         use PartitionInvocationCaptureSourceError as E;
-        let source=receipt.shared_plan_source().ok_or(E::Source)?;
+        let source=receipt.shared_plan_source();
         let context=receipt.context();
         let projection=receipt.producer(producer).ok_or(E::Source)?;
         if context.capture_plan_identity!=source.admission().identity()
@@ -85,7 +85,7 @@ impl<'a> PartitionInvocationCaptureGeometry<'a> {
         ->Result<Self,PartitionInvocationCaptureSourceError> {
         use PartitionInvocationCaptureKind as K;
         use PartitionInvocationCaptureSourceError as E;
-        let source=receipt.shared_plan_source().ok_or(E::Source)?;
+        let source=receipt.shared_plan_source();
         let context=receipt.context();
         let logical=window.validate(physical).map_err(CaptureTensorGeometryError::from)?;
         if context.invocation!=Some(logical)||context.capture_plan_identity!=source.admission().identity()

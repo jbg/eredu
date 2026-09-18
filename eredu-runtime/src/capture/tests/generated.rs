@@ -61,7 +61,7 @@ fn declared_empty_sources_preserve_precision_without_running_factories() {
                 end: 2,
                 stride: 1,
             });
-            let mut session = CaptureSession::new(admit(plan, &catalog, &support, &caps).unwrap());
+            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
             let mut backend = TypedBackend::default();
             let source = GeneratedCaptureSource {
                 creation_bytes: 4096,
@@ -126,7 +126,7 @@ fn generated_contract_mismatch_fails_before_transform_and_keeps_reserved_cost() 
         (TensorDtype::Bf16, vec![3, 5]),
     ] {
         let (plan, catalog, support, caps) = fixture(CaptureTransform::FullTensor);
-        let mut session = CaptureSession::new(admit(plan, &catalog, &support, &caps).unwrap());
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
         let mut backend = TypedBackend::default();
         let source = GeneratedCaptureSource {
             creation_bytes: 4096,
@@ -180,7 +180,7 @@ fn unknown_empty_raw_source_is_unsupported_without_factory_work() {
         end: 0,
         stride: 1,
     });
-    let mut session = CaptureSession::new(admit(plan, &catalog, &support, &caps).unwrap());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
     let mut backend = TypedBackend::default();
     session.begin_step(CapturePhase::Prefill, 0).unwrap();
     let result = session.observe_generated(

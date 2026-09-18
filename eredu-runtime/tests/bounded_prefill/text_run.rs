@@ -819,7 +819,7 @@ fn foreign_and_forked_contexts_cannot_reuse_the_original_run_grant() {
         .start(vec![1], config(5), Controller(facts.clone()))
         .unwrap();
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     let original = facts.borrow().bound[0].clone();
     let mut child = {
         let mut boundary = driver.quiescent(&mut state).unwrap();
@@ -836,7 +836,7 @@ fn foreign_and_forked_contexts_cannot_reuse_the_original_run_grant() {
         )
     };
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     driver.advance(&mut child).unwrap().unwrap();
     let restored = facts.borrow().attempts[1].clone();
     let forked = facts.borrow().attempts[2].clone();

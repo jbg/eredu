@@ -1,0 +1,162 @@
+diff --git a/mlx/backend/cpu/gather_storage.cpp b/mlx/backend/cpu/gather_storage.cpp
+--- a/mlx/backend/cpu/gather_storage.cpp
++++ b/mlx/backend/cpu/gather_storage.cpp
+@@ -12,6 +12,14 @@
+   if(value>size_t(PTRDIFF_MAX)-total)return false;total+=value;return true;
+ }
+ bool geometry(const array& input,size_t& elements) noexcept {
++  if(input.size()==0) {
++    if(input.ndim()>5||input.strides().size()!=input.ndim()||input.data_size()!=0)return false;
++    elements=1;
++    for(size_t axis=0;axis!=size_t(input.ndim());++axis)
++      if(input.shape(axis)<0||input.strides()[axis]<0||
++          !product(elements,size_t(input.shape(axis)),elements))return false;
++    return elements==0;
++  }
+   if(input.ndim()>5||input.strides().size()!=input.ndim())return false;
+   elements=1;size_t span=1,delta=0,bytes=0;
+   for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+@@ -37,9 +45,9 @@
+       (source==int32&&source.size()==4)||(source==uint32&&source.size()==4))||
+       !((index==uint32&&index.size()==4)||(index==int32&&index.size()==4))||
+       !source_rank||source_rank>4||index_rank>5-source_rank||
+-      !source_elements||source_elements>size_t(INT_MAX)||
+-      !index_elements||index_elements>size_t(INT_MAX)||(!index_rank&&index_elements!=1)||
+-      !slice_elements||slice_elements>source_elements||source_elements%slice_elements||
++      source_elements>size_t(INT_MAX)||(!source_elements&&index_elements)||
++      index_elements>size_t(INT_MAX)||(!index_rank&&index_elements!=1)||
++      !slice_elements||slice_elements>size_t(INT_MAX)||(source_elements&&(slice_elements>source_elements||source_elements%slice_elements))||
+       !product(index_elements,slice_elements,output_elements)||output_elements>size_t(INT_MAX)||
+       !product(source_elements,source.size(),bytes)||
+       !product(index_elements,index.size(),bytes)||!product(output_elements,source.size(),bytes))return false;
+@@ -47,6 +55,9 @@
+   if(!gather_dispatch_storage(source_rank,index_rank,dispatch)||
+       !single_output_eval_layout(source_rank+index_rank,2,tracer,&dispatch,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  // Empty Gather still constructs output Data, weak descriptors, the index
++  // vector and the ordinary queued task. Only its physical birth is absent.
++  if(output_elements==0) {value.backing_births=0;value.request_counts[7]=0;}
+   // The one-index ArrayVector grows once. Its actual backing stays in the
+   // queued task until task death. Worker iterator storage is independently
+   // charged through dispatch.worker_graph_extents under that task's Graph loan.
+@@ -56,7 +67,7 @@
+       sizeof(source_elements)+sizeof(index_elements)+sizeof(slice_elements)+sizeof(tracer)+
+       sizeof(out)+sizeof(output_elements)+sizeof(bytes)+sizeof(dispatch)+sizeof(common)+sizeof(value)+
+       sizeof(const array*)*4+sizeof(const Gather*)+sizeof(const Shape*)*2+sizeof(Dtype)*2+
+-      sizeof(size_t)*18+sizeof(bool)*3+sizeof(int)*3+
++      sizeof(size_t)*19+sizeof(bool)*3+sizeof(int)*3+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+
+       sizeof(submission::GraphFailure);
+diff --git a/mlx/backend/cpu/scatter_storage.cpp b/mlx/backend/cpu/scatter_storage.cpp
+--- a/mlx/backend/cpu/scatter_storage.cpp
++++ b/mlx/backend/cpu/scatter_storage.cpp
+@@ -98,11 +98,12 @@
+           index_elements*size_t(source.shape(1))!=update_elements))) return false;
+   return scatter_eval_layout(source.dtype(),index.dtype(),rank,source_elements,update_elements,output.is_tracer(),out);
+ }
+-bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
+-    size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
++static bool scatter_axis_worker_layout(Dtype index,size_t rank,size_t output_elements,
++    size_t update_elements,bool tracer,bool row_sum,CopyEvalStorage& out) noexcept {
+   if(!((index==int32&&index.size()==4)||(index==uint32&&index.size()==4))||rank<1||rank>4||
+       !output_elements||output_elements>size_t(INT_MAX)||output_elements>size_t(PTRDIFF_MAX)/sizeof(float)||
+-      !update_elements||update_elements>size_t(INT_MAX)||update_elements>size_t(PTRDIFF_MAX)/sizeof(float))return false;
++      (!row_sum&&!update_elements)||(row_sum&&rank!=2)||
++      update_elements>size_t(INT_MAX)||update_elements>size_t(PTRDIFF_MAX)/sizeof(float))return false;
+   CopyEvalStorage value;
+   // Exactly one Eval cleanup retains all three inputs through both queued jobs.
+   if(!copy_eval_layout(0,3,false,tracer,value))return false;
+@@ -124,7 +125,7 @@
+   if(!add(value.worker_graph_extents,scatter.worker_graph_extents))return false;
+   const auto adoption=array::buffer_adoption_layout();
+   const size_t controls[]={sizeof(value)*2,sizeof(out),sizeof(index),sizeof(rank),sizeof(output_elements),
+-      sizeof(update_elements),sizeof(tracer),sizeof(copy),sizeof(scatter),sizeof(weak),sizeof(routing),
++      sizeof(update_elements),sizeof(tracer),sizeof(row_sum),sizeof(copy),sizeof(scatter),sizeof(weak),sizeof(routing),
+       sizeof(allocation_controls),sizeof(adoption),sizeof(first),sizeof(second),sizeof(birth),
+       copy.controls,scatter.controls,weak.controls,weak.controls,weak.controls,weak.controls,weak.controls,
+       sizeof(std::function<allocator::Buffer(size_t)>)*2,sizeof(allocator::Buffer)*2,
+@@ -132,14 +133,37 @@
+       sizeof(Shape),sizeof(Strides),sizeof(array::Flags),sizeof(CopyType),sizeof(Stream),sizeof(bool),
+       adoption.incoming_bytes,adoption.scratch_owner_bytes,adoption.deleter_bytes,
+       adoption.allocator_callable_bytes,adoption.prepared_strides_bytes,allocation_controls,
+-      sizeof(const array*)*5,sizeof(const ScatterAxis*),sizeof(size_t)*9,sizeof(int)*3,
++      sizeof(const array*)*6,sizeof(const ScatterAxis*),sizeof(size_t)*11,sizeof(int)*3,sizeof(bool)*3,
+       sizeof(std::pair<ScatterAxis::ReduceType,int>),sizeof(submission::FixedEvalPrologueGuard*),
+       sizeof(submission::Record*),sizeof(submission::GraphQuota*),
+-      sizeof(submission::GraphConstructionContext),sizeof(submission::GraphFailure)};
++      sizeof(submission::GraphConstructionContext),sizeof(submission::GraphFailure),
++      sizeof(Dtype),sizeof(size_t)*3,sizeof(bool),sizeof(CopyEvalStorage*),
++      sizeof(const array*),sizeof(size_t*),sizeof(size_t)};
+   if(!add(value.named_control_bytes,sizeof(controls)))return false;
+   for(size_t bytes:controls)if(!add(value.named_control_bytes,bytes))return false;
+   if(!submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
++}
++bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
++    size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return scatter_axis_worker_layout(index,rank,output_elements,update_elements,tracer,false,out);
++}
++bool scatter_add_rows_eval_layout(Dtype index,size_t output_elements,
++    size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return scatter_axis_worker_layout(index,2,output_elements,update_elements,tracer,true,out);
++}
++namespace {
++bool scatter_input_geometry(const array& input,size_t& elements) noexcept {
++  if(input.size()!=0)return alias_input_geometry(input,elements);
++  if(input.ndim()!=2||input.strides().size()!=2||input.data_size()!=0)return false;
++  elements=1;
++  for(size_t axis=0;axis!=2;++axis) {
++    if(input.shape(axis)<0||input.strides()[axis]<0||
++        (input.shape(axis)&&elements>size_t(PTRDIFF_MAX)/size_t(input.shape(axis))))return false;
++    elements*=size_t(input.shape(axis));
++  }
++  return elements==0;
++}
+ }
+ bool is_scatter_axis_eval_primitive(const array& output) noexcept {
+   return output.has_primitive()&&output.primitive().stream().device==Device::cpu&&
+@@ -150,19 +174,23 @@
+   const auto& source=output.inputs()[0];const auto& index=output.inputs()[1];const auto& updates=output.inputs()[2];
+   const size_t rank=source.ndim();const auto state=static_cast<const ScatterAxis&>(output.primitive()).state();
+   size_t source_elements=0,index_elements=0,update_elements=0;
++  const bool row_sum=state.first==ScatterAxis::Sum&&state.second==0&&rank==2;
+   if(rank<1||rank>4||output.ndim()!=rank||index.ndim()!=rank||updates.ndim()!=rank||
+-      state.first!=ScatterAxis::None||state.second!=int(rank)-1||
++      (!row_sum&&(state.first!=ScatterAxis::None||state.second!=int(rank)-1))||
+       source.dtype()!=float32||source.itemsize()!=sizeof(float)||
+       updates.dtype()!=float32||updates.itemsize()!=sizeof(float)||
+       output.dtype()!=float32||output.itemsize()!=sizeof(float)||
+       source.shape()!=output.shape()||updates.shape()!=index.shape()||
+-      !alias_input_geometry(source,source_elements)||!alias_input_geometry(index,index_elements)||
+-      !alias_input_geometry(updates,update_elements)||source_elements!=output.size()||index_elements!=update_elements)return false;
++      !alias_input_geometry(source,source_elements)||
++      !(row_sum?scatter_input_geometry(index,index_elements):alias_input_geometry(index,index_elements))||
++      !(row_sum?scatter_input_geometry(updates,update_elements):alias_input_geometry(updates,update_elements))||
++      source_elements!=output.size()||index_elements!=update_elements)return false;
+   for(size_t axis=0;axis!=rank;++axis) {
+-    if(source.shape(axis)<=0||index.shape(axis)<=0||
+-        (axis+1!=rank&&source.shape(axis)!=index.shape(axis)))return false;
++    if(source.shape(axis)<=0||index.shape(axis)<0||(!row_sum&&index.shape(axis)==0)||
++        (axis!=size_t(state.second)&&source.shape(axis)!=index.shape(axis)))return false;
+   }
+-  return scatter_axis_eval_layout(index.dtype(),rank,source_elements,update_elements,output.is_tracer(),out);
++  return scatter_axis_worker_layout(index.dtype(),rank,source_elements,update_elements,
++      output.is_tracer(),row_sum,out);
+ }
+ }
+ namespace mlx::core::submission {
+diff --git a/mlx/backend/cpu/scatter_storage.h b/mlx/backend/cpu/scatter_storage.h
+--- a/mlx/backend/cpu/scatter_storage.h
++++ b/mlx/backend/cpu/scatter_storage.h
+@@ -13,6 +13,10 @@
+ MLX_API bool scatter_axis_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+ MLX_API bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage&) noexcept;
++// Same copy and ScatterAxis task for F32 rank-two row summation, including
++// zero updates. A nonempty destination always keeps its possible copy birth.
++MLX_API bool scatter_add_rows_eval_layout(Dtype index,size_t output_elements,
++    size_t update_elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_scatter_axis_eval_primitive(const array&) noexcept;
+ MLX_API bool scatter_axis_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }

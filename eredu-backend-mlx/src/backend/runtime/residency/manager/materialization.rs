@@ -311,7 +311,7 @@ pub(super) fn materialize_host_buffers<'context>(
             .expect("completed host buffer");
         validate_host_buffer_bytes(id, binding, &buffer)?;
         buffers.insert(binding.name().to_owned(), Arc::new(buffer.freeze()).into());
-        let status = retained.finish();
+        let status = retained.finish().map_err(ResidencyError::OriginalRetirement)?;
         if status.failed || status.blocked {
             return Err(ResidencyError::Mlx {
                 id: id.clone(),

@@ -18,7 +18,7 @@ pub(super) fn run(
     fault: Option<&'static str>,
 ) -> CaptureUsage {
     executable.reset().unwrap();
-    let mut session = CaptureSession::new(placement::plan(descriptor));
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(placement::plan(descriptor)));
     session
         .configure_partition_capture(
             PartitionCaptureIdentity::new(
@@ -55,7 +55,7 @@ pub(super) fn run(
              -> Result<PartitionCaptureNativeEstimate, CaptureError> {
                 panic!("dense estimate")
             },
-            |error: PartitionCaptureObserverError<Error>| Error::backend_source(error),
+            |error: PartitionCaptureObserverError<Error>| Error::backend_retained_source(error),
         );
         let output = executable.forward_observed(tokens, prediction == 0, &mut observer);
         drop(observer);
@@ -64,7 +64,7 @@ pub(super) fn run(
             fault.is_none(),
             "actual shared prepared observer {fault:?}: {output:?}"
         );
-        let step=session.take_step().unwrap_or_else(||panic!("shared transaction did not settle capture {fault:?}: {output:?}, source/collector calls {:?}", calls.iter().map(|n|n.load(Ordering::SeqCst)).collect::<Vec<_>>()));
+        let step=session.take_shared_step().unwrap_or_else(||panic!("shared transaction did not settle capture {fault:?}: {output:?}, source/collector calls {:?}", calls.iter().map(|n|n.load(Ordering::SeqCst)).collect::<Vec<_>>()));
         assert!(step.cumulative_usage.host_bytes > last.host_bytes);
         last = step.cumulative_usage;
         if fault.is_some() {

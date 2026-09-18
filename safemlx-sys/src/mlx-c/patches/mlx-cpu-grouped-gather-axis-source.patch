@@ -1,0 +1,62 @@
+diff --git a/mlx/backend/cpu/indexing.cpp b/mlx/backend/cpu/indexing.cpp
+--- a/mlx/backend/cpu/indexing.cpp
++++ b/mlx/backend/cpu/indexing.cpp
+@@ -321,6 +321,11 @@
+       for (int j = 0; j < ind_ax_size; ++j) {
+         auto ind_val = offset_neg_idx(
+             ind_ptr[ind_it.loc + j * ind_ax_stride], src_ax_size);
++        // Indices may be produced by earlier queued tasks. Validate them
++        // here, after dependencies, before dereferencing the selected source.
++        if (size_t(ind_val) >= size_t(src_ax_size)) {
++          throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++        }
+         dst_ptr[k + j * dst_ax_stride] =
+             src_ptr[src_it.loc + ind_val * src_ax_stride];
+       }
+@@ -1104,7 +1109,9 @@
+       sizeof(ContiguousIterator)*2,sizeof(const float*)*2,sizeof(float*)*2,sizeof(const uint32_t*)*2,
+       sizeof(size_t)*12,sizeof(int)*5,sizeof(int64_t)*3,sizeof(uint32_t)*2,
+       sizeof(Stream),sizeof(CommandEncoder*),sizeof(Dtype)*2,
+-      sizeof(const array*)*4,sizeof(const GatherAxis*),sizeof(bool)*4};
++      sizeof(const array*)*4,sizeof(const GatherAxis*),sizeof(bool)*4,
++      sizeof(submission::GraphQuotaError),sizeof(submission::GraphFailure),
++      sizeof(size_t)*10,sizeof(size_t*)*2,sizeof(int)};
+   size_t controls=sizeof(frames);
+   for(size_t frame:frames){if(frame>SIZE_MAX-controls)return false;controls+=frame;}
+   EvalDispatchStorage dispatch{task.task_bytes,task.task_alignment,iterator.graph_extent_sum*2,controls};
+@@ -1123,12 +1130,29 @@
+       index.dtype()!=uint32||index.itemsize()!=sizeof(uint32_t)||
+       input.shape()!=output.shape()||index.shape()!=input.shape()||
+       input.strides().size()!=rank||index.strides().size()!=rank||
+-      !input.flags().row_contiguous||!index.flags().row_contiguous||input.shape(-1)<=0||
+-      input.strides().back()!=1||index.strides().back()!=1||
+-      static_cast<const GatherAxis&>(output.primitive()).state()!=int(rank)-1)return false;
+-  for(size_t axis=0;axis+1<rank;++axis)if(input.shape(axis)!=1)return false;
+-  if(input.size()!=size_t(input.shape(-1))||index.size()!=input.size()||
+-      input.data_size()<input.size()||index.data_size()<index.size())return false;
++      !input.flags().row_contiguous)return false;
++  const int selected_axis=static_cast<const GatherAxis&>(output.primitive()).state();
++  if(selected_axis<0||size_t(selected_axis)>=rank)return false;
++  size_t elements=1,source_span=1,index_span=1,compact=1;
++  for(size_t axis=rank;axis--;) {
++    if(input.shape(axis)<=0||input.strides()[axis]<0||index.strides()[axis]<0||
++        (input.shape(axis)>1&&size_t(input.strides()[axis])!=compact))return false;
++    const size_t dimension=size_t(input.shape(axis));
++    if(elements>size_t(INT_MAX)/dimension)return false;
++    elements*=dimension;compact=elements;
++    // Positive physical spans include broadcast index axes with stride zero.
++    // They prove each task read stays within the retained input backing.
++    const size_t strides[]={size_t(input.strides()[axis]),size_t(index.strides()[axis])};
++    size_t* spans[]={&source_span,&index_span};
++    for(size_t which=0;which!=2;++which) {
++      if(strides[which]&&dimension-1>size_t(PTRDIFF_MAX)/strides[which])return false;
++      const size_t delta=(dimension-1)*strides[which];
++      if(delta>size_t(PTRDIFF_MAX)-*spans[which])return false;
++      *spans[which]+=delta;
++    }
++  }
++  if(input.size()!=elements||index.size()!=elements||output.size()!=elements||
++      source_span>input.data_size()||index_span>index.data_size())return false;
+   return gather_axis_row_eval_layout(rank,input.size(),output.is_tracer(),out);
+ }
+ }

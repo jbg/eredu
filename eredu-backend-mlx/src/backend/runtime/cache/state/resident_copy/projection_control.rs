@@ -23,7 +23,6 @@ impl PreparedResidentDecoderCopy<'_> {
     pub(crate) fn dense_projection_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
         let (layout, projection) = match &self.storage {
             PreparedStorage::KeyValue(plan) => (plan.shared_layout(), Projection::Concat),
-            PreparedStorage::HybridKvOnly(plan) => (plan.shared_layout(), Projection::Concat),
             PreparedStorage::HybridGrouped(plan) => (plan.shared_layout(), Projection::Grouped),
             PreparedStorage::Pooling(plan) => (plan.shared_layout(), Projection::Pooling),
             PreparedStorage::Paged(_) | PreparedStorage::StatelessPooling(_) => {

@@ -307,7 +307,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                 units,
                 experts,
                 |metadata, shape| {
-                    let name = metadata.id.as_str();
+                    let name = metadata.id().as_str();
                     if name.contains("gate_up_proj") {
                         let rows = shape.get(1).copied().ok_or_else(|| {
                             ParallelPlanError::InvalidTensor(format!(
@@ -353,7 +353,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                     shared,
                     |metadata, _| {
                         Ok(MemberSharding::Partitioned {
-                            axis: if metadata.id.as_str().contains("down_proj") {
+                            axis: if metadata.id().as_str().contains("down_proj") {
                                 1
                             } else {
                                 0

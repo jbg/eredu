@@ -27,9 +27,9 @@ impl PendingSnapshotResumeRetention {
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
-struct ResumeFailure<B: std::error::Error + 'static, C: std::error::Error + 'static> {
+struct ResumeFailure<C: std::error::Error + 'static> {
     #[source]
-    cause: ControlledTextGenerationError<B, C>,
+    cause: ControlledTextGenerationError<BackendFailure, C>,
     _host: HostPreparationAuthority,
 }
 
@@ -39,18 +39,17 @@ where
         + TextResumeBackend<ResumeSource = <B as TextSnapshotBackend>::SavedTextComponents>,
     C: SnapshotTokenController,
 {
-    /// Remaining admitted output positions represented by the saved frontier.
-    /// A fresh run may shorten this allowance, but cannot refund or extend it.
-    pub fn remaining_tokens(&self) -> Option<usize> {
-        self.remaining_tokens
+    /// Fixed source facts from the actual opaque saved native components.
+    pub fn resume_source_facts(&self) -> Option<eredu_core::TextResumeSourceFacts> {
+        B::saved_text_resume_facts(&self.saved)
     }
-
     /// Borrowed original resume constructor facts, with no host allocation or
     /// source replacement. The eventual native admission revalidates its source.
     pub fn original_resume_preparation_bytes(
         &self,
         runtime: &ModelRuntime<B>,
         config: TextGenerationConfig,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<u64, TextSnapshotError<B::Error>> {
         self.validate_original_resume(config)?;
         B::original_saved_components_resume_preparation_bytes(
@@ -58,6 +57,7 @@ where
             &self.saved,
             config,
             &self.controller,
+            options,
         )
         .map_err(TextSnapshotError::HostAdmission)?
         .ok_or(TextSnapshotError::Unsupported(
@@ -78,6 +78,8 @@ where
             size_of::<TextGenerationConfig>(),
             size_of::<TextSnapshotError<B::Error>>(),
             size_of::<HostPreparationAuthority>(),
+            size_of::<B::DisplacedState>(),
+            size_of::<Option<(ControlledTextGeneration<'_, B, C>, B::DisplacedState, H)>>(),
             size_of::<Result<(H, HostPreparationAuthority), TextHostCopyError>>(),
             size_of::<
                 Result<
@@ -85,7 +87,9 @@ where
                     TextSnapshotError<B::Error>,
                 >,
             >(),
-            BackendFailure::source_retention_peak_bytes::<ResumeFailure<B::Error, C::Error>>()?,
+            BackendFailure::source_retention_peak_bytes::<ResumeFailure<C::Error>>()?,
+            BackendFailure::source_retention_peak_bytes::<B::Error>()?,
+            size_of::<ControlledTextGenerationError<BackendFailure, C::Error>>(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -105,13 +109,21 @@ where
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<(ControlledTextGeneration<'a, B, C>, H::Copied)>, TextSnapshotError<B::Error>>
     {
-        self.resume_original_host(
+        self.resume_original_host_with_displaced(
             runtime,
             config,
             host,
             cancellation,
-            SnapshotResourceKind::Restore,
+            &eredu_core::OriginalTextResumeOptions::new(
+                eredu_core::OriginalTextResumeKind::Restore,
+            ),
         )
+        .map(|result| {
+            result.map(|(generation, displaced, host)| {
+                drop(displaced);
+                (generation, host)
+            })
+        })
     }
 
     /// Makes another independently admitted runnable branch from the immutable
@@ -125,13 +137,19 @@ where
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<(ControlledTextGeneration<'a, B, C>, H::Copied)>, TextSnapshotError<B::Error>>
     {
-        self.resume_original_host(
+        self.resume_original_host_with_displaced(
             runtime,
             config,
             host,
             cancellation,
-            SnapshotResourceKind::Branch,
+            &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Branch),
         )
+        .map(|result| {
+            result.map(|(generation, displaced, host)| {
+                drop(displaced);
+                (generation, host)
+            })
+        })
     }
 
     fn validate_original_resume(
@@ -148,19 +166,34 @@ where
             _ => Err(TextSnapshotError::InconsistentState),
         }
     }
-    fn resume_original_host<'a, H: PreparedTextHostCopy>(
+    /// Same original copy transaction while retaining the native slot displaced
+    /// by successful installation for serial branch composition. The slot grants
+    /// no new run or copy allowance; only the source's cumulative budget is used.
+    pub fn resume_original_host_with_displaced<'a, H: PreparedTextHostCopy>(
         &self,
         runtime: &'a mut ModelRuntime<B>,
         config: TextGenerationConfig,
         host: H,
         cancellation: &GenerationCancellationToken,
-        kind: SnapshotResourceKind,
-    ) -> Result<Option<(ControlledTextGeneration<'a, B, C>, H::Copied)>, TextSnapshotError<B::Error>>
-    {
-        if cancellation.is_cancelled() || config.sampling().max_new_tokens == Some(0) {
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
+    ) -> Result<
+        Option<(
+            ControlledTextGeneration<'a, B, C>,
+            B::DisplacedState,
+            H::Copied,
+        )>,
+        TextSnapshotError<B::Error>,
+    > {
+        if cancellation.is_cancelled()
+            || (config.sampling().max_new_tokens == Some(0) && !options.terminal)
+        {
             return Ok(None);
         }
-        let preparation = self.original_resume_preparation_bytes(runtime, config)?;
+        let kind = match options.kind {
+            eredu_core::OriginalTextResumeKind::Restore => SnapshotResourceKind::Restore,
+            eredu_core::OriginalTextResumeKind::Branch => SnapshotResourceKind::Branch,
+        };
+        let preparation = self.original_resume_preparation_bytes(runtime, config, options)?;
         let controls = Self::original_resume_control_bytes::<H::Copied>()
             .ok_or(ExecutionControlError::Overflow)?;
         if host
@@ -184,6 +217,7 @@ where
                 runtime,
                 &self.saved,
                 config,
+                options,
             )],
             host_bytes
                 .checked_add(controller_bytes)
@@ -205,32 +239,45 @@ where
                 .ok_or(TextSnapshotError::Unsupported(
                     "original resume controller copy",
                 ))?;
-        let generation = ControlledTextGeneration::resume_saved_original_with_kind(
+        let generation = ControlledTextGeneration::resume_saved_original_with_displaced(
             runtime,
             &self.saved,
             config,
             controller,
             cancellation,
             &host,
-            match kind {
-                SnapshotResourceKind::Restore => eredu_core::OriginalTextResumeKind::Restore,
-                SnapshotResourceKind::Branch => eredu_core::OriginalTextResumeKind::Branch,
-                _ => return Err(TextSnapshotError::InconsistentState),
-            },
+            options,
         )
         .map_err(|cause| {
-            let kind = match &cause {
-                ControlledTextGenerationError::Preparation(cause) => cause.kind(),
-                _ => eredu_core::BackendFailureKind::Other,
+            let cause = match cause {
+                ControlledTextGenerationError::Preparation(error) => {
+                    ControlledTextGenerationError::Preparation(error)
+                }
+                ControlledTextGenerationError::Backend(error) => {
+                    ControlledTextGenerationError::Backend(B::into_backend_failure(error))
+                }
+                ControlledTextGenerationError::Controller(error) => {
+                    ControlledTextGenerationError::Controller(error)
+                }
             };
-            TextSnapshotError::Resume(BackendFailure::new(
-                kind,
-                ResumeFailure {
-                    cause,
-                    _host: host.clone(),
-                },
-            ))
+            let (kind, operation) = match &cause {
+                ControlledTextGenerationError::Preparation(error)
+                | ControlledTextGenerationError::Backend(error) => {
+                    (error.kind(), error.operation())
+                }
+                _ => (eredu_core::BackendFailureKind::Other, "snapshot resume"),
+            };
+            TextSnapshotError::Resume(
+                BackendFailure::new(
+                    kind,
+                    ResumeFailure {
+                        cause,
+                        _host: host.clone(),
+                    },
+                )
+                .with_operation(operation),
+            )
         })?;
-        Ok(generation.map(|generation| (generation, copied)))
+        Ok(generation.map(|(generation, displaced)| (generation, displaced, copied)))
     }
 }

@@ -6,13 +6,13 @@ use std::{
 };
 #[derive(Debug)]
 struct Account(Arc<Mutex<usize>>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let mut available = self.0.lock().unwrap();
         *available =
             available
                 .checked_sub(bytes)
-                .ok_or(WorkspaceMetadataFundingError::Capacity {
+                .ok_or(HostMetadataFundingError::Capacity {
                     required: bytes as u64,
                     available: *available as u64,
                 })?;
@@ -60,7 +60,7 @@ impl WorkspaceFactMechanisms for NoTensors {
 }
 pub(crate) fn check<S: ArchitectureBoundary>(schema: S, values: Vec<i32>) {
     let remaining = Arc::new(Mutex::new(8 * 1024 * 1024));
-    let funding = WorkspaceMetadataFunding::new(Account(remaining.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(remaining.clone())).unwrap();
     let context = WorkspaceContext::new_with_metadata_funding(NoTensors, funding).unwrap();
     let before = *remaining.lock().unwrap();
     let ordinary = schema

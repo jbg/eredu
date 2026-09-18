@@ -65,7 +65,7 @@ rustdoc-args = [
 [features]
 # Development-only: force one actual workspace reserve to fail by overflow.
 workspace-test-support = []
-alloc = []
+alloc = ["dep:hashbrown"]
 default = [
     "std",
     "syntax",
@@ -166,7 +166,15 @@ bench = false
 name = "integration"
 path = "tests/lib.rs"
 
+[dependencies.hashbrown]
+version = "=0.17.1"
+path = "../hashbrown-0.17.1"
+optional = true
+default-features = false
+features = ["default-hasher"]
+
 [dependencies.aho-corasick]
+path = "../aho-corasick-1.1.5"
 version = "1.0.0"
 optional = true
 default-features = false
@@ -176,12 +184,14 @@ version = "0.4.14"
 optional = true
 
 [dependencies.memchr]
+path = "../memchr-2.8.3"
 version = "2.6.0"
 optional = true
 default-features = false
 
 [dependencies.regex-syntax]
-version = "0.8.5"
+version = "=0.8.11"
+path = "../regex-syntax-0.8.11"
 optional = true
 default-features = false
 

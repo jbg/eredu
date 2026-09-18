@@ -24,12 +24,12 @@ where
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime.architecture(),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.architecture(),
         };
-        architecture.validate_ingress_plan(plan)?;
+        architecture.validate_ingress_plan(plan, None)?;
         CompositePrefillCut::new(
-            architecture.execution_graph()?,
+            architecture.execution_graph()?.into_owned(),
             architecture.primary_execution_group(),
         )
-        .map_err(A::ingress_error)
+        .map_err(|cause| A::ingress_error(cause, None))
     }
 
     fn media_cut_with_metadata(
@@ -44,9 +44,9 @@ where
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime.architecture(),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.architecture(),
         };
-        architecture.validate_ingress_plan_with_metadata(plan, context)?;
+        architecture.validate_ingress_plan(plan, Some(context))?;
         let graph = architecture
-            .ingress_execution_graph_with_metadata(context)?
+            .ingress_execution_graph(Some(context))?
             .into_owned_with_metadata(context)?;
         crate::media_prefill::construction::original_cut(
             graph,
@@ -85,7 +85,7 @@ where
     {
         let initial = source
             .start(span)
-            .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e)))?;
+            .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e, None)))?;
         let invocation = MediaInvocation {
             source,
             span,
@@ -541,6 +541,57 @@ where
         })
     }
 
+    fn execute_media_span_before_publication<O>(
+        &mut self,
+        source: &mut PreparedMediaPrefill<A, B, M::State>,
+        input: Result<&PrefillChunk, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        checkpoint: Option<M::StateCheckpoint>,
+    ) -> Result<(Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let session = self;
+        let batch_size = source.geometry().batch_size;
+            session.require_input_result_agreement(true)?;
+            let (output, checkpoint, forward) = session
+                .execute_input_operation_before_publication(
+                    input,
+                    ExpertPass::Prefill,
+                    context,
+                    observer,
+                    demand,
+                    checkpoint,
+                    |span| Ok(Some([batch_size, span.input.end - span.input.start])),
+                    |driver, execution, state, paths, span, observer, demand| {
+                        driver
+                            .forward_media_span(
+                                execution,
+                                source,
+                                span,
+                                state,
+                                context,
+                                observer,
+                                paths,
+                                demand,
+                            )
+                            .map_err(widen_infallible)
+                            .and_then(|result| {
+                                // This joins the existing execution vote, before
+                                // completion/publication. No second readiness phase.
+                                source.validate_complete_cut().map_err(|error| {
+                                    ReplicatedTextSessionError::Architecture(A::ingress_error(
+                                        error, None))
+                                })?;
+                                Ok(result)
+                            })
+                    },
+                )?;
+        Ok((output, checkpoint, forward))
+    }
+
     pub(super) fn prefill_media_span<O>(
         &mut self,
         source: &mut PreparedMediaPrefill<A, B, M::State>,
@@ -556,7 +607,7 @@ where
         let input = span.and_then(|span| {
             source
                 .validate_span(span)
-                .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e)))?;
+                .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e, None)))?;
             source
                 .validate_revision(self.state.inference_retention().revision())
                 .map_err(ReplicatedTextSessionError::WorkingMemory)?;
@@ -593,7 +644,7 @@ where
                         WorkingMemoryError::IdentityMismatch,
                     ));
                 }
-                capture.validate_request(source.request())
+                capture.validate_request(source.request().map_err(ReplicatedTextSessionError::WorkingMemory)?)
                     .map_err(ReplicatedTextSessionError::WorkingMemory)?;
             } else if let Some(capture) = observer.admitted_capture_continuation() {
                 if !capture.selection().is_prepared_media() {
@@ -601,7 +652,7 @@ where
                         WorkingMemoryError::IdentityMismatch,
                     ));
                 }
-                capture.validate_request(source.request())
+                capture.validate_request(source.request().map_err(ReplicatedTextSessionError::WorkingMemory)?)
                     .map_err(ReplicatedTextSessionError::WorkingMemory)?;
             } else if observer.requires_prepared_traversal()
                 || observer.requires_sequence_readout()
@@ -613,47 +664,10 @@ where
             }
             Ok(span)
         });
-        let batch_size = source.geometry().batch_size;
         let result = self.with_observation_transaction(observer, |session, observer| {
-            session.require_input_result_agreement(true)?;
-            let (output, checkpoint, forward) = session
-                .execute_input_operation_before_publication(
-                    input,
-                    ExpertPass::Prefill,
-                    context,
-                    observer,
-                    demand,
-                    None,
-                    |span| Ok(Some([batch_size, span.input.end - span.input.start])),
-                    |session, span, observer, demand, prepared_traversal| {
-                        let paths = prepared_traversal
-                            .then_some(session.observation_paths.as_ref())
-                            .flatten();
-                        session
-                            .driver
-                            .forward_media_span(
-                                &mut session.execution,
-                                source,
-                                span,
-                                &mut session.state,
-                                context,
-                                observer,
-                                paths,
-                                demand,
-                            )
-                            .map_err(widen_infallible)
-                            .and_then(|result| {
-                                // This joins the existing execution vote, before
-                                // completion/publication. No second readiness phase.
-                                source.validate_complete_cut().map_err(|error| {
-                                    ReplicatedTextSessionError::Architecture(A::ingress_error(
-                                        error,
-                                    ))
-                                })?;
-                                Ok(result)
-                            })
-                    },
-                )?;
+            let (output, checkpoint, forward) = session.execute_media_span_before_publication(
+                source, input, demand, context, observer, None,
+            )?;
             let (output, checkpoint, forward) = session
                 .publish_observed_output_transaction_with_readout(
                     output, checkpoint, forward, context,
@@ -682,3 +696,5 @@ where
         }
     }
 }
+
+mod speculative;

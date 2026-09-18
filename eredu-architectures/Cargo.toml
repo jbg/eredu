@@ -18,6 +18,7 @@ image = ["eredu-media/image"]
 audio = ["eredu-media/audio"]
 
 [dependencies]
+eredu-collections.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-gguf.workspace = true

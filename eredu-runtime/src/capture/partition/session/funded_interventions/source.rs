@@ -31,7 +31,7 @@ pub struct PreparedPartitionInterventionSource {
     pub(super) members: Vec<usize>,
     pub(super) descriptor: [u8; 32],
     pub(super) identity: Arc<Identity>,
-    pub(super) metadata: WorkspaceMetadataFunding,
+    pub(super) metadata: HostMetadataFunding,
     metadata_bytes: usize,
 }
 impl PreparedPartitionInterventionSource {
@@ -42,7 +42,7 @@ impl PreparedPartitionInterventionSource {
         prediction: u64,
         world: usize,
         invocations: &[PartitionInterventionInvocationSource<'_>],
-        metadata: &WorkspaceMetadataFunding,
+        metadata: &HostMetadataFunding,
     ) -> Result<Self, PartitionInterventionSourceError> {
         let result = (|| -> Result<Self, Cause> {
             let mut bytes = Self::control_bytes().ok_or(CaptureError::Overflow)?;
@@ -375,7 +375,7 @@ impl PreparedPartitionInterventionSource {
             size_of::<Result<Self, Cause>>(),
             size_of::<Result<Self, PartitionInterventionSourceError>>(),
             size_of::<OriginalInterventionSource>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Arc<Identity>>(),
             size_of::<Sha256>(),
             size_of::<HashWriter<'_>>(),
@@ -388,7 +388,7 @@ impl PreparedPartitionInterventionSource {
                 u64,
                 usize,
                 &[PartitionInterventionInvocationSource<'_>],
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<PartitionInterventionInvocationSource<'_>>(),
             size_of::<PartitionInterventionMemberSource<'_>>(),
@@ -405,7 +405,7 @@ impl PreparedPartitionInterventionSource {
     }
 }
 fn vector<T>(
-    metadata: &WorkspaceMetadataFunding,
+    metadata: &HostMetadataFunding,
     count: usize,
     bytes: &mut usize,
 ) -> Result<Vec<T>, Cause> {
@@ -463,3 +463,5 @@ fn runtime_controls<T: PartitionCaptureTransport>() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&frames), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

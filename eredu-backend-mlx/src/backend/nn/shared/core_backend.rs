@@ -182,7 +182,7 @@ impl NeuralBackend for MlxNeuralBackend {
                 let topology = exact_parameter_topology(&module, [("weight", weight)])?;
                 (Some(module), topology)
             }
-            None => (None, BTreeMap::new()),
+            None => (None, NativeParameterTable::from_rows(Vec::new())?),
         };
         Ok(MlxRmsNorm {
             groups: spec.groups,
@@ -239,22 +239,22 @@ impl NeuralBackend for MlxNeuralBackend {
         let dtype = input.dtype();
         let wide = compute(input.as_dtype(Dtype::Float32, context))?;
         let scaled = compute(wide.multiply(
-            Array::try_from_f32(beta).map_err(ComputeError::backend_source)?,
+            Array::try_from_f32(beta).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let output = compute(scaled.exp(context))?;
         let output = compute(output.log1p(context))?;
         let output = compute(output.divide(
-            Array::try_from_f32(beta).map_err(ComputeError::backend_source)?,
+            Array::try_from_f32(beta).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let output = compute(safemlx::ops::r#where(
             scaled
                 .gt(
-                    Array::try_from_f32(20.0).map_err(ComputeError::backend_source)?,
+                    Array::try_from_f32(20.0).map_err(ComputeError::backend_retained_source)?,
                     context,
                 )
-                .map_err(ComputeError::backend_source)?,
+                .map_err(ComputeError::backend_retained_source)?,
             &wide,
             output,
             context,
@@ -305,7 +305,7 @@ impl NeuralBackend for MlxNeuralBackend {
         ))?;
         let scale = compute(safemlx::ops::rsqrt(
             compute(variance.add(
-                Array::try_from_f32(epsilon).map_err(ComputeError::backend_source)?,
+                Array::try_from_f32(epsilon).map_err(ComputeError::backend_retained_source)?,
                 context,
             ))?,
             context,
@@ -326,7 +326,7 @@ impl NeuralBackend for MlxNeuralBackend {
         let squared = compute(input.square(context))?;
         let sum = compute(safemlx::ops::sum_axis(&squared, -1, true, context))?;
         let denominator = compute(sum.add(
-            Array::try_from_f32(epsilon).map_err(ComputeError::backend_source)?,
+            Array::try_from_f32(epsilon).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         compute_tensor(input.multiply(compute(denominator.rsqrt(context))?, context))
@@ -367,7 +367,7 @@ impl NeuralBackend for MlxNeuralBackend {
         ))?;
         let scale = compute(safemlx::ops::rsqrt(
             compute(variance.add(
-                Array::try_from_f32(epsilon).map_err(ComputeError::backend_source)?,
+                Array::try_from_f32(epsilon).map_err(ComputeError::backend_retained_source)?,
                 context,
             ))?,
             context,
@@ -381,7 +381,7 @@ impl NeuralBackend for MlxNeuralBackend {
         compute(normalized.multiply(&gate, context))?
             .as_dtype(dtype, context)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn segmented_attention(
@@ -454,7 +454,7 @@ impl NeuralBackend for MlxNeuralBackend {
         if let Some(bound) = policy.gate_upper_bound() {
             gate = compute(safemlx::ops::minimum(
                 gate,
-                Array::try_from_f32(bound).map_err(ComputeError::backend_source)?,
+                Array::try_from_f32(bound).map_err(ComputeError::backend_retained_source)?,
                 context,
             ))?;
         }
@@ -463,7 +463,7 @@ impl NeuralBackend for MlxNeuralBackend {
         }
         if policy.up_offset() != 0.0 {
             up = compute(up.add(
-                Array::try_from_f32(policy.up_offset()).map_err(ComputeError::backend_source)?,
+                Array::try_from_f32(policy.up_offset()).map_err(ComputeError::backend_retained_source)?,
                 context,
             ))?;
         }
@@ -475,7 +475,7 @@ impl NeuralBackend for MlxNeuralBackend {
                 let scaled = compute(
                     gate.multiply(
                         Array::try_from_f32(policy.sigmoid_multiplier())
-                            .map_err(ComputeError::backend_source)?,
+                            .map_err(ComputeError::backend_retained_source)?,
                         context,
                     ),
                 )?;
@@ -577,13 +577,13 @@ impl NeuralBackend for MlxNeuralBackend {
         let key_positions = compute(key_positions.try_index_device((NewAxis, ..), context))?;
         let distances = compute(query_positions.subtract(key_positions, context))?;
         let mut valid = compute(distances.ge(
-            Array::try_from_int(0).map_err(ComputeError::backend_source)?,
+            Array::try_from_int(0).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         if let Some(window) = input.window {
             valid = compute(valid.logical_and(
                 &compute(distances.lt(
-                    Array::try_from_int(window).map_err(ComputeError::backend_source)?,
+                    Array::try_from_int(window).map_err(ComputeError::backend_retained_source)?,
                     context,
                 ))?,
                 context,
@@ -598,7 +598,7 @@ impl NeuralBackend for MlxNeuralBackend {
             context,
         ))?;
         let scaled = compute(relative.queries.multiply(
-            Array::try_from_f32(1.0 / dimensions as f32).map_err(ComputeError::backend_source)?,
+            Array::try_from_f32(1.0 / dimensions as f32).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let scores = compute(matmul(
@@ -610,7 +610,7 @@ impl NeuralBackend for MlxNeuralBackend {
         let scores = compute(r#where(
             &valid,
             scores,
-            Array::try_from_f32(f32::NEG_INFINITY).map_err(ComputeError::backend_source)?,
+            Array::try_from_f32(f32::NEG_INFINITY).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let probabilities = compute(softmax_axis(scores, -1, true, context))?;
@@ -699,7 +699,7 @@ impl NeuralBackend for MlxNeuralBackend {
                 }
             })
             .transpose()
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         compute_tensor(safemlx::fast::scaled_dot_product_attention(
             input.queries.as_array(),
             &keys,
@@ -867,8 +867,8 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
     ) -> Result<MlxEmbedding, ComputeError> {
         range.validate_global_rows(spec.vocabulary)?;
         let global =
-            i32::try_from(range.global_vocabulary).map_err(ComputeError::backend_source)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_source)?;
+            i32::try_from(range.global_vocabulary).map_err(ComputeError::backend_retained_source)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
         let module = compute(common::linear::unloaded_embedding(
             local,
             spec.dimensions,
@@ -890,7 +890,7 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxLinear, ComputeError> {
         range.validate_global_rows(spec.output)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_source)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
         let module = compute(common::linear::PhysicalLinear::unloaded(
             spec.input,
             local,

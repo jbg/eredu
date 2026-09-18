@@ -9,7 +9,7 @@ use eredu_runtime::{intervention::StaticInterventionPreflight,
 pub(super) struct Source {
     declaration: OriginalInterventionDeclaration,
     pool: WorkingMemoryPool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Source {
     pub(super) fn prepare(sources: &OriginalSpeculativeNumericalSources) -> Result<Self, Error> {
@@ -23,7 +23,7 @@ impl Source {
     pub(super) fn validate(&self, state: &OriginalSpeculativeCapture, plan: &AdmittedSpeculativeActivations) -> Result<(), Error> {
         let bytes = OriginalInterventionDeclaration::activation_validation_control_bytes()
             .and_then(|n| n.checked_add(size_of::<(&Self, &OriginalSpeculativeCapture, &AdmittedSpeculativeActivations, Result<(), Error>)>()))
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         self.funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
         state.validate_control_plan(plan).map_err(|cause| retain_planning_error(cause, self.funding.clone()))?;
         self.declaration.validate_activations(plan)
@@ -38,16 +38,16 @@ impl Source {
             size_of::<Result<OriginalInterventionSource, eredu_runtime::working_memory::OriginalInterventionSourceError>>(),
             size_of::<Result<StaticInterventionPreflight, eredu_runtime::intervention::StaticInterventionScratchError>>(),
             size_of::<Result<(), eredu_runtime::intervention::StaticInterventionPreflightError>>(),
-            PreparedInterventionPlanCopy::inspection_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            OriginalInterventionDeclaration::activation_validation_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            NativeInterventionEstimator::prepared_preflight_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            StaticInterventionPreflight::required_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            OriginalCaptureSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            OriginalInterventionSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            PreparedInterventionPlanCopy::inspection_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            OriginalInterventionDeclaration::activation_validation_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            NativeInterventionEstimator::prepared_preflight_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            StaticInterventionPreflight::required_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            OriginalCaptureSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            OriginalInterventionSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         ];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let retain = |cause| retain_planning_error(cause, self.funding.clone());
         self.validate(state, plan)?;

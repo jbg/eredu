@@ -225,13 +225,13 @@ fn persistent_workers_encode_with_cloned_and_restored_sources_after_owner_drop()
         let (done, wait) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             while receive.recv().unwrap() {
-                let legacy = tokenizer(ModelCachePolicy::Legacy);
-                let original = tokenizer(ModelCachePolicy::NoModelCaches);
+                let legacy = tokenizer(ModelCachePolicy::default());
+                let original = tokenizer(ModelCachePolicy::disabled());
                 let cloned = original.clone();
                 let serialized = serde_json::to_vec(&original).unwrap();
                 let restored = Tokenizer::from_bytes_with_cache_policy(
                     &serialized,
-                    ModelCachePolicy::NoModelCaches,
+                    ModelCachePolicy::disabled(),
                 )
                 .unwrap();
                 drop(original);
@@ -245,17 +245,17 @@ fn persistent_workers_encode_with_cloned_and_restored_sources_after_owner_drop()
                         c.len_utf8(),
                     ));
                 }
-                assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::Legacy);
+                assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::default());
                 for source in [&cloned, &restored, &legacy] {
                     let output = source.encode(input, false).unwrap();
                     assert_eq!(output.get_ids(), expected_ids);
                     assert_eq!(output.get_offsets(), expected_offsets);
                     assert_eq!(source.decode(output.get_ids(), false).unwrap(), input);
                 }
-                assert_eq!(cloned.model_cache_policy(), ModelCachePolicy::NoModelCaches);
+                assert_eq!(cloned.model_cache_policy(), ModelCachePolicy::disabled());
                 assert_eq!(
                     restored.model_cache_policy(),
-                    ModelCachePolicy::NoModelCaches
+                    ModelCachePolicy::disabled()
                 );
                 done.send(()).unwrap();
             }

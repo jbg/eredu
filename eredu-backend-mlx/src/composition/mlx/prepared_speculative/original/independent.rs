@@ -4,7 +4,7 @@ use super::batch::{buffer, inspect};
 use crate::backend::OriginalCopyEnvironment;
 use crate::composition::mlx::session::{MlxModelSession, OriginalInterventionDeclaration};
 use eredu_core::SpeculativeBuffer;
-use eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation;
+use eredu_runtime::working_memory::PreparedSemanticSource;
 
 struct Lane<'lane, 'world, C: SpeculativeTokenFilterController> {
     lane: SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>,
@@ -12,11 +12,11 @@ struct Lane<'lane, 'world, C: SpeculativeTokenFilterController> {
     context_positions: NonZeroU64,
     declaration: Option<OriginalInterventionDeclaration>,
     // Retires after this lane's actual source/header-bearing payloads.
-    preparation: OriginalSpeculativeSemanticPreparation,
+    preparation: PreparedSemanticSource,
 }
 struct Bound {
     sources: AutoregressiveSourcePair,
-    preparation: OriginalSpeculativeSemanticPreparation,
+    preparation: PreparedSemanticSource,
 }
 
 pub(super) fn run_batch<'lane, 'world, C, V>(
@@ -32,15 +32,15 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
         size_of::<eredu_core::SpeculativeBufferIntoIter<SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>>>(),
         size_of::<SpeculativeBuffer<Lane<'lane, 'world, C>>>(),
         size_of::<eredu_core::SpeculativeBufferIntoIter<Lane<'lane, 'world, C>>>(),
-        size_of::<OriginalSpeculativeSemanticPreparation>(), size_of::<WorkspaceMetadataFunding>(),
+        size_of::<PreparedSemanticSource>(), size_of::<HostMetadataFunding>(),
         size_of::<SpeculativeDraft<'_, MlxDrafter>>(), size_of::<V>(),
         size_of::<(eredu_core::SpeculativeSchedulerOptions, usize)>(),
         size_of::<(&MlxBackend<'_>, &mut MlxModelSession, &mut MlxDrafter)>(),
         size_of::<Result<SpeculativeGenerationBatchOutput, Error>>(),
-        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
     let run = || {
         // Qualify every actual source before either model is lent for work.
         for lane in &lanes { inspect(backend, session, lane)?; }
@@ -67,7 +67,7 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
                 size_of::<Result<Option<OriginalInterventionDeclaration>, Error>>(),
             ];
             local.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
             let geometry = eredu_core::speculative::SpeculativeRequestGeometry::new(lane.config(), capacity.get());
             let context_positions = u64::try_from(geometry.output_positions()).ok()
                 .and_then(|output| input_positions.get().checked_add(output)).and_then(NonZeroU64::new)
@@ -90,7 +90,7 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
                     size_of::<Result<(), Error>>(), size_of::<Result<SpeculativeGenerationBatchOutput, Error>>(),
                 ];
                 funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-                    .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
                 let mut plans = buffer(count, &funding)?;
                 let mut sources = buffer(count, &funding)?;
                 let mut lanes = buffer(count, &funding)?;
@@ -101,11 +101,11 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
                         size_of::<Result<Bound, Error>>(), size_of::<SpeculativeExecutionStreams<'_>>(),
                     ];
                     local.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-                        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+                        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
                     let schedule = AutoregressiveSchedulePlan::new(selected, capacity,
                         value.input_positions, value.context_positions, value.lane.config(), options)
                         .map_err(|cause| super::super::super::model::retain_planning_error(cause, local.clone()))?;
-                    local.reserve_metadata(schedule.control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+                    local.reserve_metadata(schedule.control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
                         .map_err(Error::WorkspacePlanning)?;
                     let pair = AutoregressiveSourcePair::prepare_funded(target, draft.executable(), &schedule,
                         backend.memory_pool(), value.preparation.capacity_bytes(), local.clone())?

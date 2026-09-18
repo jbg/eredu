@@ -10,10 +10,10 @@ struct Account {
     closed: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
 }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(WorkspaceMetadataFundingError::Capacity {
+            return Err(HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: 0,
             });
@@ -79,7 +79,7 @@ fn collector() -> CacheResidencyTelemetry {
 fn prepared_snapshot_preserves_history_overflow_peaks_and_empty_scratch_custody() {
     let closed = Arc::new(AtomicBool::new(false));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         closed: closed.clone(),
         retired: retired.clone(),
     })

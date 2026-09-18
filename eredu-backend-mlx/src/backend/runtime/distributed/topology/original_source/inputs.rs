@@ -4,7 +4,7 @@ use safemlx::{PreparedInputArena,PreparedInputLeaf,PreparedInputPlan,PreparedSub
 #[derive(Clone)]
 struct Custody {source:RetainedCommunicationSource,
     native:Option<super::preparation::SharedPreparationCustody>,
-    funding:WorkspaceMetadataFunding}
+    funding:HostMetadataFunding}
 // Provisional arrays/leaves retire before the arena/preparation and H on every
 // failed prefix. No native roots are stored in the account-only custody.
 struct Progress<const N:usize> {
@@ -19,7 +19,7 @@ struct Progress<const N:usize> {
 pub(in crate::backend::runtime::distributed::topology::original_source) struct CompletedCommunicationInput {
     value: Array,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl CompletedCommunicationInput {
     pub(super) fn value(&self) -> &Array { &self.value }
@@ -110,8 +110,8 @@ fn construct_inner<const N:usize>(source:&OriginalCommunicationSource<'_>,
     }
     Ok(std::array::from_fn(|index|progress.arrays[index].take().expect("completed source array")))
 }
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,bytes:&[usize])->Result<(),Error>{
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,bytes:&[usize])->Result<(),Error>{
     funding.reserve_metadata(bytes.iter().copied().try_fold(size_of_val(bytes),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }

@@ -112,7 +112,7 @@ impl CaptureSession {
         let custody = host.clone();
         let result = (|| {
             binding.source().retain_host_preparation(host)?;
-            let mut result = Self::from_shared_plan(binding.source().clone());
+            let mut result = Self::new(binding.source().clone());
             result.ordinary_error_custody = Some(host.clone());
             result.retain_host_preparation(host)?;
             result.ordinary_prefill = Some(binding);
@@ -206,7 +206,7 @@ impl CaptureSession {
             }
             if p.logical_epoch.is_none() {
                 self.claim_step_epoch(epoch, false)
-                    .map_err(policy::legacy_error)?;
+                    .map_err(policy::public_error)?;
                 p.logical_epoch = Some(epoch);
                 self.begin_step_inner(CapturePhase::Prefill, 0)?;
                 let count = p.binding.source().admission().plan().selections.len();

@@ -44,22 +44,22 @@ pub(crate) struct SourceBindingError {
 }
 impl PreparedPartitionFragmentSourceAllowance {
     pub(crate) fn prepare<T:PartitionCaptureTransport>(transport:&T,receipt:&mut PartitionCaptureReceiptPlan,
-        geometry:&[PartitionCaptureFragmentGeometry<'_>],metadata:&WorkspaceMetadataFunding,ledger:&mut dyn CaptureReservation)
+        geometry:&[PartitionCaptureFragmentGeometry<'_>],metadata:&HostMetadataFunding,ledger:&mut dyn CaptureReservation)
         ->Result<Self,PartitionCaptureFragmentAllowanceError>
     where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
         metadata.reserve_metadata(Self::control_bytes().ok_or_else(||PartitionCaptureFragmentAllowanceError{
-            cause:Cause::Source("source allowance controls overflow"),_source:receipt.shared_plan_source().cloned(),_metadata:metadata.clone()})?)
-            .map_err(|e|PartitionCaptureFragmentAllowanceError{cause:e.into(),_source:receipt.shared_plan_source().cloned(),_metadata:metadata.clone()})?;
+            cause:Cause::Source("source allowance controls overflow"),_source:receipt.shared_plan_source().clone(),_metadata:metadata.clone()})?)
+            .map_err(|e|PartitionCaptureFragmentAllowanceError{cause:e.into(),_source:receipt.shared_plan_source().clone(),_metadata:metadata.clone()})?;
         let allowance=PreparedPartitionFragmentAllowance::prepare_sources(transport,receipt,Sources::Geometry(geometry),metadata,ledger)?;
         Ok(Self{allowance})
     }
     pub(crate) fn prepare_routed<T:PartitionCaptureTransport>(transport:&T,receipt:&mut PartitionCaptureReceiptPlan,
-        geometry:&[PartitionCaptureRoutedFragmentGeometry<'_>],metadata:&WorkspaceMetadataFunding,ledger:&mut dyn CaptureReservation)
+        geometry:&[PartitionCaptureRoutedFragmentGeometry<'_>],metadata:&HostMetadataFunding,ledger:&mut dyn CaptureReservation)
         ->Result<Self,PartitionCaptureFragmentAllowanceError>
     where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
         metadata.reserve_metadata(Self::control_bytes().ok_or_else(||PartitionCaptureFragmentAllowanceError{
-            cause:Cause::Source("source allowance controls overflow"),_source:receipt.shared_plan_source().cloned(),_metadata:metadata.clone()})?)
-            .map_err(|e|PartitionCaptureFragmentAllowanceError{cause:e.into(),_source:receipt.shared_plan_source().cloned(),_metadata:metadata.clone()})?;
+            cause:Cause::Source("source allowance controls overflow"),_source:receipt.shared_plan_source().clone(),_metadata:metadata.clone()})?)
+            .map_err(|e|PartitionCaptureFragmentAllowanceError{cause:e.into(),_source:receipt.shared_plan_source().clone(),_metadata:metadata.clone()})?;
         let allowance=PreparedPartitionFragmentAllowance::prepare_sources(transport,receipt,Sources::RoutedGeometry(geometry),metadata,ledger)?;
         Ok(Self{allowance})
     }

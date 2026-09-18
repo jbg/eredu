@@ -6,6 +6,7 @@ use eredu_runtime::working_memory::WorkingMemoryFundingScope;
 
 #[derive(Debug)]
 struct PublishedStorage {
+    domain: eredu_core::SharedStorageDomain,
     // Native arrays and host buffers are removed after successful attachment.
     // The remaining source/buffer roots retire outside native locks before
     // their registrations. Their weak identity tokens prevent address reuse.
@@ -24,6 +25,72 @@ struct PublishedStorage {
 pub(crate) struct RetainedStoragePublication(
     #[allow(dead_code)] std::rc::Rc<OrdinaryRetirement<PublishedStorage>>,
 );
+
+impl RetainedStoragePublication {
+    /// Frames used by the read-only receipt lookup. The ordinary initial map
+    /// already owns its nodes; lookup neither clones a key nor builds a table.
+    pub(crate) fn attachment_lookup_control_bytes() -> Option<usize> {
+        use std::mem::size_of;
+        let parts = [
+            size_of::<&Self>(),
+            size_of::<&eredu_core::SharedStorageDomain>(),
+            size_of::<safemlx::AllocationInfo>(),
+            size_of::<safemlx::AllocationIdentity>(),
+            size_of::<u64>(), // exact capacity forwarded to the scalar receipt lookup
+            size_of::<Option<&NativeEntry<RetainedArray>>>(),
+            size_of::<Option<&NativeEntry<RetainedHostBuffer>>>(),
+            size_of::<bool>(), // Host receipt comparison
+            size_of::<bool>(),
+        ];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+
+    pub(crate) fn has_native_attachment(
+        &self,
+        domain: &eredu_core::SharedStorageDomain,
+        allocation: safemlx::AllocationInfo,
+    ) -> bool {
+        self.has_native_attachment_facts(domain, allocation.identity(), allocation.bytes() as u64)
+    }
+
+    fn has_native_attachment_facts(
+        &self,
+        domain: &eredu_core::SharedStorageDomain,
+        identity: safemlx::AllocationIdentity,
+        capacity: u64,
+    ) -> bool {
+        self.0.domain.same_identity(domain)
+            && (matches!(self.0._non_native.arrays.get(&identity),
+                Some(NativeEntry::Attached(bytes)) if *bytes == capacity)
+                || matches!(self.0._non_native.hosts.get(&identity),
+                    Some(NativeEntry::Attached(bytes)) if *bytes == capacity))
+    }
+    /// All charges that could not attach to their physical owners must remain
+    /// covered by this separate, still-retained publication. Source aliases in
+    /// the inventory retain their own original construction accounts. An
+    /// unquoted source population is outside this narrow comparison.
+    pub(crate) fn can_retire_with(&self, retained: &Self) -> bool {
+        !self.0._original.has_custody()
+            && self.0._registrations.iter().all(|charge| {
+                retained.0._registrations.iter()
+                    .any(|other| charge.same_registered_storage(other))
+            })
+    }
+
+    pub(crate) fn coverage_control_bytes() -> Option<usize> {
+        use std::{mem::size_of, slice::Iter};
+        let parts = [
+            size_of::<(&Self, &Self)>(),
+            size_of::<Option<&Self>>(),
+            size_of::<bool>(),
+            size_of::<[Iter<'static, WorkingMemoryStorage<StorageIdentity>>; 2]>(),
+            size_of::<(&WorkingMemoryStorage<StorageIdentity>, &WorkingMemoryStorage<StorageIdentity>)>(),
+            size_of::<Option<(&WorkingMemoryPool, &WorkingMemoryPool)>>(),
+            size_of::<[Iter<'static, StorageIdentity>; 2]>(),
+        ];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+}
 
 impl std::fmt::Debug for RetainedStoragePublication {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,7 +264,7 @@ impl RetainedStorage {
         ) {
             return Err(original_source_failure(cause, original));
         }
-        Ok(self.finish_publication(|| registrations.into_values().collect(), original))
+        Ok(self.finish_publication(|| registrations.into_values().collect(), original, domain))
     }
 
     // Shared ordinary/source attachment worker. The selected native route has
@@ -295,11 +362,12 @@ impl RetainedStorage {
         mut self,
         registrations: impl FnOnce() -> Vec<WorkingMemoryStorage<StorageIdentity>>,
         original: UnquotedOriginalSlotSources,
+        domain: &eredu_core::SharedStorageDomain,
     ) -> RetainedStoragePublication {
         let metadata_custody = self
             .publication_custody()
             .expect("validated publication role");
-        self.finish_publication_with_custody(registrations, original, metadata_custody, None)
+        self.finish_publication_with_custody(registrations, original, metadata_custody, None, domain)
     }
     fn finish_publication_with_custody(
         mut self,
@@ -307,12 +375,20 @@ impl RetainedStorage {
         original: UnquotedOriginalSlotSources,
         metadata_custody: Option<eredu_runtime::working_memory::OriginalTextMetadataCustody>,
         host: Option<eredu_core::HostPreparationAuthority>,
+        domain: &eredu_core::SharedStorageDomain,
     ) -> RetainedStoragePublication {
         if let Some(original) = self.original.as_mut() {
             original.finish();
         }
-        self.arrays.clear();
-        self.hosts.clear();
+        // Reuse the already constructed map nodes. Only a successful complete
+        // attachment pass reaches here, and allocation generations never reuse.
+        // A receipt retains neither an Array nor a registration/payload pin.
+        for entry in self.arrays.values_mut() {
+            *entry = NativeEntry::Attached(entry.bytes());
+        }
+        for entry in self.hosts.values_mut() {
+            *entry = NativeEntry::Attached(entry.bytes());
+        }
         // The actual immutable owners now retain only their per-source charge.
         // No publication record keeps a root that points back to that record.
         self.metadata.retain(|_, (_, metadata)| {
@@ -327,10 +403,10 @@ impl RetainedStorage {
         self.slot_metadata.clear();
         RetainedStoragePublication(std::rc::Rc::new(OrdinaryRetirement::new(
             PublishedStorage {
+                domain: domain.clone(),
                 _non_native: self,
-                // Drop the map's duplicate weak identity keys while their
-                // charges remain live. Final key ownership then belongs solely
-                // to the registrations and the pool's ordered retirement.
+                // Detached host/source charges remain here. Native attachment
+                // receipts above hold only scalar generation/capacity facts.
                 _registrations: registrations(),
                 _original: original,
                 _metadata_custody: metadata_custody,
@@ -372,6 +448,10 @@ fn publication_control_bytes(rows: usize) -> Option<u64> {
     let fixed = [
         shared,
         size_of::<PublishedStorage>(),
+        size_of::<std::collections::btree_map::ValuesMut<'_, safemlx::AllocationIdentity, NativeEntry<RetainedHostBuffer>>>(),
+        size_of::<&mut NativeEntry<RetainedHostBuffer>>(),
+        size_of::<NativeEntry<RetainedHostBuffer>>(),
+        size_of::<u64>(),
         size_of::<RetainedStoragePublication>(),
         size_of::<std::rc::Rc<OrdinaryRetirement<PublishedStorage>>>(),
         size_of::<Vec<WorkingMemoryStorage<StorageIdentity>>>(),

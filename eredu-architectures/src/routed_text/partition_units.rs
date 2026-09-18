@@ -15,7 +15,7 @@ impl<P> PartitionUnitProvider<P> {
     }
 }
 
-pub(super) fn with_optional_coordinates<T: Tensor, R>(
+pub(crate) fn with_optional_coordinates<T: Tensor, R>(
     coordinates: Option<&BTreeMap<usize, eredu_core::component::RoutedComponentCoordinateMap>>,
     request: RoutedExpertRequest<'_, '_, T>,
     execute: impl FnOnce(RoutedExpertRequest<'_, '_, T>) -> Result<R, RoutedTextExecutionError>,

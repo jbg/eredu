@@ -395,7 +395,7 @@ struct PagedCopyFailure {
     _rows: Vec<Row>,
     _destination: Option<PreparedIndependentCacheManager>,
     _copy_custody: Option<eredu_runtime::working_memory::WorkspaceCopyRetention>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl std::fmt::Debug for PagedCopyFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -628,3 +628,5 @@ pub(crate) use layout::PagedArrayCopyLayout;
 
 #[path = "registered_copy/host.rs"]
 mod host;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

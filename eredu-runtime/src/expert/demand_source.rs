@@ -1,12 +1,12 @@
 //! Completed demand metadata stays with its issuing source through bank use.
 use eredu_core::ErasedSharedStorageOwner;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, Clone)]
 struct Custody {
     source: ErasedSharedStorageOwner,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
 /// One actual ordered demand result. This owner grants no acquisition, native
@@ -27,13 +27,13 @@ impl IndexedDemandSource {
     /// capacity and `control_bytes` before creating these owners. This method
     /// copies no data and does not infer or reconstruct a source from counts.
     pub fn from_prepared(demands: Vec<(usize, u64)>, source: ErasedSharedStorageOwner,
-        funding: WorkspaceMetadataFunding) -> Self {
+        funding: HostMetadataFunding) -> Self {
         Self { demands, custody: Some(Custody { source, funding }) }
     }
     /// Borrows actual identities and positive occurrence counts.
     pub fn demands(&self) -> &[(usize, u64)] { &self.demands }
     /// The original cumulative account, if the selected producer supplied one.
-    pub fn funding(&self) -> Option<&WorkspaceMetadataFunding> {
+    pub fn funding(&self) -> Option<&HostMetadataFunding> {
         self.custody.as_ref().map(|value| &value.funding)
     }
     /// Exact original source, available only by a borrowed type inspection.
@@ -45,8 +45,8 @@ impl IndexedDemandSource {
     pub fn control_bytes() -> Option<usize> {
         let frames = [size_of::<Self>(), size_of::<Custody>(), size_of::<Failure>(),
             size_of::<Cause>(), size_of::<Option<Custody>>(), size_of::<eredu_nn::Error>(),
-            size_of::<WorkspaceMetadataFundingError>(), size_of::<Result<(), eredu_nn::Error>>(),
-            eredu_nn::Error::retained_source_control_bytes::<Failure>()?];
+            size_of::<HostMetadataFundingError>(), size_of::<Result<(), eredu_nn::Error>>(),
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>()?];
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
     /// Prices derived consumer storage before construction. A refusal keeps
@@ -74,7 +74,7 @@ enum Cause {
     #[error("addressable demand consumer metadata extent overflowed")]
     Overflow,
     #[error("addressable demand metadata funding: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
     #[error("addressable demand consumer: {0}")]
     Execution(#[source] eredu_nn::Error),
 }
@@ -91,15 +91,15 @@ struct Failure {
 #[derive(Clone,Copy)]
 pub struct PreparedIndexedDemandLoan<'a> {
     source:&'a dyn std::any::Any,
-    funding:&'a WorkspaceMetadataFunding,
+    funding:&'a HostMetadataFunding,
 }
 impl<'a> PreparedIndexedDemandLoan<'a> {
     /// Lends the explicitly selected source and its original account.
-    pub fn new(source:&'a dyn std::any::Any,funding:&'a WorkspaceMetadataFunding)->Self {Self{source,funding}}
+    pub fn new(source:&'a dyn std::any::Any,funding:&'a HostMetadataFunding)->Self {Self{source,funding}}
     /// Borrows the exact private source without reconstructing ownership.
     pub fn source<T:std::any::Any>(&self)->Option<&'a T>{self.source.downcast_ref()}
     /// The cumulative account used by completed discovery.
-    pub fn funding(&self)->&'a WorkspaceMetadataFunding{self.funding}
+    pub fn funding(&self)->&'a HostMetadataFunding{self.funding}
 }
 /// Funded demands cannot silently select ordinary acquisition.
 #[derive(Debug,thiserror::Error)]

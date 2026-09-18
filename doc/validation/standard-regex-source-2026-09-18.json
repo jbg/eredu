@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-18",
+  "scope": "Standard regex wrapper construction, source census and invocation cache; both selected schema engines",
+  "rustc": "1.98.0-aarch64-apple-darwin",
+  "archive": {
+    "crate": "regex",
+    "version": "1.13.1",
+    "sha256": "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+  },
+  "validation": {
+    "schema": {
+      "passed": 1329,
+      "filtered": [
+        "validator::tests::validate_ref (external fixture absent)"
+      ],
+      "log": "/tmp/native-standard-schema-final-tests.log"
+    },
+    "wrapper": {
+      "default_passed": 4,
+      "minimal_passed": 4,
+      "upstream_passed": 56,
+      "upstream_ignored": 1,
+      "logs": [
+        "/tmp/native-standard-regex-final-tests.log",
+        "/tmp/native-standard-regex-minimal-final-tests.log"
+      ]
+    },
+    "source_identity": {
+      "repeat_sweeps": 12,
+      "aho_tests": 2,
+      "empty_arc_tests": 1,
+      "logs": [
+        "/tmp/native-standard-schema-repeat-final.log",
+        "/tmp/native-aho-census-base-tests.log",
+        "/tmp/native-regex-census-base-tests.log"
+      ]
+    },
+    "pristine_reference": {
+      "patterns": 316,
+      "comparisons": 36131,
+      "log": "/tmp/native-standard-regex-reference-2.log"
+    },
+    "full_invocation_performance": "/tmp/native-schema-standard-invocation-performance.log"
+  },
+  "commands": [
+    "CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true RUSTC=<pinned rustc> cargo test -p regex --lib --test allocation --test integration",
+    "CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true RUSTC=<pinned rustc> cargo test -p regex --no-default-features --test allocation",
+    "CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true RUSTC=<pinned rustc> cargo check -p regex --all-features",
+    "<direct schema test build, same cargo-selected extern artifacts> --skip validator::tests::validate_ref",
+    "cargo run --manifest-path /private/tmp/eredu-standard-regex-reference/Cargo.toml --release --offline"
+  ],
+  "source_sha256": {
+    "doc/validation/schema-regex-invocation-compare.rs": "33332fc9a3feabdc3b2c91b3b5554d1cb189f8f536d721d1c5ce4d1f976c3502",
+    "doc/validation/standard-regex-compare.rs": "f98fa2b12a4754d8668b4c37dd5cb1579f3f25cdacebe5d29b76b27c49139907",
+    "third-party/aho-corasick-1.1.5/src/source_storage.rs": "ae36ea4f865476de01e10012dc27103cffc8cf071d95d37984e4b7413e26d031",
+    "third-party/jsonschema-0.52.0/src/compilation.rs": "d83e30ab4f6fb78188d786267cf9179a7e2e5357509bda652787a0f6345a2d5e",
+    "third-party/jsonschema-0.52.0/src/error.rs": "e05dd4581e28271211154d5401bc8a87432ab1c7ab3af02619b97edf612bd39e",
+    "third-party/jsonschema-0.52.0/src/regex.rs": "2fc7c36dca55dfed4c786f4d71255b641e98f42ac80d2d368a1c07e80951d563",
+    "third-party/jsonschema-0.52.0/src/validator/source.rs": "d2ed900ab54355be1f5baa78ac9c9cfe57c3659e9cb28ec41a734e3863ac6f7b",
+    "third-party/jsonschema-0.52.0/src/validator/workspace.rs": "7e09185ec257607206772e31bbf9b535b8ed304bdccafb268c2dffb95f542e21",
+    "third-party/regex-1.13.1/Cargo.toml": "1a44d81c33e89108d1e075b6cdf1dae14b5b32a14b729238c59c7fa5ca55337e",
+    "third-party/regex-1.13.1/src/allocation.rs": "88cf613ef88d7c95bd0df65d568264ca5bdaefebe47cf1588233ab865c172a83",
+    "third-party/regex-1.13.1/src/builders.rs": "f83d343877c76d721510838d472b652d2b0e24517a0016a5f92b46146b16cf35",
+    "third-party/regex-1.13.1/src/bytes.rs": "5c28739462f73ac36110723c264f3308d36ecbb0d5897df2fd9cdde4f451db93",
+    "third-party/regex-1.13.1/src/error.rs": "757a247e6d2fb39e5174156069170d9e7a077d4dd90a507187f1e3f526e98c40",
+    "third-party/regex-1.13.1/src/find_byte.rs": "e17cd3b765467685946707840b92ea4e37d3c11081fbf316174a15858cd4bd99",
+    "third-party/regex-1.13.1/src/lib.rs": "93242fb17bb6b4b07b0f41e7b56f9bfe4f009d802d622069a3cc94215be94472",
+    "third-party/regex-1.13.1/src/pattern.rs": "53971d02dde4f8e69055c36e7c56c6c872f0302161bf0977a02b97dc8a152d46",
+    "third-party/regex-1.13.1/src/regex/bytes.rs": "ffbaa431baaa6ad23ac796e3f46e691b0a6567fed632c460fe052e5abe875c36",
+    "third-party/regex-1.13.1/src/regex/mod.rs": "c220b6dd7a5e1945f8e743d1dcd796c5f782c91b0c34eb9915c588174a517fe8",
+    "third-party/regex-1.13.1/src/regex/string.rs": "93bcceb4b9fb1f6240c792fd81eeb53f82624cc5cb16401cbaec96e69753fd85",
+    "third-party/regex-1.13.1/src/regexset/bytes.rs": "25c8d896e4b9caf627cce46e3c305d2e640aeeacea96c40526699f86960d1868",
+    "third-party/regex-1.13.1/src/regexset/mod.rs": "c220b6dd7a5e1945f8e743d1dcd796c5f782c91b0c34eb9915c588174a517fe8",
+    "third-party/regex-1.13.1/src/regexset/string.rs": "ac3fc9c8d2d58379e63bcd92ab2f8ee1c32a1210dceec63925d0c23f1d9dfedd",
+    "third-party/regex-1.13.1/src/search_workspace.rs": "49d603823a15ad096ba4cad99b13f467b6a2866daf2529a89a0819fb6c54e7dd",
+    "third-party/regex-1.13.1/src/source_storage.rs": "ef761185a117a08e2d3d1b5dd1ff918dcd92ca1d51eda3ef9269a9766d09388e",
+    "third-party/regex-1.13.1/tests/allocation.rs": "8c4dc073872f6cf4aa337dcef0e90aff1de9c58df8d51be74f26b47a417186ab",
+    "third-party/regex-automata-0.4.18/src/util/source_storage.rs": "5ca5a62b45d7d650e68ab3c47ec45734bbedcab57b084f0ce3eccf997d2b660b"
+  }
+}

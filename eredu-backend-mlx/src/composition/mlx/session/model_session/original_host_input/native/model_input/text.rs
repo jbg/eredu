@@ -55,6 +55,7 @@ impl MlxOriginalPreparedTextInput {
             controlled_attribution: None,
             prepared_capture: None,
             original_media: None,
+            placement_semantics: None,
             cache_identity: self.0.storage().cache().cloned(),
             prefill_chunk_positions: chunk,
             inference_request: None,

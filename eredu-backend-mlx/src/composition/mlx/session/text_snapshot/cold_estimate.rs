@@ -95,6 +95,12 @@ pub(super) fn resume(
         (None, Some(media)) => {
             pending_input::PromptCopyPlan::completed_media_estimate(media, array_bytes)?
         }
+        // A terminal continuation retains its decoder and sampler, but the
+        // validated zero-output resume source has no next native input.
+        (None, None) if source.terminal => SnapshotEstimate {
+            retained_bytes: 0,
+            copy_bytes: 0,
+        },
         _ => return None,
     };
     [sampler, pending]

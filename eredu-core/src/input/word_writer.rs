@@ -64,6 +64,11 @@ impl InputExtent {
                 dimension(width)?;
             }
             Self::AudioValidFrames(frames) => dimension(frames)?,
+            Self::VideoFrame { group, index, count, first_source_frame, last_source_frame, source_fps_bits } => {
+                for value in [group, index, count, first_source_frame, last_source_frame] { dimension(value)?; }
+                emit(sink, source_fps_bits as u32)?;
+                emit(sink, (source_fps_bits >> 32) as u32)?;
+            }
         }
         Ok(())
     }

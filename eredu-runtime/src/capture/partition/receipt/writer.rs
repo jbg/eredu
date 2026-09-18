@@ -1,7 +1,7 @@
 //! Exact borrowed completed-record encoding into an original counted destination.
 use super::*;
 use eredu_core::capture::{BorrowedPartitionCaptureFragmentRecord, BorrowedPartitionCaptureProducerRecord};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Borrowed encoding input. It is descriptive only: placement, record validity,
@@ -25,16 +25,16 @@ pub enum PartitionCaptureEncodingError {
         /// Actual closed-source refusal.
         reason: &'static str,
         /// Original account outliving the failure.
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     },
     /// Fixed writer controls could not be reserved.
     #[error("partition capture writer reservation: {cause}")]
     Funding {
         /// Original metadata failure.
         #[source]
-        cause: WorkspaceMetadataFundingError,
+        cause: HostMetadataFundingError,
         /// Nonrefunding original account.
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     },
     /// Counted output destination failed.
     #[error(transparent)]
@@ -56,7 +56,7 @@ impl<'a> PartitionCaptureRecordEncoding<'a> {
     /// Encode one complete global-producer record with the canonical core wire
     /// serializer. Original H owns the record; the supplied metadata source pays
     /// output/serializer storage separately. No raw protected tensor exits.
-    pub fn encode(self, funding: &WorkspaceMetadataFunding)
+    pub fn encode(self, funding: &HostMetadataFunding)
         -> Result<PartitionCaptureBuffer<u8>, PartitionCaptureEncodingError>
     {
         let source = |reason| PartitionCaptureEncodingError::Source { reason, funding: funding.clone() };
@@ -64,7 +64,7 @@ impl<'a> PartitionCaptureRecordEncoding<'a> {
             size_of::<Self>(), eredu_core::capture::CaptureRecordWire::control_bytes(),
             size_of::<BorrowedPartitionCaptureProducerRecord<'_, [BorrowedPartitionCaptureFragmentRecord<'_>; 1]>>(),
             size_of::<BorrowedPartitionCaptureFragmentRecord<'_>>(),
-            size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &HostMetadataFunding)>(),
             size_of::<Result<PartitionCaptureBuffer<u8>, PartitionCaptureEncodingError>>(),
         ];
         let controls = controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
@@ -94,7 +94,7 @@ pub(crate) fn encode_contiguous(
     context: &PartitionCaptureContext, identity: &str, rank: usize,
     combination: PartitionCaptureCombination, dtype: Option<&TensorDtype>,
     record: Option<&eredu_core::capture::CaptureRecordWire<'_>>, maximum: usize,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PartitionCaptureBuffer<u8>, PartitionCaptureEncodingError> {
     let source = |reason| PartitionCaptureEncodingError::Source { reason, funding: funding.clone() };
     type Fragment<'a> = BorrowedPartitionCaptureFragmentRecord<'a, eredu_core::capture::CaptureRecordWire<'a>>;
@@ -104,7 +104,7 @@ pub(crate) fn encode_contiguous(
         size_of::<BorrowedPartitionCaptureProducerRecord<'_, Fragments<'_>>>(),
         size_of::<Fragments<'_>>(), eredu_core::capture::CaptureRecordWire::control_bytes(),
         size_of::<(&PartitionCaptureContext, &str, usize, PartitionCaptureCombination,
-            Option<&TensorDtype>, usize, &WorkspaceMetadataFunding)>(),
+            Option<&TensorDtype>, usize, &HostMetadataFunding)>(),
     ];
     funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or_else(||source("fragment writer controls overflow"))?)
@@ -136,14 +136,14 @@ impl serde::Serialize for Fragments<'_> {
 /// the authenticated original fragment bank; no arbitrary callback is accepted.
 pub(crate) fn encode_fragment_records(context:&PartitionCaptureContext,identity:&str,rank:usize,
     combination:PartitionCaptureCombination,dtype:Option<&TensorDtype>,
-    records:&[eredu_core::capture::CaptureRecordWire<'_>],maximum:usize,funding:&WorkspaceMetadataFunding)
+    records:&[eredu_core::capture::CaptureRecordWire<'_>],maximum:usize,funding:&HostMetadataFunding)
     ->Result<PartitionCaptureBuffer<u8>,PartitionCaptureEncodingError> {
     let source=|reason|PartitionCaptureEncodingError::Source{reason,funding:funding.clone()};
     let parts=[size_of::<RecordFragments<'_,'_>>(),
         size_of::<BorrowedPartitionCaptureProducerRecord<'_,RecordFragments<'_,'_>>>(),
         size_of::<BorrowedPartitionCaptureFragmentRecord<'_,eredu_core::capture::CaptureRecordWire<'_>>>(),
         eredu_core::capture::CaptureRecordWire::control_bytes(),
-        size_of::<(&PartitionCaptureContext,&str,usize,PartitionCaptureCombination,Option<&TensorDtype>,&[eredu_core::capture::CaptureRecordWire<'_>],usize,&WorkspaceMetadataFunding)>(),
+        size_of::<(&PartitionCaptureContext,&str,usize,PartitionCaptureCombination,Option<&TensorDtype>,&[eredu_core::capture::CaptureRecordWire<'_>],usize,&HostMetadataFunding)>(),
         size_of::<std::iter::Enumerate<std::slice::Iter<'_,eredu_core::capture::CaptureRecordWire<'_>>>>(),
         size_of::<(usize,&eredu_core::capture::CaptureRecordWire<'_>)>(),
         size_of::<Result<PartitionCaptureBuffer<u8>,PartitionCaptureEncodingError>>()];
@@ -172,10 +172,10 @@ impl serde::Serialize for RecordFragments<'_,'_> {
 }
 
 // Private shared writer. Only the closed record forms above can reach it.
-fn encode_closed<T: serde::Serialize>(record: &T, maximum: usize, funding: &WorkspaceMetadataFunding)
+fn encode_closed<T: serde::Serialize>(record: &T, maximum: usize, funding: &HostMetadataFunding)
     -> Result<PartitionCaptureBuffer<u8>, PartitionCaptureEncodingError> {
     let source = |reason| PartitionCaptureEncodingError::Source { reason, funding: funding.clone() };
-    let parts = [size_of::<(&T,usize,&WorkspaceMetadataFunding)>(),size_of::<Destination<'_>>(),
+    let parts = [size_of::<(&T,usize,&HostMetadataFunding)>(),size_of::<Destination<'_>>(),
         crate::capture::RECORD_ENCODING_CONTROL_BYTES, size_of::<serde_json::Serializer<&mut Destination<'_>>>(),
         size_of::<Option<u64>>(), size_of::<usize>(), size_of::<bool>(),
         size_of::<PartitionCaptureEncodingError>(),size_of::<Result<PartitionCaptureBuffer<u8>,PartitionCaptureEncodingError>>()];

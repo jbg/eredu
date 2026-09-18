@@ -115,45 +115,48 @@ struct Ordinary<'a> {
     probes: Vec<ExprRef>,
 }
 impl Context for Ordinary<'_> {
-    type Error = anyhow::Error;
+    type Error = crate::ParserError;
     fn source(&self) -> &ExprSet {
         self.source
     }
     fn cached(&self, root: ExprRef) -> Option<bool> {
         self.cache.relevance_cache.get(&root).copied()
     }
-    fn cache_true(&mut self, root: ExprRef) -> anyhow::Result<()> {
-        self.cache.relevance_cache.insert(root, true);
+    fn cache_true(&mut self, root: ExprRef) -> crate::ParserResult<()> {
+        self.source.construction_funding()?.try_insert(&mut self.cache.relevance_cache, root, true)?;
         Ok(())
     }
-    fn begin_concat(&mut self, count: usize) -> anyhow::Result<()> {
-        self.concat = Vec::with_capacity(count);
+    fn begin_concat(&mut self, count: usize) -> crate::ParserResult<()> {
+        self.concat.clear();
+        self.source.construction_funding()?.try_grow_vec(&mut self.concat, count)?;
         Ok(())
     }
-    fn copy_concat(&mut self, root: ExprRef) -> anyhow::Result<()> {
+    fn copy_concat(&mut self, root: ExprRef) -> crate::ParserResult<()> {
+        let funding = self.source.construction_funding()?.clone();
         let concat = &mut self.concat;
         copy_filtered(self.source, root, |child| {
-            concat.push(child);
+            funding.try_push(concat, child)?;
             Ok(())
         })
     }
-    fn fold_concat(&mut self) -> anyhow::Result<ExprRef> {
-        Ok(concat::ordinary_fold_expressions(self.source, &self.concat))
+    fn fold_concat(&mut self) -> crate::ParserResult<ExprRef> {
+        Ok(concat::growing_fold_expressions(self.source, &self.concat)?)
     }
-    fn and(&mut self, left: ExprRef, right: ExprRef) -> anyhow::Result<ExprRef> {
-        Ok(self.source.mk_and(&mut vec![left, right]))
+    fn and(&mut self, left: ExprRef, right: ExprRef) -> crate::ParserResult<ExprRef> {
+        Ok(self.source.mk_and_pair(left, right)?)
     }
-    fn push_probe(&mut self, root: ExprRef) -> anyhow::Result<()> {
-        self.probes.push(root);
+    fn push_probe(&mut self, root: ExprRef) -> crate::ParserResult<()> {
+        self.source.construction_funding()?.try_push(&mut self.probes, root)?;
         Ok(())
     }
     fn pop_probe(&mut self) -> Option<ExprRef> {
         self.probes.pop()
     }
-    fn walk(&mut self, root: ExprRef) -> anyhow::Result<bool> {
+    fn walk(&mut self, root: ExprRef) -> crate::ParserResult<bool> {
         walk::ordinary(self.cache, self.source, root)
     }
-    fn probe_refusal(&mut self, _: anyhow::Error) -> anyhow::Result<()> {
+    fn probe_refusal(&mut self, error: crate::ParserError) -> crate::ParserResult<()> {
+        if crate::allocation_funding::is_storage_failure(&error) { return Err(error); }
         Ok(())
     }
 }
@@ -161,7 +164,7 @@ pub(crate) fn ordinary(
     cache: &mut RelevanceCache,
     source: &mut ExprSet,
     root: ExprRef,
-) -> anyhow::Result<bool> {
+) -> crate::ParserResult<bool> {
     run(
         &mut Ordinary {
             source,

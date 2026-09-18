@@ -1,6 +1,6 @@
 //! Bind retained placement using paid scalar snapshots of its actual streams.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
@@ -24,7 +24,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             size_of::<[usize; 2]>(),
         ];
         funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         numerical.validate_environment(target)?;
         numerical.validate_environment(draft)?;
@@ -33,7 +33,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         let draft_value = safemlx::StreamCopyPlan::<()>::capture(draft.stream())
             .map_err(|cause| numerical.retain_startup_error(cause))?;
         funding.reserve_metadata(target_value.source_comparison_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let same_stream = target_value.matches_source(draft.stream());
         let same_device = target_value.device_type() == draft_value.device_type()

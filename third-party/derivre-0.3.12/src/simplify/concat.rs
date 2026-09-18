@@ -4,7 +4,7 @@ use super::{
     ConcatElement, OwnedConcatElement,
 };
 use crate::ast::{Expr, ExprFlags, ExprRef, ExprSet};
-use std::convert::Infallible;
+use crate::{ParserAllocationFunding, raw::PreparedExprError};
 
 pub(crate) mod storage;
 
@@ -38,36 +38,36 @@ fn append<D: Destination>(
     }
     Ok(true)
 }
-struct OwnedDestination<'a>(&'a mut Vec<OwnedConcatElement>);
+struct OwnedDestination<'a>(&'a mut Vec<OwnedConcatElement>, &'a ParserAllocationFunding);
 impl Destination for OwnedDestination<'_> {
-    type Error = Infallible;
+    type Error = PreparedExprError;
     fn last_is_bytes(&self) -> bool {
         matches!(self.0.last(), Some(OwnedConcatElement::Bytes(_)))
     }
-    fn extend_bytes(&mut self, bytes: &[u8]) -> Result<(), Infallible> {
+    fn extend_bytes(&mut self, bytes: &[u8]) -> Result<(), PreparedExprError> {
         let Some(OwnedConcatElement::Bytes(current)) = self.0.last_mut() else {
             unreachable!("checked last byte group")
         };
-        current.extend_from_slice(bytes);
+        self.1.try_extend_copy(current, bytes)?;
         Ok(())
     }
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), Infallible> {
-        self.0.push(OwnedConcatElement::Bytes(bytes.to_vec()));
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), PreparedExprError> {
+        let mut copy = Vec::new();
+        self.1.try_extend_copy(&mut copy, bytes)?;
+        self.1.try_push(self.0, OwnedConcatElement::Bytes(copy))?;
         Ok(())
     }
-    fn push_expr(&mut self, expr: ExprRef) -> Result<(), Infallible> {
-        self.0.push(OwnedConcatElement::Expr(expr));
+    fn push_expr(&mut self, expr: ExprRef) -> Result<(), PreparedExprError> {
+        self.1.try_push(self.0, OwnedConcatElement::Expr(expr))?;
         Ok(())
     }
 }
 pub(super) fn push_owned(
     destination: &mut Vec<OwnedConcatElement>,
     value: &ConcatElement<'_>,
-) -> bool {
-    match append(&mut OwnedDestination(destination), value) {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
+    funding: &ParserAllocationFunding,
+) -> Result<bool, PreparedExprError> {
+    append(&mut OwnedDestination(destination, funding), value)
 }
 
 trait Memory {
@@ -79,22 +79,22 @@ trait Memory {
     fn part(&self, frame: usize, index: usize) -> ConcatElement<'_>;
     fn finish(&mut self, frame: usize);
 }
-#[derive(Default)]
-struct OrdinaryMemory {
+struct GrowingMemory {
+    funding: ParserAllocationFunding,
     frames: Vec<Vec<OwnedConcatElement>>,
 }
-impl Memory for OrdinaryMemory {
-    type Error = Infallible;
-    fn begin(&mut self) -> Result<usize, Infallible> {
+impl Memory for GrowingMemory {
+    type Error = PreparedExprError;
+    fn begin(&mut self) -> Result<usize, PreparedExprError> {
         let index = self.frames.len();
-        self.frames.push(Vec::new());
+        self.funding.try_push(&mut self.frames, Vec::new())?;
         Ok(index)
     }
-    fn append(&mut self, frame: usize, value: &ConcatElement<'_>) -> Result<bool, Infallible> {
-        append(&mut OwnedDestination(&mut self.frames[frame]), value)
+    fn append(&mut self, frame: usize, value: &ConcatElement<'_>) -> Result<bool, PreparedExprError> {
+        append(&mut OwnedDestination(&mut self.frames[frame], &self.funding), value)
     }
-    fn push_tail(&mut self, frame: usize, tail: ExprRef) -> Result<(), Infallible> {
-        self.frames[frame].push(OwnedConcatElement::Expr(tail));
+    fn push_tail(&mut self, frame: usize, tail: ExprRef) -> Result<(), PreparedExprError> {
+        self.funding.try_push(&mut self.frames[frame], OwnedConcatElement::Expr(tail))?;
         Ok(())
     }
     fn len(&self, frame: usize) -> usize {
@@ -111,21 +111,14 @@ impl Memory for OrdinaryMemory {
         self.frames.pop();
     }
 }
-pub(super) fn ordinary(source: &mut ExprSet, left: ExprRef, right: ExprRef) -> ExprRef {
-    let mut memory = OrdinaryMemory::default();
-    match concat(&mut scalar::Ordinary(source), &mut memory, left, right) {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
+pub(super) fn growing(source: &mut ExprSet, left: ExprRef, right: ExprRef) -> Result<ExprRef, PreparedExprError> {
+    let mut memory = GrowingMemory { funding: source.construction_funding()?.clone(), frames: Vec::new() };
+    concat(&mut scalar::Prepared(source), &mut memory, left, right)
 }
-pub(super) fn ordinary_fold(source: &mut ExprSet, parts: Vec<OwnedConcatElement>) -> ExprRef {
-    let mut memory = OrdinaryMemory {
-        frames: vec![parts],
-    };
-    match fold(&mut scalar::Ordinary(source), &mut memory, 0) {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
+pub(super) fn growing_fold(source: &mut ExprSet, parts: Vec<OwnedConcatElement>) -> Result<ExprRef, PreparedExprError> {
+    let mut memory = GrowingMemory { funding: source.construction_funding()?.clone(), frames: Vec::new() };
+    memory.funding.try_push(&mut memory.frames, parts)?;
+    fold(&mut scalar::Prepared(source), &mut memory, 0)
 }
 
 fn fold<S: Emission, M: Memory<Error = S::Error>>(
@@ -200,13 +193,7 @@ fn fold_expressions<S: Emission, M: Memory<Error = S::Error>>(
     }
     fold(sink, memory, frame)
 }
-pub(crate) fn ordinary_fold_expressions(source: &mut ExprSet, args: &[ExprRef]) -> ExprRef {
-    match fold_expressions(
-        &mut scalar::Ordinary(source),
-        &mut OrdinaryMemory::default(),
-        args,
-    ) {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
+pub(crate) fn growing_fold_expressions(source: &mut ExprSet, args: &[ExprRef]) -> Result<ExprRef, PreparedExprError> {
+    let mut memory = GrowingMemory { funding: source.construction_funding()?.clone(), frames: Vec::new() };
+    fold_expressions(&mut scalar::Prepared(source), &mut memory, args)
 }

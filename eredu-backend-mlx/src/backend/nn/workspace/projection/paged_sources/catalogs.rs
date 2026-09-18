@@ -19,7 +19,7 @@ pub(super) struct PreparedPagedCatalogs {
     pub(super) entries: Vec<Option<PreparedManagerCatalog>>,
     pub(super) installed: Vec<InstalledManagerCatalog>,
     pub(super) programs: Vec<Option<super::programs::PagedAppendProgram>>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl ProjectedPagedSources {
     /// Prepares both authoritative catalogs once, before accepted execution.
@@ -250,6 +250,7 @@ pub(super) fn visit_append_plans(
         .enumerate()
     {
         let (position, input) = match record.span() {
+            InferenceWorkspaceSpan::Sampling(_) => return Err(CacheSourceError::Identity),
             InferenceWorkspaceSpan::Prefill(chunk) => (
                 chunk.position,
                 chunk
@@ -276,3 +277,5 @@ pub(super) fn visit_append_plans(
     }
     Ok(())
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

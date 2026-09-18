@@ -1,5 +1,9 @@
-use crate::{regex_to_lark, HashMap, JsonCompileOptions};
-use anyhow::{anyhow, bail, ensure, Result};
+mod source_copy;
+pub(super) mod frames;
+use crate::{regex_to_lark, JsonCompileOptions};
+use crate::allocation::{CollectFunded, CompilerAllocation};
+use derivre::SourceHashMap as HashMap;
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
 use derivre::RegexAst;
 use indexmap::{IndexMap, IndexSet};
 use serde_json::Value;
@@ -69,19 +73,34 @@ pub(crate) const META_AND_ANNOTATIONS: [&str; 15] = [
     "contentEncoding",
 ];
 
-fn limited_str(node: &Value) -> String {
-    let s = node.to_string();
-    if s.len() > 100 {
-        format!("{}...", &s[..100])
-    } else {
-        s
+struct LimitedValue<'a>(&'a Value);
+fn limited_str(value: &Value) -> LimitedValue<'_> { LimitedValue(value) }
+impl std::fmt::Display for LimitedValue<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        struct Output<'a, 'b> { formatter: &'a mut std::fmt::Formatter<'b>, left: usize, truncated: bool }
+        impl Write for Output<'_, '_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let mut end = text.len().min(self.left);
+                while !text.is_char_boundary(end) { end -= 1; }
+                self.formatter.write_str(&text[..end])?;
+                self.left -= end;
+                self.truncated |= end < text.len();
+                if end < text.len() { self.left = 0; }
+                Ok(())
+            }
+        }
+        let mut output = Output { formatter, left: 100, truncated: false };
+        write!(output, "{}", self.0)?;
+        if output.truncated { output.formatter.write_str("...")?; }
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Schema {
     Any,
-    Unsatisfiable(String),
+    Unsatisfiable(&'static str),
     Null,
     Number(NumberSchema),
     String(StringSchema),
@@ -135,14 +154,14 @@ impl NumberSchema {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StringSchema {
     pub min_length: usize,
     pub max_length: Option<usize>,
     pub regex: Option<RegexAst>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ArraySchema {
     pub min_items: usize,
     pub max_items: Option<usize>,
@@ -150,7 +169,7 @@ pub struct ArraySchema {
     pub items: Option<Box<Schema>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ObjectSchema {
     pub properties: IndexMap<String, Schema>,
     pub pattern_properties: IndexMap<String, Schema>,
@@ -161,16 +180,13 @@ pub struct ObjectSchema {
 }
 
 pub trait OptSchemaExt {
-    fn schema(&self) -> Schema;
+    fn schema(&self, funding: &derivre::ParserAllocationFunding) -> Result<Schema>;
     fn schema_ref(&self) -> &Schema;
 }
 
 impl OptSchemaExt for Option<Box<Schema>> {
-    fn schema(&self) -> Schema {
-        match self {
-            Some(schema) => schema.as_ref().clone(),
-            None => Schema::Any,
-        }
+    fn schema(&self, funding: &derivre::ParserAllocationFunding) -> Result<Schema> {
+        match self { Some(schema) => schema.copy_with_funding(funding), None => Ok(Schema::Any) }
     }
 
     fn schema_ref(&self) -> &Schema {
@@ -182,95 +198,62 @@ impl OptSchemaExt for Option<Box<Schema>> {
 }
 
 impl Schema {
-    pub fn unsat(reason: &str) -> Schema {
-        Schema::Unsatisfiable(reason.to_string())
+    pub fn unsat(reason: &'static str) -> Schema {
+        Schema::Unsatisfiable(reason)
     }
 
     pub fn false_schema() -> Schema {
         Self::unsat("schema is false")
     }
 
-    pub fn any_box() -> Option<Box<Schema>> {
-        Some(Box::new(Schema::Any))
-    }
-
     pub fn is_unsat(&self) -> bool {
         matches!(self, Schema::Unsatisfiable(_))
     }
 
-    /// Shallowly normalize the schema, removing any unnecessary nesting or empty options.
-    fn normalize(self, ctx: &Context) -> Schema {
-        match self {
-            Schema::AnyOf(options) => {
-                let mut unsats = Vec::new();
-                let mut valid = Vec::new();
-                for option in options.into_iter() {
-                    match option {
-                        Schema::Any => {
-                            return Schema::Any;
-                        }
-                        Schema::Unsatisfiable(reason) => unsats.push(Schema::Unsatisfiable(reason)),
-                        Schema::AnyOf(nested) => valid.extend(nested),
-                        other => valid.push(other),
-                    }
+    /// Shallow normalization preserves the first unsatisfiable reason and pays
+    /// only the retained alternatives; discarded reasons do not need a vector.
+    fn normalize(self, ctx: &Context) -> Result<Schema> {
+        let _frame = frames::enter::<frames::Normalize<'_>>(ctx)?;
+        let (options, one_of) = match self {
+            Schema::AnyOf(options) => (options, false),
+            Schema::OneOf(options) => (options, true),
+            other => return Ok(other),
+        };
+        let mut first_unsat = None;
+        let mut valid = Vec::new();
+        for option in options {
+            match option {
+                Schema::Any if !one_of => return Ok(Schema::Any),
+                Schema::Unsatisfiable(reason) => { if first_unsat.is_none() { first_unsat = Some(reason); } }
+                Schema::AnyOf(nested) if !one_of => {
+                    for option in nested { ctx.funding.try_push(&mut valid, option)?; }
                 }
-                if valid.is_empty() {
-                    // Return the first unsatisfiable schema for debug-ability
-                    if let Some(unsat) = unsats.into_iter().next() {
-                        return unsat;
-                    }
-                    // We must not have had any schemas to begin with
-                    return Schema::unsat("anyOf is empty");
+                Schema::OneOf(nested) if one_of => {
+                    for option in nested { ctx.funding.try_push(&mut valid, option)?; }
                 }
-                if valid.len() == 1 {
-                    // Unwrap singleton
-                    return valid.swap_remove(0);
-                }
-                Schema::AnyOf(valid)
+                other => ctx.funding.try_push(&mut valid, other)?,
             }
-            Schema::OneOf(options) => {
-                let mut unsats = Vec::new();
-                let mut valid = Vec::new();
-                for option in options.into_iter() {
-                    match option {
-                        Schema::Unsatisfiable(reason) => unsats.push(Schema::Unsatisfiable(reason)),
-                        // Flatten nested oneOfs: (A⊕B)⊕(C⊕D) = A⊕B⊕C⊕D
-                        Schema::OneOf(nested) => valid.extend(nested),
-                        other => valid.push(other),
-                    }
-                }
-                if valid.is_empty() {
-                    // Return the first unsatisfiable schema for debug-ability
-                    if let Some(unsat) = unsats.into_iter().next() {
-                        return unsat;
-                    }
-                    // We must not have had any schemas to begin with
-                    return Schema::unsat("oneOf is empty");
-                }
-                if valid.len() == 1 {
-                    // Unwrap singleton
-                    return valid.swap_remove(0);
-                }
-                if valid.iter().enumerate().all(|(i, x)| {
-                    valid
-                        .iter()
-                        .skip(i + 1) // "upper diagonal"
-                        .all(|y| x.is_verifiably_disjoint_from(y, ctx))
-                }) {
-                    Schema::AnyOf(valid)
-                } else {
-                    Schema::OneOf(valid)
-                }
-            }
-            other_schema => other_schema,
         }
+        if valid.is_empty() {
+            return Ok(Schema::unsat(first_unsat.unwrap_or(if one_of { "oneOf is empty" } else { "anyOf is empty" })));
+        }
+        if valid.len() == 1 { return Ok(valid.swap_remove(0)); }
+        if one_of {
+            for (index, left) in valid.iter().enumerate() {
+                for right in valid.iter().skip(index + 1) {
+                    if !left.is_verifiably_disjoint_from(right, ctx)? { return Ok(Schema::OneOf(valid)); }
+                }
+            }
+        }
+        Ok(Schema::AnyOf(valid))
     }
 
     /// Intersect two schemas, returning a new (normalized) schema that represents the intersection of the two.
     fn intersect(self, other: Schema, ctx: &Context, stack_level: usize) -> Result<Schema> {
+        let _frame = frames::enter::<frames::Intersection<'_>>(ctx)?;
         ctx.increment()?;
         if stack_level > ctx.options.max_stack_level {
-            bail!("Schema intersection stack level exceeded");
+            bail!(&ctx.funding, "Schema intersection stack level exceeded");
         }
 
         let merged = match (self, other) {
@@ -287,27 +270,27 @@ impl Schema {
             (Schema::OneOf(options), schema1) => Schema::OneOf(
                 options
                     .into_iter()
-                    .map(|opt| opt.intersect(schema1.clone(), ctx, stack_level + 1))
-                    .collect::<Result<Vec<_>>>()?,
+                    .map(|opt| opt.intersect(schema1.copy_with_funding(&ctx.funding)?, ctx, stack_level + 1))
+                    .collect_with_funding(&ctx.funding)?,
             ),
 
             (schema0, Schema::OneOf(options)) => Schema::OneOf(
                 options
                     .into_iter()
-                    .map(|opt| schema0.clone().intersect(opt, ctx, stack_level + 1))
-                    .collect::<Result<Vec<_>>>()?,
+                    .map(|opt| schema0.copy_with_funding(&ctx.funding)?.intersect(opt, ctx, stack_level + 1))
+                    .collect_with_funding(&ctx.funding)?,
             ),
             (Schema::AnyOf(options), schema1) => Schema::AnyOf(
                 options
                     .into_iter()
-                    .map(|opt| opt.intersect(schema1.clone(), ctx, stack_level + 1))
-                    .collect::<Result<Vec<_>>>()?,
+                    .map(|opt| opt.intersect(schema1.copy_with_funding(&ctx.funding)?, ctx, stack_level + 1))
+                    .collect_with_funding(&ctx.funding)?,
             ),
             (schema0, Schema::AnyOf(options)) => Schema::AnyOf(
                 options
                     .into_iter()
-                    .map(|opt| schema0.clone().intersect(opt, ctx, stack_level + 1))
-                    .collect::<Result<Vec<_>>>()?,
+                    .map(|opt| schema0.copy_with_funding(&ctx.funding)?.intersect(opt, ctx, stack_level + 1))
+                    .collect_with_funding(&ctx.funding)?,
             ),
             (Schema::Null, Schema::Null) => Schema::Null,
             (Schema::Boolean(value1), Schema::Boolean(value2)) => {
@@ -339,47 +322,66 @@ impl Schema {
                 regex: match (s1.regex, s2.regex) {
                     (None, None) => None,
                     (None, Some(r)) | (Some(r), None) => Some(r),
-                    (Some(r1), Some(r2)) => Some(RegexAst::And(vec![r1, r2])),
+                    (Some(r1), Some(r2)) => Some(RegexAst::And([Ok::<_, derivre::ParserError>(r1), Ok(r2)].into_iter().collect_with_funding(&ctx.funding)?)),
                 },
             }),
 
-            (Schema::Array(mut a1), Schema::Array(mut a2)) => Schema::Array(ArraySchema {
+            (Schema::Array(a1), Schema::Array(a2)) => Self::intersect_arrays(a1, a2, ctx, stack_level)?,
+
+            (Schema::Object(o1), Schema::Object(o2)) => Self::intersect_objects(o1, o2, ctx, stack_level)?,
+
+            //TODO: get types for error message
+            _ => Schema::unsat("incompatible types"),
+        };
+        merged.normalize(ctx)
+    }
+
+    // Keep recursive dispatch frames small: object/array construction owns its
+    // concrete destination frame only when that branch is actually reached.
+    #[inline(never)]
+    fn intersect_arrays(mut a1: ArraySchema, mut a2: ArraySchema, ctx: &Context, stack_level: usize) -> Result<Schema> {
+        let _frame = frames::enter::<frames::Arrays<'_>>(ctx)?;
+        Ok(Schema::Array(ArraySchema {
                 min_items: a1.min_items.max(a2.min_items),
                 max_items: opt_min(a1.max_items, a2.max_items),
                 prefix_items: {
                     let len = a1.prefix_items.len().max(a2.prefix_items.len());
-                    a1.prefix_items.resize_with(len, || a1.items.schema());
-                    a2.prefix_items.resize_with(len, || a2.items.schema());
+                    while a1.prefix_items.len() < len { ctx.funding.try_push(&mut a1.prefix_items, a1.items.schema(&ctx.funding)?)?; }
+                    while a2.prefix_items.len() < len { ctx.funding.try_push(&mut a2.prefix_items, a2.items.schema(&ctx.funding)?)?; }
                     a1.prefix_items
                         .into_iter()
                         .zip(a2.prefix_items)
                         .map(|(item1, item2)| item1.intersect(item2, ctx, stack_level + 1))
-                        .collect::<Result<Vec<_>>>()?
+                        .collect_with_funding(&ctx.funding)?
                 },
                 items: match (a1.items, a2.items) {
                     (None, None) => None,
                     (None, Some(item)) | (Some(item), None) => Some(item),
                     (Some(item1), Some(item2)) => {
-                        Some(Box::new(item1.intersect(*item2, ctx, stack_level + 1)?))
+                        Some(ctx.funding.try_box(item1.intersect(*item2, ctx, stack_level + 1)?)?)
                     }
                 },
-            }),
+            }))
+    }
 
-            (Schema::Object(mut o1), Schema::Object(o2)) => {
+    #[inline(never)]
+    fn intersect_objects(mut o1: ObjectSchema, o2: ObjectSchema, ctx: &Context, stack_level: usize) -> Result<Schema> {
+        let _frame = frames::enter::<frames::Objects<'_>>(ctx)?;
+
                 let mut properties = IndexMap::new();
                 for (key, prop1) in std::mem::take(&mut o1.properties).into_iter() {
                     let prop2 = ctx.property_schema(&o2, &key)?;
-                    properties.insert(key, prop1.intersect(prop2.clone(), ctx, stack_level + 1)?);
+                    ctx.funding.try_insert_index_map(&mut properties, key, prop1.intersect(prop2.copy_with_funding(&ctx.funding)?, ctx, stack_level + 1)?)?;
                 }
                 for (key, prop2) in o2.properties.into_iter() {
                     if properties.contains_key(&key) {
                         continue;
                     }
                     let prop1 = ctx.property_schema(&o1, &key)?;
-                    properties.insert(key, prop1.clone().intersect(prop2, ctx, stack_level + 1)?);
+                    ctx.funding.try_insert_index_map(&mut properties, key, prop1.copy_with_funding(&ctx.funding)?.intersect(prop2, ctx, stack_level + 1)?)?;
                 }
                 let mut required = o1.required;
-                required.extend(o2.required);
+                for key in o2.required { ctx.funding.try_insert_index_set(&mut required, key)?; }
 
                 let pattern_properties = intersect_pattern_properties(
                     o1.pattern_properties,
@@ -395,100 +397,79 @@ impl Schema {
                         (None, None) => None,
                         (None, Some(p)) | (Some(p), None) => Some(p),
                         (Some(p1), Some(p2)) => {
-                            Some(Box::new((*p1).intersect(*p2, ctx, stack_level + 1)?))
+                            Some(ctx.funding.try_box((*p1).intersect(*p2, ctx, stack_level + 1)?)?)
                         }
                     };
 
                 let min_properties = o1.min_properties.max(o2.min_properties);
                 let max_properties = opt_min(o1.max_properties, o2.max_properties);
 
-                mk_object_schema(ObjectSchema {
+                Ok(mk_object_schema(ObjectSchema {
                     properties,
                     pattern_properties,
                     additional_properties,
                     required,
                     min_properties,
                     max_properties,
-                })
-            }
+                }))
+                }
 
-            //TODO: get types for error message
-            _ => Schema::unsat("incompatible types"),
-        };
-        Ok(merged.normalize(ctx))
-    }
-
-    fn is_verifiably_disjoint_from(&self, other: &Schema, ctx: &Context) -> bool {
-        match (self, other) {
-            (Schema::Unsatisfiable(_), _) => true,
-            (_, Schema::Unsatisfiable(_)) => true,
-            (Schema::Any, _) => false,
-            (_, Schema::Any) => false,
-            (Schema::Ref(_), _) => false, // TODO: could resolve
-            (_, Schema::Ref(_)) => false, // TODO: could resolve
-            (Schema::Boolean(value1), Schema::Boolean(value2)) => {
-                value1.is_some() && value2.is_some() && value1 != value2
+    fn is_verifiably_disjoint_from(&self, other: &Schema, ctx: &Context) -> Result<bool> {
+        let _frame = frames::enter::<frames::Disjoint<'_>>(ctx)?;
+        Ok(match (self, other) {
+            (Schema::Any, _) | (_, Schema::Any) => false,
+            (Schema::Unsatisfiable(_), _) | (_, Schema::Unsatisfiable(_)) => true,
+            (Schema::Ref(_), _) | (_, Schema::Ref(_)) => false,
+            (Schema::Boolean(left), Schema::Boolean(right)) => left.is_some() && right.is_some() && left != right,
+            (Schema::AnyOf(options) | Schema::OneOf(options), _) => {
+                for option in options { if !option.is_verifiably_disjoint_from(other, ctx)? { return Ok(false); } }
+                true
             }
-            (Schema::AnyOf(options), _) => options
-                .iter()
-                .all(|opt| opt.is_verifiably_disjoint_from(other, ctx)),
-            (_, Schema::AnyOf(options)) => options
-                .iter()
-                .all(|opt| self.is_verifiably_disjoint_from(opt, ctx)),
-            (Schema::OneOf(options), _) => options
-                .iter()
-                .all(|opt| opt.is_verifiably_disjoint_from(other, ctx)),
-            (_, Schema::OneOf(options)) => options
-                .iter()
-                .all(|opt| self.is_verifiably_disjoint_from(opt, ctx)),
-            // TODO: could actually compile the regexes and check for overlap
-            (
-                Schema::String(StringSchema {
-                    regex: Some(RegexAst::Literal(lit1)),
-                    ..
-                }),
-                Schema::String(StringSchema {
-                    regex: Some(RegexAst::Literal(lit2)),
-                    ..
-                }),
-            ) => lit1 != lit2,
-            (Schema::Object(o1), Schema::Object(o2)) => {
-                o1.required.union(&o2.required).any(|key| {
-                    let prop1 = ctx.property_schema(o1, key).unwrap_or(&Schema::Any);
-                    let prop2 = ctx.property_schema(o2, key).unwrap_or(&Schema::Any);
-                    prop1.is_verifiably_disjoint_from(prop2, ctx)
-                })
+            (_, Schema::AnyOf(options) | Schema::OneOf(options)) => {
+                for option in options { if !self.is_verifiably_disjoint_from(option, ctx)? { return Ok(false); } }
+                true
             }
-            _ => {
-                // Except for in the cases above, it should suffice to check that the types are different
-                mem::discriminant(self) != mem::discriminant(other)
+            (Schema::String(StringSchema { regex: Some(RegexAst::Literal(left)), .. }),
+             Schema::String(StringSchema { regex: Some(RegexAst::Literal(right)), .. })) => left != right,
+            (Schema::Object(left), Schema::Object(right)) => {
+                for key in left.required.union(&right.required) {
+                    let property = |object| match ctx.property_schema(object, key) {
+                        Ok(schema) => Ok(schema),
+                        Err(error) if crate::earley::is_grammar_storage_failure(&error) => Err(error),
+                        Err(_) => Ok(&Schema::Any),
+                    };
+                    if property(left)?.is_verifiably_disjoint_from(property(right)?, ctx)? { return Ok(true); }
+                }
+                false
             }
-        }
+            _ => mem::discriminant(self) != mem::discriminant(other),
+        })
     }
 
     fn apply(self, applicator: (&str, &Value), ctx: &Context) -> Result<Schema> {
+        let _frame = frames::enter::<frames::Apply<'_>>(ctx)?;
         let mut result = self;
         let (k, v) = applicator;
         match k {
             // TODO: Do const and enum really belong here? Maybe they should always take precedence as they are "literal" constraints?
             "const" => {
-                let schema = compile_const(v)?;
+                let schema = compile_const(ctx, v)?;
                 result = result.intersect(schema, ctx, 0)?
             }
             "enum" => {
                 let instances = v
                     .as_array()
-                    .ok_or_else(|| anyhow!("enum must be an array"))?;
+                    .ok_or_else(|| anyhow!(&ctx.funding, "enum must be an array"))?;
                 let options = instances
                     .iter()
-                    .map(compile_const)
-                    .collect::<Result<Vec<_>>>()?;
+                    .map(|value| compile_const(ctx, value))
+                    .collect_with_funding(&ctx.funding)?;
                 result = result.intersect(Schema::AnyOf(options), ctx, 0)?;
             }
             "allOf" => {
                 let all_of = v
                     .as_array()
-                    .ok_or_else(|| anyhow!("allOf must be an array"))?;
+                    .ok_or_else(|| anyhow!(&ctx.funding, "allOf must be an array"))?;
                 for value in all_of {
                     let schema = compile_resource(ctx, ctx.as_resource_ref(value))?;
                     result = result.intersect(schema, ctx, 0)?;
@@ -497,28 +478,27 @@ impl Schema {
             "anyOf" => {
                 let any_of = v
                     .as_array()
-                    .ok_or_else(|| anyhow!("anyOf must be an array"))?;
+                    .ok_or_else(|| anyhow!(&ctx.funding, "anyOf must be an array"))?;
                 let options = any_of
                     .iter()
                     .map(|value| compile_resource(ctx, ctx.as_resource_ref(value)))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect_with_funding(&ctx.funding)?;
                 result = result.intersect(Schema::AnyOf(options), ctx, 0)?;
             }
             "oneOf" => {
                 let one_of = v
                     .as_array()
-                    .ok_or_else(|| anyhow!("oneOf must be an array"))?;
+                    .ok_or_else(|| anyhow!(&ctx.funding, "oneOf must be an array"))?;
                 let options = one_of
                     .iter()
                     .map(|value| compile_resource(ctx, ctx.as_resource_ref(value)))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect_with_funding(&ctx.funding)?;
                 result = result.intersect(Schema::OneOf(options), ctx, 0)?;
             }
             "$ref" => {
                 let reference = v
                     .as_str()
-                    .ok_or_else(|| anyhow!("$ref must be a string, got {}", limited_str(v)))?
-                    .to_string();
+                    .ok_or_else(|| anyhow!(&ctx.funding, "$ref must be a string, got {}", limited_str(v)))?;
                 let uri: String = ctx.normalize_ref(&reference)?;
                 if matches!(result, Schema::Any) {
                     define_ref(ctx, &uri)?;
@@ -527,7 +507,7 @@ impl Schema {
                     result = intersect_ref(ctx, &uri, result, false, 0)?;
                 }
             }
-            _ => bail!("Unknown applicator: {}", applicator.0),
+            _ => bail!(&ctx.funding, "Unknown applicator: {}", applicator.0),
         };
         Ok(result)
     }
@@ -550,17 +530,26 @@ impl Default for SchemaBuilderOptions {
     }
 }
 
-pub fn build_schema(contents: Value, options: &JsonCompileOptions) -> Result<BuiltSchema> {
+pub fn build_schema(contents: Value, options: &JsonCompileOptions, funding: &derivre::ParserAllocationFunding) -> Result<BuiltSchema> {
+    // The invocation's outer values remain live for the entire recursive
+    // compilation. Child frames below reuse only their separate scoped peak.
+    funding.reserve(std::mem::size_of::<(
+        Value, &JsonCompileOptions, &derivre::ParserAllocationFunding,
+        CompilerAllocation<'_>, PreContext<'_>, Context<'_>, ResourceRef<'_>,
+        Result<PreContext<'_>>, Result<Context<'_>>,
+        Schema, Result<Schema>, BuiltSchema, Result<BuiltSchema>, bool,
+    )>())?;
     if let Some(b) = contents.as_bool() {
         let s = if b {
             Schema::Any
         } else {
             Schema::false_schema()
         };
-        return Ok(BuiltSchema::simple(s));
+        return Ok(BuiltSchema::simple(s, funding.clone()));
     }
 
-    let pre_ctx = PreContext::new(contents, options.retriever.clone())?;
+    let allocation = crate::allocation::CompilerAllocation(funding);
+    let pre_ctx = PreContext::new(contents, options.retriever.clone(), &allocation)?;
     let mut ctx = Context::new(&pre_ctx)?;
 
     ctx.options.lenient = options.lenient;
@@ -571,15 +560,18 @@ pub fn build_schema(contents: Value, options: &JsonCompileOptions) -> Result<Bui
 }
 
 fn compile_resource(ctx: &Context, resource: ResourceRef) -> Result<Schema> {
+    let _frame = frames::enter::<(&Context, ResourceRef<'_>, Context<'_>, Result<Schema>)>(ctx)?;
     let ctx = ctx.in_subresource(resource)?;
     compile_contents(&ctx, resource.contents())
 }
 
 fn compile_contents(ctx: &Context, contents: &Value) -> Result<Schema> {
-    compile_contents_inner(ctx, contents).map(|schema| schema.normalize(ctx))
+    let _frame = frames::enter::<(&Context, &Value, Schema, Result<Schema>)>(ctx)?;
+    compile_contents_inner(ctx, contents).and_then(|schema| schema.normalize(ctx))
 }
 
 fn compile_contents_inner(ctx: &Context, contents: &Value) -> Result<Schema> {
+    let _frame = frames::enter::<frames::Contents<'_>>(ctx)?;
     if let Some(b) = contents.as_bool() {
         if b {
             return Ok(Schema::Any);
@@ -592,18 +584,18 @@ fn compile_contents_inner(ctx: &Context, contents: &Value) -> Result<Schema> {
     // TODO: validate against metaschema & check for unimplemented keys
     let schemadict = contents
         .as_object()
-        .ok_or_else(|| anyhow!("schema must be an object or boolean"))?;
+        .ok_or_else(|| anyhow!(&ctx.funding, "schema must be an object or boolean"))?;
 
     // Make a mutable copy of the schema so we can modify it
-    let schemadict = schemadict
-        .iter()
-        .map(|(k, v)| (k.as_str(), v))
-        .collect::<IndexMap<_, _>>();
+    let mut borrowed = IndexMap::new();
+    for (key, value) in schemadict { ctx.funding.try_insert_index_map(&mut borrowed, key.as_str(), value)?; }
+    let schemadict = borrowed;
 
     compile_contents_map(ctx, schemadict)
 }
 
 fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Result<Schema> {
+    let _frame = frames::enter::<frames::ContentsMap<'_>>(ctx)?;
     ctx.increment()?;
 
     // We don't need to compile the schema if it's just meta and annotations
@@ -615,18 +607,18 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
     }
 
     // Check for unimplemented keys and bail if any are found
-    let mut unimplemented_keys = schemadict
-        .keys()
-        .filter(|k| !ctx.is_valid_keyword(k))
-        .collect::<Vec<_>>();
+    let mut unimplemented_keys = Vec::new();
+    for key in schemadict.keys().filter(|key| !ctx.is_valid_keyword(key)) {
+        ctx.funding.try_push(&mut unimplemented_keys, key)?;
+    }
     if !unimplemented_keys.is_empty() {
         // ensure consistent order for tests
-        unimplemented_keys.sort();
-        let msg = format!("Unimplemented keys: {unimplemented_keys:?}");
+        unimplemented_keys.sort_unstable();
+        let msg = ctx.funding.try_format(format_args!("Unimplemented keys: {unimplemented_keys:?}"))?;
         if ctx.options.lenient {
-            ctx.record_warning(msg);
+            ctx.record_warning(msg)?;
         } else {
-            bail!(msg);
+            bail!(&ctx.funding, msg);
         }
     }
 
@@ -637,12 +629,12 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
         Some(properties) => {
             let properties = properties
                 .as_object()
-                .ok_or_else(|| anyhow!("properties must be an object"))?;
-            Some(Value::from_iter(
-                properties
-                    .iter()
-                    .map(|(k, _)| (k.as_str(), Value::Bool(true))),
-            ))
+                .ok_or_else(|| anyhow!(&ctx.funding, "properties must be an object"))?;
+            let mut values = serde_json::Map::new();
+            for key in properties.keys() {
+                values.try_insert_with_allocations(ctx.funding.try_copy_str(key)?, Value::Bool(true), &CompilerAllocation(&ctx.funding)).map_err(|error| derivre::ParserError::cause(error, &ctx.funding))?;
+            }
+            Some(Value::Object(values))
         }
         None => None,
     };
@@ -650,10 +642,10 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
         Some(prefix_items) => {
             let prefix_items = prefix_items
                 .as_array()
-                .ok_or_else(|| anyhow!("prefixItems must be an array"))?;
-            Some(Value::from_iter(
-                prefix_items.iter().map(|_| Value::Bool(true)),
-            ))
+                .ok_or_else(|| anyhow!(&ctx.funding, "prefixItems must be an array"))?;
+            let mut values = Vec::new();
+            for _ in prefix_items { ctx.funding.try_push(&mut values, Value::Bool(true))?; }
+            Some(Value::Array(values))
         }
         None => None,
     };
@@ -666,7 +658,7 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
             if !current.is_empty() {
                 if let Some(&types) = schemadict.get("type") {
                     // Make sure we always give type information to ensure we get the smallest union we can
-                    current.insert("type", types);
+                    ctx.funding.try_insert(&mut current, "type", types)?;
                 }
                 let current_schema = compile_contents_simple(ctx, std::mem::take(&mut current))?;
                 result = result.intersect(current_schema, ctx, 0)?;
@@ -674,13 +666,13 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
             // Finally apply the applicator
             result = result.apply((k, v), ctx)?;
         } else if !META_AND_ANNOTATIONS.contains(k) {
-            current.insert(k, v);
+            ctx.funding.try_insert(&mut current, k, v)?;
             if *k == "additionalProperties" && !current.contains_key("properties") {
                 // additionalProperties needs to know about properties
                 // Insert a dummy version of properties into current
                 // (not the real deal, as we don't want to intersect it out of order)
                 if let Some(dummy_props) = &dummy_properties {
-                    current.insert("properties", dummy_props);
+                    ctx.funding.try_insert(&mut current, "properties", dummy_props)?;
                 }
             }
             if *k == "items" && !current.contains_key("prefixItems") {
@@ -688,7 +680,7 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
                 // Insert a dummy version of prefixItems into current
                 // (not the real deal, as we don't want to intersect it out of order)
                 if let Some(dummy_itms) = &dummy_prefix_items {
-                    current.insert("prefixItems", dummy_itms);
+                    ctx.funding.try_insert(&mut current, "prefixItems", dummy_itms)?;
                 }
             }
         }
@@ -696,7 +688,7 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
     if !current.is_empty() {
         if let Some(&types) = schemadict.get("type") {
             // Make sure we always give type information to ensure we get the smallest union we can
-            current.insert("type", types);
+            ctx.funding.try_insert(&mut current, "type", types)?;
         }
         let current_schema = compile_contents_simple(ctx, std::mem::take(&mut current))?;
         result = result.intersect(current_schema, ctx, 0)?;
@@ -705,6 +697,7 @@ fn compile_contents_map(ctx: &Context, schemadict: IndexMap<&str, &Value>) -> Re
 }
 
 fn compile_contents_simple(ctx: &Context, schemadict: HashMap<&str, &Value>) -> Result<Schema> {
+    let _frame = frames::enter::<frames::SimpleContents<'_>>(ctx)?;
     if schemadict.is_empty() {
         Ok(Schema::Any)
     } else {
@@ -717,25 +710,26 @@ fn compile_contents_simple(ctx: &Context, schemadict: HashMap<&str, &Value>) -> 
                     .map(|type_value| {
                         type_value
                             .as_str()
-                            .ok_or_else(|| anyhow!("type must be a string"))
+                            .ok_or_else(|| anyhow!(&ctx.funding, "type must be a string"))
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect_with_funding(&ctx.funding)?;
                 compile_types(ctx, options, &schemadict)
             }
-            None => compile_types(ctx, TYPES.to_vec(), &schemadict),
+            None => compile_types(ctx, TYPES, &schemadict),
             Some(_) => {
-                bail!("type must be a string or array of strings");
+                bail!(&ctx.funding, "type must be a string or array of strings");
             }
         }
     }
 }
 
 fn define_ref(ctx: &Context, ref_uri: &str) -> Result<()> {
+    let _frame = frames::enter::<(&Context, &str, ResourceRef<'_>, Schema, Result<()>)>(ctx)?;
     if !ctx.been_seen(ref_uri) {
-        ctx.mark_seen(ref_uri);
+        ctx.mark_seen(ref_uri)?;
         let resource = ctx.lookup_resource(ref_uri)?;
         let resolved_schema = compile_resource(ctx, resource)?;
-        ctx.insert_ref(ref_uri, resolved_schema);
+        ctx.insert_ref(ref_uri, resolved_schema)?;
     }
     Ok(())
 }
@@ -751,6 +745,7 @@ fn intersect_pattern_properties(
     ctx: &Context,
     stack_level: usize,
 ) -> Result<IndexMap<String, Schema>> {
+    let _frame = frames::enter::<frames::Patterns<'_>>(ctx)?;
     let mut result = IndexMap::new();
     // When a pattern exists only on one side, properties matching
     // it are "additional" from the other side's perspective and
@@ -758,27 +753,24 @@ fn intersect_pattern_properties(
     let mut o2_remaining = o2_pp;
     for (key, prop1) in o1_pp.into_iter() {
         if let Some(prop2) = o2_remaining.shift_remove(&key) {
-            result.insert(key, prop1.intersect(prop2, ctx, stack_level + 1)?);
+            ctx.funding.try_insert_index_map(&mut result, key, prop1.intersect(prop2, ctx, stack_level + 1)?)?;
         } else if let Some(ap) = o2_ap {
-            result.insert(
-                key,
-                prop1.intersect(ap.as_ref().clone(), ctx, stack_level + 1)?,
-            );
+            ctx.funding.try_insert_index_map(&mut result, key,
+                prop1.intersect(ap.copy_with_funding(&ctx.funding)?, ctx, stack_level + 1)?)?;
         } else {
-            result.insert(key, prop1);
+            ctx.funding.try_insert_index_map(&mut result, key, prop1)?;
         }
     }
     for (key, prop2) in o2_remaining.into_iter() {
         if let Some(ap) = o1_ap {
-            result.insert(
-                key,
-                prop2.intersect(ap.as_ref().clone(), ctx, stack_level + 1)?,
-            );
+            ctx.funding.try_insert_index_map(&mut result, key,
+                prop2.intersect(ap.copy_with_funding(&ctx.funding)?, ctx, stack_level + 1)?)?;
         } else {
-            result.insert(key, prop2);
+            ctx.funding.try_insert_index_map(&mut result, key, prop2)?;
         }
     }
-    let keys = result.keys().collect::<Vec<_>>();
+    let mut keys = Vec::new();
+    for key in result.keys() { ctx.funding.try_push(&mut keys, key)?; }
     if !keys.is_empty() {
         ctx.check_disjoint_pattern_properties(&keys)?;
     }
@@ -792,15 +784,16 @@ fn intersect_ref(
     ref_first: bool,
     stack_level: usize,
 ) -> Result<Schema> {
+    let _frame = frames::enter::<frames::Reference<'_>>(ctx)?;
     define_ref(ctx, ref_uri)?;
     let resolved_schema = ctx
-        .get_ref_cloned(ref_uri)
+        .get_ref_cloned(ref_uri)?
         // The ref might not have been defined if we're in a recursive loop and every ref in the loop
         // has a sibling key.
         // TODO: add an extra layer of indirection by defining a URI for the current location (e.g. by hashing the serialized sibling schema)
         // and returning a ref to that URI here to break the loop.
         .ok_or_else(|| {
-            anyhow!(
+            anyhow!(&ctx.funding,
                 "circular references with sibling keys are not supported: {}",
                 ref_uri
             )
@@ -812,13 +805,14 @@ fn intersect_ref(
     }
 }
 
-fn compile_const(instance: &Value) -> Result<Schema> {
+fn compile_const(ctx: &Context, instance: &Value) -> Result<Schema> {
+    let _frame = frames::enter::<frames::Constant<'_>>(ctx)?;
     match instance {
         Value::Null => Ok(Schema::Null),
         Value::Bool(b) => Ok(Schema::Boolean(Some(*b))),
         Value::Number(n) => {
             let value = n.as_f64().ok_or_else(|| {
-                anyhow!(
+                anyhow!(&ctx.funding,
                     "Expected f64 for numeric const, got {}",
                     limited_str(instance)
                 )
@@ -835,30 +829,31 @@ fn compile_const(instance: &Value) -> Result<Schema> {
         Value::String(s) => Ok(Schema::String(StringSchema {
             min_length: 0,
             max_length: None,
-            regex: Some(RegexAst::Literal(s.to_string())),
+            regex: Some(RegexAst::Literal(ctx.funding.try_copy_str(s)?)),
         })),
         Value::Array(items) => {
             let prefix_items = items
                 .iter()
-                .map(compile_const)
-                .collect::<Result<Vec<Schema>>>()?;
+                .map(|value| compile_const(ctx, value))
+                .collect_with_funding(&ctx.funding)?;
             Ok(Schema::Array(ArraySchema {
                 min_items: prefix_items.len(),
                 max_items: Some(prefix_items.len()),
                 prefix_items,
-                items: Some(Box::new(Schema::false_schema())),
+                items: Some(ctx.funding.try_box(Schema::false_schema())?),
             }))
         }
         Value::Object(mapping) => {
-            let properties = mapping
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), compile_const(v)?)))
-                .collect::<Result<IndexMap<String, Schema>>>()?;
-            let required = properties.keys().cloned().collect();
+            let mut properties = IndexMap::new();
+            let mut required = IndexSet::new();
+            for (key, value) in mapping {
+                ctx.funding.try_insert_index_map(&mut properties, ctx.funding.try_copy_str(key)?, compile_const(ctx, value)?)?;
+                ctx.funding.try_insert_index_set(&mut required, ctx.funding.try_copy_str(key)?)?;
+            }
             Ok(Schema::Object(ObjectSchema {
                 properties,
                 pattern_properties: IndexMap::default(),
-                additional_properties: Some(Box::new(Schema::false_schema())),
+                additional_properties: Some(ctx.funding.try_box(Schema::false_schema())?),
                 required,
                 min_properties: 0,
                 max_properties: None,
@@ -867,15 +862,16 @@ fn compile_const(instance: &Value) -> Result<Schema> {
     }
 }
 
-fn compile_types(
+fn compile_types<'a, I: IntoIterator<Item=&'a str>>(
     ctx: &Context,
-    types: Vec<&str>,
+    types: I,
     schema: &HashMap<&str, &Value>,
 ) -> Result<Schema> {
+    let _frame = frames::enter::<(&Context, I, I::IntoIter, &HashMap<&str, &Value>, &str, Vec<Schema>, Schema, Result<Schema>)>(ctx)?;
     let mut options = Vec::new();
     for tp in types {
         let option = compile_type(ctx, tp, schema)?;
-        options.push(option);
+        ctx.funding.try_push(&mut options, option)?;
     }
     if options.len() == 1 {
         Ok(options.swap_remove(0))
@@ -885,20 +881,23 @@ fn compile_types(
 }
 
 fn compile_type(ctx: &Context, tp: &str, schema: &HashMap<&str, &Value>) -> Result<Schema> {
+    let _frame = frames::enter::<(&Context, &str, &HashMap<&str, &Value>, Result<Schema>)>(ctx)?;
     ctx.increment()?;
 
     match tp {
         "null" => Ok(Schema::Null),
         "boolean" => Ok(Schema::Boolean(None)),
-        "number" | "integer" => compile_numeric(schema, tp == "integer"),
+        "number" | "integer" => compile_numeric(ctx, schema, tp == "integer"),
         "string" => compile_string(ctx, schema),
         "array" => compile_array(ctx, schema),
         "object" => compile_object(ctx, schema),
-        _ => bail!("Invalid type: {}", tp),
+        _ => bail!(&ctx.funding, "Invalid type: {}", tp),
     }
 }
 
-fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Schema> {
+fn compile_numeric(ctx: &Context, schema: &HashMap<&str, &Value>, integer: bool) -> Result<Schema> {
+    let _frame = frames::enter::<(&Context, &HashMap<&str, &Value>, bool,
+        [Option<&Value>; 5], [Option<f64>; 4], f64, Option<Decimal>, NumberSchema, Result<Schema>)>(ctx)?;
     let minimum = schema.get("minimum").copied();
     let maximum = schema.get("maximum").copied();
     let exclusive_minimum = schema.get("exclusiveMinimum").copied();
@@ -909,14 +908,14 @@ fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Sche
         None => None,
         Some(val) => Some(
             val.as_f64()
-                .ok_or_else(|| anyhow!("Expected f64 for 'minimum', got {}", limited_str(val)))?,
+                .ok_or_else(|| anyhow!(&ctx.funding, "Expected f64 for 'minimum', got {}", limited_str(val)))?,
         ),
     };
     let maximum = match maximum {
         None => None,
         Some(val) => Some(
             val.as_f64()
-                .ok_or_else(|| anyhow!("Expected f64 for 'maximum', got {}", limited_str(val)))?,
+                .ok_or_else(|| anyhow!(&ctx.funding, "Expected f64 for 'maximum', got {}", limited_str(val)))?,
         ),
     };
     // TODO: actually use ctx.draft to determine which style of exclusiveMinimum/Maximum to use
@@ -926,7 +925,7 @@ fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Sche
         Some(Value::Bool(true)) => minimum,
         // Draft2020-12-style numeric values
         Some(value) => Some(value.as_f64().ok_or_else(|| {
-            anyhow!(
+            anyhow!(&ctx.funding,
                 "Expected f64 for 'exclusiveMinimum', got {}",
                 limited_str(value)
             )
@@ -938,7 +937,7 @@ fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Sche
         Some(Value::Bool(true)) => maximum,
         // Draft2020-12-style numeric values
         Some(value) => Some(value.as_f64().ok_or_else(|| {
-            anyhow!(
+            anyhow!(&ctx.funding,
                 "Expected f64 for 'exclusiveMaximum', got {}",
                 limited_str(value)
             )
@@ -948,10 +947,10 @@ fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Sche
         None => None,
         Some(val) => {
             let f = val.as_f64().ok_or_else(|| {
-                anyhow!("Expected f64 for 'multipleOf', got {}", limited_str(val))
+                anyhow!(&ctx.funding, "Expected f64 for 'multipleOf', got {}", limited_str(val))
             })?;
             // Can discard the sign of f
-            Some(Decimal::try_from(f.abs())?)
+            Some(Decimal::from_value(f.abs(), &ctx.funding)?)
         }
     };
     Ok(Schema::Number(NumberSchema {
@@ -965,20 +964,20 @@ fn compile_numeric(schema: &HashMap<&str, &Value>, integer: bool) -> Result<Sche
 }
 
 fn compile_string(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schema> {
+    let _frame = frames::enter::<frames::StringValue<'_>>(ctx)?;
     let pattern = schema.get("pattern").copied();
     let format = schema.get("format").copied();
 
-    let min_length = get_usize(schema, "minLength")?.unwrap_or(0);
-    let max_length = get_usize(schema, "maxLength")?;
+    let min_length = get_usize(ctx, schema, "minLength")?.unwrap_or(0);
+    let max_length = get_usize(ctx, schema, "maxLength")?;
 
     let pattern_rx = match pattern {
         None => None,
         Some(val) => Some({
             let s = val
                 .as_str()
-                .ok_or_else(|| anyhow!("Expected string for 'pattern', got {}", limited_str(val)))?
-                .to_string();
-            RegexAst::SearchRegex(regex_to_lark(&s, "dw"))
+                .ok_or_else(|| anyhow!(&ctx.funding, "Expected string for 'pattern', got {}", limited_str(val)))?;
+            RegexAst::SearchRegex(ctx.funding.try_format(format_args!("{}", regex_to_lark(&s, "dw")))?)
         }),
     };
     let format_rx = match format {
@@ -986,18 +985,17 @@ fn compile_string(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schem
         Some(val) => {
             let key = val
                 .as_str()
-                .ok_or_else(|| anyhow!("Expected string for 'format', got {}", limited_str(val)))?
-                .to_string();
+                .ok_or_else(|| anyhow!(&ctx.funding, "Expected string for 'format', got {}", limited_str(val)))?;
 
             if let Some(fmt) = lookup_format(&key) {
-                Some(RegexAst::Regex(fmt.to_string()))
+                Some(RegexAst::Regex(ctx.funding.try_copy_str(fmt)?))
             } else {
-                let msg = format!("Unknown format: {key}");
+                let msg = ctx.funding.try_format(format_args!("Unknown format: {key}"))?;
                 if ctx.options.lenient {
-                    ctx.record_warning(msg);
+                    ctx.record_warning(msg)?;
                     None
                 } else {
-                    bail!(msg);
+                    bail!(&ctx.funding, msg);
                 }
             }
         }
@@ -1006,7 +1004,7 @@ fn compile_string(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schem
         (None, None) => None,
         (None, Some(fmt)) => Some(fmt),
         (Some(pat), None) => Some(pat),
-        (Some(pat), Some(fmt)) => Some(RegexAst::And(vec![pat, fmt])),
+        (Some(pat), Some(fmt)) => Some(RegexAst::And([Ok::<_, derivre::ParserError>(pat), Ok(fmt)].into_iter().collect_with_funding(&ctx.funding)?)),
     };
     Ok(Schema::String(StringSchema {
         min_length,
@@ -1016,8 +1014,9 @@ fn compile_string(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schem
 }
 
 fn compile_array(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schema> {
-    let min_items = get_usize(schema, "minItems")?.unwrap_or(0);
-    let max_items = get_usize(schema, "maxItems")?;
+    let _frame = frames::enter::<frames::ArrayValue<'_>>(ctx)?;
+    let min_items = get_usize(ctx, schema, "minItems")?.unwrap_or(0);
+    let max_items = get_usize(ctx, schema, "maxItems")?;
     let prefix_items = schema.get("prefixItems").copied();
     let items = schema.get("items").copied();
     let additional_items = schema.get("additionalItems").copied();
@@ -1043,14 +1042,14 @@ fn compile_array(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schema
         None => vec![],
         Some(val) => val
             .as_array()
-            .ok_or_else(|| anyhow!("Expected array for 'prefixItems', got {}", limited_str(val)))?
+            .ok_or_else(|| anyhow!(&ctx.funding, "Expected array for 'prefixItems', got {}", limited_str(val)))?
             .iter()
             .map(|item| compile_resource(ctx, ctx.as_resource_ref(item)))
-            .collect::<Result<Vec<Schema>>>()?,
+            .collect_with_funding(&ctx.funding)?,
     };
     let items = match items {
         None => None,
-        Some(val) => Some(Box::new(compile_resource(ctx, ctx.as_resource_ref(val))?)),
+        Some(val) => Some(ctx.funding.try_box(compile_resource(ctx, ctx.as_resource_ref(val))?)?),
     };
     Ok(Schema::Array(ArraySchema {
         min_items,
@@ -1065,27 +1064,29 @@ fn compile_prop_map(
     lbl: &str,
     prop_map: Option<&Value>,
 ) -> Result<IndexMap<String, Schema>> {
-    match prop_map {
-        None => Ok(IndexMap::new()),
-        Some(val) => val
-            .as_object()
-            .ok_or_else(|| anyhow!("Expected object for '{lbl}', got {}", limited_str(val)))?
-            .iter()
-            .map(|(k, v)| compile_resource(ctx, ctx.as_resource_ref(v)).map(|v| (k.clone(), v)))
-            .collect(),
+    let _frame = frames::enter::<frames::PropertyMap<'_>>(ctx)?;
+    let mut result = IndexMap::new();
+    if let Some(value) = prop_map {
+        let values = value.as_object().ok_or_else(|| anyhow!(&ctx.funding, "Expected object for '{lbl}', got {}", limited_str(value)))?;
+        for (name, value) in values {
+            let schema = compile_resource(ctx, ctx.as_resource_ref(value))?;
+            ctx.funding.try_insert_index_map(&mut result, ctx.funding.try_copy_str(name)?, schema)?;
+        }
     }
+    Ok(result)
 }
 
-fn get_usize(schema: &HashMap<&str, &Value>, name: &str) -> Result<Option<usize>> {
+fn get_usize(ctx: &Context, schema: &HashMap<&str, &Value>, name: &str) -> Result<Option<usize>> {
+    let _frame = frames::enter::<(&Context, &HashMap<&str, &Value>, &str, &Value, u64, Result<Option<usize>>)>(ctx)?;
     if let Some(val) = schema.get(name) {
         if let Some(val) = val.as_u64() {
-            ensure!(
+            ensure!(&ctx.funding,
                 val <= usize::MAX as u64,
                 "Value {val} for '{name}' is too large"
             );
             Ok(Some(val as usize))
         } else {
-            bail!(
+            bail!(&ctx.funding,
                 "Expected positive integer for '{name}', got {}",
                 limited_str(val)
             )
@@ -1096,16 +1097,19 @@ fn get_usize(schema: &HashMap<&str, &Value>, name: &str) -> Result<Option<usize>
 }
 
 fn compile_object(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schema> {
+    let _frame = frames::enter::<frames::ObjectValue<'_>>(ctx)?;
     let properties = schema.get("properties").copied();
     let pattern_properties = schema.get("patternProperties").copied();
     let additional_properties = schema.get("additionalProperties").copied();
     let required = schema.get("required").copied();
-    let min_properties = get_usize(schema, "minProperties")?.unwrap_or(0);
-    let max_properties = get_usize(schema, "maxProperties")?;
+    let min_properties = get_usize(ctx, schema, "minProperties")?.unwrap_or(0);
+    let max_properties = get_usize(ctx, schema, "maxProperties")?;
 
     let mut properties = compile_prop_map(ctx, "properties", properties)?;
     let pattern_properties = compile_prop_map(ctx, "patternProperties", pattern_properties)?;
-    ctx.check_disjoint_pattern_properties(&pattern_properties.keys().collect::<Vec<_>>())?;
+    let mut patterns = Vec::new();
+    for key in pattern_properties.keys() { ctx.funding.try_push(&mut patterns, key)?; }
+    ctx.check_disjoint_pattern_properties(&patterns)?;
 
     // Per JSON Schema spec, a named property must validate against BOTH its
     // properties schema AND any matching patternProperties schema. Since
@@ -1120,7 +1124,7 @@ fn compile_object(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schem
             for (pattern, pat_schema) in pattern_properties.iter() {
                 if ctx.property_schema_matches(pattern, name)? {
                     let owned = std::mem::replace(prop_schema, Schema::Null);
-                    *prop_schema = owned.intersect(pat_schema.clone(), ctx, 0)?;
+                    *prop_schema = owned.intersect(pat_schema.copy_with_funding(&ctx.funding)?, ctx, 0)?;
                     break; // patterns are disjoint, at most one match
                 }
             }
@@ -1129,26 +1133,17 @@ fn compile_object(ctx: &Context, schema: &HashMap<&str, &Value>) -> Result<Schem
 
     let additional_properties = match additional_properties {
         None => None,
-        Some(val) => Some(Box::new(compile_resource(ctx, ctx.as_resource_ref(val))?)),
+        Some(val) => Some(ctx.funding.try_box(compile_resource(ctx, ctx.as_resource_ref(val))?)?),
     };
-    let required = match required {
-        None => IndexSet::new(),
-        Some(val) => val
-            .as_array()
-            .ok_or_else(|| anyhow!("Expected array for 'required', got {}", limited_str(val)))?
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Expected string for 'required' item, got {}",
-                            limited_str(item)
-                        )
-                    })
-                    .map(|s| s.to_string())
-            })
-            .collect::<Result<IndexSet<String>>>()?,
-    };
+    let mut required_names = IndexSet::new();
+    if let Some(value) = required {
+        let values = value.as_array().ok_or_else(|| anyhow!(&ctx.funding, "Expected array for 'required', got {}", limited_str(value)))?;
+        for value in values {
+            let name = value.as_str().ok_or_else(|| anyhow!(&ctx.funding, "Expected string for 'required' item, got {}", limited_str(value)))?;
+            ctx.funding.try_insert_index_set(&mut required_names, ctx.funding.try_copy_str(name)?)?;
+        }
+    }
+    let required = required_names;
 
     Ok(mk_object_schema(ObjectSchema {
         properties,
@@ -1203,7 +1198,7 @@ fn opt_min<T: PartialOrd>(a: Option<T>, b: Option<T>) -> Option<T> {
     }
 }
 
-#[cfg(all(test, feature = "referencing"))]
+#[cfg(test)]
 mod test_retriever {
     use crate::json::{Retrieve, RetrieveWrapper};
     use crate::JsonCompileOptions;
@@ -1256,7 +1251,7 @@ mod test_retriever {
             retriever: Some(wrapper.clone()),
             ..Default::default()
         };
-        let r = build_schema(schema, &options).unwrap();
+        let r = build_schema(schema, &options, &derivre::ParserAllocationFunding::unenforced()).unwrap();
         let schema = r.schema;
         let defs = r.definitions;
         match schema {
@@ -1312,6 +1307,6 @@ mod tests {
         });
         // Test failure amounts to this resulting in a stack overflow
         let options = JsonCompileOptions::default();
-        let _ = build_schema(schema, &options);
+        let _ = build_schema(schema, &options, &derivre::ParserAllocationFunding::unenforced());
     }
 }

@@ -210,8 +210,8 @@ fn load_recurrent_parameters(
         visited: BTreeMap<String, ()>,
     }
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Load {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let Some((_, field)) = metadata.id.as_str().rsplit_once(".mamba.") else {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let Some((_, field)) = metadata.id().as_str().rsplit_once(".mamba.") else {
                 return;
             };
             let (base, step) = match field {
@@ -225,12 +225,12 @@ fn load_recurrent_parameters(
             };
             assert!(self
                 .visited
-                .insert(metadata.id.as_str().into(), ())
+                .insert(metadata.id().as_str().into(), ())
                 .is_none());
             assert!(
                 value.data.iter().all(|value| *value == 0.0),
                 "unloaded {}",
-                metadata.id.as_str()
+                metadata.id().as_str()
             );
             for (index, value) in value.data.iter_mut().enumerate() {
                 *value = base + step * (index % 7) as f32;
@@ -253,7 +253,7 @@ fn compare_equations(config: serde_json::Value) {
     let context = NumericContext::default();
     let architecture = HybridModel::new(args.clone(), &context).unwrap();
     let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 10 + 4 * args.layer_schedule.len());
     let mut model = ResidentRuntime::new(architecture, &context).unwrap();
     let mamba_units = args
@@ -481,7 +481,7 @@ fn nemotron_actual_sources_bind_target_rows_and_original_physical_readout() {
         let context = NumericContext::default();
         let architecture = HybridModel::new(args, &context).unwrap();
         let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-            prefill_observation_declarations(&architecture).unwrap();
+            prefill_observation_declarations(&architecture, None).unwrap();
         assert_eq!(declarations.len(), 26);
         let runtime =
             ResidentRuntime::<_, NumericBackend, HybridState>::new(architecture, &context).unwrap();
@@ -551,7 +551,7 @@ fn nemotron_target_rows_preserve_mtp_scope_and_state() {
     let context = NumericContext::default();
     let architecture = HybridModel::new(args.clone(), &context).unwrap();
     let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 26);
     assert!(declarations
         .iter()
@@ -703,7 +703,7 @@ fn nemotron_body_rows_preserve_sequence_before_state_only_or_last_position_reado
         let context = NumericContext::default();
         let architecture = HybridModel::new(args.clone(), &context).unwrap();
         let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-            prefill_observation_declarations(&architecture).unwrap()
+            prefill_observation_declarations(&architecture, None).unwrap()
             .into_iter().filter(|d| d.readout_stage() == Stage::BeforeReadout)
             .collect::<Vec<_>>();
         assert_eq!(declarations.len(), 18);
@@ -776,7 +776,7 @@ fn nemotron_embedded_tp1_target_and_draft_use_their_own_attention_frontiers() {
     let args = nemotron_h::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let architecture = HybridModel::new(args.clone(), &context).unwrap();
-    let description = architecture.parameter_description(&context).unwrap();
+    let description = architecture.parameter_description(&context).unwrap().into_owned();
     let groups = description
         .groups()
         .iter()

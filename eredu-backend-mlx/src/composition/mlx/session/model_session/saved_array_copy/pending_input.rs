@@ -52,10 +52,8 @@ impl<'a> PromptCopySource<'a> {
                 prompt,
                 kind: PromptCopyKind::Media(
                     packet,
-                    prompt
-                        .quote
-                        .as_ref()
-                        .and_then(|quote| quote.copied_media_semantics())
+                    prompt.placement_semantics.as_ref().or_else(|| prompt
+                        .quote.as_ref().and_then(|quote| quote.copied_media_semantics()))
                         .unwrap_or_else(|| packet.borrowed_semantics()),
                 ),
                 positions: packet.shape()[1],

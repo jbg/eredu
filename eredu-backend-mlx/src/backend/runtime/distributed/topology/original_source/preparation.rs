@@ -31,7 +31,7 @@ pub(crate) struct OriginalPreparationFrame {
     word_count:usize,
     runtime:PreparedInputRuntime,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// One actual world gather, including its preallocated unsigned host destination.
 pub(crate) struct PreparedOriginalPreparationGather<'a> {
@@ -41,15 +41,16 @@ pub(crate) struct PreparedOriginalPreparationGather<'a> {
     runtime:&'a PreparedInputRuntime,
     backing:usize,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalCommunicationSource<'_> {
     pub(crate) fn prepare_preparation_frame(&self,
         words:&[u32],
-        pool:&eredu_runtime::working_memory::WorkingMemoryPool)->Result<OriginalPreparationFrame,Error> {
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,
+        policy:Option<&eredu_runtime::working_memory::SessionResetPreparationFunding>)->Result<OriginalPreparationFrame,Error> {
         reserve(self.funding(),&[
             size_of::<OriginalPreparationFrame>(),size_of::<Result<OriginalPreparationFrame,Error>>(),
-            size_of::<(&Self,&[u32],&eredu_runtime::working_memory::WorkingMemoryPool)>(),
+            size_of::<(&Self,&[u32],&eredu_runtime::working_memory::WorkingMemoryPool,Option<&eredu_runtime::working_memory::SessionResetPreparationFunding>)>(),
             size_of::<PreparedInputRuntime>(),size_of::<Result<PreparedInputRuntime,eredu_runtime::working_memory::WorkingMemoryError>>(),
             size_of::<PreparedInputPlan<'_>>(),size_of::<Result<PreparedInputPlan<'_>,safemlx::PreparedInputCause>>(),
             size_of::<[usize;1]>(),size_of::<[Array;1]>(),
@@ -65,7 +66,7 @@ impl OriginalCommunicationSource<'_> {
             .map_err(|cause|failure(Cause::Allocator(cause),self.source(),self.funding()))?;
         let shape=[words.len()];
         let plan=runtime.u32(words,&shape).map_err(|cause|failure(Cause::Input(cause),self.source(),self.funding()))?;
-        let value=pool.prepare_communication(FrameProducer{source:self,plan,words,pool})
+        let value=pool.prepare_communication(FrameProducer{source:self,plan,words,pool,policy})
             .map_err(|cause|retired_error(cause.retire(),self.source(),self.funding()))?;
         Ok(OriginalPreparationFrame{value,word_count:words.len(),runtime,source:self.source().clone(),funding:self.funding().clone()})
     }
@@ -112,8 +113,8 @@ impl PreparedOriginalPreparationGather<'_> {
         Ok((words,completion.into()))
     }
 }
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,bytes:&[usize])->Result<(),Error>{
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,bytes:&[usize])->Result<(),Error>{
     funding.reserve_metadata(bytes.iter().copied().try_fold(size_of_val(bytes),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
@@ -122,6 +123,7 @@ struct FrameProducer<'a,'native>{
     source:&'a OriginalCommunicationSource<'native>,plan:PreparedInputPlan<'a>,
     words:&'a [u32],
     pool:&'a eredu_runtime::working_memory::WorkingMemoryPool,
+    policy:Option<&'a eredu_runtime::working_memory::SessionResetPreparationFunding>,
 }
 impl eredu_runtime::working_memory::CommunicationPreparationProducer for FrameProducer<'_, '_>{
     type Output=Array;type Error=Error;
@@ -133,6 +135,10 @@ impl eredu_runtime::working_memory::CommunicationPreparationProducer for FramePr
     fn required_storage_bytes(&self)->Result<usize,eredu_runtime::working_memory::WorkingMemoryError>{
         super::inputs::storage_bytes(std::array::from_ref(&self.plan))
     }
+    fn check_preparation_policy(&self,pool:&eredu_runtime::working_memory::WorkingMemoryPool,bytes:u64)
+        ->Result<(),eredu_runtime::working_memory::WorkingMemoryError>{
+        self.policy.map_or(Ok(()),|policy|policy.charge_communication(pool,bytes))
+    }
     fn produce(self,custody:eredu_runtime::working_memory::CommunicationPreparationCustody)->Result<Array,Error>{
         let [value]=super::inputs::construct_admitted(self.source,[self.plan],custody)?;Ok(value)
     }
@@ -141,10 +147,10 @@ impl eredu_runtime::working_memory::CommunicationPreparationProducer for FramePr
 #[error("{cause}")]
 struct RetiredFailure {
     #[source] cause:eredu_runtime::working_memory::RetiredCommunicationPreparationError<Error>,
-    source:RetainedCommunicationSource,funding:WorkspaceMetadataFunding,
+    source:RetainedCommunicationSource,funding:HostMetadataFunding,
 }
 fn retired_error(cause:eredu_runtime::working_memory::RetiredCommunicationPreparationError<Error>,
-    source:&RetainedCommunicationSource,funding:&WorkspaceMetadataFunding)->Error{
+    source:&RetainedCommunicationSource,funding:&HostMetadataFunding)->Error{
     Error::with_original_control_source(eredu_core::BackendFailure::new(eredu_core::BackendFailureKind::Other,
         RetiredFailure{cause,source:source.clone(),funding:funding.clone()}),false)
 }

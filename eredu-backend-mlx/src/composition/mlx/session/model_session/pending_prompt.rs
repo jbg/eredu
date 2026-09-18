@@ -216,6 +216,7 @@ impl<'a> PreparedPendingPrompt<'a> {
                 controlled_attribution: None,
                 prepared_capture: None,
                 original_media: None,
+                placement_semantics: None,
                 parts: ModelInputParts::Pending(parts),
                 cache_identity,
                 prefill_chunk_positions,

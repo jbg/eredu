@@ -144,29 +144,29 @@ struct Ordinary<'a> {
     branches: branches::Ordinary,
 }
 impl Context for Ordinary<'_> {
-    type Error = anyhow::Error;
+    type Error = crate::ParserError;
     fn source(&self) -> &ExprSet {
         self.source
     }
-    fn derivative(&mut self, root: ExprRef, byte: u8) -> anyhow::Result<ExprRef> {
-        Ok(self.derivative.derivative(self.source, root, byte))
+    fn derivative(&mut self, root: ExprRef, byte: u8) -> crate::ParserResult<ExprRef> {
+        Ok(self.derivative.derivative(self.source, root, byte)?)
     }
-    fn not(&mut self, root: ExprRef) -> anyhow::Result<ExprRef> {
-        Ok(self.source.mk_not(root))
+    fn not(&mut self, root: ExprRef) -> crate::ParserResult<ExprRef> {
+        Ok(self.source.mk_not(root)?)
     }
-    fn and2(&mut self, a: ExprRef, b: ExprRef) -> anyhow::Result<ExprRef> {
-        Ok(self.source.mk_and2(a, b))
+    fn and2(&mut self, a: ExprRef, b: ExprRef) -> crate::ParserResult<ExprRef> {
+        Ok(self.source.mk_and2(a, b)?)
     }
-    fn repeat(&mut self, root: ExprRef, min: u32, max: u32) -> anyhow::Result<ExprRef> {
-        Ok(self.source.mk_repeat(root, min, max))
+    fn repeat(&mut self, root: ExprRef, min: u32, max: u32) -> crate::ParserResult<ExprRef> {
+        Ok(self.source.mk_repeat(root, min, max)?)
     }
-    fn non_empty(&mut self, root: ExprRef) -> anyhow::Result<bool> {
+    fn non_empty(&mut self, root: ExprRef) -> crate::ParserResult<bool> {
         entry::ordinary(self.cache, self.source, root)
     }
-    fn max_length(&mut self, root: ExprRef) -> anyhow::Result<Option<usize>> {
-        length::run(self.source, root, &mut self.lengths, &mut length::Ordinary)
+    fn max_length(&mut self, root: ExprRef) -> crate::ParserResult<Option<usize>> {
+        length::run(self.source, root, &mut self.lengths, &mut length::Ordinary(self.source.construction_funding()?))
     }
-    fn branches(&mut self, main: ExprRef, head: ExprRef) -> anyhow::Result<Option<ExprRef>> {
+    fn branches(&mut self, main: ExprRef, head: ExprRef) -> crate::ParserResult<Option<ExprRef>> {
         self.branches.stack.clear();
         self.branches.rows.clear();
         branches::run(self.source, main, head, &mut self.branches)
@@ -181,7 +181,8 @@ pub(crate) fn ordinary(
     derivative: &mut DerivCache,
     small: ExprRef,
     big: ExprRef,
-) -> anyhow::Result<bool> {
+) -> crate::ParserResult<bool> {
+    let funding = source.construction_funding()?.clone();
     run(
         &mut Ordinary {
             source,
@@ -189,6 +190,7 @@ pub(crate) fn ordinary(
             derivative,
             lengths: Vec::new(),
             branches: branches::Ordinary {
+                funding,
                 stack: Vec::new(),
                 rows: Vec::new(),
             },

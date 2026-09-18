@@ -91,7 +91,7 @@ fn complete_input(region:Option<&crate::backend::runtime::distributed::topology:
 impl OriginalParallelControlProjection {
     pub(crate) fn complete_variable_all_to_all(&self, input: &Array,
         counts: &CommunicationPeerCounts, axis: usize, matrix: &CommunicationPeerMatrix<'_>,
-        group: &Group, context: &Group, executor: &Stream, funding: &WorkspaceMetadataFunding)
+        group: &Group, context: &Group, executor: &Stream, funding: &HostMetadataFunding)
         -> Result<Array, Error> {
         self.with_context(context, |bound| {
             let c = &self.custody;
@@ -349,7 +349,7 @@ impl Invocation {
             size_of::<eredu_core::Submission<super::super::super::OriginalCommunicationConstructed,
                 crate::backend::runtime::distributed::completion::OriginalCommunicationCompletion>>(),
             size_of::<Result<super::super::super::OriginalCommunicationConstructed, PartitionExecutionError>>(),
-            size_of::<(Array, RetainedCommunicationSource, WorkspaceMetadataFunding)>(),
+            size_of::<(Array, RetainedCommunicationSource, HostMetadataFunding)>(),
             size_of::<Option<(&Group, &CommunicationGroupDescriptor, bool)>>(),
             size_of::<(&Self, &OriginalScopeObserver)>(),
             // One actual collective output crosses this independently admitted

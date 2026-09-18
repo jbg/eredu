@@ -8,6 +8,12 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         path: &str,
         value: &T,
     ) -> Result<Option<T>, FundedCaptureError<E>> {
+        match &self.frame {
+            Frame::Empty => return Ok(None),
+            Frame::Active(frame) if frame.intervention_admission().is_none() => return Ok(None),
+            Frame::Active(_) => (),
+            _ => return Err(CaptureProtocolError::Transaction.into()),
+        }
         let prefill = if self.prefill.is_some() {
             Some((self.bound.ok_or(CaptureProtocolError::PrefillAttribution)?.geometry(),self.current_fragment_chunk()?))
         } else {None};

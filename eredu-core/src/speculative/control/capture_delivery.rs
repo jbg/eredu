@@ -1,72 +1,6 @@
-//! The existing capture delivery owner inside a speculative prediction record.
-use super::{SpeculativePredictionCapture, SpeculativeActivationCapture};
-use crate::capture::{CapturedStep, CapturedStepDelivery};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-impl Clone for SpeculativePredictionCapture {
-    fn clone(&self) -> Self {
-        Self {
-            role: self.role,
-            position: self.position,
-            capture: match &self.capture {
-                CapturedStepDelivery::Legacy(frame) => CapturedStepDelivery::Legacy(frame.clone()),
-                CapturedStepDelivery::Shared(frame) => CapturedStepDelivery::Shared(frame.clone()),
-            },
-        }
-    }
-}
-impl PartialEq for SpeculativePredictionCapture {
-    fn eq(&self, other: &Self) -> bool {
-        self.role == other.role
-            && self.position == other.position
-            && self.capture.as_step() == other.capture.as_step()
-    }
-}
-
-impl Clone for SpeculativeActivationCapture {
-    fn clone(&self) -> Self {
-        Self {
-            admission_identity: self.admission_identity.clone(),
-            invocation: self.invocation,
-            origin: self.origin,
-            phase: self.phase,
-            prefill_span: self.prefill_span,
-            completed: self.completed,
-            captures: match &self.captures {
-                CapturedStepDelivery::Legacy(frame) => CapturedStepDelivery::Legacy(frame.clone()),
-                CapturedStepDelivery::Shared(frame) => CapturedStepDelivery::Shared(frame.clone()),
-            },
-            prefill_reductions: self.prefill_reductions.clone(),
-        }
-    }
-}
-impl PartialEq for SpeculativeActivationCapture {
-    fn eq(&self, other: &Self) -> bool {
-        self.admission_identity == other.admission_identity
-            && self.invocation == other.invocation
-            && self.origin == other.origin
-            && self.phase == other.phase
-            && self.prefill_span == other.prefill_span
-            && self.completed == other.completed
-            && self.captures.as_step() == other.captures.as_step()
-            && self.prefill_reductions == other.prefill_reductions
-    }
-}
-
-pub(super) fn serialize<S: Serializer>(
-    value: &CapturedStepDelivery,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    value.as_step().serialize(serializer)
-}
-
-pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<CapturedStepDelivery, D::Error> {
-    // Decoding wire records creates ordinary caller-owned data, never funding
-    // or an original source/transaction witness.
-    CapturedStep::deserialize(deserializer).map(CapturedStepDelivery::Legacy)
-}
+//! Retained speculative capture custody and diagnostic wire conformance.
+use super::{SpeculativeActivationCapture, SpeculativePredictionCapture};
+use crate::capture::SharedCapturedStep;
 
 #[cfg(test)]
 mod tests {
@@ -75,7 +9,7 @@ mod tests {
         HostPreparationAuthority, ObservationPosition, SpeculativeBuffer,
         capture::{
             CAPTURE_SCHEMA_VERSION, CaptureOutcome, CapturePhase, CaptureRecord,
-            CaptureStepOutcome, CaptureUsage, SharedCapturedStep,
+            CaptureStepOutcome, CaptureUsage, CapturedStep,
         },
         speculative::SpeculativeCaptureRole,
     };
@@ -127,7 +61,10 @@ mod tests {
         let legacy = SpeculativePredictionCapture {
             role: SpeculativeCaptureRole::Draft,
             position: 3,
-            capture: CapturedStepDelivery::Legacy(frame.clone()),
+            capture: crate::capture::SharedCapturedStep::retain(
+                frame.clone(),
+                (),
+            ),
         };
         let frame_retired = Arc::new(AtomicUsize::new(0));
         let buffer_retired = Arc::new(AtomicUsize::new(0));
@@ -136,16 +73,15 @@ mod tests {
         let record = SpeculativePredictionCapture {
             role: legacy.role,
             position: legacy.position,
-            capture: CapturedStepDelivery::Shared(shared),
+            capture: shared,
         };
         let wire = serde_json::to_value(&legacy).unwrap();
         assert_eq!(serde_json::to_value(&record).unwrap(), wire);
         let decoded: SpeculativePredictionCapture = serde_json::from_value(wire).unwrap();
-        assert!(matches!(&decoded.capture, CapturedStepDelivery::Legacy(_)));
         assert_eq!(record, decoded);
 
         let alias = record.clone();
-        assert!(source.same_storage(alias.capture.shared().unwrap()));
+        assert!(source.same_storage(&alias.capture));
         assert!(std::ptr::eq(
             source.records()[0].selection_id.as_ptr(),
             alias.capture.as_step().records[0].selection_id.as_ptr(),
@@ -193,21 +129,24 @@ mod tests {
             phase: SpeculativeActivationPhase::Proposal { depth: 2 },
             prefill_span: None,
             completed: false,
-            captures: CapturedStepDelivery::Shared(shared),
+            captures: shared,
             prefill_reductions: None,
         };
         let wire = serde_json::to_value(&record).unwrap();
         let decoded: SpeculativeActivationCapture = serde_json::from_value(wire.clone()).unwrap();
-        assert!(matches!(&decoded.captures, CapturedStepDelivery::Legacy(_)));
         assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
         assert_eq!(record, decoded);
         let alias = record.clone();
-        assert!(source.same_storage(alias.captures.shared().unwrap()));
-        assert_eq!(source.records()[0].selection_id.as_ptr(),
-            alias.captures.as_step().records[0].selection_id.as_ptr());
+        assert!(source.same_storage(&alias.captures));
+        assert_eq!(
+            source.records()[0].selection_id.as_ptr(),
+            alias.captures.as_step().records[0].selection_id.as_ptr()
+        );
         let mut rows = SpeculativeBuffer::try_new_retained(
-            1, HostPreparationAuthority::retain(Retires(buffer_retired.clone())),
-        ).unwrap();
+            1,
+            HostPreparationAuthority::retain(Retires(buffer_retired.clone())),
+        )
+        .unwrap();
         rows.try_push(record).unwrap();
         let mut drained = rows.into_iter();
         let escaped = drained.next().unwrap();
@@ -221,5 +160,4 @@ mod tests {
         drop(alias);
         assert_eq!(retired.load(Ordering::SeqCst), 1);
     }
-
 }

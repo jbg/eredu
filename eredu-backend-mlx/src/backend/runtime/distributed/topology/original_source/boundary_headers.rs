@@ -25,21 +25,21 @@ pub(crate) struct OriginalBoundaryHeaders {
     values:Vec<OriginalBoundaryHeader>,
     route:CommunicationRouteId,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalBoundaryHeaders {
     pub(crate) fn values(&self)->&[OriginalBoundaryHeader]{&self.values}
     pub(crate) fn route(&self)->CommunicationRouteId{self.route}
     pub(crate) fn source(&self)->&RetainedCommunicationSource{&self.source}
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding{&self.funding}
-    pub(crate) fn into_parts(self)->(Vec<OriginalBoundaryHeader>,RetainedCommunicationSource,WorkspaceMetadataFunding){
+    pub(crate) fn funding(&self)->&HostMetadataFunding{&self.funding}
+    pub(crate) fn into_parts(self)->(Vec<OriginalBoundaryHeader>,RetainedCommunicationSource,HostMetadataFunding){
         (self.values,self.source,self.funding)
     }
 }
 // The source arena holds only this paid, array-free custody. It cannot keep the
 // request, observer, source table, frame vector or native payload alive.
 #[derive(Clone)]
-struct Custody { source:RetainedCommunicationSource, funding:WorkspaceMetadataFunding }
+struct Custody { source:RetainedCommunicationSource, funding:HostMetadataFunding }
 struct Bytes<'a>(&'a [u8]);
 impl OwnedHostCopyBuffer<u8> for Bytes<'_> {
     fn as_slice(&self)->&[u8]{self.0}
@@ -126,8 +126,8 @@ fn upload(source:&OriginalCommunicationSource<'_>,runtime:&PreparedInputRuntime,
     header.observe().map_err(|cause|fail(Cause::Buffer(cause)))?;
     Ok(header)
 }
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,bytes:&[usize])->Result<(),Error>{
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,bytes:&[usize])->Result<(),Error>{
     funding.reserve_metadata(bytes.iter().copied().try_fold(size_of_val(bytes),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }

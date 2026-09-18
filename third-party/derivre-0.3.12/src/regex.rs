@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use crate::HashSet;
-use anyhow::Result;
+use crate::ParserResult as Result;
 
 use crate::{
     ast::{ExprRef, ExprSet, NextByte},
@@ -111,7 +111,6 @@ pub struct AlphabetInfo {
 /// Construct a `Regex` from a pattern string with [`Regex::new`], or build
 /// one programmatically via [`RegexBuilder`](crate::RegexBuilder). Matching
 /// is always anchored at the start of the input.
-#[derive(Clone)]
 pub struct Regex {
     exprs: ExprSet,
     deriv: DerivCache,
@@ -119,7 +118,7 @@ pub struct Regex {
     relevance: RelevanceCache,
     alpha: AlphabetInfo,
     initial: StateID,
-    rx_sets: VecHashCons,
+    rx_sets: crate::raw::PreparedVecHashCons,
     state_table: Vec<StateID>,
     state_descs: Vec<StateDesc>,
     num_transitions: usize,
@@ -135,14 +134,14 @@ struct StateDesc {
 
 // public implementation
 impl Regex {
-    pub fn new(rx: &str) -> Result<Self> {
+    pub fn new(rx: &str, funding: crate::ParserAllocationFunding) -> Result<Self> {
         let parser = regex_syntax::ParserBuilder::new().build();
-        Self::new_with_parser(parser, rx)
+        Self::new_with_parser(parser, rx, funding)
     }
 
-    pub fn new_with_parser(parser: regex_syntax::Parser, rx: &str) -> Result<Self> {
-        let mut exprset = ExprSet::new(256);
-        let rx = exprset.parse_expr(parser.clone(), rx, false)?;
+    pub fn new_with_parser(parser: regex_syntax::Parser, rx: &str, funding: crate::ParserAllocationFunding) -> Result<Self> {
+        let mut exprset = ExprSet::new(256, funding)?;
+        let rx = exprset.parse_expr(parser, rx, false)?;
         Self::new_with_exprset(exprset, rx, u64::MAX)
     }
 
@@ -174,7 +173,7 @@ impl Regex {
         if let Some(len) = desc.lookahead_len {
             return len;
         }
-        let expr = Self::resolve(&self.rx_sets, state);
+        let expr = Self::resolve(self.rx_sets.source(), state);
         let mut res = None;
         if self.exprs.is_nullable(expr) {
             res = Some(self.exprs.lookahead_len(expr).unwrap_or(0));
@@ -184,50 +183,50 @@ impl Regex {
     }
 
     #[inline(always)]
-    pub fn transition(&mut self, state: StateID, b: u8) -> StateID {
+    pub fn transition(&mut self, state: StateID, b: u8) -> Result<StateID> {
         let idx = self.alpha.map_state(state, b);
         let new_state = self.state_table[idx];
         if new_state != StateID::MISSING {
-            new_state
+            Ok(new_state)
         } else {
-            let new_state = self.transition_inner(state, b);
+            let new_state = self.transition_inner(state, b)?;
             self.num_transitions += 1;
             self.state_table[idx] = new_state;
-            new_state
+            Ok(new_state)
         }
     }
 
-    pub fn transition_bytes(&mut self, state: StateID, bytes: &[u8]) -> StateID {
+    pub fn transition_bytes(&mut self, state: StateID, bytes: &[u8]) -> Result<StateID> {
         let mut state = state;
         for &b in bytes {
-            state = self.transition(state, b);
+            state = self.transition(state, b)?;
         }
-        state
+        Ok(state)
     }
 
-    pub fn is_match(&mut self, text: &str) -> bool {
-        self.lookahead_len(text).is_some()
+    pub fn is_match(&mut self, text: &str) -> Result<bool> {
+        Ok(self.lookahead_len(text)?.is_some())
     }
 
-    pub fn is_match_bytes(&mut self, text: &[u8]) -> bool {
-        self.lookahead_len_bytes(text).is_some()
+    pub fn is_match_bytes(&mut self, text: &[u8]) -> Result<bool> {
+        Ok(self.lookahead_len_bytes(text)?.is_some())
     }
 
-    pub fn lookahead_len_bytes(&mut self, text: &[u8]) -> Option<usize> {
+    pub fn lookahead_len_bytes(&mut self, text: &[u8]) -> Result<Option<usize>> {
         let mut state = self.initial_state();
         for b in text {
             let b = *b;
-            let new_state = self.transition(state, b);
+            let new_state = self.transition(state, b)?;
             debug!("b: {:?} --{:?}--> {:?}", state, b as char, new_state);
             state = new_state;
             if state == StateID::DEAD {
-                return None;
+                return Ok(None);
             }
         }
-        self.lookahead_len_for_state(state)
+        Ok(self.lookahead_len_for_state(state))
     }
 
-    pub fn lookahead_len(&mut self, text: &str) -> Option<usize> {
+    pub fn lookahead_len(&mut self, text: &str) -> Result<Option<usize>> {
         self.lookahead_len_bytes(text.as_bytes())
     }
 
@@ -238,7 +237,7 @@ impl Regex {
             + self.next_byte.num_bytes()
             + self.state_descs.len() * 100
             + self.state_table.len() * std::mem::size_of::<StateID>()
-            + self.rx_sets.num_bytes()
+            + self.rx_sets.source().num_bytes()
     }
 
     pub fn cost(&self) -> u64 {
@@ -257,7 +256,7 @@ impl Regex {
             return next_byte;
         }
 
-        let e = Self::resolve(&self.rx_sets, state);
+        let e = Self::resolve(self.rx_sets.source(), state);
         let next_byte = self.next_byte.next_byte(&self.exprs, e);
         desc.next_byte = Some(next_byte);
         next_byte
@@ -276,7 +275,7 @@ impl Regex {
         )
     }
 
-    pub fn dfa(&mut self) -> Vec<u8> {
+    pub fn dfa(&mut self) -> Result<Vec<u8>> {
         let mut used = HashSet::default();
         let mut designated_bytes = vec![];
         for b in 0..=255 {
@@ -291,7 +290,7 @@ impl Regex {
         let mut visited = HashSet::default();
         while let Some(state) = stack.pop() {
             for b in &designated_bytes {
-                let new_state = self.transition(state, *b);
+                let new_state = self.transition(state, *b)?;
                 if !visited.contains(&new_state) {
                     stack.push(new_state);
                     visited.insert(new_state);
@@ -303,7 +302,7 @@ impl Regex {
         assert!(!self.state_table.contains(&StateID::MISSING));
         let mut res = self.alpha.mapping.to_vec();
         res.extend(self.state_table.iter().map(|s| s.as_u32() as u8));
-        res
+        Ok(res)
     }
 
     pub fn print_state_table(&self) {
@@ -321,18 +320,19 @@ impl AlphabetInfo {
         Self { mapping, size }
     }
 
-    pub fn from_exprset(exprset: ExprSet, rx_list: &[ExprRef]) -> (Self, ExprSet, Vec<ExprRef>) {
+    pub fn from_exprset(exprset: ExprSet, rx_list: &[ExprRef]) -> Result<(Self, ExprSet, Vec<ExprRef>)> {
         assert!(exprset.alphabet_size == 256);
 
         debug!("rx0: {}", exprset.expr_to_string_with_info(rx_list[0]));
 
-        let mapping = MappingPlan::prepare(&exprset, rx_list)
-            .expect("ordinary alphabet source geometry")
-            .compile()
-            .expect("ordinary alphabet destination allocation");
+        let funding = exprset.construction_funding()?.clone();
+        funding.reserve(MappingPlan::inspection_control_bytes().ok_or_else(|| funding.storage_overflow())?)?;
+        let plan = MappingPlan::prepare(&exprset, rx_list).map_err(|error| crate::ParserError::cause(error, &funding))?;
+        funding.reserve(plan.requirements().required_bytes())?;
+        let mapping = plan.compile().map_err(|error| crate::ParserError::cause(error, &funding))?;
         let (alpha, exprset, roots) = mapping.finish(exprset);
         debug!("compressed: {}", exprset.expr_to_string_with_info(roots[0]));
-        (alpha, exprset, roots)
+        Ok((alpha, exprset, roots))
     }
 
     #[inline(always)]
@@ -380,7 +380,7 @@ impl Regex {
         big: ExprRef,
         relevance_fuel: u64,
     ) -> Result<bool> {
-        let (mut slf, rxes) = Self::prep_regex(exprset, &[small, big]);
+        let (mut slf, rxes) = Self::prep_regex(exprset, &[small, big])?;
         let small = rxes[0];
         let big = rxes[1];
 
@@ -394,11 +394,13 @@ impl Regex {
         )
     }
 
-    fn prep_regex(exprset: ExprSet, top_rxs: &[ExprRef]) -> (Self, Vec<ExprRef>) {
-        let (alpha, exprset, rx_list) = AlphabetInfo::from_exprset(exprset, top_rxs);
+    fn prep_regex(exprset: ExprSet, top_rxs: &[ExprRef]) -> Result<(Self, Vec<ExprRef>)> {
+        let (alpha, exprset, rx_list) = AlphabetInfo::from_exprset(exprset, top_rxs)?;
         let num_ast_nodes = exprset.len();
 
-        let rx_sets = StateID::new_hash_cons();
+        let funding = exprset.construction_funding()?.clone();
+        let mut rx_sets = crate::raw::PreparedVecHashCons::empty_with_funding(funding)?;
+        StateID::seed_hash_cons(|words| rx_sets.try_insert(words))?;
 
         let mut slf = Regex {
             deriv: DerivCache::new(),
@@ -421,14 +423,14 @@ impl Regex {
         };
 
         // DEAD
-        slf.append_state(desc.clone());
+        slf.append_state(desc.clone())?;
         // also append state for the "MISSING"
-        slf.append_state(desc);
+        slf.append_state(desc)?;
         // in fact, transition from MISSING and DEAD should both lead to DEAD
         slf.state_table.fill(StateID::DEAD);
         assert!(!slf.alpha.is_empty());
 
-        (slf, rx_list)
+        Ok((slf, rx_list))
     }
 
     pub(crate) fn new_with_exprset(
@@ -436,13 +438,13 @@ impl Regex {
         top_rx: ExprRef,
         relevance_fuel: u64,
     ) -> Result<Self> {
-        let (mut r, top_rx) = Self::prep_regex(exprset, &[top_rx]);
+        let (mut r, top_rx) = Self::prep_regex(exprset, &[top_rx])?;
         let top_rx = top_rx[0];
 
         if r.relevance
             .is_non_empty_limited(&mut r.exprs, top_rx, relevance_fuel)?
         {
-            r.initial = r.insert_state(top_rx);
+            r.initial = r.insert_state(top_rx)?;
         } else {
             r.initial = StateID::DEAD;
         }
@@ -450,34 +452,34 @@ impl Regex {
         Ok(r)
     }
 
-    fn append_state(&mut self, state_desc: StateDesc) {
-        let mut new_states = vec![StateID::MISSING; self.alpha.len()];
-        self.state_table.append(&mut new_states);
+    fn append_state(&mut self, state_desc: StateDesc) -> Result<()> {
+        let funding = self.exprs.construction_funding()?.clone();
+        let next = self.state_table.len().checked_add(self.alpha.len()).ok_or_else(|| funding.storage_overflow())?;
+        funding.try_grow_vec(&mut self.state_table, next)?;
+        let descriptors = self.state_descs.len().checked_add(1).ok_or_else(|| funding.storage_overflow())?;
+        funding.try_grow_vec(&mut self.state_descs, descriptors)?;
+        self.state_table.resize(next, StateID::MISSING);
         self.state_descs.push(state_desc);
-        if self.state_descs.len() >= self.max_states {
-            self.alpha.enter_error_state();
-        }
+        if self.state_descs.len() >= self.max_states { self.alpha.enter_error_state(); }
+        Ok(())
+    }
+    fn insert_state(&mut self, d: ExprRef) -> Result<StateID> {
+        let id = StateID::new(self.rx_sets.try_insert(&[d.as_u32()])?);
+        if id.as_usize() >= self.state_descs.len() { self.append_state(StateDesc::default())?; }
+        Ok(id)
     }
 
-    fn insert_state(&mut self, d: ExprRef) -> StateID {
-        let id = StateID::new(self.rx_sets.insert(&[d.as_u32()]));
-        if id.as_usize() >= self.state_descs.len() {
-            self.append_state(StateDesc::default());
-        }
-        id
-    }
-
-    fn transition_inner(&mut self, state: StateID, b: u8) -> StateID {
+    fn transition_inner(&mut self, state: StateID, b: u8) -> Result<StateID> {
         assert!(state.is_valid());
 
-        let e = Self::resolve(&self.rx_sets, state);
-        let d = self.deriv.derivative(&mut self.exprs, e, b);
+        let e = Self::resolve(self.rx_sets.source(), state);
+        let d = self.deriv.derivative(&mut self.exprs, e, b)?;
         if d == ExprRef::NO_MATCH {
-            StateID::DEAD
-        } else if self.relevance.is_non_empty(&mut self.exprs, d) {
+            Ok(StateID::DEAD)
+        } else if self.relevance.is_non_empty_limited(&mut self.exprs, d, u64::MAX)? {
             self.insert_state(d)
         } else {
-            StateID::DEAD
+            Ok(StateID::DEAD)
         }
     }
 }

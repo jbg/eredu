@@ -40,7 +40,14 @@ use regex_syntax::hir::{
     Hir, HirKind,
 };
 
-use crate::{meta::prefix, util::prefilter::Prefilter, MatchKind};
+use crate::{
+    meta::prefix,
+    util::{
+        allocation::{Allocation, AllocationError, Allocator},
+        prefilter::Prefilter,
+    },
+    MatchKind,
+};
 
 /// Returns true when it's impossible for an earlier match to be detected after
 /// a literal candidate (corresponding to anything in `literals`) has
@@ -51,17 +58,18 @@ use crate::{meta::prefix, util::prefilter::Prefilter, MatchKind};
 ///
 /// Since this requires a single `Hir`, this implies the reverse inner optimization
 /// only works with a single regex.
-pub(super) fn has_no_earlier_match(
+pub(super) fn has_no_earlier_match_with_allocations(
     concat_prefix: &Hir,
     literals: &[Literal],
-) -> bool {
+    funding: &dyn Allocation,
+) -> Result<bool, AllocationError> {
     // let literals = prefix::LiteralSet::many(literals);
     if literals.is_empty() || literals.iter().any(|lit| lit.is_empty()) {
         debug!(
             "reverse inner is not early return safe because \
                  no non-empty inner literals were found"
         );
-        return false;
+        return Ok(false);
     }
     // With one literal, an occurrence crossing the prefix boundary must
     // overlap another occurrence of that same literal. Such an overlap
@@ -69,35 +77,41 @@ pub(super) fn has_no_earlier_match(
     // This reasoning does not apply when one extracted literal can cross
     // the boundary into a different extracted literal.
     if literals.len() == 1 {
-        let prefix_may_contain = prefix::hir_can_contain_literal(
-            concat_prefix,
-            literals[0].as_bytes(),
-        );
+        let prefix_may_contain =
+            prefix::hir_can_contain_literal_with_allocations(
+                concat_prefix,
+                literals[0].as_bytes(),
+                funding,
+            )?;
         debug!(
             "reverse inner prefix can contain inner literals? \
              {prefix_may_contain}"
         );
         if !prefix_may_contain {
-            return true;
+            return Ok(true);
         }
     }
 
     let fixed_length = prefix::hir_has_fixed_length(concat_prefix);
     debug!("reverse inner has fixed length prefix? {fixed_length}");
     if fixed_length {
-        return true;
+        return Ok(true);
     }
 
     let class_separator =
-        prefix::has_disjoint_class_separator(concat_prefix, &literals);
+        prefix::has_disjoint_class_separator_with_allocations(
+            concat_prefix,
+            &literals,
+            funding,
+        )?;
     debug!("reverse inner has disjoint class separator? {class_separator}");
     if class_separator {
-        return true;
+        return Ok(true);
     }
 
     // We couldn't prove that the reverse inner optimization
     // was safe, so bail out.
-    false
+    Ok(false)
 }
 
 /// This attempts to extract an "inner" prefilter from the given HIR
@@ -127,30 +141,35 @@ pub(crate) struct InnerPrefilter {
 }
 
 impl InnerPrefilter {
-    pub(crate) fn new(hirs: &[&Hir]) -> Option<InnerPrefilter> {
+    pub(crate) fn new_with_allocations(
+        hirs: &[&Hir],
+        funding: &dyn Allocation,
+    ) -> Result<Option<InnerPrefilter>, AllocationError> {
         if hirs.len() != 1 {
             debug!(
                 "skipping reverse inner optimization since it only \
                  supports 1 pattern, {} were given",
                 hirs.len(),
             );
-            return None;
+            return Ok(None);
         }
-        let mut concat = match top_concat(hirs[0]) {
+        let mut concat = match top_concat_with_allocations(hirs[0], funding)? {
             Some(concat) => concat,
             None => {
                 debug!(
                     "skipping reverse inner optimization because a top-level \
                      concatenation could not found",
                 );
-                return None;
+                return Ok(None);
             }
         };
         // We skip the first HIR because if it did have a prefix prefilter in
         // it, we probably wouldn't be here looking for an inner prefilter.
         for i in 1..concat.len() {
             let hir = &concat[i];
-            let (pre, lits) = match prefilter_with_literals(hir) {
+            let (pre, lits) = match prefilter_with_literals_with_allocations(
+                hir, funding,
+            )? {
                 None => continue,
                 Some(pre) => pre,
             };
@@ -166,15 +185,23 @@ impl InnerPrefilter {
                 );
                 continue;
             }
-            let concat_suffix = Hir::concat(concat.split_off(i));
-            let concat_prefix = Hir::concat(concat);
+            let allocation = Allocator::new(funding);
+            let syntax = regex_syntax::allocation::Allocator::new(&allocation);
+            let mut suffix = Vec::new();
+            allocation.grow(&mut suffix, concat.len() - i)?;
+            suffix.extend(concat.drain(i..));
+            let concat_suffix = Hir::concat_with_allocations(suffix, syntax)?;
+            let concat_prefix = Hir::concat_with_allocations(concat, syntax)?;
             // Look for a prefilter again. Why? Because above we only looked
             // for a prefilter on the individual 'hir', but we might be able
             // to find something better and more discriminatory by looking at
             // the entire suffix. We don't do this above to avoid making this
             // loop worst case quadratic in the length of 'concat'.
             let (preinner, inner_literals) =
-                match prefilter_with_literals(&concat_suffix) {
+                match prefilter_with_literals_with_allocations(
+                    &concat_suffix,
+                    funding,
+                )? {
                     None => (pre, lits),
                     Some((pre2, lits2)) => {
                         if pre2.is_fast() {
@@ -184,17 +211,17 @@ impl InnerPrefilter {
                         }
                     }
                 };
-            return Some(InnerPrefilter {
+            return Ok(Some(InnerPrefilter {
                 prefix: concat_prefix,
                 pre: preinner,
                 literals: inner_literals,
-            });
+            }));
         }
         debug!(
             "skipping reverse inner optimization because a top-level \
              sub-expression with a fast prefilter could not be found"
         );
-        None
+        Ok(None)
     }
 }
 
@@ -207,33 +234,34 @@ impl InnerPrefilter {
 ///
 /// Note that this assumes leftmost-first match semantics, so callers must
 /// not call this otherwise.
-fn prefilter_with_literals(hir: &Hir) -> Option<(Prefilter, Vec<Literal>)> {
+fn prefilter_with_literals_with_allocations(
+    hir: &Hir,
+    funding: &dyn Allocation,
+) -> Result<Option<(Prefilter, Vec<Literal>)>, AllocationError> {
+    let allocation = Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
     let mut extractor = literal::Extractor::new();
     extractor.kind(literal::ExtractKind::Prefix);
-    let mut prefixes = extractor.extract(hir);
-    debug!(
-        "inner prefixes (len={:?}) extracted before optimization: {:?}",
-        prefixes.len(),
-        prefixes
-    );
-    // Since these are inner literals, we know they cannot be exact. But the
-    // extractor doesn't know this. We mark them as inexact because this might
-    // impact literal optimization. Namely, optimization weights "all literals
-    // are exact" as very high, because it presumes that any match results in
-    // an overall match. But of course, that is not the case here.
-    //
-    // In practice, this avoids plucking out a ASCII-only \s as an alternation
-    // of single-byte whitespace characters.
+    let mut prefixes = extractor.extract_with_allocations(hir, syntax)?;
     prefixes.make_inexact();
-    prefixes.optimize_for_prefix_by_preference();
-    debug!(
-        "inner prefixes (len={:?}) extracted after optimization: {:?}",
-        prefixes.len(),
-        prefixes
-    );
-    let lits = prefixes.literals()?;
-    let pre = Prefilter::new(MatchKind::LeftmostFirst, lits)?;
-    Some((pre, lits.to_vec()))
+    prefixes.optimize_for_prefix_by_preference_with_allocations(syntax)?;
+    let Some(lits) = prefixes.literals() else {
+        return Ok(None);
+    };
+    let Some(pre) = Prefilter::new_with_allocations(
+        MatchKind::LeftmostFirst,
+        lits,
+        funding,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut copied = Vec::new();
+    allocation.grow(&mut copied, lits.len())?;
+    for lit in lits {
+        copied.push(lit.clone_with_allocations(syntax)?);
+    }
+    Ok(Some((pre, copied)))
 }
 
 /// Looks for a "top level" HirKind::Concat item in the given HIR. This will
@@ -246,58 +274,102 @@ fn prefilter_with_literals(hir: &Hir) -> Option<(Prefilter, Vec<Literal>)> {
 /// a bit simpler, and it works because 1) capturing groups never influence
 /// whether a match occurs or not and 2) capturing groups are not used when
 /// doing the reverse inner search to find the start of the match.
-fn top_concat(mut hir: &Hir) -> Option<Vec<Hir>> {
+fn top_concat_with_allocations(
+    mut hir: &Hir,
+    funding: &dyn Allocation,
+) -> Result<Option<Vec<Hir>>, AllocationError> {
+    let allocation = Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
     loop {
         hir = match hir.kind() {
-            HirKind::Empty
-            | HirKind::Literal(_)
-            | HirKind::Class(_)
-            | HirKind::Look(_)
-            | HirKind::Repetition(_)
-            | HirKind::Alternation(_) => return None,
-            HirKind::Capture(hir::Capture { ref sub, .. }) => sub,
-            HirKind::Concat(ref subs) => {
-                // We are careful to only do the flattening/copy when we know
-                // we have a "top level" concat we can inspect. This avoids
-                // doing extra work in cases where we definitely won't use it.
-                // (This might still be wasted work if we can't go on to find
-                // some literals to extract.)
-                let concat =
-                    Hir::concat(subs.iter().map(|h| flatten(h)).collect());
-                return match concat.into_kind() {
-                    HirKind::Concat(xs) => Some(xs),
-                    // It is actually possible for this case to occur, because
-                    // 'Hir::concat' might simplify the expression to the point
-                    // that concatenations are actually removed. One wonders
-                    // whether this leads to other cases where we should be
-                    // extracting literals, but in theory, I believe if we do
-                    // get here, then it means that a "real" prefilter failed
-                    // to be extracted and we should probably leave well enough
-                    // alone. (A "real" prefilter is unbothered by "top-level
-                    // concats" and "capturing groups.")
-                    _ => return None,
-                };
+            HirKind::Capture(capture) => &capture.sub,
+            HirKind::Concat(subs) => {
+                let mut copied = Vec::new();
+                allocation.grow(&mut copied, subs.len())?;
+                for sub in subs {
+                    copied.push(flatten_with_allocations(sub, funding)?);
+                }
+                return Ok(
+                    match Hir::concat_with_allocations(copied, syntax)?
+                        .into_kind()
+                    {
+                        HirKind::Concat(children) => Some(children),
+                        _ => None,
+                    },
+                );
             }
+            _ => return Ok(None),
         };
     }
 }
 
-/// Returns a copy of the given HIR but with all capturing groups removed.
-fn flatten(hir: &Hir) -> Hir {
-    match hir.kind() {
-        HirKind::Empty => Hir::empty(),
-        HirKind::Literal(hir::Literal(ref x)) => Hir::literal(x.clone()),
-        HirKind::Class(ref x) => Hir::class(x.clone()),
-        HirKind::Look(ref x) => Hir::look(x.clone()),
-        HirKind::Repetition(ref x) => Hir::repetition(x.with(flatten(&x.sub))),
-        // This is the interesting case. We just drop the group information
-        // entirely and use the child HIR itself.
-        HirKind::Capture(hir::Capture { ref sub, .. }) => flatten(sub),
-        HirKind::Alternation(ref xs) => {
-            Hir::alternation(xs.iter().map(|x| flatten(x)).collect())
-        }
-        HirKind::Concat(ref xs) => {
-            Hir::concat(xs.iter().map(|x| flatten(x)).collect())
-        }
+/// Rebuild the same capture-free HIR through its canonical smart constructors,
+/// using paid postorder controls instead of recursive Rust frames.
+fn flatten_with_allocations(
+    hir: &Hir,
+    funding: &dyn Allocation,
+) -> Result<Hir, AllocationError> {
+    enum Frame<'a> {
+        Visit(&'a Hir),
+        Finish(&'a Hir),
     }
+    let allocation = Allocator::new(funding);
+    let syntax = regex_syntax::allocation::Allocator::new(&allocation);
+    let mut stack = Vec::new();
+    let mut values = Vec::new();
+    allocation.push(&mut stack, Frame::Visit(hir))?;
+    while let Some(frame) = stack.pop() {
+        let source = match frame {
+            Frame::Visit(mut source) => {
+                while let HirKind::Capture(capture) = source.kind() {
+                    source = &capture.sub;
+                }
+                allocation.push(&mut stack, Frame::Finish(source))?;
+                for sub in source.kind().subs().iter().rev() {
+                    allocation.push(&mut stack, Frame::Visit(sub))?;
+                }
+                continue;
+            }
+            Frame::Finish(source) => source,
+        };
+        let copied = match source.kind() {
+            HirKind::Empty => Hir::empty_with_allocations(syntax)?,
+            HirKind::Literal(literal) => Hir::literal_with_allocations(
+                syntax.copy_slice(&literal.0)?,
+                syntax,
+            )?,
+            HirKind::Class(class) => Hir::class_with_allocations(
+                class.clone_with_allocations(syntax)?,
+                syntax,
+            )?,
+            HirKind::Look(look) => Hir::look_with_allocations(*look, syntax)?,
+            HirKind::Capture(_) => {
+                unreachable!("capture stripped before postorder visit")
+            }
+            HirKind::Repetition(rep) => Hir::repetition_with_allocations(
+                hir::Repetition {
+                    min: rep.min,
+                    max: rep.max,
+                    greedy: rep.greedy,
+                    sub: syntax.boxed(
+                        values.pop().expect("postorder repetition child"),
+                    )?,
+                },
+                syntax,
+            )?,
+            HirKind::Concat(children) | HirKind::Alternation(children) => {
+                let start = values.len() - children.len();
+                let mut subs = Vec::new();
+                allocation.grow(&mut subs, children.len())?;
+                subs.extend(values.drain(start..));
+                if matches!(source.kind(), HirKind::Concat(_)) {
+                    Hir::concat_with_allocations(subs, syntax)?
+                } else {
+                    Hir::alternation_with_allocations(subs, syntax)?
+                }
+            }
+        };
+        allocation.push(&mut values, copied)?;
+    }
+    Ok(values.pop().expect("one transformed root"))
 }

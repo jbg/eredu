@@ -5288,22 +5288,40 @@ pub struct mlx_original_buffer_info {
     pub identity: u64,
     pub charged_bytes: usize,
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_immutable_host_transfer_info {
+    pub backing: mlx_original_buffer_info,
+    pub prepared_source: bool,
+}
+extern "C" {
+    pub fn mlx_immutable_host_transfer_inspect(facts: *mut mlx_immutable_host_transfer_info, source: mlx_host_transfer_buffer) -> u32;
+    pub fn mlx_immutable_host_transfer_attach(source: mlx_host_transfer_buffer,
+        facts: *const mlx_immutable_host_transfer_info, node: *mut ::std::os::raw::c_void,
+        payload: *mut ::std::os::raw::c_void, release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>) -> u32;
+    pub fn mlx_immutable_host_transfer_control_bytes() -> usize;
+}
 pub const MLX_ORDINARY_BUFFER_UNKNOWN: u32 = 0;
 pub const MLX_ORDINARY_BUFFER_EMPTY: u32 = 1;
 pub const MLX_ORDINARY_BUFFER_ALLOCATION: u32 = 2;
 extern "C" {
     pub fn mlx_host_transfer_array_alias_info(
-        facts: *mut mlx_original_buffer_info,
+        facts: *mut mlx_immutable_host_transfer_info,
         array: mlx_array,
     ) -> u32;
     pub fn mlx_host_transfer_array_alias_attach(
         array: mlx_array,
-        facts: *const mlx_original_buffer_info,
+        facts: *const mlx_immutable_host_transfer_info,
         node: *mut ::std::os::raw::c_void,
         payload: *mut ::std::os::raw::c_void,
         release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
     ) -> u32;
     pub fn mlx_host_transfer_array_alias_control_bytes() -> usize;
+    pub fn mlx_host_transfer_array_view_info(facts: *mut mlx_host_transfer_view_info, array: mlx_array) -> u32;
+    pub fn mlx_host_transfer_array_view_attach(array: mlx_array,
+        facts: *const mlx_host_transfer_view_info, node: *mut ::std::os::raw::c_void,
+        payload: *mut ::std::os::raw::c_void, release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>) -> u32;
+    pub fn mlx_host_transfer_array_view_control_bytes() -> usize;
     pub fn mlx_immutable_source_array_info(
         kind: *mut u32,
         facts: *mut mlx_original_buffer_info,
@@ -5376,6 +5394,12 @@ extern "C" {
         payload: *mut ::std::os::raw::c_void,
         release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
     ) -> u32;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_host_transfer_view_info {
+    pub backing: mlx_original_buffer_info,
+    pub view_identity: u64,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -5475,6 +5499,9 @@ extern "C" {
     pub fn mlx_prefill_roots_append(
         roots: mlx_prefill_roots,
         value: mlx_array,
+    ) -> ::std::os::raw::c_uint;
+    pub fn mlx_prefill_roots_retire_completed_current(
+        roots: mlx_prefill_roots, value: mlx_array,
     ) -> ::std::os::raw::c_uint;
     pub fn mlx_prefill_roots_append_validation(
         roots: mlx_prefill_roots,
@@ -7165,6 +7192,13 @@ pub struct mlx_cpu_copy_eval_layout {
     pub signal_graph_extents: usize,
 }
 unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_host_transfer_eval_layout(
+        out: *mut mlx_cpu_copy_eval_layout,
+        dtype: mlx_dtype,
+        rank: usize,
+        store: bool,
+        tracer: bool,
+    ) -> bool;
     pub fn mlx_operation_event_cpu_copy_eval_layout(
         out: *mut mlx_cpu_copy_eval_layout,
         rank: usize,
@@ -7215,9 +7249,9 @@ unsafe extern "C" {
     pub fn mlx_operation_event_cpu_static_update_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         rank: usize, elements: usize, update_elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_argsort_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
-        elements: usize, tracer: bool) -> bool;
+        source: mlx_dtype, rank: usize, columns: usize, rows: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_slice_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
-        rank: usize, tracer: bool) -> bool;
+        rank: usize, empty: bool, tracer: bool) -> bool;
 }
 
 unsafe extern "C" {
@@ -7262,7 +7296,9 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_operation_event_cpu_flat_scatter_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
+    pub fn mlx_operation_event_cpu_scatter_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
+        source: mlx_dtype, index: mlx_dtype, rank: usize, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
+    pub fn mlx_operation_event_cpu_scatter_add_rows_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         index: mlx_dtype, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_scatter_axis_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         index: mlx_dtype, rank: usize, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
@@ -7301,7 +7337,10 @@ unsafe extern "C" {
     pub fn mlx_operation_event_cpu_arange_float_eval_layout(out:*mut mlx_cpu_copy_eval_layout,
         elements:usize,tracer:bool)->bool;
     pub fn mlx_operation_event_cpu_arange_int_eval_layout(out:*mut mlx_cpu_copy_eval_layout,
-        elements:usize,tracer:bool)->bool;
+        dtype:mlx_dtype,elements:usize,tracer:bool)->bool;
+    pub fn mlx_operation_event_cpu_tiled_gather_mm_eval_layout(out:*mut mlx_cpu_copy_eval_layout,
+        lhs_rank:usize,rhs_rank:usize,index_rank:usize,m:usize,n:usize,k:usize,
+        batches:usize,tracer:bool)->bool;
     pub fn mlx_operation_event_cpu_rope_fallback_control_bytes(out:*mut usize,
         rank:usize,dimensions:usize,elements:usize)->bool;
 }
@@ -7314,8 +7353,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_operation_event_cpu_argsort_row_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
-        rank: usize, elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_partition_row_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         rank: usize, elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_scan_sum_row_eval_layout(out: *mut mlx_cpu_copy_eval_layout,

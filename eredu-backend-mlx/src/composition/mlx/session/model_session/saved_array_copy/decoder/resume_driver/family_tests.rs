@@ -213,7 +213,7 @@ fn parity(family: Family) {
             ids.push(output.token_id());
             // Controlled advancement requires delivery and exact completion
             // before the next step, even when capture is disabled.
-            assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+            assert!(driver.take_completed_delivery(&mut state).unwrap().is_none());
         }
         ids
     };

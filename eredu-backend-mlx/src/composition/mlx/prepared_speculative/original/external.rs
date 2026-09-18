@@ -15,30 +15,30 @@ use eredu_core::{HostPreparationAuthority,SpeculativeBuffer};
 use eredu_runtime::{prefill::PrefillControlPlan,
     speculative::external_occurrence::ExternalSchedulePlan,
     working_memory::{OriginalExternalSpeculativeSource,OriginalExternalSpeculativeStartup,
-        OriginalSpeculativeSemanticPreparation}};
+        PreparedSemanticSource}};
 
 struct Lane<'lane,'world,C:SpeculativeTokenFilterController> {
     lane:SpeculativeGenerationLane<'lane,MlxBackend<'world>,C>,
     input:NonZeroU64, frontier:u64,output:u64,context:u64,chunk:u64,
     source:OriginalSpeculativeNumericalPreparation,
     declaration:Option<OriginalInterventionDeclaration>,
-    preparation:OriginalSpeculativeSemanticPreparation,
+    preparation:PreparedSemanticSource,
 }
 struct Bound<'selected> {
     cache:OriginalEmbeddedCachePreparation,
     sources:OriginalExternalSources<'selected>,
-    preparation:OriginalSpeculativeSemanticPreparation,
+    preparation:PreparedSemanticSource,
 }
 struct CacheHost {
     _startup:OriginalExternalSpeculativeStartup,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
-fn pay<const N:usize>(funding:&WorkspaceMetadataFunding,parts:[usize;N])->Result<(),Error>{
+fn pay<const N:usize>(funding:&HostMetadataFunding,parts:[usize;N])->Result<(),Error>{
     let bytes=parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)
 }
-fn retained(error:Error,funding:&WorkspaceMetadataFunding)->Error{
+fn retained(error:Error,funding:&HostMetadataFunding)->Error{
     super::super::super::model::retain_planning_error(error,funding.clone())
 }
 
@@ -54,11 +54,11 @@ where C:SpeculativeTokenFilterController,V:SpeculativeGenerationVisitor {
         size_of::<eredu_core::SpeculativeBufferIntoIter<SpeculativeGenerationLane<'lane,MlxBackend<'world>,C>>>(),
         size_of::<SpeculativeBuffer<Lane<'lane,'world,C>>>(),
         size_of::<Select<'_,'_,'lane,'world,C,V>>(),
-        size_of::<OriginalSpeculativeSemanticPreparation>(),size_of::<WorkspaceMetadataFunding>(),
+        size_of::<PreparedSemanticSource>(),size_of::<HostMetadataFunding>(),
         size_of::<(eredu_core::SpeculativeSchedulerOptions,usize)>(),
         size_of::<(&MlxBackend<'_>,&mut MlxModelSession,&mut MlxDrafter)>(),
         size_of::<Result<SpeculativeGenerationBatchOutput,Error>>(),
-        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?])?;
+        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?])?;
     let run=||{
         for lane in &lanes {inspect(backend,session,lane)?;}
         let topology=drafter.topology();
@@ -82,9 +82,9 @@ where C:SpeculativeTokenFilterController,V:SpeculativeGenerationVisitor {
             size_of::<Option<OriginalCopyEnvironment<'_>>>(),
             size_of::<Result<OriginalCopyEnvironment<'_>,PreparedOriginalCopyEnvironmentError>>(),
             size_of::<HostPreparationAuthority>(),size_of::<eredu_core::SpeculativeExecutionTopology>(),
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             eredu_core::BackendFailure::source_retention_peak_bytes::<PreparedOriginalCopyEnvironmentError>()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?])?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?])?;
         let host=HostPreparationAuthority::retain(funding.clone());
         // The actual selected backend is borrowed only while constructing this
         // independent paid stream/prerequisite owner, before mutable visitation.
@@ -152,7 +152,7 @@ struct Select<'target,'environment,'lane,'world,C:SpeculativeTokenFilterControll
     draft:&'environment OriginalCopyEnvironment<'environment>,
     topology:eredu_core::SpeculativeExecutionTopology,
     visitor:V,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl<C,V> SelectedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for Select<'_,'_,'_,'_,C,V>
 where C:SpeculativeTokenFilterController,V:SpeculativeGenerationVisitor {
@@ -245,7 +245,7 @@ where C:SpeculativeTokenFilterController,V:SpeculativeGenerationVisitor {
 }
 
 fn prepare_cache(target:&Executable,selected:&ExternalSelectionSource,source:&OriginalExternalSources<'_>,
-    preparation:&OriginalSpeculativeSemanticPreparation,environment:&OriginalCopyEnvironment<'_>,frontier:u64)
+    preparation:&PreparedSemanticSource,environment:&OriginalCopyEnvironment<'_>,frontier:u64)
     ->Result<MlxExternalPredictionCache,Error>{
     use crate::backend::runtime::cache::state::PreparedResidentDecoderCopy;
     use eredu_runtime::replicated_session::ReplicatedTextControlOrigin;

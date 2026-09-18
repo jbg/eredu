@@ -68,6 +68,12 @@ impl TextSamplingInput<'_> {
             Self::Configured(config, filter) => {
                 let sampler = ConfiguredTextSampler::from_config(config)
                     .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
+                // Equation quotation has finished its last report. The fresh
+                // key descriptor belongs to sampling construction, before the
+                // runtime worker quotes its complete initial state span. The
+                // transition preserves cumulative metadata funding; the runtime
+                // preparation report still prices actual key creation once.
+                context.begin_span();
                 let random = (config.sampling().temperature > 0.0)
                     .then(|| WorkspaceSamplingRandomState::from_seed(context))
                     .transpose()?;
@@ -201,3 +207,7 @@ impl SamplingScores {
             .transpose()
     }
 }
+
+#[cfg(test)]
+#[path = "sampling/tests.rs"]
+mod tests;

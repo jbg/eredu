@@ -1,13 +1,13 @@
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataAccount,WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount,HostMetadataFunding,HostMetadataFundingError};
 use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
 #[derive(Debug)]
 struct Account {live:Arc<AtomicBool>,used:Arc<AtomicUsize>,limit:Arc<AtomicUsize>}
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
         self.used.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|used|
             used.checked_add(bytes).filter(|&next|next<=self.limit.load(Ordering::SeqCst)))
-            .map(|_|()).map_err(|_|WorkspaceMetadataFundingError::Unavailable)
+            .map(|_|()).map_err(|_|HostMetadataFundingError::Unavailable)
     }
 }
 impl Drop for Account {fn drop(&mut self){self.live.store(false,Ordering::SeqCst);}}
@@ -52,7 +52,7 @@ fn prepared_boundary_headers_preserve_unicode_wire_and_keep_source_after_payload
     let source_live=Arc::new(AtomicBool::new(true));let funding_live=Arc::new(AtomicBool::new(true));
     let used=Arc::new(AtomicUsize::new(0));let limit=Arc::new(AtomicUsize::new(usize::MAX));
     let drops=Arc::new(AtomicUsize::new(0));
-    let funding=WorkspaceMetadataFunding::new(Account{live:funding_live.clone(),used:used.clone(),limit:limit.clone()}).unwrap();
+    let funding=HostMetadataFunding::new(Account{live:funding_live.clone(),used:used.clone(),limit:limit.clone()}).unwrap();
     let host=eredu_core::HostPreparationAuthority::retain(SourceOwner(source_live.clone()));
     let source=prepared_source().with_host_preparation(&host).unwrap();
     let selected=source.prepare_boundary_source(CommunicationRouteId::new(19),&funding).unwrap();
@@ -81,7 +81,7 @@ fn prepared_boundary_headers_preserve_unicode_wire_and_keep_source_after_payload
 fn prepared_boundary_refusal_spends_no_retry_credit_and_retains_error_source(){
     let source_live=Arc::new(AtomicBool::new(true));let funding_live=Arc::new(AtomicBool::new(true));
     let used=Arc::new(AtomicUsize::new(0));let limit=Arc::new(AtomicUsize::new(usize::MAX));
-    let funding=WorkspaceMetadataFunding::new(Account{live:funding_live.clone(),used:used.clone(),limit:limit.clone()}).unwrap();
+    let funding=HostMetadataFunding::new(Account{live:funding_live.clone(),used:used.clone(),limit:limit.clone()}).unwrap();
     let host=eredu_core::HostPreparationAuthority::retain(SourceOwner(source_live.clone()));
     let source=prepared_source().with_host_preparation(&host).unwrap();
     let selected=source.prepare_boundary_source(CommunicationRouteId::new(19),&funding).unwrap();

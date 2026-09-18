@@ -13,7 +13,7 @@ pub(crate) struct OriginalRouteExchange<'a> {
     plan: LogicalExchangePlan<'a>,
     order: usize,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
 // The directed selected route, not native rank numbering, selects complementary
@@ -73,7 +73,7 @@ pub(crate) struct OriginalRouteRound<'a> {
     round: usize,
     submission_order: SubmissionOrder,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 enum RoundPersistent<'a> {
     Queried([OriginalCommunicatorPersistent<'a>;2]),
@@ -105,9 +105,9 @@ impl OriginalCommunicationSource<'_> {
             size_of::<Option<(&CommunicationRouteRealization, &CommunicationRouteDescriptor, bool)>>(),
             size_of::<Result<Option<LogicalExchangePlan<'_>>, crate::backend::runtime::distributed::group::LogicalExchangeCause>>(),
             size_of::<(&Self, usize)>(), size_of::<(usize,usize,usize)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         let (route,_,_) = self.route(order).ok_or_else(|| failure(Cause::Resource,&self.source,&self.funding))?;
         if !self.matches_route(order,route) { return Err(failure(Cause::Identity,&self.source,&self.funding)); }
@@ -135,9 +135,9 @@ impl OriginalRouteExchange<'_> {
     {
         let parts=[size_of::<OriginalRouteRound<'a>>(),size_of::<Result<OriginalRouteRound<'a>,Error>>(),
             size_of::<OriginalRouteLayoutRound<'a>>(),size_of::<(&Self,&OriginalCommunicationSource<'_>,usize,&Array)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.round_layout_storage(source,round,input.shape(),input.dtype())?.bind_actual(source,input)
     }
 }
@@ -161,11 +161,11 @@ impl<'a> OriginalRouteRound<'a> {
             size_of::<Result<usize,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&PreparedInputRuntime)>(),
             size_of::<(usize,usize)>(),size_of::<Option<usize>>(),
-            self.native.send().backing_storage_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            self.native.receive().backing_storage_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.send().backing_storage_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            self.native.receive().backing_storage_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         if !self.source.same_source(source.source()){return Err(failure(Cause::Identity,&self.source,&self.funding));}
         let send=self.native.send().backing_storage(runtime)
@@ -181,7 +181,7 @@ impl<'a> OriginalRouteRound<'a> {
     {
         self.funding.reserve_metadata([size_of::<Self>(),size_of::<PreparedRouteRound<'a>>(),
             size_of::<Result<PreparedRouteRound<'a>,Error>>()].into_iter().try_fold(size_of::<[usize;3]>(),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let backing_capacity=self.backing_capacity(source,runtime)?;
         let ready=self.selection.completion(source,self.native.traversal())?;
         Ok(PreparedRouteRound{round:self,ready,backing_capacity})
@@ -192,11 +192,11 @@ impl<'a> OriginalRouteRound<'a> {
 pub(crate) struct ConstructedRouteExchange {
     outputs:[Array;2],
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl ConstructedRouteExchange {
     pub(crate) fn outputs(&self)->&[Array;2]{&self.outputs}
-    pub(crate) fn into_parts(self)->([Array;2],RetainedCommunicationSource,WorkspaceMetadataFunding){
+    pub(crate) fn into_parts(self)->([Array;2],RetainedCommunicationSource,HostMetadataFunding){
         (self.outputs,self.source,self.funding)
     }
     pub(crate) fn source(&self)->&RetainedCommunicationSource{&self.source}
@@ -209,7 +209,7 @@ pub(crate) struct AcceptedRouteSource<'stream> {
     stream:&'stream Stream,
     traversal:safemlx::OperationEvalTraversalLayout,
     submission_order:SubmissionOrder,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 pub(crate) struct AcceptedRouteExchange<'stream> {
     source:AcceptedRouteSource<'stream>,
@@ -227,11 +227,11 @@ impl PreparedRouteRound<'_> {
             size_of::<Result<AcceptedRouteExchange<'stream>,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&OriginalScopeObserver,&Stream)>(),
             size_of::<[Array;2]>(),size_of::<Result<[Array;2],safemlx::error::Exception>>(),
-            self.round.native.construction_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            safemlx::OriginalScopeObserver::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.round.native.construction_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            safemlx::OriginalScopeObserver::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.round.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         if !self.round.source.same_source(source.source()){
             return Err(failure(Cause::Identity,&self.round.source,&self.round.funding));
@@ -255,7 +255,7 @@ impl AcceptedRouteExchange<'_> {
     pub(crate) fn submit(mut self)->Result<(ConstructedRouteExchange,OriginalCommunicationCompletion),Error>{
         let controls=[size_of::<Self>(),size_of::<Result<(ConstructedRouteExchange,OriginalCommunicationCompletion),Error>>()];
         self.source.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         // MLX appends both independent outputs to its BFS tape in root order
         // and dispatches that tape in reverse. Source therefore submits
         // [receive,send], Destination [send,receive]. These exact two operations

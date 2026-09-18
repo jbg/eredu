@@ -24,8 +24,8 @@ pub struct MediaPrefillPlan<T> {
     identity: Option<SharedPreparedInputCacheIdentity>,
     // Plan/source fields and their allocations retire before planning custody.
     _workspace_funding: (
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
     metadata: Option<eredu_nn::workspace::WorkspaceContext>,
 }
@@ -263,46 +263,31 @@ where
     ) -> Option<SharedPreparedInputCacheIdentity> {
         plan.identity.clone()
     }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan) -> Result<(), Error> {
-        if plan.original.is_none()
-            && plan.fingerprint != super::super::prompt_cache_architecture_fingerprint(&self.args)
-        {
-            return Err(Error::backend(
-                "Qwen3-VL media source belongs to another architecture",
-            ));
+    fn ingress_execution_graph(&self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ArchitectureExecutionGraph<'_>)>()?;
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.execution_graph))
+    }
+    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, &Self::IngressPlan, Option<&eredu_nn::workspace::WorkspaceContext>,
+            PreparedCompositeInput<'_, B::Tensor, QwenVlInputPartPlan>, String)>()?;
+        let identity_metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        if plan.original.is_none() && plan.fingerprint != super::super::prompt_cache_architecture_fingerprint_with_metadata(&self.args, identity_metadata)? {
+            return Err(metadata.error(format_args!("Qwen3-VL media source belongs to another architecture")));
         }
-        plan.input().map_err(Error::backend)?;
+        plan.input_with_diagnostic(|message| metadata.error(format_args!("{message}")))?;
         Ok(())
     }
-    fn validate_ingress_plan_with_metadata(
-        &self,
-        plan: &Self::IngressPlan,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<(), Error> {
-        if !context.uses_checked_metadata() {
-            return <Self as PrefillIngressArchitecture<B, S>>::validate_ingress_plan(self, plan);
+
+
+    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Error {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        if let Err(refusal) = metadata.controls::<(MediaIngressError, Option<&eredu_nn::workspace::WorkspaceContext>)>() {
+            return refusal;
         }
-        // The original binding already authenticates the selected architecture;
-        // the ordinary branch's fingerprint is intentionally absent in this plan.
-        let original = plan
-            .original
-            .as_ref()
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?;
-        PreparedCompositeInput::<_, QwenVlInputPartPlan>::from_original_with_diagnostic(
-            &plan.prepared,
-            original,
-            |message| context.metadata_error(format_args!("{message}")),
-        )?;
-        Ok(())
-    }
-    fn ingress_error_with_metadata(
-        error: MediaIngressError,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Error {
-        context.metadata_source(error)
-    }
-    fn ingress_error(error: MediaIngressError) -> Error {
-        Error::backend_source(error)
+        metadata.source(error)
     }
 
     fn begin_ingress(
@@ -494,7 +479,14 @@ where
         // Tokens and compact metadata are prepared here; no patch/position projection.
         input.pixels = None;
         let vision_state = if encoder_continuation {
-            if let Some(tables) = plan.prepared.original_encoder_tables() {
+            if let Some((tables, _, _)) = &plan.workspace {
+                Some(self.static_modules.vision.continuation_state_with_projected_tables(
+                    tables,
+                    tables.tables().layout().patches(),
+                    context,
+                    metadata.context(),
+                )?)
+            } else if let Some(tables) = plan.prepared.original_encoder_tables() {
                 Some(
                     self.static_modules
                         .vision
@@ -847,8 +839,17 @@ where
         tensor_partitions: usize,
         pipeline_stages: usize,
         include_text_ingress: bool,
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
+        destination: crate::composite_execution::graph::Destination<'_>,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, Error>
     {
+        use crate::composite_execution::CompositeTensorCollective;
+        destination.controls::<(
+            (&Self, PreparedCompositeInput<'_, B::Tensor, QwenVlInputPartPlan>, usize, usize, usize, bool),
+            (u64, u64, i32, i32, usize, [i32; 2], [i32; 2], [i32; 3]),
+            (Vec<Vec<CompositeTensorCollective>>, Vec<CompositeTensorCollective>, Vec<CompositeTensorCollective>),
+            (Vec<i32>, std::ops::Range<usize>, CompositeTensorCollective, [CompositeTensorCollective; 2]),
+            Option<Vec<Vec<CompositeTensorCollective>>>,
+        )>()?;
         if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
             return Ok(None);
         }
@@ -860,7 +861,7 @@ where
             }
             projected_positions = projected_positions
                 .checked_add(part.positions)
-                .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?;
+                .ok_or_else(|| destination.error(format_args!("Qwen3-VL projected media positions overflowed")))?;
             for (time, height, width) in part.grid.iter() {
                 let patches = u64::try_from(time)
                     .ok()
@@ -874,55 +875,63 @@ where
                             .ok()
                             .and_then(|width| area.checked_mul(width))
                     })
-                    .ok_or_else(|| "Qwen3-VL patch-grid geometry overflowed".to_owned())?;
+                    .ok_or_else(|| destination.error(format_args!("Qwen3-VL patch-grid geometry overflowed")))?;
                 patch_positions = patch_positions
                     .checked_add(patches)
-                    .ok_or_else(|| "Qwen3-VL patch positions overflowed".to_owned())?;
+                    .ok_or_else(|| destination.error(format_args!("Qwen3-VL patch positions overflowed")))?;
             }
         }
         let patch_positions = i32::try_from(patch_positions)
-            .map_err(|_| "Qwen3-VL patch positions exceed i32".to_owned())?;
+            .map_err(|_| destination.error(format_args!("Qwen3-VL patch positions exceed i32")))?;
         let projected_positions = i32::try_from(projected_positions)
-            .map_err(|_| "Qwen3-VL projected positions exceed i32".to_owned())?;
+            .map_err(|_| destination.error(format_args!("Qwen3-VL projected positions exceed i32")))?;
         if patch_positions == 0 || projected_positions == 0 {
-            return Ok(Some(vec![Vec::new(); pipeline_stages]));
+            return destination.try_collect((0..pipeline_stages).map(|_|destination.vector(0))).map(Some);
         }
         let layers = self.args.vision.layer_count();
         if layers < pipeline_stages {
-            return Err(
-                "Qwen3-VL vision collective schedule has fewer units than PP stages".into(),
-            );
+            return Err(destination.error(format_args!(
+                "Qwen3-VL vision collective schedule has fewer units than PP stages")));
         }
-        let patch_shape = vec![patch_positions, self.args.vision.hidden_size];
-        let projected_shape = vec![projected_positions, self.args.vision.out_hidden_size];
-        let mut ingress_operations = Vec::new();
+        let patch_shape = [patch_positions, self.args.vision.hidden_size];
+        let projected_shape = [projected_positions, self.args.vision.out_hidden_size];
+        let mut ingress_operations = destination.vector(if include_text_ingress { input.prepared().len() } else { 0 })?;
         if include_text_ingress {
             for (part, plan) in input.prepared().parts().iter().zip(input.qwen_parts()) {
                 if plan.role == crate::media_plan::qwen::QwenPartRole::Tokens {
                     let batch = part.payload().value().dim(0);
                     let positions = i32::try_from(plan.positions)
-                        .map_err(|_| "Qwen3-VL text positions exceed i32".to_owned())?;
+                        .map_err(|_| destination.error(format_args!("Qwen3-VL text positions exceed i32")))?;
                     ingress_operations.push(
                         crate::composite_execution::CompositeTensorCollective::Sum {
-                            shape: vec![batch, positions, self.args.text.hidden_size],
+                            shape: destination.collect([batch, positions, self.args.text.hidden_size])?,
                         },
                     );
                 }
             }
         }
-        let mut stages = Vec::with_capacity(pipeline_stages);
+        let mut stages = destination.vector(pipeline_stages)?;
         for stage in 0..pipeline_stages {
             let range =
                 eredu_core::balanced_contiguous_range(layers, pipeline_stages, stage, false)
-                    .map_err(|error| error.to_string())?;
-            let mut operations = ingress_operations.clone();
+                    .map_err(|error| destination.error(format_args!("{error}")))?;
+            let count=ingress_operations.len().checked_add(range.len().checked_mul(2)
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)
+                .and_then(|value|value.checked_add(range.clone().filter(|&layer|self.args.vision.layer_policy(layer)
+                    .is_some_and(|policy|policy.deepstack_merger.is_some())).count()))
+                .and_then(|value|value.checked_add(usize::from(range.end==layers)))
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+            let mut operations = destination.vector(count)?;
+            for operation in &ingress_operations {
+                operations.push(CompositeTensorCollective::Sum{shape:destination.collect(operation.shape().iter().copied())?});
+            }
             for layer in range.clone() {
                 operations.extend([
                     crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
+                        shape: destination.collect(patch_shape)?,
                     },
                     crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
+                        shape: destination.collect(patch_shape)?,
                     },
                 ]);
                 if self
@@ -932,13 +941,13 @@ where
                     .is_some_and(|policy| policy.deepstack_merger.is_some())
                 {
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: projected_shape.clone(),
+                        shape: destination.collect(projected_shape)?,
                     });
                 }
             }
             if range.end == layers {
                 operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: projected_shape.clone(),
+                    shape: destination.collect(projected_shape)?,
                 });
             }
             stages.push(operations);
@@ -1041,6 +1050,7 @@ where
             })?;
         plan.workspace = Some(workspace);
         plan._workspace_funding = funding;
+        plan.metadata = Some(context.clone());
         Ok(plan)
     }
     fn prepared_ingress_input(
@@ -1062,7 +1072,16 @@ where
             tensor_partitions,
             pipeline_stages,
             false,
-        )
+            crate::composite_execution::graph::Destination(None),
+        ).map_err(|cause|cause.to_string())
+    }
+    fn media_group_collective_waves_with_metadata(
+        &self,plan:&Self::IngressPlan,group:usize,tensor_partitions:usize,pipeline_stages:usize,
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,Error> {
+        self.ingress_group_collective_waves(group,
+            plan.input_with_metadata(crate::decoder::identity::Metadata::new(Some(context)))?,
+            tensor_partitions,pipeline_stages,false,crate::composite_execution::graph::Destination(Some(context)))
     }
     fn media_primary_ingress_collectives(
         &self,
@@ -1070,13 +1089,33 @@ where
         span: &eredu_runtime::prefill::PrefillChunk,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        media_ingress_waves(plan,span,self.args.text.hidden_size,tensor_partitions,
+            crate::composite_execution::graph::Destination(None)).map_err(|cause|cause.to_string())
+    }
+    fn media_primary_ingress_collectives_with_metadata(
+        &self,plan:&Self::IngressPlan,span:&eredu_runtime::prefill::PrefillChunk,tensor_partitions:usize,
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,Error> {
+        media_ingress_waves(plan,span,self.args.text.hidden_size,tensor_partitions,
+            crate::composite_execution::graph::Destination(Some(context)))
+    }
+}
+
+
+fn media_ingress_waves<T:Tensor>(
+    plan:&MediaPrefillPlan<T>,span:&eredu_runtime::prefill::PrefillChunk,hidden:i32,tensor_partitions:usize,
+    destination:crate::composite_execution::graph::Destination<'_>,
+)->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,Error> {
+    destination.controls::<(&MediaPrefillPlan<T>, &eredu_runtime::prefill::PrefillChunk,
+        i32, usize, u64, u64, u64, u64, u64, Vec<u64>, PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
+        Option<Vec<crate::composite_execution::CompositeTensorCollective>>)>()?;
         let mut offset = 0u64;
-        let mut positions = Vec::new();
-        for part in plan.input()?.qwen_parts() {
+        let mut positions = destination.vector(plan.prepared.parts().len())?;
+        for part in plan.input_with_diagnostic(|cause|destination.error(format_args!("{cause}")))?.qwen_parts() {
             let length = part.positions;
             let end = offset
                 .checked_add(length)
-                .ok_or("media decoder positions overflow")?;
+                .ok_or_else(||destination.error(format_args!("media decoder positions overflow")))?;
             if part.role == crate::media_plan::qwen::QwenPartRole::Tokens {
                 let start = offset.max(span.input.start);
                 let stop = end.min(span.input.end);
@@ -1086,10 +1125,10 @@ where
             }
             offset = end;
         }
-        crate::composite_execution::segmented_token_ingress_collectives(
+        crate::composite_execution::segmented_token_ingress_collectives_in(
             positions,
-            self.args.text.hidden_size,
+            hidden,
             tensor_partitions,
+            destination,
         )
-    }
 }

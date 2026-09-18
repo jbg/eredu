@@ -1,7 +1,7 @@
 //! Dense state destinations paid by the same finite host metadata account.
 use super::*;
 use eredu_core::{BackendFailure, HostPreparationAuthority};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{DenseHostSlotInitialization, HostSlotTable, PreparedDenseHostCopyError};
 
 /// Only host storage is authorized here. The caller must already have admitted
@@ -9,7 +9,7 @@ use eredu_runtime::{DenseHostSlotInitialization, HostSlotTable, PreparedDenseHos
 pub(in crate::backend::runtime::cache::state) fn copy_slots<S, D, F>(
     source: DenseHostSlotInitialization<'_, S, D>,
     host: &HostPreparationAuthority,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     copy: F,
 ) -> Result<HostSlotTable<D>, Error>
 where
@@ -43,7 +43,7 @@ impl PreparedResidentDecoderCopy<'_> {
     pub(crate) fn copy_dense_with_preparation(
         self,
         host: &HostPreparationAuthority,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<OriginalResidentState, Error> {
@@ -58,9 +58,6 @@ impl PreparedResidentDecoderCopy<'_> {
             dense::PreparedResidentDenseCopy::KeyValue(plan) => plan
                 .copy_dense_with_preparation(host, funding, stream, roots)
                 .map(OriginalResidentState::KeyValue),
-            dense::PreparedResidentDenseCopy::HybridKvOnly(plan) => plan
-                .copy_dense_with_preparation(host, funding, stream, roots)
-                .map(OriginalResidentState::Hybrid),
             dense::PreparedResidentDenseCopy::HybridGrouped(plan) => plan
                 .copy_dense_with_preparation(host, funding, stream, roots)
                 .map(OriginalResidentState::Hybrid),
@@ -81,3 +78,5 @@ impl OriginalResidentState {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

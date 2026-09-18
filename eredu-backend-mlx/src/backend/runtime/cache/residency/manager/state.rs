@@ -33,7 +33,7 @@ pub(in super::super) struct CacheBlockRecord {
     pub(in super::super) imported: bool,
     // Set only by a completed exact scan. Native/source owners retire first.
     pub(in super::super) original_discard: Option<super::original_discard::PendingOriginalDiscard>,
-    pub(in super::super) _metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(in super::super) _metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl CacheBlockRecord {
@@ -139,5 +139,5 @@ pub(super) struct CacheResidencyManagerInner {
     pub(super) disk_worker: Option<Arc<DiskWorker>>,
     pub(super) pool_membership: Arc<CachePoolMembership>,
     // Both canonical state and worker aliases retire before construction H.
-    pub(super) _metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(super) _metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }

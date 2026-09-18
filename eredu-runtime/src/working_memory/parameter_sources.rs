@@ -102,6 +102,9 @@ type Result<T> = std::result::Result<T, WorkspaceParameterSourceError>;
 /// This contract conveys facts, not source registration or accounting authority.
 /// The native adapter implements it on the actual owning LayerwiseWorkspace.
 pub trait WorkspaceParameterRows {
+    /// Exact selected parameters populated by an independent owner, rather than
+    /// this unit source. Missing rows must never be used to infer exclusions.
+    fn excludes_parameter(&self, _name: &str) -> bool { false }
     /// Retained selected execution layout.
     fn layout(&self) -> &ExecutionUnitLayout;
     /// Architecture address of a local requested slot. Pipeline storage can use

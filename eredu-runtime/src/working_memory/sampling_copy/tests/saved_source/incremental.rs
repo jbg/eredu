@@ -45,6 +45,96 @@ fn full_bytes(quote: &CopyPreparationInferenceQuote<u32>) -> u64 {
             .unwrap()
 }
 
+fn terminal_copy_quote(pool: &WorkingMemoryPool) -> CopyPreparationInferenceQuote<u32> {
+    let geometry = InferenceGeometry {
+        batch_size: 1,
+        cached_positions: 7,
+        input_positions: 0,
+        max_output_tokens: 0,
+        prefill_chunk_positions: 0,
+        output: OutputDemand::StateOnly,
+    };
+    let equations = quote_inference_workspace(geometry, |_| -> Result<
+        eredu_nn::workspace::WorkspaceTraceReport, eredu_nn::Error,
+    > {
+        panic!("terminal copy preparation must not inspect a model equation");
+    }).unwrap();
+    let layout = StateMemoryLayout::new(
+        LayerSchedule::empty(), vec![], 1, 1, EstimationCompleteness::Complete,
+    ).unwrap();
+    let state = eredu_core::estimate_runtime_state(
+        &layout, InputTokenCount::text(geometry.cached_positions), 0, 1,
+        std::num::NonZeroU8::new(4).unwrap(),
+    ).unwrap().with_selected_state_backing(
+        geometry, WorkspaceBound::bounded(32, "independently priced copied state"),
+    ).unwrap();
+    let zero = || WorkspaceBound::bounded(0, "no additional terminal mechanism");
+    let outside = ExecutionWorkspaceEstimate {
+        geometry, activations: zero(), attention: zero(), vocabulary: zero(),
+        state_update: zero(), materialization: zero(),
+        retained: WorkspaceBound::bounded(13, "retained terminal host payload"),
+    };
+    copy_plan(pool, 2, 16, 2).compose_inference(&equations, state, outside).unwrap()
+}
+
+#[test]
+fn terminal_copy_seals_empty_schedule_with_exact_cost_and_source_custody() {
+    let pool = WorkingMemoryPool::new(16 << 20, 0).unwrap();
+    // This source ceiling must also fit the explicitly sealed execution
+    // controls, unlike the smaller unsealed-copy fixtures below.
+    let (sampler, custody, native, registered) = saved_with_capacity(&pool, false, 16 << 20);
+    native.certify().unwrap();
+    let witness = custody.bind_saved_sampling_source(&sampler, registered.clone()).unwrap();
+    let copies = attempts();
+    let quote = terminal_copy_quote(&pool);
+    assert_eq!(quote.state().requested_state_bytes, 32);
+    assert_eq!(quote.incremental_bytes(), 32 + COPY_BYTES * 2 + 13);
+    assert_eq!(full_bytes(&quote), quote.incremental_bytes() + 16);
+    let unsealed = quote.incremental_bytes();
+    let quote = quote.with_span_workspace().unwrap();
+    assert!(quote.span_workspace().plan().records().is_empty());
+    assert_eq!(quote.span_workspace().plan().generation_forward_count(), Some(0));
+    assert!(quote.incremental_bytes() > unsealed);
+    assert_eq!(full_bytes(&quote), quote.incremental_bytes() + 16);
+    let before = usage(&pool);
+    let capacity = before.0 + quote.incremental_bytes();
+    let execution = InferenceExecutionIdentity::default();
+    assert!(matches!(quote.reserve_saved_source_with_capacity_handoff(
+        &pool, &execution, &admission(&quote), capacity - 1, &[], &witness,
+    ), Err(WorkingMemoryError::BudgetExceeded { .. })));
+    assert_eq!(usage(&pool), before);
+    let reservation = quote.reserve_saved_source_with_capacity_handoff(
+        &pool, &execution, &admission(&quote), capacity, &[], &witness,
+    ).unwrap();
+    assert!(quote.reserved_span_workspace(&reservation).unwrap().workspace().plan().records().is_empty());
+    let foreign = terminal_copy_quote(&pool).with_span_workspace().unwrap();
+    assert!(matches!(foreign.reserved_span_workspace(&reservation), Err(WorkingMemoryError::IdentityMismatch)));
+    drop(foreign);
+    assert_eq!(attempts(), copies);
+    let bytes = quote.incremental_bytes();
+    let (reservation, run) = reservation.into_funding().unwrap();
+    let scope = run.scope().unwrap();
+    drop((quote, witness));
+    drop((registered, sampler, custody, reservation, run));
+    assert_eq!(pool.used_bytes().unwrap(), bytes + 16);
+    scope.certify().unwrap();
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn terminal_copy_empty_schedule_does_not_bypass_saved_source_health() {
+    let pool = WorkingMemoryPool::new(16 << 20, 0).unwrap();
+    let (sampler, custody, native, registered) = saved_with_capacity(&pool, false, 16 << 20);
+    let witness = custody.bind_saved_sampling_source(&sampler, registered).unwrap();
+    let quote = terminal_copy_quote(&pool).with_span_workspace().unwrap();
+    drop(native);
+    let before = usage(&pool);
+    assert!(matches!(quote.reserve_saved_source_with_capacity_handoff(
+        &pool, &InferenceExecutionIdentity::default(), &admission(&quote), 16 << 20, &[], &witness,
+    ), Err(WorkingMemoryError::ExecutionFenced)));
+    assert_eq!(usage(&pool), before);
+}
+
 #[test]
 fn exact_increment_excludes_old_root_once_but_keeps_independent_copies_and_history() {
     for adaptive in [false, true] {

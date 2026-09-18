@@ -1,11 +1,11 @@
 //! Original request controls around the unchanged session mutation/recovery guard.
 use super::*;
 use crate::backend::submission_recovery::PreparedRecovery;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
-type Prepared = PreparedRecovery<ScopeRetention, WorkspaceMetadataFunding>;
+type Prepared = PreparedRecovery<ScopeRetention, HostMetadataFunding>;
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -23,10 +23,10 @@ struct Failure {
     #[source]
     cause: Cause,
     // BackendFailure's closed source retirement frees its shell before this account.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
-fn failure(cause: Cause, funding: WorkspaceMetadataFunding) -> Error {
+fn failure(cause: Cause, funding: HostMetadataFunding) -> Error {
     let kind = match &cause {
         Cause::Operation(error) => error
             .retained_backend_failure_kind()
@@ -49,12 +49,12 @@ fn control_bytes<T>() -> Option<usize> {
         size_of::<Result<T, Error>>(),
         size_of::<(T, SubmissionResourcesOwner, Recovery<ScopeRetention>)>(),
         size_of::<Result<(T, SubmissionResourcesOwner, Recovery<ScopeRetention>), Error>>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
         size_of::<Cause>(),
         size_of::<Failure>(),
         size_of::<eredu_core::BackendFailureKind>(),
         size_of::<eredu_core::BackendFailure>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?,
     ];
     controls
@@ -85,7 +85,7 @@ impl MlxModelSession {
     /// reservation, native quotas, publication and independent completion proof.
     pub(crate) fn with_model_operation_funded<T>(
         &mut self,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         operation: impl FnOnce(&mut Executable) -> Result<T, Error>,
     ) -> Result<T, Error> {
         crate::backend::submission_recovery::reap();
@@ -94,7 +94,7 @@ impl MlxModelSession {
             .map_err(Error::PrefillControl)?;
         funding
             .reserve_metadata(control_bytes::<T>().ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?)
             .map_err(Error::WorkspacePlanning)?;
         // From this point one returned typed cause shell and all native/host

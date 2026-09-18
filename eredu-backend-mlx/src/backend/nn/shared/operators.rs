@@ -13,7 +13,7 @@ pub(crate) fn projection_observation_control_bytes() -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct MlxLinear {
     pub(super) module: common::linear::PhysicalLinear,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
+    pub(super) topology: NativeParameterTable,
     pub(super) vocabulary_range: Option<VocabularyParallelRange>,
 }
 
@@ -75,7 +75,7 @@ impl common::linear::NativeProjectionInputObserver for NativeInputObserver<'_> {
                 .observe_generated(MlxTensor::ref_cast(prototype), source, &mut || {
                     generate()
                         .map(MlxTensor::from_array)
-                        .map_err(ComputeError::backend_source)
+                        .map_err(ComputeError::backend_retained_source)
                 });
         self.result(result)
     }
@@ -138,7 +138,7 @@ impl MlxLinear {
             Some(error) => Err(error),
             None => result.map(MlxTensor::from_array).map_err(|cause|match cause {
                 ForwardFailure::Native(cause) if retained=>observation_transport::source(cause),
-                ForwardFailure::Native(cause)=>ComputeError::backend_source(cause),
+                ForwardFailure::Native(cause)=>ComputeError::backend_retained_source(cause),
                 ForwardFailure::Reduction(cause)=>cause,
             }),
         }
@@ -157,16 +157,9 @@ impl Parameterized<MlxTensor> for MlxLinear {
         self.module.native_retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_native_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -182,7 +175,7 @@ impl Parameterized<MlxTensor> for MlxLinear {
 #[derive(Debug, Clone)]
 pub struct MlxEmbedding {
     pub(super) module: common::linear::PhysicalEmbedding,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
+    pub(super) topology: NativeParameterTable,
     pub(super) vocabulary: i32,
     pub(super) vocabulary_range: Option<VocabularyParallelRange>,
 }
@@ -210,11 +203,11 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             context,
         ))?;
         let nonnegative = compute(input.ge(
-            Array::try_from_int(0).map_err(ComputeError::backend_source)?,
+            Array::try_from_int(0).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let below_vocabulary = compute(input.lt(
-            Array::try_from_int(self.vocabulary).map_err(ComputeError::backend_source)?,
+            Array::try_from_int(self.vocabulary).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let ordinary_mask = compute(nonnegative.logical_and(&below_vocabulary, context))?;
@@ -230,7 +223,7 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             return Ok(MlxTensor::from_array(embedded));
         };
         let sentinel_mask = compute(input.eq(
-            Array::try_from_int(sentinel).map_err(ComputeError::backend_source)?,
+            Array::try_from_int(sentinel).map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let output_mask = compute(sentinel_mask.expand_dims(-1, context))?;
@@ -264,16 +257,9 @@ impl Parameterized<MlxTensor> for MlxEmbedding {
         self.module.native_retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_native_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -291,7 +277,7 @@ impl Parameterized<MlxTensor> for MlxEmbedding {
 pub struct MlxRmsNorm {
     pub(super) groups: Option<i32>,
     pub(super) module: Option<nn::RmsNorm>,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
+    pub(super) topology: NativeParameterTable,
     pub(super) offset: Option<f32>,
     pub(super) dimensions: i32,
     pub(super) epsilon: f32,
@@ -326,8 +312,8 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
             )));
         }
         if let Some(groups) = self.groups {
-            let mut shape = input.shape().to_vec();
-            shape.pop();
+            let mut shape = Vec::with_capacity(input.ndim() + 1);
+            shape.extend_from_slice(&input.shape()[..input.ndim() - 1]);
             shape.extend([groups, self.dimensions / groups]);
             let wide = compute(input.as_dtype(Dtype::Float32, context))?;
             let grouped = compute(wide.reshape(&shape, context))?;
@@ -337,7 +323,7 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
                 let mut scale = compute(module.weight.as_ref().as_dtype(Dtype::Float32, context))?;
                 if let Some(offset) = self.offset {
                     scale = compute(scale.add(
-                        Array::try_from_f32(offset).map_err(ComputeError::backend_source)?,
+                        Array::try_from_f32(offset).map_err(ComputeError::backend_retained_source)?,
                         context,
                     ))?;
                 }
@@ -349,7 +335,7 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
             (Some(module), None) => compute_tensor(module.forward(input, context)),
             (Some(module), Some(offset)) => {
                 let scale = compute(module.weight.as_ref().add(
-                    Array::try_from_f32(offset).map_err(ComputeError::backend_source)?,
+                    Array::try_from_f32(offset).map_err(ComputeError::backend_retained_source)?,
                     context,
                 ))?;
                 compute_tensor(super::super::normalization::input_precision_rms(
@@ -383,20 +369,9 @@ impl Parameterized<MlxTensor> for MlxRmsNorm {
         Some(1)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module
-            .as_ref()
-            .is_none_or(|module| module.visit_native_retained_values(visitor))
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        if let Some(module) = &self.module {
-            visit_module_parameters(module, &self.topology, visitor);
-        }
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -427,13 +402,13 @@ pub(super) fn mlx_weightless_rms_norm(
     let variance = compute(input.square(context))?;
     let variance = compute(variance.mean_axis(-1, true, context))?;
     let denominator = compute(variance.add(
-        Array::try_from_f32(epsilon).map_err(ComputeError::backend_source)?,
+        Array::try_from_f32(epsilon).map_err(ComputeError::backend_retained_source)?,
         context,
     ))?;
     let denominator = compute(denominator.rsqrt(context))?;
     compute(input.multiply(denominator, context))?
         .as_dtype(dtype, context)
-        .map_err(ComputeError::backend_source)
+        .map_err(ComputeError::backend_retained_source)
 }
 
 /// MLX RoPE variant selected from model metadata.
@@ -471,7 +446,7 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
                 let rope_input = nn::RopeInputBuilder::new(input.as_array())
                     .offset(offset)
                     .build()
-                    .map_err(ComputeError::backend_source)?;
+                    .map_err(ComputeError::backend_retained_source)?;
                 match &self.explicit {
                     Some(rotary) => {
                         compute_tensor(rotary.forward(input.as_array(), offset, context))
@@ -508,20 +483,9 @@ impl Parameterized<MlxTensor> for MlxRotary {
         Some(2)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        let mut arrays = |value: &Array| visitor(MlxTensor::ref_cast(value));
-        self.native.visit_retained_arrays(&mut arrays);
-        if let Some(explicit) = &self.explicit {
-            explicit.visit_retained_arrays(&mut arrays);
-        }
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -534,12 +498,12 @@ impl Parameterized<MlxTensor> for MlxRotary {
 #[derive(Debug, Clone)]
 pub struct MlxHyperConnection {
     pub(super) module: common::hyper_connections::HyperConnection,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
+    pub(super) topology: NativeParameterTable,
 }
 
 fn hyper_native_error(cause: Exception) -> ComputeError {
     match safemlx::OriginalScopeObserver::try_current() {
-        Ok(None) => ComputeError::backend_source(cause),
+        Ok(None) => ComputeError::backend_retained_source(cause),
         _ => ComputeError::backend_retained_source(cause),
     }
 }
@@ -614,16 +578,9 @@ impl Parameterized<MlxTensor> for MlxHyperConnection {
         self.module.native_retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_native_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -641,7 +598,7 @@ impl Parameterized<MlxTensor> for MlxHyperConnection {
 #[derive(Debug, Clone)]
 pub struct MlxHyperHead {
     pub(super) module: common::hyper_connections::HyperHead,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
+    pub(super) topology: NativeParameterTable,
 }
 
 impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
@@ -705,16 +662,9 @@ impl Parameterized<MlxTensor> for MlxHyperHead {
         self.module.native_retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_native_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -746,16 +696,9 @@ impl Parameterized<MlxTensor> for MlxTopKGroupSelector {
         self.module.retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        self.module.visit_parameters(visitor);
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -902,16 +845,9 @@ impl Parameterized<MlxTensor> for MlxGroupedGatedProduct {
         self.module.retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        self.module.visit_parameters(visitor);
-    }
+
+
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, MlxTensor>,
@@ -1088,16 +1024,9 @@ impl Parameterized<MlxTensor> for MlxGroupedRelu2 {
         self.module.retained_value_slot_bound()
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        self.module.visit_retained_values(visitor)
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        self.module.visit_parameters(visitor);
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where

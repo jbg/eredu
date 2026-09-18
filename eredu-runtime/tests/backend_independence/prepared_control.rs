@@ -1,4 +1,6 @@
 use super::*;
+#[path = "prepared_control/prediction_loan.rs"]
+mod prediction_loan;
 use eredu_runtime::{
     working_memory::{
         InferenceExecutionIdentity, InferenceRequest, InferenceStateRetention, WorkingMemoryPool,
@@ -11,6 +13,10 @@ type Session =
     eredu_runtime::ReplicatedTextSession<OrdinaryTextFixture, FakeBackend, ReferenceTextMechanisms>;
 
 fn session() -> (Session, ReplicatedSessionCounters) {
+    session_with_checkpoint_failure(true)
+}
+
+fn session_with_checkpoint_failure(fail_checkpoint: bool) -> (Session, ReplicatedSessionCounters) {
     let counters = ReplicatedSessionCounters::default();
     let architecture = OrdinaryTextFixture {
         static_modules: FakeOperator,
@@ -35,7 +41,7 @@ fn session() -> (Session, ReplicatedSessionCounters) {
         counters: counters.clone(),
         fail_completion: Rc::new(Cell::new(false)),
         // Any accidental use of the old independent-copy callback must fail.
-        fail_checkpoint: true,
+        fail_checkpoint,
         fail_construction_report: false,
         prepared_partition: None,
         prompt_cache: None,

@@ -32,6 +32,9 @@ pub struct SpeculativeBufferAllocationError {
     authority: HostPreparationAuthority,
 }
 impl<T> SpeculativeBuffer<T> {
+    pub(super) fn is_funded_by(&self, funding: &crate::HostMetadataFunding) -> bool {
+        self.authority.is_funded_by(funding)
+    }
     /// Ordinary allocation, with the same growth behavior as Vec.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {

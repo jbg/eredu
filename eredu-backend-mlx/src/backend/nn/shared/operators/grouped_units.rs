@@ -30,7 +30,7 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
                     Some(prepared) => prepared
                         .shape(batch.values.shape(), effective.shape())
                         .map_err(observation_transport::native)?,
-                    None => ComputeError::backend_source(GroupedUnitError::ReplacementShape {
+                    None => ComputeError::backend_retained_source(GroupedUnitError::ReplacementShape {
                         expected: batch.values.shape().to_vec(),
                         actual: effective.shape().to_vec(),
                     }),
@@ -39,7 +39,7 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
             if effective.as_array().dtype() != batch.values.as_array().dtype() {
                 return Err(match self.shape_error.take() {
                     Some(prepared) => prepared.dtype(),
-                    None => ComputeError::backend_source(GroupedUnitError::ReplacementDtype),
+                    None => ComputeError::backend_retained_source(GroupedUnitError::ReplacementDtype),
                 });
             }
             self.inner

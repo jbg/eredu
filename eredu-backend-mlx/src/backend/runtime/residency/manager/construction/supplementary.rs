@@ -25,7 +25,7 @@ impl SupplementarySourcePlan {
         // This group describes the actual singleton source-acquire protocol,
         // not an architecture layer schedule or target execution identity.
         let graph = eredu_runtime::ArchitectureExecutionGraph::single("supplementary-source")
-            .and_then(|graph| graph.into_owned())
+            .map(|graph| graph.into_owned())
             .map_err(|_| WorkingMemoryError::UnknownBound)?;
         let layout = ExecutionUnitLayout::new(&graph, [ids.len()])
             .map_err(|_| WorkingMemoryError::UnknownBound)?;

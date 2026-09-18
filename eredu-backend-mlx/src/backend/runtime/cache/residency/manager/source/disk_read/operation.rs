@@ -57,7 +57,7 @@ pub(crate) struct DiskReadOperation {
     armed: bool,
     committed: bool,
     promotion_attempted: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -79,7 +79,7 @@ pub(crate) struct DiskReadOperationFailure {
     finished: Finished,
     native_failure: NativeFailure,
     output: PreparedDiskReadOutput,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for DiskReadOperationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1,4 +1,4 @@
-use crate::HashMap;
+use crate::SourceHashMap as HashMap;
 
 use crate::ast::{ExprRef, ExprSet};
 
@@ -39,13 +39,13 @@ impl DerivCache {
         }
     }
 
-    pub fn derivative(&mut self, exprs: &mut ExprSet, r: ExprRef, b: u8) -> ExprRef {
+    pub fn derivative(&mut self, exprs: &mut ExprSet, r: ExprRef, b: u8) -> crate::ParserResult<ExprRef> {
         // This kicks in for lexers with lots of keywords, that is regexps that are
         // just concats of single bytes.
         // Most of these do not match, so this provides very significant speedup.
         // TODO add a flag on exprs to see if this even applies?
         if construction::surely_no_match(exprs, r, b) {
-            return ExprRef::NO_MATCH;
+            return Ok(ExprRef::NO_MATCH);
         }
 
         let mut or_branches = vec![];
@@ -58,7 +58,7 @@ impl DerivCache {
             |r| (r, b),
             |exprs, deriv, r| {
                 self.num_deriv += 1;
-                let d = match construction::node(
+                let d = construction::node(
                     &mut construction::Ordinary {
                         expressions: exprs,
                         alternatives: &mut or_branches,
@@ -66,17 +66,14 @@ impl DerivCache {
                     deriv,
                     r,
                     b,
-                ) {
-                    Ok(result) => result,
-                    Err(never) => match never {},
-                };
+                )?;
                 debug!(
                     "deriv({}) via {} = {}",
                     exprs.expr_to_string(r),
                     exprs.pp().byte_to_string(b),
                     exprs.expr_to_string(d)
                 );
-                d
+                Ok(d)
             },
         )
     }

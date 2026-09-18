@@ -13,8 +13,7 @@ fn source(pattern: usize, template: bool) -> Value {
         json!(fancy_regex::workspace::construction::patterns()
             .nth(pattern)
             .unwrap());
-    value["pre_tokenizer"]["pretokenizers"][1]["trim_offsets"] =
-        json!(pattern == 4);
+    value["pre_tokenizer"]["pretokenizers"][1]["trim_offsets"] = json!(pattern == 4);
     if !template {
         value["post_processor"] = json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false});
     }
@@ -44,14 +43,11 @@ fn compare(a: &Encoding, b: &Encoding) {
     assert!(a.get_overflowing().is_empty() && b.get_overflowing().is_empty());
 }
 fn counts(text: &str) -> [usize; 3] {
-    let plan =
-        unicode_normalization_alignments::workspace::Plan::new(text).unwrap();
+    let plan = unicode_normalization_alignments::workspace::Plan::new(text, "").unwrap();
     let r = plan.requirements();
     [r.scalar_capacity(), r.scalar_capacity(), r.text_capacity()]
 }
-fn reserve_cause(
-    mut error: Option<&(dyn std::error::Error + 'static)>,
-) -> bool {
+fn reserve_cause(mut error: Option<&(dyn std::error::Error + 'static)>) -> bool {
     while let Some(e) = error {
         if e.is::<TryReserveError>() {
             return true;
@@ -61,16 +57,13 @@ fn reserve_cause(
     false
 }
 #[test]
-fn actual_nfc_patterns_raw_barriers_and_template_single_pair_keep_ordinary_encoding(
-) {
+fn actual_nfc_patterns_raw_barriers_and_template_single_pair_keep_ordinary_encoding() {
     let bytes: String = (0u8..=255).map(char::from).collect();
-    let combining =
-        format!("a{}", "\u{315}\u{300}\u{301}\u{0323}".repeat(257));
+    let combining = format!("a{}", "\u{315}\u{300}\u{301}\u{0323}".repeat(257));
     for (pattern, template) in [(3, false), (4, false), (4, true)] {
         let value = source(pattern, template);
         let mut actual = compiled(&value);
-        let mut legacy =
-            Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
+        let mut legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
         for skip in [false, true] {
             actual.set_encode_special_tokens(skip);
             legacy.set_encode_special_tokens(skip);
@@ -89,15 +82,10 @@ fn actual_nfc_patterns_raw_barriers_and_template_single_pair_keep_ordinary_encod
                     let expected = legacy.encode(text, special).unwrap();
                     compare(&actual.encode(text, special).unwrap(), &expected);
                     compare(
-                        &actual
-                            .encode((text, "hi e\u{300}"), special)
-                            .unwrap(),
-                        &legacy
-                            .encode((text, "hi e\u{300}"), special)
-                            .unwrap(),
+                        &actual.encode((text, "hi e\u{300}"), special).unwrap(),
+                        &legacy.encode((text, "hi e\u{300}"), special).unwrap(),
                     );
-                    let plan = EncodeIdsPlan::prepare(&actual, text, special)
-                        .unwrap();
+                    let plan = EncodeIdsPlan::prepare(&actual, text, special).unwrap();
                     let limits = plan.requirements();
                     let geometry = counts(text);
                     assert_eq!(limits.normalization_capacities(), geometry);
@@ -118,10 +106,7 @@ fn actual_nfc_patterns_raw_barriers_and_template_single_pair_keep_ordinary_encod
                             limits.id_capacity()
                         ]
                     );
-                    assert_eq!(
-                        output.mapped_capacity(),
-                        limits.mapped_capacity()
-                    );
+                    assert_eq!(output.mapped_capacity(), limits.mapped_capacity());
                 }
             }
         }
@@ -130,10 +115,8 @@ fn actual_nfc_patterns_raw_barriers_and_template_single_pair_keep_ordinary_encod
             cloned.get_encode_special_tokens(),
             actual.get_encode_special_tokens()
         );
-        let mut restored = Tokenizer::from_bytes(
-            serde_json::to_string(&actual).unwrap().as_bytes(),
-        )
-        .unwrap();
+        let mut restored =
+            Tokenizer::from_bytes(serde_json::to_string(&actual).unwrap().as_bytes()).unwrap();
         // HF serialization stores added-token declarations, not this mutable
         // encoding policy. Restore its default before explicitly matching policy.
         assert!(!restored.get_encode_special_tokens());
@@ -168,8 +151,7 @@ fn expansion_empty_affixes_and_noop_option_identity_are_explicit() {
             options["model"]["continuing_subword_prefix"] = prefix.clone();
             options["model"]["end_of_word_suffix"] = suffix.clone();
             let packed = compiled(&options);
-            let legacy =
-                Tokenizer::from_bytes(options.to_string().as_bytes()).unwrap();
+            let legacy = Tokenizer::from_bytes(options.to_string().as_bytes()).unwrap();
             assert_eq!(
                 EncodeIdsPlan::prepare(&packed, "\u{344}", false)
                     .unwrap()
@@ -195,8 +177,7 @@ fn expansion_empty_affixes_and_noop_option_identity_are_explicit() {
         sparse["model"]["fuse_unk"] = json!(fuse);
         sparse["added_tokens"] = json!([]);
         let packed = compiled(&sparse);
-        let legacy =
-            Tokenizer::from_bytes(sparse.to_string().as_bytes()).unwrap();
+        let legacy = Tokenizer::from_bytes(sparse.to_string().as_bytes()).unwrap();
         for text in ["hi é", "\u{344}", "zz\u{301}hizz"] {
             compare(
                 &packed.encode(text, false).unwrap(),
@@ -218,8 +199,7 @@ fn expansion_empty_affixes_and_noop_option_identity_are_explicit() {
         nonempty["model"]["merges"] = json!([]);
         nonempty["model"]["unk_token"] = json!("?");
         let packed = compiled(&nonempty);
-        let legacy =
-            Tokenizer::from_bytes(nonempty.to_string().as_bytes()).unwrap();
+        let legacy = Tokenizer::from_bytes(nonempty.to_string().as_bytes()).unwrap();
         compare(
             &packed.encode("hi é", false).unwrap(),
             &legacy.encode("hi é", false).unwrap(),
@@ -231,8 +211,7 @@ fn expansion_empty_affixes_and_noop_option_identity_are_explicit() {
     }
 }
 #[test]
-fn every_actual_nfc_reserve_and_later_regex_bpe_error_retain_the_real_prefix()
-{
+fn every_actual_nfc_reserve_and_later_regex_bpe_error_retain_the_real_prefix() {
     let value = source(4, true);
     let actual = compiled(&value);
     let input = String::from("hi e\u{300}\u{344}<S>x");
@@ -264,8 +243,7 @@ fn every_actual_nfc_reserve_and_later_regex_bpe_error_retain_the_real_prefix()
         let caps = failure.normalization_capacities();
         assert!(caps[..stage].iter().all(|&n| n > 0));
         assert!(caps[stage..].iter().all(|&n| n == 0));
-        let EncodeIdsError::NormalizationPreparation(error) = failure.cause()
-        else {
+        let EncodeIdsError::NormalizationPreparation(error) = failure.cause() else {
             panic!("actual NFC reserve");
         };
         assert_eq!(error.buffer(), *target);
@@ -273,7 +251,7 @@ fn every_actual_nfc_reserve_and_later_regex_bpe_error_retain_the_real_prefix()
     }
     let later = EncodeIdsPlan::prepare(&actual, &input, true)
         .unwrap()
-        .fail_regex_reservation(PrepareFailure::Outer(Buffer::Slots))
+        .fail_regex_reservation(PrepareFailure::Outer(Buffer::Undo))
         .unwrap()
         .encode()
         .unwrap_err();
@@ -294,8 +272,103 @@ fn every_actual_nfc_reserve_and_later_regex_bpe_error_retain_the_real_prefix()
     assert_eq!(late.partial_id_count(), 4); // Two template IDs, hi and raw <S> before the failed next word.
     assert_eq!(late.normalization_capacities(), counts("hi<S>\u{344}"));
     drop((input, actual, broken));
-    assert!(
-        later.normalization_capacities()[2] > 0
-            && late.normalization_capacities()[2] > 0
-    );
+    assert!(later.normalization_capacities()[2] > 0 && late.normalization_capacities()[2] > 0);
+}
+
+#[test]
+fn nested_prepend_and_nfc_use_the_same_encoding_and_compose_at_boundaries() {
+    let normalizers = [
+        json!({"type":"Prepend","prepend":"e"}),
+        json!({"type":"Sequence","normalizers":[]}),
+        json!({"type":"Sequence","normalizers":[{"type":"Prepend","prepend":"e"},{"type":"NFC"}]}),
+        json!({"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Prepend","prepend":"e"}]}),
+        json!({"type":"Sequence","normalizers":[{"type":"Prepend","prepend":"a"},{"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Prepend","prepend":"e"},{"type":"NFC"}]},{"type":"Prepend","prepend":"x\\\"🦀"}]}),
+        json!({"type":"Sequence","normalizers":[{"type":"Sequence","normalizers":[]},{"type":"Prepend","prepend":"\u{1100}"},{"type":"NFC"},{"type":"Prepend","prepend":"z"}]}),
+    ];
+    for normalizer in normalizers {
+        let mut value = source(4, true);
+        value["normalizer"] = normalizer.clone();
+        let actual = compiled(&value);
+        let ordinary = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
+        assert!(
+            actual.matches_compiled_configuration(&ordinary),
+            "{:?}",
+            normalizer
+        );
+        for text in [
+            "",
+            "hi",
+            "\u{301}hi",
+            "\u{1161}\u{11a8}",
+            "a<S>hi<S>x<S>z",
+            "<S><S>",
+            "é\u{344} e\u{301}",
+        ] {
+            for special in [false, true] {
+                let expected = ordinary.encode(text, special).unwrap();
+                let compiled = actual.encode(text, special).unwrap();
+                compare(&compiled, &expected);
+                assert_eq!(
+                    compiled.get_ids(),
+                    expected.get_ids(),
+                    "{normalizer:?} {text:?}"
+                );
+                let plan = EncodeIdsPlan::prepare(&actual, text, special).unwrap();
+                let capacity = plan.requirements().id_capacity();
+                let ids = plan.encode().unwrap();
+                assert_eq!(ids.ids(), expected.get_ids(), "{normalizer:?} {text:?}");
+                assert!(ids.ids().len() <= capacity);
+            }
+        }
+    }
+}
+
+#[test]
+fn normalized_added_spelling_is_constructed_before_matching_and_decoding() {
+    for normalizer in [
+        json!({"type":"NFC"}),
+        json!({"type":"Prepend","prepend":"e"}),
+        json!({"type":"Sequence","normalizers":[{"type":"Prepend","prepend":"e"},{"type":"NFC"},{"type":"Prepend","prepend":"z"}]}),
+        json!({"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Sequence","normalizers":[{"type":"Prepend","prepend":"a"},{"type":"NFC"}]}]}),
+    ] {
+        let mut value = source(4, false);
+        value["normalizer"] = normalizer.clone();
+        value["added_tokens"].as_array_mut().unwrap().extend([
+            json!({"id":990,"content":"e\u{301}","normalized":true,"single_word":false,"lstrip":false,"rstrip":false,"special":false}),
+            json!({"id":991,"content":"\u{301}","normalized":true,"single_word":false,"lstrip":false,"rstrip":false,"special":true}),
+            json!({"id":992,"content":"Ω","normalized":true,"single_word":false,"lstrip":false,"rstrip":false,"special":false}),
+        ]);
+        let actual = compiled(&value);
+        let ordinary = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
+        assert!(
+            actual.matches_compiled_configuration(&ordinary),
+            "{:?}",
+            normalizer
+        );
+        for text in [
+            "",
+            "e\u{301}",
+            "\u{301}hi",
+            "Ω",
+            "a<S>\u{301}<S>e\u{301}",
+            "é e\u{301} Ω",
+        ] {
+            let expected = ordinary.encode(text, false).unwrap();
+            let ids = EncodeIdsPlan::prepare(&actual, text, false)
+                .unwrap()
+                .encode()
+                .unwrap();
+            assert_eq!(ids.ids(), expected.get_ids(), "{normalizer:?} {text:?}");
+            assert_eq!(
+                actual.decode(ids.ids(), false).unwrap(),
+                ordinary.decode(expected.get_ids(), false).unwrap()
+            );
+        }
+        for id in actual.decode_vocabulary().ids() {
+            assert_eq!(
+                actual.decode_vocabulary().id_to_token(id),
+                ordinary.decode_vocabulary().id_to_token(id)
+            );
+        }
+    }
 }

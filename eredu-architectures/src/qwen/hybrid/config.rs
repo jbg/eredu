@@ -1,18 +1,18 @@
 //! Strict hybrid text and conditional-generation configuration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::rotary::RopeValue;
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
     cache::{
-        LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+        MutableStateResidency,
+        StateTensorDimension, StateTensorDtype, StateTensorRole,
     },
 };
 use eredu_gguf::MetadataValue;
-use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
+use eredu_runtime::{StateLayout, StateSegmentLifetime};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 

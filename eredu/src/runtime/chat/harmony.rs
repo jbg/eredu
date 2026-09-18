@@ -1,10 +1,12 @@
 //! Harmony output syntax and incremental parser state.
 
-use llguidance::api::TopLevelGrammar;
+use super::grammar_text::{Error as GrammarError, Text as GrammarText, StructuralTokens};
+use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::tool_schema::ToolDefinition;
 use serde_json::Value;
 
 use crate::{
-    runtime::chat::constraints::{parse_tools, tool_call_bounds},
+    runtime::chat::constraints::{tool_call_bounds},
     runtime::chat::dialect::{
         ConstraintConfiguration, DialectParameters, FormatDialect, GenerationPromptBehavior,
     },
@@ -40,133 +42,88 @@ impl HarmonyDialect {
     }
 
     fn grammar(
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-    ) -> Result<String, String> {
-        if STRUCTURAL_TOKENS.len() != structural_token_ids.len() {
-            return Err(format!(
-                "Harmony declares {} structural tokens but {} tokenizer IDs were resolved",
-                STRUCTURAL_TOKENS.len(),
-                structural_token_ids.len()
-            ));
-        }
-
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
+        let literals = StructuralTokens::new(STRUCTURAL_TOKENS, structural_token_ids)?;
         let (minimum, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         let protocol_maximum = maximum.map_or(1, |maximum| maximum.min(1));
         if minimum > protocol_maximum {
             return Err("Harmony assistant actions support at most one function call".into());
         }
-
-        let literal =
-            |text: &str| structural_literal(text, STRUCTURAL_TOKENS, structural_token_ids);
-        let tools = parse_tools(tools)?;
+        let mut grammar = GrammarText::new(funding)?;
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__eredu_harmony_tools_disabled__\"\n".into());
+            grammar.push_str("start: \"__eredu_harmony_tools_disabled__\"\n")?;
+            return Ok(grammar.finish());
         }
-
-        let mut grammar = String::new();
         match tool_choice {
             ToolChoice::Required => {
-                grammar.push_str(
-                    "start: analysis_message* commentary_message* required_function_call\n",
-                );
-                grammar.push_str(&format!(
+                grammar.push_str("start: analysis_message* commentary_message* required_function_call\n")?;
+                grammar.push_fmt(format_args!(
                     "analysis_message: {} \"analysis\" {} harmony_text {} {} \"assistant\"\n",
-                    literal(CHANNEL)?,
-                    literal(MESSAGE)?,
-                    literal(END)?,
-                    literal(START)?,
-                ));
-                grammar.push_str(&format!(
+                    literals.literal(CHANNEL), literals.literal(MESSAGE),
+                    literals.literal(END), literals.literal(START),
+                ))?;
+                grammar.push_fmt(format_args!(
                     "commentary_message: {} \"commentary\" {} harmony_text {} {} \"assistant\"\n",
-                    literal(CHANNEL)?,
-                    literal(MESSAGE)?,
-                    literal(END)?,
-                    literal(START)?,
-                ));
-                grammar.push_str(
-                    "harmony_text: HARMONY_TEXT_CHARACTER*\n\
-                     HARMONY_TEXT_CHARACTER: /[^<]|<[^|]/\n",
-                );
+                    literals.literal(CHANNEL), literals.literal(MESSAGE),
+                    literals.literal(END), literals.literal(START),
+                ))?;
+                grammar.push_str("harmony_text: HARMONY_TEXT_CHARACTER*\nHARMONY_TEXT_CHARACTER: /[^<]|<[^|]/\n")?;
             }
-            ToolChoice::Auto => {
-                grammar.push_str(&format!(
-                    "start: {} auto_function_call\n",
-                    literal(AUTO_TRIGGER)?
-                ));
-            }
+            ToolChoice::Auto => grammar.push_fmt(format_args!(
+                "start: {} auto_function_call\n", literals.literal(AUTO_TRIGGER)
+            ))?,
             ToolChoice::None => unreachable!("disabled tools returned above"),
         }
-
         if tools.is_empty() {
-            grammar.push_str("auto_function_call: \"__eredu_unreachable_harmony_function__\"\n");
-            return Ok(grammar);
+            grammar.push_str("auto_function_call: \"__eredu_unreachable_harmony_function__\"\n")?;
+            return Ok(grammar.finish());
         }
-
-        grammar.push_str(&format!(
+        grammar.push_fmt(format_args!(
             "call_format: \" json\" | \" \" {} \"json\" | \" \" {} \" json\" | {} \"json\"\n",
-            literal(CONSTRAIN)?,
-            literal(CONSTRAIN)?,
-            literal(CONSTRAIN)?,
-        ));
-
-        match tool_choice {
-            ToolChoice::Required => {
-                let alternatives = (0..tools.len())
-                    .flat_map(|index| {
-                        [
-                            format!("required_recipient_{index}"),
-                            format!("required_channel_{index}"),
-                        ]
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                grammar.push_str(&format!("required_function_call: {alternatives}\n"));
+            literals.literal(CONSTRAIN), literals.literal(CONSTRAIN), literals.literal(CONSTRAIN),
+        ))?;
+        grammar.push_str(if tool_choice == ToolChoice::Required {
+            "required_function_call: "
+        } else { "auto_function_call: " })?;
+        for index in 0..tools.len() {
+            if index != 0 { grammar.push_str(" | ")?; }
+            if tool_choice == ToolChoice::Required {
+                grammar.push_fmt(format_args!("required_recipient_{index} | required_channel_{index}"))?;
+            } else {
+                grammar.push_fmt(format_args!("auto_call_{index}"))?;
             }
-            ToolChoice::Auto => {
-                let alternatives = (0..tools.len())
-                    .map(|index| format!("auto_call_{index}"))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                grammar.push_str(&format!("auto_function_call: {alternatives}\n"));
-            }
-            ToolChoice::None => unreachable!("disabled tools returned above"),
         }
-
+        grammar.push_str("\n")?;
         for (index, tool) in tools.iter().enumerate() {
-            let name = literal(&tool.name)?;
-            let schema = serde_json::to_string(
-                &crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "")?,
-            )
-            .expect("validated schemas serialize");
+            let name = literals.literal(tool.name);
+            let schema = crate::runtime::chat::tool_schema::ArgumentsSchema::new(tool.parameters, "")?;
             match tool_choice {
                 ToolChoice::Required => {
-                    grammar.push_str(&format!(
+                    grammar.push_fmt(format_args!(
                         "required_recipient_{index}: \" to=functions.\" {name} {} \"commentary\" call_format {} arguments_{index} {}\n",
-                        literal(CHANNEL)?,
-                        literal(MESSAGE)?,
-                        literal(CALL)?,
-                    ));
-                    grammar.push_str(&format!(
+                        literals.literal(CHANNEL), literals.literal(MESSAGE), literals.literal(CALL),
+                    ))?;
+                    grammar.push_fmt(format_args!(
                         "required_channel_{index}: {} \"commentary to=functions.\" {name} call_format {} arguments_{index} {}\n",
-                        literal(CHANNEL)?,
-                        literal(MESSAGE)?,
-                        literal(CALL)?,
-                    ));
+                        literals.literal(CHANNEL), literals.literal(MESSAGE), literals.literal(CALL),
+                    ))?;
                 }
-                ToolChoice::Auto => grammar.push_str(&format!(
+                ToolChoice::Auto => grammar.push_fmt(format_args!(
                     "auto_call_{index}: {name} (({} \"commentary\" call_format) | call_format) {} arguments_{index} {}\n",
-                    literal(CHANNEL)?,
-                    literal(MESSAGE)?,
-                    literal(CALL)?,
-                )),
+                    literals.literal(CHANNEL), literals.literal(MESSAGE), literals.literal(CALL),
+                ))?,
                 ToolChoice::None => unreachable!("disabled tools returned above"),
             }
-            grammar.push_str(&format!("arguments_{index}: %json {schema}\n"));
+            grammar.push_fmt(format_args!("arguments_{index}: %json "))?;
+            grammar.push_json(&schema)?;
+            grammar.push_str("\n")?;
         }
-        Ok(grammar)
+        Ok(grammar.finish())
     }
 }
 
@@ -201,19 +158,21 @@ impl FormatDialect for HarmonyDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<HarmonyParameters>()?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(Self::grammar(
+            grammar: super::grammar_text::lark(Self::grammar(
                 tools,
                 tool_choice,
                 parallel_tool_calls,
                 resolved_structural_token_ids,
-            )?),
+                funding,
+            )?, funding)?,
         })
     }
 
@@ -248,39 +207,6 @@ impl FormatDialect for HarmonyDialect {
         Self::parameters(parameters)?;
         Ok(Box::new(HarmonyParser::default()))
     }
-}
-
-fn structural_literal(
-    text: &str,
-    structural_tokens: &[&str],
-    structural_token_ids: &[u32],
-) -> Result<String, String> {
-    let mut sequence = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let Some((position, structural_index)) = structural_tokens
-            .iter()
-            .enumerate()
-            .filter_map(|(index, token)| remaining.find(token).map(|position| (position, index)))
-            .min_by_key(|(position, index)| (*position, *index))
-        else {
-            sequence.push(json_literal(remaining));
-            break;
-        };
-        if position > 0 {
-            sequence.push(json_literal(&remaining[..position]));
-        }
-        sequence.push(format!("<[{}]>", structural_token_ids[structural_index]));
-        remaining = &remaining[position + structural_tokens[structural_index].len()..];
-    }
-    if sequence.is_empty() {
-        sequence.push(json_literal(""));
-    }
-    Ok(sequence.join(" "))
-}
-
-fn json_literal(text: &str) -> String {
-    serde_json::to_string(text).expect("strings serialize as Lark literals")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,7 +618,7 @@ mod tests {
     }
 
     fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
-        let mut grammar = plan.generation_constraint().grammar_state();
+        let mut grammar = plan.generation_constraint().grammar_matcher();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;
         while offset < text.len() {
@@ -705,18 +631,18 @@ mod tests {
                 })
                 .flatten()
             {
-                if grammar.commit(*token).is_err() {
+                if grammar.consume_token(*token).is_err() {
                     return false;
                 }
                 offset += spelling.len();
             } else {
-                if grammar.commit(text.as_bytes()[offset] as TokenId).is_err() {
+                if grammar.consume_token(text.as_bytes()[offset] as TokenId).is_err() {
                     return false;
                 }
                 offset += 1;
             }
         }
-        grammar.is_complete().unwrap()
+        grammar.is_accepting().unwrap()
     }
 
     fn joined_reasoning(events: &[SemanticEvent]) -> String {

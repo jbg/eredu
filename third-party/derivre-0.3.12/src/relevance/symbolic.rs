@@ -2,7 +2,7 @@
 pub(crate) mod storage;
 use super::SymRes;
 use crate::ast::{Expr, ExprRef, ExprSet};
-use std::convert::Infallible;
+use crate::ParserError as ConstructionError;
 
 pub(crate) trait Construction {
     type Error;
@@ -183,36 +183,40 @@ pub(crate) fn node<C: Construction>(
 
 pub(super) struct Ordinary<'a>(pub(super) &'a mut ExprSet);
 impl Construction for Ordinary<'_> {
-    type Error = Infallible;
+    type Error = ConstructionError;
     fn source(&self) -> &ExprSet {
         self.0
     }
-    fn list(&mut self, _capacity: usize) -> Result<SymRes, Infallible> {
-        Ok(Vec::new())
+    fn list(&mut self, capacity: usize) -> Result<SymRes, ConstructionError> {
+        let mut list = Vec::new();
+        self.0.construction_funding()?.try_grow_vec(&mut list, capacity)?;
+        Ok(list)
     }
-    fn push(&mut self, list: &mut SymRes, value: (ExprRef, ExprRef)) -> Result<(), Infallible> {
-        list.push(value);
+    fn push(&mut self, list: &mut SymRes, value: (ExprRef, ExprRef)) -> Result<(), ConstructionError> {
+        self.0.construction_funding()?.try_push(list, value)?;
         Ok(())
     }
-    fn overflow(&self) -> Infallible {
-        panic!("symbolic derivative list geometry overflow")
+    fn overflow(&self) -> ConstructionError {
+        crate::raw::PreparedExprError::Capacity.into()
     }
-    fn pay(&mut self, amount: usize) -> Result<(), Infallible> {
-        self.0.pay(amount);
+    fn pay(&mut self, amount: usize) -> Result<(), ConstructionError> {
+        self.0.pay_prepared(amount)?;
         Ok(())
     }
-    fn literal_derivative(&mut self, root: ExprRef) -> Result<(ExprRef, ExprRef), Infallible> {
+    fn literal_derivative(&mut self, root: ExprRef) -> Result<(ExprRef, ExprRef), ConstructionError> {
         let Expr::ByteConcat(_, bytes, tail) = self.0.get(root) else {
             unreachable!("symbolic literal source")
         };
         let first = bytes[0];
-        let copy = bytes[1..].to_vec();
-        let selector = self.0.mk_byte(first);
-        let expression = self.0.mk_byte_concat(&copy, tail);
+        let mut copy = [0; ExprRef::MAX_BYTE_CONCAT];
+        let len = bytes.len() - 1;
+        copy[..len].copy_from_slice(&bytes[1..]);
+        let selector = self.0.mk_byte(first)?;
+        let expression = self.0.mk_byte_concat(&copy[..len], tail)?;
         Ok((selector, expression))
     }
-    fn byte(&mut self, value: u8) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_byte(value))
+    fn byte(&mut self, value: u8) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_byte(value)?)
     }
     fn remainder(
         &mut self,
@@ -220,48 +224,50 @@ impl Construction for Ordinary<'_> {
         remainder: u32,
         scale: u32,
         fractional: bool,
-    ) -> Result<ExprRef, Infallible> {
+    ) -> Result<ExprRef, ConstructionError> {
         Ok(self
             .0
-            .mk_remainder_is(divisor, remainder, scale, fractional))
+            .mk_remainder_is(divisor, remainder, scale, fractional)?)
     }
-    fn multiply(&mut self, left: u32, right: u32) -> Result<u32, Infallible> {
-        Ok(left * right)
+    fn multiply(&mut self, left: u32, right: u32) -> Result<u32, ConstructionError> {
+        Ok(left.checked_mul(right).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn add(&mut self, left: u32, right: u32) -> Result<u32, Infallible> {
-        Ok(left + right)
+    fn add(&mut self, left: u32, right: u32) -> Result<u32, ConstructionError> {
+        Ok(left.checked_add(right).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn power10(&mut self, scale: u32) -> Result<u32, Infallible> {
-        Ok(10u32.pow(scale))
+    fn power10(&mut self, scale: u32) -> Result<u32, ConstructionError> {
+        Ok(10u32.checked_pow(scale).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn modulo(&mut self, value: u32, divisor: u32) -> Result<u32, Infallible> {
-        Ok(value % divisor)
+    fn modulo(&mut self, value: u32, divisor: u32) -> Result<u32, ConstructionError> {
+        Ok(value.checked_rem(divisor).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn byte_and(&mut self, a: ExprRef, b: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_byte_set_and(a, b))
+    fn byte_and(&mut self, a: ExprRef, b: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_byte_set_and(a, b)?)
     }
-    fn and(&mut self, a: ExprRef, b: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_and(&mut vec![a, b]))
+    fn and(&mut self, a: ExprRef, b: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_and_pair(a, b)?)
     }
-    fn not(&mut self, arg: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_not(arg))
+    fn not(&mut self, arg: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_not(arg)?)
     }
-    fn repeat(&mut self, arg: ExprRef, min: u32, max: u32) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_repeat(arg, min, max))
+    fn repeat(&mut self, arg: ExprRef, min: u32, max: u32) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_repeat(arg, min, max)?)
     }
-    fn concat(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_concat(left, right))
+    fn concat(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_concat(left, right)?)
     }
-    fn simplify(&mut self, list: SymRes) -> Result<SymRes, Infallible> {
-        Ok(super::simplify(self.0, list))
+    fn simplify(&mut self, list: SymRes) -> Result<SymRes, ConstructionError> {
+        super::simplify(self.0, list)
     }
-    fn disjoint(&mut self, list: &SymRes) -> Result<SymRes, Infallible> {
-        Ok(super::make_disjoint(self.0, list))
+    fn disjoint(&mut self, list: &SymRes) -> Result<SymRes, ConstructionError> {
+        super::make_disjoint(self.0, list)
     }
-    fn negated_union(&mut self, list: &SymRes) -> Result<ExprRef, Infallible> {
-        Ok(self
-            .0
-            .mk_byte_set_neg_or(&list.iter().map(|&(b, _)| b).collect::<Vec<_>>()))
+    fn negated_union(&mut self, list: &SymRes) -> Result<ExprRef, ConstructionError> {
+        let funding = self.0.construction_funding()?.clone();
+        let mut selectors = Vec::new();
+        funding.try_grow_vec(&mut selectors, list.len())?;
+        selectors.extend(list.iter().map(|&(selector, _)| selector));
+        Ok(self.0.mk_byte_set_neg_or(&selectors)?)
     }
 }
 
@@ -279,10 +285,10 @@ mod tests {
         remaining: usize,
         completed: Option<ExprRef>,
     }
-    fn lift<T>(result: Result<T, Infallible>) -> Result<T, Refusal> {
+    fn lift<T>(result: Result<T, ConstructionError>) -> Result<T, Refusal> {
         match result {
             Ok(value) => Ok(value),
-            Err(never) => match never {},
+            Err(error) => panic!("unenforced fixture constructor: {error}"),
         }
     }
     macro_rules! forward {
@@ -347,11 +353,11 @@ mod tests {
     }
     #[test]
     fn shared_symbolic_remainder_keeps_digit_order_and_post_constructor_failure_prefix() {
-        let mut source = ExprSet::new(256);
-        let root = source.mk_remainder_is(13, 3, 1, false);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let root = source.mk_remainder_is(13, 3, 1, false).unwrap();
         let mut failed_source = source.clone();
         let mut cache = super::super::RelevanceCache::new();
-        let result = cache.deriv(&mut source, root);
+        let result = cache.deriv(&mut source, root).unwrap();
         assert_eq!(result.len(), 11);
         for (i, &(selector, expression)) in result[..10].iter().enumerate() {
             assert!(source.get(selector).matches_byte(b'0' + i as u8));
@@ -362,12 +368,12 @@ mod tests {
         assert!(source.get(result[10].0).matches_byte(b'.'));
         assert_eq!(result[10].1, ExprRef::NO_MATCH);
         let cost = source.cost();
-        assert_eq!(cache.deriv(&mut source, root), result);
+        assert_eq!(cache.deriv(&mut source, root).unwrap(), result);
         assert_eq!(source.cost(), cost);
 
         // Byte-concat mapping deliberately skips the tail child. Its actual
         // reached source therefore has zero child lists, though the AST has one.
-        let literal = source.mk_byte_literal(b"ab");
+        let literal = source.mk_byte_literal(b"ab").unwrap();
         let mut literal_lists = storage::Plan::prepare(&source, literal, &[])
             .unwrap()
             .compile()

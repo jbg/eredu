@@ -18,61 +18,22 @@ impl From<eredu_runtime::ParameterBankLoadOptions>
 }
 
 pub(crate) fn neural_observer_error(error: crate::backend::error::Error) -> eredu_nn::Error {
-    if error.is_ordinary_capture_failure() {
-        eredu_nn::Error::backend_retained_source(error)
-    } else {
-        eredu_nn::Error::backend_source(error)
-    }
-}
-fn retained_activation_error(error: crate::backend::error::Error) -> eredu_nn::Error {
-    if error.is_ordinary_capture_failure() {
-        eredu_nn::Error::backend_retained_source(error)
-    } else {
-        eredu_nn::Error::backend_source(RetainedActivationFailure(error))
-    }
+    eredu_nn::Error::backend_retained_source(error)
 }
 
-// NN's legacy source constructor formats its input. Keep this retained-only
-// boundary bounded without formatting the original observer failure.
-#[derive(Debug)]
-struct RetainedActivationFailure(crate::backend::error::Error);
-impl std::fmt::Display for RetainedActivationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("retained generated activation observation failed")
-    }
-}
-impl std::error::Error for RetainedActivationFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
-/// Actual retained callback Arc block plus named NN constructor controls.
-/// Rust 1.98 ArcInner is repr(C, align(2)), two AtomicUsize counters followed by T;
-/// source is pinned with this unit. This excludes String capacity/allocator
-/// overhead and does not claim completeness for arbitrary NN error clones.
+/// Canonical NN source constructor plus this adapter's native argument and
+/// neural return transports. The actual cause retains its existing payer.
 pub(crate) fn retained_observation_error_control_bytes() -> Option<usize> {
-    use std::{
-        alloc::Layout,
-        mem::size_of,
-        sync::{atomic::AtomicUsize, Arc},
-    };
-    let block = Layout::new::<[AtomicUsize; 2]>()
-        .align_to(2)
-        .ok()?
-        .pad_to_align()
-        .extend(Layout::new::<RetainedActivationFailure>())
-        .ok()?
-        .0
-        .pad_to_align()
-        .size();
-    block
-        .checked_add(size_of::<RetainedActivationFailure>())?
-        .checked_add(size_of::<RetainedActivationFailure>())?
-        .checked_add(size_of::<Arc<RetainedActivationFailure>>())?
-        .checked_add(size_of::<Option<Arc<dyn std::error::Error + Send + Sync>>>())?
-        .checked_add(size_of::<eredu_nn::Error>())?
-        .checked_add(size_of::<Result<(), eredu_nn::Error>>())
+    use std::mem::size_of;
+    let caller = [
+        size_of::<crate::backend::error::Error>(),
+        size_of::<eredu_nn::Error>(),
+        size_of::<Result<(), eredu_nn::Error>>(),
+    ];
+    caller.into_iter().try_fold(
+        eredu_nn::Error::retained_source_construction_bytes::<crate::backend::error::Error>()?,
+        usize::checked_add,
+    )
 }
 
 /// Adapts public MLX-array observation to the neutral tensor/error contract.
@@ -179,7 +140,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
         opening.with_tensor_adapter(crate::MlxTensor::as_array, |opening| {
             self.inner
                 .prepare_prefill_chunk_with_opening(context, opening)
-                .map_err(retained_activation_error)
+                .map_err(neural_observer_error)
         })
     }
     fn prepare_prefill_chunk_retention(
@@ -189,7 +150,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     {
         self.inner
             .prepare_prefill_chunk_retention(context)
-            .map_err(retained_activation_error)
+            .map_err(neural_observer_error)
     }
     fn retire_prefill_chunk_retention(
         &mut self,
@@ -197,7 +158,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     ) -> Result<(), eredu_nn::Error> {
         self.inner
             .retire_prefill_chunk_retention(settled)
-            .map_err(retained_activation_error)
+            .map_err(neural_observer_error)
     }
 
     fn prepare_transaction(
@@ -330,12 +291,12 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
             crate::MlxTensor::into_array,
             crate::backend::error::Error::from,
             |_: &crate::backend::error::Error| {
-                eredu_nn::Error::backend_source(eredu_nn::GeneratedTensorRetentionSignal)
+                eredu_nn::Error::backend_retained_source(eredu_nn::GeneratedTensorRetentionSignal)
             },
         );
         self.inner
             .observe_generated_retained(path, prototype.as_array(), source, &mut mapped)
-            .map_err(retained_activation_error)
+            .map_err(neural_observer_error)
     }
 
     fn intervene(

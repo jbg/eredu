@@ -26,6 +26,74 @@ pub enum CompositeSemanticRole {
     Projected,
     Encoded,
 }
+/// Exact rendered-token projection selected by the architecture compiler.
+/// These scalars alone confer no source authority; consumers must retain the
+/// completed semantic storage and its actual ordered host source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompositeChatProjection {
+    /// Every original token value is present in the rendered prompt.
+    #[default]
+    SourceTokens,
+    /// Exact special-token spellings emitted by the selected chat protocol.
+    /// An empty sequence is valid only for architecture-generated framing.
+    Markers(&'static [&'static str]),
+    /// Processor-generated timestamp and opening token for one video frame.
+    VideoPrefix {
+        /// Exact video source grouping and order.
+        origin: eredu_core::InputExtent,
+        /// Architecture-derived timestamp equation, rendered by a neutral writer.
+        text: CompositeGeneratedText,
+        /// Opening token emitted after the timestamp.
+        framing: u32,
+    },
+    /// Media marker for one source-bound video frame/group.
+    VideoMarker {
+        /// Exact video source grouping and order.
+        origin: eredu_core::InputExtent,
+        /// Marker sequence for a compact rendering of the complete video.
+        compact: &'static [&'static str],
+        /// Per-frame marker sequence for a rendering containing timestamps.
+        expanded: &'static [&'static str],
+    },
+    /// Closing processor token paired with the preceding video frame/group.
+    VideoSuffix {
+        /// Exact video source grouping and order.
+        origin: eredu_core::InputExtent,
+        /// Exact token emitted by the selected processor.
+        framing: u32,
+    },
+    /// Architecture-only prepared input with no rendered-chat declaration.
+    Unavailable,
+}
+/// Fixed portable formatting operation. Family choice and timestamp arithmetic
+/// remain in architecture preparation; this value carries no source authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeGeneratedText {
+    /// Nonnegative finite seconds with one decimal place and exact delimiters.
+    DecimalSeconds {
+        /// Exact computed IEEE-754 value.
+        value_bits: u64,
+        /// Literal prefix selected by the processor protocol.
+        prefix: &'static str,
+        /// Literal suffix selected by the processor protocol.
+        suffix: &'static str,
+    },
+    /// Whole minutes and seconds with the processor's exact surrounding spaces.
+    ClockSeconds {
+        /// Nonnegative whole second count.
+        seconds: u64,
+        /// Whether a space precedes the timestamp.
+        leading_space: bool,
+    },
+}
+impl fmt::Display for CompositeGeneratedText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::DecimalSeconds { value_bits, prefix, suffix } => write!(f, "{prefix}{:.1}{suffix}", f64::from_bits(value_bits)),
+            Self::ClockSeconds { seconds, leading_space } => write!(f, "{}{:02}:{:02} ", if leading_space { " " } else { "" }, seconds / 60, seconds % 60),
+        }
+    }
+}
 /// Fixed record referring back to one actual immutable source part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositeSemanticPartRecord {
@@ -38,6 +106,8 @@ pub struct CompositeSemanticPartRecord {
     pub modality: InputModality,
     pub placeholder: u32,
     pub workspace_scalars: u64,
+    /// Render association, distinct from the expanded decoder placeholder span.
+    pub chat_projection: CompositeChatProjection,
 }
 impl Default for CompositeSemanticPartRecord {
     fn default() -> Self {
@@ -51,6 +121,7 @@ impl Default for CompositeSemanticPartRecord {
             modality: InputModality::Text,
             placeholder: 0,
             workspace_scalars: 0,
+            chat_projection: CompositeChatProjection::SourceTokens,
         }
     }
 }
@@ -140,6 +211,19 @@ impl MediaSessionBinding {
         Arc::ptr_eq(&self.execution.0, &execution.0)
             && &self.revision == revision
             && self.frontier == frontier
+    }
+    /// Checks the existing revision of an independently owned state. This
+    /// neither initializes a revision nor grants a new semantic bind attempt.
+    /// The enclosing source owner separately authenticates the control origin.
+    pub fn matches_retained_state(
+        &self,
+        execution: &InferenceExecutionIdentity,
+        retention: &super::InferenceRetention,
+        frontier: u64,
+    ) -> bool {
+        retention.initialized_revision().is_some_and(|revision| {
+            self.matches_snapshot(execution, revision, frontier)
+        })
     }
     fn duplicate(&self) -> Self {
         Self {

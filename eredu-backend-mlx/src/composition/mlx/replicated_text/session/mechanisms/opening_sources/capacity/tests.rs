@@ -10,7 +10,7 @@ use std::{convert::Infallible, num::NonZeroU8};
 
 struct Populate;
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for Populate {
-    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
+    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
         let shape = value.as_array().shape().to_vec();
         let n = shape.iter().map(|&n| n as usize).product::<usize>();
         *value = MlxTensor::from_array(Array::from_slice(&vec![1.25_f32; n], &shape));
@@ -62,7 +62,7 @@ fn execution_with_parameter_allocations(
 ) -> (Execution, Vec<safemlx::ArrayAllocationInfo>) {
     struct Snapshot(Vec<safemlx::ArrayAllocationInfo>);
     impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for Snapshot {
-        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
+        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
             let _ = value.as_array().evaluated().unwrap();
             let fact = value.as_array().try_allocation_info().unwrap().unwrap();
             assert!(fact.bytes() > 0);
@@ -258,7 +258,7 @@ pub(super) fn accept(
         |_| Ok(q.clone())
     )
     .is_err());
-    let (_, r, q) = plan_prefill_incremental_with_capacity(
+    let (r, q) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &caps,

@@ -595,6 +595,10 @@ impl Tensor for NumericTensor {
                 .with_dtype(eredu_core::checkpoint::TensorDtype::I32),
         )
     }
+    fn full_u32(value: u32, shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
+        Ok(Self::new(shape.to_vec(), vec![value as f32; elements(shape)])
+            .with_dtype(eredu_core::checkpoint::TensorDtype::U32))
+    }
 
     fn add(&self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
         self.zip(rhs, |left, right| left + right)
@@ -1395,7 +1399,7 @@ impl Tensor for NumericTensor {
             &positions, rows, prepared,
         )?;
         let mut shape = position_ids.shape[..position_ids.shape.len() - 1].to_vec();
-        shape.push(spec.dimensions().map_err(Error::backend_source)?);
+        shape.push(spec.dimensions().map_err(Error::backend_retained_source)?);
         Ok((
             NumericTensor::new(shape.clone(), cosine),
             NumericTensor::new(shape, sine),
@@ -1731,18 +1735,18 @@ fn numeric_local_layout(
     Ok(layout)
 }
 
-fn visit<'a, V>(metadata: &ParameterMetadata, value: &'a NumericTensor, visitor: &mut V)
+fn visit<'a, V>(metadata: &'a ParameterMetadata, value: &'a NumericTensor, visitor: &mut V)
 where
-    V: ParameterVisitor<'a, NumericTensor>,
+    V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
 {
-    visitor.visit(metadata.clone(), value);
+    visitor.parameter(metadata.as_view(), value);
 }
 
 fn visit_mut<'a, V>(metadata: &ParameterMetadata, value: &'a mut NumericTensor, visitor: &mut V)
 where
     V: ParameterVisitorMut<'a, NumericTensor>,
 {
-    visitor.visit_mut(metadata.clone(), value);
+    visitor.visit_mut(metadata.as_view(), value);
 }
 
 fn numeric_companion_metadata(
@@ -1799,18 +1803,14 @@ struct NumericLinear {
 }
 
 impl Parameterized<NumericTensor> for NumericLinear {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        if let Some(value) = &self.execution_weight {
-            visitor(value);
-        }
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.weight_metadata, &self.weight, visitor);
         if let Some((bias, metadata)) = &self.bias {
             visit(metadata, bias, visitor);
@@ -1818,7 +1818,15 @@ impl Parameterized<NumericTensor> for NumericLinear {
         for (companion, metadata) in &self.format_companions {
             visit(metadata, companion, visitor);
         }
-    }
+
+
+
+        if let Some(value) = &self.execution_weight {
+            visitor.retained(value);
+        }
+
+__source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -1875,23 +1883,27 @@ impl NumericEmbedding {
 }
 
 impl Parameterized<NumericTensor> for NumericEmbedding {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        if let Some(value) = &self.execution_weight {
-            visitor(value);
-        }
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.metadata, &self.weight, visitor);
         for (companion, metadata) in &self.format_companions {
             visit(metadata, companion, visitor);
         }
-    }
+
+
+
+        if let Some(value) = &self.execution_weight {
+            visitor.retained(value);
+        }
+
+__source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -2003,17 +2015,18 @@ struct NumericNorm {
 }
 
 impl Parameterized<NumericTensor> for NumericNorm {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.metadata, &self.weight, visitor);
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -2072,16 +2085,17 @@ struct NumericRotary {
 }
 
 impl Parameterized<NumericTensor> for NumericRotary {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
-    }
+ let mut __source_result = Ok(());
+
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
     where
@@ -2199,19 +2213,20 @@ struct NumericHyperConnection {
 }
 
 impl Parameterized<NumericTensor> for NumericHyperConnection {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.function.1, &self.function.0, visitor);
         visit(&self.base.1, &self.base.0, visitor);
         visit(&self.scale.1, &self.scale.0, visitor);
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -2420,19 +2435,20 @@ struct NumericHyperHead {
 }
 
 impl Parameterized<NumericTensor> for NumericHyperHead {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.function.1, &self.function.0, visitor);
         visit(&self.base.1, &self.base.0, visitor);
         visit(&self.scale.1, &self.scale.0, visitor);
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -5572,25 +5588,15 @@ struct NumericRouter {
 }
 
 impl Parameterized<NumericTensor> for NumericRouter {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        let complete = self.linear.visit_retained_values(visitor);
-        if let Some((value, _)) = &self.correction_bias {
-            visitor(value);
-        }
-        if let Some((_, value, _, _)) = &self.input_transform {
-            visitor(value);
-        }
-        if let Some((value, _)) = &self.coefficient_scale {
-            visitor(value);
-        }
-        complete
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
-        self.linear.visit_parameters(visitor);
+ let mut __source_result = Ok(());
+
+__source_result = __source_result.and(        self.linear.visit_parameter_sources(visitor));
         if let Some((value, metadata)) = &self.correction_bias {
             visit(metadata, value, visitor);
         }
@@ -5600,7 +5606,9 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((value, metadata)) = &self.coefficient_scale {
             visit(metadata, value, visitor);
         }
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6005,18 +6013,19 @@ struct NumericRelu2Groups {
 }
 
 impl Parameterized<NumericTensor> for NumericRelu2Groups {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit(&self.up.1, &self.up.0, visitor);
         visit(&self.down.1, &self.down.0, visitor);
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6129,8 +6138,20 @@ impl TensorParallelGroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
 }
 
 impl Parameterized<NumericTensor> for NumericExpertBank {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&NumericTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
+
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
+    where
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
+    {
+ let mut __source_result = Ok(());
+
+        for (parameter, metadata) in &self.parameters {
+            visit(metadata, parameter, visitor);
+        }
+
+
+
         for expert in &self.experts {
             for value in [
                 Some(&expert.gate),
@@ -6143,20 +6164,12 @@ impl Parameterized<NumericTensor> for NumericExpertBank {
             .into_iter()
             .flatten()
             {
-                visitor(value);
+                visitor.retained(value);
             }
         }
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, NumericTensor>,
-    {
-        for (parameter, metadata) in &self.parameters {
-            visit(metadata, parameter, visitor);
-        }
-    }
+__source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -7593,6 +7606,6 @@ impl AttentionCache<NumericTensor> for NumericHybridLayerState {
 impl eredu_nn::AuxiliaryConvolutionState<NumericTensor> for NumericHybridLayerState {
     fn convolution_state(&mut self, slot: u32) -> Result<&mut Option<NumericTensor>, Error> {
         self.fixed_component(StateTensorRole::Convolution { slot })
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
 }

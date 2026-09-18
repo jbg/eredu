@@ -138,13 +138,13 @@ fn semantic_step_preserves_schedules_wrong_coordinates_and_borrowed_geometry() {
 }
 
 #[test]
-fn metadata_envelopes_match_existing_legacy_delivery_for_skipped_and_selected_steps() {
+fn metadata_envelopes_and_delivery_controls_cover_skipped_and_selected_steps() {
     let source = admitted(
         vec![SymbolicDimension::Known(3)],
         CaptureTransform::FullTensor,
         vec![],
     );
-    let mut real = CaptureSession::new(source.clone());
+    let mut real = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(source.clone()));
     let mut diagnostic = CaptureLedger::new(&source);
     for p in 0..4 {
         let phase = if p == 0 {

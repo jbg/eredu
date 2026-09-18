@@ -41,7 +41,7 @@ impl crate::ProjectionInputObserver<WorkspaceTensor> for Retaining {
             assert!(value.same_context(prototype));
             self.roots.push(value.clone());
             if self.stop == Some(self.outputs) {
-                Err(Error::backend_source(std::io::Error::other(
+                Err(Error::backend_retained_source(std::io::Error::other(
                     "retained sentinel",
                 )))
             } else {

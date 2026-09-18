@@ -19,7 +19,7 @@ use crate::{
     resolve::{self, ResolveError},
 };
 #[cfg(feature = "alloc")]
-use alloc::{borrow::ToOwned, string::String};
+use alloc::string::String;
 #[cfg(feature = "alloc")]
 use core::str::FromStr;
 
@@ -366,10 +366,7 @@ macro_rules! ri_maybe_ref {
             #[inline]
             #[must_use]
             pub fn to_owned(&self) -> $Ty<String> {
-                $Ty {
-                    val: self.val.to_owned(),
-                    meta: self.meta,
-                }
+                self.to_owned_with_allocations(&crate::allocation::Unenforced).unwrap()
             }
         }
 
@@ -607,7 +604,15 @@ macro_rules! ri_maybe_ref {
                     &self,
                     base: &$NonRefTy<U>,
                 ) -> Result<$NonRefTy<String>, ResolveError> {
-                    resolve::resolve(base.make_ref(), self.make_ref(), true).map(RiMaybeRef::from_pair)
+                    self.resolve_against_with_allocations(base, &crate::allocation::Unenforced)
+                }
+
+                /// Resolves while admitting every reached storage request before allocation.
+                #[cfg(feature = "alloc")]
+                pub fn resolve_against_with_allocations<U: Bos<str>>(
+                    &self, base: &$NonRefTy<U>, allocation: &dyn crate::allocation::Allocation,
+                ) -> Result<$NonRefTy<String>, ResolveError> {
+                    resolve::resolve(base.make_ref(), self.make_ref(), true, allocation).map(RiMaybeRef::from_pair)
                 }
             )?
 
@@ -653,6 +658,25 @@ macro_rules! ri_maybe_ref {
             #[must_use]
             pub fn normalize(&self) -> $Ty<String> {
                 Normalizer::new().normalize(self).unwrap()
+            }
+
+            /// Normalizes while admitting every reached storage request before allocation.
+            #[cfg(feature = "alloc")]
+            pub fn normalize_with_allocations(
+                &self, allocation: &dyn crate::allocation::Allocation,
+            ) -> Result<$Ty<String>, crate::normalize::NormalizeError> {
+                Normalizer::new().normalize_with_allocations(self, allocation)
+            }
+
+            /// Copies this value, admitting the owned string before allocation.
+            #[cfg(feature = "alloc")]
+            pub fn to_owned_with_allocations(
+                &self, allocation: &dyn crate::allocation::Allocation,
+            ) -> Result<$Ty<String>, crate::allocation::AllocationError> {
+                let value = self.make_ref().as_str();
+                let mut buffer = crate::allocation::Buffer::new(value.len(), allocation)?;
+                buffer.push_str(value)?;
+                Ok($Ty { val: buffer.finish(), meta: self.meta })
             }
 
             cond!(if $scheme_required {} else {
@@ -762,8 +786,16 @@ macro_rules! ri_maybe_ref {
             #[cfg(feature = "alloc")]
             #[must_use]
             pub fn with_fragment(&self, opt: Option<&EStr<$FragmentE>>) -> $Ty<String> {
+                self.with_fragment_with_allocations(opt, &crate::allocation::Unenforced).unwrap()
+            }
+
+            /// Copies with a replacement fragment, admitting storage before allocation.
+            #[cfg(feature = "alloc")]
+            pub fn with_fragment_with_allocations(
+                &self, opt: Option<&EStr<$FragmentE>>, allocation: &dyn crate::allocation::Allocation,
+            ) -> Result<$Ty<String>, crate::allocation::AllocationError> {
                 // Altering only the fragment does not change the metadata.
-                RiMaybeRef::new(self.make_ref().with_fragment(opt.map(EStr::as_str)), self.meta)
+                Ok(RiMaybeRef::new(self.make_ref().with_fragment(opt.map(EStr::as_str), allocation)?, self.meta))
             }
         }
 
@@ -788,8 +820,15 @@ macro_rules! ri_maybe_ref {
             /// # Ok::<_, fluent_uri::ParseError>(())
             /// ```
             pub fn set_fragment(&mut self, opt: Option<&EStr<$FragmentE>>) {
-                // Altering only the fragment does not change the metadata.
-                RmrRef::set_fragment(&mut self.val, &self.meta, opt.map(EStr::as_str))
+                self.set_fragment_with_allocations(opt, &crate::allocation::Unenforced).unwrap()
+            }
+
+            /// Replaces the fragment after admitting any reached string growth.
+            /// Refusal leaves the original URI unchanged.
+            pub fn set_fragment_with_allocations(
+                &mut self, opt: Option<&EStr<$FragmentE>>, allocation: &dyn crate::allocation::Allocation,
+            ) -> Result<(), crate::allocation::AllocationError> {
+                RmrRef::set_fragment(&mut self.val, &self.meta, opt.map(EStr::as_str), allocation)
             }
         }
 
@@ -1054,13 +1093,34 @@ impl<'v, 'm> RmrRef<'v, 'm> {
     }
 
     #[cfg(feature = "alloc")]
-    pub fn set_fragment(buf: &mut String, meta: &Meta, opt: Option<&str>) {
-        buf.truncate(meta.query_or_path_end());
+    pub fn set_fragment(
+        buf: &mut String,
+        meta: &Meta,
+        opt: Option<&str>,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> Result<(), crate::allocation::AllocationError> {
+        let end = meta.query_or_path_end();
+        let needed = match opt {
+            Some(s) => end
+                .checked_add(1)
+                .and_then(|len| len.checked_add(s.len()))
+                .ok_or(crate::allocation::AllocationError::SizeOverflow)?,
+            None => end,
+        };
+        if needed > buf.capacity() {
+            if needed > isize::MAX as usize {
+                return Err(crate::allocation::AllocationError::SizeOverflow);
+            }
+            allocation.reserve(needed)?;
+            buf.try_reserve_exact(needed - buf.len())
+                .map_err(|_| crate::allocation::AllocationError::HostAllocation)?;
+        }
+        buf.truncate(end);
         if let Some(s) = opt {
-            buf.reserve_exact(s.len() + 1);
             buf.push('#');
             buf.push_str(s);
         }
+        Ok(())
     }
 
     pub fn strip_fragment(self) -> &'v str {
@@ -1068,13 +1128,27 @@ impl<'v, 'm> RmrRef<'v, 'm> {
     }
 
     #[cfg(feature = "alloc")]
-    pub fn with_fragment(self, opt: Option<&str>) -> String {
+    pub fn with_fragment(
+        self,
+        opt: Option<&str>,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> Result<String, crate::allocation::AllocationError> {
         let stripped = self.strip_fragment();
+        let capacity = match opt {
+            Some(s) => stripped
+                .len()
+                .checked_add(1)
+                .and_then(|len| len.checked_add(s.len()))
+                .ok_or(crate::allocation::AllocationError::SizeOverflow)?,
+            None => stripped.len(),
+        };
+        let mut buffer = crate::allocation::Buffer::new(capacity, allocation)?;
+        buffer.push_str(stripped)?;
         if let Some(s) = opt {
-            [stripped, "#", s].concat()
-        } else {
-            stripped.to_owned()
+            buffer.push('#')?;
+            buffer.push_str(s)?;
         }
+        Ok(buffer.finish())
     }
 
     #[inline]

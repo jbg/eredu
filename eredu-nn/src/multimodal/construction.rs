@@ -125,7 +125,7 @@ pub(super) fn rotary<T: Tensor>(
         |message| destination.error(message),
         |cause| match destination.0 {
             Some(metadata) => metadata.metadata_source(cause),
-            None => Error::backend_source(cause),
+            None => Error::backend_retained_source(cause),
         },
     )?;
     let shape = position_ids.shape();

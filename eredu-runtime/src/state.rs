@@ -559,7 +559,7 @@ where
     F: ArchitectureStateFactory<B>,
 {
     let layout = architecture
-        .state_layout()
+        .state_layout(None)
         .map_err(ArchitectureStateRealizationError::Architecture)?;
     let state = factory
         .realize(&layout)
@@ -1366,7 +1366,7 @@ mod prepared_layer_tests;
 mod retained_visit_tests;
 
 impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentKvResetLayer>
-    crate::working_memory::ResidentKvResetState for DeviceState<B, L>
+    crate::working_memory::ResidentTableResetState for DeviceState<B, L>
 {
     type Layer = L;
     type ResetPlan = ();
@@ -1392,6 +1392,7 @@ impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentKvResetLayer>
         L::empty_resident_reset(policy)
     }
     fn from_resident_reset(
+        _context: &mut Self::ResetContext,
         layout: SharedStateLayout,
         global_start: usize,
         layers: crate::HostSlotTable<L>,

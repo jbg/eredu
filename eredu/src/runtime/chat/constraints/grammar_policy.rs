@@ -55,32 +55,3 @@ pub(super) fn control_bytes<C: Context>() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
 }
-impl Context for super::GrammarState {
-    type Error = String;
-    fn alias_committed(&self) -> bool {
-        self.terminal_eos_alias_committed
-    }
-    fn mark_alias(&mut self) {
-        self.terminal_eos_alias_committed = true;
-    }
-    fn try_token(&mut self, token: u32) -> Result<bool, Self::Error> {
-        self.try_commit(token)
-    }
-    fn is_eos(&self, token: u32) -> Result<bool, Self::Error> {
-        self.is_eos_token(token)
-    }
-    fn mask_allows(&mut self, token: u32) -> Result<bool, Self::Error> {
-        Ok(self.allowed_tokens()?.is_allowed(token))
-    }
-    fn accepting(&mut self) -> Result<bool, Self::Error> {
-        self.matcher
-            .is_accepting()
-            .map_err(|error| format!("failed to inspect grammar completion: {error}"))
-    }
-    fn stopped(&self) -> bool {
-        self.matcher.is_stopped()
-    }
-    fn refusal(&self, cause: Failure) -> Self::Error {
-        cause.to_string()
-    }
-}

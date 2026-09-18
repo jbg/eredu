@@ -11,13 +11,13 @@ struct AccountState {
 #[derive(Debug)]
 struct TestAccount(Arc<AccountState>);
 
-impl WorkspaceMetadataAccount for TestAccount {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for TestAccount {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let mut remaining = self.0.remaining.lock().unwrap();
         *remaining =
             remaining
                 .checked_sub(bytes)
-                .ok_or(WorkspaceMetadataFundingError::Capacity {
+                .ok_or(HostMetadataFundingError::Capacity {
                     required: bytes.try_into().unwrap(),
                     available: (*remaining).try_into().unwrap(),
                 })?;
@@ -101,7 +101,7 @@ fn funded_facts_refuse_before_control_inspection_and_buffer_emission() {
         remaining: Mutex::new(usize::MAX),
         retired: std::sync::atomic::AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(TestAccount(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(TestAccount(state.clone())).unwrap();
     let probe = Probe::default();
     let operation = WorkspaceOperation {
         kind: WorkspaceOperationKind::Initialize,
@@ -133,7 +133,7 @@ fn funded_facts_refuse_before_control_inspection_and_buffer_emission() {
         assert!(matches!(
             error.storage,
             crate::ErrorStorage::WorkspaceMetadata(WorkspaceMetadataError::Funding(
-                WorkspaceMetadataFundingError::Capacity { required: actual, available: left }
+                HostMetadataFundingError::Capacity { required: actual, available: left }
             )) if actual == required as u64 && left == refusal_available as u64
         ));
         assert_eq!(probe.reads.get(), expected_reads);
@@ -186,4 +186,67 @@ fn prepaid_host_partition_spends_once_and_keeps_exact_owner_custody() {
     assert!(!retired.load(Ordering::SeqCst));
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
+}
+
+#[test]
+fn pure_range_coordinates_refuse_each_reached_metadata_producer() {
+    #[derive(Debug, Default)]
+    struct RangeProbe(Probe);
+    impl WorkspaceMechanisms for RangeProbe {
+        fn operation_bound(&self, _: &WorkspaceOperation) -> Result<Option<WorkspaceOperationBound>, Error> {
+            panic!("funded range must use its fact writer");
+        }
+    }
+    impl WorkspaceFactMechanisms for RangeProbe {
+        type Error = Infallible;
+        fn operation_facts(&self, operation: WorkspaceOperationView<'_>) -> Result<Option<WorkspaceOperationFacts>, Infallible> {
+            self.0.operation_facts(operation)
+        }
+        fn write_operation_facts(&self, operation: WorkspaceOperationView<'_>, destination: WorkspaceEffectDestination<'_>)
+            -> Result<Option<WorkspaceOperationFacts>, Infallible> {
+            let facts = self.operation_facts(operation)?.unwrap();
+            destination.validate(facts.layout).unwrap();
+            destination.outputs[0] = WorkspaceOutputEffect::AliasInput(0);
+            destination.assumptions[0] = b'x';
+            Ok(Some(facts))
+        }
+        fn host_facts(&self, _: WorkspaceOperationView<'_>) -> Result<Option<WorkspaceHostFacts>, Infallible> { Ok(None) }
+        fn write_host_facts(&self, _: WorkspaceOperationView<'_>, _: WorkspaceHostDestination<'_>)
+            -> Result<Option<WorkspaceHostFacts>, Infallible> { unreachable!("no host allocation") }
+    }
+    #[derive(Debug)]
+    struct CutAccount(Arc<Mutex<(usize, usize)>>);
+    impl HostMetadataAccount for CutAccount {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+            let mut state = self.0.lock().unwrap();
+            let ordinal = state.0;
+            state.0 += 1;
+            if ordinal == state.1 {
+                Err(HostMetadataFundingError::Capacity { required: bytes as u64, available: 0 })
+            } else { Ok(()) }
+        }
+    }
+    fn run(cut: usize) -> (bool, usize) {
+        use crate::{Index, Tensor};
+        let state = Arc::new(Mutex::new((0, usize::MAX)));
+        let funding = HostMetadataFunding::new(CutAccount(state.clone())).unwrap();
+        let context = WorkspaceContext::new_with_metadata_funding(RangeProbe::default(), funding).unwrap();
+        let input = WorkspaceTensor::existing(context.layout(&[2, 3, 7, 4], WorkspaceDtype::Float32).unwrap(), &context).unwrap();
+        *state.lock().unwrap() = (0, cut);
+        let result = input.index(&[Index::Full, Index::Range(1, 3), Index::Range(-5, -1)], &context);
+        let accepted = result.is_ok();
+        if let Err(error) = &result {
+            assert!(matches!(error.storage, crate::ErrorStorage::WorkspaceMetadata(
+                WorkspaceMetadataError::Funding(HostMetadataFundingError::Capacity { available: 0, .. })
+            )), "cut={cut}: {error:?}");
+        }
+        let reached = state.lock().unwrap().0;
+        drop(result); drop(input); drop(context);
+        (accepted, reached)
+    }
+    let (accepted, reached) = run(usize::MAX);
+    assert!(accepted && reached > 4);
+    for cut in 0..reached {
+        assert!(!run(cut).0, "reached metadata producer {cut} ignored refusal");
+    }
 }

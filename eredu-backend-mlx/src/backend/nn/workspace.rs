@@ -39,7 +39,7 @@ pub(crate) use resident_recipe::original_component_tests::{
 pub(crate) use resident_recipe::{
     AutoregressiveEquationRecipe, AutoregressiveReadoutRecipe, EmbeddedEquationRecipe,
     IsolatedCopyNativeLayout, ResidentCompletionRecipe, ResidentNativeRecipe,
-    ParallelRecipeRecorder, ResidentRecipeRecorder, ResidentSpanRecipe, SpeculativeNumericalRecipe, CpuCaptureLoan, AddressableNumericalPopulation,
+    ParallelRecipeRecorder, ResidentRecipeRecorder, ResidentSamplingProgram, ResidentSpanRecipe, SpeculativeNumericalRecipe, CpuCaptureLoan, AddressableNumericalPopulation,
 };
 #[cfg(all(
     test,
@@ -56,6 +56,7 @@ mod host;
 mod hyper;
 mod indexing;
 mod matrix;
+mod masked_scatter;
 mod normalization;
 mod packed;
 mod pooling;
@@ -164,22 +165,7 @@ impl WorkspaceMechanisms for MlxMetalWorkspaceMechanisms {
         bank: &WorkspaceGroupedBank,
         tokens: u32,
     ) -> Result<Option<WorkspaceGroupedObservationSchedule>, Error> {
-        use super::grouped::{GROUPED_PROJECTION_CHUNK_THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS};
-        if let WorkspaceGroupedBank::GatedProduct(spec) = bank {
-            if !matches!(
-                spec.layout(),
-                eredu_nn::GatedProductGroupLayout::Packed { .. }
-            ) {
-                return Ok(None);
-            }
-            if tokens > GROUPED_PROJECTION_CHUNK_THRESHOLD as u32 {
-                return Ok(Some(WorkspaceGroupedObservationSchedule::TokenChunks(
-                    std::num::NonZeroU32::new(GROUPED_PROJECTION_CHUNK_TOKENS as u32)
-                        .expect("native grouped chunk size is positive"),
-                )));
-            }
-        }
-        Ok(Some(WorkspaceGroupedObservationSchedule::WholeBatch))
+        grouped::observation_schedule(bank, tokens)
     }
 
     fn host_workspace_bound(

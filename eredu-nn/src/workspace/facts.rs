@@ -193,7 +193,7 @@ pub trait WorkspaceFactMechanisms {
     fn with_prepared_facts<T>(
         &self,
         _operation: WorkspaceOperationView<'_>,
-        _funding: Option<&super::WorkspaceMetadataFunding>,
+        _funding: Option<&super::HostMetadataFunding>,
         visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
     ) -> Result<T, Self::Error>
     where

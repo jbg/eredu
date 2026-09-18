@@ -544,12 +544,7 @@ impl NormalizedString {
 
     /// Lowercase
     pub fn lowercase(&mut self) -> &mut Self {
-        let mut new_chars: Vec<(char, isize)> = vec![];
-        self.for_each(|c| {
-            c.to_lowercase().enumerate().for_each(|(index, c)| {
-                new_chars.push((c, isize::from(index > 0)));
-            })
-        });
+        let new_chars: Vec<_> = self.normalized.chars().flat_map(lowercase_changes).collect();
         self.transform(new_chars, 0);
         self
     }
@@ -903,6 +898,12 @@ impl NormalizedString {
         // assert_eq!(alignments_original.len(), self.original.len());
         alignments_original
     }
+}
+
+/// The ordinary lowercase scalar/change stream, also consumed by the bounded
+/// ordered normalizer. Both preserve Rust's full Unicode lowercase expansion.
+pub(crate) fn lowercase_changes(c: char) -> impl Iterator<Item = (char, isize)> {
+    c.to_lowercase().enumerate().map(|(index, c)| (c, isize::from(index > 0)))
 }
 
 /// Returns the range covered by a slice of alignments

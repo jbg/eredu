@@ -364,7 +364,7 @@ fn cold_rebind_checks_causal_declarations_even_when_group_and_unit_paths_match()
         .prefill_observation("readout.embedding")
         .is_some());
     assert!(matches!(
-        runtime.bind_observation_paths(&paths),
+        runtime.bind_observation_paths(&paths, None),
         Err(PreparedLayeredObservationError::SemanticMismatch)
     ));
 }

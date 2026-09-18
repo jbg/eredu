@@ -1,6 +1,6 @@
 //! Scoped backend context lending around the ordinary shared session driver.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Fixed rejection before a scoped parallel context is installed.
@@ -14,7 +14,7 @@ pub enum PreparedParallelContextCause {
     Unsupported,
     /// The exact scoped replacement controls did not fit their host source.
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
 }
 /// Rejection with the exact uninstalled context. No user callback has run.
 pub struct PreparedParallelContextFailure<C> {
@@ -56,16 +56,16 @@ impl<S, C> Drop for Restore<'_, S, C> {
     }
 }
 pub(super) fn with_runtime<R,C,T,F>(
-    runtime:&mut R,context:C,funding:&WorkspaceMetadataFunding,
+    runtime:&mut R,context:C,funding:&HostMetadataFunding,
     replace:fn(&mut R,C)->Result<C,C>,run:F,
 )->Result<T,PreparedParallelContextFailure<C>>
 where F:FnOnce(&mut R)->T {
     let controls=[size_of::<Restore<'_,R,C>>(),size_of::<C>(),size_of::<Option<C>>(),
         size_of::<Result<C,C>>(),size_of::<PreparedParallelContextFailure<C>>(),
         size_of::<Result<T,PreparedParallelContextFailure<C>>>(),size_of::<F>(),size_of::<T>(),
-        size_of::<(&mut R,&WorkspaceMetadataFunding,fn(&mut R,C)->Result<C,C>)>()];
+        size_of::<(&mut R,&HostMetadataFunding,fn(&mut R,C)->Result<C,C>)>()];
     if let Err(cause)=controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-        .ok_or(WorkspaceMetadataFundingError::Overflow).and_then(|n|funding.reserve_metadata(n)) {
+        .ok_or(HostMetadataFundingError::Overflow).and_then(|n|funding.reserve_metadata(n)) {
         return Err(PreparedParallelContextFailure {cause:cause.into(),context});
     }
     let previous=match replace(runtime,context) {
@@ -89,15 +89,15 @@ impl<R,C:?Sized> Drop for RestoreBorrowed<'_,R,C> {
 }
 
 pub(super) fn with_borrowed_runtime<R,C:?Sized,T,F>(
-    runtime:&mut R,context:&mut C,funding:&WorkspaceMetadataFunding,
+    runtime:&mut R,context:&mut C,funding:&HostMetadataFunding,
     exchange:fn(&mut R,&mut C)->bool,run:F,
 )->Result<T,PreparedParallelContextCause>
 where F:FnOnce(&mut R)->T {
     let controls=[size_of::<RestoreBorrowed<'_,R,C>>(),size_of::<Result<T,PreparedParallelContextCause>>(),
         size_of::<F>(),size_of::<T>(),size_of::<PreparedParallelContextCause>(),size_of::<bool>(),
-        size_of::<(&mut R,&mut C,&WorkspaceMetadataFunding,fn(&mut R,&mut C)->bool)>()];
+        size_of::<(&mut R,&mut C,&HostMetadataFunding,fn(&mut R,&mut C)->bool)>()];
     let bytes=controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-        .ok_or(WorkspaceMetadataFundingError::Overflow)?;
+        .ok_or(HostMetadataFundingError::Overflow)?;
     funding.reserve_metadata(bytes)?;
     if !exchange(runtime,context){return Err(PreparedParallelContextCause::Unsupported);}
     let guard=RestoreBorrowed{runtime,context,exchange};
@@ -122,7 +122,7 @@ where
     pub fn with_prepared_parallel_context<T, F>(
         &mut self,
         context: B::ParallelContext,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         run: F,
     ) -> Result<T, PreparedParallelContextFailure<B::ParallelContext>>
     where
@@ -133,13 +133,13 @@ where
             size_of::<PreparedParallelContextFailure<B::ParallelContext>>(),
             size_of::<Result<T, PreparedParallelContextFailure<B::ParallelContext>>>(),
             size_of::<F>(), size_of::<T>(), size_of::<PreparedParallelContextCause>(),
-            size_of::<(&mut Self, &WorkspaceMetadataFunding)>(),
+            size_of::<(&mut Self, &HostMetadataFunding)>(),
             size_of::<Result<Result<(), std::convert::Infallible>, RuntimeInspectionBoundary>>(),
         ];
         let reserve = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(WorkspaceMetadataFundingError::Overflow)
+            .ok_or(HostMetadataFundingError::Overflow)
             .and_then(|bytes| funding.reserve_metadata(bytes));
         if let Err(cause) = reserve {
             return Err(PreparedParallelContextFailure {

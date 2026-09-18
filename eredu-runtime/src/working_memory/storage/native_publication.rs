@@ -38,6 +38,8 @@ pub(in crate::working_memory) enum NativePublicationInput<K> {
     SourceInventory(K, u64),
     Native(NativeStorageWitness<K>),
     Existing(ExistingNativeAlias<K>),
+    // Positive actual-owner proof, but no claimed accounting provenance.
+    ExistingPhysical(K, u64),
     ExistingSource(NativeStorageWitness<K>),
     // Ordinary load-time source payload, already fully paid in this pool.
     // Unlike SourceInventory this can never create a row or take native credit.
@@ -58,6 +60,7 @@ impl<K> NativePublicationInput<K> {
                 witness.origin.immutable(),
                 false,
             ),
+            Self::ExistingPhysical(key, bytes) => (key, *bytes, None, true, false, false),
             Self::Existing(alias) => (&alias.key, alias.bytes, None, true, alias.immutable, false),
             Self::RegisteredSource(key, bytes) => (key, *bytes, None, true, false, true),
             Self::ExistingSource(witness) => (
@@ -81,6 +84,7 @@ struct Row<K: Ord + Send + Sync + 'static> {
     // Sticky across duplicates: even a same-key birth witness cannot replace
     // the requirement for an already registered native allocation.
     existing_only: bool,
+    existing_physical: bool,
     source_inventory: bool,
     registered_source: bool,
     immutable: bool,
@@ -251,6 +255,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
             let (key, bytes, origin, existing_only, immutable, source) = input.parts();
             let source_inventory = matches!(input, NativePublicationInput::SourceInventory(..));
             let registered_source = matches!(input, NativePublicationInput::RegisteredSource(..));
+            let existing_physical = matches!(input, NativePublicationInput::ExistingPhysical(..));
             if let Some(prior) = self.rows.iter_mut().find(|row| {
                 row.key.as_ref().expect("staged key").as_ref().cmp(key) == Ordering::Equal
             }) {
@@ -261,6 +266,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                     || prior.immutable != immutable
                     || prior.source != source
                     || prior.registered_source != registered_source
+                    || prior.existing_physical != existing_physical
                 {
                     return Err(WorkingMemoryError::IdentityMismatch);
                 }
@@ -295,6 +301,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                 key: Some(key),
                 bytes,
                 existing_only,
+                existing_physical,
                 source_inventory,
                 registered_source,
                 immutable,
@@ -411,6 +418,17 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                         || row.origin.is_some() {
                         return Err(WorkingMemoryError::IdentityMismatch);
                     }
+                } else if row.existing_physical {
+                    self.failure_site = "registry canonical physical owner";
+                    // The borrowed physical witness proves the same live owner,
+                    // not its payer. Exact capacity and origin health were checked
+                    // above. Preserve the canonical row and its full charge;
+                    // only prepaid accounting custody needs an additional alias.
+                    if let Some(canonical) = entry.prepaid.as_ref() {
+                        canonical.validate_pool(pool, &usage)?;
+                        canonical.validate_capacity(row.bytes)?;
+                        row.origin = Some(canonical.clone());
+                    }
                 } else if row.existing_only {
                     self.failure_site = "registry canonical alias kind";
                     let canonical = entry
@@ -465,6 +483,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                 if row.existing_only {
                     self.failure_site = "registry immutable alias missing";
                     if !row.immutable { self.failure_site = "registry native alias missing"; }
+                    if row.existing_physical { self.failure_site = "registry physical alias missing"; }
                     return Err(WorkingMemoryError::IdentityMismatch);
                 }
                 new_rows = new_rows
@@ -730,6 +749,8 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
         // values, not fields of the requested registry/output destinations.
         let publication_frames = [
             size_of::<Option<u64>>(),
+            size_of::<bool>(), // reached existing-physical classification
+            size_of::<Option<&PrepaidStorageOrigin>>(), // canonical accounting loan
             size_of::<Option<&funding::FundingState>>(),
             size_of::<(u64, usize, usize)>(),
             size_of::<Option<crate::working_memory::OriginalHostMetadataCustody>>(),
@@ -831,6 +852,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                     bytes,
                     immutable: true,
                 })
+            }
+            NativeStorageObservation::ExistingPhysical(key, bytes) => {
+                NativePublicationInput::ExistingPhysical(key, bytes)
             }
             NativeStorageObservation::Ordinary(key, bytes) => {
                 NativePublicationInput::Ordinary(key, bytes)

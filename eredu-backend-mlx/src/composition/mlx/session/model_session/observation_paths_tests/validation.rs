@@ -4,7 +4,7 @@ use crate::tests::support::path_instrumentation;
 
 struct Slots;
 impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadata, _: &mut crate::MlxTensor) {}
+    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut crate::MlxTensor) {}
 }
 fn binding_error(error: &Error) {
     let mut cause: &(dyn std::error::Error + 'static) = error;
@@ -63,18 +63,18 @@ fn replicated_and_composite_erasure_validate_actual_path_owner_and_stale_token_c
         first
             .executable_mut()
             .erased()
-            .validate_prepared_observation_paths(&a)
+            .validate_prepared_observation_paths(&a, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
             .unwrap();
         second
             .executable_mut()
             .erased()
-            .validate_prepared_observation_paths(&b)
+            .validate_prepared_observation_paths(&b, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
             .unwrap();
         binding_error(
             &first
                 .executable_mut()
                 .erased()
-                .validate_prepared_observation_paths(&b)
+                .validate_prepared_observation_paths(&b, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
                 .unwrap_err(),
         );
         assert_eq!(path_instrumentation::snapshot(), before);
@@ -91,7 +91,7 @@ fn replicated_and_composite_erasure_validate_actual_path_owner_and_stale_token_c
             &first
                 .executable_mut()
                 .erased()
-                .validate_prepared_observation_paths(&a)
+                .validate_prepared_observation_paths(&a, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
                 .unwrap_err(),
         );
         assert_eq!(path_instrumentation::snapshot(), stale_before);

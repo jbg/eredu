@@ -149,6 +149,14 @@ impl PreparedCpuExecution {
             .try_observe_idle()
             .map_err(MlxStreamOwnershipError::CpuWorker)
     }
+    /// The enclosing initializer and optional selected-context copy are local
+    /// wrapper owners. The process registrations retain only their independent
+    /// source stream/worker accounts after this execution owner retires.
+    #[cfg(test)]
+    pub(super) fn wrapper_control_bytes(&self) -> u64 {
+        self.0.original_bytes()
+            + self.0.output().selected.as_ref().map_or(0,InitializedSharedNative::original_bytes)
+    }
     #[cfg(test)]
     pub(super) fn original_bytes(&self) -> u64 {
         self.0.original_bytes()

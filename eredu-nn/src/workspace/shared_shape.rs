@@ -88,8 +88,8 @@ impl WorkspaceLayout {
             size_of::<TryReserveError>(),
             size_of::<(&[i32], &mut Vec<i32>, usize)>(),
             size_of::<Layout>(),
-            Error::retained_source_control_bytes::<WorkspaceLayoutError>()?
-                .max(Error::retained_source_control_bytes::<TryReserveError>()?),
+            Error::retained_source_construction_bytes::<WorkspaceLayoutError>()?
+                .max(Error::retained_source_construction_bytes::<TryReserveError>()?),
             size_of::<Error>(),
         ];
         parts

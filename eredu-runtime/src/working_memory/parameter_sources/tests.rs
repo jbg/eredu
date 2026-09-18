@@ -17,8 +17,12 @@ struct Source {
     requested: Vec<usize>,
     windows: Vec<Vec<usize>>,
     addresses: Option<Vec<ExecutionUnitAddress>>,
+    excluded: Vec<String>,
 }
 impl WorkspaceParameterRows for Source {
+    fn excludes_parameter(&self, name: &str) -> bool {
+        self.excluded.iter().any(|id| id == name)
+    }
     fn layout(&self) -> &ExecutionUnitLayout {
         &self.layout
     }
@@ -119,6 +123,7 @@ fn source() -> Source {
         requested: vec![0, 1, 2],
         windows: vec![vec![0, 1], vec![1], vec![2]],
         addresses: None,
+        excluded: Vec::new(),
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

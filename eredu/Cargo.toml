@@ -108,6 +108,11 @@ path = "tests/native_execution_control.rs"
 required-features = ["mlx"]
 
 [[test]]
+name = "prepared_chat_native"
+path = "tests/prepared_chat_native.rs"
+required-features = ["mlx"]
+
+[[test]]
 name = "automatic_planner_api"
 path = "tests/automatic_planner_api.rs"
 required-features = ["mlx"]
@@ -145,6 +150,7 @@ audio = ["eredu-architectures/audio", "eredu-backend-mlx?/audio"]
 workspace = true
 
 [dependencies]
+hashbrown = "=0.17.1"
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
 # Canonical native types for integration fixtures; enabled only with mlx.
@@ -172,3 +178,7 @@ half.workspace = true
 tempfile.workspace = true
 anyhow = "1"
 eredu-evaluation.workspace = true
+
+[[example]]
+name = "prepared_chat_generate"
+required-features = ["mlx"]

@@ -1,5 +1,6 @@
-use anyhow::{anyhow, Result};
-use regex_syntax::escape;
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
+use derivre::ParserAllocationFunding;
+use std::fmt::{self, Write};
 
 use super::schema::NumberSchema;
 
@@ -41,12 +42,10 @@ impl Decimal {
     }
 }
 
-impl TryFrom<f64> for Decimal {
-    type Error = anyhow::Error;
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
+impl Decimal {
+    pub(super) fn from_value(value: f64, funding: &ParserAllocationFunding) -> Result<Self> {
         if value < 0.0 {
-            return Err(anyhow!("Value for 'multipleOf' must be non-negative"));
+            return Err(anyhow!(funding, "Value for 'multipleOf' must be non-negative"));
         }
         let mut value = value;
         let mut exp = 0;
@@ -55,7 +54,7 @@ impl TryFrom<f64> for Decimal {
             exp += 1;
         }
         if value > u32::MAX as f64 {
-            return Err(anyhow!(
+            return Err(anyhow!(funding,
                 "Value for 'multipleOf' has too many digits: {}",
                 value
             ));
@@ -72,51 +71,66 @@ fn gcd(a: u32, b: u32) -> u32 {
     }
 }
 
-fn mk_or(parts: Vec<String>) -> String {
-    if parts.len() == 1 {
-        parts[0].clone()
-    } else {
-        format!("({})", parts.join("|"))
+fn mk_or(parts: impl IntoIterator<Item = String>, funding: &ParserAllocationFunding) -> Result<String> {
+    let mut parts = parts.into_iter();
+    let Some(mut result) = parts.next() else { return Ok(funding.try_copy_str("()")?); };
+    let Some(second) = parts.next() else { return Ok(result); };
+    result = funding.try_format(format_args!("({result}|{second}"))?;
+    for part in parts {
+        funding.try_push_str(&mut result, "|")?;
+        funding.try_push_str(&mut result, &part)?;
+    }
+    funding.try_push_str(&mut result, ")")?;
+    Ok(result)
+}
+
+struct Escaped<'a>(&'a str);
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for ch in self.0.chars() {
+            if regex_syntax::is_meta_character(ch) { output.write_char('\\')?; }
+            output.write_char(ch)?;
+        }
+        Ok(())
     }
 }
 
 fn num_digits(n: i64) -> usize {
-    n.abs().to_string().len()
+    n.unsigned_abs().checked_ilog10().unwrap_or(0) as usize + 1
 }
 
-pub fn rx_int_range(left: Option<i64>, right: Option<i64>) -> Result<String> {
+pub fn rx_int_range(left: Option<i64>, right: Option<i64>, funding: &ParserAllocationFunding) -> Result<String> {
     match (left, right) {
-        (None, None) => Ok("-?(0|[1-9][0-9]*)".to_string()),
+        (None, None) => Ok(funding.try_copy_str("-?(0|[1-9][0-9]*)")?),
         (Some(left), None) => {
             if left < 0 {
-                Ok(mk_or(vec![
-                    rx_int_range(Some(left), Some(-1))?,
-                    rx_int_range(Some(0), None)?,
-                ]))
+                Ok(mk_or([
+                    rx_int_range(Some(left), Some(-1), funding)?,
+                    rx_int_range(Some(0), None, funding)?,
+                ], funding)?)
             } else {
-                let max_value = "9"
-                    .repeat(num_digits(left))
+                let max_value = "9999999999999999999"[..num_digits(left)]
                     .parse::<i64>()
-                    .map_err(|e| anyhow!("Failed to parse max value for left {}: {}", left, e))?;
-                Ok(mk_or(vec![
-                    rx_int_range(Some(left), Some(max_value))?,
-                    format!("[1-9][0-9]{{{},}}", num_digits(left)),
-                ]))
+                    .map_err(|e| anyhow!(funding, "Failed to parse max value for left {}: {}", left, e))?;
+                Ok(mk_or([
+                    rx_int_range(Some(left), Some(max_value), funding)?,
+                    funding.try_format(format_args!("[1-9][0-9]{{{},}}", num_digits(left)))?,
+                ], funding)?)
             }
         }
         (None, Some(right)) => {
             if right >= 0 {
-                Ok(mk_or(vec![
-                    rx_int_range(Some(0), Some(right))?,
-                    rx_int_range(None, Some(-1))?,
-                ]))
+                Ok(mk_or([
+                    rx_int_range(Some(0), Some(right), funding)?,
+                    rx_int_range(None, Some(-1), funding)?,
+                ], funding)?)
             } else {
-                Ok(format!("-{}", rx_int_range(Some(-right), None)?))
+                Ok(funding.try_format(format_args!("-{}", rx_int_range(Some(-right), None, funding)?))?)
             }
         }
         (Some(left), Some(right)) => {
             if left > right {
-                return Err(anyhow!(
+                return Err(anyhow!(funding,
                     "Invalid range: left ({}) cannot be greater than right ({})",
                     left,
                     right
@@ -124,19 +138,19 @@ pub fn rx_int_range(left: Option<i64>, right: Option<i64>) -> Result<String> {
             }
             if left < 0 {
                 if right < 0 {
-                    Ok(format!("(-{})", rx_int_range(Some(-right), Some(-left))?))
+                    Ok(funding.try_format(format_args!("(-{})", rx_int_range(Some(-right), Some(-left), funding)?))?)
                 } else {
-                    Ok(format!(
+                    Ok(funding.try_format(format_args!(
                         "(-{}|{})",
-                        rx_int_range(Some(0), Some(-left))?,
-                        rx_int_range(Some(0), Some(right))?
-                    ))
+                        rx_int_range(Some(0), Some(-left), funding)?,
+                        rx_int_range(Some(0), Some(right), funding)?
+                    ))?)
                 }
             } else if num_digits(left) == num_digits(right) {
-                let l = left.to_string();
-                let r = right.to_string();
+                let l = funding.try_format(format_args!("{left}"))?;
+                let r = funding.try_format(format_args!("{right}"))?;
                 if left == right {
-                    return Ok(format!("({l})"));
+                    return Ok(funding.try_format(format_args!("({l})"))?);
                 }
 
                 let lpref = &l[..l.len() - 1];
@@ -145,13 +159,13 @@ pub fn rx_int_range(left: Option<i64>, right: Option<i64>) -> Result<String> {
                 let rx = &r[r.len() - 1..];
 
                 if lpref == rpref {
-                    return Ok(format!("({lpref}[{lx}-{rx}])"));
+                    return Ok(funding.try_format(format_args!("({lpref}[{lx}-{rx}])"))?);
                 }
 
                 let mut left_rec = lpref.parse::<i64>().unwrap_or(0);
                 let mut right_rec = rpref.parse::<i64>().unwrap_or(0);
                 if left_rec >= right_rec {
-                    return Err(anyhow!(
+                    return Err(anyhow!(funding,
                         "Invalid recursive range: left_rec ({}) must be less than right_rec ({})",
                         left_rec,
                         right_rec
@@ -162,132 +176,135 @@ pub fn rx_int_range(left: Option<i64>, right: Option<i64>) -> Result<String> {
 
                 if lx != "0" {
                     left_rec += 1;
-                    parts.push(format!("{lpref}[{lx}-9]"));
+                    funding.try_push(&mut parts, funding.try_format(format_args!("{lpref}[{lx}-9]"))?)?;
                 }
 
                 if rx != "9" {
                     right_rec -= 1;
-                    parts.push(format!("{rpref}[0-{rx}]"));
+                    funding.try_push(&mut parts, funding.try_format(format_args!("{rpref}[0-{rx}]"))?)?;
                 }
 
                 if left_rec <= right_rec {
-                    let inner = rx_int_range(Some(left_rec), Some(right_rec))?;
-                    parts.push(format!("{inner}[0-9]"));
+                    let inner = rx_int_range(Some(left_rec), Some(right_rec), funding)?;
+                    funding.try_push(&mut parts, funding.try_format(format_args!("{inner}[0-9]"))?)?;
                 }
 
-                Ok(mk_or(parts))
+                Ok(mk_or(parts, funding)?)
             } else {
                 let break_point = 10_i64
                     .checked_pow(num_digits(left) as u32)
-                    .ok_or_else(|| anyhow!("Overflow when calculating break point"))?
+                    .ok_or_else(|| anyhow!(funding, "Overflow when calculating break point"))?
                     - 1;
-                Ok(mk_or(vec![
-                    rx_int_range(Some(left), Some(break_point))?,
-                    rx_int_range(Some(break_point + 1), Some(right))?,
-                ]))
+                Ok(mk_or([
+                    rx_int_range(Some(left), Some(break_point), funding)?,
+                    rx_int_range(Some(break_point + 1), Some(right), funding)?,
+                ], funding)?)
             }
         }
     }
 }
 
-fn lexi_x_to_9(x: &str, incl: bool) -> Result<String> {
+fn lexi_x_to_9(x: &str, incl: bool, funding: &ParserAllocationFunding) -> Result<String> {
     if incl {
         if x.is_empty() {
-            Ok("[0-9]*".to_string())
+            Ok(funding.try_copy_str("[0-9]*")?)
         } else if x.len() == 1 {
-            Ok(format!("[{x}-9][0-9]*"))
+            Ok(funding.try_format(format_args!("[{x}-9][0-9]*"))?)
         } else {
             let x0 = x
                 .chars()
                 .next()
-                .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?
+                .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?
                 .to_digit(10)
-                .ok_or_else(|| anyhow!("Failed to parse character as digit"))?;
+                .ok_or_else(|| anyhow!(funding, "Failed to parse character as digit"))?;
             let x_rest = &x[1..];
-            let mut parts = vec![format!(
+            let mut parts = Vec::new();
+            funding.try_push(&mut parts, funding.try_format(format_args!(
                 "{}{}",
                 x.chars()
                     .next()
-                    .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?,
-                lexi_x_to_9(x_rest, incl)?
-            )];
+                    .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?,
+                lexi_x_to_9(x_rest, incl, funding)?
+            ))?)?;
             if x0 < 9 {
-                parts.push(format!("[{}-9][0-9]*", x0 + 1));
+                funding.try_push(&mut parts, funding.try_format(format_args!("[{}-9][0-9]*", x0 + 1))?)?;
             }
-            Ok(mk_or(parts))
+            Ok(mk_or(parts, funding)?)
         }
     } else if x.is_empty() {
-        Ok("[0-9]*[1-9]".to_string())
+        Ok(funding.try_copy_str("[0-9]*[1-9]")?)
     } else {
         let x0 = x
             .chars()
             .next()
-            .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?
+            .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?
             .to_digit(10)
-            .ok_or_else(|| anyhow!("Failed to parse character as digit"))?;
+            .ok_or_else(|| anyhow!(funding, "Failed to parse character as digit"))?;
         let x_rest = &x[1..];
-        let mut parts = vec![format!(
+        let mut parts = Vec::new();
+            funding.try_push(&mut parts, funding.try_format(format_args!(
             "{}{}",
             x.chars()
                 .next()
-                .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?,
-            lexi_x_to_9(x_rest, incl)?
-        )];
+                .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?,
+            lexi_x_to_9(x_rest, incl, funding)?
+        ))?)?;
         if x0 < 9 {
-            parts.push(format!("[{}-9][0-9]*", x0 + 1));
+            funding.try_push(&mut parts, funding.try_format(format_args!("[{}-9][0-9]*", x0 + 1))?)?;
         }
-        Ok(mk_or(parts))
+        Ok(mk_or(parts, funding)?)
     }
 }
 
-fn lexi_0_to_x(x: &str, incl: bool) -> Result<String> {
+fn lexi_0_to_x(x: &str, incl: bool, funding: &ParserAllocationFunding) -> Result<String> {
     if x.is_empty() {
         if incl {
-            Ok("".to_string())
+            Ok(funding.try_copy_str("")?)
         } else {
-            Err(anyhow!("Inclusive flag must be true for an empty string"))
+            Err(anyhow!(funding, "Inclusive flag must be true for an empty string"))
         }
     } else {
         let x0 = x
             .chars()
             .next()
-            .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?
+            .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?
             .to_digit(10)
-            .ok_or_else(|| anyhow!("Failed to parse character as digit"))?;
+            .ok_or_else(|| anyhow!(funding, "Failed to parse character as digit"))?;
         let x_rest = &x[1..];
 
         if !incl && x.len() == 1 {
             if x0 == 0 {
-                return Err(anyhow!(
+                return Err(anyhow!(funding,
                     "x0 must be greater than 0 for non-inclusive single character"
                 ));
             }
-            return Ok(format!("[0-{}][0-9]*", x0 - 1));
+            return Ok(funding.try_format(format_args!("[0-{}][0-9]*", x0 - 1))?);
         }
 
-        let mut parts = vec![format!(
+        let mut parts = Vec::new();
+            funding.try_push(&mut parts, funding.try_format(format_args!(
             "{}{}",
             x.chars()
                 .next()
-                .ok_or_else(|| anyhow!("String x is unexpectedly empty"))?,
-            lexi_0_to_x(x_rest, incl)?
-        )];
+                .ok_or_else(|| anyhow!(funding, "String x is unexpectedly empty"))?,
+            lexi_0_to_x(x_rest, incl, funding)?
+        ))?)?;
         if x0 > 0 {
-            parts.push(format!("[0-{}][0-9]*", x0 - 1));
+            funding.try_push(&mut parts, funding.try_format(format_args!("[0-{}][0-9]*", x0 - 1))?)?;
         }
-        Ok(mk_or(parts))
+        Ok(mk_or(parts, funding)?)
     }
 }
 
-fn lexi_range(ld: &str, rd: &str, ld_incl: bool, rd_incl: bool) -> Result<String> {
+fn lexi_range(ld: &str, rd: &str, ld_incl: bool, rd_incl: bool, funding: &ParserAllocationFunding) -> Result<String> {
     if ld.len() != rd.len() {
-        return Err(anyhow!("ld and rd must have the same length"));
+        return Err(anyhow!(funding, "ld and rd must have the same length"));
     }
     if ld == rd {
         if ld_incl && rd_incl {
-            Ok(ld.to_string())
+            Ok(funding.try_format(format_args!("{ld}"))?)
         } else {
-            Err(anyhow!(
+            Err(anyhow!(funding,
                 "Empty range when ld equals rd and not both inclusive"
             ))
         }
@@ -295,57 +312,58 @@ fn lexi_range(ld: &str, rd: &str, ld_incl: bool, rd_incl: bool) -> Result<String
         let l0 = ld
             .chars()
             .next()
-            .ok_or_else(|| anyhow!("ld is unexpectedly empty"))?
+            .ok_or_else(|| anyhow!(funding, "ld is unexpectedly empty"))?
             .to_digit(10)
-            .ok_or_else(|| anyhow!("Failed to parse character as digit"))?;
+            .ok_or_else(|| anyhow!(funding, "Failed to parse character as digit"))?;
         let r0 = rd
             .chars()
             .next()
-            .ok_or_else(|| anyhow!("rd is unexpectedly empty"))?
+            .ok_or_else(|| anyhow!(funding, "rd is unexpectedly empty"))?
             .to_digit(10)
-            .ok_or_else(|| anyhow!("Failed to parse character as digit"))?;
+            .ok_or_else(|| anyhow!(funding, "Failed to parse character as digit"))?;
         if l0 == r0 {
             let ld_rest = &ld[1..];
             let rd_rest = &rd[1..];
-            Ok(format!(
+            Ok(funding.try_format(format_args!(
                 "{}{}",
                 ld.chars()
                     .next()
-                    .ok_or_else(|| anyhow!("ld is unexpectedly empty"))?,
-                lexi_range(ld_rest, rd_rest, ld_incl, rd_incl)?
-            ))
+                    .ok_or_else(|| anyhow!(funding, "ld is unexpectedly empty"))?,
+                lexi_range(ld_rest, rd_rest, ld_incl, rd_incl, funding)?
+            ))?)
         } else {
             if l0 >= r0 {
-                return Err(anyhow!("l0 must be less than r0"));
+                return Err(anyhow!(funding, "l0 must be less than r0"));
             }
             let ld_rest = ld[1..].trim_end_matches('0');
-            let mut parts = vec![format!(
+            let mut parts = Vec::new();
+            funding.try_push(&mut parts, funding.try_format(format_args!(
                 "{}{}",
                 ld.chars()
                     .next()
-                    .ok_or_else(|| anyhow!("ld is unexpectedly empty"))?,
-                lexi_x_to_9(ld_rest, ld_incl)?
-            )];
+                    .ok_or_else(|| anyhow!(funding, "ld is unexpectedly empty"))?,
+                lexi_x_to_9(ld_rest, ld_incl, funding)?
+            ))?)?;
             if l0 + 1 < r0 {
-                parts.push(format!("[{}-{}][0-9]*", l0 + 1, r0 - 1));
+                funding.try_push(&mut parts, funding.try_format(format_args!("[{}-{}][0-9]*", l0 + 1, r0 - 1))?)?;
             }
             let rd_rest = rd[1..].trim_end_matches('0');
             if !rd_rest.is_empty() || rd_incl {
-                parts.push(format!(
+                funding.try_push(&mut parts, funding.try_format(format_args!(
                     "{}{}",
                     rd.chars()
                         .next()
-                        .ok_or_else(|| anyhow!("rd is unexpectedly empty"))?,
-                    lexi_0_to_x(rd_rest, rd_incl)?
-                ));
+                        .ok_or_else(|| anyhow!(funding, "rd is unexpectedly empty"))?,
+                    lexi_0_to_x(rd_rest, rd_incl, funding)?
+                ))?)?;
             }
-            Ok(mk_or(parts))
+            Ok(mk_or(parts, funding)?)
         }
     }
 }
 
-fn float_to_str(f: f64) -> String {
-    format!("{f}")
+fn float_to_str(f: f64, funding: &ParserAllocationFunding) -> Result<String> {
+    Ok(funding.try_format(format_args!("{f}"))?)
 }
 
 pub fn rx_float_range(
@@ -353,51 +371,51 @@ pub fn rx_float_range(
     right: Option<f64>,
     left_inclusive: bool,
     right_inclusive: bool,
-) -> Result<String> {
+ funding: &ParserAllocationFunding) -> Result<String> {
     match (left, right) {
-        (None, None) => Ok("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?".to_string()),
+        (None, None) => Ok(funding.try_copy_str("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")?),
         (Some(left), None) => {
             if left < 0.0 {
-                Ok(mk_or(vec![
-                    rx_float_range(Some(left), Some(0.0), left_inclusive, false)?,
-                    rx_float_range(Some(0.0), None, true, false)?,
-                ]))
+                Ok(mk_or([
+                    rx_float_range(Some(left), Some(0.0), left_inclusive, false, funding)?,
+                    rx_float_range(Some(0.0), None, true, false, funding)?,
+                ], funding)?)
             } else {
                 let left_int_part = left as i64;
-                Ok(mk_or(vec![
+                Ok(mk_or([
                     rx_float_range(
                         Some(left),
                         Some(10f64.powi(num_digits(left_int_part) as i32)),
                         left_inclusive,
                         false,
-                    )?,
-                    format!("[1-9][0-9]{{{},}}(\\.[0-9]+)?", num_digits(left_int_part)),
-                ]))
+                     funding)?,
+                    funding.try_format(format_args!("[1-9][0-9]{{{},}}(\\.[0-9]+)?", num_digits(left_int_part)))?,
+                ], funding)?)
             }
         }
         (None, Some(right)) => {
             if right == 0.0 {
-                let r = format!("-{}", rx_float_range(Some(0.0), None, false, false)?);
+                let r = funding.try_format(format_args!("-{}", rx_float_range(Some(0.0), None, false, false, funding)?))?;
                 if right_inclusive {
-                    Ok(mk_or(vec![r, "0".to_string()]))
+                    Ok(mk_or([r, funding.try_copy_str("0")?], funding)?)
                 } else {
                     Ok(r)
                 }
             } else if right > 0.0 {
-                Ok(mk_or(vec![
-                    format!("-{}", rx_float_range(Some(0.0), None, false, false)?),
-                    rx_float_range(Some(0.0), Some(right), true, right_inclusive)?,
-                ]))
+                Ok(mk_or([
+                    funding.try_format(format_args!("-{}", rx_float_range(Some(0.0), None, false, false, funding)?))?,
+                    rx_float_range(Some(0.0), Some(right), true, right_inclusive, funding)?,
+                ], funding)?)
             } else {
-                Ok(format!(
+                Ok(funding.try_format(format_args!(
                     "-{}",
-                    rx_float_range(Some(-right), None, right_inclusive, false)?
-                ))
+                    rx_float_range(Some(-right), None, right_inclusive, false, funding)?
+                ))?)
             }
         }
         (Some(left), Some(right)) => {
             if left > right {
-                return Err(anyhow!(
+                return Err(anyhow!(funding,
                     "Invalid range: left ({}) cannot be greater than right ({})",
                     left,
                     right
@@ -405,108 +423,108 @@ pub fn rx_float_range(
             }
             if left == right {
                 if left_inclusive && right_inclusive {
-                    Ok(format!("({})", escape(&float_to_str(left))))
+                    Ok(funding.try_format(format_args!("({})", Escaped(&float_to_str(left, funding)?)))?)
                 } else {
-                    Err(anyhow!(
+                    Err(anyhow!(funding,
                         "Empty range when left equals right and not both inclusive"
                     ))
                 }
             } else if left < 0.0 {
                 if right < 0.0 {
-                    Ok(format!(
+                    Ok(funding.try_format(format_args!(
                         "(-{})",
-                        rx_float_range(Some(-right), Some(-left), right_inclusive, left_inclusive)?
-                    ))
+                        rx_float_range(Some(-right), Some(-left), right_inclusive, left_inclusive, funding)?
+                    ))?)
                 } else {
-                    let mut parts = vec![];
-                    let neg_part = rx_float_range(Some(0.0), Some(-left), false, left_inclusive)?;
-                    parts.push(format!("(-{neg_part})"));
+                    let mut parts = Vec::new();
+                    let neg_part = rx_float_range(Some(0.0), Some(-left), false, left_inclusive, funding)?;
+                    funding.try_push(&mut parts, funding.try_format(format_args!("(-{neg_part})"))?)?;
 
                     if right > 0.0 || right_inclusive {
                         let pos_part =
-                            rx_float_range(Some(0.0), Some(right), true, right_inclusive)?;
-                        parts.push(pos_part);
+                            rx_float_range(Some(0.0), Some(right), true, right_inclusive, funding)?;
+                        funding.try_push(&mut parts, pos_part)?;
                     }
-                    Ok(mk_or(parts))
+                    Ok(mk_or(parts, funding)?)
                 }
             } else {
-                let l = float_to_str(left);
-                let r = float_to_str(right);
+                let l = float_to_str(left, funding)?;
+                let r = float_to_str(right, funding)?;
                 if l == r {
-                    return Err(anyhow!(
+                    return Err(anyhow!(funding,
                         "Unexpected equality of left and right string representations"
                     ));
                 }
                 if !left.is_finite() || !right.is_finite() {
-                    return Err(anyhow!("Infinite numbers not supported"));
+                    return Err(anyhow!(funding, "Infinite numbers not supported"));
                 }
 
                 let mut left_rec: i64 = l
                     .split('.')
                     .next()
-                    .ok_or_else(|| anyhow!("Failed to split left integer part"))?
+                    .ok_or_else(|| anyhow!(funding, "Failed to split left integer part"))?
                     .parse()
-                    .map_err(|e| anyhow!("Failed to parse left integer part: {}", e))?;
+                    .map_err(|e| anyhow!(funding, "Failed to parse left integer part: {}", e))?;
                 let right_rec: i64 = r
                     .split('.')
                     .next()
-                    .ok_or_else(|| anyhow!("Failed to split right integer part"))?
+                    .ok_or_else(|| anyhow!(funding, "Failed to split right integer part"))?
                     .parse()
-                    .map_err(|e| anyhow!("Failed to parse right integer part: {}", e))?;
+                    .map_err(|e| anyhow!(funding, "Failed to parse right integer part: {}", e))?;
 
-                let mut ld = l.split('.').nth(1).unwrap_or("").to_string();
-                let mut rd = r.split('.').nth(1).unwrap_or("").to_string();
+                let mut ld = funding.try_copy_str(l.split('.').nth(1).unwrap_or(""))?;
+                let mut rd = funding.try_copy_str(r.split('.').nth(1).unwrap_or(""))?;
 
                 if left_rec == right_rec {
                     while ld.len() < rd.len() {
-                        ld.push('0');
+                        funding.try_push_char(&mut ld, '0')?;
                     }
                     while rd.len() < ld.len() {
-                        rd.push('0');
+                        funding.try_push_char(&mut rd, '0')?;
                     }
-                    let suff = format!(
+                    let suff = funding.try_format(format_args!(
                         "\\.{}",
-                        lexi_range(&ld, &rd, left_inclusive, right_inclusive)?
-                    );
+                        lexi_range(&ld, &rd, left_inclusive, right_inclusive, funding)?
+                    ))?;
                     if ld.parse::<i64>().unwrap_or(0) == 0 {
-                        Ok(format!("({left_rec}({suff})?)"))
+                        Ok(funding.try_format(format_args!("({left_rec}({suff})?)"))?)
                     } else {
-                        Ok(format!("({left_rec}{suff})"))
+                        Ok(funding.try_format(format_args!("({left_rec}{suff})"))?)
                     }
                 } else {
-                    let mut parts = vec![];
+                    let mut parts = Vec::new();
                     if !ld.is_empty() || !left_inclusive {
-                        parts.push(format!(
+                        funding.try_push(&mut parts, funding.try_format(format_args!(
                             "({}\\.{})",
                             left_rec,
-                            lexi_x_to_9(&ld, left_inclusive)?
-                        ));
+                            lexi_x_to_9(&ld, left_inclusive, funding)?
+                        ))?)?;
                         left_rec += 1;
                     }
 
                     if right_rec > left_rec {
-                        let inner = rx_int_range(Some(left_rec), Some(right_rec - 1))?;
-                        parts.push(format!("({inner}(\\.[0-9]+)?)"));
+                        let inner = rx_int_range(Some(left_rec), Some(right_rec - 1), funding)?;
+                        funding.try_push(&mut parts, funding.try_format(format_args!("({inner}(\\.[0-9]+)?)"))?)?;
                     }
 
                     if !rd.is_empty() {
-                        parts.push(format!(
+                        funding.try_push(&mut parts, funding.try_format(format_args!(
                             "({}(\\.{})?)",
                             right_rec,
-                            lexi_0_to_x(&rd, right_inclusive)?
-                        ));
+                            lexi_0_to_x(&rd, right_inclusive, funding)?
+                        ))?)?;
                     } else if right_inclusive {
-                        parts.push(format!("{right_rec}(\\.0+)?"));
+                        funding.try_push(&mut parts, funding.try_format(format_args!("{right_rec}(\\.0+)?"))?)?;
                     }
 
-                    Ok(mk_or(parts))
+                    Ok(mk_or(parts, funding)?)
                 }
             }
         }
     }
 }
 
-pub fn check_number_bounds(num: &NumberSchema) -> Result<(), String> {
+pub fn check_number_bounds(num: &NumberSchema, funding: &ParserAllocationFunding) -> Result<Option<String>> {
     let (minimum, exclusive_minimum) = num.get_minimum();
     let (maximum, exclusive_maximum) = num.get_maximum();
     if let (Some(min), Some(max)) = (minimum, maximum) {
@@ -521,33 +539,33 @@ pub fn check_number_bounds(num: &NumberSchema) -> Result<(), String> {
             "maximum"
         };
         if min > max {
-            return Err(format!(
+            return Ok(Some(funding.try_format(format_args!(
                 "{minimum_repr} ({min}) is greater than {maximum_repr} ({max})"
-            ));
+            ))?));
         }
         if min == max && (exclusive_minimum || exclusive_maximum) {
-            return Err(format!(
+            return Ok(Some(funding.try_format(format_args!(
                 "{minimum_repr} ({min}) is equal to {maximum_repr} ({max})"
-            ));
+            ))?));
         }
     }
     if let Some(d) = num.multiple_of.as_ref() {
         if d.coef == 0 {
             if let Some(min) = minimum {
                 if min > 0.0 || (exclusive_minimum && min >= 0.0) {
-                    return Err(format!(
+                    return Ok(Some(funding.try_format(format_args!(
                         "minimum ({min}) is greater than 0, but multipleOf is 0"
-                    ));
+                    ))?));
                 }
             };
             if let Some(max) = maximum {
                 if max < 0.0 || (exclusive_maximum && max <= 0.0) {
-                    return Err(format!(
+                    return Ok(Some(funding.try_format(format_args!(
                         "maximum ({max}) is less than 0, but multipleOf is 0"
-                    ));
+                    ))?));
                 }
             };
-            return Ok(());
+            return Ok(None);
         }
         // If interval is not unbounded in at least one direction, check if the range contains a multiple of multipleOf
         if let (Some(min), Some(max)) = (minimum, maximum) {
@@ -580,18 +598,24 @@ pub fn check_number_bounds(num: &NumberSchema) -> Result<(), String> {
                 }
             };
             if min > max {
-                return Err(format!(
+                return Ok(Some(funding.try_format(format_args!(
                     "range {}{}, {}{} does not contain a multiple of {}",
                     if exclusive_minimum { "(" } else { "[" },
                     min,
                     max,
                     if exclusive_maximum { ")" } else { "]" },
                     step
-                ));
+                ))?));
             }
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+#[cfg(test)]
+impl TryFrom<f64> for Decimal {
+    type Error = derivre::ParserError;
+    fn try_from(value: f64) -> Result<Self> { Self::from_value(value, &ParserAllocationFunding::unenforced()) }
 }
 
 #[cfg(test)]
@@ -662,7 +686,7 @@ mod test_ranges {
         ];
 
         for (left, right) in cases {
-            let rx = rx_int_range(left, right).unwrap();
+            let rx = rx_int_range(left, right, &derivre::ParserAllocationFunding::unenforced()).unwrap();
             do_test_int_range(&rx, left, right);
         }
     }
@@ -792,11 +816,11 @@ mod test_ranges {
                                 Some(right),
                                 *left_inclusive,
                                 *right_inclusive
-                            )
+                            , &derivre::ParserAllocationFunding::unenforced())
                             .is_err());
                         }
                         _ => {
-                            let rx = rx_float_range(left, right, *left_inclusive, *right_inclusive)
+                            let rx = rx_float_range(left, right, *left_inclusive, *right_inclusive, &derivre::ParserAllocationFunding::unenforced())
                                 .unwrap();
                             do_test_float_range(
                                 &rx,
@@ -1166,9 +1190,9 @@ mod test_number_bounds {
             },
         ];
         for case in cases {
-            let result = check_number_bounds(&case.to_number_schema());
+            let result = check_number_bounds(&case.to_number_schema(), &derivre::ParserAllocationFunding::unenforced());
             assert_eq!(
-                result.is_ok(),
+                result.as_ref().unwrap().is_none(),
                 case.ok,
                 "Failed for case {case:?} with result {result:?}"
             );

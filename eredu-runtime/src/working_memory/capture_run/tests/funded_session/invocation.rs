@@ -76,7 +76,7 @@ fn explicit_original_invocation_preserves_phase_shape_scope_and_single_use() {
         }
     ));
 
-    let mut ordinary = CaptureSession::from_shared_plan(source.clone());
+    let mut ordinary = CaptureSession::new(source.clone());
     let mut ordinary_backend = Backend::default();
     ordinary
         .begin_invocation(
@@ -374,7 +374,7 @@ fn original_window_claims_match_ordinary_global_slices_and_empty_fragment_delive
             .unwrap()
             .unwrap();
         let actual = funded.take_shared_step().unwrap().unwrap();
-        let mut ordinary = CaptureSession::from_shared_plan(source.clone());
+        let mut ordinary = CaptureSession::new(source.clone());
         let mut oracle = WindowBackend::default();
         ordinary
             .begin_invocation_window(

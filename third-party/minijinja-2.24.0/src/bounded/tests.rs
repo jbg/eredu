@@ -37,7 +37,7 @@ fn exact_source_settings_name_and_real_source_reserve_prefixes() {
     ));
     let source = CompilePlan::prepare(
         recipe::SOURCE,
-        TemplateName::Default("chat.html"),
+        TemplateName::Named { model: "chat.html", entry: "default" },
         TemplateSettings::text_chat(),
     )
     .unwrap()

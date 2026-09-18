@@ -83,7 +83,7 @@ impl SpeculativeNumericalRecipe {
         },ordinary,cpu,context)?;
         let reduced=recorder.reduce_trace(report,None,0,outputs)?;
         if reduced.first_missing_operation.is_some()||reduced.unqualified_kernel_owner.is_some()
-            ||reduced.validation_roots!=0||reduced.nested_completions!=0{
+            ||reduced.validation_roots!=0{
             return Err(context.metadata_error(format_args!(
                 "CPU numerical equation source is incomplete: operation {:?}; producer {:?}; kernel {:?}; validation roots {}; nested completions {}",
                 reduced.first_missing_operation,reduced.missing_operation_detail,
@@ -95,8 +95,12 @@ impl SpeculativeNumericalRecipe {
         let graph_source=reduced.graph.ok_or_else(invalid)?;
         let (traversal,dispatch,frontier_controls)=super::super::capture::extend_frontier(
             reduced.traversal.ok_or_else(invalid)?,graph_source,dispatch,roots).ok_or_else(invalid)?;
+        // Internal equation completions (including each paged accumulator
+        // pass) remain real occurrences beside the caller's capture reads.
+        let nested = reduced.nested_completions.checked_add(nested).ok_or_else(invalid)?;
         let completion=ResidentCompletionRecipe{validation_roots:0,grouped_outputs:reduced.grouped_outputs,
-            traversal,graph:graph_source,dispatch:Some(dispatch),nested_completions:nested,nested_root_capacity:1};
+            traversal,graph:graph_source,dispatch:Some(dispatch),nested_completions:nested,
+            nested_root_capacity:reduced.nested_root_capacity.max(1)};
         let graph=graph_capacity::ResidentGraphStorage::for_completion(completion).ok_or_else(invalid)?;
         let record=record_capacity::ResidentRecordStorage::for_completion(completion).ok_or_else(invalid)?;
         let frames=[size_of::<(&WorkspaceTraceReport,usize,usize,usize,MlxMetalWorkspaceMechanisms,MlxCpuWorkspaceMechanisms,&WorkspaceContext)>(),
@@ -105,7 +109,7 @@ impl SpeculativeNumericalRecipe {
             size_of::<(safemlx::OperationEvalTraversalLayout,ResidentDispatchPopulation,usize)>(),
             size_of::<ResidentCompletionRecipe>(),size_of::<graph_capacity::ResidentGraphStorage>(),
             size_of::<record_capacity::ResidentRecordStorage>(),size_of::<Result<Self,Error>>(),size_of::<Self>(),
-            size_of::<Option<usize>>(),CpuCaptureLoan::control_bytes().ok_or_else(invalid)?,
+            size_of::<Option<usize>>(),size_of::<usize>(),CpuCaptureLoan::control_bytes().ok_or_else(invalid)?,
             // The public constructor's argument/result transport remains live
             // while this shared reducer computes the actual source.
             size_of::<(&WorkspaceTraceReport,usize,usize,usize,MlxMetalWorkspaceMechanisms,MlxCpuWorkspaceMechanisms,&WorkspaceContext)>(),

@@ -1,6 +1,8 @@
 //! Residual admission bound to already registered physical storage.
 
 mod copy_preparation;
+mod diagnostics;
+use diagnostics::QuoteDiagnostics;
 mod span_workspace;
 pub(in crate::working_memory) use span_workspace::OriginalTokenDomainBinding;
 pub(super) use span_workspace::SpanWorkspaceIdentity;
@@ -8,6 +10,7 @@ use span_workspace::SpanWorkspaceSeal;
 pub(in crate::working_memory) use span_workspace::TextControlBinding;
 pub use span_workspace::{
     AdmittedCaptureContinuation, AdmittedPrefillCapture, AggregateGenerationDecoderInput,
+    SamplingExtensionQuote, OriginalTextSamplingExtension,
     FailedCapturePlanPublication, GraphMetadataFacts, HostDestinationCause, HostDestinationFacts,
     HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, InferenceSpanWorkspace, LoadedGenerationDecoderInput,
     NativeStorageError, NativeStorageObservation, NativeStorageRegistration,
@@ -82,7 +85,7 @@ pub(super) enum RegisteredStoragePin {
 pub(super) struct PlanningStoragePins(Option<Arc<PlanningPinGroup>>);
 struct PlanningPinGroup {
     pin: RegisteredStoragePin,
-    _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    _funding: eredu_nn::workspace::HostMetadataFunding,
 }
 impl Clone for PlanningStoragePins {
     fn clone(&self) -> Self {
@@ -264,7 +267,7 @@ impl IncompleteWorkspace {
 /// construct this value. It cannot authorize a scalar discount of a peak.
 #[derive(Debug, Clone)]
 pub struct IncrementalInferenceQuote {
-    state: RuntimeStateEstimate,
+    state: QuoteDiagnostics,
     geometry: InferenceGeometry,
     incremental_bytes: u64,
     // Exact new equation peak composed above the registered opening sources.
@@ -334,7 +337,7 @@ impl IncrementalInferenceQuote {
         let incremental_bytes =
             full_requirement_with(&incremental, equations.geometry(), contribution.pool())?;
         Ok(Self {
-            state,
+            state: QuoteDiagnostics::new(state, metadata)?,
             geometry: equations.geometry(),
             incremental_bytes,
             equation_incremental_bytes: None,
@@ -349,7 +352,7 @@ impl IncrementalInferenceQuote {
 
     /// Existing host planning account for counted reservation metadata only.
     /// This closed clone creates neither source credit nor native permission.
-    pub(crate) fn metadata_funding(&self) -> Option<eredu_nn::workspace::WorkspaceMetadataFunding> {
+    pub(crate) fn metadata_funding(&self) -> Option<eredu_nn::workspace::HostMetadataFunding> {
         self.span_workspace.plan().metadata_funding()
     }
 
@@ -387,7 +390,7 @@ impl IncrementalInferenceQuote {
         capacity: u64,
         handoffs: &[WorkingMemoryCapacityHandoff],
     ) -> Result<WorkingMemoryReservation, WorkingMemoryError> {
-        if !pool.same_domain(&self.pool) || admission.state != self.state {
+        if !pool.same_domain(&self.pool) || admission.state != *self.state {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         // An empty accounting aggregate still marks this sealed route as needing
@@ -696,7 +699,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> ResidualInferenceQuote<K> {
         };
         Ok(Self {
             proof: IncrementalInferenceQuote {
-                state,
+                state: QuoteDiagnostics::new(state, metadata)?,
                 geometry: equations.geometry(),
                 incremental_bytes,
                 equation_incremental_bytes: Some(peak),
@@ -735,7 +738,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> ResidualInferenceQuote<K> {
 }
 
 /// Prices exact registered-root credit with the ordinary shared candidate and
-/// context/application-memory policies. Legacy callers retain typed root access.
+/// context/application-memory policies. The accepted quote retains typed root
+/// access; diagnostics are borrowed from the returned reservation so their
+/// metadata funding cannot retire before the report.
 pub fn plan_prefill_residual_with_capacity<K: Clone + Ord + Send + Sync + 'static>(
     execution: &InferenceExecutionIdentity,
     pool: &WorkingMemoryPool,
@@ -746,7 +751,6 @@ pub fn plan_prefill_residual_with_capacity<K: Clone + Ord + Send + Sync + 'stati
     quote: impl FnMut(InferenceGeometry) -> Result<ResidualInferenceQuote<K>, PrefillPlanningError>,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         ResidualInferenceQuote<K>,
     ),
@@ -769,6 +773,8 @@ pub fn plan_prefill_residual_with_capacity<K: Clone + Ord + Send + Sync + 'stati
 /// controller/decoder credit. The reservation independently retains all pins
 /// and requires funding conversion before native work. Historical diagnostic
 /// metadata need not survive for those source charges to remain protected.
+/// Borrow admission diagnostics through the reservation; no independently owned
+/// copy escapes its funding lifetime.
 pub fn plan_prefill_incremental_with_capacity(
     execution: &InferenceExecutionIdentity,
     pool: &WorkingMemoryPool,
@@ -779,7 +785,6 @@ pub fn plan_prefill_incremental_with_capacity(
     quote: impl FnMut(InferenceGeometry) -> Result<IncrementalInferenceQuote, PrefillPlanningError>,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -818,7 +823,6 @@ pub fn plan_prefill_incremental_with_capacity_handoff(
     quote: impl FnMut(InferenceGeometry) -> Result<IncrementalInferenceQuote, PrefillPlanningError>,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -847,7 +851,7 @@ fn plan_incremental<Q>(
     handoffs: &[WorkingMemoryCapacityHandoff],
     mut quote: impl FnMut(InferenceGeometry) -> Result<Q, PrefillPlanningError>,
     proof: fn(&Q) -> &IncrementalInferenceQuote,
-) -> Result<(Admission, WorkingMemoryReservation, Q), PrefillPlanningError> {
+) -> Result<(WorkingMemoryReservation, Q), PrefillPlanningError> {
     // Identity failures are fatal even when every numerical candidate is
     // incomplete or exceeds application policy. Eligibility and ceiling changes
     // are still checked atomically with the selected reservation below.
@@ -868,24 +872,47 @@ fn plan_incremental<Q>(
             if bound.geometry != geometry || !bound.pool.same_domain(pool) {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
-            let incremental = WorkspaceBound::bounded(
-                bound.incremental_bytes,
-                "complete equation demand and checked enclosing contributions; only exact pinned decoder roots and fixed shared controller sources receive credit",
+            let funding = bound.metadata_funding();
+            let metadata = funding.as_ref().map_or_else(
+                super::WorkspaceReportMetadata::ordinary,
+                super::WorkspaceReportMetadata::with_funding,
             );
-            match eredu_core::apply_admission_policy_with_incremental(
+            let failure = |error: super::WorkspaceReportError| match funding.as_ref() {
+                Some(funding) => PrefillPlanningError::Reservation(
+                    super::reservation_metadata::neural_error(metadata.error(error), funding),
+                ),
+                None => PrefillPlanningError::Estimate(error.into_capability()),
+            };
+            let incremental = metadata.bounded(
+                bound.incremental_bytes,
+                format_args!("complete equation demand and checked enclosing contributions; only exact pinned decoder roots and fixed shared controller sources receive credit"),
+            ).map_err(failure)?;
+            match metadata.apply_admission_with_incremental(
                 capabilities,
                 request,
-                bound.state.clone(),
+                &bound.state,
                 &incremental,
                 None,
-            )? {
+            ).map_err(failure)? {
                 eredu_core::AdmissionResult::Admitted(admission) => {
                     let reservation =
                         bound.reserve(pool, execution, &admission, capacity, handoffs)?;
-                    Ok((admission, reservation, quote))
+                    Ok((reservation, quote))
                 }
                 eredu_core::AdmissionResult::Rejected(rejection) => {
-                    Err(PrefillPlanningError::Admission(rejection))
+                    let owns_text = matches!(&rejection,
+                        eredu_core::AdmissionRejection::EstimationUnsupported { .. }
+                        | eredu_core::AdmissionRejection::AvailableMemoryUnavailable { .. });
+                    let error = PrefillPlanningError::Admission(rejection);
+                    // Scalar refusals need no escaped allocation owner. An owned
+                    // diagnostic keeps the same producer account through its
+                    // existing metadata-error enclosure.
+                    match funding.as_ref().filter(|_| owns_text) {
+                        Some(funding) => Err(super::reservation_metadata::neural_error(
+                            metadata.source(error), funding,
+                        ).into()),
+                        None => Err(error),
+                    }
                 }
             }
         },

@@ -68,7 +68,10 @@ impl<'a> Plan<'a> {
     /// check only confines the ordinary parser to numeric/syntax-error branches;
     /// it does not replace JSON syntax or finite-range validation during parse.
     pub fn prepare(source: &'a str, range: Range<usize>) -> Result<Self, PlanError> {
-        if cfg!(feature = "arbitrary_precision") {
+        Self::prepare_scalar(source, range, false)
+    }
+    fn prepare_scalar(source: &'a str, range: Range<usize>, floating: bool) -> Result<Self, PlanError> {
+        if !floating && cfg!(feature = "arbitrary_precision") {
             return Err(PlanError::Features);
         }
         let raw = tri!(source.get(range.clone()).ok_or(PlanError::Input));
@@ -90,11 +93,11 @@ impl<'a> Plan<'a> {
         ];
         let controls = tri!(parts
             .into_iter()
-            .try_fold(size_of::<[usize; 6]>(), usize::checked_add)
+            .try_fold(size_of::<[usize; 6]>() + size_of::<Result<f64, F64Error>>() + size_of::<F64Error>() + size_of::<bool>(), usize::checked_add)
             .ok_or(PlanError::Overflow));
         let failure = Error::bounded_number_storage_bytes();
         let temporary =
-            tri!(crate::de::bounded_number_temporary_bytes(raw.len()).ok_or(PlanError::Overflow));
+            tri!((if floating { crate::de::bounded_f64_temporary_bytes(raw.len()) } else { crate::de::bounded_number_temporary_bytes(raw.len()) }).ok_or(PlanError::Overflow));
         tri!(controls
             .checked_add(failure)
             .and_then(|n| n.checked_add(temporary))
@@ -118,5 +121,50 @@ impl<'a> Plan<'a> {
     pub fn parse(self) -> Result<Number, Error> {
         crate::de::from_bounded_number_slice(self.source[self.range.clone()].as_bytes())
             .map_err(|error: Error| error.relocate_number(&self.source[..self.range.start]))
+    }
+}
+
+/// A concrete `f64` destination through serde's ordinary numeric worker.
+/// Unlike a retained arbitrary-precision Number, this destination never owns a
+/// numeric string, including when the arbitrary-precision feature is enabled.
+#[derive(Debug)]
+pub struct F64Plan<'a>(Plan<'a>);
+impl<'a> F64Plan<'a> {
+    /// Inspects a numeric source slice before any floating parser allocation.
+    pub fn prepare(source: &'a str, range: Range<usize>) -> Result<Self, PlanError> {
+        Plan::prepare_scalar(source, range, true).map(Self)
+    }
+    /// Concrete parser/scratch/error requirements to admit before parsing.
+    pub fn requirements(&self) -> Requirements { self.0.requirements }
+    /// Uses the same typed f64 deserializer as an ordinary scored vocabulary.
+    pub fn parse(self) -> Result<f64, F64Error> {
+        crate::de::from_bounded_f64_slice(self.0.source[self.0.range.clone()].as_bytes())
+            .map_err(|error| match error { F64Error::Source(error) => F64Error::Source(error.relocate_number(&self.0.source[..self.0.range.start])), other => other })
+    }
+}
+
+/// Unchanged numeric syntax error or the actual original scratch reservation.
+#[derive(Debug)]
+pub enum F64Error {
+    /// Ordinary serde floating syntax/range diagnostic.
+    Source(Error),
+    /// The one original floating scratch reservation failed.
+    Reserve(alloc::collections::TryReserveError),
+}
+impl F64Error {
+    /// Actual retained syntax-error backing; failed scratch owns no allocation.
+    pub fn retained_bytes(&self) -> usize {
+        match self { Self::Source(_) => Error::bounded_number_storage_bytes(), Self::Reserve(_) => 0 }
+    }
+}
+impl fmt::Display for F64Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { Self::Source(e) => e.fmt(f), Self::Reserve(e) => e.fmt(f) }
+    }
+}
+#[cfg(feature = "std")]
+impl std::error::Error for F64Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self { Self::Source(e) => e, Self::Reserve(e) => e })
     }
 }

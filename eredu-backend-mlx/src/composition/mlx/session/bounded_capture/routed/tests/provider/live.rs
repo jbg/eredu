@@ -116,7 +116,7 @@ fn verify_live(device: DeviceType) {
     for gated in [false, true] {
         for committed in [false, true] {
             let plan = admission(geometry, 17, &slice);
-            let mut capture = CaptureSession::new(plan);
+            let mut capture = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
             let epoch = DistributedCommitEpoch::FIRST;
             let native = NativeCapture {
                 stream: &stream,
@@ -262,7 +262,7 @@ fn verify_live(device: DeviceType) {
             observer.complete_transaction(epoch).unwrap();
             observer.finish_transaction(epoch, committed);
             drop(observer);
-            let step = capture.take_step().unwrap();
+            let step = capture.take_shared_step().map(|frame| frame.as_step().clone()).unwrap();
             if let Some(expected) = expected_usage {
                 assert_eq!(step.cumulative_usage, expected);
             } else {

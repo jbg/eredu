@@ -2,6 +2,7 @@
 #include "mlx/original_buffer.h"
 #include "mlx/array.h"
 #include "mlx/c/private/array.h"
+#include "mlx/c/private/host_transfer.h"
 #include "mlx/host_transfer.h"
 #include "mlx/submission.h"
 #include <new>
@@ -313,30 +314,67 @@ extern "C" unsigned mlx_immutable_source_array_attach(mlx_array source,
   return attach_storage(source, nullptr, StorageKind::immutable, expected, node, payload, release);
 }
 
+namespace {
+void host_source_facts(mlx_immutable_host_transfer_info& out,
+    const std::optional<HostTransferAllocationInfo>& actual) noexcept {
+  if (actual && actual->identity)
+    out = {{true, actual->identity, actual->capacity}, actual->prepared_source};
+}
+}
+extern "C" unsigned mlx_immutable_host_transfer_inspect(
+    mlx_immutable_host_transfer_info* out, mlx_host_transfer_buffer source) {
+  if (!out || !source.ctx) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  *out = {};
+  // This real immutable Host owner needs no Array, completion or source slot.
+  host_source_facts(*out, mlx_host_transfer_buffer_get_(source).allocation_info());
+  return out->backing.known ? MLX_ORIGINAL_BUFFER_OK : MLX_ORIGINAL_BUFFER_UNCERTIFIED;
+}
+extern "C" unsigned mlx_host_transfer_array_alias_info(
+    mlx_immutable_host_transfer_info* out, mlx_array source) {
+  if (!out || !source.ctx) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  *out = {};
+  host_source_facts(*out, host_transfer_allocation_info(mlx_array_get_(source)));
+  return MLX_ORIGINAL_BUFFER_OK;
+}
+extern "C" unsigned mlx_immutable_host_transfer_attach(mlx_host_transfer_buffer source,
+    const mlx_immutable_host_transfer_info* expected, void* node, void* payload,
+    void (*release)(void*)) {
+  if (!expected || !expected->backing.known || !expected->backing.identity ||
+      !node || !payload || !release) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  mlx_immutable_host_transfer_info actual{};
+  const auto result = mlx_immutable_host_transfer_inspect(&actual, source);
+  if (result) return result;
+  if (actual.backing.identity != expected->backing.identity ||
+      actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.prepared_source != expected->prepared_source) return MLX_ORIGINAL_BUFFER_CHANGED;
+  return mlx_host_transfer_buffer_get_(source).retain_prepared_allocation_owner(
+      static_cast<AllocationOwners::Node*>(node), payload, release)
+      ? MLX_ORIGINAL_BUFFER_OK : MLX_ORIGINAL_BUFFER_CHANGED;
+}
+extern "C" size_t mlx_immutable_host_transfer_control_bytes(void) {
+  return sizeof(mlx_immutable_host_transfer_info) * 2 +
+      sizeof(mlx_immutable_host_transfer_info*) + sizeof(const mlx_immutable_host_transfer_info*) +
+      sizeof(std::optional<HostTransferAllocationInfo>) + sizeof(HostTransferAllocationInfo) +
+      sizeof(const std::optional<HostTransferAllocationInfo>*) +
+      sizeof(mlx_host_transfer_buffer) * 2 + sizeof(const HostTransferBuffer*) * 2 +
+      sizeof(AllocationOwners::Node*) + sizeof(void*) * 2 + sizeof(void (*)(void*)) +
+      sizeof(unsigned) + sizeof(bool);
+}
+
 // A settled Host-transfer Array is an alias of its immutable Host allocation.
 // The neutral registry must authenticate its existing prepaid source; this ABI
 // creates no source, budget, allocation or completion authority.
-extern "C" unsigned mlx_host_transfer_array_alias_info(
-    mlx_original_buffer_info* out, mlx_array source) {
-  if (!out) return MLX_ORIGINAL_BUFFER_LAYOUT;
-  *out = {};
-  mlx_array_descriptor descriptor{};
-  if (mlx_array_descriptor_read(&descriptor, source)) return MLX_ORIGINAL_BUFFER_LAYOUT;
-  if (!descriptor.known || !descriptor.host_transfer || !descriptor.identity)
-    return MLX_ORIGINAL_BUFFER_OK;
-  *out = {true, descriptor.identity, descriptor.allocation_bytes};
-  return MLX_ORIGINAL_BUFFER_OK;
-}
 extern "C" unsigned mlx_host_transfer_array_alias_attach(mlx_array source,
-    const mlx_original_buffer_info* expected, void* node, void* payload,
+    const mlx_immutable_host_transfer_info* expected, void* node, void* payload,
     void (*release)(void*)) {
-  if (!expected || !expected->known || !expected->identity || !node || !payload || !release)
+  if (!expected || !expected->backing.known || !expected->backing.identity || !node || !payload || !release)
     return MLX_ORIGINAL_BUFFER_LAYOUT;
-  mlx_original_buffer_info actual{};
+  mlx_immutable_host_transfer_info actual{};
   const auto status = mlx_host_transfer_array_alias_info(&actual, source);
   if (status) return status;
-  if (!actual.known) return MLX_ORIGINAL_BUFFER_UNCERTIFIED;
-  if (actual.identity != expected->identity || actual.charged_bytes != expected->charged_bytes)
+  if (!actual.backing.known) return MLX_ORIGINAL_BUFFER_UNCERTIFIED;
+  if (actual.backing.identity != expected->backing.identity || actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.prepared_source != expected->prepared_source)
     return MLX_ORIGINAL_BUFFER_CHANGED;
   // The caller holds the same exclusive runtime loan across inspection and this
   // no-allocation sidecar append. No callback or descriptor mutation intervenes.
@@ -346,9 +384,63 @@ extern "C" unsigned mlx_host_transfer_array_alias_attach(mlx_array source,
   return MLX_ORIGINAL_BUFFER_OK;
 }
 extern "C" size_t mlx_host_transfer_array_alias_control_bytes(void) {
-  return mlx_array_descriptor_control_bytes() + sizeof(mlx_array_descriptor) +
-      sizeof(mlx_original_buffer_info) * 2 + sizeof(mlx_array) +
+  return mlx_immutable_host_transfer_control_bytes() + sizeof(mlx_original_buffer_info) * 2 + sizeof(mlx_array) +
       sizeof(const mlx_original_buffer_info*) + sizeof(AllocationOwners::Node*) +
       sizeof(std::optional<HostTransferAllocationInfo>) + sizeof(void*) * 2 +
-      sizeof(void (*)(void*)) + sizeof(unsigned) * 2 + sizeof(const array*);
+      sizeof(void (*)(void*)) + sizeof(unsigned) * 2 + sizeof(const array*) +
+      sizeof(array::Status) + sizeof(const std::shared_ptr<array::Data>*) +
+      sizeof(const void*); // actual settled-Data and named Host deleter borrows
+}
+
+namespace {
+unsigned inspect_host_view(mlx_host_transfer_view_info& out,
+    array::Data*& data, mlx_array source) noexcept {
+  mlx_array_descriptor descriptor{};
+  if (mlx_array_descriptor_read(&descriptor, source)) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  if (!descriptor.known || !descriptor.host_transfer || !descriptor.identity ||
+      !descriptor.data) return MLX_ORIGINAL_BUFFER_OK;
+  const auto* actual = static_cast<const array::Data*>(descriptor.data);
+  if (!actual->allocation_generation) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  out = {{true, descriptor.identity, descriptor.allocation_bytes},
+      actual->allocation_generation};
+  data = const_cast<array::Data*>(actual);
+  return MLX_ORIGINAL_BUFFER_OK;
+}
+}
+extern "C" unsigned mlx_host_transfer_array_view_info(
+    mlx_host_transfer_view_info* out, mlx_array source) {
+  if (!out) return MLX_ORIGINAL_BUFFER_LAYOUT;
+  *out = {};
+  array::Data* data = nullptr;
+  return inspect_host_view(*out, data, source);
+}
+extern "C" unsigned mlx_host_transfer_array_view_attach(mlx_array source,
+    const mlx_host_transfer_view_info* expected, void* node, void* payload,
+    void (*release)(void*)) {
+  if (!expected || !expected->backing.known || !expected->backing.identity ||
+      !expected->view_identity || !node || !payload || !release)
+    return MLX_ORIGINAL_BUFFER_LAYOUT;
+  mlx_host_transfer_view_info actual{};
+  array::Data* data = nullptr;
+  const auto status = inspect_host_view(actual, data, source);
+  if (status) return status;
+  if (!actual.backing.known) return MLX_ORIGINAL_BUFFER_UNCERTIFIED;
+  if (actual.backing.identity != expected->backing.identity ||
+      actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.view_identity != expected->view_identity)
+    return MLX_ORIGINAL_BUFFER_CHANGED;
+  // Append to the exact positively inspected Data, whose ordinary destructor
+  // retires shared Device views before this payload. The immutable Host source
+  // owns a separate storage object and cannot pin this view's residency charge.
+  data->allocation_owners.append_prepared(
+      static_cast<AllocationOwners::Node*>(node), payload, release);
+  return MLX_ORIGINAL_BUFFER_OK;
+}
+extern "C" size_t mlx_host_transfer_array_view_control_bytes(void) {
+  return mlx_array_descriptor_control_bytes() + sizeof(mlx_array_descriptor) +
+      sizeof(mlx_host_transfer_view_info) * 2 + sizeof(mlx_host_transfer_view_info*) +
+      sizeof(const mlx_host_transfer_view_info*) + sizeof(array::Data*) * 2 +
+      sizeof(const array::Data*) + sizeof(mlx_array) * 2 +
+      sizeof(AllocationOwners::Node*) + sizeof(void*) * 2 +
+      sizeof(void (*)(void*)) + sizeof(unsigned);
 }

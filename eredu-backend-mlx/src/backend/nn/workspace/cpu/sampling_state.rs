@@ -38,7 +38,7 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism: MlxCpuWo
                     || u64::from(*index) >= table.shape()[0] as u64
                     || table.elements().ok()? > i32::MAX as u64
                     || output.dtype() != WorkspaceDtype::Uint32 || output.shape() != [2] { return None; }
-                if table.shape()[0] != 1 { population.copy(OperationEvent::cpu_slice_layout(2, false)?, 1)?; }
+                if table.shape()[0] != 1 { population.copy(OperationEvent::cpu_slice_layout(2, false, false)?, 1)?; }
                 population.copy(OperationEvent::cpu_reshape_alias_layout(2, 1, false)?, 1)?;
                 rank = 2; alias_input = Some(0); output_bytes = 0;
             }

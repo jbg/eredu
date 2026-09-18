@@ -225,11 +225,11 @@ fn capture_inner(
     let selections = selection_array.evaluated()?;
     let token_ids = tokens
         .try_iter::<u32>()
-        .map_err(eredu_nn::Error::backend_source)?;
+        .map_err(eredu_nn::Error::backend_retained_source)?;
     let token_count = token_ids.len();
     let selection_ids = selections
         .try_iter::<u32>()
-        .map_err(eredu_nn::Error::backend_source)?;
+        .map_err(eredu_nn::Error::backend_retained_source)?;
     for (token, selection) in token_ids.zip(selection_ids) {
         if u64::from(token) >= coefficient_shape[0] as u64
             || u64::from(selection) / native_routes != u64::from(token)
@@ -287,20 +287,20 @@ fn capture_inner(
     let mut rows = Vec::new();
     for (index, ((token, selection), (group, coefficient))) in tokens
         .try_iter::<u32>()
-        .map_err(eredu_nn::Error::backend_source)?
+        .map_err(eredu_nn::Error::backend_retained_source)?
         .zip(
             selections
                 .try_iter::<u32>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         )
         .zip(
             groups
                 .try_iter::<u32>()
-                .map_err(eredu_nn::Error::backend_source)?
+                .map_err(eredu_nn::Error::backend_retained_source)?
                 .zip(
                     coefficients
                         .try_iter::<f32>()
-                        .map_err(eredu_nn::Error::backend_source)?,
+                        .map_err(eredu_nn::Error::backend_retained_source)?,
                 ),
         )
         .enumerate()

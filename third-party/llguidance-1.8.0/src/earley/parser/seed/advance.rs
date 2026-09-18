@@ -1,4 +1,5 @@
 //! Original definitive byte/history owner consuming the shared handoff worker.
+use crate::earley::PreparedFunding as _;
 use super::super::{advance, scan, Lexeme, LexerResult, LexerState, MatchingLexemesIdx, PreLexeme};
 use super::{reserve, Cause, PreparedEarleySeed, PreparedEarleySeedError};
 use crate::earley::{PreparedLexer, PreparedLexerOperationError};
@@ -10,9 +11,9 @@ pub(super) struct Context<'a, F> {
     pub(super) owner: &'a mut PreparedEarleySeed,
     pub(super) lexer: &'a mut PreparedLexer,
     pub(super) trie: &'a TokTrie,
-    pub(super) funding: &'a F,
+    pub(super) funding: &'a derivre::prepared_funding::Scope<'a, F>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Context<'_, F> {
     fn row_bytes(&mut self, last: Option<u8>) -> Result<Vec<u8>, Cause<E>> {
         let row = self.owner.lexer_stack.last().ok_or(Cause::Source)?.row_idx;
         let source = scan::row_bytes(&self.owner.lexer_stack, row);
@@ -23,7 +24,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
             size_of::<(&mut Self, usize)>(),
             size_of::<Result<Vec<u8>, Cause<E>>>(),
         ];
-        (self.funding)(
+        self.funding.reserve(
             controls
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
@@ -60,9 +61,10 @@ impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
         .ok_or(Cause::Source)
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> advance::Context for Context<'_, F> {
+impl<'a, F: crate::earley::PreparedFunding<Error = E>, E> advance::Context for Context<'a, F> {
     type Error = Cause<E>;
-    fn enter(&mut self) -> Result<(), Self::Error> {
+    type Frame = crate::earley::Frame<'a>;
+    fn enter(&mut self) -> Result<Self::Frame, Self::Error> {
         let frames = [
             size_of::<&mut Self>(),
             size_of::<Lexeme>(),
@@ -74,13 +76,13 @@ impl<F: Fn(usize) -> Result<(), E>, E> advance::Context for Context<'_, F> {
             size_of::<Result<Option<PreLexeme>, Cause<E>>>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, u8>>>(),
         ];
-        (self.funding)(
+        self.funding.frame(
             frames
                 .into_iter()
                 .try_fold(size_of_val(&frames), usize::checked_add)
                 .ok_or(Cause::Overflow)?,
         )
-        .map_err(Cause::Funding)
+        .map_err(Cause::frame)
     }
     fn within_items(&self) -> bool {
         self.owner.stats.all_items <= self.owner.max_all_items
@@ -298,7 +300,7 @@ impl PreparedEarleySeed {
     /// routing, scan, capture, hidden-byte and greedy-handoff workers. Composition
     /// supplies the lexer/trie from this chart's retained source chain.
     /// Storage errors own the partial chart; ordinary byte rejection returns it.
-    pub fn push_byte<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn push_byte<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -326,7 +328,7 @@ impl PreparedEarleySeed {
                 size_of::<Result<StateID, PreparedLexerOperationError<E>>>(),
                 size_of::<std::iter::Enumerate<std::slice::Iter<'_, u8>>>(),
             ];
-            funding(
+            funding.reserve(
                 controls
                     .into_iter()
                     .try_fold(size_of_val(&controls), usize::checked_add)
@@ -343,12 +345,13 @@ impl PreparedEarleySeed {
             {
                 return Err(Cause::Source);
             }
+            let scope = derivre::prepared_funding::Scope::new(funding).map_err(Cause::frame)?;
             advance::definitive(
                 &mut Context {
                     owner: &mut self,
                     lexer,
                     trie,
-                    funding,
+                    funding: &scope,
                 },
                 byte,
             )

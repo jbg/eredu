@@ -202,7 +202,7 @@ impl<U: Parameterized<MlxTensor>> MlxPredictionModule<U> {
     ) -> Result<O, eredu_nn::Error> {
         if self.original.is_none() {
             if safemlx::OriginalScopeObserver::try_current()
-                .map_err(eredu_nn::Error::backend_source)?
+                .map_err(eredu_nn::Error::backend_retained_source)?
                 .is_some()
             {
                 return Err(WorkspaceMetadataError::Unqualified.into());
@@ -214,7 +214,7 @@ impl<U: Parameterized<MlxTensor>> MlxPredictionModule<U> {
                 })
                 .map_err(|cause| match cause {
                     Error::Neural(cause) => cause,
-                    cause => eredu_nn::Error::backend_source(cause),
+                    cause => eredu_nn::Error::backend_retained_source(cause),
                 });
         }
         let projection = self
@@ -265,11 +265,11 @@ fn publish_original<U: Parameterized<MlxTensor>>(
         failure: Option<safemlx::error::Exception>,
     }
     impl ParameterSlotVisitor<MlxTensor> for PublishOriginal<'_> {
-        fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut MlxTensor) {
+        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
             if self.failure.is_some() {
                 return;
             }
-            if let Some(replacement) = self.values.get(metadata.id.as_str()) {
+            if let Some(replacement) = self.values.get(metadata.id().as_str()) {
                 match replacement.as_ref().try_clone_handle() {
                     Ok(replacement) => *value = MlxTensor::from(replacement),
                     Err(cause) => self.failure = Some(cause),

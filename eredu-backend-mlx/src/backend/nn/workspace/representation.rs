@@ -11,6 +11,8 @@ use eredu_nn::{GatedProductActivation, NormalizationScale};
 mod affine;
 #[path = "representation/selector.rs"]
 mod selector;
+#[path = "representation/layer_norm.rs"]
+mod layer_norm;
 
 /// Actual F32 operands of the selected affine router; no storage or worker grant.
 pub(super) fn affine_selector_source(operation: WorkspaceOperationView<'_>) -> Option<()> {
@@ -165,7 +167,7 @@ pub(super) fn output(
         K::View(name) if super::byte_view::selected(name).is_some() => {
             super::byte_view::selected(name)?.floating()?
         }
-        K::View("reshape" | "transpose" | "squeeze" | "expand_dims" | "broadcast")
+        K::View("reshape" | "squeeze" | "expand_dims" | "broadcast")
         | K::Transpose(_)
         | K::Index { .. }
         | K::StaticSlice { .. }
@@ -185,6 +187,9 @@ pub(super) fn output(
         // The existing supplied-table adapter's negative half uses try_from_f32.
         K::Rotary(_, None) => F::Float32,
         K::TensorRotary(..) => dtype(operation, 0)?,
+        K::MultiAxisRotary(_) | K::PreparedMultiAxisRotary(_) => {
+            return super::positional::rotary_representation(operation, index);
+        }
         // Vendored SDPA selects result_type(q,k,v) before either native/fallback
         // execution. Masks/sinks are validated against that selected type.
         K::Attention {
@@ -230,6 +235,13 @@ pub(super) fn output(
         | K::HostLoadStoredFloating(_, dtype) => dtype,
         K::SliceUpdate { .. } | K::StaticSliceUpdate { .. } | K::IndexedRowAdd
         | K::IndexedElementSelect | K::IndexedElementUpdate => dtype(operation, 0)?,
+        // The pinned masked row-scatter casts its complete source to the
+        // destination dtype before broadcasting and retains that dtype in
+        // the MaskedScatter result. Source precision does not promote it.
+        K::Elementwise("masked_scatter") => {
+            super::masked_scatter::geometry(operation).ok()??;
+            dtype(operation, 0)?
+        }
         K::Elementwise("capture_cast_f32" | "cast_f32") => F::Float32,
         K::Elementwise(_) if super::zero_fill::dtype(operation).is_some() => super::zero_fill::dtype(operation)?.1?,
         K::Elementwise("scalar_f32") if basic::is_scalar_f32(operation) => F::Float32,
@@ -286,6 +298,7 @@ pub(super) fn output(
             promote(dtype(operation, 0)?, dtype(operation, 2)?)
         }
         // L2 has an explicit F32 epsilon array followed by division/multiply.
+        K::LayerNorm { .. } => layer_norm::scalar(operation)?,
         K::Normalization("l2", _) => F::Float32,
         K::GatedProduct(policy)
             if policy.activation() == GatedProductActivation::Silu

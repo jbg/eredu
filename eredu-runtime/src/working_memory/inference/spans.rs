@@ -8,6 +8,8 @@ use std::{
     mem::size_of,
     sync::{Arc, Mutex, OnceLock},
 };
+mod sampling;
+pub use sampling::SamplingWorkspacePlanCollector;
 
 /// One actual scheduled span and its complete newly allocated workspace.
 /// Opening roots receive no scalar credit: they were never new allocations.
@@ -61,7 +63,7 @@ struct SpanPlan {
     custody: OnceLock<SpanHostOwner>,
     // The closed shared shell and all report/native custody retire before the
     // independent host planning account. No execution permission is carried.
-    metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 /// Immutable, identity-preserving diagnostics from one actual quote traversal.
 /// This is neither registered opening storage nor an execution/capacity grant.
@@ -94,7 +96,7 @@ impl InferenceSpanWorkspacePlan {
 
     pub(in crate::working_memory) fn metadata_funding(
         &self,
-    ) -> Option<eredu_nn::workspace::WorkspaceMetadataFunding> {
+    ) -> Option<eredu_nn::workspace::HostMetadataFunding> {
         self.inner().metadata_funding.clone()
     }
 
@@ -113,7 +115,7 @@ impl InferenceSpanWorkspacePlan {
     fn new_with_funding(
         geometry: InferenceGeometry,
         records: Vec<InferenceSpanWorkspaceRecord>,
-        metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
     ) -> Self {
         Self(Some(Arc::new(SpanPlan {
             geometry,
@@ -248,11 +250,13 @@ impl InferenceSpanWorkspacePlan {
         &self,
     ) -> Option<impl Iterator<Item = &InferenceSpanWorkspaceRecord> + '_> {
         let geometry = self.geometry();
-        if geometry.max_output_tokens != 0 && geometry.output == OutputDemand::StateOnly {
+        if self.records().iter().any(|record| matches!(record.span(), InferenceWorkspaceSpan::Sampling(_)))
+            || (geometry.max_output_tokens != 0 && geometry.output == OutputDemand::StateOnly) {
             return None;
         }
         let decodes = geometry.max_output_tokens.saturating_sub(1);
         Some(self.records().iter().filter(move |record| match record.span() {
+            InferenceWorkspaceSpan::Sampling(_) => false,
             InferenceWorkspaceSpan::Prefill(_) => true,
             InferenceWorkspaceSpan::Decode { index, .. } => *index < decodes,
         }))

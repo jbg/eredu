@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::mem::{size_of, size_of_val};
 
@@ -10,7 +10,7 @@ use std::mem::{size_of, size_of_val};
 // final completion allocation and output retire before their account can refund.
 pub(super) struct CompletionOwner<Output> {
     inner: Arc<CacheIoCompletion<Output>>,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl<Output> Clone for CompletionOwner<Output> {
     fn clone(&self) -> Self {

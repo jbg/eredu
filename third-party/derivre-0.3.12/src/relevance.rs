@@ -4,8 +4,8 @@ pub(crate) mod entry;
 pub(crate) mod grouping;
 pub(crate) mod symbolic;
 pub(crate) mod walk;
-use crate::HashMap;
-use anyhow::Result;
+use crate::SourceHashMap as HashMap;
+use crate::ParserResult as Result;
 
 use crate::{
     ast::{ExprRef, ExprSet},
@@ -52,11 +52,11 @@ fn swap_each<A: Copy>(v: &mut [(A, A)]) {
     }
 }
 
-fn simplify(exprs: &mut ExprSet, input: SymRes) -> SymRes {
+fn simplify(exprs: &mut ExprSet, input: SymRes) -> Result<SymRes> {
     grouping::ordinary_simplify(exprs, input)
 }
 
-fn make_disjoint(exprs: &mut ExprSet, input: &SymRes) -> SymRes {
+fn make_disjoint(exprs: &mut ExprSet, input: &SymRes) -> Result<SymRes> {
     disjoint::ordinary(exprs, input)
 }
 
@@ -81,17 +81,14 @@ impl RelevanceCache {
         self.relevance_cache.len() * 3 * std::mem::size_of::<isize>()
     }
 
-    pub(crate) fn deriv(&mut self, exprs: &mut ExprSet, e: ExprRef) -> SymRes {
+    pub(crate) fn deriv(&mut self, exprs: &mut ExprSet, e: ExprRef) -> Result<SymRes> {
         exprs.map(
             e,
             &mut self.sym_deriv,
             true,
             |e| e,
             |exprs, deriv, e| {
-                let r = match symbolic::node(&mut symbolic::Ordinary(exprs), deriv, e) {
-                    Ok(value) => value,
-                    Err(never) => match never {},
-                };
+                let r = symbolic::node(&mut symbolic::Ordinary(exprs), deriv, e)?;
                 debug!(
                     "deriv: {:?} -> {:?}",
                     exprs.expr_to_string(e),
@@ -99,14 +96,13 @@ impl RelevanceCache {
                         .map(|(b, r)| (exprs.expr_to_string(*b), exprs.expr_to_string(*r)))
                         .collect::<Vec<_>>()
                 );
-                r
+                Ok(r)
             },
         )
     }
 
-    pub fn is_non_empty(&mut self, exprs: &mut ExprSet, top_expr: ExprRef) -> bool {
+    pub fn is_non_empty(&mut self, exprs: &mut ExprSet, top_expr: ExprRef) -> Result<bool> {
         self.is_non_empty_limited(exprs, top_expr, u64::MAX)
-            .unwrap()
     }
 
     fn is_contained_in_prefixes_inner(
@@ -141,12 +137,12 @@ impl RelevanceCache {
 
         match self.is_contained_in_prefixes_inner(exprs, deriv, small, big) {
             Ok(r) => {
-                self.containment_cache.insert((small, big), r);
+                exprs.construction_funding()?.try_insert(&mut self.containment_cache, (small, big), r)?;
                 Ok(r)
             }
             Err(e) => {
-                if cache_failures {
-                    self.containment_cache.insert((small, big), false);
+                if cache_failures && !crate::allocation_funding::is_storage_failure(&e) {
+                    exprs.construction_funding()?.try_insert(&mut self.containment_cache, (small, big), false)?;
                 }
                 Err(e)
             }

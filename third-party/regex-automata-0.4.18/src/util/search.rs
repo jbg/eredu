@@ -1775,25 +1775,28 @@ impl MatchKind {
 /// with a haystack that is too long, or trying to run an unanchored search
 /// with a [one-pass DFA](crate::dfa::onepass).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MatchError(
-    #[cfg(feature = "alloc")] alloc::boxed::Box<MatchErrorKind>,
-    #[cfg(not(feature = "alloc"))] MatchErrorKind,
-);
+pub struct MatchError(MatchErrorKind);
+
+#[cfg(feature = "alloc")]
+impl From<crate::util::allocation::AllocationError> for MatchError {
+    fn from(error: crate::util::allocation::AllocationError) -> Self {
+        Self::new(MatchErrorKind::Allocation(error))
+    }
+}
 
 impl MatchError {
+    /// Return a refused prospective search destination without allocating an error box.
+    #[cfg(feature = "alloc")]
+    pub fn allocation_error(&self) -> Option<crate::util::allocation::AllocationError> {
+        match self.0 { MatchErrorKind::Allocation(error) => Some(error), _ => None }
+    }
+
     /// Create a new error value with the given kind.
     ///
     /// This is a more verbose version of the kind-specific constructors,
     /// e.g., `MatchError::quit`.
     pub fn new(kind: MatchErrorKind) -> MatchError {
-        #[cfg(feature = "alloc")]
-        {
-            MatchError(alloc::boxed::Box::new(kind))
-        }
-        #[cfg(not(feature = "alloc"))]
-        {
-            MatchError(kind)
-        }
+        MatchError(kind)
     }
 
     /// Returns a reference to the underlying error kind.
@@ -1847,6 +1850,9 @@ impl MatchError {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MatchErrorKind {
+    /// A prospective search-storage destination was refused before allocation.
+    #[cfg(feature = "alloc")]
+    Allocation(crate::util::allocation::AllocationError),
     /// The search saw a "quit" byte at which it was instructed to stop
     /// searching.
     Quit {
@@ -1904,6 +1910,8 @@ impl std::error::Error for MatchError {}
 impl core::fmt::Display for MatchError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match *self.kind() {
+            #[cfg(feature = "alloc")]
+            MatchErrorKind::Allocation(error) => error.fmt(f),
             MatchErrorKind::Quit { byte, offset } => write!(
                 f,
                 "quit search after observing byte {:?} at offset {}",
@@ -1948,16 +1956,11 @@ mod tests {
     // Why? Because low level search APIs return Result<.., MatchError>. When
     // MatchError gets bigger, so to does the Result type.
     //
-    // Now, when 'alloc' is enabled, we do box the error, which de-emphasizes
-    // the importance of keeping a small error type. But without 'alloc', we
-    // still want things to be small.
+    // Errors are intentionally inline in every profile so even a failed
+    // prospective allocation can be returned without allocating its diagnostic.
     #[test]
     fn match_error_size() {
-        let expected_size = if cfg!(feature = "alloc") {
-            core::mem::size_of::<usize>()
-        } else {
-            2 * core::mem::size_of::<usize>()
-        };
+        let expected_size = 2 * core::mem::size_of::<usize>();
         assert_eq!(expected_size, core::mem::size_of::<MatchError>());
     }
 

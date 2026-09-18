@@ -83,10 +83,7 @@ fn packed_template_preserves_single_pair_encoding_and_ordinary_clone_serde() {
                         .unwrap()
                         .encode()
                         .unwrap();
-                    assert_eq!(
-                        ids.ids(),
-                        legacy.encode(text, special).unwrap().get_ids()
-                    );
+                    assert_eq!(ids.ids(), legacy.encode(text, special).unwrap().get_ids());
                     assert_eq!(
                         ids.capacities()[2],
                         text.len() + if special { 3 } else { 0 }
@@ -96,24 +93,18 @@ fn packed_template_preserves_single_pair_encoding_and_ordinary_clone_serde() {
         }
         let cloned = actual.clone();
         drop(actual);
-        let restored =
-            Tokenizer::from_bytes(serde_json::to_vec(&cloned).unwrap())
-                .unwrap();
+        let restored = Tokenizer::from_bytes(serde_json::to_vec(&cloned).unwrap()).unwrap();
         compare(
             &cloned.encode(("hi", "Hello"), true).unwrap(),
             &restored.encode(("hi", "Hello"), true).unwrap(),
         );
-        let value = serde_json::to_value(cloned.get_post_processor().unwrap())
-            .unwrap();
-        let expected =
-            serde_json::to_value(legacy.get_post_processor().unwrap())
-                .unwrap();
+        let value = serde_json::to_value(cloned.get_post_processor().unwrap()).unwrap();
+        let expected = serde_json::to_value(legacy.get_post_processor().unwrap()).unwrap();
         assert_eq!(value, expected);
     }
 }
 #[test]
-fn template_special_policy_empty_and_all_target_failure_prefixes_use_real_destinations(
-) {
+fn template_special_policy_empty_and_all_target_failure_prefixes_use_real_destinations() {
     let value = source();
     let actual = compiled(&value);
     assert_eq!(
@@ -165,15 +156,13 @@ fn template_special_policy_empty_and_all_target_failure_prefixes_use_real_destin
     assert!(matches!(&error.cause, Cause::Added(_)));
     assert!(matches!(
         &error.partial.post,
-        Some(PostProcessorWrapper::CompiledTemplate(_))
+        Some(PostProcessorWrapper::Template(_))
     ));
 }
 #[test]
-fn template_source_validation_preserves_decoded_keys_sparse_ids_and_pair_metadata(
-) {
+fn template_source_validation_preserves_decoded_keys_sparse_ids_and_pair_metadata() {
     let mut value = source();
-    value["post_processor"]["special_tokens"]["start"]["ids"][0] =
-        json!(u32::MAX);
+    value["post_processor"]["special_tokens"]["start"]["ids"][0] = json!(u32::MAX);
     let input = value.to_string().replace("\"start\"", "\"st\\u0061rt\"");
     let actual = TokenizerCompilePlan::prepare_json(input.as_bytes())
         .unwrap()
@@ -235,7 +224,10 @@ fn template_source_validation_preserves_decoded_keys_sparse_ids_and_pair_metadat
             Err(Error::Root { .. })
         ));
     }
-    let duplicate=source().to_string().replace("\"special_tokens\":{","\"special_tokens\":{\"end\":{\"id\":\"end\",\"ids\":[1],\"tokens\":[\"x\"]},");
+    let duplicate = source().to_string().replace(
+        "\"special_tokens\":{",
+        "\"special_tokens\":{\"end\":{\"id\":\"end\",\"ids\":[1],\"tokens\":[\"x\"]},",
+    );
     assert_eq!(
         TokenizerCompilePlan::prepare_json(duplicate.as_bytes())
             .unwrap_err()
@@ -244,8 +236,7 @@ fn template_source_validation_preserves_decoded_keys_sparse_ids_and_pair_metadat
     );
 }
 #[test]
-fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stays_valid(
-) {
+fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stays_valid() {
     let mut value = source();
     value["post_processor"]["single"]
         .as_array_mut()
@@ -262,8 +253,7 @@ fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stay
         Err(crate::EncodeIdsError::PipelineProfile)
     ));
     let mut no_a = source();
-    no_a["post_processor"]["single"] =
-        json!([{"SpecialToken":{"id":"end","type_id":0}}]);
+    no_a["post_processor"]["single"] = json!([{"SpecialToken":{"id":"end","type_id":0}}]);
     let no_a = compiled(&no_a);
     for special in [false, true] {
         assert!(matches!(
@@ -272,9 +262,9 @@ fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stay
         ));
     }
     let mut zero = source();
-    zero["post_processor"]["single"] =
-        json!([{"Sequence":{"id":"A","type_id":0}}]);
-    zero["post_processor"]["pair"] = json!([{"Sequence":{"id":"A","type_id":0}},{"Sequence":{"id":"B","type_id":1}}]);
+    zero["post_processor"]["single"] = json!([{"Sequence":{"id":"A","type_id":0}}]);
+    zero["post_processor"]["pair"] =
+        json!([{"Sequence":{"id":"A","type_id":0}},{"Sequence":{"id":"B","type_id":1}}]);
     zero["post_processor"]["special_tokens"] = json!({});
     let zero = compiled(&zero);
     assert!(EncodeIdsPlan::prepare(&zero, "", true)
@@ -287,8 +277,5 @@ fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stay
     value["post_processor"]["special_tokens"] = json!({});
     let legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
     assert!(!legacy.encode("hi", false).unwrap().get_ids().is_empty());
-    assert!(
-        TokenizerCompilePlan::prepare_json(value.to_string().as_bytes())
-            .is_err()
-    );
+    assert!(TokenizerCompilePlan::prepare_json(value.to_string().as_bytes()).is_err());
 }

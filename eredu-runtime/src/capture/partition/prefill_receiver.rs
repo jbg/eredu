@@ -24,7 +24,7 @@ impl PartitionPrefillReceiverSource {
         dtype:TensorDtype,inference:InferenceGeometry,chunk:u64,local_shape:&[u64])
         ->Result<Self,PartitionPrefillCaptureSourceError> {
         use PartitionPrefillCaptureSourceError as E;
-        let context=receipt.context();let source=receipt.shared_plan_source().ok_or(E::Source)?;
+        let context=receipt.context();let source=receipt.shared_plan_source();
         if context.phase!=CapturePhase::Prefill || context.prediction!=0 || context.invocation.is_some()
             || context.capture_plan_identity!=source.admission().identity() || receipt.routed_producer(producer).is_some()
             || producer>=receipt.world_size() || local_shape.is_empty() || local_shape.len()>32

@@ -7,7 +7,7 @@ use eredu_architectures::component_partition::PartitionInterventionMemberLayout;
 use eredu_core::{capture::*, intervention::*};
 use eredu_nn::{
     workspace::{
-        WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceTensor,
+        WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor,
     },
     Tensor,
 };
@@ -51,7 +51,7 @@ pub(crate) struct PreparedPartitionModelIntervention {
     projection_usage: [CaptureUsage; 2],
     source_usage: CaptureUsage,
     execution_identity: [u8; 32],
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     traced: bool,
     evidence: Option<PreparedPartitionEvidenceSource>,
 }
@@ -61,7 +61,7 @@ struct SourceFailure {
     #[source]
     cause: eredu_nn::Error,
     _source: OriginalInterventionSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedPartitionModelIntervention {
     /// Trace the ordinary static worker for every actual projected update. The
@@ -621,3 +621,5 @@ pub(crate) enum NativeFailure {
     #[error(transparent)]
     Allowance(#[from] eredu_runtime::capture::partition::PartitionInterventionSourceError),
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

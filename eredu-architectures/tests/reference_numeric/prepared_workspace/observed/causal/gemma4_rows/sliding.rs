@@ -52,8 +52,8 @@ impl AttentionCache<NumericTensor> for NativeTail {
 fn modules(f: &Fixture, context: &NumericContext) -> [gemma4::Attention<NumericBackend>; 2] {
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, tensor: &'a mut NumericTensor) {
-            let source = self.0.get(metadata.id.as_str()).unwrap();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, tensor: &'a mut NumericTensor) {
+            let source = self.0.get(metadata.id().as_str()).unwrap();
             assert_eq!(tensor.shape, source.shape);
             tensor.data.clone_from(&source.data);
             nonzero(tensor);

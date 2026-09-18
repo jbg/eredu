@@ -8,12 +8,12 @@ struct Body {
     owner:OriginalCommunicationOwner,
     taken:Cell<bool>,
     retained:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Closed initialized source for actual session agreements without a TP lane.
 pub(crate) struct OriginalParallelControlSource {
     body:Option<Rc<Body>>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl Clone for OriginalParallelControlSource {
     fn clone(&self)->Self{Self{body:self.body.clone(),funding:self.funding.clone()}}
@@ -80,7 +80,7 @@ pub(super) enum ControlSource {
     Control(OriginalParallelControlSource),
 }
 impl ControlSource {
-    pub(super) fn funding(&self)->&WorkspaceMetadataFunding{match self{
+    pub(super) fn funding(&self)->&HostMetadataFunding{match self{
         Self::Model(source)=>source.funding(),Self::Control(source)=>&source.funding,
     }}
     pub(super) fn communication_source(&self)->Result<OriginalCommunicationSource<'_>,Error>{match self{

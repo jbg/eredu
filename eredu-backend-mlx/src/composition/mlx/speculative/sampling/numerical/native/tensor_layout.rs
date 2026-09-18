@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::workspace::{WorkspaceFloatingType, WorkspaceRepresentation};
 
-pub(super) fn completed_floating(
+pub(super) fn completed(
     value: &OriginalNumericalValue,
     context: &WorkspaceContext,
 ) -> Result<WorkspaceTensor, Error> {
@@ -30,9 +30,11 @@ pub(super) fn completed_floating(
     // descriptive loan. Neither this inspection nor a stride fact creates one.
     let array = &value.value().array;
     let descriptor = array.try_descriptor()?;
-    let dtype = match descriptor.facts().dtype() {
-        safemlx::Dtype::Float32 => WorkspaceFloatingType::Float32,
-        safemlx::Dtype::Bfloat16 => WorkspaceFloatingType::Bfloat16,
+    let (dtype, floating) = match descriptor.facts().dtype() {
+        safemlx::Dtype::Float32 => (WorkspaceDtype::Float32, Some(WorkspaceFloatingType::Float32)),
+        safemlx::Dtype::Bfloat16 => (WorkspaceDtype::Float32, Some(WorkspaceFloatingType::Bfloat16)),
+        safemlx::Dtype::Uint32 => (WorkspaceDtype::Uint32, None),
+        safemlx::Dtype::Int32 => (WorkspaceDtype::Int32, None),
         _ => {
             return Err(Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
@@ -53,10 +55,9 @@ pub(super) fn completed_floating(
         || array.signed_strides().last() == Some(&1);
     WorkspaceTensor::existing(
         context
-            .layout(descriptor.shape(), WorkspaceDtype::Float32)?
-            .with_representation(Some(
-                WorkspaceRepresentation::new(dtype, row).with_last_axis_contiguous(last),
-            )),
+            .layout(descriptor.shape(), dtype)?
+            .with_representation(floating.map(|dtype|
+                WorkspaceRepresentation::new(dtype, row).with_last_axis_contiguous(last))),
         context,
     )
     .map_err(Error::from)

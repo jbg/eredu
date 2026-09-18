@@ -12,7 +12,7 @@ pub(super) struct RegisteredBuffers(());
 struct Custody {
     _pins:WorkingMemoryStorage<StorageIdentity>,
     // Pin keys/registration retire before their shared shell and H account.
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 fn groups(actual:&ParallelCommunicators)->impl Iterator<Item=&Group> {
     std::iter::once(&actual.control_world)
@@ -21,14 +21,14 @@ fn groups(actual:&ParallelCommunicators)->impl Iterator<Item=&Group> {
 }
 
 pub(super) fn pin(actual:&ParallelCommunicators,source:&RetainedCommunicationSource,
-    funding:&WorkspaceMetadataFunding,pool:&WorkingMemoryPool)
+    funding:&HostMetadataFunding,pool:&WorkingMemoryPool)
     ->Result<(RetainedCommunicationSource,RegisteredBuffers),Error> {
-    let overflow=||Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+    let overflow=||Error::WorkspacePlanning(HostMetadataFundingError::Overflow);
     let population=1usize.checked_add(actual.groups.len())
         .and_then(|n|n.checked_add(actual.routes.len())).ok_or_else(overflow)?;
     let actual_groups=groups(actual);
     let controls=[size_of::<(&ParallelCommunicators,&RetainedCommunicationSource,
-            &WorkspaceMetadataFunding,&WorkingMemoryPool)>(),
+            &HostMetadataFunding,&WorkingMemoryPool)>(),
         size_of::<(RetainedCommunicationSource,RegisteredBuffers)>(),
         size_of::<Result<(RetainedCommunicationSource,RegisteredBuffers),Error>>(),
         size_of::<ExistingStoragePinLayout<StorageIdentity>>(),
@@ -70,3 +70,5 @@ pub(super) fn pin(actual:&ParallelCommunicators,source:&RetainedCommunicationSou
         .ok_or_else(||failure(Cause::Identity,source,funding))?;
     Ok((retained,RegisteredBuffers(())))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

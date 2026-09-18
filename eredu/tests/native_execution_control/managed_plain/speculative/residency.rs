@@ -72,21 +72,26 @@ fn run_selected(residency: Residency, mode: &str) -> serde_json::Value {
     assert_eq!(settings.overrides.max_new_tokens, Some(4));
     if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
-                add_generation_prompt: false,
-                tool_choice: ToolChoice::None,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
+                    add_generation_prompt: false,
+                    tool_choice: ToolChoice::None,
+                    ..Default::default()
+                },
+                8 * 1024 * 1024 * 1024,
+            )
             .unwrap();
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]); // chunk2 has a one-token final span.
-        settings.inference.managed_memory_capacity_bytes = None;
         let output = model
-            .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, ids),
+            .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&ids),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
+                settings: chat_settings(&chat, settings),
                 options,
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -178,11 +183,17 @@ fn verify(residency: Residency, case: &str) {
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_host_speculation_matches_ordinary_and_controlled() {
-    verify(Residency::Host, "managed_plain::speculative::residency::native_original_host_speculation_matches_ordinary_and_controlled");
+    verify(
+        Residency::Host,
+        "managed_plain::speculative::residency::native_original_host_speculation_matches_ordinary_and_controlled",
+    );
 }
 
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_foreground_disk_speculation_matches_ordinary_and_controlled() {
-    verify(Residency::ForegroundDisk, "managed_plain::speculative::residency::native_original_foreground_disk_speculation_matches_ordinary_and_controlled");
+    verify(
+        Residency::ForegroundDisk,
+        "managed_plain::speculative::residency::native_original_foreground_disk_speculation_matches_ordinary_and_controlled",
+    );
 }

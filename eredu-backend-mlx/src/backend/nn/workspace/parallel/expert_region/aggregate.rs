@@ -5,6 +5,7 @@ pub(crate) struct ExpertRegionAggregate {
     pub(crate) child_births:usize,
     pub(crate) host_bytes:u64,
     pub(crate) parent_completions:usize,
+    pub(crate) indexed_parent:bool,
     pub(crate) empty_slices:usize,
     pub(crate) empty_slice:WorkspaceOperation,
     pub(crate) extra_parents:Vec<WorkspaceOperation>,
@@ -48,7 +49,8 @@ impl ExpertRegionAggregate {
             eredu_nn::workspace::WorkspaceExpertTransfer::ForwardIndex|eredu_nn::workspace::WorkspaceExpertTransfer::ReverseIndex)).count();
         let parent_completions=view.movement.parent_completions().and_then(|n|n.checked_add(1))
             .and_then(|n|n.checked_add(metadata))
-            .and_then(|n|n.checked_add(transport.parent_input_completions()?)).ok_or_else(invalid)?;
+            .and_then(|n|n.checked_add(transport.parent_input_completions()?))
+            .and_then(|n|n.checked_add(usize::from(local.addressable.is_some()))).ok_or_else(invalid)?;
         // Each optional zero-row prepared integer uses its source's paid unit
         // seed followed by this exact empty Slice. Its possible parent metadata
         // constructor must be retained even when this rank's rows are nonzero.
@@ -76,6 +78,9 @@ impl ExpertRegionAggregate {
             u64::try_from(view.selected_rows().and_then(|n|n.checked_mul(size_of::<usize>()))
                 .and_then(|n|n.checked_mul(2)).ok_or_else(invalid)?).map_err(|_|invalid())?
         }else{0};
-        Ok(Self{child_bytes:bytes,child_births:births,host_bytes,parent_completions,empty_slices,empty_slice,extra_parents:Vec::new(),output_bytes})
+        let host_bytes = host_bytes.checked_add(local.addressable.as_ref().map_or(0, |quote| quote.host_capacity()))
+            .and_then(|n| n.checked_add(u64::try_from(crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection::expert_local_control_bytes()?).ok()?))
+            .ok_or_else(invalid)?;
+        Ok(Self{child_bytes:bytes,child_births:births,host_bytes,parent_completions,indexed_parent:local.addressable.is_some(),empty_slices,empty_slice,extra_parents:Vec::new(),output_bytes})
     }
 }

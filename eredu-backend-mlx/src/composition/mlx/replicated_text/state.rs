@@ -175,10 +175,7 @@ pub(crate) trait MlxStateMechanisms:
             crate::backend::runtime::cache::state::PublishedResidentDecoderState::KeyValue(
                 state,
             ) => Self::from_published_dense_control_state_fixed(state),
-            crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridKvOnly(
-                _,
-            )
-            | crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridGrouped(
+            crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridGrouped(
                 _,
             )
             | crate::backend::runtime::cache::state::PublishedResidentDecoderState::Pooling(_) => {
@@ -210,7 +207,7 @@ pub(crate) trait MlxStateMechanisms:
         _environment: &crate::backend::OriginalCopyEnvironment<'_>,
         _initialized: &safemlx::PrefillRootsRuntime,
         _mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
-        _funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        _funding: &eredu_nn::workspace::HostMetadataFunding,
         _host: &eredu_core::HostPreparationAuthority,
         _capacity: u64,
     ) -> Result<Option<crate::backend::runtime::cache::state::OriginalResidentState>, Error> {
@@ -560,7 +557,7 @@ impl MlxStateMechanisms for MlxKeyValueState {
         &self, completed: Option<&crate::backend::runtime::cache::state::CompletedResidentSource>,
         environment: &crate::backend::OriginalCopyEnvironment<'_>, initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         host: &eredu_core::HostPreparationAuthority, capacity: u64,
     ) -> Result<Option<crate::backend::runtime::cache::state::OriginalResidentState>, Error> {
         if !self.as_ref().iter().any(|layer| matches!(layer, crate::backend::runtime::cache::state::MlxKeyValueLayerState::Paged(_))) {
@@ -824,9 +821,6 @@ impl MlxStateMechanisms for MlxHybridState {
         state: crate::backend::runtime::cache::state::PublishedResidentDecoderState,
     ) -> Result<Self, PreparedDenseControlBindingError> {
         match state {
-            crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridKvOnly(
-                state,
-            ) => Ok(state.into_state()),
             crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridGrouped(
                 state,
             ) => Ok(state.into_state()),
@@ -1079,7 +1073,7 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         match state {
             PublishedResidentDecoderState::Pooling(state) => Ok(state.into_state()),
             PublishedResidentDecoderState::KeyValue(_)
-            | PublishedResidentDecoderState::HybridKvOnly(_)
+
             | PublishedResidentDecoderState::HybridGrouped(_) => {
                 Err(PreparedDenseControlBindingError::UnsupportedStateType)
             }

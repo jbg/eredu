@@ -11,7 +11,9 @@ fn compare(
         .compile()
         .unwrap();
     let context = ChatRenderContext::from_json(base, Some(defaults), Some(caller)).unwrap();
-    let plan = source.render_plan_with_context(context).unwrap();
+    let plan = source
+        .render_plan_with_context(context)
+        .unwrap_or_else(|error| panic!("{template}: {error:?}"));
     let bound = plan.requirements().buffer_bytes();
     let rendered = plan.render().unwrap();
     assert!(rendered.retained_buffer_bytes() <= bound);

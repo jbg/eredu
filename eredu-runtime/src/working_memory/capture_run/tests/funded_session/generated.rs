@@ -311,7 +311,7 @@ fn multiple_generated_selections_match_legacy_usage_and_generate_once() {
         (1, 1, 3, 9)
     );
     let actual = funded.take_shared_step().unwrap().unwrap();
-    let mut legacy = CaptureSession::from_shared_plan(source.clone());
+    let mut legacy = CaptureSession::new(source.clone());
     let e = DistributedCommitEpoch::new(1).unwrap();
     legacy
         .prepare_step_transaction(e, ExpertPass::Prefill, 0)

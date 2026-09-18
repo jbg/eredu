@@ -129,7 +129,7 @@ pub(super) fn advance(
     state: &mut State,
 ) -> MlxTextToken {
     let token = driver.advance(state).unwrap().unwrap().into_output();
-    driver.take_completed_step(state).unwrap();
+    driver.take_completed_delivery(state).unwrap();
     token
 }
 

@@ -83,7 +83,7 @@ struct State {
     publication_roots:RefCell<Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>>,
     authority: PartitionCommunicationAuthority,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// An immutable context clone borrows one explicit invocation. It neither
 /// selects a latest source nor creates an observer from thread-local state.
@@ -93,14 +93,14 @@ pub(crate) struct OriginalParallelBinding {
     source: RetainedCommunicationSource,
     fallback: eredu_nn::Error,
     // Every weak allocation alias keeps its original host account alive.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// The enclosing model Recovery owns this value through completion or
 /// quarantine. Closing construction never retires its observer/source owners.
 pub(crate) struct OriginalParallelInvocation {
     context: Group,
     state: Option<Rc<State>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for OriginalParallelInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -119,9 +119,9 @@ impl Drop for OriginalParallelInvocation {
     }
 }
 fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
-fn reserve(funding: &WorkspaceMetadataFunding, parts: &[usize]) -> Result<(), Error> {
+fn reserve(funding: &HostMetadataFunding, parts: &[usize]) -> Result<(), Error> {
     funding
         .reserve_metadata(
             parts
@@ -138,12 +138,12 @@ struct NeuralFailure {
     #[source]
     cause: Error,
     _source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 fn retain_neural(
     cause: Error,
     source: &RetainedCommunicationSource,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> eredu_nn::Error {
     eredu_nn::Error::backend_retained_source(NeuralFailure {
         cause,
@@ -154,13 +154,13 @@ fn retain_neural(
 fn neural_failure(
     cause: Cause,
     source: &RetainedCommunicationSource,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> eredu_nn::Error {
     retain_neural(failure(cause, source, funding), source, funding)
 }
 fn neural_failure_controls() -> Option<usize> {
     failure_control_bytes()?
-        .checked_add(eredu_nn::Error::retained_source_control_bytes::<
+        .checked_add(eredu_nn::Error::retained_source_construction_bytes::<
             NeuralFailure,
         >()?)?
         .checked_add(size_of::<NeuralFailure>())?
@@ -363,7 +363,7 @@ impl OriginalParallelBinding {
         }
         Ok(())
     }
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding {&self.funding}
+    pub(crate) fn funding(&self)->&HostMetadataFunding {&self.funding}
     pub(crate) fn error(&self,cause:Cause)->eredu_nn::Error {
         match neural_failure_controls().and_then(|n|self.funding.reserve_metadata(n).ok()) {
             Some(())=>neural_failure(cause,&self.source,&self.funding),
@@ -485,17 +485,18 @@ impl State {
             &self.funding,
             &[
                 native.binding_control_bytes().ok_or_else(overflow)?,
+                size_of::<(&RetainedCommunicationSource,&HostMetadataFunding,usize,&Occurrence)>(),
                 size_of::<
                     Result<
                         safemlx::distributed::GroupCpuOperationStorage<'_>,
-                        safemlx::distributed::GroupStorageUnavailable,
+                        safemlx::distributed::GroupCpuBindingError,
                     >,
                 >(),
             ],
         )?;
         let actual = native
             .bind_actual(input)
-            .map_err(|_| fail(Cause::Resource))?;
+            .map_err(|cause| fail(Cause::NativeBinding { index:Some(index),ordinal:Some(row.ordinal),cause }))?;
         reserve(
             &self.funding,
             &[actual.control_bytes().ok_or_else(overflow)?],

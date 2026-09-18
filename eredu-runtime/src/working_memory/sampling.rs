@@ -65,7 +65,7 @@ impl WorkspaceSamplingRandomState {
 
 mod request;
 pub use request::{
-    SamplingWorkspaceObserver, SamplingWorkspacePhase, SamplingWorkspaceReport,
+    SamplingWorkspaceObserver, SamplingWorkspacePhase, SamplingWorkspaceReport, SamplingWorkspaceInputPlan,
     WorkspaceSamplingInput, WorkspaceSamplingSource, quote_sampling_workspace,
     quote_sampling_workspace_with_observer,
 };
@@ -179,7 +179,7 @@ impl SamplingBackend for WorkspaceSamplingBackend {
     }
 
     fn error(message: String) -> Error {
-        Error::backend(message)
+        Error::backend_message(message)
     }
     fn validate_token(
         token: &WorkspaceTensor,

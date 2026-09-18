@@ -31,6 +31,7 @@ pub const QWEN_VISION: C = C::GELU_APPROXIMATE
 
 /// Qwen vision-language assembly and execution requirements.
 pub const QWEN_VL: C = QWEN_VISION
+    .union(C::FULL_U32)
     .union(C::FULL_I32)
     .union(C::ZEROS_LIKE)
     .union(C::EQUAL_I32)
@@ -57,12 +58,14 @@ pub const DEEPSEEK_V4: C = C::INDEXED_ATTENTION
 
 /// Inkling learned-relative attention and routed/shared expert requirements.
 pub const INKLING: C = C::RELATIVE_ATTENTION
+    .union(C::FULL_U32)
     .union(C::JOINT_GROUP_SELECTION)
     .union(C::FROM_I32_SLICE)
     .union(C::BROADCAST_TO);
 
 /// Gemma 4 text and media execution requirements.
 pub const GEMMA4: C = C::SIGMOID
+    .union(C::FULL_U32)
     .union(C::SOFTPLUS)
     .union(C::EXP)
     .union(C::RMS_NORM_WITHOUT_WEIGHT)
@@ -77,6 +80,7 @@ pub const GEMMA4: C = C::SIGMOID
 
 /// Muse-Glimmer text and vision execution requirements.
 pub const MUSE_GLIMMER: C = C::SIGMOID
+    .union(C::FULL_U32)
     .union(C::RMS_NORM_WITHOUT_WEIGHT)
     .union(C::FROM_I32_SLICE)
     .union(C::FULL_F32)

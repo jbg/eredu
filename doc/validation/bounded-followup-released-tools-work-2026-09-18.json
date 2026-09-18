@@ -1,0 +1,582 @@
+{
+  "started_at": "2026-09-18T07:09:48.081995+00:00",
+  "status": "failed",
+  "validator_command": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "validation/prepared_chat_tools.py",
+    "--binary",
+    "/private/tmp/eredu-current-prepared-chat-generate-work",
+    "--checkpoint",
+    "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+    "--pinned-record",
+    "doc/validation/bounded-followup-native-2026-09-18.json",
+    "--source-root",
+    "/Users/jbg/dev/eredu",
+    "--output",
+    "/private/tmp/eredu-current-released-tools-work-2026-09-18",
+    "--capacity",
+    "68719476736",
+    "--chunk",
+    "128",
+    "--max-tokens",
+    "48"
+  ],
+  "working_directory": "/Users/jbg/dev/eredu",
+  "scope": "released public ordinary prepared-chat tools; no drafter, media or numerical-reference rerun",
+  "checkpoint": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "pinned_record": "/Users/jbg/dev/eredu/doc/validation/bounded-followup-native-2026-09-18.json",
+    "pinned_record_sha256": "441a33cefd1c2f1720027ffe9c83663cb43c76b53f60217d5f77f4d872240dbb",
+    "files": [
+      {
+        "name": ".gitattributes",
+        "size": 1570,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+        "actual_sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+      },
+      {
+        "name": "LICENSE",
+        "size": 11544,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+        "actual_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      {
+        "name": "README.md",
+        "size": 61705,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9",
+        "actual_sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+      },
+      {
+        "name": "chat_template.jinja",
+        "size": 7755,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+        "actual_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+      },
+      {
+        "name": "config.json",
+        "size": 2907,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+        "actual_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+      },
+      {
+        "name": "merges.txt",
+        "size": 3353259,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+        "actual_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+      },
+      {
+        "name": "model.safetensors-00001-of-00001.safetensors",
+        "size": 1746942600,
+        "digest_algorithm": "sha256",
+        "digest": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "actual_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size": 50900,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "f691cefdb79d73270895ebd6d9594ddcecfc1838",
+        "actual_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size": 390,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+        "actual_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+      },
+      {
+        "name": "tokenizer.json",
+        "size": 12807982,
+        "digest_algorithm": "sha256",
+        "digest": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "actual_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size": 16709,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "fae3ce993e07c092ad024dde45e592379fde91bb",
+        "actual_sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+      },
+      {
+        "name": "video_preprocessor_config.json",
+        "size": 385,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+        "actual_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+      },
+      {
+        "name": "vocab.json",
+        "size": 6722759,
+        "digest_algorithm": "git-blob-sha1",
+        "digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+        "actual_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+      }
+    ]
+  },
+  "binary": {
+    "path": "/private/tmp/eredu-current-prepared-chat-generate-work",
+    "size": 847765256,
+    "sha256": "13b48faec302f4687f6e6ceef3da623d56de7d0c33c1305d7a81332b2544e529"
+  },
+  "sources": {
+    "validator_sha256": "85abded15cd6e70851531486860d702671387b282697fcd0051e1518cd4e2726",
+    "example_sha256": "a8fd5e12485f4790f069b2d9e5f82b8a8fec3cec43600ce7facf2cb2efbd704b"
+  },
+  "environment": {
+    "system": "Darwin",
+    "macos": "26.6.2",
+    "machine": "arm64",
+    "RUST_MIN_STACK": "67108864",
+    "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+    "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+    "CLANG_MODULE_CACHE_PATH": "/private/tmp/eredu-followup-clang-cache"
+  },
+  "capacity_bytes": 68719476736,
+  "capacity_scope": "enforced framework working-memory limit; not an observed memory count",
+  "runs": [
+    {
+      "policy": "required",
+      "command": [
+        "/usr/bin/time",
+        "-l",
+        "/private/tmp/eredu-current-prepared-chat-generate-work",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-current-released-tools-work-2026-09-18/required.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 35.06835520802997,
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Use the provided tool for the requested action."
+          },
+          {
+            "role": "user",
+            "content": "Call the reading tool now with value 17. Do not answer in prose."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_sha256": "a625abba320f20ccfd269570b2c65244d8f452e9970c52012e28b38e08915ce7",
+      "stdout_sha256": "23609bbdd1fa6b8a9a48dd4e0c39b55a2f5ba214a302a87fb9651847cc7211a6",
+      "stderr_sha256": "eb50671ce7c75ba40e68bfc74909f3c9a24f8f490d9e98ef6572f1c774ac6daa",
+      "stderr": "Error: prepared chat advancement failed (Other): text generation constraint failed: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n\nCaused by:\n    0: prepared chat advancement failed (Other): text generation constraint failed: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    1: prepared chat advancement failed (Other): text generation constraint failed: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    2: text generation constraint failed: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    3: text generation constraint failed: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    4: token constraint failed: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    5: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    6: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    7: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    8: prepared grammar operation failed: workspace metadata funding requires 14131 bytes, with 7107 available\n    9: workspace metadata funding requires 14131 bytes, with 7107 available\n   10: workspace metadata funding requires 14131 bytes, with 7107 available\n   11: workspace metadata funding requires 14131 bytes, with 7107 available\n   12: workspace metadata funding requires 14131 bytes, with 7107 available\n   13: workspace metadata funding requires 14131 bytes, with 7107 available\n   14: workspace metadata funding requires 14131 bytes, with 7107 available\n   15: workspace metadata funding requires 14131 bytes, with 7107 available\n   16: workspace metadata funding requires 14131 bytes, with 7107 available\n   17: workspace metadata funding requires 14131 bytes, with 7107 available\n       35.05 real        27.78 user         0.86 sys\n          2631892992  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              172033  page reclaims\n                  27  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   7  voluntary context switches\n               14876  involuntary context switches\n        400036247090  instructions retired\n        103124439638  cycles elapsed\n          5619125608  peak memory footprint\n",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 2631892992,
+        "peak_memory_footprint_bytes": 5619125608
+      },
+      "events": [
+        {
+          "TextDelta": "I"
+        }
+      ],
+      "error": "native process failed: 1"
+    },
+    {
+      "policy": "auto",
+      "command": [
+        "/usr/bin/time",
+        "-l",
+        "/private/tmp/eredu-current-prepared-chat-generate-work",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-current-released-tools-work-2026-09-18/auto.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "status": "failed",
+      "returncode": 0,
+      "wall_seconds": 25.072292916942388,
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Use the provided tool for the requested action."
+          },
+          {
+            "role": "user",
+            "content": "Call the reading tool now with value 17. Do not answer in prose."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_sha256": "8148c071c7f709a45bcfbe3b9a579a6614beba5fe5ff11328e1ca3015916e2f3",
+      "stdout_sha256": "77a3bede509666cd3356c207717a283ad1039be8b04ac9b87dc33ddb0b8652f2",
+      "stderr_sha256": "2fb8de190447e730ff498deef678997b1f3a110ff3d159d373c59be00179c2b8",
+      "stderr": "committed_tokens=9 finish=StopSequence\n       25.00 real        24.39 user         1.22 sys\n          2799173632  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              184140  page reclaims\n                   5  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                2023  involuntary context switches\n        380118016232  instructions retired\n         95019846728  cycles elapsed\n          5608639800  peak memory footprint\n",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 2799173632,
+        "peak_memory_footprint_bytes": 5608639800
+      },
+      "events": [
+        {
+          "TextDelta": "I"
+        },
+        {
+          "TextDelta": " am"
+        },
+        {
+          "TextDelta": " unable"
+        },
+        {
+          "TextDelta": " to"
+        },
+        {
+          "TextDelta": " perform"
+        },
+        {
+          "TextDelta": " this"
+        },
+        {
+          "TextDelta": " action"
+        },
+        {
+          "TextDelta": "."
+        },
+        {
+          "Finished": {
+            "reason": "stop_sequence"
+          }
+        }
+      ],
+      "error": "expected one reading(value=17) call, received []"
+    }
+  ],
+  "build": {
+    "command": "cargo build --offline -p eredu --no-default-features --features mlx,metal,image,audio --example prepared_chat_generate",
+    "log": "/private/tmp/eredu-current-native-work-example-build.log",
+    "elapsed": "3m30s",
+    "source_state": "uncommitted working tree; binary digest identifies the per-Work collector capacity revision and terminal empty-schedule sealing, before the subsequent facade terminal query and grammar fixes",
+    "log_sha256": "77ba82774239c23e0601945ad015a339f802105c751c35fbefb82e7445d19a2c"
+  },
+  "measurement_context": "Concurrent development compilation and two short synthetic Metal regressions. Acceptance observations, not an isolated latency benchmark. Successful quote total was not emitted.",
+  "outcome": {
+    "native_admission_at_original_capacity": true,
+    "required_complete_tool_call": false,
+    "auto_complete_tool_call": false,
+    "required_failure": "reached grammar host metadata funding: requires14131 bytes, available7107",
+    "auto_failure": "native generation completed StopSequence with prose declining the requested action; no semantic tool call"
+  },
+  "followup_runs": [
+    {
+      "date": "2026-09-18",
+      "status": "failed",
+      "scope": "Original generic Required request after mutable lexer/vector frame census correction; grammar and 64 GiB ceiling unchanged.",
+      "artifacts": {
+        "binary": {
+          "path": "/private/tmp/eredu-current-prepared-chat-generate-reset",
+          "sha256": "97416ced490ccb4bfae3f327d6b507ff418da439b0fe4edd7dd060d758db4467",
+          "size": 848272632
+        },
+        "request": {
+          "path": "/private/tmp/eredu-current-released-tools-work-2026-09-18/required.request.json",
+          "sha256": "a625abba320f20ccfd269570b2c65244d8f452e9970c52012e28b38e08915ce7",
+          "size": 870
+        },
+        "events": {
+          "path": "/private/tmp/eredu-released-required-generic-reset.events.jsonl",
+          "sha256": "2e89ba8d8ab7d8de6303c3044684152bf4bed6ad99112a915286679d6adcb354",
+          "size": 82
+        },
+        "stderr": {
+          "path": "/private/tmp/eredu-released-required-generic-reset.stderr.log",
+          "sha256": "c0cd3f27fbca877b96d3cffc74d77922cb96018b0f14d3e41eb71320d775dbef",
+          "size": 3625
+        },
+        "build_log": {
+          "path": "/private/tmp/eredu-current-native-reset-example-build.log",
+          "sha256": "d7d637ada834f7764db2228e8b97dd1226628a39a806e296e93a7b0b039e447d",
+          "size": 823344
+        }
+      },
+      "command": [
+        "/private/tmp/eredu-current-prepared-chat-generate-reset",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-current-released-tools-work-2026-09-18/required.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "events": [
+        {
+          "TextDelta": "I"
+        },
+        {
+          "TextDelta": " am"
+        },
+        {
+          "TextDelta": " unable"
+        },
+        {
+          "TextDelta": " to"
+        }
+      ],
+      "cause": "workspace metadata funding requires 3603 bytes, with 1360 available",
+      "next_work": "Correct repeated temporary parser frame funding lifetime; preserve persistent heap growth, recursive live frames, refusal and error custody."
+    },
+    {
+      "date": "2026-09-18",
+      "status": "native execution completed; semantic tool request not satisfied within48tokens",
+      "scope": "Original generic Required request after scoped temporary parser frame funding. Initial receipt reuse included; later final backing revalidation is not part of this binary.",
+      "artifacts": {
+        "binary": {
+          "path": "/private/tmp/eredu-current-prepared-chat-generate-receipts",
+          "sha256": "3353306c3e59cd3afdb8778e3793699a77989995b42526c3514b0223cd05bb9c",
+          "size": 847663824
+        },
+        "request": {
+          "path": "/private/tmp/eredu-current-released-tools-work-2026-09-18/required.request.json",
+          "sha256": "a625abba320f20ccfd269570b2c65244d8f452e9970c52012e28b38e08915ce7",
+          "size": 870
+        },
+        "events": {
+          "path": "/private/tmp/eredu-released-required-generic-receipts.events.jsonl",
+          "sha256": "81e13e0fb7c5421c6f65f4f3fdfdacf75a67a40c4060c0ba57022ace976176f2",
+          "size": 1052
+        },
+        "stderr": {
+          "path": "/private/tmp/eredu-released-required-generic-receipts.stderr.log",
+          "sha256": "deb2727c30adcbe99ff52e51c5559ccb0636b9903e9a72d54346348672134783",
+          "size": 794
+        },
+        "build_log": {
+          "path": "/private/tmp/eredu-current-native-receipts-build.log",
+          "sha256": "eae3e614750532264e1747f5408401e9e3f75de3faab999185de859c636cfdf1",
+          "size": 825824
+        }
+      },
+      "command": [
+        "/private/tmp/eredu-current-prepared-chat-generate-receipts",
+        "/private/tmp/eredu-bounded-qwen35-2fc06364715b967f1860aea9cf38778875588b17",
+        "/private/tmp/eredu-current-released-tools-work-2026-09-18/required.request.json",
+        "68719476736",
+        "metal:0"
+      ],
+      "exit_code": 0,
+      "committed_tokens": 48,
+      "finish": "MaxTokens",
+      "elapsed_seconds": 113.47,
+      "events": [
+        {
+          "TextDelta": "I"
+        },
+        {
+          "TextDelta": " am"
+        },
+        {
+          "TextDelta": " unable"
+        },
+        {
+          "TextDelta": " to"
+        },
+        {
+          "TextDelta": " perform"
+        },
+        {
+          "TextDelta": " this"
+        },
+        {
+          "TextDelta": " action"
+        },
+        {
+          "TextDelta": "."
+        },
+        {
+          "TextDelta": " The"
+        },
+        {
+          "TextDelta": " tool"
+        },
+        {
+          "TextDelta": " is"
+        },
+        {
+          "TextDelta": " designed"
+        },
+        {
+          "TextDelta": " to"
+        },
+        {
+          "TextDelta": " record"
+        },
+        {
+          "TextDelta": " integer"
+        },
+        {
+          "TextDelta": " values"
+        },
+        {
+          "TextDelta": ","
+        },
+        {
+          "TextDelta": " and"
+        },
+        {
+          "TextDelta": " the"
+        },
+        {
+          "TextDelta": " value"
+        },
+        {
+          "TextDelta": " "
+        },
+        {
+          "TextDelta": "1"
+        },
+        {
+          "TextDelta": "7"
+        },
+        {
+          "TextDelta": " is"
+        },
+        {
+          "TextDelta": " not"
+        },
+        {
+          "TextDelta": " a"
+        },
+        {
+          "TextDelta": " valid"
+        },
+        {
+          "TextDelta": " integer"
+        },
+        {
+          "TextDelta": "."
+        },
+        {
+          "TextDelta": " I"
+        },
+        {
+          "TextDelta": " can"
+        },
+        {
+          "TextDelta": " help"
+        },
+        {
+          "TextDelta": " you"
+        },
+        {
+          "TextDelta": " with"
+        },
+        {
+          "TextDelta": " other"
+        },
+        {
+          "TextDelta": " tasks"
+        },
+        {
+          "TextDelta": "."
+        },
+        {
+          "TextDelta": " What"
+        },
+        {
+          "TextDelta": " would"
+        },
+        {
+          "TextDelta": " you"
+        },
+        {
+          "TextDelta": " like"
+        },
+        {
+          "TextDelta": " to"
+        },
+        {
+          "TextDelta": " do"
+        },
+        {
+          "TextDelta": "?"
+        },
+        {
+          "TextDelta": " I"
+        },
+        {
+          "TextDelta": " can"
+        },
+        {
+          "TextDelta": " also"
+        },
+        {
+          "TextDelta": " help"
+        },
+        {
+          "Finished": {
+            "reason": "max_tokens"
+          }
+        }
+      ],
+      "interpretation": "Reached grammar funding refusal is closed for this complete finite request. Model emitted prose and no tool call; output limit is a truncation, not successful Required tool semantics. Sensor tool requests remain separate acceptance cases."
+    }
+  ]
+}

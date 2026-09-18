@@ -467,6 +467,7 @@ fn metal_pending_input_bounds_cover_actual_overlap_and_only_the_closed_cast_geom
     }
 }
 
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 #[test]
 fn pending_prefill_matrix_uses_complete_source_and_shared_copy_program() {
     use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
@@ -544,16 +545,17 @@ fn pending_prefill_matrix_uses_complete_source_and_shared_copy_program() {
     }
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn cpu_pending_trace_prices_integer_scalar_and_complete_matrix_worker() {
     use crate::backend::nn::workspace::{
-        MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms, MlxMetalWorkspaceMechanisms,
+        MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms, MetalAllocationFacts,
     };
-    let native = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let native = MetalAllocationFacts::current_host().unwrap();
     let selected = MlxCpuMatmulMechanism::select(
         eredu_nn::CpuMatmulImplementation::Float32Tiles,
     ).unwrap();
-    let cpu = MlxCpuWorkspaceMechanisms::new(native.allocation(), selected);
+    let cpu = MlxCpuWorkspaceMechanisms::new(native, selected);
     let stream = stream();
     let cases = [
         (Array::from_slice(&[73_u32], &[]), false),

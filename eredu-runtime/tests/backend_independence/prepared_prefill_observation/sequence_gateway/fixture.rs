@@ -5,17 +5,18 @@ use super::*;
 pub(super) struct Rows(OrdinaryTextFixture);
 impl ArchitectureParameters<FakeBackend> for Rows {
     type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.0.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+        self.0.state_layout(metadata)
     }
     fn state_identity(
         &self,
         s: &eredu_runtime::PartitionState,
         t: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.0.state_identity(s, t)
+        self.0.state_identity(s, t, metadata)
     }
-    fn parameter_description(&self, c: &()) -> Result<ArchitectureParameterDescription, Error> {
+    fn parameter_description(&self, c: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.0.parameter_description(c)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -38,24 +39,15 @@ impl LayeredArchitecture<FakeBackend, State> for Rows {
     type ForwardContext = usize;
     type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
     type Error = Error;
-    fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<PrefillObservationDeclaration>, Error> {
-        Ok(PATHS
-            .iter()
-            .enumerate()
-            .map(|(i, &path)| {
-                PrefillObservationDeclaration::causal_ordinary_text(
-                    path.into(),
-                    0,
-                    if i < 4 {
-                        PrefillReadoutStage::BeforeReadout
-                    } else {
-                        PrefillReadoutStage::VocabularyScores
-                    },
-                )
-            })
-            .collect())
+    fn prefill_observation_declarations(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<Vec<PrefillObservationDeclaration>, Error> {
+        let mut rows = match metadata { Some(context) => context.metadata_vec(PATHS.len())?, None => Vec::with_capacity(PATHS.len()) };
+        for (i, &path) in PATHS.iter().enumerate() {
+            rows.push(PrefillObservationDeclaration::causal_ordinary_text(
+                architecture_metadata::text(format_args!("{path}"), metadata)?, 0,
+                if i < 4 { PrefillReadoutStage::BeforeReadout } else { PrefillReadoutStage::VocabularyScores }));
+        }
+        Ok(rows)
     }
     fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Error> {
         Ok(Some([1, input.0.len() as u64]))
@@ -72,14 +64,14 @@ impl LayeredArchitecture<FakeBackend, State> for Rows {
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         self.0.state_partition_plan(s)
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.0.execution_graph()
     }
-    fn group_unit_count(&self, g: usize) -> Result<usize, Error> {
-        self.0.group_unit_count(g)
+    fn group_unit_count(&self, g: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        self.0.group_unit_count(g, metadata_context)
     }
-    fn unit_path(&self, g: usize, i: usize) -> Result<String, Error> {
-        self.0.unit_path(g, i)
+    fn unit_path(&self, g: usize, i: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        self.0.unit_path(g, i, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
         self.0.static_modules()
@@ -452,7 +444,6 @@ pub(super) fn accept(
     mut candidate_quote: impl FnMut(InferenceGeometry) -> IncrementalInferenceQuote,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),

@@ -71,7 +71,7 @@ fn setup(captures: u64, sliced: bool) -> (CaptureSession, CaptureDiscovery, Inte
         .admit_invocations(&discovery, bounds(), "session")
         .unwrap();
     preflight(&capture, &intervention, &Estimates).unwrap();
-    let mut run = CaptureSession::new(capture);
+    let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     run.enable_interventions(intervention, Arc::new(Estimates))
         .unwrap();
     (
@@ -352,7 +352,7 @@ fn invocation_authority_is_bound_to_shape_mode_and_survives_child_readmission() 
             Some(InterventionDtype::Float32)
         )
         .is_err());
-    assert!(CaptureSession::new(ordinary)
+    assert!(CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(ordinary))
         .enable_interventions(intervention.clone(), Arc::new(Estimates))
         .is_err());
     let mut backend = Backend::default();

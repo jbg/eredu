@@ -138,7 +138,7 @@ where
 {
     let input = numeric_text_prepared_input(&[token]);
     let admitted = A::admit_prepared_input(admission, &input, &NumericInputInspector)
-        .map_err(Error::backend_source)?;
+        .map_err(Error::backend_retained_source)?;
     let paired = PreparedCompositeInput::new(&input, &admitted).map_err(Error::backend)?;
     session
         .decode_input(paired, context)
@@ -164,7 +164,7 @@ where
     >,
 {
     let shape = A::admit_prepared_input(admission, input, &NumericInputInspector)
-        .map_err(Error::backend_source)?
+        .map_err(Error::backend_retained_source)?
         .decoder_shape();
     let geometry = eredu_core::InferenceGeometry {
         batch_size: shape[0],
@@ -178,7 +178,7 @@ where
     let mut source = session
         .prepare_media_prefill_unbudgeted(plan)
         .map_err(|e| Error::backend(e.to_string()))?;
-    let request = source.request().clone();
+    let request = source.request().expect("ordinary source retains its inference request").clone();
     let execution = session.inference_execution_identity().clone();
     let cancellation = eredu_core::GenerationCancellationToken::new();
     let trace = Rc::new(RefCell::new(Trace::default()));

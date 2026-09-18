@@ -1,7 +1,7 @@
 //! Actual prepared grammar ownership through the same original sampler container.
 use super::*;
 use eredu_core::speculative::{PreparedGrammarController, SpeculativeOutputError};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::generation::{PreparedGrammarSampler, PreparedGrammarSamplerError};
 use eredu_runtime::working_memory::WorkingMemoryError;
 
@@ -26,7 +26,7 @@ fn missing() -> Error {
 }
 fn current<'a, S: SpeculativeSampler<MlxSamplingBackend>>(
     source: &'a S,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PreparedGrammarSampler<'a, S, S::PreparedGrammar>, Error> {
     let plan = source.prepared_grammar_controller().ok_or_else(missing)?;
     if source.prepared_controller().is_some()
@@ -43,7 +43,7 @@ fn host_controls<S: SpeculativeSampler<MlxSamplingBackend>, E, L>() -> Option<us
     let parts = [
         controls::<S, E, L>(0)?,
         grammar_source_control_bytes()?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
             ?,
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure<S::PreparedGrammar>>()
             ?,
@@ -58,10 +58,10 @@ fn host_controls<S: SpeculativeSampler<MlxSamplingBackend>, E, L>() -> Option<us
         size_of::<Result<bool, Error>>(),
         size_of::<Result<(), SpeculativeControlError>>(),
         size_of::<Result<bool, SpeculativeControlError>>(),
-        size_of::<Result<HostPreparationAuthority, WorkspaceMetadataFundingError>>(),
+        size_of::<Result<HostPreparationAuthority, HostMetadataFundingError>>(),
         size_of::<Result<f32, Error>>(),
         size_of::<Result<PreparedGrammarSampler<'_, S, S::PreparedGrammar>, Error>>(),
-        size_of::<(&S, &WorkspaceMetadataFunding)>(),
+        size_of::<(&S, &HostMetadataFunding)>(),
         size_of::<(&S, SpeculativeExecutionStreams<'_>)>(),
         size_of::<(
             &mut MlxSpeculativeSampling<S, E, L>,
@@ -82,15 +82,15 @@ fn host_controls<S: SpeculativeSampler<MlxSamplingBackend>, E, L>() -> Option<us
     parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
 }
 fn prepare_host<S: SpeculativeSampler<MlxSamplingBackend>, E, L>(
-    funding: &WorkspaceMetadataFunding,
-) -> Result<HostPreparationAuthority, WorkspaceMetadataFundingError> {
-    funding.reserve_metadata(host_controls::<S, E, L>().ok_or(WorkspaceMetadataFundingError::Overflow)?)?;
+    funding: &HostMetadataFunding,
+) -> Result<HostPreparationAuthority, HostMetadataFundingError> {
+    funding.reserve_metadata(host_controls::<S, E, L>().ok_or(HostMetadataFundingError::Overflow)?)?;
     Ok(HostPreparationAuthority::retain(funding.clone()))
 }
 fn own<S: SpeculativeSampler<MlxSamplingBackend>>(
     source: S,
     host: HostPreparationAuthority,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     snapshot: Option<numerical::SnapshotContext>,
 ) -> Result<Policy<S>, Error> {
     current(&source, funding)?;
@@ -144,10 +144,8 @@ pub(super) fn copy_snapshot<S: SpeculativeSampler<MlxSamplingBackend>, E, L>(
     let original_funding = source.metadata_funding()
         .ok_or_else(|| eredu_core::BackendFailure::from_error(WorkingMemoryError::IdentityMismatch))?;
     let plan = current(source.source(), original_funding).map_err(eredu_core::BackendFailure::from_error)?;
-    let funding = WorkspaceMetadataFunding::from(
-        eredu_core::HostMetadataFunding::from_prepaid(limit, host.clone())
-            .map_err(eredu_core::BackendFailure::from_error)?,
-    );
+    let funding = HostMetadataFunding::from_prepaid(limit, host.clone())
+            .map_err(eredu_core::BackendFailure::from_error)?;
     let retained = prepare_host::<S, E, L>(&funding)
         .map_err(eredu_core::BackendFailure::from_error)?;
     let copied = plan.copy(&funding).map_err(|cause| failed(cause, &retained))?;
@@ -184,7 +182,7 @@ fn control_failure<G: PreparedGrammarController>(
 fn control_missing() -> SpeculativeControlError {
     SpeculativeControlError::Unsupported("sampler has no authenticated prepared grammar owner")
 }
-fn control_funding(cause: WorkspaceMetadataFundingError) -> SpeculativeControlError {
+fn control_funding(cause: HostMetadataFundingError) -> SpeculativeControlError {
     SpeculativeControlError::Output(SpeculativeOutputError::HostFunding(cause))
 }
 impl<S, E, L> MlxSpeculativeSampling<S, E, L>

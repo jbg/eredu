@@ -7,12 +7,11 @@ pub mod json_view;
 
 #[cfg(all(feature = "fancy-regex", not(feature = "onig")))]
 mod fancy;
-#[cfg(all(feature = "fancy-regex", not(feature = "onig")))]
-pub use fancy::SysRegex;
+
 #[cfg(feature = "onig")]
 mod onig;
-#[cfg(feature = "onig")]
-pub use crate::utils::onig::SysRegex;
+pub(crate) mod regex;
+pub use regex::SysRegex;
 
 #[cfg(not(any(feature = "onig", feature = "fancy-regex")))]
 compile_error!("One of the `onig`, or `fancy-regex` features must be enabled");

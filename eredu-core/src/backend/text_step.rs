@@ -26,6 +26,12 @@ impl TextContextError {
 /// IDs never repeat, even after all evidence for a previous machine is dropped.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextRunIdentity(Option<std::num::NonZeroU64>);
+impl TextRunIdentity {
+    pub(super) fn validate(&self) -> Result<(), super::BackendFailure> {
+        self.0.map(|_| ()).ok_or_else(|| TextContextError::RunExhausted.into_backend_failure())
+    }
+}
+
 
 /// Identity of the current policy revision, replaced before mutable exposure.
 #[derive(Clone, Debug, Eq, PartialEq)]

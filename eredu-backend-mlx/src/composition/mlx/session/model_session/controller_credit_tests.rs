@@ -246,7 +246,7 @@ fn generate<C: TokenFilterController>(
         while let Some(token) = driver.advance(&mut continuation).unwrap() {
             outputs.push(token.into_output());
             assert!(driver
-                .take_completed_step(&mut continuation)
+                .take_completed_delivery(&mut continuation)
                 .unwrap()
                 .is_none());
         }

@@ -39,6 +39,9 @@ impl<C, E> FailureOrder<C, E> {
             Self::CauseFirst { cause, cursor }
         }
     }
+    fn cursor(&self) -> &C {
+        match self { Self::CursorFirst { cursor, .. } | Self::CauseFirst { cursor, .. } => cursor }
+    }
     fn cause(&self) -> &E {
         match self {
             Self::CursorFirst { cause, .. } | Self::CauseFirst { cause, .. } => cause,
@@ -75,6 +78,11 @@ impl<S, D, const ORDINARY: bool, const PLAIN: bool, const TEXT: bool>
     }
     pub(crate) fn cause(&self) -> &StepError<S, D> {
         self.order.cause()
+    }
+    /// Borrows the committed prefix while the failed cursor keeps its source
+    /// allocation charged. No tokens or native authority leave this owner.
+    pub(crate) fn committed_token_ids(&self) -> &[u32] {
+        self.order.cursor().cursor.token_ids()
     }
 }
 impl<
@@ -307,6 +315,28 @@ impl<S: Error + Send + Sync + 'static, const ORDINARY: bool, const TEXT: bool>
             .cursor
             .step_pipeline(source, &mut projection, cancellation, emit)
         {
+            Ok(()) => Ok(self),
+            Err(cause) => Err(RetainedCursorFailure::new(cause, self)),
+        }
+    }
+}
+
+impl<S: Error + Send + Sync + 'static, const ORDINARY: bool>
+    RetainedConsumerCursor<S, eredu_core::SpeculativeOutputError, ORDINARY, false>
+{
+    /// Uses the same completion, cancellation and commitment worker with the
+    /// source-funded semantic state also consumed by speculative transactions.
+    pub(crate) fn advance_semantic<T>(
+        mut self,
+        source: &mut T,
+        semantic: &mut eredu_core::SemanticStateOwner,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<Self, RetainedCursorFailure<S, eredu_core::SpeculativeOutputError, ORDINARY, false>>
+    where
+        T: CommittedTokenSource<Error = S>,
+    {
+        match self.cursor.step_pipeline(source, semantic, cancellation, emit) {
             Ok(()) => Ok(self),
             Err(cause) => Err(RetainedCursorFailure::new(cause, self)),
         }

@@ -693,7 +693,7 @@ fn verify_active_parameter_capture_and_branches(
         (0..3)
             .map(|_| {
                 let token = generation.next().unwrap().unwrap().token_id();
-                (token, generation.take_captured_step().unwrap().unwrap())
+                (token, generation.take_captured_delivery().unwrap().unwrap())
             })
             .collect::<Vec<_>>()
     };

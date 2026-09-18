@@ -1,7 +1,7 @@
 //! Original variable exchange reuses the ordinary selected operation and count
 //! matrix. No shape vector or diagnostic string is created on this path.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::size_of;
 
 #[derive(Debug, thiserror::Error)]
@@ -19,12 +19,12 @@ enum Cause {
     #[error(transparent)]
     Tensor(#[from] crate::CommunicationTensorContractError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
-struct Failure { #[source] cause:Cause, funding:WorkspaceMetadataFunding }
-fn fail(cause:Cause,funding:&WorkspaceMetadataFunding)->PartitionExecutionError {
+struct Failure { #[source] cause:Cause, funding:HostMetadataFunding }
+fn fail(cause:Cause,funding:&HostMetadataFunding)->PartitionExecutionError {
     PartitionExecutionError::PreparedCommunication {
         operation:CommunicationOperation::VariableAllToAll,
         phase:DistributedExecutionPhase::Execution,completion:false,
@@ -33,9 +33,9 @@ fn fail(cause:Cause,funding:&WorkspaceMetadataFunding)->PartitionExecutionError 
     }
 }
 fn fixed_controls<B:VariableAllToAllBackend>()->Option<usize>{
-    let extents=[size_of::<Cause>(),size_of::<Failure>(),size_of::<WorkspaceMetadataFunding>(),
+    let extents=[size_of::<Cause>(),size_of::<Failure>(),size_of::<HostMetadataFunding>(),
         size_of::<[B::Tensor;2]>(),size_of::<(&B::Tensor,&CommunicationPeerCounts,usize,CollectiveGroupId,&B::Executor,Option<&B::ParallelContext>,&[usize],bool)>(),
-        size_of::<(&[i32],&[i32])>(),size_of::<Result<Option<(TensorDtype,usize,Option<usize>)>,WorkspaceMetadataFundingError>>(),
+        size_of::<(&[i32],&[i32])>(),size_of::<Result<Option<(TensorDtype,usize,Option<usize>)>,HostMetadataFundingError>>(),
         size_of::<Option<&eredu_core::ErasedSharedStorageOwner>>(),size_of::<crate::CommunicationPeerMatrix<'_>>(),size_of::<Option<crate::CommunicationPeerMatrix<'_>>>(),
         size_of::<Result<B::Tensor,PartitionExecutionError>>(),size_of::<Result<Option<B::Tensor>,B::CommunicationError>>(),
         size_of::<Result<Result<B::Tensor,PartitionExecutionError>,B::CommunicationError>>(),

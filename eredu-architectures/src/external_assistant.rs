@@ -44,8 +44,7 @@ use crate::{gemma4, muse_glimmer};
 use eredu_runtime::{
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, ReplicatedTextParameterOwner,
     ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
-    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureEnvelope,
-    SpeculativeCaptureMetadata, SpeculativeCaptureSchema, SpeculativeIdentity,
+    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureSchema, SpeculativeIdentity,
     SpeculativeMechanism, SpeculativeMechanismRequirements, SpeculativePlacementRequest,
     SpeculativeRealizationRequirements, SpeculativeSelectionRequest,
     SpeculativeStateCacheIdentityIngredients, SpeculativeStrategyRequirements,

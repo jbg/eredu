@@ -37,7 +37,7 @@ impl Transport {
                 cause,
                 _custody: custody,
             }),
-            None => ComputeError::backend_source(cause),
+            None => ComputeError::backend_retained_source(cause),
         })
     }
     pub(in crate::backend::nn::shared) fn tensor(
@@ -55,8 +55,8 @@ impl Transport {
 }
 pub(crate) fn control_bytes() -> Option<usize> {
     let controls = [
-        ComputeError::retained_source_control_bytes::<Failure>()?,
-        ComputeError::retained_source_control_bytes::<Exception>()?,
+        ComputeError::retained_source_construction_bytes::<Failure>()?,
+        ComputeError::retained_source_construction_bytes::<Exception>()?,
         OriginalScopeObserver::control_bytes()?,
         size_of::<Transport>(),
         size_of::<Option<Exception>>(),

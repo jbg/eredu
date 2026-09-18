@@ -288,6 +288,7 @@ where
     next_snapshot: u64,
     budget: Option<SnapshotBudget>,
     trace: TraceBudget,
+    retained_record_funding: bool,
     sequence: u64,
     epoch: u64,
     preparation: Duration,
@@ -306,11 +307,11 @@ where
     P: SpeculativePublisher<C>,
 {
     fn charge_record(&mut self, record: &impl Serialize) -> Result<(), SpeculativeControlError> {
-        let _host = if self.trace.is_prepared() {
+        let _host = if self.retained_record_funding {
             self.scheduler
                 .executor
                 .driver_host_metadata(
-                    TraceBudget::prepared_control_bytes(),
+                    TraceBudget::counting_control_bytes(),
                     self.scheduler.context,
                 )
                 .map_err(|e| {
@@ -1139,8 +1140,8 @@ where
                 run_id: 0,
                 next_snapshot: 0,
                 budget,
-                trace: if retained_bridge { TraceBudget::new_prepared(self.options.trace_limits) }
-                    else { TraceBudget::new(self.options.trace_limits) },
+                trace: TraceBudget::new(self.options.trace_limits),
+                retained_record_funding: retained_bridge,
                 sequence: 0,
                 epoch: 0,
                 preparation: self.run.started.elapsed(),

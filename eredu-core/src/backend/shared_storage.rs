@@ -1,6 +1,6 @@
 //! Closed immutable sources and their per-domain accounting custody.
 
-use super::SharedTokenFilter;
+use super::{HostPreparationAuthority, SharedTokenFilter};
 use std::{
     cmp::Ordering,
     collections::TryReserveError,
@@ -16,14 +16,21 @@ pub use owned::{ErasedSharedStorageOwner, SharedStorageOwner, SharedStorageRetir
 
 /// Process-local identity of one immutable source allocation owner.
 ///
-/// Clones keep only a separate identity allocation alive, never the source or
-/// its accounting handles. Its address cannot be reused while an identity
-/// survives. This identity is neither persistent nor execution permission.
-#[derive(Clone)]
-pub struct SharedStorageIdentity(Arc<()>);
-
-/// Compatibility name for the identity of a shared token filter.
-pub type SharedTokenFilterIdentity = SharedStorageIdentity;
+/// Value keys allocate nothing and retain neither source nor accounting owner.
+/// Their monotonically assigned IDs are never reused, including after the source
+/// retires. They are not persistent identities or execution permission.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SharedStorageIdentity(u64);
+impl SharedStorageIdentity {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .expect("process-local source identity space exhausted"))
+    }
+    /// Identity keys have no independently allocated shell.
+    pub const fn source_shell_bytes() -> Option<usize> { Some(0) }
+}
 
 /// Process-local identity of one accounting domain.
 ///
@@ -37,7 +44,7 @@ macro_rules! identity_traits {
     ($identity:ty) => {
         impl PartialEq for $identity {
             fn eq(&self, other: &Self) -> bool {
-                Arc::ptr_eq(&self.0, &other.0)
+                self.as_ptr() == other.as_ptr()
             }
         }
         impl Eq for $identity {}
@@ -48,27 +55,27 @@ macro_rules! identity_traits {
         }
         impl Ord for $identity {
             fn cmp(&self, other: &Self) -> Ordering {
-                Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
+                self.as_ptr().cmp(&other.as_ptr())
             }
         }
         impl Hash for $identity {
             fn hash<H: Hasher>(&self, state: &mut H) {
-                Arc::as_ptr(&self.0).hash(state);
+                self.as_ptr().hash(state);
             }
         }
         impl fmt::Debug for $identity {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_tuple(stringify!($identity))
-                    .field(&Arc::as_ptr(&self.0))
+                    .field(&self.as_ptr())
                     .finish()
             }
         }
     };
 }
-identity_traits!(SharedStorageIdentity);
 identity_traits!(SharedStorageDomain);
 
 impl SharedStorageDomain {
+    fn as_ptr(&self) -> *const DomainPayload { Arc::as_ptr(&self.0) }
     /// Layout of the payload in this identity's one shared allocation.
     /// The caller must separately qualify and include its Arc header. This
     /// creates no identity and grants no storage or execution authority.
@@ -124,7 +131,7 @@ pub(crate) struct SharedStorageCustody {
 impl SharedStorageCustody {
     pub(crate) fn new() -> Self {
         Self {
-            identity: SharedStorageIdentity(Arc::new(())),
+            identity: SharedStorageIdentity::new(),
             attachments: Mutex::new(Vec::new()),
         }
     }
@@ -280,8 +287,12 @@ impl Drop for SharedStorageCustody {
 struct BytesInner {
     bytes: Vec<u8>,
     custody: SharedStorageCustody,
+    authority: HostPreparationAuthority,
     #[cfg(test)]
     payload_retired: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+impl SharedStorageRetirement for BytesInner {
+    fn retire(self: Arc<Self>) { drop(Arc::into_inner(self)); }
 }
 
 impl Drop for BytesInner {
@@ -303,14 +314,24 @@ impl Drop for BytesInner {
 /// there is no mutable or consuming raw-payload export. Copying bytes creates
 /// independent caller-owned storage and does not inherit this owner's coverage.
 #[derive(Clone)]
-pub struct SharedControllerBytes(Arc<BytesInner>);
+pub struct SharedControllerBytes(SharedStorageOwner<BytesInner>);
 
 impl SharedControllerBytes {
-    /// Transfers the supplied vector without copying or shrinking its capacity.
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(Arc::new(BytesInner {
+    /// Exact source-owner and identity allocation requests, excluding the byte
+    /// destination and later domain attachments. This grants no permission.
+    pub fn source_shell_bytes() -> Option<usize> {
+        use std::{alloc::Layout, sync::atomic::AtomicUsize};
+        Layout::new::<[AtomicUsize; 2]>().extend(Layout::new::<BytesInner>()).ok()?
+            .0.pad_to_align().size().checked_add(SharedStorageIdentity::source_shell_bytes()?)
+    }
+    /// Transfers the vector and retains its existing construction authority.
+    /// The caller must pay for the destination and source shells before this
+    /// call; supplying authority alone establishes no finite storage bound.
+    pub fn new(bytes: Vec<u8>, authority: HostPreparationAuthority) -> Self {
+        Self(SharedStorageOwner::new(BytesInner {
             bytes,
             custody: SharedStorageCustody::new(),
+            authority,
             #[cfg(test)]
             payload_retired: None,
         }))
@@ -334,7 +355,13 @@ impl SharedControllerBytes {
 
     /// Whether both handles share exactly this allocation owner.
     pub fn same_storage(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.0.same_owner(&other.0)
+    }
+
+    /// Whether the retained construction authority holds this exact metadata
+    /// account. This checks custody only; it does not certify prior allocations.
+    pub fn retains_funding(&self, funding: &super::HostMetadataFunding) -> bool {
+        self.0.authority.is_funded_by(funding)
     }
 
     /// Attaches one accounting handle per domain, including to earlier clones.

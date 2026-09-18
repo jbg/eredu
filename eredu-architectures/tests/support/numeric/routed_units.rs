@@ -46,7 +46,7 @@ fn observe_units(
     let replacement = observer.intervene(&batch)?;
     let effective = replacement.as_ref().unwrap_or(&sorted);
     if effective.shape != sorted.shape {
-        return Err(Error::backend_source(
+        return Err(Error::backend_retained_source(
             eredu_nn::GroupedUnitError::ReplacementShape {
                 expected: sorted.shape.clone(),
                 actual: effective.shape.clone(),

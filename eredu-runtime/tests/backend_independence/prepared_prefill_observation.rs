@@ -141,7 +141,7 @@ struct CallbackFailure {
     identity: Arc<()>,
 }
 fn callback_error(trace: &Trace) -> Error {
-    Error::backend_source(CallbackFailure {
+    Error::backend_retained_source(CallbackFailure {
         point: trace.fault,
         identity: trace.identity.clone(),
     })

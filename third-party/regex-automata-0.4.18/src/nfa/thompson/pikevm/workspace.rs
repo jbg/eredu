@@ -16,17 +16,20 @@ mod retirement;
 pub use retirement::RetiredPrepareError;
 
 use alloc::collections::TryReserveError;
-use alloc::vec::Vec;
 use core::{alloc::Layout, fmt, mem::size_of};
 
-use super::{ActiveStates, Cache, FollowEpsilon, PikeVM, SlotTable};
+use super::{Cache, FollowEpsilon, PikeVM, SlotTable};
+use crate::util::allocation::{Allocation, AllocationError, Allocator};
+struct NoGrowth;
+impl Allocation for NoGrowth {
+    fn reserve(&self, _: usize) -> Result<(), AllocationError> {
+        Err(AllocationError::Refused)
+    }
+}
 use crate::{
     nfa::thompson::State,
-    util::{
-        primitives::{NonMaxUsize, StateID},
-        sparse_set::SparseSet,
-    },
-    Input, PatternID,
+    util::primitives::{NonMaxUsize, StateID},
+    HalfMatch, Input, PatternID,
 };
 
 /// One of the seven actual workspace reserve destinations.
@@ -80,13 +83,9 @@ impl fmt::Display for PlanError {
         f.write_str(match *self {
             PlanError::Instrumentation => "PikeVM instrumentation is enabled",
             PlanError::Prefilter => "PikeVM workspace excludes prefilters",
-            PlanError::MultiplePatterns => {
-                "PikeVM workspace requires one pattern"
-            }
+            PlanError::MultiplePatterns => "PikeVM workspace requires one pattern",
             PlanError::CaptureLayout => "invalid PikeVM workspace slot layout",
-            PlanError::CapacityOverflow => {
-                "PikeVM workspace capacity overflow"
-            }
+            PlanError::CapacityOverflow => "PikeVM workspace capacity overflow",
         })
     }
 }
@@ -134,9 +133,7 @@ impl Requirements {
         let mut epsilon = 1usize;
         for state in nfa.states() {
             let extra = match *state {
-                State::Union { ref alternates } => {
-                    alternates.len().saturating_sub(1)
-                }
+                State::Union { ref alternates } => alternates.len().saturating_sub(1),
                 State::BinaryUnion { .. } => 1,
                 State::Capture { slot, .. } => {
                     if slot.as_usize() >= slots {
@@ -150,12 +147,7 @@ impl Requirements {
                 .checked_add(extra)
                 .ok_or(PlanError::CapacityOverflow)?;
         }
-        Requirements::checked(
-            nfa.states().len(),
-            slots,
-            minimum_slots,
-            epsilon,
-        )
+        Requirements::checked(nfa.states().len(), slots, minimum_slots, epsilon)
     }
 
     fn checked(
@@ -167,10 +159,8 @@ impl Requirements {
         if states > StateID::LIMIT || slots < minimum_slots {
             return Err(PlanError::CapacityOverflow);
         }
-        let table = states
-            .checked_mul(slots)
-            .and_then(|n| n.checked_add(slots.max(minimum_slots)))
-            .ok_or(PlanError::CapacityOverflow)?;
+        let (_, _, table) = SlotTable::geometry(states, slots, minimum_slots)
+            .map_err(|_| PlanError::CapacityOverflow)?;
         let frame_bytes = array_bytes::<FollowEpsilon>(epsilon)?;
         let state_bytes = array_bytes::<StateID>(states)?;
         let slot_bytes = array_bytes::<Option<NonMaxUsize>>(table)?;
@@ -195,7 +185,9 @@ impl Requirements {
             size_of::<Result<Workspace<'static>, PrepareError<'static>>>(),
             size_of::<Result<(), TryReserveError>>(),
             size_of::<Result<Option<PatternID>, SearchError>>(),
+            size_of::<Option<HalfMatch>>(),
             size_of::<Buffer>(),
+            PikeVM::search_control_bytes(),
         ]
         .iter()
         .try_fold(0usize, |sum, &n| sum.checked_add(n))
@@ -315,29 +307,17 @@ impl<'source> Plan<'source> {
     /// Attempt each actual reserve once and retain all partial storage on
     /// failure. No source construction, clone, cache pool or source swap occurs.
     pub fn prepare(self) -> Result<Workspace<'source>, PrepareError<'source>> {
-        let mut cache = empty_cache();
+        let mut cache = Cache::empty();
         for buffer in Buffer::ALL {
             let requested = self.requested_capacity(buffer);
             let result = match buffer {
                 Buffer::Epsilon => cache.stack.try_reserve_exact(requested),
-                Buffer::CurrentDense => {
-                    cache.curr.set.try_reserve_workspace_dense(requested)
-                }
-                Buffer::CurrentSparse => {
-                    cache.curr.set.try_reserve_workspace_sparse(requested)
-                }
-                Buffer::NextDense => {
-                    cache.next.set.try_reserve_workspace_dense(requested)
-                }
-                Buffer::NextSparse => {
-                    cache.next.set.try_reserve_workspace_sparse(requested)
-                }
-                Buffer::CurrentSlots => {
-                    cache.curr.slot_table.table.try_reserve_exact(requested)
-                }
-                Buffer::NextSlots => {
-                    cache.next.slot_table.table.try_reserve_exact(requested)
-                }
+                Buffer::CurrentDense => cache.curr.set.try_reserve_workspace_dense(requested),
+                Buffer::CurrentSparse => cache.curr.set.try_reserve_workspace_sparse(requested),
+                Buffer::NextDense => cache.next.set.try_reserve_workspace_dense(requested),
+                Buffer::NextSparse => cache.next.set.try_reserve_workspace_sparse(requested),
+                Buffer::CurrentSlots => cache.curr.slot_table.table.try_reserve_exact(requested),
+                Buffer::NextSlots => cache.next.slot_table.table.try_reserve_exact(requested),
             };
             if let Err(cause) = result {
                 return Err(PrepareError {
@@ -349,11 +329,11 @@ impl<'source> Plan<'source> {
                 });
             }
         }
-        // Every destination is now reserved. The existing sparse-set resize
-        // and these table fills stay within those capacities. Do not call
-        // legacy SlotTable::reset: it has an external logging callback.
-        initialize(&mut cache.curr, self.requirements);
-        initialize(&mut cache.next, self.requirements);
+        // Execute the canonical geometry worker with all destinations reserved.
+        // The no-growth policy enforces the preparation proof before allocation.
+        cache
+            .reset_with_allocations(self.source, &NoGrowth)
+            .expect("prepared Pike cache geometry fits admitted destinations");
         Ok(Workspace {
             source: self.source,
             requirements: self.requirements,
@@ -378,27 +358,6 @@ impl fmt::Debug for Plan<'_> {
             .field("requirements", &self.requirements)
             .finish()
     }
-}
-
-fn empty_cache() -> Cache {
-    fn empty_active() -> ActiveStates {
-        ActiveStates {
-            set: SparseSet::new(0),
-            slot_table: SlotTable::new(),
-        }
-    }
-    Cache {
-        stack: Vec::new(),
-        curr: empty_active(),
-        next: empty_active(),
-    }
-}
-
-fn initialize(active: &mut ActiveStates, requirements: Requirements) {
-    active.set.resize(requirements.states);
-    active.slot_table.slots_per_state = requirements.slots;
-    active.slot_table.slots_for_captures = requirements.slots;
-    active.slot_table.table.resize(requirements.table, None);
 }
 
 fn capacities(cache: &Cache) -> [usize; 7] {
@@ -461,6 +420,23 @@ impl Workspace<'_> {
         capacities(&self.cache)
     }
 
+    /// Search for the matching pattern and end offset without capture slots.
+    ///
+    /// This uses the same leftmost search and UTF-8 empty-match filtering as
+    /// capture search. The workspace already has the maximum source geometry;
+    /// selecting zero active slots requires no additional allocation.
+    pub fn search_half(&mut self, input: &Input<'_>) -> Option<HalfMatch> {
+        #[cfg(debug_assertions)]
+        let before = self.capacities();
+        let result = self
+            .source
+            .search_slots_imp(&mut self.cache, input, &mut [], Allocator::new(&NoGrowth))
+            .expect("prepared Pike search fits admitted destinations");
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(before, self.capacities());
+        result
+    }
+
     /// Search with the unchanged PikeVM worker and this workspace's source.
     ///
     /// The caller's slot slice must fit between the source's implicit slots
@@ -473,9 +449,7 @@ impl Workspace<'_> {
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
     ) -> Result<Option<PatternID>, SearchError> {
-        if slots.len() < self.requirements.minimum_slots
-            || slots.len() > self.requirements.slots
-        {
+        if slots.len() < self.requirements.minimum_slots || slots.len() > self.requirements.slots {
             return Err(SearchError::SlotCount {
                 minimum: self.requirements.minimum_slots,
                 maximum: self.requirements.slots,
@@ -484,7 +458,10 @@ impl Workspace<'_> {
         }
         #[cfg(debug_assertions)]
         let before = self.capacities();
-        let result = self.source.search_slots(&mut self.cache, input, slots);
+        let result = self
+            .source
+            .search_slots_allocated(&mut self.cache, input, slots, Allocator::new(&NoGrowth))
+            .expect("prepared Pike search fits admitted destinations");
         #[cfg(debug_assertions)]
         debug_assert_eq!(before, self.capacities());
         Ok(result)
@@ -589,7 +566,11 @@ pub enum SearchError {
 impl fmt::Display for SearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            SearchError::SlotCount { minimum, maximum, supplied } => write!(
+            SearchError::SlotCount {
+                minimum,
+                maximum,
+                supplied,
+            } => write!(
                 f,
                 "PikeVM workspace needs {minimum}..={maximum} slots, got {supplied}",
             ),

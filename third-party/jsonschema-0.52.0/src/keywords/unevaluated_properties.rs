@@ -6,7 +6,7 @@
 //!
 //! The implementation eagerly compiles a recursive `PropertyValidators` structure during
 //! schema compilation, using `Arc<OnceLock>` for circular reference handling.
-use ahash::AHashSet;
+type PropertyNames = hashbrown::HashSet<String, ahash::RandomState>;
 mod names;
 use fancy_regex::Regex;
 use names::Names;
@@ -37,11 +37,11 @@ pub(crate) type PendingPropertyValidators<F = SerdeJson> = Arc<OnceLock<Property
 /// This structure is built during schema compilation and used during validation.
 pub(crate) struct PropertyValidators<F: Json = SerdeJson> {
     /// Property names from "properties" keyword for O(1) lookup
-    properties: AHashSet<String>,
+    properties: PropertyNames,
     /// Validator from "additionalProperties" keyword
     additional: Option<SchemaNode<F>>,
     /// Pattern-based property validators from "patternProperties" keyword
-    pattern_properties: Vec<(Regex, SchemaNode<F>)>,
+    pattern_properties: Vec<(Arc<Regex>, SchemaNode<F>)>,
     /// Validator from "unevaluatedProperties" keyword itself
     unevaluated: Option<SchemaNode<F>>,
     /// Validators from "allOf" keyword - both the schema and its property validators
@@ -68,20 +68,106 @@ pub(crate) struct PropertyValidators<F: Json = SerdeJson> {
 
 impl<F: Json> Clone for PropertyValidators<F> {
     fn clone(&self) -> Self {
-        PropertyValidators {
-            properties: self.properties.clone(),
+        self.try_clone_with_funding(&crate::compilation::Funding::default())
+            .expect("ordinary property validator copy")
+    }
+}
+impl<F: Json> PropertyValidators<F> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        use crate::regex::RegexEngine;
+        source.add(self.properties.allocation_size())?;
+        for name in &self.properties {
+            source.string(name)?;
+        }
+        for node in [&self.additional, &self.unevaluated].into_iter().flatten() {
+            source.node(node)?;
+        }
+        source.vector(&self.pattern_properties)?;
+        for (pattern, node) in &self.pattern_properties {
+            pattern.original_source(source)?;
+            source.node(node)?;
+        }
+        for rows in [&self.all_of, &self.any_of, &self.one_of] {
+            source.vector(rows)?;
+            for (node, children) in rows {
+                source.node(node)?;
+                children.original_source(source)?;
+            }
+        }
+        if let Some(conditional) = &self.conditional {
+            source.add(std::mem::size_of_val(conditional.as_ref()))?;
+            source.node(&conditional.condition)?;
+            conditional.if_.original_source(source)?;
+            for children in [&conditional.then_, &conditional.else_]
+                .into_iter()
+                .flatten()
+            {
+                children.original_source(source)?;
+            }
+        }
+        for pending in [&self.ref_, &self.dynamic_ref, &self.recursive_ref]
+            .into_iter()
+            .flatten()
+        {
+            if source.arc(pending)? {
+                pending
+                    .get()
+                    .ok_or(crate::validator::workspace::Error::Unqualified(
+                        crate::validator::workspace::Component::Source(
+                            "uninitialized property validator",
+                        ),
+                    ))?
+                    .original_source(source)?;
+            }
+        }
+        source.vector(&self.dependent)?;
+        for (key, children) in &self.dependent {
+            if source.arc(key)? {
+                source.key(key)?;
+            }
+            children.original_source(source)?;
+        }
+        Ok(())
+    }
+
+    fn try_clone_with_funding(
+        &self,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        let mut properties = PropertyNames::with_hasher(self.properties.hasher().clone());
+        for property in &self.properties {
+            funding.insert_set(&mut properties, funding.copy_str(property)?)?;
+        }
+        let branches = |rows: &[(SchemaNode<F>, PropertyValidators<F>)]| {
+            funding.copy_vec(rows, |(node, children)| {
+                Ok((node.clone(), children.try_clone_with_funding(funding)?))
+            })
+        };
+        Ok(Self {
+            properties,
             additional: self.additional.clone(),
-            pattern_properties: self.pattern_properties.clone(),
+            pattern_properties: funding.copy_vec(&self.pattern_properties, |(pattern, node)| {
+                Ok((pattern.clone(), node.clone()))
+            })?,
             unevaluated: self.unevaluated.clone(),
-            all_of: self.all_of.clone(),
-            any_of: self.any_of.clone(),
-            one_of: self.one_of.clone(),
-            conditional: self.conditional.clone(),
+            all_of: branches(&self.all_of)?,
+            any_of: branches(&self.any_of)?,
+            one_of: branches(&self.one_of)?,
+            conditional: self
+                .conditional
+                .as_ref()
+                .map(|value| funding.boxed(value.try_clone_with_funding(funding)?))
+                .transpose()?,
             ref_: self.ref_.clone(),
             dynamic_ref: self.dynamic_ref.clone(),
             recursive_ref: self.recursive_ref.clone(),
-            dependent: self.dependent.clone(),
-        }
+            dependent: funding.copy_vec(&self.dependent, |(key, children)| {
+                Ok((key.clone(), children.try_clone_with_funding(funding)?))
+            })?,
+        })
     }
 }
 
@@ -101,12 +187,29 @@ struct ConditionalValidators<F: Json = SerdeJson> {
 
 impl<F: Json> Clone for ConditionalValidators<F> {
     fn clone(&self) -> Self {
-        ConditionalValidators {
+        self.try_clone_with_funding(&crate::compilation::Funding::default())
+            .expect("ordinary conditional property copy")
+    }
+}
+impl<F: Json> ConditionalValidators<F> {
+    fn try_clone_with_funding(
+        &self,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        Ok(Self {
             condition: self.condition.clone(),
-            if_: self.if_.clone(),
-            then_: self.then_.clone(),
-            else_: self.else_.clone(),
-        }
+            if_: self.if_.try_clone_with_funding(funding)?,
+            then_: self
+                .then_
+                .as_ref()
+                .map(|value| value.try_clone_with_funding(funding))
+                .transpose()?,
+            else_: self
+                .else_
+                .as_ref()
+                .map(|value| value.try_clone_with_funding(funding))
+                .transpose()?,
+        })
     }
 }
 
@@ -133,14 +236,28 @@ impl<F: Json> PropertyValidators<F> {
     ) {
         if ctx.workspace.original() {
             let controls = crate::validator::workspace::body_controls::<F, Self>(&[
-                std::mem::size_of::<(&Self, &F::Node<'_>, &mut Names<'_>, &mut ValidationContext<'_>, bool)>(),
+                std::mem::size_of::<(
+                    &Self,
+                    &F::Node<'_>,
+                    &mut Names<'_>,
+                    &mut ValidationContext<'_>,
+                    bool,
+                )>(),
                 std::mem::size_of::<(usize, bool, Option<usize>)>(),
                 std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
                 std::mem::size_of::<Option<&Self>>(),
             ]);
-            let bytes = match controls { Ok(bytes) => bytes, Err(cause) => { ctx.workspace.refuse(cause); return; } };
+            let bytes = match controls {
+                Ok(bytes) => bytes,
+                Err(cause) => {
+                    ctx.workspace.refuse(cause);
+                    return;
+                }
+            };
             let controls = bytes.checked_add(ctx.workspace.input_controls());
-            if !ctx.workspace.reserve(controls) { return; }
+            if !ctx.workspace.reserve(controls) {
+                return;
+            }
         }
         // Break cycles from self-referential `$dynamicRef`/`$recursiveRef` where the
         // pending node resolves back to this same validators for the same instance.
@@ -195,12 +312,9 @@ impl<F: Json> PropertyValidators<F> {
                         continue; // Already marked by "properties"
                     }
                     for (pattern, _) in &self.pattern_properties {
-                        if ctx.workspace.original() {
-                            ctx.workspace.refuse(crate::validator::workspace::Error::Unqualified(
-                                crate::validator::workspace::Component::Validator("unevaluatedProperties pattern matching")));
-                            return;
-                        }
-                        if pattern.is_match(property.as_ref()).unwrap_or(false) {
+                        if crate::regex::RegexEngine::is_match(pattern, property.as_ref(), ctx)
+                            .unwrap_or(false)
+                        {
                             if !properties.insert(property.into(), ctx) {
                                 return;
                             }
@@ -341,14 +455,14 @@ impl<F: Json> ConditionalValidators<F> {
 fn compile_property_validators<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<PropertyValidators<F>, ValidationError<'a>> {
+) -> Result<PropertyValidators<F>, crate::compilation::CompileError<'a>> {
     let pending = compile_pending_property_validators(ctx, parent)?;
     // Only a reference cycle through this node keeps another handle to the cell
     Ok(match Arc::try_unwrap(pending) {
         Ok(cell) => cell
             .into_inner()
             .expect("pending node is initialized before it is returned"),
-        Err(shared) => initialized(&shared).clone(),
+        Err(shared) => initialized(&shared).try_clone_with_funding(ctx.funding())?,
     })
 }
 
@@ -356,12 +470,12 @@ fn compile_property_validators<'a, F: Json>(
 fn compile_pending_property_validators<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<PendingPropertyValidators<F>, ValidationError<'a>> {
+) -> Result<PendingPropertyValidators<F>, crate::compilation::CompileError<'a>> {
     // Create a pending node and cache it before compiling to handle circular refs
     let cache_key = ctx.location_cache_key();
-    let pending = Arc::new(OnceLock::new());
-    ctx.cache_pending_property_validators(cache_key.clone(), pending.clone());
-    ctx.cache_pending_property_validators_for_schema(parent, pending.clone());
+    let pending = ctx.funding().arc(OnceLock::new())?;
+    ctx.cache_pending_property_validators(cache_key.clone(), pending.clone())?;
+    ctx.cache_pending_property_validators_for_schema(parent, pending.clone())?;
 
     let applicator = ctx.has_vocabulary(&Vocabulary::Applicator);
 
@@ -369,7 +483,7 @@ fn compile_pending_property_validators<'a, F: Json>(
         properties: if applicator {
             compile_properties(ctx, parent)?
         } else {
-            AHashSet::new()
+            PropertyNames::with_hasher(ahash::RandomState::default())
         },
         additional: if applicator {
             compile_additional(ctx, parent)?
@@ -402,8 +516,10 @@ fn compile_pending_property_validators<'a, F: Json>(
         } else {
             None
         },
-        ref_: compile_ref(ctx, parent).map_err(ValidationError::to_owned)?,
-        dynamic_ref: compile_dynamic_ref(ctx, parent).map_err(ValidationError::to_owned)?,
+        ref_: compile_ref(ctx, parent)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
+        dynamic_ref: compile_dynamic_ref(ctx, parent)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         recursive_ref: compile_recursive_ref(ctx, parent)?,
         dependent: if applicator {
             compile_dependent(ctx, parent)?
@@ -432,56 +548,56 @@ fn initialized<F: Json>(pending: &PendingPropertyValidators<F>) -> &PropertyVali
 }
 
 fn compile_properties<'a, F: Json>(
-    _ctx: &compiler::Context<'_, F>,
+    ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<AHashSet<String>, ValidationError<'a>> {
+) -> Result<PropertyNames, crate::compilation::CompileError<'a>> {
     let Some(Value::Object(map)) = parent.get("properties") else {
-        return Ok(AHashSet::new());
+        return Ok(PropertyNames::with_hasher(ahash::RandomState::default()));
     };
     // Only need property names for evaluation tracking, not the validators
-    Ok(map.keys().cloned().collect())
+    let mut names = PropertyNames::with_hasher(ahash::RandomState::default());
+    for key in map.keys() {
+        let name = ctx.funding().copy_str(key)?;
+        ctx.funding().insert_set(&mut names, name)?;
+    }
+    Ok(names)
 }
 
 fn compile_additional<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<SchemaNode<F>>, ValidationError<'a>> {
+) -> Result<Option<SchemaNode<F>>, crate::compilation::CompileError<'a>> {
     let Some(subschema) = parent.get("additionalProperties") else {
         return Ok(None);
     };
 
-    let additional_ctx = ctx.new_at_location("additionalProperties");
+    let additional_ctx = ctx.new_at_location("additionalProperties")?;
     let node = compiler::compile(&additional_ctx, additional_ctx.as_resource_ref(subschema))
-        .map_err(ValidationError::to_owned)?;
+        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
     Ok(Some(node))
 }
 
 fn compile_pattern_properties<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Vec<(Regex, SchemaNode<F>)>, ValidationError<'a>> {
+) -> Result<Vec<(Arc<Regex>, SchemaNode<F>)>, crate::compilation::CompileError<'a>> {
     let Some(Value::Object(patterns)) = parent.get("patternProperties") else {
         return Ok(Vec::new());
     };
 
-    let pat_ctx = ctx.new_at_location("patternProperties");
-    let mut result = Vec::with_capacity(patterns.len());
+    let pat_ctx = ctx.new_at_location("patternProperties")?;
+    let mut result = Vec::new();
+    ctx.funding().grow(&mut result, patterns.len())?;
 
     for (pattern, schema) in patterns {
-        let schema_ctx = pat_ctx.new_at_location(pattern.as_str());
-        let Ok(regex) =
-            jsonschema_regex::to_rust_regex(pattern).and_then(|p| Regex::new(&p).map_err(|_| ()))
-        else {
-            return Err(ValidationError::format(
-                schema_ctx.location().clone(),
-                LazyEvaluationPath::SameAsSchemaPath,
-                Location::new(),
-                Cow::Borrowed(schema),
-                "regex",
-            ));
-        };
+        let schema_ctx = pat_ctx.new_at_location(pattern.as_str())?;
+        // This evaluation helper has always used the default fancy profile,
+        // independently of the configured pattern keyword profile.
+        let regex = ctx
+            .compile_default_regex(pattern)
+            .map_err(|error| error.diagnostic(ctx.funding(), schema_ctx.location(), schema))?;
         let node = compiler::compile(&schema_ctx, schema_ctx.as_resource_ref(schema))
-            .map_err(ValidationError::to_owned)?;
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
         result.push((regex, node));
     }
 
@@ -491,14 +607,14 @@ fn compile_pattern_properties<'a, F: Json>(
 fn compile_unevaluated<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<SchemaNode<F>>, ValidationError<'a>> {
+) -> Result<Option<SchemaNode<F>>, crate::compilation::CompileError<'a>> {
     let Some(subschema) = parent.get("unevaluatedProperties") else {
         return Ok(None);
     };
 
-    let unevaluated_ctx = ctx.new_at_location("unevaluatedProperties");
+    let unevaluated_ctx = ctx.new_at_location("unevaluatedProperties")?;
     let node = compiler::compile(&unevaluated_ctx, unevaluated_ctx.as_resource_ref(subschema))
-        .map_err(ValidationError::to_owned)?;
+        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
     Ok(Some(node))
 }
 
@@ -507,24 +623,23 @@ type CompiledPropertySubschemas<F> = Vec<(SchemaNode<F>, PropertyValidators<F>)>
 fn compile_all_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<CompiledPropertySubschemas<F>, ValidationError<'a>> {
+) -> Result<CompiledPropertySubschemas<F>, crate::compilation::CompileError<'a>> {
     let Some(Some(subschemas)) = parent.get("allOf").map(Value::as_array) else {
         return Ok(Vec::new());
     };
 
-    let all_of_ctx = ctx.new_at_location("allOf");
-    let mut result = Vec::with_capacity(subschemas.len());
+    let all_of_ctx = ctx.new_at_location("allOf")?;
+    let mut result = Vec::new();
+    ctx.funding().grow(&mut result, subschemas.len())?;
 
     for (idx, subschema) in subschemas.iter().enumerate() {
-        let subschema_ctx = all_of_ctx.new_at_location(idx);
+        let subschema_ctx = all_of_ctx.new_at_location(idx)?;
         let resource = subschema_ctx.as_resource_ref(subschema);
-        let node =
-            compiler::compile(&subschema_ctx, resource).map_err(ValidationError::to_owned)?;
+        let node = compiler::compile(&subschema_ctx, resource)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
         if let Value::Object(obj) = subschema {
-            let inner_ctx = subschema_ctx
-                .in_subresource(resource)
-                .map_err(ValidationError::from)?;
+            let inner_ctx = subschema_ctx.in_subresource(resource)?;
             let validators = compile_property_validators(&inner_ctx, obj)?;
             result.push((node, validators));
         }
@@ -536,24 +651,23 @@ fn compile_all_of<'a, F: Json>(
 fn compile_any_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<CompiledPropertySubschemas<F>, ValidationError<'a>> {
+) -> Result<CompiledPropertySubschemas<F>, crate::compilation::CompileError<'a>> {
     let Some(Some(subschemas)) = parent.get("anyOf").map(Value::as_array) else {
         return Ok(Vec::new());
     };
 
-    let any_of_ctx = ctx.new_at_location("anyOf");
-    let mut result = Vec::with_capacity(subschemas.len());
+    let any_of_ctx = ctx.new_at_location("anyOf")?;
+    let mut result = Vec::new();
+    ctx.funding().grow(&mut result, subschemas.len())?;
 
     for (idx, subschema) in subschemas.iter().enumerate() {
-        let subschema_ctx = any_of_ctx.new_at_location(idx);
+        let subschema_ctx = any_of_ctx.new_at_location(idx)?;
         let resource = subschema_ctx.as_resource_ref(subschema);
-        let node =
-            compiler::compile(&subschema_ctx, resource).map_err(ValidationError::to_owned)?;
+        let node = compiler::compile(&subschema_ctx, resource)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
         if let Value::Object(obj) = subschema {
-            let inner_ctx = subschema_ctx
-                .in_subresource(resource)
-                .map_err(ValidationError::from)?;
+            let inner_ctx = subschema_ctx.in_subresource(resource)?;
             let validators = compile_property_validators(&inner_ctx, obj)?;
             result.push((node, validators));
         }
@@ -565,24 +679,23 @@ fn compile_any_of<'a, F: Json>(
 fn compile_one_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<CompiledPropertySubschemas<F>, ValidationError<'a>> {
+) -> Result<CompiledPropertySubschemas<F>, crate::compilation::CompileError<'a>> {
     let Some(Some(subschemas)) = parent.get("oneOf").map(Value::as_array) else {
         return Ok(Vec::new());
     };
 
-    let one_of_ctx = ctx.new_at_location("oneOf");
-    let mut result = Vec::with_capacity(subschemas.len());
+    let one_of_ctx = ctx.new_at_location("oneOf")?;
+    let mut result = Vec::new();
+    ctx.funding().grow(&mut result, subschemas.len())?;
 
     for (idx, subschema) in subschemas.iter().enumerate() {
-        let subschema_ctx = one_of_ctx.new_at_location(idx);
+        let subschema_ctx = one_of_ctx.new_at_location(idx)?;
         let resource = subschema_ctx.as_resource_ref(subschema);
-        let node =
-            compiler::compile(&subschema_ctx, resource).map_err(ValidationError::to_owned)?;
+        let node = compiler::compile(&subschema_ctx, resource)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
         if let Value::Object(obj) = subschema {
-            let inner_ctx = subschema_ctx
-                .in_subresource(resource)
-                .map_err(ValidationError::from)?;
+            let inner_ctx = subschema_ctx.in_subresource(resource)?;
             let validators = compile_property_validators(&inner_ctx, obj)?;
             result.push((node, validators));
         }
@@ -597,24 +710,22 @@ fn compile_branch<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
     keyword: &'static str,
-) -> Result<Option<PropertyValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PropertyValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(value) = parent.get(keyword) else {
         return Ok(None);
     };
     let Value::Object(schema) = value else {
         return Ok(None);
     };
-    let branch_ctx = ctx.new_at_location(keyword);
-    let inner_ctx = branch_ctx
-        .in_subresource(branch_ctx.as_resource_ref(value))
-        .map_err(ValidationError::from)?;
+    let branch_ctx = ctx.new_at_location(keyword)?;
+    let inner_ctx = branch_ctx.in_subresource(branch_ctx.as_resource_ref(value))?;
     Ok(Some(compile_property_validators(&inner_ctx, schema)?))
 }
 
 fn compile_conditional<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<Box<ConditionalValidators<F>>>, ValidationError<'a>> {
+) -> Result<Option<Box<ConditionalValidators<F>>>, crate::compilation::CompileError<'a>> {
     let Some(if_value) = parent.get("if") else {
         return Ok(None);
     };
@@ -622,34 +733,35 @@ fn compile_conditional<'a, F: Json>(
         return Ok(None);
     };
 
-    let if_ctx = ctx.new_at_location("if");
+    let if_ctx = ctx.new_at_location("if")?;
     let if_resource = if_ctx.as_resource_ref(if_value);
-    let condition = compiler::compile(&if_ctx, if_resource).map_err(ValidationError::to_owned)?;
-    let if_inner_ctx = if_ctx
-        .in_subresource(if_resource)
-        .map_err(ValidationError::from)?;
+    let condition = compiler::compile(&if_ctx, if_resource)
+        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
+    let if_inner_ctx = if_ctx.in_subresource(if_resource)?;
     let if_ = compile_property_validators(&if_inner_ctx, if_schema)?;
 
     let then_ = compile_branch(ctx, parent, "then")?;
     let else_ = compile_branch(ctx, parent, "else")?;
 
-    Ok(Some(Box::new(ConditionalValidators {
+    Ok(Some(ctx.funding().boxed(ConditionalValidators {
         condition,
         if_,
         then_,
         else_,
-    })))
+    })?))
 }
 
 fn compile_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &Map<String, Value>,
-) -> Result<Option<PendingPropertyValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingPropertyValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(Value::String(reference)) = parent.get("$ref") else {
         return Ok(None);
     };
 
-    let resolved = ctx.lookup(reference).map_err(ValidationError::from)?;
+    let resolved = ctx
+        .lookup(reference)
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     let (contents, resolver, draft) = resolved.into_inner();
     if let Value::Object(subschema) = &contents {
@@ -664,7 +776,7 @@ fn compile_ref<'a, F: Json>(
 
         Ok(Some(
             compile_pending_property_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -674,12 +786,14 @@ fn compile_ref<'a, F: Json>(
 fn compile_dynamic_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &Map<String, Value>,
-) -> Result<Option<PendingPropertyValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingPropertyValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(Value::String(reference)) = parent.get("$dynamicRef") else {
         return Ok(None);
     };
 
-    let resolved = ctx.lookup(reference).map_err(ValidationError::from)?;
+    let resolved = ctx
+        .lookup(reference)
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     let (contents, resolver, draft) = resolved.into_inner();
     if let Value::Object(subschema) = &contents {
@@ -694,7 +808,7 @@ fn compile_dynamic_ref<'a, F: Json>(
 
         Ok(Some(
             compile_pending_property_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -704,7 +818,7 @@ fn compile_dynamic_ref<'a, F: Json>(
 fn compile_recursive_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &Map<String, Value>,
-) -> Result<Option<PendingPropertyValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingPropertyValidators<F>>, crate::compilation::CompileError<'a>> {
     if !parent.contains_key("$recursiveRef") {
         return Ok(None);
     }
@@ -712,7 +826,7 @@ fn compile_recursive_ref<'a, F: Json>(
     // For $recursiveRef, we need to resolve the reference and check if it's already being compiled
     let resolved = ctx
         .lookup_recursive_reference()
-        .map_err(ValidationError::from)?;
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     // Create context for the resolved reference and check its cache key
     let (contents, resolver, draft) = resolved.into_inner();
@@ -735,7 +849,7 @@ fn compile_recursive_ref<'a, F: Json>(
         // Not circular, compile normally
         Ok(Some(
             compile_pending_property_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -747,22 +861,24 @@ type DependentEntry<F> = (Arc<<F as Json>::PreparedKey>, PropertyValidators<F>);
 fn compile_dependent<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Vec<DependentEntry<F>>, ValidationError<'a>> {
+) -> Result<Vec<DependentEntry<F>>, crate::compilation::CompileError<'a>> {
     let Some(Value::Object(map)) = parent.get("dependentSchemas") else {
         return Ok(Vec::new());
     };
 
-    let dependent_ctx = ctx.new_at_location("dependentSchemas");
-    let mut result = Vec::with_capacity(map.len());
+    let dependent_ctx = ctx.new_at_location("dependentSchemas")?;
+    let mut result = Vec::new();
+    ctx.funding().grow(&mut result, map.len())?;
 
     for (property, subschema) in map {
         if let Value::Object(obj) = subschema {
-            let property_ctx = dependent_ctx.new_at_location(property.as_str());
-            let inner_ctx = property_ctx
-                .in_subresource(property_ctx.as_resource_ref(subschema))
-                .map_err(ValidationError::from)?;
+            let property_ctx = dependent_ctx.new_at_location(property.as_str())?;
+            let inner_ctx = property_ctx.in_subresource(property_ctx.as_resource_ref(subschema))?;
             let validators = compile_property_validators(&inner_ctx, obj)?;
-            result.push((Arc::new(F::prepare_key(property)), validators));
+            result.push((
+                ctx.funding().arc(ctx.funding().key::<F>(property)?)?,
+                validators,
+            ));
         }
     }
 
@@ -780,18 +896,33 @@ impl UnevaluatedPropertiesValidator {
         ctx: &'a compiler::Context<F>,
         parent: &'a Map<String, Value>,
     ) -> CompilationResult<'a, F> {
-        let validators =
-            compile_property_validators(ctx, parent).map_err(ValidationError::to_owned)?;
+        let validators = compile_property_validators(ctx, parent)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
-        Ok(Box::new(UnevaluatedPropertiesValidator {
-            location: ctx.location().join("unevaluatedProperties"),
+        Ok(ctx.funding().boxed(UnevaluatedPropertiesValidator {
+            location: ctx
+                .location()
+                .join_with_funding("unevaluatedProperties", ctx.funding())?,
             validators,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for UnevaluatedPropertiesValidator<F> {
-    fn validate<'i>(
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.location(&self.location)?;
+        self.validators.original_source(source)
+    }
+
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -819,22 +950,32 @@ impl<F: Json> Validate<F> for UnevaluatedPropertiesValidator<F> {
                 // Check against unevaluatedProperties schema
                 if let Some(unevaluated_schema) = &self.validators.unevaluated {
                     if !unevaluated_schema.is_valid(&value, ctx) {
-                        unevaluated.push(property.as_ref().to_owned());
+                        let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref()))
+                        else {
+                            return Ok(());
+                        };
+                        if !ctx.workspace.push(&mut unevaluated, name) {
+                            return Ok(());
+                        }
                     }
                 } else {
                     // No unevaluatedProperties schema means false (reject all)
-                    unevaluated.push(property.as_ref().to_owned());
+                    let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref()))
+                    else {
+                        return Ok(());
+                    };
+                    if !ctx.workspace.push(&mut unevaluated, name) {
+                        return Ok(());
+                    }
                 }
             }
 
             if !unevaluated.is_empty() {
-                return Err(ValidationError::unevaluated_properties(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    unevaluated,
-                ));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::UnevaluatedProperties {
+                        unexpected: unevaluated,
+                    })
+                });
             }
         }
         Ok(())

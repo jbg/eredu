@@ -10,7 +10,7 @@ use eredu_core::generation::SpeculativeRequestStatus;
 use eredu_core::{
     SpeculativeCallbackPublisher, SpeculativeDriverError, SpeculativeOutputError,
     SpeculativeOutputRuntime, SpeculativeSampling, SpeculativeSemanticConstraint,
-    SpeculativeSemanticState,
+    SemanticState,
 };
 #[cfg(test)]
 use eredu_core::{
@@ -165,7 +165,7 @@ where
 fn semantic_runtime<'a, S, F>(
     sampler: S,
     config: &SpeculativeConfig,
-    semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
+    semantic: impl Into<eredu_core::SemanticStateOwner>,
     cancellation: GenerationCancellationToken,
     on_event: F,
 ) -> CommittedOutputRuntime<'a, S>
@@ -287,7 +287,7 @@ where
         config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
+        semantic: impl Into<eredu_core::SemanticStateOwner>,
         on_event: F,
     ) -> Result<SpeculativeRequestId, Exception>
     where
@@ -314,7 +314,7 @@ where
         config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
+        semantic: impl Into<eredu_core::SemanticStateOwner>,
         cancellation: GenerationCancellationToken,
         on_event: F,
     ) -> Result<SpeculativeRequestId, Exception>

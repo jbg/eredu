@@ -314,8 +314,8 @@ fn ordinary(
 ) -> Vec<(NumericTensor, Values, Values)> {
     struct Populate<'a>(&'a prepared_adapter::ParameterBits);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let (shape, bits) = &self.0[metadata.id.as_str()];
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let (shape, bits) = &self.0[metadata.id().as_str()];
             assert_eq!(&value.shape, shape);
             value.data = bits.iter().map(|bits| f32::from_bits(*bits)).collect();
         }
@@ -330,7 +330,7 @@ fn ordinary(
         .static_modules_mut()
         .visit_parameters_mut(&mut Populate(fixture));
     let mut state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -389,7 +389,7 @@ fn selected_partition_providers_preserve_sparse_units_and_edits_across_tp_ep_pp_
         qwen::RoutedLayeredModel::<NumericBackend>::new(args.clone(), &NumericContext::default())
             .unwrap()
             .parameter_description(&NumericContext::default())
-            .unwrap();
+            .unwrap().into_owned();
     let inputs = [
         NumericTensor::token_ids(&[1, 2, 5]),
         NumericTensor::token_ids(&[3]),
@@ -567,7 +567,7 @@ fn k2_selected_partition_providers_preserve_sparse_units_and_edits_across_tp_ep_
             let architecture =
                 family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
             let mut state = DeviceState::<NumericBackend, _>::create(
-                architecture.state_layout().unwrap(),
+                architecture.state_layout(None).unwrap(),
                 |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
             )
             .unwrap();

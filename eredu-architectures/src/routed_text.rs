@@ -76,6 +76,9 @@ impl RoutedGroupedPlan {
         }
     }
 
+    pub(crate) fn project_local_group_range(&self,topology:eredu_core::ParallelRankTopology)->Result<std::ops::Range<usize>,eredu_core::TopologyError>{
+        match self{Self::Linear(plan)=>plan.project_local_group_range(topology),Self::Gated(plan)=>plan.project_local_group_range(topology),Self::Relu2(plan)=>plan.project_local_group_range(topology)}
+    }
     /// Checkpoint-global members owned by this rank for this bank alone.
     pub fn local_global_group_indices(&self) -> &[usize] {
         match self {
@@ -190,9 +193,9 @@ impl RoutedGroupedSpec for eredu_nn::GroupedRelu2Spec {
 
 mod banks;
 pub use banks::{PlannedAddressableBank, PlannedResidentBank};
-mod partition_units;
-mod partition_source;
-mod addressable_source;
+pub(crate) mod partition_units;
+pub(crate) mod partition_source;
+pub(crate) mod addressable_source;
 pub(crate) use partition_source::RetainedPartitionResidentSource;
 pub(crate) use partition_units::PartitionUnitProvider;
 
@@ -206,7 +209,7 @@ impl std::ops::Deref for RetainedRoutedBanks{
     fn deref(&self)->&Self::Target{self.0.as_deref().expect("live immutable routed bank table")}
 }
 impl RetainedRoutedBanks{
-    fn new(values:BTreeMap<RoutedBankId,SelectedRoutedBank>)->Self{Self(Some(std::sync::Arc::new(values)))}
+    pub(crate) fn new(values:BTreeMap<RoutedBankId,SelectedRoutedBank>)->Self{Self(Some(std::sync::Arc::new(values)))}
     fn same_source(&self,other:&Self)->bool{std::sync::Arc::ptr_eq(self.0.as_ref().expect("live bank table"),other.0.as_ref().expect("live bank table"))}
     // Existing public ordinary materialization API. Checked construction uses
     // into_shared_parts and never enters this independently owned copy path.
@@ -2407,8 +2410,9 @@ impl SelectedRoutedBank {
         catalog: ExpertResidencyCatalog,
         addressable_members: Vec<eredu_runtime::AddressableBankMember>,
         layout: &eredu_runtime::LocalModelLayout,
+        residency: eredu_runtime::ParameterBankResidency,
     ) -> Result<Self, crate::component_partition::ComponentPartitionError> {
-        let plan = plan
+        let mut plan = plan
             .with_catalog_distribution(&self.catalog)
             .map_err(crate::component_partition::ComponentPartitionError::ParameterLayout)?;
         let partition_unit_coordinates = crate::component_partition::derive_bank_unit_coordinates(
@@ -2417,6 +2421,9 @@ impl SelectedRoutedBank {
             &self.catalog,
             layout,
         )?;
+        if let eredu_runtime::ParameterBankResidency::IndependentCache(options) = residency {
+            plan.bind_partition_source(std::sync::Arc::new(addressable_source::PartitionSource::new(&self.owner_group,options)));
+        }
         Ok(Self {
             plan,
             catalog,
@@ -3434,7 +3441,7 @@ impl From<&str> for RoutedTextExecutionError {
 impl RoutedTextExecutionError {
     /// Retains a mechanism failure without erasing its typed cause.
     pub fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Source(eredu_nn::Error::backend_source(error))
+        Self::Source(eredu_nn::Error::backend_retained_source(error))
     }
 }
 
@@ -4177,7 +4184,7 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
@@ -4271,7 +4278,7 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -4299,7 +4306,7 @@ pub trait RoutedGroupedOperationValidation {
 
     /// Copies the original full specification under the outer invocation source.
     fn clone_spec_with_funding(spec:&Self::Spec,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error>;
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error>;
 
     /// Borrows the same retained grouped equation for an addressable source.
     fn workspace_kernel(spec: &Self::Spec) -> eredu_nn::workspace::WorkspaceExpertKernel<'_>;
@@ -4327,7 +4334,7 @@ pub trait RoutedGroupedOperationValidation {
 
     /// Uses the closed clone producer of the retained semantic specification.
     fn compact_spec_with_funding(spec:&Self::Spec,group_count:i32,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         if funding.is_some(){return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());}
         Self::compact_spec(spec,group_count)
     }
@@ -4378,7 +4385,7 @@ impl RoutedGroupedOperationValidation for GatedProductOperation {
     type Spec = eredu_nn::GroupedGatedProductSpec;
 
     fn clone_spec_with_funding(spec:&Self::Spec,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_gated_product(spec),None=>Ok(spec.clone())}
     }
 
@@ -4467,7 +4474,7 @@ impl RoutedGroupedOperationValidation for GatedProductOperation {
             .with_group_geometry(group_count, spec.intermediate_dimensions())
     }
     fn compact_spec_with_funding(spec:&Self::Spec,group_count:i32,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_gated_product(spec)?,None=>spec.clone()}
             .with_group_geometry(group_count,spec.intermediate_dimensions())
     }
@@ -4492,10 +4499,10 @@ where
     {
         let mut groups = bank
             .gated_product_groups(acquisition, spec, context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         groups
             .forward_grouped_with_unit_observer(input, routes, context, observer)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -4519,7 +4526,7 @@ where
     {
         let mut groups = bank
             .gated_product_groups(acquisition, spec, context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         B::gated_product_groups_tensor_parallel_with_unit_observer(
             &mut groups,
             input,
@@ -4528,7 +4535,7 @@ where
             context,
             observer,
         )
-        .map_err(eredu_nn::Error::backend_source)
+        .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -4536,7 +4543,7 @@ impl RoutedGroupedOperationValidation for Relu2Operation {
     type Spec = eredu_nn::GroupedRelu2Spec;
 
     fn clone_spec_with_funding(spec:&Self::Spec,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_relu2(spec),None=>Ok(spec.clone())}
     }
 
@@ -4595,7 +4602,7 @@ impl RoutedGroupedOperationValidation for Relu2Operation {
         spec.clone().with_group_count(group_count)
     }
     fn compact_spec_with_funding(spec:&Self::Spec,group_count:i32,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_relu2(spec)?,None=>spec.clone()}
             .with_group_count(group_count)
     }
@@ -4647,10 +4654,10 @@ where
     {
         let mut groups = bank
             .relu2_groups(acquisition, spec, context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         groups
             .forward_grouped_with_unit_observer(input, routes, context, observer)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -4674,7 +4681,7 @@ where
     {
         let mut groups = bank
             .relu2_groups(acquisition, spec, context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         B::relu2_groups_tensor_parallel_with_unit_observer(
             &mut groups,
             input,
@@ -4683,7 +4690,7 @@ where
             context,
             observer,
         )
-        .map_err(eredu_nn::Error::backend_source)
+        .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -4834,7 +4841,7 @@ where
             owner_group,
             plan,
             catalog,
-            selected_member_bytes,
+            &selected_member_bytes,
             bank,
             movement,
             options,
@@ -4848,7 +4855,7 @@ where
         owner_group: eredu_runtime::ExecutionGroupId,
         plan: ExpertRealizationPlan<O::Spec>,
         catalog: ExpertResidencyCatalog,
-        selected_member_bytes: BTreeMap<ParameterBankKey, u64>,
+        selected_member_bytes: &BTreeMap<ParameterBankKey, u64>,
         bank: Bank,
         movement: Movement,
         options: eredu_runtime::ParameterBankLoadOptions,
@@ -4863,7 +4870,7 @@ where
             &owner_group,
             &plan,
             &catalog,
-            &selected_member_bytes,
+            selected_member_bytes,
             |key| bank.member_bytes(key),
         )?;
         Ok(Self {
@@ -5055,7 +5062,7 @@ where
                 .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(&controls)))
                 .and_then(|bytes| controls.into_iter().try_fold(bytes, usize::checked_add))
                 .and_then(|bytes| bytes.checked_add(
-                    eredu_nn::Error::retained_source_control_bytes::<RoutedTextExecutionError>()?));
+                    eredu_nn::Error::retained_source_construction_bytes::<RoutedTextExecutionError>()?));
             demands.reserve_metadata(bytes)
                 .map_err(RoutedTextExecutionError::Source)?;
         }
@@ -5176,7 +5183,7 @@ where
         partitions: Option<usize>,
         context: &<B::Tensor as Tensor>::Context,
         run:fn(&mut Self,RoutedExpertRequest<'a,'observer,B::Tensor>,Option<usize>,
-            eredu_runtime::expert::AddressableChunkPlan,Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+            eredu_runtime::expert::AddressableChunkPlan,Option<&eredu_nn::workspace::HostMetadataFunding>,
             &<B::Tensor as Tensor>::Context)
             ->Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>,RoutedTextExecutionError>,
     ) -> Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>,RoutedTextExecutionError>
@@ -5218,7 +5225,7 @@ where
         {
             let interested=request.unit_observer.is_some();
             let mut observe=|source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>|request.unit_observer.as_mut()
-                .ok_or_else(||eredu_nn::Error::backend_source(eredu_nn::GroupedUnitError::Unavailable))?
+                .ok_or_else(||eredu_nn::Error::backend_retained_source(eredu_nn::GroupedUnitError::Unavailable))?
                 .observe_addressable_source(source);
             if let Some(output)=B::record_addressable_region_source(source,input,routes,context,
                 interested.then_some(&mut observe as &mut dyn for<'view> FnMut(eredu_nn::workspace::WorkspaceAddressableObservationView<'view>)->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,eredu_nn::Error>))
@@ -5227,7 +5234,7 @@ where
         let mut callback=addressable_source::Callback {request:Some(request),error:None,chunks,partitions,context,run};
         // Passing the entire named frame prevents disjoint closure captures
         // from changing the native/cold descriptor's callback census.
-        let mut invoke=|owner:&mut Self,funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>| {
+        let mut invoke=|owner:&mut Self,funding:Option<&eredu_nn::workspace::HostMetadataFunding>| {
             owner.invoke_addressable_callback(&mut callback,funding)
         };
         if let Some(metadata)=B::construction_metadata(context) {
@@ -5250,7 +5257,7 @@ where
     }
 
     fn invoke_addressable_callback(&mut self,callback:&mut addressable_source::Callback<'_,'_,'_,Self,B::Tensor>,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)
         ->Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>,()> {
         let request=callback.request.take().ok_or(())?;
         let result=(callback.run)(self,request,callback.partitions,callback.chunks,funding,callback.context);
@@ -5276,7 +5283,7 @@ where
         &mut self,
         mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         chunks: eredu_runtime::expert::AddressableChunkPlan,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RoutedTextExecutionError> {
         let selected = self
@@ -5520,7 +5527,7 @@ where
         mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         chunks: eredu_runtime::expert::AddressableChunkPlan,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>, RoutedTextExecutionError> {
         let selected = self
@@ -6882,7 +6889,7 @@ pub struct LinearOperation;
 impl RoutedGroupedOperationValidation for LinearOperation {
     type Spec = eredu_nn::GroupedLinearSpec;
     fn clone_spec_with_funding(spec:&Self::Spec,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_linear(spec),None=>Ok(spec.clone())}
     }
 
@@ -6938,7 +6945,7 @@ impl RoutedGroupedOperationValidation for LinearOperation {
         spec.clone().with_group_count(groups)
     }
     fn compact_spec_with_funding(spec:&Self::Spec,groups:i32,
-        funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
+        funding:Option<&eredu_nn::workspace::HostMetadataFunding>)->Result<Self::Spec,eredu_nn::Error> {
         match funding {Some(funding)=>funding.clone_grouped_linear(spec)?,None=>spec.clone()}
             .with_group_count(groups)
     }
@@ -6958,16 +6965,16 @@ impl<B: GroupedNeuralBackend> RoutedGroupedOperation<B> for LinearOperation {
         Bank::Error: std::fmt::Display,
     {
         if observer.is_some() {
-            return Err(eredu_nn::Error::backend_source(
+            return Err(eredu_nn::Error::backend_retained_source(
                 eredu_nn::GroupedUnitError::Unavailable,
             ));
         }
         let mut groups = bank
             .linear_groups(acquisition, spec, context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         groups
             .forward_grouped(input, routes, context)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -7013,3 +7020,7 @@ where
         ))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
+
+use eredu_nn::workspace::ParameterMetadataAllocation;

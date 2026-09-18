@@ -2,23 +2,23 @@ use super::*;
 use crate::capture::partition::{PartitionCaptureRoutedFragmentGeometry,PartitionCaptureRoutedFragmentSource,
     PreparedPartitionFragmentAllowance,PreparedPartitionFragmentSourceAllowance};
 use eredu_core::capture::{SharedCapturePlan,CaptureRoutedUnitsGeometry};
-use eredu_nn::workspace::{WorkspaceMetadataAccount,WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount,HostMetadataFunding,HostMetadataFundingError};
 #[derive(Debug)]
 struct Account(Arc<AtomicUsize>,Arc<AtomicBool>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError> {self.0.fetch_add(bytes,Ordering::SeqCst);Ok(())}
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError> {self.0.fetch_add(bytes,Ordering::SeqCst);Ok(())}
 }
 impl Drop for Account {fn drop(&mut self){self.1.store(true,Ordering::SeqCst);}}
-fn funding()->(WorkspaceMetadataFunding,Arc<AtomicUsize>,Arc<AtomicBool>) {
+fn funding()->(HostMetadataFunding,Arc<AtomicUsize>,Arc<AtomicBool>) {
     let used=Arc::new(AtomicUsize::new(0));let retired=Arc::new(AtomicBool::new(false));
-    (WorkspaceMetadataFunding::new(Account(used.clone(),retired.clone())).unwrap(),used,retired)
+    (HostMetadataFunding::new(Account(used.clone(),retired.clone())).unwrap(),used,retired)
 }
 #[test]
 fn routed_fragment_allowance_preserves_shared_costs_source_vote_and_move_only_native_credits() {
     for dtype in [TensorDtype::F32,TensorDtype::F64] {
         let source=SharedCapturePlan::new(fixture::plan(false));
         let mut ledger=CaptureLedger::new(source.admission());let mut second=CaptureLedger::new(source.admission());
-        let make=|ledger:&mut CaptureLedger|PartitionCaptureReceiptPlan::new_routed_shared(source.clone(),context(source.admission()),
+        let make=|ledger:&mut CaptureLedger|PartitionCaptureReceiptPlan::new_routed(source.clone(),context(source.admission()),
             fixture::producers(source.admission(),true),8,fixture::limits(),ledger).unwrap();
         let mut receipt=make(&mut ledger);let mut voted_receipt=make(&mut second);
         let raw:Vec<_>=receipt.producers().flat_map(|(rank,projection)|projection.fragments().iter().enumerate().map(move |(fragment,_)| {
@@ -70,7 +70,7 @@ fn routed_source_vote_preserves_idle_presence_and_requires_real_common_result_pr
                 let transport=transport(shared,rank,Fault::None);
                 let mut ledger=CaptureLedger::new(source.admission());
                 let context=context(source.admission());
-                let receipt=PartitionCaptureReceiptPlan::new_routed_shared(source.clone(),context.clone(),
+                let receipt=PartitionCaptureReceiptPlan::new_routed(source.clone(),context.clone(),
                     fixture::producers(source.admission(),true),8,fixture::limits(),&mut ledger).unwrap();
                 let (metadata,_,_)=funding();
                 let coordination=crate::capture::partition::PreparedPartitionCaptureCoordination::prepare(

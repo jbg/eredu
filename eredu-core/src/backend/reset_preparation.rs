@@ -1,4 +1,4 @@
-//! Explicit ordinary settlement followed by one original, nonblocking reset.
+//! Explicit ordinary settlement followed by one originally funded reset.
 
 use super::{
     BackendFailure, BackendFailureKind, BackendSession, ModelRuntime, SessionCapabilities,
@@ -58,7 +58,13 @@ pub trait SessionResetPreparationBackend: TextGenerationBackend {
     /// Validate claim/session, current health and the exact source, selection,
     /// revision and domain before one original comparison and construction.
     /// No unreserved wait, native progress, global reap or replacement grant is
-    /// permitted. Failure preserves installed state and all unresolved owners.
+    /// permitted. Distributed implementations may run separately admitted bounded
+    /// readiness exchanges through the retained session coordinator. Those actual
+    /// producers participate in this operation's application limit and domain
+    /// capacity; the claim alone grants no communication work.
+    /// Failure before publication preserves installed state. If ranks disagree
+    /// about publication, the implementation fences the session and retains all
+    /// unresolved/displaced owners; it must not pretend to roll back or refund.
     /// Host publication and displaced-state retirement need their own complete
     /// originally priced controls. Returning success does not authorize reuse
     /// of readiness after queued retirement or another operation.
@@ -141,12 +147,14 @@ impl<B: SessionResetPreparationBackend> ModelRuntime<B> {
 }
 
 impl<B: SessionResetPreparationBackend> PreparedSessionReset<'_, B> {
-    /// Consumes this readiness for one original reset without implicitly waiting.
+    /// Consumes this readiness for one original reset without waiting on prior work.
     ///
     /// Core revalidates actual capabilities, then creates the genuine claim for
     /// the session captured before the exclusive borrow. The backend must bind
     /// the actual source and obtain original domain acceptance before allocation.
-    /// This neither refills prior accounts nor authorizes native waiting.
+    /// This neither refills prior accounts nor independently authorizes native
+    /// waiting. Any distributed readiness exchange requires its own originally
+    /// admitted producers and the retained bounded completion policy.
     pub fn reset_admitted(self, limits: SessionResetLimits) -> Result<(), BackendFailure> {
         self.admission.validate(self.ready.capabilities())?;
         let claim =

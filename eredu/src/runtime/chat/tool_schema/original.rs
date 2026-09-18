@@ -1,20 +1,21 @@
 //! Facade representation adapter over the paid ordinary serde event tree.
 //! Compiled sources are cold declarations, separate from invocation authority.
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{
     OriginalJsonChildren, OriginalJsonNode, OriginalJsonNumber, OriginalJsonTree,
     OriginalJsonTreeError, OriginalJsonValueKind,
 };
 use jsonschema::{
-    json::{Array, Json, JsonNumber, Node, NodeIdentity, Object},
     JsonType, OriginalJson, OriginalValidationError, OriginalValidationFunding,
     OriginalValidationSource,
+    json::{Array, Json, JsonNumber, Node, NodeIdentity, Object},
 };
+use llguidance::derivre::{ParserAllocationFailure, ParserAllocationFunding};
 use std::{
     borrow::Cow,
     mem::{size_of, size_of_val},
-    sync::Arc,
+    sync::{Arc, OnceLock, atomic::AtomicUsize},
 };
 
 #[derive(Debug)]
@@ -27,16 +28,23 @@ pub(crate) enum Input<'a> {
 pub(crate) struct Members<'a>(OriginalJsonChildren<'a>);
 pub(crate) struct Elements<'a>(OriginalJsonChildren<'a>);
 pub(crate) struct Container<'a>(OriginalJsonNode<'a>);
-pub(crate) struct Number(OriginalJsonNumber);
+pub(crate) struct Number<'a>(OriginalJsonNumber<'a>);
 impl Json for Representation {
     type Node<'a> = Input<'a>;
     type PreparedKey = String;
     type StringBuffer = ();
-    fn prepare_key(key: &str) -> String {
-        key.to_owned()
+    fn prepare_key_with_allocations(
+        key: &str,
+        allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<String, jsonschema::json::KeyPreparationError> {
+        Ok(serde_json::allocation::Allocator::new(allocations).copy_string(key)?)
     }
-    fn with_string_node<T>(_: &mut (), string: &str, f: impl FnOnce(Input<'_>) -> T) -> T {
-        f(Input::String(string))
+    fn prepare_string_node_with_allocations<'a>(
+        _: &'a mut (),
+        string: &'a str,
+        _: &dyn serde_json::allocation::Allocation,
+    ) -> Result<Input<'a>, jsonschema::json::KeyPreparationError> {
+        Ok(Input::String(string))
     }
 }
 impl OriginalJson for Representation {
@@ -47,10 +55,11 @@ impl OriginalJson for Representation {
         let invoke = size_of::<(&mut (), &str, Input<'_>)>();
         Some((prepare, invoke))
     }
-    fn original_key_bytes(key: &String) -> Option<usize> { Some(key.capacity()) }
-    fn original_number_bytes(_: &serde_json::Number) -> Option<usize> {
-        // The actual serde plan refuses arbitrary-precision representation.
-        serde_json::bounded_events::Plan::prepare(b"0").ok().map(|_| 0)
+    fn original_key_bytes(key: &String) -> Option<usize> {
+        Some(key.capacity())
+    }
+    fn original_number_bytes(number: &serde_json::Number) -> Option<usize> {
+        Some(number.allocation_size())
     }
     fn original_input_controls() -> Option<usize> {
         // Only borrowed primitive operations are reached by qualified bodies.
@@ -60,12 +69,12 @@ impl OriginalJson for Representation {
             size_of::<Container<'_>>(),
             size_of::<Members<'_>>(),
             size_of::<Elements<'_>>(),
-            size_of::<Number>(),
+            size_of::<Number<'_>>(),
             size_of::<OriginalJsonNode<'_>>(),
             size_of::<OriginalJsonChildren<'_>>(),
             size_of::<Option<(&str, Input<'_>)>>(),
             size_of::<Option<Input<'_>>>(),
-            size_of::<Option<Number>>(),
+            size_of::<Option<Number<'_>>>(),
             size_of::<Option<NodeIdentity>>(),
             size_of::<Option<Cow<'_, str>>>(),
             size_of::<std::str::Chars<'_>>(),
@@ -82,12 +91,13 @@ impl OriginalJson for Representation {
             .try_fold(size_of_val(&parts), usize::checked_add)
     }
 }
-impl JsonNumber for Number {
+impl JsonNumber for Number<'_> {
     fn as_u64(&self) -> Option<u64> {
         match self.0 {
             OriginalJsonNumber::U64(n) => Some(n),
             OriginalJsonNumber::I64(n) => n.try_into().ok(),
             OriginalJsonNumber::F64(_) => None,
+            OriginalJsonNumber::Exact(n)=>n.as_u64(),
         }
     }
     fn as_i64(&self) -> Option<i64> {
@@ -95,6 +105,7 @@ impl JsonNumber for Number {
             OriginalJsonNumber::I64(n) => Some(n),
             OriginalJsonNumber::U64(n) => n.try_into().ok(),
             OriginalJsonNumber::F64(_) => None,
+            OriginalJsonNumber::Exact(n)=>n.as_i64(),
         }
     }
     fn as_f64(&self) -> Option<f64> {
@@ -102,14 +113,17 @@ impl JsonNumber for Number {
             OriginalJsonNumber::I64(n) => n as f64,
             OriginalJsonNumber::U64(n) => n as f64,
             OriginalJsonNumber::F64(n) => n,
+            OriginalJsonNumber::Exact(n)=>return n.as_f64(),
         })
     }
     // These cold conversions remain unqualified in original dispatch.
     fn as_str(&self) -> Cow<'_, str> {
+        if let OriginalJsonNumber::Exact(number)=self.0 {if let Some(text)=number.source_text(){return Cow::Borrowed(text);}}
         Cow::Owned(self.to_number().to_string())
     }
     fn to_number(&self) -> Cow<'_, serde_json::Number> {
         Cow::Owned(match self.0 {
+            OriginalJsonNumber::Exact(n)=>return Cow::Borrowed(n),
             OriginalJsonNumber::I64(n) => n.into(),
             OriginalJsonNumber::U64(n) => n.into(),
             OriginalJsonNumber::F64(n) => {
@@ -121,13 +135,14 @@ impl JsonNumber for Number {
         match self.0 {
             OriginalJsonNumber::I64(_) | OriginalJsonNumber::U64(_) => true,
             OriginalJsonNumber::F64(n) => n.fract() == 0.0,
+            OriginalJsonNumber::Exact(n)=>jsonschema::json::JsonNumber::is_integer(&n),
         }
     }
 }
 impl<'a> Node<'a, Representation> for Input<'a> {
     type Object = Container<'a>;
     type Array = Container<'a>;
-    type Number = Number;
+    type Number = Number<'a>;
     fn as_object(&self) -> Option<Container<'a>> {
         match self {
             Self::Tree(node) if node.kind() == OriginalJsonValueKind::Object => {
@@ -150,7 +165,7 @@ impl<'a> Node<'a, Representation> for Input<'a> {
             Self::Tree(node) => node.string().map(Cow::Borrowed),
         }
     }
-    fn as_number(&self) -> Option<Number> {
+    fn as_number(&self) -> Option<Number<'a>> {
         match self {
             Self::Tree(node) => node.number().map(Number),
             Self::String(_) => None,
@@ -253,17 +268,92 @@ impl<'a> Array<'a, Representation> for Container<'a> {
 }
 
 #[derive(Debug)]
+struct CompilationAccount {
+    failure: OnceLock<ParserAllocationFailure>,
+    funding: ParserAllocationFunding,
+}
+impl jsonschema::CompilationFunding for CompilationAccount {
+    fn reserve(&self, bytes: usize) -> Result<(), jsonschema::CompilationAllocationError> {
+        if self.failure.get().is_some() {
+            return Err(jsonschema::CompilationAllocationError::Refused);
+        }
+        self.funding.reserve(bytes).map_err(|cause| {
+            let _ = self.failure.set(cause);
+            jsonschema::CompilationAllocationError::Refused
+        })
+    }
+    fn source_error(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.failure.get().map(|cause| cause as _)
+    }
+}
+#[derive(Debug, thiserror::Error)]
+enum CompilationCause {
+    #[error(transparent)]
+    Funding(#[from] ParserAllocationFailure),
+    #[error(transparent)]
+    Schema(#[from] jsonschema::CompilationError),
+    #[error("tool schema compiler extent overflow")]
+    Overflow,
+}
+/// The dependency error and callback shell retire before their original payer.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub(crate) struct CompilationFailure {
+    #[source]
+    cause: CompilationCause,
+    authority: HostPreparationAuthority,
+    funding: ParserAllocationFunding,
+}
+
+impl CompilationFailure {
+    pub(crate) fn is_local_property_error(&self) -> bool {
+        matches!(&self.cause, CompilationCause::Schema(error)
+            if error.schema_error().is_some() || matches!(error.reference_error(),
+                Some(jsonschema::ReferencingError::PointerToNowhere { .. }
+                    | jsonschema::ReferencingError::NoSuchAnchor { .. })))
+    }
+    pub(crate) fn is_unqualified(&self) -> bool {
+        use std::error::Error;
+        let mut cause: &(dyn Error + 'static) = self;
+        loop {
+            if matches!(
+                cause.downcast_ref::<OriginalValidationError>(),
+                Some(OriginalValidationError::Unqualified(_))
+            ) || matches!(
+                cause.downcast_ref::<jsonschema::CompilationAllocationError>(),
+                Some(jsonschema::CompilationAllocationError::Unqualified(_))
+            ) {
+                return true;
+            }
+            match cause.source() {
+                Some(next) => cause = next,
+                None => return false,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Payload {
     validator: OriginalValidationSource<Representation>,
     authority: HostPreparationAuthority,
+    funding: ParserAllocationFunding,
 }
 /// Cold typed source. Construction is never called by the original completion.
 #[derive(Debug, Clone)]
-pub(crate) struct Source(Arc<Payload>);
+pub(crate) struct Source(Option<Arc<Payload>>);
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            // The last alias frees its shell before the graph and source payer.
+            drop(Arc::into_inner(owner));
+        }
+    }
+}
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Validation(#[from] OriginalValidationError),
     #[error("tool arguments must be a JSON object")]
@@ -283,7 +373,7 @@ pub(crate) struct Failure {
     tree: Option<OriginalJsonTree>,
     parse_failure: Option<OriginalJsonTreeError>,
     source: Source,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -304,8 +394,8 @@ impl std::error::Error for Failure {
     }
 }
 struct Loan<'a> {
-    funding: &'a WorkspaceMetadataFunding,
-    failure: Option<WorkspaceMetadataFundingError>,
+    funding: &'a HostMetadataFunding,
+    failure: Option<HostMetadataFundingError>,
 }
 impl OriginalValidationFunding for Loan<'_> {
     fn reserve(&mut self, bytes: usize) -> bool {
@@ -322,36 +412,127 @@ impl OriginalValidationFunding for Loan<'_> {
     }
 }
 impl Source {
-    /// Ordinary immutable source construction. The caller supplies and retains
-    /// source authority; this method makes no finite compilation bound claim.
+    fn payload(&self) -> &Payload {
+        self.0.as_deref().expect("live schema source")
+    }
+    /// One schema compiler for funded and explicitly unenforced preparation.
+    /// The dependency owns its default options, graph and diagnostic producers.
     pub(crate) fn compile(
         schema: &serde_json::Value,
         authority: &HostPreparationAuthority,
-    ) -> Result<Self, String> {
-        let options = jsonschema::ValidationOptions::<
-            '_,
-            Arc<dyn jsonschema::Retrieve>,
-            Representation,
-        >::default();
-        let validator = options.build(schema).map_err(|error| error.to_string())?;
-        Ok(Self(Arc::new(Payload {
-            validator: OriginalValidationSource::new(validator),
+        funding: &ParserAllocationFunding,
+    ) -> Result<Self, CompilationFailure> {
+        let result = (|| -> Result<Self, CompilationCause> {
+            let source_shell = std::alloc::Layout::new::<[AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<Payload>())
+                .map_err(|_| CompilationCause::Overflow)?
+                .0
+                .pad_to_align()
+                .size();
+            let callback_shell = if funding.is_enforced() {
+                std::alloc::Layout::new::<[AtomicUsize; 2]>()
+                    .extend(std::alloc::Layout::new::<CompilationAccount>())
+                    .map_err(|_| CompilationCause::Overflow)?
+                    .0
+                    .pad_to_align()
+                    .size()
+            } else {
+                0
+            };
+            let controls = [
+                source_shell,
+                callback_shell,
+                size_of::<Self>(),
+                size_of::<Payload>(),
+                size_of::<Option<Arc<Payload>>>(),
+                size_of::<Option<Payload>>(),
+                size_of::<CompilationAccount>(),
+                size_of::<Option<Arc<dyn jsonschema::CompilationFunding>>>(),
+                size_of::<CompilationCause>(),
+                size_of::<CompilationFailure>(),
+                size_of::<Result<Self, CompilationFailure>>(),
+                size_of::<Result<Self, CompilationCause>>(),
+                size_of::<
+                    Result<jsonschema::Validator<Representation>, jsonschema::CompilationError>,
+                >(),
+                size_of::<jsonschema::Validator<Representation>>(),
+                size_of::<OriginalValidationSource<Representation>>(),
+                size_of::<(
+                    &serde_json::Value,
+                    &HostPreparationAuthority,
+                    &ParserAllocationFunding,
+                )>(),
+            ];
+            let bytes = controls
+                .into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add)
+                .ok_or(CompilationCause::Overflow)?;
+            funding.reserve(bytes)?;
+            let source = if funding.is_enforced() {
+                Some(Arc::new(CompilationAccount {
+                    failure: OnceLock::new(),
+                    funding: funding.clone(),
+                })
+                    as Arc<dyn jsonschema::CompilationFunding>)
+            } else {
+                None
+            };
+            let validator =
+                jsonschema::Validator::<Representation>::build_with_funding(schema, source)?;
+            Ok(Self(Some(Arc::new(Payload {
+                validator: OriginalValidationSource::new(validator)?,
+                authority: authority.clone(),
+                funding: funding.clone(),
+            }))))
+        })();
+        result.map_err(|cause| CompilationFailure {
+            cause,
             authority: authority.clone(),
-        })))
+            funding: funding.clone(),
+        })
     }
     /// Cold immutable backing census. This is called before original admission;
     /// completion consumes a stored receipt and never walks this graph.
-    pub(crate) fn capacity_bytes(&self) -> Result<usize, OriginalValidationError> {
-        let shell = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
-            .extend(std::alloc::Layout::new::<Payload>()).map_err(|_| OriginalValidationError::Overflow)?
-            .0.pad_to_align().size();
-        shell.checked_add(self.0.validator.retained_bytes()?).ok_or(OriginalValidationError::Overflow)
+    pub(crate) fn capacity_bytes(&self) -> Result<usize, CompilationFailure> {
+        let payload = self.payload();
+        let result = (|| -> Result<_, CompilationCause> {
+            let parts = [
+                size_of::<&Self>(),
+                size_of::<std::alloc::Layout>(),
+                size_of::<CompilationCause>(),
+                size_of::<CompilationFailure>(),
+                size_of::<Result<usize, CompilationFailure>>(),
+                size_of::<Result<usize, CompilationCause>>(),
+                size_of::<Result<usize, jsonschema::CompilationError>>(),
+            ];
+            let controls = parts
+                .into_iter()
+                .try_fold(size_of_val(&parts), usize::checked_add)
+                .ok_or(CompilationCause::Overflow)?;
+            payload.funding.reserve(controls)?;
+            let shell = std::alloc::Layout::new::<[AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<Payload>())
+                .map_err(|_| CompilationCause::Overflow)?
+                .0
+                .pad_to_align()
+                .size();
+            shell
+                .checked_add(payload.validator.retained_bytes()?)
+                .ok_or(CompilationCause::Overflow)
+        })();
+        result.map_err(|cause| CompilationFailure {
+            cause,
+            authority: payload.authority.clone(),
+            funding: payload.funding.clone(),
+        })
     }
-    pub(crate) fn validate(
-        &self,
-        arguments: &str,
-        funding: &WorkspaceMetadataFunding,
-    ) -> Result<(), Failure> {
+    pub(crate) fn validate(&self, arguments: &str, funding: &HostMetadataFunding) -> Result<(), Failure> {
+        self.evaluate(arguments, true, funding).map(|_| ())
+    }
+    pub(crate) fn matches(&self, value: &str, funding: &HostMetadataFunding) -> Result<bool, Failure> {
+        self.evaluate(value, false, funding)
+    }
+    fn evaluate(&self, arguments: &str, require_object: bool, funding: &HostMetadataFunding) -> Result<bool, Failure> {
         let mut failure = Failure {
             cause: Cause::Parse,
             tree: None,
@@ -359,17 +540,17 @@ impl Source {
             source: self.clone(),
             funding: funding.clone(),
         };
-        let result = (|| -> Result<(), Cause> {
+        let result = (|| -> Result<bool, Cause> {
             let parts = [
                 size_of::<Self>(),
                 size_of::<Failure>(),
                 size_of::<Cause>(),
                 size_of::<Loan<'_>>(),
-                size_of::<Option<WorkspaceMetadataFundingError>>(),
-                size_of::<Result<(), Failure>>(),
-                size_of::<Result<(), Cause>>(),
+                size_of::<Option<HostMetadataFundingError>>(),
+                size_of::<Result<bool, Failure>>(),
+                size_of::<Result<bool, Cause>>(),
                 size_of::<Result<OriginalJsonTree, OriginalJsonTreeError>>(),
-                size_of::<(&Self, &str, &WorkspaceMetadataFunding)>(),
+                size_of::<(&Self, &str, bool, &HostMetadataFunding)>(),
                 OriginalValidationSource::<Representation>::control_bytes()
                     .ok_or(Cause::Overflow)?,
             ];
@@ -388,25 +569,27 @@ impl Source {
             };
             failure.tree = Some(tree);
             let root = failure.tree.as_ref().expect("stored input").root();
-            if root.kind() != OriginalJsonValueKind::Object {
+            if require_object && root.kind() != OriginalJsonValueKind::Object {
                 return Err(Cause::Object);
             }
             let mut loan = Loan {
                 funding,
                 failure: None,
             };
-            let result = self.0.validator.is_valid(Input::Tree(root), &mut loan);
+            let result = self
+                .payload()
+                .validator
+                .is_valid(Input::Tree(root), &mut loan);
             // Preserve the original payer cause, rather than its Boolean bridge.
             if let Some(cause) = loan.failure {
                 return Err(cause.into());
             }
-            if !result? {
-                return Err(Cause::Mismatch);
-            }
-            Ok(())
+            let valid = result?;
+            if require_object && !valid { return Err(Cause::Mismatch); }
+            Ok(valid)
         })();
         match result {
-            Ok(()) => Ok(()),
+            Ok(valid) => Ok(valid),
             Err(cause) => {
                 failure.cause = cause;
                 Err(failure)

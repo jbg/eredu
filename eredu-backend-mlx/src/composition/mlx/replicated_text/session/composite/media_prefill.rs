@@ -1,5 +1,6 @@
 //! Typed optional entry retained before the selected composite is erased.
 use super::*;
+pub(super) mod speculative;
 use eredu_architectures::composite_execution::CompositeMediaIngressArchitecture;
 use eredu_runtime::media_prefill::MediaTextExecutionStrategy;
 
@@ -47,6 +48,7 @@ where
     A: CompositeMediaIngressArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + 'static,
     A::InputPartPlan: 'static,
+    A::IngressPlan: 'static, A::Ingress: 'static,
     D: MediaTextExecutionStrategy<
             PreparedCompositeArchitecture<A>,
             MlxNeuralBackend,
@@ -58,6 +60,8 @@ where
     pub(in crate::composition::mlx::replicated_text::session) fn with_media_prefill(
         mut self,
     ) -> Self {
+        self.speculative_media_prepare = Some(speculative::prepare::<A,D>);
+        self.speculative_media_run = Some(speculative::run::<A,D>);
         self.media_prefill = Some(run::<A, D>);
         self.bind_original_media = Some(A::bind_original_media_semantics);
         self.original_media_prefill = Some(run_original::<A, D>);
@@ -103,7 +107,7 @@ where
         identity,
         chunk,
         |geometry| {
-            let (input, admitted, _) = prepared.map_err(eredu_nn::Error::backend_source)?;
+            let (input, admitted, _) = prepared.map_err(eredu_nn::Error::backend_retained_source)?;
             A::prepare_ingress_plan_admitted(
                 admission,
                 input,
@@ -203,7 +207,7 @@ where
                 .unwrap_or_else(|| packet.semantics()),
             geometry,
         )
-        .map_err(eredu_nn::Error::backend_source),
+        .map_err(eredu_nn::Error::backend_retained_source),
     };
     if let Some(metadata) = metadata {
         // Pay the error's closed transport before constructing a source or plan.
@@ -212,7 +216,7 @@ where
             .ok_or(SessionError::WorkingMemory(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             ))?;
-        let bytes = eredu_nn::Error::retained_source_control_bytes::<MediaExecutionFailure>()
+        let bytes = eredu_nn::Error::retained_source_construction_bytes::<MediaExecutionFailure>()
             .and_then(|bytes| {
                 bytes.checked_add(std::mem::size_of::<(
                     MediaExecutionFailure,
@@ -326,5 +330,5 @@ struct MediaExecutionFailure {
     #[source]
     cause: SessionError,
     // Account only: no native source/completion backedge and no Context Rc.
-    _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    _funding: eredu_nn::workspace::HostMetadataFunding,
 }

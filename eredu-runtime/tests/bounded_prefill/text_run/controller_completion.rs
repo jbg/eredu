@@ -85,7 +85,7 @@ fn termination_queries_preserve_original_finite_context_across_cached_decodes() 
                 for _ in 0..3 {
                     check_query(&facts, &queries, || state.controller_is_complete());
                     output.push(driver.advance(&mut state).unwrap().unwrap().token_id());
-                    driver.take_completed_step(&mut state).unwrap();
+                    driver.take_completed_delivery(&mut state).unwrap();
                     check_query(&facts, &queries, || state.controller_is_complete());
                 }
                 assert!(driver.advance(&mut state).unwrap().is_none());
@@ -94,7 +94,7 @@ fn termination_queries_preserve_original_finite_context_across_cached_decodes() 
                 for _ in 0..3 {
                     check_query(&facts, &queries, || managed.controller_is_complete());
                     output.push(managed.advance(&mut driver).unwrap().unwrap().token_id());
-                    managed.take_completed_step(&mut driver).unwrap();
+                    managed.take_completed_delivery(&mut driver).unwrap();
                     check_query(&facts, &queries, || managed.controller_is_complete());
                 }
                 assert!(managed.advance(&mut driver).unwrap().is_none());
@@ -140,7 +140,7 @@ fn query_errors_do_not_rebind_or_fence_finite_run_but_mutable_policy_still_inval
             ));
             fail.set(false);
             assert_eq!(state.advance(&mut driver).unwrap().unwrap().token_id(), 7);
-            state.take_completed_step(&mut driver).unwrap();
+            state.take_completed_delivery(&mut driver).unwrap();
             assert!(!state.controller_is_complete().unwrap());
             let _ = state.controller_mut();
             assert!(matches!(

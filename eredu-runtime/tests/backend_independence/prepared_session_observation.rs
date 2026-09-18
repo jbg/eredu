@@ -104,7 +104,7 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
 }
 struct Slots;
 impl eredu_nn::ParameterSlotVisitor<FakeTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadata, _: &mut FakeTensor) {}
+    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut FakeTensor) {}
 }
 
 #[test]

@@ -2,11 +2,15 @@ use super::*;
 use eredu_core::intervention::*;
 
 pub(super) fn tensors(
-    events: &[ObservedGenerationRecord],
+    events: &[ControlledGenerationRecord],
+) -> std::collections::BTreeMap<String, Vec<f32>> {
+    tensors_from_events(events.iter().filter_map(|event| event.event.progress()))
+}
+pub(super) fn tensors_from_events<'a>(
+    events: impl Iterator<Item = &'a ObservedGenerationEvent>,
 ) -> std::collections::BTreeMap<String, Vec<f32>> {
     events
-        .iter()
-        .filter_map(|e| match &e.event {
+        .filter_map(|event| match event {
             ObservedGenerationEvent::Token {
                 forced,
                 captures: Some(step),
@@ -93,13 +97,15 @@ fn component_masks_with_device(
             eredu_core::ObservationSupportStatus::Supported
         );
         assert!(point.operations.contains(&InterventionKind::MaskComponents));
-        assert!(!discovery
-            .points
-            .iter()
-            .any(|p| p.path == format!("{path}.effective")));
+        assert!(
+            !discovery
+                .points
+                .iter()
+                .any(|p| p.path == format!("{path}.effective"))
+        );
     }
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
             add_generation_prompt: true,
             ..Default::default()
@@ -119,11 +125,7 @@ fn component_masks_with_device(
         total_bytes: 16 << 20,
     };
     let prefix = vec![1, 2, 5, 7];
-    let prepared = model
-        .prepare_observed_token_ids(&chat, prefix.clone(), settings, CapturePlan::none(), trace)
-        .unwrap();
-    assert_eq!(prepared.prompt_token_ids(), prefix);
-    let last = prepared.prompt_token_ids().len() as u64 - 1;
+    let last = prefix.len() as u64 - 1;
     let slice = CaptureSlice {
         axis: "sequence".into(),
         start: last,
@@ -231,16 +233,31 @@ fn component_masks_with_device(
             })
             .collect(),
     };
-    let baseline = model
-        .prepare_observed_token_ids(&chat, prefix.clone(), settings, capture.clone(), trace)
-        .unwrap();
+    let baseline_prefix = prefix.clone();
+    let baseline_capture = capture.clone();
+    let baseline_trace = trace;
+    let mut baseline = PreparedChatRequest::new(&chat, original_settings(settings));
+    baseline.input = PreparedChatPrompt::TokenIds(&baseline_prefix);
+    baseline.output_mode = PreparedChatOutputMode::Text;
+    baseline.capture = Some(&baseline_capture);
     let mut events = vec![];
-    model
-        .generate_observed_text(baseline, &[], Default::default(), |event| {
+    (|| -> Result<_, ControlledGenerationError> {
+        let mut emit = |event| {
             events.push(event);
             ControlFlow::Continue(())
-        })
-        .unwrap();
+        };
+        let mut run = model
+            .start_controlled_chat(
+                baseline,
+                baseline_trace,
+                GenerationControlHandle::new(Default::default()),
+                &mut emit,
+            )?
+            .expect("live fixture control");
+        assert_eq!(run.prompt_attribution().canonical_token_ids, prefix);
+        run.run(&mut emit)
+    })()
+    .unwrap();
     let baseline = tensors(&events);
     for term in &other_writes {
         assert!(
@@ -251,23 +268,33 @@ fn component_masks_with_device(
         assert_eq!(baseline[&term.output], baseline[&term.effective_output]);
     }
     model.reset().unwrap();
-    let trial = model
-        .prepare_intervened_token_ids(
-            &chat,
-            prefix.clone(),
-            settings,
-            capture.clone(),
-            plan.clone(),
-            trace,
-        )
-        .unwrap();
+    let trial_prefix = prefix.clone();
+    let trial_capture = capture.clone();
+    let trial_trace = trace;
+    let trial_intervention = plan.clone();
+    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings));
+    trial.input = PreparedChatPrompt::TokenIds(&trial_prefix);
+    trial.output_mode = PreparedChatOutputMode::Text;
+    trial.capture = Some(&trial_capture);
+    trial.intervention = Some(&trial_intervention);
     events.clear();
-    model
-        .generate_observed_text(trial, &[], Default::default(), |event| {
+    (|| -> Result<_, ControlledGenerationError> {
+        let mut emit = |event| {
             events.push(event);
             ControlFlow::Continue(())
-        })
-        .unwrap();
+        };
+        let mut run = model
+            .start_controlled_chat(
+                trial,
+                trial_trace,
+                GenerationControlHandle::new(Default::default()),
+                &mut emit,
+            )?
+            .expect("live fixture control");
+        assert_eq!(run.prompt_attribution().canonical_token_ids, prefix);
+        run.run(&mut emit)
+    })()
+    .unwrap();
     let ordinary = tensors(&events);
     for values in [&baseline, &ordinary] {
         use eredu_core::component::ComponentOutputTransform;
@@ -306,41 +333,47 @@ fn component_masks_with_device(
     assert_ne!(baseline[ffn], ordinary[ffn]);
     assert_ne!(baseline["model.logits"], ordinary["model.logits"]);
     model.reset().unwrap();
-    let trial = model
-        .prepare_intervened_token_ids(&chat, prefix, settings, capture, plan, trace)
-        .unwrap();
+    let trial_prefix = prefix;
+    let trial_capture = capture;
+    let trial_trace = trace;
+    let trial_intervention = plan;
+    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings));
+    trial.input = PreparedChatPrompt::TokenIds(&trial_prefix);
+    trial.output_mode = PreparedChatOutputMode::Text;
+    trial.capture = Some(&trial_capture);
+    trial.intervention = Some(&trial_intervention);
     let mut records = vec![];
     {
         let mut run = model
-            .start_controlled_text(trial, &[], Default::default(), collect(&mut records))
+            .start_controlled_chat(
+                trial,
+                trial_trace,
+                Default::default(),
+                collect(&mut records),
+            )
+            .unwrap()
             .unwrap();
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 2,
-            max_branches: 1,
-            retained_bytes: 64 << 20,
-            cumulative_copy_bytes: 256 << 20,
-        })
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 2,
+                max_branches: 1,
+                retained_bytes: 64 << 20,
+                cumulative_copy_bytes: 256 << 20,
+            },
+            ORIGINAL_CAPACITY,
+            copy_limits(),
+        )
         .unwrap();
         let initial = run.snapshot(collect(&mut records)).unwrap();
         run.run(collect(&mut records)).unwrap();
-        let first = tensors(
-            &records
-                .iter()
-                .map(|r| r.generation.clone())
-                .collect::<Vec<_>>(),
-        );
+        let first = tensors_from_events(records.iter().filter_map(|r| r.event.progress()));
         assert_eq!(ordinary, first);
         let before = records.len();
         run.restore(&initial, collect(&mut records)).unwrap();
         run.run(collect(&mut records)).unwrap();
         assert_eq!(
             ordinary,
-            tensors(
-                &records[before..]
-                    .iter()
-                    .map(|r| r.generation.clone())
-                    .collect::<Vec<_>>()
-            )
+            tensors_from_events(records[before..].iter().filter_map(|r| r.event.progress()))
         );
     }
     (baseline, ordinary)

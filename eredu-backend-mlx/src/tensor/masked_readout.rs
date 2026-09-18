@@ -60,7 +60,7 @@ pub(super) fn execute(
     let selected_logits = backend(selected_logits.squeeze_axes(&[-2], context))?;
     let minimum = backend(selected_logits.min_axis(-1, true, context))?;
     let masked_value = backend(minimum.subtract(
-        Array::try_from_f32(input.mask_margin).map_err(Error::backend_source)?,
+        Array::try_from_f32(input.mask_margin).map_err(Error::backend_retained_source)?,
         context,
     ))?;
     let output = backend(full::<f32>(

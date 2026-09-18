@@ -393,12 +393,12 @@ fn serial_reference(
     }
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             let source = self
                 .0
-                .get(metadata.id.as_str())
-                .unwrap_or_else(|| panic!("missing Muse reference parameter {}", metadata.id));
-            assert_eq!(value.shape, source.shape, "{}", metadata.id);
+                .get(metadata.id().as_str())
+                .unwrap_or_else(|| panic!("missing Muse reference parameter {}", metadata.id()));
+            assert_eq!(value.shape, source.shape, "{}", metadata.id());
             value.data.clone_from(&source.data);
         }
     }
@@ -616,7 +616,7 @@ fn muse_embedding_waves_follow_token_segments_and_exclude_media_positions() {
                 .unwrap();
             let prepared = PreparedCompositeInput::new(&input, &admitted).unwrap();
             let sums = <Model as CompositeArchitecture<NumericBackend, State>>::prepared_primary_ingress_collectives(
-                &architecture, prepared, 2,
+                &architecture, prepared, 2, None,
             ).unwrap().unwrap();
             assert_eq!(
                 sums,
@@ -628,7 +628,7 @@ fn muse_embedding_waves_follow_token_segments_and_exclude_media_positions() {
                     .collect::<Vec<_>>()
             );
             assert!(<Model as CompositeArchitecture<NumericBackend, State>>::prepared_primary_ingress_collectives(
-                &architecture, prepared, 1,
+                &architecture, prepared, 1, None,
             ).unwrap().is_none());
         }
     }
@@ -715,7 +715,7 @@ fn muse_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 assert!(selected.parameters().iter().any(|p| matches!(p.lowering(),eredu_runtime::WeightLoweringKind::Transform|eredu_runtime::WeightLoweringKind::DerivedTransform)));
                                 let target_args = muse_glimmer::with_checkpoint_formats(args,selected.parameters().iter().filter_map(|p| p.executable().weight_quantization().map(|format|(p.name().to_owned(),format))).collect()).unwrap();
                                 let target = muse_glimmer::LayeredModel::<NumericBackend>::new(target_args,&NumericContext::default()).unwrap();
-                                let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
+                                let target_parameters = target.parameter_description(&NumericContext::default()).unwrap().into_owned();
                                 let rank_topology = ParallelRankTopology::new(topology,rank).unwrap();
                                 let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters,rank_topology).unwrap();
                                 let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters,rank_topology).unwrap();

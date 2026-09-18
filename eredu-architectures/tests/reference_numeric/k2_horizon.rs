@@ -634,7 +634,7 @@ fn k2_tensor_parallel_keeps_complete_value_projections_and_local_kv_state() {
         let architecture =
             family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
         let cold = family::parameter_description(&args).unwrap();
-        let constructed = architecture.parameter_description(&context).unwrap();
+        let constructed = architecture.parameter_description(&context).unwrap().into_owned();
         let members = |description: &eredu_runtime::ArchitectureParameterDescription| {
             description
                 .groups()
@@ -770,7 +770,7 @@ fn k2_pipeline_cuts_before_and_after_dense_to_mova_transition_match_cached_refer
     let args = family::model_args_from_config_value(&fixture["mova"]["config"]).unwrap();
     let context = NumericContext::default();
     let model = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let description = model.parameter_description(&context).unwrap();
+    let description = model.parameter_description(&context).unwrap().into_owned();
     let topology = ParallelTopology::new(1, 2, 1, 1).unwrap();
     let rank = ParallelRankTopology::new(topology, 0).unwrap();
     let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
@@ -1094,7 +1094,7 @@ fn k2_mova_collective_waves_keep_bank_order_ownership_and_value_output_width() {
     let args = family::model_args_from_config_value(&fixture()["mova"]["config"]).unwrap();
     let context = NumericContext::default();
     let model = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let description = model.parameter_description(&context).unwrap();
+    let description = model.parameter_description(&context).unwrap().into_owned();
     let owner = ExecutionGroupId::new("text_decoder").unwrap();
     for stages in [2, 3] {
         let topology = ParallelTopology::new(2, stages, 2, 1).unwrap();
@@ -1226,7 +1226,7 @@ fn k2_routed_prepared_payload_tp_pp_ep_and_bounded_match_four_decode_steps() {
                             let plan = prepared_adapter::plan(None).with_topology(topology).with_residency(residency.clone());
                             let sources = partitioned_adapter::prepare_plan_with_banks(inspection, &plan, rank, std::time::Duration::from_secs(10), bank_options).unwrap_or_else(|e| panic!("{name} {topology:?} {residency:?} prepare rank {rank}: {e}"));
                             let context = NumericContext::default();
-                            let description = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap().parameter_description(&context).unwrap();
+                            let description = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap().parameter_description(&context).unwrap().into_owned();
                             let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&description, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
                             let mut context = NumericContext::with_partition(layout, rank, world); context.bind_checkpoint_values = true;
                             reset_reference_stage_evidence("SafeTensors");

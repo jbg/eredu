@@ -104,6 +104,28 @@ impl TokenParser {
         inference_caps: InferenceCapabilities,
         limits: ParserLimits,
     ) -> Result<Self> {
+        let max_tokens = match &grammar_init {
+            GrammarInit::Serialized(input) => input.max_tokens.unwrap_or(usize::MAX),
+            GrammarInit::Internal(_, _) => usize::MAX,
+        };
+        let compiled_grammar = grammar_init.to_cgrammar(
+            Some(factory.tok_env().tok_trie()),
+            &mut logger,
+            limits.clone(),
+            factory.extra_lexemes(),
+            derivre::ParserAllocationFunding::unenforced(),
+        )?;
+        Self::from_compiled(factory, crate::earley::SharedGrammar::new(compiled_grammar)?, max_tokens, logger, inference_caps, limits)
+    }
+
+    pub(crate) fn from_compiled(
+        factory: &ParserFactory,
+        compiled_grammar: crate::earley::SharedGrammar,
+        max_tokens: usize,
+        logger: Logger,
+        inference_caps: InferenceCapabilities,
+        limits: ParserLimits,
+    ) -> Result<Self> {
         let token_env = factory.tok_env().clone();
         ensure!(
             token_env.tokenize_is_canonical() || !inference_caps.ff_tokens,
@@ -115,18 +137,6 @@ impl TokenParser {
         );
 
         let compute_mask_start_time = Instant::now();
-        let mut max_tokens = usize::MAX;
-        if let GrammarInit::Serialized(input) = &grammar_init {
-            if let Some(m) = input.max_tokens {
-                max_tokens = m;
-            }
-        }
-        let compiled_grammar = grammar_init.to_cgrammar(
-            Some(token_env.clone()),
-            &mut logger,
-            limits.clone(),
-            factory.extra_lexemes(),
-        )?;
         let parser = Parser::new(
             token_env.clone(),
             compiled_grammar,

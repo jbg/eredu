@@ -7,7 +7,7 @@ use crate::backend::nn::workspace::{ResidentExecutionMechanisms, PipelineBoundar
 #[derive(Clone)]
 pub(crate) struct RetainedPipelineBoundary {
     value: Option<Rc<PipelineBoundaryQuote>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl RetainedPipelineBoundary {
     pub(crate) fn value(&self) -> &PipelineBoundaryQuote {
@@ -26,7 +26,7 @@ impl Drop for RetainedPipelineBoundary {
 pub(crate) struct OriginalBoundaryCall {
     state: Option<Rc<State>>,
     quotes: Vec<RetainedPipelineBoundary>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalBoundaryCall {
     pub(crate) fn quotes(&self) -> &[RetainedPipelineBoundary] {

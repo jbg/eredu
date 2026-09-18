@@ -1,4 +1,4 @@
-use anyhow::{ensure, Result};
+use derivre::{ParserResult as Result, ParserError, parser_ensure as ensure};
 use derivre::{
     raw::ExprSet, ExprRef, JsonQuoteOptions, RegexAst, RegexBuilder, SourceHashMap as HashMap,
 };
@@ -30,6 +30,7 @@ pub struct LexerSpec {
     pub has_max_tokens: bool,
     pub has_temperature: bool,
     pub grammar_warnings: Vec<(String, usize)>,
+    pub(crate) funding: derivre::ParserAllocationFunding,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
@@ -70,21 +71,25 @@ pub struct LexemeSpec {
 // or to a very specific lexeme like WHILE or MULTIPLY.
 id32_type!(LexemeIdx);
 
-pub fn token_ranges_to_string(token_ranges: &Vec<RangeInclusive<TokenId>>) -> String {
-    use std::fmt::Write;
-    let mut s = "<[".to_string();
-    for range in token_ranges {
-        if s.len() > 2 {
-            s.push(',');
+pub(crate) struct TokenRangesDisplay<'a>(pub &'a [RangeInclusive<TokenId>]);
+impl std::fmt::Display for TokenRangesDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<[")?;
+        for (index, range) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            if range.start() == range.end() {
+                write!(formatter, "{:?}", range.start())?;
+            } else {
+                write!(formatter, "{:?}-{:?}", range.start(), range.end())?;
+            }
         }
-        if range.start() == range.end() {
-            write!(s, "{:?}", range.start()).unwrap();
-        } else {
-            write!(s, "{:?}-{:?}", range.start(), range.end()).unwrap();
-        }
+        formatter.write_str("]>")
     }
-    s.push_str("]>");
-    s
+}
+pub fn token_ranges_to_string(token_ranges: &[RangeInclusive<TokenId>]) -> String {
+    TokenRangesDisplay(token_ranges).to_string()
 }
 
 mod input;
@@ -98,7 +103,7 @@ pub use source_copy::{
 };
 impl Clone for LexemeSpec {
     fn clone(&self) -> Self {
-        self.source_copy_plan()
+        self.source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
             .expect("ordinary lexeme source geometry")
             .compile()
             .expect("ordinary lexeme source copy")
@@ -106,7 +111,7 @@ impl Clone for LexemeSpec {
 }
 impl Clone for LexerSpec {
     fn clone(&self) -> Self {
-        self.source_copy_plan()
+        self.source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
             .expect("ordinary lexer declaration source geometry")
             .compile()
             .expect("ordinary lexer declaration copy")
@@ -159,11 +164,11 @@ impl Debug for LexemeSpec {
 }
 
 impl LexerSpec {
-    pub fn new() -> Result<Self> {
+    pub fn new(funding: derivre::ParserAllocationFunding) -> Result<Self> {
         Ok(LexerSpec {
             lexemes: Vec::new(),
             special_token_rx: None,
-            regex_builder: RegexBuilder::new(),
+            regex_builder: RegexBuilder::new(funding.clone())?,
             no_forcing: false,
             allow_initial_skip: false,
             num_extra_lexemes: 0,
@@ -174,6 +179,7 @@ impl LexerSpec {
             has_max_tokens: false,
             has_temperature: false,
             grammar_warnings: Vec::new(),
+            funding,
         })
     }
 
@@ -195,12 +201,19 @@ impl LexerSpec {
         r
     }
 
+    /// Borrows compiler warning messages without allocating a diagnostic copy.
+    pub fn warnings(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
+        self.grammar_warnings
+            .iter()
+            .map(|(message, count)| (message.as_str(), *count))
+    }
+
     pub fn can_rollback(&self) -> bool {
         !self.has_stop && !self.has_max_tokens
     }
 
     pub fn check_rollback(&self) -> Result<()> {
-        ensure!(
+        ensure!(&self.funding,
             self.can_rollback(),
             "rollback not supported with max_tokens=... or stop=... lexemes; suffix=... is OK"
         );
@@ -234,18 +247,22 @@ impl LexerSpec {
         }
 
         self.current_class = LexemeClass::new(self.skip_by_class.len());
-        self.class_by_skip
-            .insert((skip_node, skip_repetition), self.current_class);
-        self.skip_by_class.push(LexemeIdx(0)); // avoid assert in empty_spec()
-        let idx = self
-            .add_lexeme_spec(LexemeSpec {
-                name: format!("SKIP{}", self.current_class.as_usize()),
-                rx: skip,
-                is_skip: true,
-                skip_repetition,
-                ..self.empty_spec()
-            })
-            .expect("already validated");
+        self.funding.try_insert(
+            &mut self.class_by_skip,
+            (skip_node, skip_repetition),
+            self.current_class,
+        )?;
+        self.funding
+            .try_push(&mut self.skip_by_class, LexemeIdx(0))?; // avoid assert in empty_spec()
+        let idx = self.add_lexeme_spec(LexemeSpec {
+            name: self
+                .funding
+                .try_format(format_args!("SKIP{}", self.current_class.as_usize()))?,
+            rx: skip,
+            is_skip: true,
+            skip_repetition,
+            ..self.empty_spec()
+        })?;
         self.skip_by_class.pop();
         self.skip_by_class.push(idx);
         Ok(self.current_class)
@@ -305,7 +322,7 @@ impl LexerSpec {
             .is_nullable(self.lexemes[idx.as_usize()].compiled_rx)
     }
 
-    pub fn to_regex_vec(&self, limits: &mut ParserLimits) -> Result<RegexVec> {
+    pub fn to_regex_vec(&self, limits: &mut ParserLimits) -> anyhow::Result<RegexVec> {
         limits.validate_lexer_state_limit()?;
         // TODO
         // Find all non-contextual lexemes that are literals (we call them 'keywords')
@@ -323,10 +340,11 @@ impl LexerSpec {
             if let Some(rx) = self.special_token_rx {
                 rx
             } else {
-                let rx_ast = RegexAst::Concat(vec![
-                    RegexAst::Byte(TokTrie::SPECIAL_TOKEN_MARKER),
-                    RegexAst::Regex(r"\[[0-9]+\]".to_string()),
-                ]);
+                let mut parts = Vec::new();
+                self.funding.try_grow_vec(&mut parts, 2)?;
+                parts.push(RegexAst::Byte(TokTrie::SPECIAL_TOKEN_MARKER));
+                parts.push(RegexAst::Regex(self.funding.try_copy_str(r"\[[0-9]+\]")?));
+                let rx_ast = RegexAst::Concat(parts);
                 let compiled = self.regex_builder.mk(&rx_ast)?;
                 self.special_token_rx = Some(compiled);
                 compiled
@@ -373,9 +391,11 @@ impl LexerSpec {
         spec.single_set = MatchingLexemes::One(idx);
         spec.compiled_rx = compiled;
         if spec.name.is_empty() {
-            spec.name = format!("[{}]", idx.as_usize());
+            spec.name = self
+                .funding
+                .try_format(format_args!("[{}]", idx.as_usize()))?;
         }
-        self.lexemes.push(spec);
+        self.funding.try_push(&mut self.lexemes, spec)?;
         Ok(idx)
     }
 
@@ -414,7 +434,12 @@ impl LexerSpec {
         is_suffix: bool,
     ) -> Result<LexemeIdx> {
         let rx = if !matches!(stop_rx, RegexAst::EmptyString) {
-            RegexAst::Concat(vec![body_rx, RegexAst::LookAhead(Box::new(stop_rx))])
+            let stop = self.funding.try_box(stop_rx)?;
+            let mut parts = Vec::new();
+            self.funding.try_grow_vec(&mut parts, 2)?;
+            parts.push(body_rx);
+            parts.push(RegexAst::LookAhead(stop));
+            RegexAst::Concat(parts)
         } else {
             body_rx
         };
@@ -437,7 +462,7 @@ impl LexerSpec {
     ) -> Result<LexemeIdx> {
         self.add_lexeme_spec(LexemeSpec {
             name,
-            rx: RegexAst::Literal(literal.to_string()),
+            rx: RegexAst::Literal(self.funding.try_copy_str(literal)?),
             contextual,
             ..self.empty_spec()
         })
@@ -473,23 +498,23 @@ impl LexerSpec {
         })
     }
 
-    pub fn add_extra_lexemes(&mut self, extra_lexemes: &[String]) {
+    pub fn add_extra_lexemes(&mut self, extra_lexemes: &[String]) -> Result<()> {
         assert!(self.num_extra_lexemes == 0);
         self.num_extra_lexemes = extra_lexemes.len();
         let lex0 = self.lexemes.len();
         for (idx, added) in extra_lexemes.iter().enumerate() {
             self.add_lexeme_spec(LexemeSpec {
-                name: format!("$extra_{idx}"),
-                rx: RegexAst::Regex(added.clone()),
+                name: self.funding.try_format(format_args!("$extra_{idx}"))?,
+                rx: RegexAst::Regex(self.funding.try_copy_str(added)?),
                 is_extra: true,
                 ..self.empty_spec()
-            })
-            .expect("adding lexeme");
+            })?;
         }
         assert!(
             self.lexemes.len() - lex0 == self.num_extra_lexemes,
             "repeating slices?"
         );
+        Ok(())
     }
 
     pub fn extra_lexeme(&self, idx: usize) -> LexemeIdx {
@@ -639,3 +664,5 @@ impl Lexeme {
         &self.bytes
     }
 }
+
+mod retained_capacity;

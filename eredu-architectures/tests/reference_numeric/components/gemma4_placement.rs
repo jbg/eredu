@@ -502,12 +502,12 @@ fn serial_reference(
     }
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             let source = self
                 .0
-                .get(metadata.id.as_str())
-                .unwrap_or_else(|| panic!("missing Gemma parameter {}", metadata.id));
-            assert_eq!(value.shape, source.shape, "{}", metadata.id);
+                .get(metadata.id().as_str())
+                .unwrap_or_else(|| panic!("missing Gemma parameter {}", metadata.id()));
+            assert_eq!(value.shape, source.shape, "{}", metadata.id());
             value.data.clone_from(&source.data);
         }
     }
@@ -788,7 +788,7 @@ fn gemma4_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 let formats = selected.parameters().iter().filter_map(|p| p.executable().weight_quantization().map(|format|(p.name().to_owned(),format))).collect();
                                 let target_args = gemma4::with_checkpoint_formats(args,formats).unwrap();
                                 let target = gemma4::LayeredModel::<NumericBackend>::new(target_args,&NumericContext::default()).unwrap();
-                                let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
+                                let target_parameters = target.parameter_description(&NumericContext::default()).unwrap().into_owned();
                                 let rank_topology = ParallelRankTopology::new(topology,rank).unwrap();
                                 let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters,rank_topology).unwrap();
                                 let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters,rank_topology).unwrap();

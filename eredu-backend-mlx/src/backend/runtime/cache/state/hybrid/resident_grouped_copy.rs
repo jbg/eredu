@@ -117,20 +117,6 @@ pub(crate) struct PreparedHybridGroupedCopy<'a> {
     paged: Option<PreparedPagedStorageCopy<'a>>,
 }
 impl<'a> PreparedHybridGroupedCopy<'a> {
-    pub(crate) fn requires_group(source: &MlxHybridState) -> bool {
-        source
-            .layers
-            .slots()
-            .iter()
-            .any(|layer| !layer.fixed.is_empty())
-            || (0..source.layout.layout().len()).any(|i| {
-                !matches!(
-                    source.layout.layout().layer(i),
-                    Some(LayerCachePolicy::KeyValue { .. })
-                )
-            })
-    }
-
     pub(crate) fn prepare(source: &'a MlxHybridState) -> Result<Self, Error> {
         Self::prepare_fixed(source).map_err(ResidentDecoderPreparationError::into_error)
     }
@@ -335,10 +321,10 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
         i: usize,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Option<MlxHybridAttentionState>, Error> {
         fn cause(
-            funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+            funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
             error: impl std::error::Error + Send + Sync + 'static,
         ) -> Error {
             match funding {
@@ -458,3 +444,5 @@ pub(crate) struct ProjectedHybridGroupedCopy {
     not(feature = "cuda")
 ))]
 mod tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

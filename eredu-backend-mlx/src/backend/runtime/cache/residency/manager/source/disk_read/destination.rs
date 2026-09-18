@@ -22,7 +22,7 @@ pub(crate) struct PreparedDiskReadDestination {
     id: CacheBlockId,
     generation: u64,
     context: WorkspaceContext,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(crate) struct DiskReadBinding {
     output: PreparedDiskReadOutput,
@@ -467,3 +467,5 @@ fn control_bytes() -> Option<usize> {
         .into_iter()
         .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -607,6 +607,8 @@ pub fn create_causal_mask(
     not(feature = "cuda")
 ))]
 mod grouped_original_tests;
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod row_movement_tests;
 #[cfg(all(
     test,
     target_vendor = "apple",

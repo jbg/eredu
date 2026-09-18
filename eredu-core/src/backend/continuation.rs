@@ -1,7 +1,6 @@
 //! Detached continuations for the ordinary text-generation machine.
 
 use super::*;
-use std::sync::Arc;
 
 /// Unforgeable identity of one continuation, distinct from its shared driver.
 /// This is the already issued immutable run identity; clones allocate nothing
@@ -18,14 +17,12 @@ impl Eq for TextContinuationIdentity {}
 
 /// Unforgeable identity of the exclusive driver shared by one serial branch tree.
 /// A later generation on the same loaded executable has a different identity.
-#[derive(Clone)]
-pub struct TextDriverIdentity(Arc<()>);
-impl PartialEq for TextDriverIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
+#[derive(Clone, PartialEq, Eq)]
+pub struct TextDriverIdentity(TextRunIdentity);
+impl TextDriverIdentity {
+    fn validate(&self) -> Result<(), BackendFailure> { self.0.validate() }
+    pub(super) fn for_branch(identity: &TextRunIdentity) -> Self { Self(identity.clone()) }
 }
-impl Eq for TextDriverIdentity {}
 
 /// Failure to advance or settle a detached ordinary continuation.
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +56,7 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
-    owner: Arc<()>,
+    owner: TextDriverIdentity,
     identity: TextContinuationIdentity,
     inner: TextGenerationMachine<B, C>,
     failed: bool,
@@ -157,7 +154,7 @@ where
 /// objects need not implement `Send` or `Sync`.
 pub struct TextGenerationDriver<'a, B: TextGenerationBackend> {
     runtime: &'a mut ModelRuntime<B>,
-    owner: Arc<()>,
+    owner: TextDriverIdentity,
 }
 
 impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
@@ -167,7 +164,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     pub fn new(runtime: &'a mut ModelRuntime<B>) -> Self {
         Self {
             runtime,
-            owner: Arc::new(()),
+            owner: TextDriverIdentity(TextStepContext::new().run_identity().clone()),
         }
     }
 
@@ -183,7 +180,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         stage:crate::run_preparation::TextPreparationStage,local:Result<Option<T>,E>,
         map_backend:impl FnOnce(BackendFailure)->E,
     )->Result<Option<T>,E> {
-        let valid=if !Arc::ptr_eq(&self.owner,&state.owner) || state.failed {
+        let valid=if self.owner != state.owner || state.failed {
             Err(PreparedRequestRejection::RequestMismatch.into_backend_failure())
         } else {state.inner.step_context.validate()};
         if let Err(error)=valid {
@@ -213,9 +210,10 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         controller: C,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
+        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::new(self.runtime, input, config, controller)?;
         Ok(TextGenerationContinuation {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             identity: TextContinuationIdentity(inner.step_context.run_identity().clone()),
             inner,
             failed: false,
@@ -251,6 +249,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         options: TextPreparationOptions,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
+        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
         // Obtain the validated fresh run before exposing its continuation identity.
         let inner = TextGenerationMachine::new_preparation(
             self.runtime,
@@ -260,7 +259,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             Some(options),
         )?;
         Ok(TextGenerationContinuation {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             identity: TextContinuationIdentity(inner.step_context.run_identity().clone()),
             inner,
             failed: false,
@@ -280,6 +279,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         sequence: GenerationSequenceRequest<'_>,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
+        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::new_preparation_with_sequence(
             self.runtime,
             input,
@@ -289,7 +289,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             Some(sequence),
         )?;
         Ok(TextGenerationContinuation {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             identity: TextContinuationIdentity(inner.step_context.run_identity().clone()),
             inner,
             failed: false,
@@ -332,6 +332,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     where
         B: TextResumeBackend,
     {
+        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::from_resume(
             self.runtime,
             saved,
@@ -340,7 +341,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             cancellation,
         )?;
         Ok(inner.map(|inner| TextGenerationContinuation {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             identity: TextContinuationIdentity(inner.step_context.run_identity().clone()),
             inner,
             failed: false,
@@ -353,7 +354,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         &self,
         state: &TextGenerationContinuation<B, C>,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
-        if !Arc::ptr_eq(&self.owner, &state.owner) {
+        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        if self.owner != state.owner {
             return Err(TextContinuationError::IncompatibleDriver);
         }
         Ok(())
@@ -386,7 +388,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     }
 
     /// Advances at most one constraint-committed canonical token using the
-    /// ordinary sampler and pending input. Call `take_completed_step` before
+    /// ordinary sampler and pending input. Call `take_completed_delivery` before
     /// advancing again or composing a pause/snapshot boundary.
     #[allow(clippy::type_complexity)]
     pub fn advance<C: TokenFilterController>(
@@ -423,28 +425,6 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         }
     }
 
-    /// Settles exact native completion and moves out the single bounded record
-    /// batch for legacy callers. A retained frame is parked without cloning and
-    /// returns None, leaving records undrained; use `take_completed_delivery` for
-    /// funded collectors. Draining never clears an existing failure.
-    pub fn take_completed_step<C: TokenFilterController>(
-        &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
-    ) -> Result<Option<crate::capture::CapturedStep>, TextContinuationError<B::Error, C::Error>>
-    {
-        self.validate(state)?;
-        let was_failed = state.failed;
-        state.failed = true;
-        state.records_drained = false;
-        let records = state
-            .inner
-            .take_legacy_capture()
-            .map_err(ControlledTextGenerationError::Backend)?;
-        state.records_drained = !state.inner.capture_pending();
-        state.failed = was_failed;
-        Ok(records)
-    }
-
     /// Retained delivery after exact completion. A ready shared frame moves
     /// without copying its payload or detaching custody. None is quiescent only
     /// when `capture_pending` is false. Drain failures keep the continuation
@@ -453,7 +433,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
     ) -> Result<
-        Option<crate::capture::CapturedStepDelivery>,
+        Option<crate::capture::SharedCapturedStep>,
         TextContinuationError<B::Error, C::Error>,
     > {
         self.validate(state)?;
@@ -655,6 +635,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> ControlledTextGeneratio
     pub fn snapshot_source(
         &mut self,
     ) -> Result<TextSnapshotSource<'_, B, C>, TextContinuationError<B::Error, C::Error>> {
+        if self.inner.branch_fenced { return Err(TextContinuationError::Failed) }
         self.inner
             .step_context
             .validate()
@@ -683,6 +664,20 @@ where
     state: &'s mut TextGenerationContinuation<B, C>,
 }
 
+impl<B: crate::execution_control::TextSamplingControlBackend, C: TokenFilterController>
+    TextContinuationBoundary<'_, '_, B, C>
+{
+    /// Lends only the admitted prospective sampler update at this already
+    /// completed boundary. Model, controller and source policy remain private.
+    pub fn sampling_boundary(&mut self) -> TextSamplingBoundary<'_, B> {
+        TextSamplingBoundary {
+            runtime: self.runtime,
+            state: &mut self.state.inner.backend_state,
+            context: &self.state.inner.step_context,
+        }
+    }
+}
+
 impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundary<'_, '_, B, C> {
     /// Lends the same immutable capture view as a borrowed generation machine.
     pub fn snapshot_source(&mut self) -> TextSnapshotSource<'_, B, C> {
@@ -700,7 +695,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
 
     /// Exclusive source driver, common to this run and its isolated descendants.
     pub fn driver_identity(&self) -> TextDriverIdentity {
-        TextDriverIdentity(Arc::clone(&self.state.owner))
+        self.state.owner.clone()
     }
 
     /// Constraint state for an independently staged host checkpoint.
@@ -809,10 +804,11 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         // a valid new identity; restore cannot clear that terminal condition.
         let step_context = TextStepContext::new();
         TextGenerationContinuation {
-            owner: Arc::clone(&self.state.owner),
+            owner: self.state.owner.clone(),
             identity: TextContinuationIdentity(step_context.run_identity().clone()),
             inner: TextGenerationMachine {
                 capture_source: self.state.inner.capture_source.clone(),
+                intervention_source: self.state.inner.intervention_source.clone(),
                 resume_host: self.state.inner.resume_host.clone(),
                 prepared_sequence: preparation::PreparedSequence::Legacy,
                 preparation: self.state.inner.preparation.clone(),
@@ -821,8 +817,9 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
                 controller,
                 step: pending,
                 completions: Vec::new(),
-                capture_delivery: None,
-                remaining_tokens,
+                    remaining_tokens,
+                branch_owner: self.state.inner.branch_owner.clone(),
+                branch_fenced: false,
                 step_context,
             },
             failed: false,
@@ -921,13 +918,13 @@ impl<B: crate::execution_control::NativeTextStateBackend, C: TokenFilterControll
         other: &mut TextGenerationContinuation<B, C>,
         native: &mut B::NativeTextState,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
-        if !Arc::ptr_eq(&self.state.owner, &other.owner) {
+        if self.state.owner != other.owner {
             return Err(TextContinuationError::IncompatibleDriver);
         }
         other.require_quiescent()?;
-        B::validate_native_text_state(self.runtime, native)
-            .map_err(ControlledTextGenerationError::Backend)?;
-        B::exchange_native_text_state(self.runtime, native)
+        B::exchange_text_branch(self.runtime,
+            TextBranchSource::from_machine(&mut self.state.inner),
+            TextBranchSource::from_machine(&mut other.inner), native)
             .map_err(ControlledTextGenerationError::Backend)?;
         std::mem::swap(self.state, other);
         Ok(())

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{OriginalTokenDomainWitness, TokenSamplingDecision};
+use crate::{OriginalSourceWitness, TokenSamplingDecision};
 #[test]
 fn original_tag_cannot_reduce_legacy_capacity_validation_and_owned_masks_stay_separate() {
     let mask = TokenFilter::Allowed(vec![true; 7]);
@@ -13,7 +13,7 @@ fn original_tag_cannot_reduce_legacy_capacity_validation_and_owned_masks_stay_se
     )
     .unwrap();
     let mut decision = TokenSamplingDecision::new(mask.clone())
-        .with_original_tokenizer_validity(&mask, OriginalTokenDomainWitness::new(&witness));
+        .with_original_tokenizer_validity(&mask, OriginalSourceWitness::new(&witness));
     assert!(matches!(
         contract.validate_decision(&decision),
         Err(TextControllerContractError::AdditionalPayloadExceeded {

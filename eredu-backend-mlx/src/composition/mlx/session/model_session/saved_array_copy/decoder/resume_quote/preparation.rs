@@ -149,7 +149,7 @@ fn context_memory(
     cause: eredu_nn::workspace::WorkspaceContextMetadataError<MlxWorkspaceFactError>,
 ) -> WorkingMemoryError {
     use eredu_nn::workspace::{
-        WorkspaceContextMetadataError, WorkspaceMetadataError, WorkspaceMetadataFundingError,
+        WorkspaceContextMetadataError, WorkspaceMetadataError, HostMetadataFundingError,
         WorkspaceReportError,
     };
     match cause {
@@ -157,7 +157,7 @@ fn context_memory(
         WorkspaceContextMetadataError::Geometry(cause) => layout_memory(cause),
         WorkspaceContextMetadataError::Metadata(
             WorkspaceMetadataError::Overflow
-            | WorkspaceMetadataError::Funding(WorkspaceMetadataFundingError::Overflow)
+            | WorkspaceMetadataError::Funding(HostMetadataFundingError::Overflow)
             | WorkspaceMetadataError::Report(WorkspaceReportError::Overflow),
         ) => WorkingMemoryError::Overflow,
         _ => WorkingMemoryError::UnknownBound,

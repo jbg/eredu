@@ -1,15 +1,18 @@
 //! Paid destinations for the ordinary complete, contiguous and sparse receipt constructor.
 use super::*;
 use eredu_core::capture::{CaptureContiguousProjectionPlan, CaptureCoordinateProjectionPlan, CaptureRoutedUnitsGeometry, CaptureTensorGeometry, CaptureSummaryGeometry, CaptureHistogramGeometry, CaptureTransform};
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::capture::partition) enum Cause {
+    #[error("{0}")]
+    Coordinates(#[from] eredu_core::component::ComponentCoordinateConstructionError),
+
     #[error("complete producer source: {0}")]
     Source(&'static str),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Destination(#[from] eredu_nn::Error),
     #[error(transparent)]
@@ -26,7 +29,7 @@ pub struct PartitionCaptureReceiptConstructionError {
     #[source]
     cause: Cause,
     _source: SharedCapturePlan,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 
 /// Private destinations consumed only by the same validating constructor used
@@ -36,7 +39,7 @@ pub(super) struct PreparedReceiptStorage {
     pub(super) terminal_rows: Option<usize>,
     pub(super) global_shape: Vec<u64>,
     pub(super) identity: String,
-    pub(super) metadata: WorkspaceMetadataFunding,
+    pub(super) metadata: HostMetadataFunding,
 }
 
 /// Retained contiguous coordinates for one expected producer. The caller
@@ -117,7 +120,7 @@ impl PartitionCaptureReceiptPlan {
         producer: usize,
         world_size: usize,
         limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding,
+        metadata: &HostMetadataFunding,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source, context, ProducerSources::Complete(producer), world_size, limits,
@@ -126,7 +129,7 @@ impl PartitionCaptureReceiptPlan {
     pub(crate) fn new_complete_shared_funded_global(
         source: &SharedCapturePlan, context: &PartitionCaptureContext,
         producer: usize, world_size: usize, limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding, ledger: &mut dyn CaptureReservation,
+        metadata: &HostMetadataFunding, ledger: &mut dyn CaptureReservation,
     ) -> Result<(Self, CaptureUsage), PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source, context, ProducerSources::Complete(producer), world_size, limits,
             metadata, ledger, true, None)
@@ -134,7 +137,7 @@ impl PartitionCaptureReceiptPlan {
     pub(crate) fn new_complete_shared_funded_terminal_global(
         source: &SharedCapturePlan, context: &PartitionCaptureContext,
         producer: usize, world_size: usize, limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding, ledger: &mut dyn CaptureReservation,
+        metadata: &HostMetadataFunding, ledger: &mut dyn CaptureReservation,
         terminal_rows: Option<usize>,
     ) -> Result<(Self,CaptureUsage),PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source,context,ProducerSources::Complete(producer),world_size,limits,
@@ -148,7 +151,7 @@ impl PartitionCaptureReceiptPlan {
         source:&SharedCapturePlan,context:&PartitionCaptureContext,
         axis:usize,producers:&[PartitionCaptureContiguousProducer],combination:PartitionCaptureCombination,
         world_size:usize,limits:PartitionCaptureReceiptLimits,
-        metadata:&WorkspaceMetadataFunding,ledger:&mut dyn CaptureReservation,
+        metadata:&HostMetadataFunding,ledger:&mut dyn CaptureReservation,
     )->Result<Self,PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source,context,ProducerSources::Contiguous{axis,rows:producers,combination},
             world_size,limits,metadata,ledger,false,None).map(|(receipt,_)|receipt)
@@ -159,7 +162,7 @@ impl PartitionCaptureReceiptPlan {
     /// Owning geometry storage is paid from this original metadata account.
     pub fn new_coordinates_shared_funded(source:&SharedCapturePlan,context:&PartitionCaptureContext,
         axis:usize,producers:&[PartitionCaptureCoordinateProducer<'_>],combination:PartitionCaptureCombination,
-        world_size:usize,limits:PartitionCaptureReceiptLimits,metadata:&WorkspaceMetadataFunding,
+        world_size:usize,limits:PartitionCaptureReceiptLimits,metadata:&HostMetadataFunding,
         ledger:&mut dyn CaptureReservation)->Result<Self,PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source,context,ProducerSources::Coordinates{axis,rows:producers,combination},
             world_size,limits,metadata,ledger,false,None).map(|(receipt,_)|receipt)
@@ -172,7 +175,7 @@ impl PartitionCaptureReceiptPlan {
     pub fn new_routed_shared_funded(
         source: &SharedCapturePlan, context: &PartitionCaptureContext,
         producers: &[PartitionCaptureRoutedProducerSource<'_>], world_size: usize,
-        limits: PartitionCaptureReceiptLimits, metadata: &WorkspaceMetadataFunding,
+        limits: PartitionCaptureReceiptLimits, metadata: &HostMetadataFunding,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureReceiptConstructionError> {
         Self::construct_shared_funded(source,context,ProducerSources::Routed(producers),
@@ -182,7 +185,7 @@ impl PartitionCaptureReceiptPlan {
     fn construct_shared_funded(
         source: &SharedCapturePlan, context: &PartitionCaptureContext,
         producers_source: ProducerSources<'_>, world_size: usize, limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding, ledger: &mut dyn CaptureReservation,
+        metadata: &HostMetadataFunding, ledger: &mut dyn CaptureReservation,
         global_preparation_required: bool, terminal_rows: Option<usize>,
     ) -> Result<(Self, CaptureUsage), PartitionCaptureReceiptConstructionError> {
         let error = |cause| PartitionCaptureReceiptConstructionError {
@@ -334,25 +337,20 @@ impl PartitionCaptureReceiptPlan {
             slice: Some(slice), terminal_rows, global_shape, identity: String::with_capacity(64),
             metadata: metadata.clone(),
         };
-        Self::new_with_ownership(CapturePlanSource::Shared(source.clone()), context,
+        Self::new_with_ownership(source.clone(), context,
             producers, ownership, producers_source.combination(),
             world_size, limits, ledger, Some(storage)).map(|receipt| (receipt, global_preparation))
             .map_err(|cause| error(cause.into()))
     }
 }
 
-pub(in crate::capture::partition) fn copy_routed_ownership(source:&RoutedUnitCaptureOwnership,metadata:&WorkspaceMetadataFunding)
+pub(in crate::capture::partition) fn copy_routed_ownership(source:&RoutedUnitCaptureOwnership,metadata:&HostMetadataFunding)
     ->Result<RoutedUnitCaptureOwnership,Cause>
 {
-    fn copy(source:&eredu_core::component::ComponentCoordinateMap,metadata:&WorkspaceMetadataFunding)
+    fn copy(source:&eredu_core::component::ComponentCoordinateMap,metadata:&HostMetadataFunding)
         ->Result<eredu_core::component::ComponentCoordinateMap,Cause>
     {
-        let controls=eredu_core::component::ComponentCoordinateMap::copy_control_bytes()
-            .ok_or(Cause::Source("coordinate copy controls overflow"))?;
-        metadata.reserve_metadata(controls)?;
-        let count=source.copy_storage_elements();
-        source.copy_with_storage(metadata.metadata_vec(count)?,metadata.metadata_vec(count)?)
-            .map_err(|_|Cause::Source("paid coordinate copy destination differs"))
+        source.try_clone_with_funding(metadata).map_err(Into::into)
     }
     Ok(RoutedUnitCaptureOwnership {
         coordinates:eredu_core::component::RoutedComponentCoordinateMap::new(
@@ -361,7 +359,7 @@ pub(in crate::capture::partition) fn copy_routed_ownership(source:&RoutedUnitCap
     })
 }
 
-pub(in crate::capture::partition) fn copy_context(source: &PartitionCaptureContext, metadata: &WorkspaceMetadataFunding)
+pub(in crate::capture::partition) fn copy_context(source: &PartitionCaptureContext, metadata: &HostMetadataFunding)
     -> Result<PartitionCaptureContext, eredu_nn::Error>
 {
     Ok(PartitionCaptureContext {
@@ -401,16 +399,16 @@ fn constructor_control_bytes() -> Option<usize> {
         size_of::<PartitionCaptureContext>() * 2,
         size_of::<Option<eredu_core::capture::CaptureInvocationShape>>(),
         size_of::<PartitionCaptureReceiptLimits>(),
-        size_of::<(SharedCapturePlan, WorkspaceMetadataFunding)>(),
+        size_of::<(SharedCapturePlan, HostMetadataFunding)>(),
         size_of::<BTreeMap<usize, CaptureSlicePartition>>(),
         size_of::<BTreeMap<usize, RoutedUnitCaptureOwnership>>(),
         size_of::<Vec<PartitionCaptureProducer>>() * 2,
         size_of::<ProducerSources<'_>>() * 2,
         size_of::<PartitionCaptureCoordinateProducer<'_>>() * 2,
         size_of::<(&SharedCapturePlan,&PartitionCaptureContext,usize,&[PartitionCaptureCoordinateProducer<'_>],
-            PartitionCaptureCombination,usize,PartitionCaptureReceiptLimits,&WorkspaceMetadataFunding,&mut dyn CaptureReservation)>(),
+            PartitionCaptureCombination,usize,PartitionCaptureReceiptLimits,&HostMetadataFunding,&mut dyn CaptureReservation)>(),
         size_of::<(&SharedCapturePlan,&PartitionCaptureContext,usize,&[PartitionCaptureContiguousProducer],
-            PartitionCaptureCombination,usize,PartitionCaptureReceiptLimits,&WorkspaceMetadataFunding,&mut dyn CaptureReservation)>(),
+            PartitionCaptureCombination,usize,PartitionCaptureReceiptLimits,&HostMetadataFunding,&mut dyn CaptureReservation)>(),
         size_of::<(usize,usize)>(),size_of::<std::ops::Range<usize>>() * 2,
         size_of::<(usize,usize,std::ops::Range<u64>)>(),
         size_of::<(usize,ProducerProjection<'_>)>() * 2,
@@ -420,7 +418,7 @@ fn constructor_control_bytes() -> Option<usize> {
         size_of::<std::slice::Iter<'_,PartitionCaptureContiguousProducer>>(),
         size_of::<Result<usize,usize>>(),
         size_of::<Option<String>>(),
-        size_of::<Option<WorkspaceMetadataFunding>>(),
+        size_of::<Option<HostMetadataFunding>>(),
         size_of::<CaptureUsage>() * 6,
         size_of::<Option<CaptureQuota>>(),
         size_of::<Result<(PartitionCaptureReceiptPlan, CaptureUsage), PartitionCaptureReceiptConstructionError>>(),
@@ -433,7 +431,7 @@ fn constructor_control_bytes() -> Option<usize> {
         size_of::<Result<PartitionCaptureReceiptPlan, PartitionCaptureReceiptConstructionError>>(),
         size_of::<Result<PartitionCaptureReceiptPlan, PartitionCaptureMergeError>>(),
         size_of::<Result<PartitionCaptureContext, eredu_nn::Error>>(),
-        size_of::<(&SharedCapturePlan, &PartitionCaptureContext, &WorkspaceMetadataFunding,
+        size_of::<(&SharedCapturePlan, &PartitionCaptureContext, &HostMetadataFunding,
             &mut dyn CaptureReservation, usize, usize)>(),
         size_of::<(&CaptureSlicePartition, &ResolvedCaptureSlice, usize, u64)>(),
         size_of::<std::slice::Iter<'_, PartitionCaptureProducer>>() * 2,
@@ -470,9 +468,9 @@ fn routed_constructor_control_bytes()->Option<usize> {
         size_of::<Vec<(usize,RoutedUnitCaptureOwnership)>>() * 2,
         size_of::<RoutedUnitCaptureOwnership>() * 3,
         size_of::<eredu_core::component::RoutedComponentCoordinateMap>(),
-        size_of::<(&RoutedUnitCaptureOwnership,&WorkspaceMetadataFunding)>(),
+        size_of::<(&RoutedUnitCaptureOwnership,&HostMetadataFunding)>(),
         size_of::<Result<RoutedUnitCaptureOwnership,Cause>>(),
-        size_of::<(&eredu_core::component::ComponentCoordinateMap,&WorkspaceMetadataFunding)>(),
+        size_of::<(&eredu_core::component::ComponentCoordinateMap,&HostMetadataFunding)>(),
         size_of::<Result<eredu_core::component::ComponentCoordinateMap,Cause>>(),
         size_of::<std::slice::Iter<'_,PartitionCaptureRoutedProducerSource<'_>>>(),
         size_of::<std::slice::Windows<'_,(usize,RoutedUnitCaptureOwnership)>>(),
@@ -481,7 +479,9 @@ fn routed_constructor_control_bytes()->Option<usize> {
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
 
-pub(in crate::capture::partition) fn component_adapter_error(source:&SharedCapturePlan,metadata:&WorkspaceMetadataFunding,cause:eredu_nn::Error)
+pub(in crate::capture::partition) fn component_adapter_error(source:&SharedCapturePlan,metadata:&HostMetadataFunding,cause:eredu_nn::Error)
     ->PartitionCaptureReceiptConstructionError {
     PartitionCaptureReceiptConstructionError{cause:Cause::Destination(cause),_source:source.clone(),_metadata:metadata.clone()}
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -452,5 +452,5 @@ pub(super) fn ordinary(
         roots: None,
     }))
     .map(MlxTensor::from_array)
-    .map_err(|cause| Error::Neural(eredu_nn::Error::backend_source(cause)))
+    .map_err(|cause| Error::Neural(eredu_nn::Error::backend_retained_source(cause)))
 }

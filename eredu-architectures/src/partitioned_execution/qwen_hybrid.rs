@@ -207,7 +207,7 @@ where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     let model = crate::qwen::hybrid::LayeredModel::<B>::new(args.clone(), context)?;
-    eredu_runtime::ArchitectureParameters::parameter_description(&model, context)
+    eredu_runtime::ArchitectureParameters::parameter_description(&model, context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description, B::construction_metadata(context)))
 }
 
 pub(super) fn prepare_routed<B, S, V>(

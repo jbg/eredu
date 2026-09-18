@@ -701,30 +701,34 @@ mod tests {
         }
 
         impl Parameterized<crate::MlxTensor> for Module {
-            fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+            fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
             where
-                V: ParameterVisitor<'a, crate::MlxTensor>,
+                V: eredu_nn::ParameterSourceVisitor<'a, crate::MlxTensor>,
             {
-                visitor.visit(
-                    ParameterMetadata::from_spec(&self.weight_spec, true),
+ let mut __source_result = Ok(());
+
+                visitor.parameter(
+                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec,true),
                     &self.weight,
                 );
-                visitor.visit(
-                    ParameterMetadata::from_spec(&self.scales_spec, true),
+                visitor.parameter(
+                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec,true),
                     &self.scales,
                 );
-            }
+
+ __source_result
+}
 
             fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
             where
                 V: ParameterVisitorMut<'a, crate::MlxTensor>,
             {
                 visitor.visit_mut(
-                    ParameterMetadata::from_spec(&self.weight_spec, true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec,true),
                     &mut self.weight,
                 );
                 visitor.visit_mut(
-                    ParameterMetadata::from_spec(&self.scales_spec, true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec,true),
                     &mut self.scales,
                 );
             }

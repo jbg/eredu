@@ -110,12 +110,52 @@ pub struct PreparedLexer {
     selected: Option<LexemeSet>,
     failed: bool,
 }
-fn mask<F: Fn(usize) -> Result<(), E>, E>(bits: usize, reserve: &F) -> Result<SimpleVob, Cause<E>> {
+fn mask<F: crate::earley::PreparedFunding<Error = E>, E>(bits: usize, reserve: &F) -> Result<SimpleVob, Cause<E>> {
     let plan = TokenMaskConstructionPlan::zeroed(bits).map_err(Cause::MaskSource)?;
-    reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+    reserve.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
     plan.compile().map_err(Cause::Mask)
 }
 impl PreparedLexer {
+    // Mutable workers borrow the already constructed lexer. In particular,
+    // they never construct Self, PreparedLexerError's owning prefix, or the
+    // Result<Self, PreparedLexerError> returned by prepare. Charging those
+    // constructor frames per trie byte would repeatedly count the whole
+    // retained DFA owner even for a cached transition.
+    fn operation_controls<F, E>() -> Option<usize> {
+        let parts = [
+            TokenMaskConstructionPlan::inspection_control_bytes()?,
+            size_of::<&mut Self>(),
+            size_of::<PreparedLexerOperationError<E>>(),
+            size_of::<Cause<E>>(),
+            size_of::<PreparedRegexVectorOperationError<E>>(),
+            size_of::<&F>(),
+            size_of::<TokenMaskConstructionPlan<'_>>(),
+            size_of::<TokenMaskConstructionFailure>(),
+            size_of::<TokenMaskSourceError>(),
+            size_of::<Result<(), E>>(),
+            size_of::<Result<(), Cause<E>>>(),
+            size_of::<Result<SimpleVob, Cause<E>>>(),
+            size_of::<Result<SimpleVob, TokenMaskConstructionFailure>>(),
+            size_of::<Result<TokenMaskConstructionPlan<'_>, TokenMaskSourceError>>(),
+            size_of::<Result<StateID, PreparedRegexVectorOperationError<E>>>(),
+            size_of::<Option<SimpleVob>>(),
+            size_of::<Option<LexemeSet>>(),
+            size_of::<(usize, u8, StateID, StateID)>(),
+            size_of::<(&mut PreparedRegexVector, &F, StateID)>(),
+            size_of::<(
+                &mut PreparedRegexVector,
+                &SimpleVob,
+                &toktrie::TokTrie,
+                &LexemeSet,
+                &F,
+            )>(),
+            size_of::<std::ops::Range<usize>>(),
+            size_of::<std::ops::RangeInclusive<u8>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
     fn controls<F, E>() -> Option<usize> {
         let parts = [
             TokenMaskConstructionPlan::inspection_control_bytes()?,
@@ -155,7 +195,7 @@ impl PreparedLexer {
     }
     /// Consumes the existing paid vector, selects its actual lexical rows, and
     /// uses the same full first-byte warm-up as ordinary Lexer construction.
-    pub fn prepare<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn prepare<F: crate::earley::PreparedFunding<Error = E>, E>(
         vector: PreparedRegexVector,
         reserve: &F,
     ) -> Result<Self, PreparedLexerError<E>> {
@@ -166,7 +206,7 @@ impl PreparedLexer {
             failed: true,
         };
         let result = (|| -> Result<(), Cause<E>> {
-            reserve(Self::controls::<F, E>().ok_or(Cause::Overflow)?).map_err(Cause::Funding)?;
+            reserve.reserve(Self::controls::<F, E>().ok_or(Cause::Overflow)?).map_err(Cause::Funding)?;
             owner.selected = Some(LexemeSet::from_owned_vob(mask(
                 owner.vector.roots().len(),
                 reserve,
@@ -208,7 +248,7 @@ impl PreparedLexer {
     }
     fn run<T, F, E, G>(&mut self, reserve: &F, run: G) -> Result<T, PreparedLexerOperationError<E>>
     where
-        F: Fn(usize) -> Result<(), E>,
+        F: crate::earley::PreparedFunding<Error = E>,
         G: FnOnce(&mut Self, &F) -> Result<T, Cause<E>>,
     {
         if self.failed {
@@ -219,7 +259,7 @@ impl PreparedLexer {
         self.failed = true;
         let result = (|| {
             let frames = [
-                Self::controls::<F, E>().ok_or(Cause::Overflow)?,
+                Self::operation_controls::<F, E>().ok_or(Cause::Overflow)?,
                 size_of::<G>(),
                 size_of::<T>(),
                 size_of::<Result<T, Cause<E>>>(),
@@ -230,13 +270,13 @@ impl PreparedLexer {
                 size_of::<PreLexeme>(),
                 size_of::<NextByte>(),
             ];
-            reserve(
+            let _frame = reserve.frame(
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
                     .ok_or(Cause::Overflow)?,
             )
-            .map_err(Cause::Funding)?;
+            .map_err(Cause::frame)?;
             run(self, reserve)
         })();
         match result {
@@ -254,7 +294,7 @@ impl PreparedLexer {
         self.vector.state_desc(state).ok_or(Cause::Source)
     }
     /// Same selected initial-state worker and state interning as the ordinary lexer.
-    pub fn start_state<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn start_state<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         selected: &LexemeSet,
         reserve: &F,
@@ -267,7 +307,7 @@ impl PreparedLexer {
         })
     }
     /// One real derivative transition followed by the shared greedy/lazy/special decision.
-    pub fn advance<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn advance<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         prev: StateID,
         byte: u8,
@@ -293,7 +333,7 @@ impl PreparedLexer {
         })
     }
     /// Same raw initial-row transition used by ordinary lexical handoff.
-    pub(crate) fn transition_start_state<F: Fn(usize) -> Result<(), E>, E>(
+    pub(crate) fn transition_start_state<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         byte: Option<u8>,
@@ -311,7 +351,7 @@ impl PreparedLexer {
         })
     }
     /// Restricts an existing state through the same paid state-interning worker.
-    pub(crate) fn limit_state_to<F: Fn(usize) -> Result<(), E>, E>(
+    pub(crate) fn limit_state_to<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         selected: &LexemeSet,
@@ -325,7 +365,7 @@ impl PreparedLexer {
         })
     }
     /// Actual next-byte query, including greedy-match fuzzing used by ordinary Lexer.
-    pub fn next_byte<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn next_byte<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -342,7 +382,7 @@ impl PreparedLexer {
         })
     }
     /// Shared ordinary forced-end decision on the same completed descriptor.
-    pub fn force_lexeme_end<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn force_lexeme_end<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -352,7 +392,7 @@ impl PreparedLexer {
         })
     }
     /// Shared ordinary greedy accepting end decision.
-    pub fn try_lexeme_end<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn try_lexeme_end<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         reserve: &F,
@@ -362,7 +402,7 @@ impl PreparedLexer {
         })
     }
     /// Shared single-byte ForcedEOI decision without greedy fuzzing.
-    pub fn check_for_single_byte_lexeme<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn check_for_single_byte_lexeme<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         state: StateID,
         byte: u8,
@@ -378,7 +418,7 @@ impl PreparedLexer {
     }
     /// The actual source-trie precompute uses the same fixed-depth stack,
     /// TokTrie traversal and lexical decision worker as ordinary Lexer.
-    pub fn precompute_for<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn precompute_for<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         trie: &toktrie::TokTrie,
         selected: &LexemeSet,
@@ -397,7 +437,7 @@ impl PreparedLexer {
             )
         })
     }
-    fn precompute_parts<F: Fn(usize) -> Result<(), E>, E>(
+    fn precompute_parts<F: crate::earley::PreparedFunding<Error = E>, E>(
         vector: &mut PreparedRegexVector,
         first: &SimpleVob,
         trie: &toktrie::TokTrie,
@@ -405,7 +445,7 @@ impl PreparedLexer {
         reserve: &F,
     ) -> Result<(), Cause<E>> {
         use super::precompute::{LexerPrecompute, LexerPrecomputePlan};
-        reserve(LexerPrecomputePlan::inspection_control_bytes().ok_or(Cause::Overflow)?)
+        reserve.reserve(LexerPrecomputePlan::inspection_control_bytes().ok_or(Cause::Overflow)?)
             .map_err(Cause::Funding)?;
         let state = vector
             .initial_state(selected, reserve)
@@ -423,10 +463,10 @@ impl PreparedLexer {
                 vector.state_desc(state).expect("completed transition"),
             ))
         };
-        reserve(LexerPrecompute::execution_control_bytes(&advance).ok_or(Cause::Overflow)?)
+        reserve.reserve(LexerPrecompute::execution_control_bytes(&advance).ok_or(Cause::Overflow)?)
             .map_err(Cause::Funding)?;
         let plan = LexerPrecomputePlan::prepare(trie).map_err(Cause::Precompute)?;
-        reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+        reserve.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
         let storage = plan.compile().map_err(Cause::Precompute)?;
         storage
             .run_with(state, advance)
@@ -435,7 +475,7 @@ impl PreparedLexer {
     }
     /// Same parser startup schedule, with paid single-lexeme selections and the
     /// exact original trie. Failure retains any reached selection in this owner.
-    pub fn prepare_large_lexemes<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn prepare_large_lexemes<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         trie: &toktrie::TokTrie,
         limits: &crate::api::ParserLimits,
@@ -457,7 +497,7 @@ impl PreparedLexer {
                     &F,
                 )>(),
             ];
-            reserve(
+            reserve.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -475,7 +515,7 @@ impl PreparedLexer {
             )
         })
     }
-    pub(crate) fn begin_mask<F: Fn(usize) -> Result<(), E>, E>(
+    pub(crate) fn begin_mask<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         limits: &crate::api::ParserLimits,
         funding: &F,
@@ -504,7 +544,7 @@ struct Scheduled<'a, F, E> {
     reserve: &'a F,
     marker: std::marker::PhantomData<E>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> super::schedule::Context for Scheduled<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> super::schedule::Context for Scheduled<'_, F, E> {
     type Error = Cause<E>;
     fn len(&self) -> usize {
         self.owner.vector.roots().len()
@@ -540,4 +580,8 @@ impl<F: Fn(usize) -> Result<(), E>, E> super::schedule::Context for Scheduled<'_
         self.owner.selected = None;
         Ok(())
     }
+}
+
+impl<E> Cause<E> {
+ fn frame(error: crate::earley::FrameError<E>) -> Self { match error { crate::earley::FrameError::Overflow => Self::Overflow, crate::earley::FrameError::Funding(error) => Self::Funding(error) } }
 }

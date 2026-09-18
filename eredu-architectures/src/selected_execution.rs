@@ -250,44 +250,49 @@ impl SelectedExecution {
     /// compiled by the architecture's admission driver, not inferred from rank
     /// adjacency, checkpoint aliases or a backend's local native tensor shapes.
     /// The supplied descriptor/parameters must be those retained with this model.
-    pub fn component_partition_layout_for_rank(
+    pub fn component_partition_layout_for_rank(&self,descriptor:&eredu_core::ArchitectureDescriptor,parameters:&eredu_runtime::ArchitectureParameterDescription,global_rank:usize)->Result<Option<crate::component_partition::ComponentPartitionLayout>,crate::component_partition::ComponentPartitionError>{self.component_partition_layout_for_rank_worker(descriptor,parameters,global_rank,crate::component_partition::construction::Destination(None))}
+    /// Compiles all retained rank declarations through the shared constructor.
+    pub fn component_partition_layouts(&self,descriptor:&eredu_core::ArchitectureDescriptor,parameters:&eredu_runtime::ArchitectureParameterDescription,max_ranks:usize)->Result<Option<crate::component_partition::ComponentPartitionLayouts>,crate::component_partition::ComponentPartitionError>{self.component_partition_layouts_worker(descriptor,parameters,max_ranks,crate::component_partition::construction::Destination(None))}
+    pub(crate) fn component_partition_layout_for_rank_worker(
         &self,
         descriptor: &eredu_core::ArchitectureDescriptor,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         global_rank: usize,
+        allocation:crate::component_partition::construction::Destination<'_>,
     ) -> Result<
         Option<crate::component_partition::ComponentPartitionLayout>,
         crate::component_partition::ComponentPartitionError,
     > {
-        use crate::partitioned_execution::selected_component_layout_for_rank;
+        use crate::partitioned_execution::selected_component_layout_for_rank_worker;
+        allocation.controls::<(&Self,&eredu_core::ArchitectureDescriptor,&eredu_runtime::ArchitectureParameterDescription,usize)>()?;
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
-                selected_component_layout_for_rank(
+                selected_component_layout_for_rank_worker(
                     selected.requirements(),
                     descriptor,
                     parameters,
                     global_rank,
-                    self.routed_realization(),
+                    self.routed_realization(),allocation,
                 )
                 .map(Some)
             }
             SelectedExecutionKind::PartitionedRouted(selected) => {
-                selected_component_layout_for_rank(
+                selected_component_layout_for_rank_worker(
                     selected.requirements(),
                     descriptor,
                     parameters,
                     global_rank,
-                    self.routed_realization(),
+                    self.routed_realization(),allocation,
                 )
                 .map(Some)
             }
             SelectedExecutionKind::PartitionedComposite(selected) => {
-                selected_component_layout_for_rank(
+                selected_component_layout_for_rank_worker(
                     selected.requirements(),
                     descriptor,
                     parameters,
                     global_rank,
-                    self.routed_realization(),
+                    self.routed_realization(),allocation,
                 )
                 .map(Some)
             }
@@ -298,31 +303,26 @@ impl SelectedExecution {
     /// Compiles one reusable set of component layouts for the whole retained
     /// topology. The rank bound is checked before allocating or deriving layouts.
     /// Reuse the result across selections and forwards; it contains no native state.
-    pub fn component_partition_layouts(
+    pub(crate) fn component_partition_layouts_worker(
         &self,
         descriptor: &eredu_core::ArchitectureDescriptor,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         max_ranks: usize,
+        allocation:crate::component_partition::construction::Destination<'_>,
     ) -> Result<
         Option<crate::component_partition::ComponentPartitionLayouts>,
         crate::component_partition::ComponentPartitionError,
     > {
+        allocation.controls::<(&Self,&eredu_core::ArchitectureDescriptor,&eredu_runtime::ArchitectureParameterDescription,usize,Vec<crate::component_partition::ComponentPartitionLayout>)>()?;
         let Some(topology) = self.parallel_topology() else {
             return Ok(None);
         };
         if topology.world_size() > max_ranks {
-            return Err(eredu_core::capture::CaptureError::Invalid(
-                "component rank count exceeds its bound".into(),
-            )
-            .into());
+            return Err(allocation.capture_invalid(format_args!("component rank count exceeds its bound")));
         }
-        let layouts = (0..topology.world_size())
-            .map(|rank| {
-                self.component_partition_layout_for_rank(descriptor, parameters, rank)
-                    .map(|layout| layout.expect("retained partition selection"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        crate::component_partition::ComponentPartitionLayouts::new(topology.topology(), layouts)
+        let mut layouts=allocation.vector(topology.world_size())?;
+        for rank in 0..topology.world_size(){layouts.push(self.component_partition_layout_for_rank_worker(descriptor,parameters,rank,allocation)?.expect("retained partition selection"));}
+        crate::component_partition::ComponentPartitionLayouts::new_worker(topology.topology(),layouts,allocation)
             .map(Some)
     }
 

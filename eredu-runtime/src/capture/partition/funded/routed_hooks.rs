@@ -9,7 +9,7 @@ pub(super) enum Slot { Unused, Active(Option<PartitionCaptureLocalHook>) }
 #[derive(Debug)]
 pub struct PartitionCaptureRoutedHooks {
     slots:Vec<Slot>,first:usize,prefill:Option<(InferenceGeometry,u64)>,
-    source:SharedCapturePlan,metadata:WorkspaceMetadataFunding,
+    source:SharedCapturePlan,metadata:HostMetadataFunding,
 }
 #[derive(Debug,thiserror::Error)]
 #[error("partition routed hook scope: {cause}")]
@@ -72,7 +72,7 @@ impl PartitionCaptureRoutedHooks {
             size_of::<Failure>(),eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?,
             size_of::<PartitionCaptureProgramError>(),size_of::<Result<Self,PartitionCaptureProgramError>>(),
             size_of::<Option<(InferenceGeometry,u64)>>(),size_of::<Option<PartitionCaptureLocalHook>>(),
-            size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>()];
+            size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
 }
@@ -166,3 +166,5 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
         self.routed_hooks=Some(scope.slots);Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

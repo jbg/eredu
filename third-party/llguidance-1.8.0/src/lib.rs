@@ -68,7 +68,6 @@ mod regex_rewrite;
 pub mod substring;
 pub use grammar_builder::{GrammarBuilder, NodeRef};
 pub use json::compiler::JsonCompileOptions;
-pub use json::json_merge;
 pub use stop_controller::StopController;
 pub use tokenizer_json::token_bytes_from_tokenizer_json;
 
@@ -137,3 +136,5 @@ pub use tokenparser::forcing::{
     forced_token_driver_control_bytes, select_forced_prefix, select_forced_tokens,
     ForcedTokenContext, ForcedTokenSelection,
 };
+
+mod allocation;

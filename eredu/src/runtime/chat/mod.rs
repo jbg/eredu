@@ -8,6 +8,7 @@ pub(crate) mod atem;
 pub(crate) mod constraints;
 pub(crate) mod dialect;
 pub(crate) mod gemma;
+pub(crate) mod grammar_text;
 pub(crate) mod harmony;
 pub(crate) mod ifm;
 pub(crate) mod inkling;
@@ -133,9 +134,16 @@ pub(crate) struct SemanticRuntimePlan {
 
 impl SemanticRuntimePlan {
     pub(crate) fn original_tool_validation(
-        &self, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
-    ) -> Result<Option<Arc<dyn eredu_runtime::working_memory::OriginalToolValidation>>, tool_schema::registered::PreparationFailure> {
-        self.tool_schemas.as_ref().map(|source| source.prepare(&self.recipe, funding)).transpose()
+        &self,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<
+        Option<Arc<dyn eredu_runtime::working_memory::OriginalToolValidation>>,
+        tool_schema::registered::PreparationFailure,
+    > {
+        self.tool_schemas
+            .as_ref()
+            .map(|source| source.prepare(&self.recipe, funding))
+            .transpose()
     }
 
     /// Borrows the actual selected parser program and compares the exact trigger
@@ -160,9 +168,12 @@ impl SemanticRuntimePlan {
         source: eredu_core::speculative::PreparedGrammarSource<'_>,
     ) -> Result<&'static dialect::DeclarativeDialectSpec, dialect::DeclarationError> {
         if !self.recipe.source().same_storage(source.recipe()) {
-            return Err(dialect::DeclarationError::Message("grammar parser recipe source changed"));
+            return Err(dialect::DeclarationError::Message(
+                "grammar parser recipe source changed",
+            ));
         }
-        self.dialect.original_channel_program(self.dialect_parameters)
+        self.dialect
+            .original_channel_program(self.dialect_parameters)
     }
 
     /// Ordinary literal stop selection excludes exact structural spellings.
@@ -209,9 +220,15 @@ impl SemanticRuntimePlan {
         authority: &eredu_core::HostPreparationAuthority,
     ) -> Result<ToolRuntimeParser, String> {
         let tools = self.recipe.tools()?;
-        let parser = self
-            .dialect
-            .incremental_parser_state_with_tools(self.dialect_parameters, &tools)?;
+        let declarations = tool_schema::ToolDeclarations::prepare(
+            &tools,
+            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        )
+        .map_err(|e| e.to_string())?;
+        let parser = self.dialect.incremental_parser_state_with_tools(
+            self.dialect_parameters,
+            declarations.as_slice(),
+        )?;
         ToolRuntimeParser::new_with_structural_stops(
             parser,
             self.recipe.stop_sequences(),
@@ -273,6 +290,13 @@ pub(crate) struct GenerationRuntimePlanParts {
 }
 
 impl GenerationRuntimePlan {
+    pub(crate) fn controller_sources(&self) -> eredu_runtime::working_memory::ControllerCompilationSources<'_> {
+        eredu_runtime::working_memory::ControllerCompilationSources {
+            recipe: Some(self.generation_constraint.inner.recipe.source()),
+            grammar: self.generation_constraint.inner.compiled_grammar_source(),
+            validation: self.semantic.tool_schemas.as_ref().map(|source| source.source()),
+        }
+    }
     pub(crate) fn new(parts: GenerationRuntimePlanParts) -> Self {
         let semantic = SemanticRuntimePlan {
             dialect: parts.dialect,
@@ -288,33 +312,12 @@ impl GenerationRuntimePlan {
         }
     }
 
-    pub(super) fn prepare_tool_schema_sources(
-        &mut self, tools: &[Value], authority: &eredu_core::HostPreparationAuthority,
-    ) -> Result<(), String> {
-        if !tools.is_empty() {
-            self.semantic.tool_schemas = Some(tool_schema::registered::Historical::compile(tools, &self.semantic.recipe, authority)?);
-        }
-        Ok(())
-    }
-    /// Replaces every local recipe alias with the source registered in the exact
-    /// runtime domain. Called while eager compiler temporaries remain guarded.
-    pub(crate) fn register_sources<B: eredu_core::TextGenerationBackend>(
+    pub(super) fn bind_tool_schema_sources(
         &mut self,
-        runtime: &eredu_core::ModelRuntime<B>,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        let recipe = self.semantic.recipe.register(runtime)?;
-        let blueprint = self
-            .generation_constraint
-            .inner
-            .with_registered_recipe(runtime, recipe.clone())?;
-        let tool_schemas = self.semantic.tool_schemas.as_ref()
-            .map(|source| source.register(runtime, &self.semantic.recipe, &recipe)).transpose()?;
-        self.generation_constraint.inner = Arc::new(blueprint);
-        self.semantic.recipe = recipe;
-        self.semantic.tool_schemas = tool_schemas;
-        Ok(())
+        schemas: tool_schema::registered::PendingSchemas,
+    ) {
+        self.semantic.tool_schemas = Some(schemas.bind(&self.semantic.recipe));
     }
-
     pub(crate) fn semantic_plan(&self) -> &SemanticRuntimePlan {
         &self.semantic
     }
@@ -358,10 +361,15 @@ impl GenerationRuntimePlan {
     #[cfg(test)]
     pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
         let tools = self.semantic.recipe.tools()?;
-        let parser = self
-            .semantic
-            .dialect
-            .incremental_parser_state_with_tools(self.semantic.dialect_parameters, &tools)?;
+        let declarations = tool_schema::ToolDeclarations::prepare(
+            &tools,
+            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        )
+        .map_err(|e| e.to_string())?;
+        let parser = self.semantic.dialect.incremental_parser_state_with_tools(
+            self.semantic.dialect_parameters,
+            declarations.as_slice(),
+        )?;
         let mut parser = ToolRuntimeParser::new(
             parser,
             self.semantic.recipe.stop_sequences(),
@@ -411,14 +419,14 @@ impl PartialEq for GenerationRuntimePlan {
 impl Eq for GenerationRuntimePlan {}
 
 /// Whether the selected checkpoint template has registered native tool support.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeToolSupport {
     /// The selected format profile produced a native tool runtime plan.
     Supported,
     /// No safe native tool runtime plan could be selected.
     Unsupported {
         /// Human-readable explanation suitable for diagnostics.
-        reason: String,
+        reason: &'static str,
     },
 }
 
@@ -440,14 +448,14 @@ impl NativeToolSupport {
 
 /// Whether generated responses can be decoded into protocol-neutral semantic
 /// events for the selected checkpoint protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticSupport {
     /// A structural response parser was recognized and prepared.
     Supported,
     /// No safe semantic parser could be recognized.
     Unsupported {
         /// Human-readable explanation suitable for diagnostics.
-        reason: String,
+        reason: &'static str,
     },
 }
 
@@ -462,14 +470,14 @@ impl SemanticSupport {
 }
 
 /// Support status for one independently gated chat capability.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilitySupport {
     /// The capability was established from protocol evidence.
     Supported,
     /// The capability was not established.
     Unsupported {
         /// Human-readable explanation suitable for diagnostics.
-        reason: String,
+        reason: &'static str,
     },
 }
 
@@ -489,7 +497,7 @@ impl CapabilitySupport {
 }
 
 /// Independently recognized chat protocol capabilities.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatCapabilities {
     /// Structural reasoning-channel parsing.
     pub reasoning_parser: CapabilitySupport,
@@ -507,9 +515,13 @@ pub struct ChatCapabilities {
     pub constrained_tool_generation: CapabilitySupport,
 }
 
-/// A rendered chat prompt together with generation and parsing metadata.
+mod prepared_chat;
+pub use prepared_chat::PreparedChat;
+pub(crate) use prepared_chat::PublicationError as PreparedChatPublicationError;
+
+/// Inspection output has no source receipt and cannot authorize execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedChat {
+pub(crate) struct ChatInspection {
     /// The rendered prompt, honoring the request's generation-prompt toggle.
     pub(crate) rendered_prompt: String,
     /// The suffix contributed when `add_generation_prompt` is enabled.
@@ -519,24 +531,11 @@ pub struct PreparedChat {
     pub(crate) generation_prompt: String,
     /// Stable identity of the selected checkpoint chat template.
     pub(crate) template_identity: ChatTemplateIdentity,
-    /// Stable format-protocol identity, when behavior was recognized.
-    pub(crate) format_profile_identity: Option<String>,
-    /// Native tool capability for the selected template and profile.
-    pub(crate) native_tool_support: NativeToolSupport,
-    /// Semantic response parsing capability, independent of tool constraints.
-    pub(crate) semantic_support: SemanticSupport,
-    pub(crate) text_generation_support: CapabilitySupport,
-    pub(crate) capabilities: ChatCapabilities,
-    pub(crate) generation_runtime_plan: Option<GenerationRuntimePlan>,
-    /// Checkpoint EOS token IDs used to stop generation.
-    pub(crate) eos_token_ids: Vec<u32>,
-    /// Profile-owned structural token IDs that decoding must preserve.
-    pub(crate) preserved_structural_token_ids: Vec<u32>,
-    /// Profile-owned text sequences that stop generation.
-    pub(crate) profile_stop_sequences: Vec<String>,
+    /// Immutable compiled declarations and metadata share their original payer.
+    pub(crate) policy: crate::api::CompiledChatPolicy,
 }
 
-impl PreparedChat {
+impl ChatInspection {
     /// Returns the rendered prompt.
     pub fn rendered_prompt(&self) -> &str {
         &self.rendered_prompt
@@ -554,17 +553,17 @@ impl PreparedChat {
 
     /// Returns the recognized stable format-protocol identity.
     pub fn format_profile_identity(&self) -> Option<&str> {
-        self.format_profile_identity.as_deref()
+        self.policy.metadata().profile_identity
     }
 
     /// Returns native tool capability for the selected template.
     pub fn native_tool_support(&self) -> &NativeToolSupport {
-        &self.native_tool_support
+        &self.policy.metadata().selection.native_tool_support
     }
 
     /// Returns semantic response parsing capability for the selected protocol.
     pub fn semantic_support(&self) -> &SemanticSupport {
-        &self.semantic_support
+        &self.policy.metadata().selection.semantic_support
     }
 
     /// Admission for explicit ordinary, speculative or controlled text generation. Tool declarations
@@ -574,50 +573,82 @@ impl PreparedChat {
     /// This reports request admission; backend support for speculation or execution
     /// control is separate, and snapshots require complete estimates and limits.
     pub fn text_generation_support(&self) -> &CapabilitySupport {
-        &self.text_generation_support
+        &self.policy.metadata().selection.text_generation_support
     }
 
     /// Returns independently gated protocol capabilities.
     pub fn capabilities(&self) -> &ChatCapabilities {
-        &self.capabilities
+        &self.policy.metadata().selection.capabilities
     }
 
     #[cfg(test)]
     pub(crate) fn tool_runtime_plan(&self) -> Option<&GenerationRuntimePlan> {
-        self.generation_runtime_plan
+        self.policy
+            .metadata()
+            .generation_runtime_plan
             .as_ref()
             .filter(|plan| plan.has_tool_surface())
     }
 
     pub(crate) fn semantic_runtime_plan(&self) -> Option<&SemanticRuntimePlan> {
-        self.generation_runtime_plan
+        self.policy
+            .metadata()
+            .generation_runtime_plan
             .as_ref()
             .map(GenerationRuntimePlan::semantic_plan)
     }
 
     pub(crate) fn generation_runtime_plan(&self) -> Option<&GenerationRuntimePlan> {
-        self.generation_runtime_plan.as_ref()
+        self.policy.metadata().generation_runtime_plan.as_ref()
     }
 
     /// Returns checkpoint EOS token IDs.
     pub fn eos_token_ids(&self) -> &[u32] {
-        &self.eos_token_ids
+        &self.policy.metadata().eos_token_ids
     }
 
     /// Returns structural token IDs that must survive decoding.
     pub fn preserved_structural_token_ids(&self) -> &[u32] {
-        &self.preserved_structural_token_ids
+        &self.policy.metadata().preserved_structural_token_ids
     }
 
     /// Returns format-profile stop sequences.
     pub fn profile_stop_sequences(&self) -> &[String] {
-        &self.profile_stop_sequences
+        &self.policy.metadata().stop_sequences
     }
 }
 
-#[derive(Debug)]
+/// Borrowed immutable profile strings and at most two optional protocol markers.
+/// Recognition chooses static declarations; owning copies belong to consumers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProfileStrings {
+    base: &'static [&'static str],
+    extra: [Option<&'static str>; 2],
+}
+impl ProfileStrings {
+    pub(crate) const fn new(base: &'static [&'static str]) -> Self {
+        Self {
+            base,
+            extra: [None; 2],
+        }
+    }
+    pub(crate) const fn with_optional(
+        base: &'static [&'static str],
+        extra: [Option<&'static str>; 2],
+    ) -> Self {
+        Self { base, extra }
+    }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &'static str> + Clone + '_ {
+        self.base
+            .iter()
+            .copied()
+            .chain(self.extra.into_iter().flatten())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PreparedFormatProfile {
-    pub(crate) identity: Option<String>,
+    pub(crate) identity: Option<&'static str>,
     pub(crate) dialect: Option<&'static dyn FormatDialect>,
     pub(crate) dialect_parameters: Option<DialectParameters>,
     pub(crate) tool_dialect: Option<&'static dyn FormatDialect>,
@@ -630,10 +661,10 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) supports_tool_input_rendering: bool,
     pub(crate) supports_mapping_tool_arguments: bool,
     pub(crate) supports_string_tool_arguments: bool,
-    pub(crate) native_tool_unavailable_reason: Option<String>,
-    pub(crate) required_structural_tokens: Vec<String>,
-    pub(crate) tool_required_structural_tokens: Vec<String>,
-    pub(crate) stop_sequences: Vec<String>,
+    pub(crate) native_tool_unavailable_reason: Option<&'static str>,
+    pub(crate) required_structural_tokens: ProfileStrings,
+    pub(crate) tool_required_structural_tokens: ProfileStrings,
+    pub(crate) stop_sequences: ProfileStrings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1176,9 +1207,9 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
             supports_mapping_tool_arguments: true,
             supports_string_tool_arguments: false,
             native_tool_unavailable_reason: None,
-            required_structural_tokens: vec![SYNTHETIC_STRUCTURAL_TOKEN.into()],
-            tool_required_structural_tokens: vec![SYNTHETIC_STRUCTURAL_TOKEN.into()],
-            stop_sequences: Vec::new(),
+            required_structural_tokens: ProfileStrings::new(&[SYNTHETIC_STRUCTURAL_TOKEN]),
+            tool_required_structural_tokens: ProfileStrings::new(&[SYNTHETIC_STRUCTURAL_TOKEN]),
+            stop_sequences: ProfileStrings::new(&[]),
         };
     }
 
@@ -1199,9 +1230,9 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
         native_tool_unavailable_reason: Some(
             "no behavioral format recognizer matched the selected chat template".into(),
         ),
-        required_structural_tokens: Vec::new(),
-        tool_required_structural_tokens: Vec::new(),
-        stop_sequences: Vec::new(),
+        required_structural_tokens: ProfileStrings::new(&[]),
+        tool_required_structural_tokens: ProfileStrings::new(&[]),
+        stop_sequences: ProfileStrings::new(&[]),
     }
 }
 
@@ -1225,8 +1256,8 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("no behavioral format recognizer"))
         );
-        assert!(prepared.required_structural_tokens.is_empty());
-        assert!(prepared.stop_sequences.is_empty());
+        assert!(prepared.required_structural_tokens.iter().next().is_none());
+        assert!(prepared.stop_sequences.iter().next().is_none());
     }
 
     #[test]
@@ -1262,7 +1293,7 @@ mod tests {
     #[test]
     fn structural_resolution_rejects_non_atomic_special_identity() {
         let mut raw = Tokenizer::new(WordLevel::default());
-        raw.with_pre_tokenizer(Some(Whitespace));
+        raw.with_pre_tokenizer(Some(Whitespace::default()));
         raw.add_tokens([
             AddedToken::from("left", false),
             AddedToken::from("right", false),

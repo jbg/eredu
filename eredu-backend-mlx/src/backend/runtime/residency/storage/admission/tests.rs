@@ -88,6 +88,7 @@ fn registered_native_inventories_deduplicate_and_keep_all_physical_owners_charge
                 .values()
                 .next()
                 .unwrap()
+                .owned().unwrap()
                 .1
                 .evaluated()
                 .unwrap()
@@ -130,7 +131,8 @@ fn native_storage_registration_rejects_unknown_and_conflicting_bounds_without_wo
     assert_eq!(lazy.allocation_info().unwrap(), None);
     let mut conflict = RetainedStorage::default();
     conflict.include_array(&array).unwrap();
-    conflict.arrays.values_mut().next().unwrap().0 += 1;
+    let NativeEntry::Owned((conflicting_bytes, _)) = conflict.arrays.values_mut().next().unwrap() else { panic!("unpublished source") };
+    *conflicting_bytes += 1;
     let error = conflict.register(&pool).unwrap_err();
     let Error::Other(error) = error else {
         panic!("typed working-memory error");

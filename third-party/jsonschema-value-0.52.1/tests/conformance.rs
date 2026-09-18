@@ -59,8 +59,8 @@ impl Json for SimpleJson {
     type PreparedKey = String;
     type StringBuffer = Simple;
 
-    fn prepare_key(key: &str) -> String {
-        key.to_owned()
+    fn prepare_key_with_allocations(key: &str, allocations: &dyn serde_json::allocation::Allocation) -> Result<String, jsonschema_value::KeyPreparationError> {
+        Ok(serde_json::allocation::Allocator::new(allocations).copy_string(key)?)
     }
 
     fn with_string_node<T>(buffer: &mut Simple, string: &str, f: impl FnOnce(&Simple) -> T) -> T {
@@ -268,8 +268,8 @@ impl Json for ArenaJson {
     type PreparedKey = String;
     type StringBuffer = Arena;
 
-    fn prepare_key(key: &str) -> String {
-        key.to_owned()
+    fn prepare_key_with_allocations(key: &str, allocations: &dyn serde_json::allocation::Allocation) -> Result<String, jsonschema_value::KeyPreparationError> {
+        Ok(serde_json::allocation::Allocator::new(allocations).copy_string(key)?)
     }
 
     fn with_string_node<T>(

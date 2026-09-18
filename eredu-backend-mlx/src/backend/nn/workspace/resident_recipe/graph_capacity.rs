@@ -14,6 +14,68 @@ pub(crate) struct ResidentGraphStorage {
     query_controls: usize,
 }
 impl ResidentGraphStorage {
+    fn include_sampling(&mut self, rows: &[ResidentSamplingRecipe]) -> Result<bool, crate::backend::error::Error> {
+        let unknown = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::UnknownBound);
+        let overflow = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
+        let mut complete = true;
+        for row in rows {
+            match row.phase() {
+                SamplingWorkspacePhase::Preparation => {
+                    complete &= row.completion().is_none();
+                    match row.preparation {
+                        Some(ResidentSamplingPreparation::Empty) => {}
+                        Some(ResidentSamplingPreparation::EagerKey(graph)) => {
+                            self
+                                .add(graph.allocation_extents())
+                                .ok_or_else(overflow)?;
+                        }
+                        None => complete = false,
+                    }
+                }
+                SamplingWorkspacePhase::Step { .. } => match row.completion() {
+                    Some(completion) => {
+                        self
+                            .add(completion.graph.allocation_extents())
+                            .ok_or_else(overflow)?;
+                        // ReadToken moves this same completion into Submission;
+                        // outer scalar observation issues no second Eval/event.
+                        let event =
+                            OperationEvent::root_storage_layout(completion.traversal.roots())
+                                .ok_or_else(unknown)?;
+                        self
+                            .add(event.graph_request_extent())
+                            .ok_or_else(overflow)?;
+                        match completion.dispatch {
+                            Some(dispatch) => {
+                                self
+                                    .include_dag(
+                                        completion.traversal,
+                                        completion.graph,
+                                        dispatch,
+                                        NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
+                                        0,
+                                    )
+                                    .ok_or_else(unknown)?;
+                            }
+                            None => complete = false,
+                        }
+                    }
+                    None => complete = false,
+                },
+            }
+        }
+        Ok(complete)
+    }
+    fn finish_capacity(&mut self, complete: bool) -> Result<(), crate::backend::error::Error> {
+        let overflow = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
+        if complete {
+            let extents = usize::try_from(self.known_constructor_bytes).map_err(|_| overflow())?;
+            self.full_capacity = Some(u64::try_from(
+                SubmissionGraphQuota::fresh_capacity_for_extents(extents).ok_or_else(overflow)?,
+            ).map_err(|_| overflow())?);
+        }
+        Ok(())
+    }
     pub(super) fn include_source_copies(&mut self, copies: host_copies::HostCopies,
         transfers: host_copies::HostTransfers, dispatch: ResidentDispatchPopulation) -> Option<()> {
         let mut one = ResidentGraphStorage::default();
@@ -124,7 +186,7 @@ impl ResidentGraphStorage {
             return None;
         }
         let operation = match cpu_operation {
-            Some(numerical::CpuNumericalOperation::Slice {rank} | numerical::CpuNumericalOperation::Index {rank,..}) => Some(OperationEvent::cpu_slice_layout(rank,false)?),
+            Some(numerical::CpuNumericalOperation::Slice {rank} | numerical::CpuNumericalOperation::Index {rank,..}) => Some(OperationEvent::cpu_slice_layout(rank, false, false)?),
             Some(numerical::CpuNumericalOperation::Normalize {rank,columns,rows}) =>
                 Some(OperationEvent::cpu_softmax_layout(rank,columns,rows,false)?),
             Some(numerical::CpuNumericalOperation::Greedy {rank,columns}) =>
@@ -163,7 +225,7 @@ impl ResidentGraphStorage {
             alias.control_bytes()?
         } else {0};
         let split_controls=if let Some(numerical::CpuNumericalOperation::SplitKeys {count,views})=cpu_operation {
-            let sources=[if count==1 {None} else {Some(OperationEvent::cpu_slice_layout(2,false)?)},
+            let sources=[if count==1 {None} else {Some(OperationEvent::cpu_slice_layout(2, false, false)?)},
                 Some(OperationEvent::cpu_reshape_alias_layout(2,1,false)?)];
             let mut controls=0usize;
             for source in sources.into_iter().flatten() {
@@ -440,6 +502,7 @@ impl ResidentGraphStorage {
         traversal: safemlx::OperationEvalTraversalLayout,
         dispatch: ResidentDispatchPopulation,
     ) -> Option<()> {
+        if dispatch.completion_streams()? != traversal.limits().streams { return None; }
         if (dispatch.gpu_entries == 0
             && (dispatch.gpu_input_edges != 0 || dispatch.gpu_siblings != 0))
             || (dispatch.cpu_entries == 0
@@ -450,18 +513,15 @@ impl ResidentGraphStorage {
         }
         if let Some(source) = dispatch.cpu_model {
             let limits=traversal.limits();
-            if dispatch.gpu_entries!=0
-                || dispatch.worker_graph_extents!=0 || dispatch.copy_rank_extents!=0 || dispatch.kernel_attempts!=0
-                || limits.streams!=1 + usize::from(dispatch.parallel_entries != 0)
-                || dispatch.cpu_entries!=source.primitives.checked_add(dispatch.parallel_entries)?.checked_add(1)?
-                || dispatch.cpu_siblings!=dispatch.cpu_entries || limits.tape_entries!=dispatch.cpu_entries
+            if dispatch.cpu_siblings!=dispatch.cpu_entries || limits.tape_entries!=dispatch.cpu_entries
                 || limits.input_edges<source.input_edges.checked_add(dispatch.parallel_entries)?.checked_add(limits.roots)?
                 || dispatch.cpu_input_edges<source.input_edges.checked_add(dispatch.parallel_entries)? {
                 return None;
             }
             let completion=OperationEvent::cpu_completion_layout(limits.roots)?;
             if completion.backing_births()!=0 || completion.worker_graph_allocation_extents()!=0 {return None;}
-            let controls=self.include_eval_construction(traversal)?;
+            let controls=self.include_eval_construction(traversal)?
+                .checked_add(ResidentDispatchPopulation::completion_stream_control_bytes())?;
             self.add(source.extents)?;
             self.add(dispatch.parallel_graph_extents)?;
             self.add(completion.graph_allocation_extents())?;
@@ -472,7 +532,8 @@ impl ResidentGraphStorage {
             self.query_controls=self.query_controls.max(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)?);
             return Some(());
         }
-        let mut controls = self.include_eval_construction(traversal)?;
+        let mut controls = self.include_eval_construction(traversal)?
+            .checked_add(ResidentDispatchPopulation::completion_stream_control_bytes())?;
         let mut prologue = 0usize;
         if dispatch.gpu_entries != 0 {
             // Original traversal authentication forbids tracing/export. The
@@ -596,7 +657,7 @@ impl ResidentNativeRecipe {
         }).ok_or_else(unknown)?;
         let roots = safemlx::PrefillRoots::layout(root_capacity).map_err(|_| unknown())?;
         required.query_controls = roots.control_bytes;
-        let mut complete = !records.is_empty();
+        let mut complete = !records.is_empty() || self.is_terminal_resume();
         for row in records {
             // Every prefill InputTransaction and later ModelExecution owns the
             // actual global-capacity retained/submitted buffers. They are made
@@ -628,63 +689,8 @@ impl ResidentNativeRecipe {
             }
             complete &= row.unqualified_kernel_owner.is_none();
         }
-        for row in self.sampling_records() {
-            match row.phase() {
-                SamplingWorkspacePhase::Preparation => {
-                    complete &= row.completion().is_none();
-                    match row.preparation {
-                        Some(ResidentSamplingPreparation::Empty) => {}
-                        Some(ResidentSamplingPreparation::EagerKey(graph)) => {
-                            required
-                                .add(graph.allocation_extents())
-                                .ok_or_else(overflow)?;
-                        }
-                        None => complete = false,
-                    }
-                }
-                SamplingWorkspacePhase::Step { .. } => match row.completion() {
-                    Some(completion) => {
-                        required
-                            .add(completion.graph.allocation_extents())
-                            .ok_or_else(overflow)?;
-                        // ReadToken moves this same completion into Submission;
-                        // outer scalar observation issues no second Eval/event.
-                        let event =
-                            OperationEvent::root_storage_layout(completion.traversal.roots())
-                                .ok_or_else(unknown)?;
-                        required
-                            .add(event.graph_request_extent())
-                            .ok_or_else(overflow)?;
-                        match completion.dispatch {
-                            Some(dispatch) => {
-                                required
-                                    .include_dag(
-                                        completion.traversal,
-                                        completion.graph,
-                                        dispatch,
-                                        NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
-                                        0,
-                                    )
-                                    .ok_or_else(unknown)?;
-                            }
-                            None => complete = false,
-                        }
-                    }
-                    None => complete = false,
-                },
-            }
-        }
-        if complete {
-            let extents =
-                usize::try_from(required.known_constructor_bytes).map_err(|_| overflow())?;
-            required.full_capacity = Some(
-                u64::try_from(
-                    SubmissionGraphQuota::fresh_capacity_for_extents(extents)
-                        .ok_or_else(overflow)?,
-                )
-                .map_err(|_| overflow())?,
-            );
-        }
+        complete &= required.include_sampling(self.sampling_records())?;
+        required.finish_capacity(complete)?;
         Ok(required)
     }
 }
@@ -730,5 +736,14 @@ mod prediction_tests {
         assert!(large.known_constructor_bytes > small.known_constructor_bytes);
         assert!(large.minimum_capacity > small.minimum_capacity);
         assert_eq!(completion.nested_traversal().unwrap().roots(), 17);
+    }
+}
+
+impl ResidentSamplingProgram {
+    pub(crate) fn graph_storage_requirement(&self) -> Result<ResidentGraphStorage, crate::backend::error::Error> {
+        let mut required = ResidentGraphStorage::default();
+        let complete = required.include_sampling(self.rows())?;
+        required.finish_capacity(complete)?;
+        Ok(required)
     }
 }

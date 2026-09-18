@@ -4,7 +4,7 @@
 use super::*;
 use eredu_core::{
     BackendFailure, GenerationPlainTextOutput, GenerationSequenceConsumerLayout, GenerationTiming,
-    OriginalTokenDomainWitness, TextControllerStorage, TextControllerWorkspace, TokenFilter,
+    OriginalSourceWitness, TextControllerStorage, TextControllerWorkspace, TokenFilter,
     TokenFilterController, TokenSamplingDecision,
 };
 use eredu_runtime::working_memory::{
@@ -28,9 +28,7 @@ impl TokenFilterController for Domain {
         })
     }
     fn inference_storage(&self) -> TextControllerStorage<'_> {
-        TextControllerStorage::RunOwnedWithOriginalTokenDomain(OriginalTokenDomainWitness::new(
-            &self.0,
-        ))
+        TextControllerStorage::RunOwnedWithOriginalTokenDomain(OriginalSourceWitness::new(&self.0))
     }
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         Ok(self.0.generation_domain().unwrap().clone())
@@ -39,7 +37,7 @@ impl TokenFilterController for Domain {
         Ok(TokenSamplingDecision::new(self.current_filter()?)
             .with_original_tokenizer_validity(
                 self.0.generation_domain().unwrap(),
-                OriginalTokenDomainWitness::new(&self.0),
+                OriginalSourceWitness::new(&self.0),
             )
             .with_controller_storage(self.inference_storage()))
     }
@@ -120,7 +118,7 @@ fn run_original(
     expected_input: &[u32],
     route: usize,
     policy: &[&str],
-    tracking_capacity: u64,
+    tracking_capacity: Option<std::num::NonZeroU64>,
 ) -> (GenerationPlainTextOutput, u64) {
     let probe = Probe::new(runtime, None, false);
     let stops = MlxBackend::compile_original_text_stop_source(
@@ -132,15 +130,20 @@ fn run_original(
     let layout = consumer();
     let cfg = config(4, u64::MAX).with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(2),
-        graph_metadata_capacity_bytes: std::num::NonZeroU64::new(GRAPH),
-        submission_tracking_capacity_bytes: std::num::NonZeroU64::new(tracking_capacity),
+        graph_metadata_capacity_bytes: None,
+        submission_tracking_capacity_bytes: tracking_capacity,
         ..config(4, u64::MAX).inference_policy()
     });
     assert!(encoded.matches_source(source));
     assert_eq!(encoded.ids(), expected_input);
     if let Some(rendered) = &rendered {
         assert!(rendered.tokenizer_source().same_source(source));
-        assert!(rendered.accepts_consumer(&layout));
+        assert!(
+            rendered
+                .bind_consumer(layout)
+                .unwrap()
+                .accepts_consumer(&layout)
+        );
     }
     let output = if route < 2 {
         let mut generation = ControlledTextGeneration::from_token_ids_with_sequence(
@@ -232,6 +235,10 @@ fn run_original(
     let preparation = probe.take();
     let quote = preparation.quote.as_ref().unwrap();
     assert!(quote.storage_contract().has_original_domain());
+    assert!(
+        quote.record_quota.is_some(),
+        "derived policy still installs actual original submission tracking"
+    );
     assert_eq!(probe.0.calls.get(), 1);
     assert_eq!(probe.0.decoder_takes.get(), 1);
     assert!(
@@ -241,7 +248,7 @@ fn run_original(
             .is_unclaimed_for_test()
     );
     assert!(quote.sequence.as_ref().unwrap().pending.borrow().is_none());
-    assert!(quote.graph_quota.as_ref().unwrap().occupied_bytes() <= GRAPH as usize);
+    assert!(quote.graph_quota.as_ref().unwrap().occupied_bytes() > 0);
     let held = probe.facts().held;
     drop((preparation, probe));
     (output, held)
@@ -255,7 +262,9 @@ fn original_j_h_chat_matches_four_predictions_and_full_kv_across_cached_residenc
     compare_original(true);
 }
 fn compare_original(chat: bool) {
-    let stream = stream();
+    let prepared = PreparedResidencyFixture::new();
+    let stream = prepared.stream();
+    let pool = &prepared.pool;
     let config_source = include_str!("original_chat_tokenizer_config.json");
     let messages = [TextMessage {
         role: "system",
@@ -305,36 +314,26 @@ fn compare_original(chat: bool) {
     // requests also retain three decoded positions each and reserve one final
     // output position. Keep the ordinary 32-position fixtures unchanged, and
     // give this comparison's actual source model enough context for both runs.
-    let load_pair = |pool: &WorkingMemoryPool, residency| {
-        if !chat {
-            return load(&stream, pool, residency);
-        }
-        let maximum_positions = 2 * positions_per_request + 1;
-        match residency {
-            0 => host::runtime_with_context(&stream, pool, None, maximum_positions),
-            1 => host::runtime_with_context(&stream, pool, Some(1), maximum_positions),
-            2 => disk::load_runtime_with_context(&stream, pool, true, maximum_positions),
-            _ => unreachable!(),
-        }
-    };
+    let load_pair =
+        |residency| prepared.load(residency, chat.then_some(2 * positions_per_request + 1));
     for residency in 0..3 {
         for route in 0..3 {
             let mut reference = Vec::new();
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let (mut runtime, _artifact) = load_pair(&pool, residency);
+            let (mut runtime, _artifact, baseline) = load_pair(residency);
             for request in 0..2 {
                 let mut ids = expected_input.to_vec();
+                let disk_reads = prepared.disk_read_bytes(&runtime, residency);
                 let values = run(&mut runtime, route, false, &mut ids);
                 runtime.synchronize().unwrap();
+                prepared.assert_disk_read_progress(&runtime, residency, disk_reads);
                 reference.push((
                     values,
                     logical_kv(&runtime, positions_per_request * (request + 1)),
                 ));
             }
-            finish(runtime, &stream);
-            settle(&pool, 0);
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let (mut runtime, _artifact) = load_pair(&pool, residency);
+            finish(runtime, stream);
+            settle(pool, baseline);
+            let (mut runtime, _artifact, baseline) = load_pair(residency);
             let source = MlxBackend::compile_original_tokenizer(
                 &runtime,
                 TokenizerPlan::prepare_json(json.as_bytes())
@@ -350,7 +349,8 @@ fn compare_original(chat: bool) {
             let template = chat.then(|| {
                 MlxBackend::compile_original_chat_template(
                     &runtime,
-                    ChatTemplatePlan::prepare_config(config_source.as_bytes(), "native").unwrap(),
+                    ChatTemplatePlan::prepare_config(config_source.as_bytes(), "native", false)
+                        .unwrap(),
                 )
                 .unwrap()
             });
@@ -378,8 +378,9 @@ fn compare_original(chat: bool) {
                         &runtime,
                         template,
                         &source,
-                        ChatMessages::from_text(&messages),
-                        consumer(),
+                        eredu_text::chat_storage::ChatRenderContext::from_messages(
+                            ChatMessages::from_text(&messages),
+                        ),
                     )
                     .unwrap();
                     assert!(render.has_sources(template, &source));
@@ -395,6 +396,7 @@ fn compare_original(chat: bool) {
                     .map_or("abcde", |render| render.prompt(false));
                 let encoded =
                     MlxBackend::encode_original_text_ids(&runtime, &source, text, !chat).unwrap();
+                let disk_reads = prepared.disk_read_bytes(&runtime, residency);
                 let (output, held) = run_original(
                     &mut runtime,
                     &source,
@@ -403,7 +405,9 @@ fn compare_original(chat: bool) {
                     expected_input,
                     route,
                     if request == 0 { &["NEVER"] } else { &[] },
-                    1 << 20,
+                    // The selected native recipe supplies its complete tracker
+                    // population; this parity test has no separate Record cap.
+                    None,
                 );
                 assert_eq!(output.token_ids.as_ref(), expected);
                 assert_eq!(
@@ -412,6 +416,7 @@ fn compare_original(chat: bool) {
                 );
                 assert!(!output.text.as_str().is_empty());
                 runtime.synchronize().unwrap();
+                prepared.assert_disk_read_progress(&runtime, residency, disk_reads);
                 let actual = logical_kv(&runtime, positions_per_request * (request + 1));
                 assert_eq!(actual.len(), expected_kv.len());
                 for ((shape, values), (other_shape, other)) in actual.iter().zip(expected_kv) {
@@ -427,29 +432,47 @@ fn compare_original(chat: bool) {
                 outputs.push((output, held));
             }
             let total = outputs.iter().map(|(_, held)| held).sum::<u64>();
-            finish(runtime, &stream);
-            settle(
-                &pool,
-                source.original_bytes()
-                    + template.as_ref().map_or(0, |j| j.original_bytes())
-                    + total,
-            );
+            finish(runtime, stream);
+            // Synchronization settled native work before model destruction;
+            // explicit owner-thread cleanup now drains its nested retirements.
+            // The only remaining request owners are these two immutable outputs.
+            disk::reclaim();
+            assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
+            let template_bytes = template.as_ref().map_or(0, |j| j.original_bytes());
+            let tokenizer_bytes = source.original_bytes();
+            let with_sources = pool.used_bytes().unwrap();
+            let mut remaining = with_sources.checked_sub(baseline + tokenizer_bytes + template_bytes).unwrap();
+            // Q is exact but not the whole escaped charge: its numeric ledger
+            // node also retains the separate H account that paid for that node.
+            // This isolated balance is used only for alias lifetime checks; the
+            // final assertion still requires the original infrastructure baseline.
+            assert!(remaining >= total);
+            settle(pool, with_sources);
             drop(template);
-            settle(&pool, source.original_bytes() + total);
+            settle(pool, baseline + tokenizer_bytes + remaining);
             drop(source);
-            settle(&pool, total);
-            let mut remaining = total;
+            settle(pool, baseline + remaining);
+            let mut remaining_host = total;
             while let Some((output, held)) = outputs.pop() {
                 let text = output.text.clone();
                 let ids = output.token_ids.clone().into_iter();
                 drop(output);
-                settle(&pool, remaining);
+                settle(pool, baseline + remaining);
                 drop(text);
-                settle(&pool, remaining);
+                settle(pool, baseline + remaining);
                 drop(ids);
-                remaining -= held;
-                settle(&pool, remaining);
+                crate::backend::submission_recovery::wait_for_retirement(|| {
+                    disk::reclaim();
+                    pool.used_bytes().unwrap() <= baseline + remaining - held
+                });
+                let after = pool.used_bytes().unwrap().checked_sub(baseline).unwrap();
+                assert!(after < remaining, "the final output alias must retire its actual accounts");
+                assert!(remaining - after >= held, "the complete original Q must retire with its final alias");
+                remaining_host -= held;
+                assert!(after >= remaining_host, "other live outputs retain their own original Q");
+                remaining = after;
             }
+            settle(pool, baseline);
         }
     }
 }
@@ -561,7 +584,7 @@ fn first_original_resident_request(
         &input,
         0,
         &[],
-        tracking_capacity,
+        std::num::NonZeroU64::new(tracking_capacity),
     );
     assert_eq!(output.token_ids.as_ref(), expected);
     assert!(!output.text.as_str().is_empty());

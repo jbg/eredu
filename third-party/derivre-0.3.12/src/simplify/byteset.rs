@@ -5,7 +5,6 @@ use crate::ast::{
     PreparedExprError,
 };
 use std::{
-    convert::Infallible,
     mem::{size_of, size_of_val},
 };
 
@@ -14,29 +13,6 @@ pub(super) trait Memory {
     fn words(&mut self, count: usize) -> Result<&mut [u32], Self::Error>;
     fn invalid() -> Self::Error;
 }
-pub(super) struct Ordinary(Vec<u32>);
-impl Memory for Ordinary {
-    type Error = Infallible;
-    fn words(&mut self, count: usize) -> Result<&mut [u32], Infallible> {
-        self.0.resize(count, 0);
-        self.0.fill(0);
-        Ok(&mut self.0)
-    }
-    fn invalid() -> Infallible {
-        panic!("byte-set operation requires a byte or byte set")
-    }
-}
-pub(super) fn ordinary(
-    source: &mut ExprSet,
-    work: impl FnOnce(&mut scalar::Ordinary<'_>, &mut Ordinary) -> Result<ExprRef, Infallible>,
-) -> ExprRef {
-    let result = work(&mut scalar::Ordinary(source), &mut Ordinary(Vec::new()));
-    match result {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
-}
-
 pub(super) fn not<S: Emission, M: Memory<Error = S::Error>>(
     sink: &mut S,
     memory: &mut M,
@@ -149,7 +125,7 @@ pub(super) fn subtract<S: Emission, M: Memory<Error = S::Error>>(
 }
 
 // Byte selectors are u8: the maximum complete domain is exactly eight u32s.
-// Larger ordinary expression alphabets remain on their ordinary destination.
+// Every expression source uses this exact bounded byte-selector domain.
 struct Fixed {
     words: [u32; 8],
 }
@@ -168,7 +144,6 @@ impl Memory for Fixed {
     }
 }
 fn validate(source: &ExprSet, args: &[ExprRef]) -> Result<(), PreparedExprError> {
-    source.require_prepared()?;
     if source.alphabet_size == 0
         || source.alphabet_size > 256
         || source.alphabet_words != source.alphabet_size.div_ceil(32)
@@ -272,31 +247,31 @@ mod tests {
     fn fixed_byte_selectors_preserve_shared_tail_bits_shortcuts_cost_and_source_refusal() {
         assert!(fixed_control_bytes().unwrap() >= size_of::<Fixed>());
         for alphabet in [1, 31, 32, 33, 256] {
-            let mut source = ExprSet::new(alphabet);
-            let a = source.mk_byte(0);
-            let b = source.mk_byte((alphabet - 1) as u8);
-            let c = source.mk_byte((alphabet / 2) as u8);
-            let left = source.mk_byte_set_or(&[a, b]);
-            let right = source.mk_byte_set_or(&[a, c]);
-            source.reserve(32);
+            let mut source = ExprSet::new(alphabet, crate::ParserAllocationFunding::unenforced()).unwrap();
+            let a = source.mk_byte(0).unwrap();
+            let b = source.mk_byte((alphabet - 1) as u8).unwrap();
+            let c = source.mk_byte((alphabet / 2) as u8).unwrap();
+            let left = source.mk_byte_set_or(&[a, b]).unwrap();
+            let right = source.mk_byte_set_or(&[a, c]).unwrap();
+            source.reserve(32).unwrap();
             let mut ordinary = source.clone();
             let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
             drop(source);
-            let extent = prepared.source().prepared_extents().unwrap();
+            let extent = prepared.source().storage_extents();
             for operation in 0..12 {
                 let expected = match operation {
-                    0 => ordinary.mk_byte_set_not(left),
-                    1 => ordinary.mk_byte_set_or(&[]),
-                    2 => ordinary.mk_byte_set_or(&[left, right]),
-                    3 => ordinary.mk_byte_set_neg_or(&[left, right]),
-                    4 => ordinary.mk_byte_set_and(left, right),
-                    5 => ordinary.mk_byte_set_sub(left, right),
-                    6 => ordinary.mk_byte_set_sub(left, a),
-                    7 => ordinary.mk_byte_set_and(a, right),
-                    8 => ordinary.mk_byte_set_not(a),
-                    9 => ordinary.mk_byte_set_sub(a, right),
-                    10 => ordinary.mk_byte_set_and(left, left),
-                    11 => ordinary.mk_byte_set_neg_or(&[]),
+                    0 => ordinary.mk_byte_set_not(left).unwrap(),
+                    1 => ordinary.mk_byte_set_or(&[]).unwrap(),
+                    2 => ordinary.mk_byte_set_or(&[left, right]).unwrap(),
+                    3 => ordinary.mk_byte_set_neg_or(&[left, right]).unwrap(),
+                    4 => ordinary.mk_byte_set_and(left, right).unwrap(),
+                    5 => ordinary.mk_byte_set_sub(left, right).unwrap(),
+                    6 => ordinary.mk_byte_set_sub(left, a).unwrap(),
+                    7 => ordinary.mk_byte_set_and(a, right).unwrap(),
+                    8 => ordinary.mk_byte_set_not(a).unwrap(),
+                    9 => ordinary.mk_byte_set_sub(a, right).unwrap(),
+                    10 => ordinary.mk_byte_set_and(left, left).unwrap(),
+                    11 => ordinary.mk_byte_set_neg_or(&[]).unwrap(),
                     _ => unreachable!(),
                 };
                 let p = prepared.source_mut();
@@ -328,7 +303,7 @@ mod tests {
                         ordinary.get(expected).matches_byte(byte as u8)
                     );
                 }
-                assert_eq!(p.prepared_extents().unwrap(), extent);
+                assert_eq!(p.storage_extents(), extent);
                 if let (Expr::ByteSet(actual), Expr::ByteSet(expected)) =
                     (p.get(actual), ordinary.get(expected))
                 {

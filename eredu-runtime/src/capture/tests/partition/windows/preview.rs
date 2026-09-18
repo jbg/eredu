@@ -71,7 +71,7 @@ fn setup(
         .unwrap();
     let backend = Rc::new(RefCell::new(Backend::default()));
     let observer = SpeculativeCaptureObserver::new(
-        CaptureSession::new(admitted),
+        CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admitted)),
         Provider(backend.clone()),
         map as fn(&CaptureExecutionError<std::io::Error>) -> String,
         SpeculativeRequestId::new(0),
@@ -746,21 +746,21 @@ fn preview_checks_no_overlap_precision_coverage_and_generated_sources() {
 fn unfinished_preview_retires_actual_source_before_host_preparation_custody() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Weak,
+        Arc,
     };
     struct Retired {
-        source: Weak<AdmittedCapturePlan>,
+        source: crate::capture::tests::PlanRetirementProbe,
         drops: Arc<AtomicUsize>,
     }
     impl Drop for Retired {
         fn drop(&mut self) {
-            assert!(self.source.upgrade().is_none());
+            assert!(self.source.is_retired());
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
     for kind in [0, 1] {
         let (mut observer, _, _) = setup(5, false, 1, kind, 7, 0, None);
-        let source = Arc::downgrade(observer.session().plan.legacy_arc().unwrap());
+        let source = crate::capture::tests::plan_retirement_probe(&observer.session().plan);
         let drops = Arc::new(AtomicUsize::new(0));
         let owner = eredu_core::HostPreparationAuthority::retain(Retired {
             source: source.clone(),
@@ -782,9 +782,9 @@ fn unfinished_preview_retires_actual_source_before_host_preparation_custody() {
         )
         .unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        assert!(source.upgrade().is_some());
+        assert!(!source.is_retired());
         drop(observer);
-        assert!(source.upgrade().is_none());
+        assert!(source.is_retired());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

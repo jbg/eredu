@@ -23,19 +23,23 @@ impl PrefixItemsValidator {
         ctx: &compiler::Context<F>,
         items: &'a [Value],
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("prefixItems");
-        let mut schemas = Vec::with_capacity(items.len());
+        let ctx = ctx.new_at_location("prefixItems")?;
+        let mut schemas = Vec::new();
+        ctx.funding().grow(&mut schemas, items.len())?;
         for (idx, item) in items.iter().enumerate() {
-            let ctx = ctx.new_at_location(idx);
+            let ctx = ctx.new_at_location(idx)?;
             let validators = compiler::compile(&ctx, ctx.as_resource_ref(item))?;
             schemas.push(validators);
         }
-        Ok(Box::new(PrefixItemsValidator { schemas }))
+        Ok(ctx.funding().boxed(PrefixItemsValidator { schemas })?)
     }
 }
 
 impl<F: Json> Validate<F> for PrefixItemsValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.nodes(&self.schemas)
     }
 
@@ -43,11 +47,15 @@ impl<F: Json> Validate<F> for PrefixItemsValidator<F> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             for (schema, item) in self.schemas.iter().zip(array.elements()) {
@@ -61,7 +69,7 @@ impl<F: Json> Validate<F> for PrefixItemsValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -76,7 +84,7 @@ impl<F: Json> Validate<F> for PrefixItemsValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -137,14 +145,20 @@ pub(crate) fn compile<'a, F: Json>(
     if let Value::Array(items) = schema {
         Some(PrefixItemsValidator::compile(ctx, items))
     } else {
-        let location = ctx.location().join("prefixItems");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::Array,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("prefixItems", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::Array,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 

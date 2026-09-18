@@ -23,29 +23,60 @@ pub(crate) struct MultipleOfFloatValidator {
 impl MultipleOfFloatValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         multiple_of: f64,
         #[cfg(feature = "arbitrary-precision")] original_value: &serde_json::Number,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(MultipleOfFloatValidator {
+        Ok(ctx.funding().boxed(MultipleOfFloatValidator {
             multiple_of,
             #[cfg(feature = "arbitrary-precision")]
-            original_value: original_value.clone(),
+            original_value: ctx.funding().number(original_value)?,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for MultipleOfFloatValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        #[cfg(feature = "arbitrary-precision")]
+        source.number(&self.original_value)?;
+        source.location(&self.location)
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature = "arbitrary-precision") {
+            return Err(crate::validator::workspace::Error::Unqualified(
+                crate::validator::workspace::Component::Validator(
+                    "arbitrary-precision float multiple",
+                ),
+            ));
+        }
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<f64>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_number() {
-            numeric::is_multiple_of_float(&item, self.multiple_of)
+            ctx.workspace
+                .with_numeric_allocations(|allocations| {
+                    numeric::is_multiple_of_float_with_allocations(
+                        &item,
+                        self.multiple_of,
+                        allocations,
+                    )
+                })
+                .unwrap_or(false)
         } else {
             true
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -53,26 +84,16 @@ impl<F: Json> Validate<F> for MultipleOfFloatValidator {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if !Validate::<F>::is_valid(self, instance, ctx) {
-            #[cfg(feature = "arbitrary-precision")]
-            {
-                return Err(ValidationError::multiple_of(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::Number(self.original_value.clone()),
-                ));
-            }
-            #[cfg(not(feature = "arbitrary-precision"))]
-            {
-                return Err(ValidationError::multiple_of(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.multiple_of,
-                ));
-            }
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                #[cfg(feature = "arbitrary-precision")]
+                let multiple_of = Value::Number(funding.number(&self.original_value)?);
+                #[cfg(not(feature = "arbitrary-precision"))]
+                let multiple_of = {
+                    let _ = funding;
+                    self.multiple_of
+                };
+                Ok(crate::error::ValidationErrorKind::MultipleOf { multiple_of })
+            });
         }
         Ok(())
     }
@@ -88,32 +109,47 @@ pub(crate) struct MultipleOfIntegerValidator {
 impl MultipleOfIntegerValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         multiple_of: f64,
         #[cfg(feature = "arbitrary-precision")] original_value: &serde_json::Number,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(MultipleOfIntegerValidator {
+        Ok(ctx.funding().boxed(MultipleOfIntegerValidator {
             multiple_of,
             #[cfg(feature = "arbitrary-precision")]
-            original_value: original_value.clone(),
+            original_value: ctx.funding().number(original_value)?,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for MultipleOfIntegerValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         #[cfg(feature = "arbitrary-precision")]
         source.number(&self.original_value)?;
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        let numeric = numeric::original_integer_multiple_control_bytes::<<F::Node<'_> as Node<'_, F>>::Number>()
-            .ok_or(crate::validator::workspace::Error::Unqualified(
-                crate::validator::workspace::Component::Validator("arbitrary-precision integer multiple"),
-            ))?;
-        crate::validator::workspace::body_controls::<F, Self>(&[numeric, std::mem::size_of::<f64>()])
+        let numeric = numeric::original_integer_multiple_control_bytes::<
+            <F::Node<'_> as Node<'_, F>>::Number,
+        >()
+        .ok_or(crate::validator::workspace::Error::Unqualified(
+            crate::validator::workspace::Component::Validator(
+                "arbitrary-precision integer multiple",
+            ),
+        ))?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            numeric,
+            std::mem::size_of::<f64>(),
+        ])
+    }
+
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
 
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
@@ -124,7 +160,7 @@ impl<F: Json> Validate<F> for MultipleOfIntegerValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -132,26 +168,16 @@ impl<F: Json> Validate<F> for MultipleOfIntegerValidator {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if !Validate::<F>::is_valid(self, instance, ctx) {
-            #[cfg(feature = "arbitrary-precision")]
-            {
-                return Err(ValidationError::multiple_of(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::Number(self.original_value.clone()),
-                ));
-            }
-            #[cfg(not(feature = "arbitrary-precision"))]
-            {
-                return Err(ValidationError::multiple_of(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.multiple_of,
-                ));
-            }
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                #[cfg(feature = "arbitrary-precision")]
+                let multiple_of = Value::Number(funding.number(&self.original_value)?);
+                #[cfg(not(feature = "arbitrary-precision"))]
+                let multiple_of = {
+                    let _ = funding;
+                    self.multiple_of
+                };
+                Ok(crate::error::ValidationErrorKind::MultipleOf { multiple_of })
+            });
         }
         Ok(())
     }
@@ -168,15 +194,16 @@ pub(crate) struct MultipleOfBigIntValidator {
 impl MultipleOfBigIntValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         multiple_of: num_bigint::BigInt,
         original_value: &serde_json::Number,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(MultipleOfBigIntValidator {
+        Ok(ctx.funding().boxed(MultipleOfBigIntValidator {
             multiple_of,
-            original_value: original_value.clone(),
+            original_value: ctx.funding().number(original_value)?,
             location,
-        }))
+        })?)
     }
 }
 
@@ -238,7 +265,7 @@ impl<F: Json> Validate<F> for MultipleOfBigIntValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -269,15 +296,16 @@ pub(crate) struct MultipleOfBigFracValidator {
 impl MultipleOfBigFracValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         multiple_of: fraction::BigFraction,
         original_value: &serde_json::Number,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(MultipleOfBigFracValidator {
+        Ok(ctx.funding().boxed(MultipleOfBigFracValidator {
             multiple_of,
-            original_value: original_value.clone(),
+            original_value: ctx.funding().number(original_value)?,
             location,
-        }))
+        })?)
     }
 }
 
@@ -312,7 +340,7 @@ impl<F: Json> Validate<F> for MultipleOfBigFracValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -339,13 +367,16 @@ pub(crate) fn compile<'a, F: Json>(
     schema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
     if let Value::Number(multiple_of) = schema {
-        let location = ctx.location().join("multipleOf");
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("multipleOf", ctx.funding()));
 
         #[cfg(feature = "arbitrary-precision")]
         {
             // Try BigInt first for large integers
             if let Some(bigint_multiple) = numeric::bignum::try_parse_bigint(multiple_of) {
                 return Some(MultipleOfBigIntValidator::compile(
+                    ctx,
                     bigint_multiple,
                     multiple_of,
                     location,
@@ -354,6 +385,7 @@ pub(crate) fn compile<'a, F: Json>(
             // Then try BigFraction for exact decimal precision
             if let Some(bigfrac_multiple) = numeric::bignum::try_parse_bigfraction(multiple_of) {
                 return Some(MultipleOfBigFracValidator::compile(
+                    ctx,
                     bigfrac_multiple,
                     multiple_of,
                     location,
@@ -368,12 +400,14 @@ pub(crate) fn compile<'a, F: Json>(
             {
                 if f64_value.fract() == 0. {
                     Some(MultipleOfIntegerValidator::compile(
+                        ctx,
                         f64_value,
                         multiple_of,
                         location,
                     ))
                 } else {
                     Some(MultipleOfFloatValidator::compile(
+                        ctx,
                         f64_value,
                         multiple_of,
                         location,
@@ -383,9 +417,11 @@ pub(crate) fn compile<'a, F: Json>(
             #[cfg(not(feature = "arbitrary-precision"))]
             {
                 if f64_value.fract() == 0. {
-                    Some(MultipleOfIntegerValidator::compile(f64_value, location))
+                    Some(MultipleOfIntegerValidator::compile(
+                        ctx, f64_value, location,
+                    ))
                 } else {
-                    Some(MultipleOfFloatValidator::compile(f64_value, location))
+                    Some(MultipleOfFloatValidator::compile(ctx, f64_value, location))
                 }
             }
         } else {
@@ -394,14 +430,20 @@ pub(crate) fn compile<'a, F: Json>(
             None
         }
     } else {
-        let location = ctx.location().join("multipleOf");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::Number,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("multipleOf", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::Number,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 

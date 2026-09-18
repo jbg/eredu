@@ -10,12 +10,13 @@ input or execution condition. Every scheduled intervention must execute before
 prediction commitment; an absent conditional target retains a `Missing` outcome
 and fails the attempt through the ordinary state-recovery driver.
 
-Call `prepare_intervened_chat(chat, settings, capture, intervention, trace_limits)`
-and pass its result to the existing `generate_observed_chat`. The returned
-`PreparedObservedGeneration` owns immutable capture and intervention admissions.
-Preparation uses retained source and session identities and performs no native
-model work. Existing `prepare_observed_chat` callers remain valid. An empty
-intervention plan takes the ordinary path and has no intervention trace identity.
+Supply borrowed `capture` and `intervention` declarations on the canonical
+`PreparedChatRequest`, or retain admitted declarations in its `options`.
+`start_prepared_chat` and `start_controlled_chat` compile raw declarations after
+exact prompt geometry is known, using the same preparation and execution driver.
+An empty intervention plan retains its source identity and lineage while reporting
+that no intervention operations are active. Preparation validates retained source
+and session identities before native model work.
 
 The plan digest binds operation order, target declarations, request geometry,
 prepared-source content, backend session identity and facade session identity.

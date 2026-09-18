@@ -24,10 +24,10 @@ pub(super) fn poison_unselected_static(
         omitted: Vec<String>,
     }
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Poison<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            if !self.selected.contains(metadata.id.as_str()) {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            if !self.selected.contains(metadata.id().as_str()) {
                 value.data.fill(f32::NAN);
-                self.omitted.push(metadata.id.to_string());
+                self.omitted.push(metadata.id().to_string());
             }
         }
     }
@@ -51,8 +51,8 @@ pub(super) fn poison_unselected_static(
 }
 
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         if self.omitted.contains(name) || name == "numeric.unit_norm.weight" {
             return;
         }

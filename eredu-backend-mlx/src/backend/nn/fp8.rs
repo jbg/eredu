@@ -8,6 +8,7 @@
 //! expanding a complete weight bank. CPU execution uses a deliberately slow
 //! dequantized reference path for correctness tests and functional fallback.
 
+pub(crate) mod kernel;
 pub(crate) mod original;
 
 use std::cell::RefCell;
@@ -31,11 +32,6 @@ use safemlx::{
 
 #[cfg(not(feature = "cuda"))]
 thread_local! {
-    static ACT_QUANT_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static GROUPED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static GROUPED_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SEGMENTED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SEGMENTED_TRANSPOSED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
@@ -49,7 +45,9 @@ thread_local! {
     static SEGMENTED_TRANSPOSED_LINEAR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
 }
 
+#[cfg(feature = "cuda")]
 const OUT_TILE: i32 = 16;
+#[cfg(feature = "cuda")]
 const REDUCTION_TILE: i32 = 16;
 const SCALE_BLOCK: i32 = 128;
 static E8M0_SCALE_TABLE: [f32; 256] = {
@@ -88,6 +86,7 @@ pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> 
     }
 }
 
+#[cfg(feature = "cuda")]
 fn linear_tiled_config(
     rows: i32,
     in_dim: i32,
@@ -107,6 +106,7 @@ fn linear_tiled_config(
         .with_output_arg([rows, out_dim], Dtype::Float32)
 }
 
+#[cfg(feature = "cuda")]
 fn grouped_tiled_config(
     routes: i32,
     in_dim: i32,
@@ -203,24 +203,12 @@ fn quantize_activations(
 ) -> Result<QuantizedActivations, Exception> {
     let scale_cols = ceil_div(in_dim, SCALE_BLOCK);
     if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        {
-            if stream.device_type()? != DeviceType::Gpu
-                || input.shape() != [rows, in_dim]
-                || !matches!(
-                    input.dtype(),
-                    Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
-                )
-            {
-                return Err(observer.invalid_input_error());
-            }
-            let [values, scales] = crate::backend::managed_memory::fp8_kernel::quantize(
-                input, rows, in_dim, scale_cols, stream,
-            )?;
-            return Ok(QuantizedActivations { values, scales });
-        }
         #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
         return Err(observer.capacity_error());
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if is_cpu_stream(stream)? {
+            return Err(observer.capacity_error());
+        }
     }
     if is_cpu_stream(stream)? {
         let input = input
@@ -245,46 +233,40 @@ fn quantize_activations(
             scales: concatenate_axis(&scales, 1, stream)?,
         });
     }
-    let config = CustomKernelConfig::new()
-        .with_template_arg_int("IN_DIM", in_dim)
-        .with_template_arg_int("SCALE_COLS", scale_cols)
-        .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
-        .with_grid([rows * scale_cols * SCALE_BLOCK, 1, 1])
-        .with_thread_group([SCALE_BLOCK, 1, 1])
-        .with_output_arg([rows, in_dim], Dtype::Uint8)
-        .with_output_arg([rows, scale_cols], Dtype::Float32);
-
     #[cfg(feature = "cuda")]
-    let mut outputs = ACT_QUANT_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(activation_quantization_kernel_cuda()?);
-        }
-        cell.borrow()
-            .as_ref()
-            .expect("CUDA activation quantization kernel initialized")
-            .apply_device([input], &config, stream)
-    })?;
+    {
+        let config = CustomKernelConfig::new()
+            .with_template_arg_int("IN_DIM", in_dim)
+            .with_template_arg_int("SCALE_COLS", scale_cols)
+            .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
+            .with_grid([rows * scale_cols * SCALE_BLOCK, 1, 1])
+            .with_thread_group([SCALE_BLOCK, 1, 1])
+            .with_output_arg([rows, in_dim], Dtype::Uint8)
+            .with_output_arg([rows, scale_cols], Dtype::Float32);
 
-    #[cfg(not(feature = "cuda"))]
-    let mut outputs = ACT_QUANT_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(activation_quantization_kernel_metal()?);
-        }
-        cell.borrow()
-            .as_ref()
-            .expect("Metal activation quantization kernel initialized")
-            .apply_device([input], &config, stream)
-    })?;
+        let mut outputs = ACT_QUANT_KERNEL.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(activation_quantization_kernel_cuda()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("CUDA activation quantization kernel initialized")
+                .apply_device([input], &config, stream)
+        })?;
 
-    if outputs.len() != 2 {
-        return Err(Exception::custom(format!(
-            "block-FP8 activation quantization returned {} outputs, expected 2",
-            outputs.len()
-        )));
+        let scales = outputs.pop().expect("activation scale output");
+        let values = outputs.pop().expect("quantized activation output");
+        return Ok(QuantizedActivations { values, scales });
     }
-    let scales = outputs.pop().expect("activation scale output");
-    let values = outputs.pop().expect("quantized activation output");
-    Ok(QuantizedActivations { values, scales })
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let [values, scales] = kernel::quantize(input, rows, in_dim, scale_cols, stream)?;
+        Ok(QuantizedActivations { values, scales })
+    }
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    Err(original::invalid(format_args!(
+        "GPU FP8 requires a Metal or CUDA backend"
+    )))
 }
 
 fn activation_reference(
@@ -398,19 +380,6 @@ impl eredu_nn::BlockFp8InputReconstructionMechanism for InputReconstruction<'_> 
     fn restore_shape(&self, product: &Array) -> Result<Array, Exception> {
         product.reshape(self.plan.shape(), self.stream)
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-fn activation_quantization_kernel_metal() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "block_fp8_activation_quantization",
-        ["input"],
-        ["quantized", "activation_scale"],
-        include_str!("fp8/activation.metal"),
-        METAL_HEADER,
-        true,
-        false,
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -616,20 +585,6 @@ pub(crate) fn linear_with_input_observer(
     finish_linear_output(out, prototype, output_dtype, out_dim, stream)
 }
 
-/// Legacy logical factory quota used by partition capture policy. The selected
-/// fixed reconstruction operations independently price physical allocations;
-/// this compatibility formula is not native allocation evidence.
-pub(crate) fn projection_input_capture_storage(
-    elements: u64,
-    rows: u64,
-    width: u64,
-) -> Option<u64> {
-    rows.checked_mul(width.div_ceil(SCALE_BLOCK as u64))?
-        .checked_mul(SCALE_BLOCK as u64 * 4)?
-        .checked_add(elements.checked_mul(12)?)?
-        .checked_add(4096)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn linear_quantized(
     input: &QuantizedActivations,
@@ -641,37 +596,9 @@ fn linear_quantized(
     scale_cols: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        {
-            let _ = observer;
-            return crate::backend::managed_memory::fp8_kernel::linear(
-                [&input.values, &input.scales, weight, scale],
-                rows,
-                out_dim,
-                rows <= TILED_ROW_THRESHOLD,
-                stream,
-            );
-        }
-        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-        return Err(observer.capacity_error());
-    }
     #[cfg(feature = "cuda")]
-    let out = linear_tiled_cuda(
-        &input.values,
-        &input.scales,
-        weight,
-        scale,
-        rows,
-        in_dim,
-        out_dim,
-        scale_cols,
-        stream,
-    )?;
-
-    #[cfg(not(feature = "cuda"))]
-    let out = if rows <= TILED_ROW_THRESHOLD {
-        linear_tiled(
+    {
+        linear_tiled_cuda(
             &input.values,
             &input.scales,
             weight,
@@ -681,22 +608,28 @@ fn linear_quantized(
             out_dim,
             scale_cols,
             stream,
-        )?
-    } else {
-        linear_scalar(
-            &input.values,
-            &input.scales,
-            weight,
-            scale,
+        )
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let _ = (in_dim, scale_cols);
+        kernel::linear(
+            [&input.values, &input.scales, weight, scale],
             rows,
-            in_dim,
             out_dim,
-            scale_cols,
+            rows <= TILED_ROW_THRESHOLD,
             stream,
-        )?
-    };
-
-    Ok(out)
+        )
+    }
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    {
+        let _ = (
+            input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+        );
+        Err(original::invalid(format_args!(
+            "GPU FP8 requires a Metal or CUDA backend"
+        )))
+    }
 }
 
 fn finish_linear_output(
@@ -771,89 +704,6 @@ fn linear_kernel_cuda() -> Result<CudaKernel, Exception> {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn linear_tiled(
-    input: &Array,
-    input_scale: &Array,
-    weight: &Array,
-    scale: &Array,
-    rows: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(linear_kernel()?);
-        }
-        let config = linear_tiled_config(rows, in_dim, out_dim, scale_cols);
-        cell.borrow()
-            .as_ref()
-            .expect("FP8 linear kernel initialized")
-            .apply_one_device([input, input_scale, weight, scale], &config, stream)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn linear_scalar(
-    input: &Array,
-    input_scale: &Array,
-    weight: &Array,
-    scale: &Array,
-    rows: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(linear_scalar_kernel()?);
-        }
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([rows * out_dim, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg([rows, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("scalar FP8 linear kernel initialized")
-            .apply_one_device([input, input_scale, weight, scale], &config, stream)
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn linear_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "block_fp8_linear_k16",
-        ["input", "input_scale", "weight", "scale"],
-        ["out"],
-        include_str!("fp8/linear_tiled.metal"),
-        METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn linear_scalar_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "block_fp8_linear_scalar",
-        ["input", "input_scale", "weight", "scale"],
-        ["out"],
-        include_str!("fp8/linear_scalar.metal"),
-        METAL_HEADER,
-        true,
-        false,
-    )
-}
-
 /// Applies a rank-3 block-scaled E4M3 group bank to group-major rows.
 pub fn grouped_linear(
     input: &Array,
@@ -912,6 +762,7 @@ pub fn grouped_linear_with_row_layout(
             "invalid grouped block-FP8 linear weight, scale, or route dimensions",
         ));
     }
+    #[cfg(feature = "cuda")]
     let scale_cols = scale.dim(2);
     if matches!(
         weight.dtype(),
@@ -960,35 +811,21 @@ pub fn grouped_linear_with_row_layout(
         stream,
     )?;
 
-    #[cfg(not(feature = "cuda"))]
-    let out = if routes <= TILED_ROW_THRESHOLD {
-        grouped_linear_tiled(
-            &input.values,
-            &input.scales,
-            weight,
-            &scale,
-            group_ids,
-            routes,
-            in_dim,
-            out_dim,
-            scale_cols,
-            row_width,
-            stream,
-        )?
-    } else {
-        grouped_linear_scalar(
-            &input.values,
-            &input.scales,
-            weight,
-            &scale,
-            group_ids,
-            routes,
-            in_dim,
-            out_dim,
-            scale_cols,
-            row_width,
-            stream,
-        )?
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let out = kernel::grouped_linear(
+        [&input.values, &input.scales, weight, &scale, group_ids],
+        routes,
+        out_dim,
+        row_width,
+        routes <= TILED_ROW_THRESHOLD,
+        stream,
+    )?;
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    let out = {
+        let _ = (input, row_width);
+        return Err(original::invalid(format_args!(
+            "GPU FP8 requires a Metal or CUDA backend"
+        )));
     };
 
     restore_activation_dtype(out, output_dtype, stream)
@@ -1058,127 +895,6 @@ fn grouped_linear_kernel_cuda() -> Result<CudaKernel, Exception> {
         CUDA_HEADER,
         true,
         0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn grouped_linear_tiled(
-    input: &Array,
-    input_scale: &Array,
-    weight: &Array,
-    scale: &Array,
-    group_ids: &Array,
-    routes: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    row_width: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        {
-            return crate::backend::managed_memory::fp8_kernel::grouped_linear(
-                [input, input_scale, weight, scale, group_ids], routes, out_dim, row_width, true, stream,
-            );
-        }
-        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-        return Err(observer.capacity_error());
-    }
-
-    GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(grouped_linear_kernel()?);
-        }
-        let config =
-            grouped_tiled_config(routes, in_dim, out_dim, scale.dim(1), scale_cols, row_width);
-        cell.borrow()
-            .as_ref()
-            .expect("grouped FP8 linear kernel initialized")
-            .apply_one_device(
-                [input, input_scale, weight, scale, group_ids],
-                &config,
-                stream,
-            )
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn grouped_linear_scalar(
-    input: &Array,
-    input_scale: &Array,
-    weight: &Array,
-    scale: &Array,
-    group_ids: &Array,
-    routes: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    row_width: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        {
-            return crate::backend::managed_memory::fp8_kernel::grouped_linear(
-                [input, input_scale, weight, scale, group_ids], routes, out_dim, row_width, false, stream,
-            );
-        }
-        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-        return Err(observer.capacity_error());
-    }
-
-    GROUPED_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(grouped_linear_scalar_kernel()?);
-        }
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_OUT", scale.dim(1))
-            .with_template_arg_int("ROW_WIDTH", row_width)
-            .with_template_arg_int("ROW_SCALES", ceil_div(row_width, SCALE_BLOCK))
-            .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([routes * out_dim, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg([routes, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("scalar grouped FP8 linear kernel initialized")
-            .apply_one_device(
-                [input, input_scale, weight, scale, group_ids],
-                &config,
-                stream,
-            )
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn grouped_linear_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "block_fp8_grouped_linear_k16",
-        ["input", "input_scale", "weight", "scale", "group_ids"],
-        ["out"],
-        include_str!("fp8/grouped_tiled.metal"),
-        METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn grouped_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "block_fp8_grouped_linear_scalar",
-        ["input", "input_scale", "weight", "scale", "group_ids"],
-        ["out"],
-        include_str!("fp8/grouped_scalar.metal"),
-        METAL_HEADER,
-        true,
-        false,
     )
 }
 

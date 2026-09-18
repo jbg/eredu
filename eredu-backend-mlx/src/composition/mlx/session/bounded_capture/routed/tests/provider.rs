@@ -52,12 +52,12 @@ impl RoutedUnitObserver<MlxTensor> for Collector<'_> {
     fn observe(&mut self, batch: &RoutedUnitBatch<'_, MlxTensor>) -> Result<(), eredu_nn::Error> {
         let source = batch
             .partition_capture_source()
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         self.original.push(
             self.backend
                 .capture_partition_routed_units(&source, &self.request)
                 .unwrap()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         );
         Ok(())
     }
@@ -72,7 +72,7 @@ impl RoutedUnitObserver<MlxTensor> for Collector<'_> {
                 .values
                 .as_array()
                 .multiply(&two, self.backend.stream)
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         )))
     }
     fn observe_effective(
@@ -81,12 +81,12 @@ impl RoutedUnitObserver<MlxTensor> for Collector<'_> {
     ) -> Result<(), eredu_nn::Error> {
         let source = batch
             .partition_capture_source()
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         self.effective.push(
             self.backend
                 .capture_partition_routed_units(&source, &self.request)
                 .unwrap()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         );
         Ok(())
     }
@@ -161,7 +161,7 @@ fn verify(device: DeviceType) {
             })
             .collect();
         let receipt = PartitionCaptureReceiptPlan::new_routed(
-            plan.clone(),
+            eredu_core::capture::SharedCapturePlan::new(plan.clone()),
             context.clone(),
             producers,
             2,

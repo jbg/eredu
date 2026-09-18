@@ -4,7 +4,7 @@ use super::{
     OriginalGrammarTokenParserCopyError, OriginalGrammarTokenParserError,
 };
 use crate::runtime::chat::constraints::grammar_policy::{self, Context};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use llguidance::{api::StopReason, toktrie::SimpleVob};
 use std::{
     mem::{size_of, size_of_val},
@@ -17,8 +17,8 @@ pub(in crate::runtime::chat::constraints) enum Cause {
     Source,
     #[error("original grammar state control extent overflow")]
     Overflow,
-    #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Policy(#[from] grammar_policy::Failure),
     #[error(transparent)]
@@ -36,8 +36,8 @@ pub(in crate::runtime::chat::constraints) enum Cause {
 enum OperationControl {
     #[error("original grammar state control extent overflow")]
     Overflow,
-    #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
 }
 #[derive(Debug, thiserror::Error)]
 enum Failure {
@@ -60,7 +60,7 @@ struct Storage {
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarState {
     storage: Box<Storage>,
     terminal_eos_alias_committed: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug)]
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarStateError {
@@ -93,8 +93,8 @@ impl std::error::Error for OriginalGrammarStateError {
 enum ConstructionCause {
     #[error("original active grammar state constructor extent overflow")]
     Overflow,
-    #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
 }
 /// Before the paid cell exists, a refusal retains the actual unboxed parser.
 /// This cold constructor failure does not enlarge ordinary operation errors.
@@ -104,7 +104,7 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarStateConstructio
     #[source]
     cause: ConstructionCause,
     prefix: OriginalGrammarTokenParser,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalGrammarTokenParser {
     #[inline(never)]
@@ -122,8 +122,8 @@ impl OriginalGrammarTokenParser {
                 size_of::<OriginalGrammarStateConstructionError>(),
                 size_of::<Result<OriginalGrammarState, OriginalGrammarStateConstructionError>>(),
                 size_of::<Result<(), ConstructionCause>>(),
-                size_of::<WorkspaceMetadataFunding>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<HostMetadataFunding>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
             ];
             funding.reserve_metadata(
                 parts
@@ -152,42 +152,57 @@ impl OriginalGrammarTokenParser {
 }
 impl OriginalGrammarState {
     pub(in crate::runtime::chat::constraints) fn copy_required_bytes(&self) -> Option<usize> {
-        if self.storage.failure.is_some() { return None; }
+        if self.storage.failure.is_some() {
+            return None;
+        }
         Self::copy_controls()?.checked_add(self.storage.parser.as_ref()?.copy_required_bytes()?)
     }
     fn copy_controls() -> Option<usize> {
-            let parts = [
-                size_of::<Self>(),
-                size_of::<CopyCause>(),
-                size_of::<OriginalGrammarStateCopyError>(),
-                size_of::<WorkspaceMetadataFunding>(),
-                size_of::<Arc<OriginalGrammarSlicer>>(),
-                size_of::<Storage>(),
-                size_of::<Box<Storage>>(),
-                size_of::<(&Self, &WorkspaceMetadataFunding)>(),
-                size_of::<Result<Self, OriginalGrammarStateCopyError>>(),
-                size_of::<Option<OriginalGrammarState>>(),
-                size_of::<Result<(), CopyCause>>(),
-                size_of::<Option<Failure>>(),
-                size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserCopyError>>(
-                ),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-            ];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        let parts = [
+            size_of::<Self>(),
+            size_of::<CopyCause>(),
+            size_of::<OriginalGrammarStateCopyError>(),
+            size_of::<HostMetadataFunding>(),
+            size_of::<Arc<OriginalGrammarSlicer>>(),
+            size_of::<Storage>(),
+            size_of::<Box<Storage>>(),
+            size_of::<(&Self, &HostMetadataFunding)>(),
+            size_of::<Result<Self, OriginalGrammarStateCopyError>>(),
+            size_of::<Option<OriginalGrammarState>>(),
+            size_of::<Result<(), CopyCause>>(),
+            size_of::<Option<Failure>>(),
+            size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserCopyError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
-    pub(super) fn controller_funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub(super) fn controller_funding(&self) -> &HostMetadataFunding {
+        &self.funding
+    }
     pub(super) fn is_initial_controller(&self) -> bool {
         !self.terminal_eos_alias_committed && self.parser().parser().tokens().is_empty()
     }
     pub(in crate::runtime::chat::constraints) fn into_controller(
-        self, capacity: usize, validity: eredu_core::SharedTokenFilter,
-    ) -> Result<super::OriginalPreparedGrammarController, super::OriginalPreparedGrammarControllerError> {
+        self,
+        capacity: usize,
+        validity: eredu_core::SharedTokenFilter,
+    ) -> Result<
+        super::OriginalPreparedGrammarController,
+        super::OriginalPreparedGrammarControllerError,
+    > {
         super::OriginalPreparedGrammarController::new(self, capacity, validity)
     }
 
     pub(in crate::runtime::chat::constraints) fn into_auto_controller(
-        self, capacity: usize, validity: eredu_core::SharedTokenFilter,
-    ) -> Result<super::OriginalPreparedGrammarController, super::OriginalPreparedGrammarControllerError> {
+        self,
+        capacity: usize,
+        validity: eredu_core::SharedTokenFilter,
+    ) -> Result<
+        super::OriginalPreparedGrammarController,
+        super::OriginalPreparedGrammarControllerError,
+    > {
         super::OriginalPreparedGrammarController::new_auto(self, capacity, validity)
     }
 
@@ -195,34 +210,69 @@ impl OriginalGrammarState {
     /// Whole-token activation preserves its ID; cross-token activation uses the
     /// same special-aware byte tokenizer and exact ordinary decoded round trip.
     pub(super) fn try_activation(
-        self, token: u32, found: eredu_core::speculative::byte_trigger::TriggerMatch<'_>,
+        self,
+        token: u32,
+        found: eredu_core::speculative::byte_trigger::TriggerMatch<'_>,
     ) -> Result<(Self, bool), OriginalGrammarStateError> {
-        if found.starts_at_token_boundary { return self.try_commit(token); }
+        if found.starts_at_token_boundary {
+            return self.try_commit(token);
+        }
         self.operation(|owner| {
+            use super::super::{
+                GrammarTokenizationMode, OriginalGrammarTokenIds, OriginalGrammarTokenizationError,
+            };
             use eredu_core::{HostPreparationAuthority, SpeculativeBuffer};
-            use super::super::{GrammarTokenizationMode, OriginalGrammarTokenIds, OriginalGrammarTokenizationError};
-            let capacity = found.prefix.len().checked_add(found.tail.len()).ok_or(Cause::Overflow)?;
+            let capacity = found
+                .prefix
+                .len()
+                .checked_add(found.tail.len())
+                .ok_or(Cause::Overflow)?;
             let parts = [
                 SpeculativeBuffer::<u8>::retained_control_bytes(capacity).ok_or(Cause::Overflow)?,
-                HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().ok_or(Cause::Overflow)?,
-                llguidance::toktrie::TokTrie::decoded_tokens_match_control_bytes().ok_or(Cause::Overflow)?,
+                HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+                    .ok_or(Cause::Overflow)?,
+                llguidance::toktrie::TokTrie::decoded_tokens_match_control_bytes()
+                    .ok_or(Cause::Overflow)?,
                 size_of::<eredu_core::speculative::byte_trigger::TriggerMatch<'_>>(),
                 size_of::<OriginalGrammarTokenIds>(),
                 size_of::<Result<OriginalGrammarTokenIds, OriginalGrammarTokenizationError>>(),
                 size_of::<SpeculativeBuffer<u8>>(),
-                size_of::<Result<SpeculativeBuffer<u8>, eredu_core::SpeculativeBufferAllocationError>>(),
+                size_of::<
+                    Result<SpeculativeBuffer<u8>, eredu_core::SpeculativeBufferAllocationError>,
+                >(),
                 size_of::<Result<(), eredu_core::GenerationError>>(),
                 size_of::<HostPreparationAuthority>(),
                 size_of::<(usize, u32)>(),
-                size_of::<std::iter::Copied<std::iter::Chain<std::slice::Iter<'_, u8>, std::slice::Iter<'_, u8>>>>(),
+                size_of::<
+                    std::iter::Copied<
+                        std::iter::Chain<std::slice::Iter<'_, u8>, std::slice::Iter<'_, u8>>,
+                    >,
+                >(),
             ];
-            owner.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(Cause::Overflow)?)?;
-            let mut bytes = SpeculativeBuffer::try_new_retained(capacity, HostPreparationAuthority::retain(owner.funding.clone()))?;
-            bytes.try_extend(found.prefix.iter().chain(found.tail).copied()).map_err(|_| Cause::Source)?;
+            owner.funding.reserve_metadata(
+                parts
+                    .into_iter()
+                    .try_fold(size_of_val(&parts), usize::checked_add)
+                    .ok_or(Cause::Overflow)?,
+            )?;
+            let mut bytes = SpeculativeBuffer::try_new_retained(
+                capacity,
+                HostPreparationAuthority::retain(owner.funding.clone()),
+            )?;
+            bytes
+                .try_extend(found.prefix.iter().chain(found.tail).copied())
+                .map_err(|_| Cause::Source)?;
             let vocabulary = owner.parser().vocabulary();
-            let tokens = vocabulary.tokenize_bytes_with_funding(&bytes, GrammarTokenizationMode::Special, &owner.funding)?;
-            if !vocabulary.trie_source().trie().decoded_tokens_match(tokens.ids(), &bytes) {
+            let tokens = vocabulary.tokenize_bytes_with_funding(
+                &bytes,
+                GrammarTokenizationMode::Special,
+                &owner.funding,
+            )?;
+            if !vocabulary
+                .trie_source()
+                .trie()
+                .decoded_tokens_match(tokens.ids(), &bytes)
+            {
                 return Err(Cause::ActivationEncoding);
             }
             let parser = owner.storage.parser.take().ok_or(Cause::Source)?;
@@ -277,7 +327,13 @@ impl OriginalGrammarState {
         let parts = [
             grammar_policy::control_bytes::<Self>().ok_or(OperationControl::Overflow)?,
             eredu_core::PackedTokenFilter::control_bytes(),
-            size_of::<(&SimpleVob, &[u32], Option<&[u32]>, usize, std::ops::RangeTo<usize>)>(),
+            size_of::<(
+                &SimpleVob,
+                &[u32],
+                Option<&[u32]>,
+                usize,
+                std::ops::RangeTo<usize>,
+            )>(),
             size_of::<Self>(),
             size_of::<Cause>(),
             size_of::<OperationControl>(),
@@ -289,10 +345,10 @@ impl OriginalGrammarState {
             size_of::<OriginalGrammarStateError>(),
             size_of::<F>(),
             size_of::<T>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Result<(Self, T), OriginalGrammarStateError>>(),
             size_of::<Result<T, Cause>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Result<(OriginalGrammarTokenParser, usize), OriginalGrammarTokenParserError>>(
             ),
             size_of::<Result<(OriginalGrammarTokenParser, bool), OriginalGrammarTokenParserError>>(
@@ -421,8 +477,8 @@ impl Context for OriginalGrammarState {
 enum CopyCause {
     #[error("original active grammar copy extent overflow")]
     Overflow,
-    #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
     #[error("original active grammar parser copy failed")]
     Parser,
 }
@@ -434,12 +490,16 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarStateCopyError {
     cause: CopyCause,
     prefix: Option<OriginalGrammarState>,
     source: Arc<OriginalGrammarSlicer>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalGrammarStateCopyError {
     fn source_cause(&self) -> &(dyn std::error::Error + 'static) {
         match self.prefix.as_ref() {
-            Some(prefix) => prefix.storage.failure.as_ref().expect("failed copied parser"),
+            Some(prefix) => prefix
+                .storage
+                .failure
+                .as_ref()
+                .expect("failed copied parser"),
             None => &self.cause,
         }
     }
@@ -458,7 +518,7 @@ impl OriginalGrammarState {
     #[inline(never)]
     pub(in crate::runtime::chat::constraints) fn try_copy(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalGrammarStateCopyError> {
         let original = self.parser();
         let reservation = Self::copy_controls()
@@ -476,7 +536,10 @@ impl OriginalGrammarState {
         // Successful and failed copies retain this same paid cell; no allocation
         // is needed after the underlying constructor refuses funding.
         let mut copied = Self {
-            storage: Box::new(Storage { parser: None, failure: None }),
+            storage: Box::new(Storage {
+                parser: None,
+                failure: None,
+            }),
             terminal_eos_alias_committed: self.terminal_eos_alias_committed,
             funding: funding.clone(),
         };

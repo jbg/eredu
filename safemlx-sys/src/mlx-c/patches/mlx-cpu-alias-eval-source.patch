@@ -188,7 +188,7 @@ diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_stora
        sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
        sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
    if(controls>SIZE_MAX-value.named_control_bytes)return false;
-@@ -36,7 +38,11 @@
+@@ -36,7 +38,13 @@
    if(rank>4||output_rank>4||shape.size()!=output_rank||!input.flags().row_contiguous||
        input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
        !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
@@ -197,7 +197,9 @@ diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_stora
 +        (input.dtype()==float16&&input.itemsize()==2)||
 +        (input.dtype()==bfloat16&&input.itemsize()==2)))return false;
 +  size_t source_elements=0;
-+  if(!alias_input_geometry(input,source_elements)||input.data_size()<source_elements)return false;
++  // Broadcasts may repeat a smaller backing. The shared geometry proof checks
++  // the exact readable stride span; logical element count is not backing size.
++  if(!alias_input_geometry(input,source_elements))return false;
    size_t input_elements=1,output_elements=1,bytes=0;
    for(size_t i=0;i!=rank;++i)
      if(input.shape(i)<=0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;

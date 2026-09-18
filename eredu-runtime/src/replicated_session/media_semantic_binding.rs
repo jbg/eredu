@@ -16,7 +16,7 @@ where
     /// The revision retains its original payer independently of later input work.
     pub fn prepare_original_media_semantic_binding(
         &self,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<MediaSessionBinding, OriginalMediaBindingError> {
         self.media_semantic_boundary()?;
         if !self.state.inference_retention().is_empty()
@@ -138,5 +138,5 @@ pub enum OriginalMediaBindingError {
     Boundary(#[from] WorkingMemoryError),
     /// Exact identity-constructor metadata refusal.
     #[error(transparent)]
-    Funding(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    Funding(#[from] eredu_nn::workspace::HostMetadataFundingError),
 }

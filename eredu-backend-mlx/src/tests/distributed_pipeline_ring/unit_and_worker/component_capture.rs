@@ -311,7 +311,7 @@ fn verify_loaded_component_capture(
         let mut steps = Vec::new();
         for _ in 0..3 {
             tokens.push(generation.next().unwrap().unwrap().token_id());
-            steps.push(generation.take_captured_step().unwrap().unwrap());
+            steps.push(generation.take_captured_delivery().unwrap().unwrap());
         }
         (tokens, steps)
     };
@@ -721,7 +721,7 @@ fn verify_component_prefill_geometry_rejection(
                 .source()
                 .expect("prefill rejection retains its neutral geometry cause");
         }
-        let _ = generation.take_captured_step();
+        let _ = generation.take_captured_delivery();
     }
     runtime.synchronize().unwrap();
     assert_eq!(
@@ -811,10 +811,13 @@ fn verify_cold_component_preparation(
             plan.request(),
         )
         .unwrap();
-    for stage in [
-        TextPreparationStage::Prompt,
-        TextPreparationStage::Sampling,
-        TextPreparationStage::Instrumentation,
+    let mut expected_attempts = 0;
+    // The shared startup driver agrees admission before prompt construction.
+    // Every failed phase retains all preceding agreement attempts.
+    for (stage, attempts) in [
+        (TextPreparationStage::Prompt, 2),
+        (TextPreparationStage::Sampling, 3),
+        (TextPreparationStage::Instrumentation, 4),
     ] {
         let ids = if stage == TextPreparationStage::Prompt && rank == 0 {
             vec![]
@@ -906,9 +909,12 @@ fn verify_cold_component_preparation(
                 .unwrap(),
             numeric
         );
+        expected_attempts += attempts;
+        assert_eq!(runtime.text_preparation_usage().unwrap().attempts
+            - initial_usage.attempts, expected_attempts);
     }
     let usage = runtime.text_preparation_usage().unwrap();
-    assert_eq!(usage.attempts - initial_usage.attempts, 6);
+    assert_eq!(usage.attempts - initial_usage.attempts, expected_attempts);
     assert!(usage.retained_bytes > initial_usage.retained_bytes);
     assert!(usage.host_bytes > initial_usage.host_bytes);
 }
@@ -943,15 +949,15 @@ fn component_capture_step<'a>(
         MlxBackend<'a>,
         ComponentCaptureController,
     >,
-) -> (u32, eredu_core::capture::CapturedStep) {
+) -> (u32, eredu_core::capture::SharedCapturedStep) {
     let token = state.advance(driver).unwrap().unwrap().token_id();
-    let capture = state.take_completed_step(driver).unwrap().unwrap();
+    let capture = state.take_completed_delivery(driver).unwrap().unwrap();
     (token, capture)
 }
 
 fn same_component_values(
-    actual: &(u32, eredu_core::capture::CapturedStep),
-    expected: &(u32, eredu_core::capture::CapturedStep),
+    actual: &(u32, eredu_core::capture::SharedCapturedStep),
+    expected: &(u32, eredu_core::capture::SharedCapturedStep),
 ) {
     assert_eq!(actual.0, expected.0);
     assert_eq!(actual.1.prediction_index, expected.1.prediction_index);
@@ -1269,7 +1275,7 @@ fn verify_loaded_component_interventions(
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
-                    let step = generation.take_captured_step().unwrap().unwrap();
+                    let step = generation.take_captured_delivery().unwrap().unwrap();
                     (token, step)
                 })
                 .collect::<Vec<_>>()

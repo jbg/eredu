@@ -333,7 +333,7 @@ fn replica_sources_prepare_together_but_export_once_and_never_run_empty_or_skipp
             assert!(steps[0].step_usage.retained_bytes >= 8192);
         }
         if executes {
-            let mut ordinary = CaptureSession::new(plan_for(CaptureTransform::Slice, false));
+            let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan_for(CaptureTransform::Slice, false)));
             ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
             ordinary
                 .observe(&mut Backend::default(), "block.output", &global())

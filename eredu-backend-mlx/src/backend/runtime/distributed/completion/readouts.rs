@@ -2,7 +2,7 @@
 use super::*;
 use super::prepared::{Cause,ResourceCustody,ReadyCompletionResources,error};
 use crate::backend::runtime::distributed::topology::OriginalCommunicationSource;
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use std::{alloc::Layout,mem::{size_of,size_of_val},ops::{Deref,DerefMut}};
 
 #[derive(Debug)]
@@ -223,7 +223,7 @@ impl PreparedCommunicationHeader {
 }
 fn prepare_custody<T:CommunicationWord>(source:&OriginalCommunicationSource<'_>)->Result<ResourceCustody,Error> {
     source.validate()?;
-    source.funding().reserve_metadata(control_bytes::<T>().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+    source.funding().reserve_metadata(control_bytes::<T>().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     Ok(ResourceCustody { source:source.source().clone(),funding:source.funding().clone() })
 }
@@ -244,7 +244,7 @@ fn control_bytes<T:CommunicationWord>()->Option<usize> {
         size_of::<Result<WordsResult<T>,Error>>(),size_of::<(usize,ResourceCustody)>(),
         size_of::<(&OriginalCommunicationSource<'_>,&crate::backend::runtime::distributed::topology::OriginalCommunicationCompletedOperation<'_>)>(),
         size_of::<Result<(crate::backend::runtime::distributed::topology::OriginalCommunicationConstructed,OriginalCommunicationCompletion),Error>>(),
-        size_of::<(Array,eredu_runtime::RetainedCommunicationSource,eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+        size_of::<(Array,eredu_runtime::RetainedCommunicationSource,eredu_nn::workspace::HostMetadataFunding)>(),
         size_of::<Result<PreparedWordDestination<T>,Error>>(),size_of::<Result<PreparedCommunicationHeader,Error>>(),
         size_of::<Result<(OriginalWordDestination<T>,OriginalCommunicationCompletion),Error>>(),
         size_of::<Result<CompletedWordDestination<T>,Error>>(),size_of::<Result<OriginalCommunicationCompletion,Error>>(),

@@ -239,9 +239,7 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
         let step = envelope.captures.as_step();
         assert_eq!(step.interventions.len(), 4);
         if shared {
-            let CapturedStepDelivery::Shared(owner) = &envelope.captures else {
-                panic!("original escaped frame")
-            };
+            let owner = &envelope.captures;
             let alias = owner.clone();
             assert!(alias.same_storage(owner));
             assert_eq!(
@@ -308,7 +306,7 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
     assert_eq!(delivered.len(), 1);
     let delivery = delivered[0].prefill_reductions.as_ref().unwrap();
     if shared {
-        let owner = delivery.shared().expect("original escaped aggregate");
+        let owner = delivery;
         let alias = owner.clone();
         assert!(alias.same_storage(owner));
         assert_eq!(
@@ -386,13 +384,22 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
                 _ => unreachable!(),
             };
             let values: Vec<_> = selected.iter().map(|v| v * factor).collect();
-            let physical_captures: u64 = windows.iter()
-                .map(|window| window.captures.as_step().interventions[entry.operation_index]
-                    .evidence[side].charged.captures)
+            let physical_captures: u64 = windows
+                .iter()
+                .map(|window| {
+                    window.captures.as_step().interventions[entry.operation_index].evidence[side]
+                        .charged
+                        .captures
+                })
                 .sum();
-            assert_eq!(entry.record.evidence[side].charged.captures, physical_captures);
-            assert_eq!(report.charged.captures, 0,
-                "aggregate delivery adds no physical capture spending");
+            assert_eq!(
+                entry.record.evidence[side].charged.captures,
+                physical_captures
+            );
+            assert_eq!(
+                report.charged.captures, 0,
+                "aggregate delivery adds no physical capture spending"
+            );
             evidence.push(payload(
                 &entry.record.evidence[side],
                 kind,

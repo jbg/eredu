@@ -146,7 +146,7 @@ where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueSt
     let bind=|ordinal,address,unit:&mut eredu_architectures::moshi::Unit<eredu_nn::workspace::WorkspaceBackend>,context:&WorkspaceContext| {
             let native=parameters.unit(ordinal,address).map_err(|cause|context.metadata_source(cause))?;
             let mut values=bindings(native,&mut projection)?;
-            eredu_runtime::working_memory::bind_prepared_workspace_parameters(unit,&mut values,context)?;
+            eredu_runtime::working_memory::bind_prepared_workspace_parameters(unit,&mut values,context, |_| false)?;
             visited=visited.checked_add(1).ok_or(WorkspaceMetadataError::Overflow)?;
             Ok(())
         };

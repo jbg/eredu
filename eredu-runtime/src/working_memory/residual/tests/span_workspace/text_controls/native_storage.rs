@@ -25,6 +25,8 @@ struct Root {
     key: u32,
     bytes: u64,
     values: [f32; 2],
+    generation: Cell<u64>,
+    replace_after_observation: Cell<bool>,
     owners: RefCell<[Option<NativeStorageRegistration<u32>>; 4]>,
 }
 impl Root {
@@ -35,6 +37,8 @@ impl Root {
             key,
             bytes,
             values: [1.25, -3.5],
+            generation: Cell::new(0),
+            replace_after_observation: Cell::new(false),
             owners: RefCell::new(std::array::from_fn(|_| None)),
         }
     }
@@ -44,6 +48,8 @@ impl Root {
             key,
             bytes,
             values: [4.0, 2.5],
+            generation: Cell::new(0),
+            replace_after_observation: Cell::new(false),
             owners: RefCell::new(std::array::from_fn(|_| None)),
         }
     }
@@ -54,6 +60,7 @@ impl Root {
 struct Observation<'a> {
     root: &'a Root,
     kind: u8,
+    generation: u64,
 }
 #[derive(Clone)]
 struct Mechanism {
@@ -61,6 +68,7 @@ struct Mechanism {
     pool: WorkingMemoryPool,
     calls: Rc<Cell<usize>>,
     fail_install: Rc<Cell<bool>>,
+    reuse_attachments: Rc<Cell<bool>>,
     nested_key_bytes: Option<u64>,
 }
 impl Mechanism {
@@ -70,6 +78,7 @@ impl Mechanism {
             pool: pool.clone(),
             calls: Rc::new(Cell::new(0)),
             fail_install: Rc::new(Cell::new(false)),
+            reuse_attachments: Rc::new(Cell::new(false)),
             nested_key_bytes: None,
         }
     }
@@ -89,7 +98,7 @@ impl Mechanism {
 impl OriginalNativeStorageMechanism for Mechanism {
     type Key = u32;
     type Budget = Rc<Budget>;
-    type Root = Root;
+    type Root<'a> = &'a Root;
     type Attachment = NativeStorageRegistration<u32>;
     type Error = Failure;
     type Observation<'a> = Observation<'a>;
@@ -106,10 +115,10 @@ impl OriginalNativeStorageMechanism for Mechanism {
         }
         Ok(Rc::new(Budget(custody)))
     }
-    fn observe<'a>(
+    fn observe<'a, 'root: 'a>(
         &'a self,
         budget: &'a Rc<Budget>,
-        root: &'a Root,
+        root: &'root Root,
     ) -> Result<Observation<'a>, Failure> {
         self.callback();
         assert_eq!(root.values.len(), 2);
@@ -118,7 +127,14 @@ impl OriginalNativeStorageMechanism for Mechanism {
             Some(_) => 1,
             None => 2,
         };
-        Ok(Observation { root, kind })
+        let generation = root.generation.get();
+        if root.replace_after_observation.replace(false) {
+            // Deterministic descriptor replacement through another fixture
+            // alias after the borrowed facts were read. Existing sidecars
+            // still name the old physical generation.
+            root.generation.set(generation + 1);
+        }
+        Ok(Observation { root, kind, generation })
     }
     fn describe(observed: &Observation<'_>) -> NativeStorageObservation<u32> {
         let r = observed.root;
@@ -131,6 +147,15 @@ impl OriginalNativeStorageMechanism for Mechanism {
     fn prepare_attachment(&self, owner: Self::Attachment) -> Result<Self::Attachment, Failure> {
         self.callback();
         Ok(owner)
+    }
+    fn has_retained_attachment(&self, previous: &Observation<'_>, current: &Observation<'_>, pool: &WorkingMemoryPool) -> bool {
+        self.reuse_attachments.get()
+            && self.pool.shared_storage_domain().same_identity(pool.shared_storage_domain())
+            && previous.kind == current.kind
+            && previous.generation == current.generation
+            && current.generation == 0
+            && std::ptr::eq(previous.root, current.root)
+            && current.root.attachments() > 0
     }
     fn registration(owner: &Self::Attachment) -> &Self::Attachment {
         owner
@@ -216,6 +241,55 @@ fn setup(
 fn balances(pool: &WorkingMemoryPool) -> (u64, u64) {
     let usage = pool.0.usage.lock().unwrap();
     (usage.reserved, usage.registered)
+}
+
+#[test]
+fn attached_registration_compares_its_exact_metadata_origin_without_retaining_or_reissuing() {
+    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let foreign_pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let foreign_namespace = foreign_pool.register_storage([(1u32, 64)]).unwrap();
+    let (ar, a_run, a_span, mut a, mechanism) = setup(&pool, 32, 1, 1);
+    let (br, b_run, b_span, b, _) = setup(&pool, 32, 1, 1);
+    let (fr, f_run, f_span, f, _) = setup(&foreign_pool, 32, 1, 1);
+    let a_origin = a_span.control_guard().metadata_custody().into();
+    let b_origin = b_span.control_guard().metadata_custody().into();
+    let foreign_origin = f_span.control_guard().metadata_custody().into();
+    let mut scope = a_run.scope().unwrap();
+    let root = Root::native(7, 16, a.budget_for_scope(&scope).unwrap());
+    let mut publication = a.claim_publication(&mut scope).unwrap();
+    publication.publish(&scope, [&root], &[]).unwrap();
+    assert_eq!(root.attachments(), 1);
+    assert_eq!(root.values, [1.25, -3.5]);
+    let before = balances(&pool);
+    let calls = mechanism.calls.get();
+    let foreign_before = balances(&foreign_pool);
+    {
+        let owners = root.owners.borrow();
+        let registration = owners.iter().flatten().next().unwrap();
+        assert!(registration.has_metadata_origin(&a_origin));
+        assert!(!registration.has_metadata_origin(&b_origin));
+        assert!(!registration.has_metadata_origin(&foreign_origin));
+        assert!(registration.has_metadata_origin(&a_origin));
+    }
+    assert_eq!(balances(&pool), before);
+    assert_eq!(balances(&foreign_pool), foreign_before);
+    assert_eq!(mechanism.calls.get(), calls);
+    assert_eq!(a.remaining_publications(), 0);
+    assert_eq!(b.remaining_publications(), 1);
+    assert!(NativeStorageRegistration::<u32>::metadata_origin_control_bytes().unwrap() > 0);
+    scope.certify().unwrap();
+    drop((publication, a, a_span, ar, a_run));
+    {
+        let owners = root.owners.borrow();
+        let registration = owners.iter().flatten().next().unwrap();
+        assert!(registration.has_metadata_origin(&a_origin), "closed retained account remains the same origin");
+        a_origin.validate_retained_origin(&pool).unwrap();
+    }
+    drop((root, a_origin, b_origin, foreign_origin, b, b_span, br, b_run, f, f_span, fr, f_run));
+    drop((namespace, foreign_namespace));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -507,3 +581,37 @@ fn excess_actual_root_iterator_and_wrong_selection_are_refused_without_native_ca
 }
 
 mod qualified_controls;
+
+mod sampling_extension;
+
+#[test]
+fn retained_attachment_revalidates_descriptor_at_commit_without_an_extra_sidecar() {
+    for changed in [false, true] {
+        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let (r, run, span, mut bank, mechanism) = setup(&pool, 32, 2, 1);
+        let mut scope = run.scope().unwrap();
+        let root = Root::native(7, 16, bank.budget_for_scope(&scope).unwrap());
+        let mut first = bank.claim_publication(&mut scope).unwrap();
+        first.publish(&scope, [&root], &[]).unwrap();
+        assert_eq!(root.attachments(), 1);
+        mechanism.reuse_attachments.set(true);
+        root.replace_after_observation.set(changed);
+        let mut repeated = bank.claim_publication(&mut scope).unwrap();
+        let before = balances(&pool);
+        let result = repeated.publish(&scope, [&root], &[]);
+        if changed {
+            assert!(matches!(result, Err(NativeStorageError::Memory(WorkingMemoryError::IdentityMismatch))));
+            assert!(!repeated.is_published());
+        } else {
+            result.unwrap();
+            assert!(repeated.is_published());
+        }
+        assert_eq!(root.attachments(), 1, "existing attachment is never duplicated");
+        assert_eq!(balances(&pool), before);
+        drop(root); // explicit actual fixture settlement before scope certification
+        scope.certify().unwrap();
+        drop((first, repeated, bank, span, r, run, namespace));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
+}

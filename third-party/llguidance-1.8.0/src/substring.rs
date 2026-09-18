@@ -1,6 +1,5 @@
-use anyhow::Result;
-use derivre::{ExprRef, RegexBuilder};
-use std::collections::{hash_map::Entry, HashMap};
+use derivre::ParserResult as Result;
+use derivre::{ExprRef, RegexBuilder, ParserAllocationFunding, SourceHashMap as HashMap};
 
 #[derive(Debug)]
 struct State<'a> {
@@ -15,48 +14,43 @@ struct State<'a> {
 struct SuffixAutomaton<'a> {
     states: Vec<State<'a>>,
     last: usize,
+    funding: ParserAllocationFunding,
 }
 
 impl<'a> SuffixAutomaton<'a> {
-    fn new() -> Self {
+    fn new(funding: ParserAllocationFunding) -> Result<Self> {
         let init_state = State {
             len: 0,
             link: None,
             next: HashMap::default(),
             regex: None,
         };
-        SuffixAutomaton {
-            states: vec![init_state],
-            last: 0,
-        }
+        let mut states = Vec::new();
+        funding.try_push(&mut states, init_state)?;
+        Ok(SuffixAutomaton { states, last: 0, funding })
     }
 
-    fn from_string(chunks: Vec<&'a str>) -> Self {
-        let mut sa = SuffixAutomaton::new();
-        for s in chunks.into_iter() {
-            sa.extend(s);
-        }
-        sa
+    fn from_string(chunks: impl IntoIterator<Item=&'a str>, funding: ParserAllocationFunding) -> Result<Self> {
+        let mut sa = SuffixAutomaton::new(funding)?;
+        for s in chunks { sa.extend(s)?; }
+        Ok(sa)
     }
 
-    fn extend(&mut self, s: &'a str) {
+    fn extend(&mut self, s: &'a str) -> Result<()> {
         let cur_index = self.states.len();
-        self.states.push(State {
-            len: self.states[self.last].len + 1,
+        let len = self.states[self.last].len.checked_add(1).ok_or_else(|| self.funding.storage_overflow())?;
+        self.funding.try_push(&mut self.states, State {
+            len,
             link: None,
             next: HashMap::default(),
             regex: None,
-        });
+        })?;
 
         let mut p = Some(self.last);
         while let Some(pp) = p {
-            match self.states[pp].next.entry(s) {
-                Entry::Occupied(_) => break,
-                Entry::Vacant(entry) => {
-                    entry.insert(cur_index);
-                    p = self.states[pp].link;
-                }
-            }
+            if self.states[pp].next.contains_key(s) { break; }
+            self.funding.try_insert(&mut self.states[pp].next, s, cur_index)?;
+            p = self.states[pp].link;
         }
 
         if let Some(pp) = p {
@@ -65,15 +59,16 @@ impl<'a> SuffixAutomaton<'a> {
                 self.states[cur_index].link = Some(q);
             } else {
                 let clone_index = self.states.len();
-                self.states.push(State {
-                    len: self.states[pp].len + 1,
-                    link: self.states[q].link,
-                    next: self.states[q].next.clone(),
-                    regex: None,
-                });
+                let len = self.states[pp].len.checked_add(1).ok_or_else(|| self.funding.storage_overflow())?;
+                let link = self.states[q].link;
+                let mut next = HashMap::default();
+                for (&key, &value) in &self.states[q].next {
+                    self.funding.try_insert(&mut next, key, value)?;
+                }
+                self.funding.try_push(&mut self.states, State { len, link, next, regex: None })?;
                 while let Some(ppp) = p {
                     if self.states[ppp].next[&s] == q {
-                        self.states[ppp].next.insert(s, clone_index);
+                        *self.states[ppp].next.get_mut(s).unwrap() = clone_index;
                     } else {
                         break;
                     }
@@ -86,12 +81,15 @@ impl<'a> SuffixAutomaton<'a> {
             self.states[cur_index].link = Some(0);
         }
         self.last = cur_index;
+        Ok(())
     }
 }
 
-pub fn substring(builder: &mut RegexBuilder, chunks: Vec<&str>) -> Result<ExprRef> {
-    let mut sa = SuffixAutomaton::from_string(chunks);
-    let mut state_stack = vec![0];
+pub fn substring<'a>(builder: &mut RegexBuilder, chunks: impl IntoIterator<Item=&'a str>) -> Result<ExprRef> {
+    let funding = builder.allocation_funding()?.clone();
+    let mut sa = SuffixAutomaton::from_string(chunks, funding.clone())?;
+    let mut state_stack = Vec::new();
+    funding.try_push(&mut state_stack, 0)?;
 
     let empty = ExprRef::EMPTY_STRING;
 
@@ -112,7 +110,7 @@ pub fn substring(builder: &mut RegexBuilder, chunks: Vec<&str>) -> Result<ExprRe
         let prev_stack = state_stack.len();
         for child_index in state.next.values() {
             if sa.states[*child_index].regex.is_none() {
-                state_stack.push(*child_index);
+                funding.try_push(&mut state_stack, *child_index)?;
             }
         }
 
@@ -120,12 +118,13 @@ pub fn substring(builder: &mut RegexBuilder, chunks: Vec<&str>) -> Result<ExprRe
             continue;
         }
 
-        let mut options = state
-            .next
-            .iter()
-            .map(|(k, v)| (k.to_string().into_bytes(), sa.states[*v].regex.unwrap()))
-            .collect::<Vec<_>>();
-        options.push((Vec::new(), empty));
+        let mut options = Vec::new();
+        for (key, value) in &state.next {
+            let mut bytes = Vec::new();
+            funding.try_extend_copy(&mut bytes, key.as_bytes())?;
+            funding.try_push(&mut options, (bytes, sa.states[*value].regex.unwrap()))?;
+        }
+        funding.try_push(&mut options, (Vec::new(), empty))?;
         let expr = builder.mk_prefix_tree(options)?;
         sa.states[state_index].regex = Some(expr);
         state_stack.pop();
@@ -133,19 +132,13 @@ pub fn substring(builder: &mut RegexBuilder, chunks: Vec<&str>) -> Result<ExprRe
     Ok(sa.states[0].regex.unwrap())
 }
 
-pub fn chunk_into_chars(input: &str) -> Vec<&str> {
-    let mut chunks = vec![];
-    let mut char_indices = input.char_indices().peekable();
-
-    while let Some((start, _)) = char_indices.next() {
-        let end = match char_indices.peek() {
-            Some(&(next_index, _)) => next_index,
-            None => input.len(),
-        };
-        chunks.push(&input[start..end]);
-    }
-
-    chunks
+pub fn chunk_into_chars(input: &str) -> impl Iterator<Item=&str> {
+    let mut chars = input.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = chars.next()?;
+        let end = chars.peek().map_or(input.len(), |&(next, _)| next);
+        Some(&input[start..end])
+    })
 }
 
 #[derive(PartialEq)]
@@ -165,23 +158,15 @@ fn classify(ch: char) -> TokenType {
     }
 }
 
-pub fn chunk_into_words(input: &str) -> Vec<&str> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut current_type = classify(input.chars().next().unwrap());
-    for (i, ch) in input.char_indices() {
-        let token_type = classify(ch);
-        if token_type != current_type {
-            chunks.push(&input[start..i]);
-            start = i;
-            current_type = token_type;
-        }
-    }
-    chunks.push(&input[start..]);
-    chunks
+pub fn chunk_into_words(input: &str) -> impl Iterator<Item=&str> {
+    let mut chars = input.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, first) = chars.next()?;
+        let current = classify(first);
+        while chars.peek().is_some_and(|&(_, ch)| classify(ch) == current) { chars.next(); }
+        let end = chars.peek().map_or(input.len(), |&(next, _)| next);
+        Some(&input[start..end])
+    })
 }
 
 #[cfg(test)]
@@ -190,13 +175,13 @@ mod test {
     use derivre::{ExprRef, Regex, RegexBuilder};
 
     fn to_regex(builder: RegexBuilder, expr: ExprRef) -> Regex {
-        builder.to_regex(expr)
+        builder.to_regex(expr).unwrap()
     }
 
     #[test]
     fn test_tokenize_chars() {
         let input = "The quick brown fox jumps over the lazy dog.";
-        let tokens = chunk_into_chars(input);
+        let tokens = chunk_into_chars(input).collect::<Vec<_>>();
         assert_eq!(input, tokens.join(""));
         assert_eq!(
             tokens,
@@ -211,7 +196,7 @@ mod test {
     #[test]
     fn test_tokenize_chars_unicode() {
         let input = "빠른 갈색 여우가 게으른 개를 뛰어넘었다.";
-        let tokens = chunk_into_chars(input);
+        let tokens = chunk_into_chars(input).collect::<Vec<_>>();
         assert_eq!(input, tokens.join(""));
         assert_eq!(
             tokens,
@@ -225,7 +210,7 @@ mod test {
     #[test]
     fn test_tokenize_words() {
         let input = "The quick brown fox jumps over the lazy dog.";
-        let tokens = chunk_into_words(input);
+        let tokens = chunk_into_words(input).collect::<Vec<_>>();
         assert_eq!(input, tokens.join(""));
         assert_eq!(
             tokens,
@@ -239,7 +224,7 @@ mod test {
     #[test]
     fn test_tokenize_words_unicode() {
         let input = "빠른 갈색 여우가 게으른 개를 뛰어넘었다.";
-        let tokens = chunk_into_words(input);
+        let tokens = chunk_into_words(input).collect::<Vec<_>>();
         assert_eq!(input, tokens.join(""));
         assert_eq!(
             tokens,
@@ -262,69 +247,69 @@ mod test {
 
     #[test]
     fn test_substring_chars() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let expr = substring(
             &mut builder,
             chunk_into_chars("The quick brown fox jumps over the lazy dog."),
         )
         .unwrap();
         let mut regex = to_regex(builder, expr);
-        assert!(regex.is_match("The quick brown fox jumps over the lazy dog."));
-        assert!(regex.is_match("The quick brown fox"));
-        assert!(regex.is_match("he quick brow"));
-        assert!(regex.is_match("fox jump"));
-        assert!(regex.is_match("dog."));
-        assert!(!regex.is_match("brown fx"));
+        assert!(regex.is_match("The quick brown fox jumps over the lazy dog.").unwrap());
+        assert!(regex.is_match("The quick brown fox").unwrap());
+        assert!(regex.is_match("he quick brow").unwrap());
+        assert!(regex.is_match("fox jump").unwrap());
+        assert!(regex.is_match("dog.").unwrap());
+        assert!(!regex.is_match("brown fx").unwrap());
     }
 
     #[test]
     fn test_substring_chars_unicode() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let expr = substring(
             &mut builder,
             chunk_into_chars("빠른 갈색 여우가 게으른 개를 뛰어넘었다."),
         )
         .unwrap();
         let mut regex = to_regex(builder, expr);
-        assert!(regex.is_match("빠른 갈색 여우가 게으른 개를 뛰어넘었다."));
-        assert!(regex.is_match("빠른 갈색 여우가 게으른"));
-        assert!(regex.is_match("른 갈색 여우"));
-        assert!(regex.is_match("여우가 게으"));
-        assert!(regex.is_match("뛰어넘었다."));
-        assert!(!regex.is_match("갈색 여가"));
+        assert!(regex.is_match("빠른 갈색 여우가 게으른 개를 뛰어넘었다.").unwrap());
+        assert!(regex.is_match("빠른 갈색 여우가 게으른").unwrap());
+        assert!(regex.is_match("른 갈색 여우").unwrap());
+        assert!(regex.is_match("여우가 게으").unwrap());
+        assert!(regex.is_match("뛰어넘었다.").unwrap());
+        assert!(!regex.is_match("갈색 여가").unwrap());
     }
 
     #[test]
     fn test_substring_words() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let expr = substring(
             &mut builder,
             chunk_into_words("The quick brown fox jumps over the lazy dog."),
         )
         .unwrap();
         let mut regex = to_regex(builder, expr);
-        assert!(regex.is_match("The quick brown fox jumps over the lazy dog."));
-        assert!(regex.is_match("The quick brown fox"));
-        assert!(!regex.is_match("he quick brow"));
-        assert!(!regex.is_match("fox jump"));
-        assert!(regex.is_match("dog."));
-        assert!(!regex.is_match("brown fx"));
+        assert!(regex.is_match("The quick brown fox jumps over the lazy dog.").unwrap());
+        assert!(regex.is_match("The quick brown fox").unwrap());
+        assert!(!regex.is_match("he quick brow").unwrap());
+        assert!(!regex.is_match("fox jump").unwrap());
+        assert!(regex.is_match("dog.").unwrap());
+        assert!(!regex.is_match("brown fx").unwrap());
     }
 
     #[test]
     fn test_substring_words_unicode() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let expr = substring(
             &mut builder,
             chunk_into_words("빠른 갈색 여우가 게으른 개를 뛰어넘었다."),
         )
         .unwrap();
         let mut regex = to_regex(builder, expr);
-        assert!(regex.is_match("빠른 갈색 여우가 게으른 개를 뛰어넘었다."));
-        assert!(regex.is_match("빠른 갈색 여우가 게으른"));
-        assert!(!regex.is_match("른 갈색 여우"));
-        assert!(!regex.is_match("여우가 게으"));
-        assert!(regex.is_match("뛰어넘었다."));
-        assert!(!regex.is_match("갈색 여가"));
+        assert!(regex.is_match("빠른 갈색 여우가 게으른 개를 뛰어넘었다.").unwrap());
+        assert!(regex.is_match("빠른 갈색 여우가 게으른").unwrap());
+        assert!(!regex.is_match("른 갈색 여우").unwrap());
+        assert!(!regex.is_match("여우가 게으").unwrap());
+        assert!(regex.is_match("뛰어넘었다.").unwrap());
+        assert!(!regex.is_match("갈색 여가").unwrap());
     }
 }

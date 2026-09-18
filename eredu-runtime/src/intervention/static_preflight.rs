@@ -158,6 +158,26 @@ impl StaticInterventionPreflight {
         self.slice.shape.resize(rank, 0);
         Ok(())
     }
+    /// Validates a capture-only source using the same scheduled geometry and
+    /// cumulative budget worker, without constructing an intervention source.
+    pub fn run_capture(
+        &mut self, capture: &AdmittedCapturePlan, estimator: &dyn InterventionEstimator,
+    ) -> Result<(), StaticInterventionPreflightError> {
+        if capture.invocation_bounds().is_some() { return Err(StaticInterventionPreflightError::Request); }
+        let mut base = CaptureUsage::default();
+        for (selection, point) in capture.plan().selections.iter().zip(capture.points()) {
+            base = base.checked_add(crate::capture::metadata_reservation(selection, point)?)?;
+        }
+        let mut budget = crate::capture::PreflightBudget::new(capture, base, 0, CaptureUsage::default())?;
+        for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
+            if budget.begin_phase(phase) {
+                self.add_selections(&mut budget, capture, phase, estimator)?;
+                budget.finish_phase()?;
+            }
+        }
+        budget.finish()?;
+        Ok(())
+    }
     /// Existing static admission without source-owned evidence companions.
     pub fn run(
         &mut self,

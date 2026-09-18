@@ -16,20 +16,20 @@ use eredu_core::{
     ModelInspectionReport,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::metadata::{
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
 };
-use super::request::prepare_chat_from_parts;
+use super::request::inspect_chat_from_parts;
 use super::tokenizer::{
     gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_tokenizer_template_kwargs,
     resolve_chat_template,
 };
-use super::{load_tokenizer, TextMetadataError, TextModelOptions};
+use super::{TextMetadataError, TextModelOptions, load_tokenizer};
 use crate::runtime::chat::{
-    constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
-    SemanticSupport, ToolChoice,
+    ChatTemplateRequest, NativeToolSupport, ChatInspection, SemanticSupport, ToolChoice,
+    constraints::ConstraintCompiler,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -242,7 +242,7 @@ fn inspect_chat_behavior(
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
     let model_id = report.path.display().to_string();
     if let Some(request) = request {
-        match prepare_chat_from_parts(
+        match inspect_chat_from_parts(
             &mut tokenizer,
             template,
             &model_id,
@@ -271,7 +271,7 @@ fn inspect_chat_behavior(
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     };
-    match prepare_chat_from_parts(
+    match inspect_chat_from_parts(
         &mut tokenizer,
         template.clone(),
         &model_id,
@@ -286,7 +286,7 @@ fn inspect_chat_behavior(
                     report.issue(
                         InspectionIssueCode::UnsupportedSemanticProtocol,
                         InspectionSeverity::Warning,
-                        reason.clone(),
+                        *reason,
                         Some(report.path.clone()),
                     );
                     InspectionReadiness::Unsupported
@@ -322,7 +322,7 @@ fn inspect_chat_behavior(
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     };
-    match prepare_chat_from_parts(
+    match inspect_chat_from_parts(
         &mut tokenizer,
         template,
         &model_id,
@@ -337,7 +337,7 @@ fn inspect_chat_behavior(
                     report.issue(
                         InspectionIssueCode::UnsupportedToolProtocol,
                         InspectionSeverity::Warning,
-                        reason.clone(),
+                        *reason,
                         Some(report.path.clone()),
                     );
                     InspectionReadiness::Unsupported
@@ -362,14 +362,14 @@ fn inspect_chat_behavior(
     );
 }
 
-fn apply_prepared_chat(report: &mut ModelInspectionReport, prepared: &PreparedChat) {
+fn apply_prepared_chat(report: &mut ModelInspectionReport, prepared: &ChatInspection) {
     report.semantic_streaming = match prepared.semantic_support() {
         SemanticSupport::Supported => InspectionReadiness::Ready,
         SemanticSupport::Unsupported { reason } => {
             report.issue(
                 InspectionIssueCode::UnsupportedSemanticProtocol,
                 InspectionSeverity::Warning,
-                reason.clone(),
+                *reason,
                 Some(report.path.clone()),
             );
             InspectionReadiness::Unsupported
@@ -381,7 +381,7 @@ fn apply_prepared_chat(report: &mut ModelInspectionReport, prepared: &PreparedCh
             report.issue(
                 InspectionIssueCode::UnsupportedToolProtocol,
                 InspectionSeverity::Warning,
-                reason.clone(),
+                *reason,
                 Some(report.path.clone()),
             );
             InspectionReadiness::Unsupported

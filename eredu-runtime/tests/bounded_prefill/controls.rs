@@ -1,5 +1,75 @@
 use super::*;
 
+#[test]
+fn terminal_geometry_has_no_prefill_roles_or_submissions() {
+    let g = InferenceGeometry {
+        batch_size: 1,
+        cached_positions: 23,
+        input_positions: 0,
+        max_output_tokens: 0,
+        prefill_chunk_positions: 0,
+        output: OutputDemand::StateOnly,
+    };
+    for retained in [false, true] {
+        let plan = PrefillControlPlan::new(g, retained).unwrap();
+        assert_eq!(plan.geometry(), g);
+        assert_eq!(plan.span_count(), 0);
+        assert_eq!(plan.scope_count(), 0);
+        assert_eq!(plan.role(0), None);
+        assert_eq!(plan.chunk(0), None);
+        for position in [0, 23, u64::MAX] {
+            assert_eq!(
+                plan.boundary_role(PrefillBoundary::Before {
+                    input_position: position
+                }),
+                None
+            );
+            assert_eq!(
+                plan.boundary_role(PrefillBoundary::After {
+                    input_position: position
+                }),
+                None
+            );
+        }
+        for invalid in [
+            InferenceGeometry {
+                max_output_tokens: 1,
+                ..g
+            },
+            InferenceGeometry {
+                input_positions: 1,
+                ..g
+            },
+            InferenceGeometry {
+                output: OutputDemand::LastPosition,
+                ..g
+            },
+        ] {
+            assert!(PrefillControlPlan::new(invalid, retained).is_err());
+        }
+    }
+    // The actual enclosing bank still has storage even though no per-role
+    // producer is required. Unknown unused roles must not invent native work.
+    let facts = TextPrefillScopeFacts::new(g, [None; 7], Some(19), 3, 103).unwrap();
+    assert_eq!(facts.total_bytes().unwrap(), Some(19));
+    assert_eq!(facts.graph_bytes().unwrap(), 0);
+    let execution = InferenceExecutionIdentity::default();
+    let request = InferenceRequest::without_memory_budget(&execution, g).unwrap();
+    let mut driver =
+        PrefillDriver::new(&execution, request, g, GenerationCancellationToken::new()).unwrap();
+    let mut executor = Boundaries::new();
+    let state = executor.inner.state;
+    assert_eq!(
+        driver
+            .run(&mut executor, |_, _| panic!("terminal output"))
+            .unwrap(),
+        PrefillOutcome::Complete
+    );
+    assert!(executor.observed.is_empty());
+    assert!(executor.inner.submitted.is_empty());
+    assert_eq!(executor.inner.state, state);
+}
+
 struct Boundaries {
     inner: RecurrentExecutor,
     observed: Vec<PrefillBoundary>,

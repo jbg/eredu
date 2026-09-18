@@ -1,11 +1,11 @@
 //! Released-checkpoint capture/intervention parity through public APIs.
 //! Generate the oracle with eredu-evaluation/scripts/component_reference.py.
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::parameters::*;
-use eredu_core::{capture::*, intervention::*, ExecutionPlan, GenerationConfigOverrides};
+use eredu_core::{ExecutionPlan, GenerationConfigOverrides, capture::*, intervention::*};
 use std::ops::ControlFlow;
 
 #[path = "component_reference_analysis.rs"]
@@ -50,15 +50,34 @@ fn main() -> anyhow::Result<()> {
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
             .into_parts();
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .context("cancelled before source compilation")?;
+    let policy = ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"reference output contract"})],
         add_generation_prompt: true,
         ..Default::default()
-    })?;
+    };
+    let chat = model
+        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(0.0),
             max_new_tokens: Some(4),
+            ..Default::default()
+        },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
             ..Default::default()
         },
         seed: 17,
@@ -286,40 +305,44 @@ fn main() -> anyhow::Result<()> {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let prepared = model.prepare_intervened_token_ids(
-            &chat,
-            prefix.clone(),
-            settings,
-            capture.clone(),
-            InterventionPlan {
-                schema_version: INTERVENTION_SCHEMA_VERSION,
-                operations,
-            },
-            trace,
-        )?;
+        let interventions = InterventionPlan {
+            schema_version: INTERVENTION_SCHEMA_VERSION,
+            operations,
+        };
+        let mut request = PreparedChatRequest::new(&chat, settings);
+        request.input = PreparedChatPrompt::TokenIds(&prefix);
+        request.output_mode = PreparedChatOutputMode::Text;
+        request.capture = Some(&capture);
+        request.intervention = Some(&interventions);
         let mut records = vec![];
-        let output = model.generate_observed_text(prepared, &[], Default::default(), |record| {
+        let mut collect = |record| {
             records.push(record);
             ControlFlow::Continue(())
-        })?;
+        };
+        let mut run = model
+            .start_controlled_chat(request, trace, Default::default(), &mut collect)?
+            .context("cancelled before reference trial")?;
+        run.run(&mut collect)?;
+        let output_ids = run.token_ids().to_vec();
+        drop(run);
         let expected_ids: Vec<u32> =
             serde_json::from_value(reference[expected_trial]["generated"].clone())?;
         ensure!(
-            output.token_ids == expected_ids,
+            output_ids == expected_ids,
             "{trial}: generated {:?}, expected {expected_ids:?}",
-            output.token_ids
+            output_ids
         );
         let mut worst = 0.0f64;
         let mut compared = 0;
         let mut evidence = std::collections::BTreeMap::new();
         let mut precision = std::collections::BTreeMap::new();
         for event in &records {
-            let ObservedGenerationEvent::Token {
+            let Some(ObservedGenerationEvent::Token {
                 prediction_index,
                 forced,
                 captures: Some(step),
                 ..
-            } = &event.event
+            }) = event.event.progress()
             else {
                 continue;
             };
@@ -439,7 +462,11 @@ fn main() -> anyhow::Result<()> {
                 for (&actual, expected) in values.iter().zip(expected) {
                     let error = (actual as f64 - expected).abs();
                     worst = worst.max(error);
-                    ensure!(error <= 2e-4 + 3e-4 * expected.abs(), "{trial} prediction {prediction_index} {}: {actual} != {expected} (error {error})", record.path);
+                    ensure!(
+                        error <= 2e-4 + 3e-4 * expected.abs(),
+                        "{trial} prediction {prediction_index} {}: {actual} != {expected} (error {error})",
+                        record.path
+                    );
                     compared += 1;
                 }
             }
@@ -468,7 +495,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         println!(
             "{}",
-            serde_json::json!({"trial":trial,"generated":output.token_ids,"compared_values":compared,"max_absolute_error":worst,"absolute_tolerance":2e-4,"relative_tolerance":3e-4,"source_dtypes":precision,"analysis":reconstruction})
+            serde_json::json!({"trial":trial,"generated":output_ids,"compared_values":compared,"max_absolute_error":worst,"absolute_tolerance":2e-4,"relative_tolerance":3e-4,"source_dtypes":precision,"analysis":reconstruction})
         );
     }
     Ok(())

@@ -37,7 +37,7 @@ fn split_and_views()->Option<CpuPopulation>{
     let mut population=CpuPopulation::default();
     population.copy(OperationEvent::cpu_random_bits_layout(2,4,false)?,1)?;
     for _ in 0usize..2 {
-        population.copy(OperationEvent::cpu_slice_layout(2,false)?,1)?;
+        population.copy(OperationEvent::cpu_slice_layout(2, false, false)?,1)?;
         population.copy(OperationEvent::cpu_reshape_alias_layout(2,1,false)?,1)?;
     }
     let parts=[size_of::<CpuPopulation>(),size_of::<Option<CpuPopulation>>(),

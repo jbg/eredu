@@ -133,8 +133,8 @@ fn assert_loaded_parameters(model: &Model, config: &deepseek::V3Args) {
     #[derive(Default)]
     struct Loaded(BTreeMap<String, Vec<usize>>);
     impl<'a> ParameterVisitor<'a, NumericTensor> for Loaded {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+            let name = metadata.id().as_str();
             assert!(
                 value.data.iter().all(|v| v.is_finite()),
                 "finite parameter {name}"
@@ -186,7 +186,7 @@ fn make_model(
 ) {
     let architecture = V3Architecture::new(config.clone(), context).unwrap();
     let declarations = <V3Architecture as LayeredArchitecture<NumericBackend, V3State>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     // Sparse carrier hooks have their own typed collector. This fixture
     // compares every actual dense tensor declaration, including the new
     // local units and complete/additive writes, with whole-request execution.
@@ -197,8 +197,7 @@ fn make_model(
         let path = <V3Architecture as LayeredArchitecture<NumericBackend, V3State>>::unit_path(
             &architecture,
             0,
-            index,
-        )
+            index, None)
         .unwrap();
         let component = match config.layer_schedule.get(index).expect("validated target layer policy") {
             deepseek::LayerPolicy::DenseMlp => format!("{path}.feed_forward"),
@@ -607,7 +606,7 @@ fn deepseek_v3_target_declarations_preserve_existing_prediction_availability() {
             assert_eq!(hooks.supports(site), prediction_layers == 0);
         }
         let declarations = <V3Architecture as LayeredArchitecture<NumericBackend, V3State>>::
-            prefill_observation_declarations(&architecture).unwrap();
+            prefill_observation_declarations(&architecture, None).unwrap();
         assert_eq!(declarations.iter().filter(|d| !d.flattens_batch_tokens()).count(), 26);
         assert!(declarations
             .iter()
@@ -620,7 +619,7 @@ fn deepseek_v3_target_declarations_preserve_existing_prediction_availability() {
             let prediction_path = <V3Architecture as LayeredArchitecture<
                 NumericBackend,
                 V3State,
-            >>::unit_path(&architecture, 1, 0)
+            >>::unit_path(&architecture, 1, 0, None)
             .unwrap();
             assert!(declarations
                 .iter()

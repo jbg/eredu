@@ -17,6 +17,7 @@ workspace = true
 original-custody-test-support = []
 
 [dependencies]
+eredu-collections.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }

@@ -15,23 +15,41 @@ pub(crate) struct Inspector<F: Json> {
     seen: Vec<(usize, usize)>,
     key: fn(&F::PreparedKey) -> Option<usize>,
     number: fn(&serde_json::Number) -> Option<usize>,
+    failure: Option<crate::CompilationError>,
+    funding: crate::compilation::Funding,
 }
 impl<F: Json> Inspector<F> {
     pub(crate) fn new(
         key: fn(&F::PreparedKey) -> Option<usize>,
         number: fn(&serde_json::Number) -> Option<usize>,
+        funding: crate::compilation::Funding,
     ) -> Self {
         Self {
             bytes: 0,
             seen: Vec::new(),
             key,
             number,
+            failure: None,
+            funding,
         }
+    }
+    pub(crate) fn take_failure(&mut self) -> Option<crate::CompilationError> {
+        self.failure.take()
+    }
+    fn reserve_controls(&mut self, bytes: usize) -> Result<(), Error> {
+        if self.failure.is_some() {
+            return Err(Error::Funding);
+        }
+        self.funding.reserve(bytes).map_err(|error| {
+            self.failure = Some(error);
+            Error::Funding
+        })
     }
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
     pub(crate) fn add(&mut self, bytes: usize) -> Result<(), Error> {
+        self.reserve_controls(std::mem::size_of::<(&mut Self, usize, Result<(), Error>)>())?;
         self.bytes = self.bytes.checked_add(bytes).ok_or(Error::Overflow)?;
         Ok(())
     }
@@ -53,13 +71,17 @@ impl<F: Json> Inspector<F> {
         )
     }
     pub(crate) fn arc<T: ?Sized>(&mut self, value: &Arc<T>) -> Result<bool, Error> {
-        let id = Arc::as_ptr(value).cast::<()>() as usize;
-        let bytes = Layout::new::<[AtomicUsize; 2]>()
+        let (layout, offset) = Layout::new::<[AtomicUsize; 2]>()
             .extend(Layout::for_value(value.as_ref()))
-            .map_err(|_| Error::Overflow)?
-            .0
-            .pad_to_align()
-            .size();
+            .map_err(|_| Error::Overflow)?;
+        let identity = Arc::as_ptr(value)
+            .cast::<u8>()
+            .wrapping_sub(offset)
+            .cast::<()>();
+        self.allocation(identity, layout.pad_to_align().size())
+    }
+    pub(crate) fn allocation(&mut self, identity: *const (), bytes: usize) -> Result<bool, Error> {
+        let id = identity as usize;
         if let Some((_, prior)) = self.seen.iter().find(|(prior, _)| *prior == id) {
             if *prior != bytes {
                 return Err(Error::Capacity);
@@ -67,6 +89,13 @@ impl<F: Json> Inspector<F> {
             return Ok(false);
         }
         self.add(bytes)?;
+        let required = self.seen.len().checked_add(1).ok_or(Error::Overflow)?;
+        self.funding
+            .grow(&mut self.seen, required)
+            .map_err(|error| {
+                self.failure = Some(error);
+                Error::Funding
+            })?;
         self.seen.push((id, bytes));
         Ok(true)
     }
@@ -91,6 +120,11 @@ impl<F: Json> Inspector<F> {
         Ok(())
     }
     pub(crate) fn node(&mut self, value: &SchemaNode<F>) -> Result<(), Error> {
+        self.reserve_controls(std::mem::size_of::<(
+            &mut Self,
+            &SchemaNode<F>,
+            Result<(), Error>,
+        )>())?;
         value.original_source(self)
     }
     pub(crate) fn nodes(&mut self, values: &Vec<SchemaNode<F>>) -> Result<(), Error> {
@@ -114,7 +148,10 @@ impl<F: Json> Inspector<F> {
             )))?,
         )
     }
-    pub(crate) fn literal(&mut self, value: &jsonschema_value::literal::Literal) -> Result<(), Error> {
+    pub(crate) fn literal(
+        &mut self,
+        value: &jsonschema_value::literal::Literal,
+    ) -> Result<(), Error> {
         use jsonschema_value::literal::Literal;
         match value {
             Literal::Null | Literal::Bool(_) => Ok(()),
@@ -122,12 +159,17 @@ impl<F: Json> Inspector<F> {
             Literal::Number(value) => self.number(value),
             Literal::Array(values) => {
                 self.vector(values)?;
-                for value in values { self.literal(value)?; }
+                for value in values {
+                    self.literal(value)?;
+                }
                 Ok(())
             }
             Literal::Object(values) => {
                 self.vector(values)?;
-                for (key, value) in values { self.string(key)?; self.literal(value)?; }
+                for (key, value) in values {
+                    self.string(key)?;
+                    self.literal(value)?;
+                }
                 Ok(())
             }
         }
@@ -148,9 +190,14 @@ impl<F: Json> Inspector<F> {
                 }
                 Ok(())
             }
-            Value::Object(_) => Err(Error::Unqualified(Component::Source(
-                "retained serde object backing",
-            ))),
+            Value::Object(values) => {
+                self.add(values.allocation_size())?;
+                for (key, value) in values {
+                    self.string(key)?;
+                    self.value(value)?;
+                }
+                Ok(())
+            }
         }
     }
 }

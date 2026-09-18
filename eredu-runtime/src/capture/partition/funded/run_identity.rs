@@ -10,7 +10,7 @@ struct RunIdentity {
     overlay: Option<String>,
     first_epoch: OnceLock<DistributedCommitEpoch>,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 /// Shared identity of one real capture run. The first reached forward survives
 /// failed frames and restoration; a fresh fork binds its own later epoch. This
@@ -24,21 +24,21 @@ impl std::fmt::Debug for PreparedPartitionCaptureRunIdentity {
             .finish_non_exhaustive()
     }
 }
-fn error(source: &SharedCapturePlan, metadata: &WorkspaceMetadataFunding, cause: Cause)
+fn error(source: &SharedCapturePlan, metadata: &HostMetadataFunding, cause: Cause)
     -> PartitionCaptureProgramError {
     PartitionCaptureProgramError { cause, _source: source.clone(), _metadata: metadata.clone() }
 }
 impl PreparedPartitionCaptureRunIdentity {
     fn prepare(source: &SharedCapturePlan, artifact: &str, execution: &str,
         setup: crate::CommunicationSessionIdentity, overlay: Option<&str>,
-        metadata: &WorkspaceMetadataFunding) -> Result<Self, PartitionCaptureProgramError> {
+        metadata: &HostMetadataFunding) -> Result<Self, PartitionCaptureProgramError> {
         let fail = |cause| error(source, metadata, cause);
         let allocation = Layout::new::<[usize; 2]>().extend(Layout::new::<RunIdentity>())
             .map_err(|_| fail(Cause::Source("run identity allocation overflow")))?.0.pad_to_align().size();
         let parts = [allocation, size_of::<RunIdentity>() * 2, size_of::<Self>() * 2,
             size_of::<Result<Self, PartitionCaptureProgramError>>(), size_of::<PartitionCaptureProgramError>(),
             size_of::<(&SharedCapturePlan, &str, &str, crate::CommunicationSessionIdentity,
-                Option<&str>, &WorkspaceMetadataFunding)>(), size_of::<Cause>()];
+                Option<&str>, &HostMetadataFunding)>(), size_of::<Cause>()];
         let bytes = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or_else(|| fail(Cause::Source("run identity controls overflow")))?;
         metadata.reserve_metadata(bytes).map_err(|cause| fail(cause.into()))?;
@@ -68,7 +68,7 @@ impl PreparedPartitionCaptureRunIdentity {
             .map_err(Into::into)
     }
     fn context(&self, phase: CapturePhase, prediction: u64,
-        metadata: &WorkspaceMetadataFunding) -> Result<PartitionCaptureContext, Cause> {
+        metadata: &HostMetadataFunding) -> Result<PartitionCaptureContext, Cause> {
         source_context(&self.0.source,&self.0.artifact,&self.0.execution,self.0.setup,
             self.0.overlay.as_deref(),phase,prediction,metadata)
     }
@@ -78,7 +78,7 @@ impl PreparedPartitionCaptureRunIdentity {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_host_context(source:&SharedCapturePlan,artifact:&str,execution:&str,
         setup:crate::CommunicationSessionIdentity,overlay:Option<&str>,phase:CapturePhase,
-        prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<PartitionCaptureContext,PartitionCaptureProgramError> {
+        prediction:u64,metadata:&HostMetadataFunding)->Result<PartitionCaptureContext,PartitionCaptureProgramError> {
         source_context(source,artifact,execution,setup,overlay,phase,prediction,metadata)
             .map_err(|cause|error(source,metadata,cause))
     }
@@ -87,10 +87,10 @@ impl PreparedPartitionCaptureRunIdentity {
 #[allow(clippy::too_many_arguments)]
 fn source_context(source:&SharedCapturePlan,artifact:&str,execution:&str,
     setup:crate::CommunicationSessionIdentity,overlay:Option<&str>,phase:CapturePhase,
-    prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<PartitionCaptureContext,Cause> {
+    prediction:u64,metadata:&HostMetadataFunding)->Result<PartitionCaptureContext,Cause> {
     let parts=[size_of::<PartitionCaptureContext>()*2,size_of::<Result<PartitionCaptureContext,Cause>>(),
         size_of::<Result<PartitionCaptureContext,PartitionCaptureProgramError>>(),
-        size_of::<(&SharedCapturePlan,&str,&str,crate::CommunicationSessionIdentity,Option<&str>,CapturePhase,u64,&WorkspaceMetadataFunding)>(),
+        size_of::<(&SharedCapturePlan,&str,&str,crate::CommunicationSessionIdentity,Option<&str>,CapturePhase,u64,&HostMetadataFunding)>(),
         size_of::<(&PreparedPartitionCaptureRunIdentity,CapturePhase,u64)>(),
         size_of::<std::array::IntoIter<&str,2>>(),size_of::<Option<&str>>()];
     metadata.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
@@ -112,13 +112,13 @@ impl crate::capture::FundedCaptureSession {
     /// Bind the actual loaded setup/parameter labels once. The native caller
     /// must authenticate these facts; this constructor supplies no native grant.
     pub fn prepare_partition_run_identity(&mut self, artifact: &str, execution: &str,
-        setup: crate::CommunicationSessionIdentity, overlay: Option<&str>, metadata: &WorkspaceMetadataFunding)
+        setup: crate::CommunicationSessionIdentity, overlay: Option<&str>, metadata: &HostMetadataFunding)
         -> Result<PreparedPartitionCaptureRunIdentity, PartitionCaptureProgramError> {
         let source = self.source();
         metadata.reserve_metadata(size_of::<PreparedPartitionCaptureRunIdentity>() * 2
             + size_of::<Result<PreparedPartitionCaptureRunIdentity, PartitionCaptureProgramError>>()
             + size_of::<PartitionCaptureProgramError>() + size_of::<Cause>()
-            + size_of::<(&mut Self, &str, &str, crate::CommunicationSessionIdentity, Option<&str>, &WorkspaceMetadataFunding)>())
+            + size_of::<(&mut Self, &str, &str, crate::CommunicationSessionIdentity, Option<&str>, &HostMetadataFunding)>())
             .map_err(|cause| error(source, metadata, cause.into()))?;
         if let Some(run) = &self.partition_run {
             if !run.matches(source, artifact, execution, setup, overlay) {
@@ -139,12 +139,12 @@ where T::Error: Send + Sync + 'static, <T::Completion as Completion>::Error: Sen
     pub fn new_for_run(transport: &'t T, source: &SharedCapturePlan,
         run: &PreparedPartitionCaptureRunIdentity, phase: CapturePhase, prediction: u64,
         rows: &[PartitionCaptureProducerSource], limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding) -> Result<Self, PartitionCaptureProgramError> {
+        metadata: &HostMetadataFunding) -> Result<Self, PartitionCaptureProgramError> {
         let fail = |cause| error(source, metadata, cause);
         metadata.reserve_metadata(size_of::<Self>() * 2 + size_of::<PreparedPartitionCaptureRunIdentity>()
             + size_of::<Result<Self, PartitionCaptureProgramError>>() + size_of::<PartitionCaptureContext>()
             + size_of::<(&T, &SharedCapturePlan, &PreparedPartitionCaptureRunIdentity, CapturePhase, u64,
-                &[PartitionCaptureProducerSource], PartitionCaptureReceiptLimits, &WorkspaceMetadataFunding)>())
+                &[PartitionCaptureProducerSource], PartitionCaptureReceiptLimits, &HostMetadataFunding)>())
             .map_err(|cause| fail(cause.into()))?;
         if !run.0.source.same_storage(source) || run.0.setup.participant_count() != transport.participant_count() {
             return Err(fail(Cause::Source("run source or participant world differs")));
@@ -163,12 +163,12 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
     pub fn new_selected_for_run(transport:&'t T,source:&SharedCapturePlan,
         run:&PreparedPartitionCaptureRunIdentity,phase:CapturePhase,prediction:u64,
         rows:&[PreparedPartitionCaptureRow<'_>],limits:PartitionCaptureReceiptLimits,
-        metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         let fail=|cause|error(source,metadata,cause);
         metadata.reserve_metadata(size_of::<Self>()*2+size_of::<PreparedPartitionCaptureRunIdentity>()
             +size_of::<Result<Self,PartitionCaptureProgramError>>()+size_of::<PartitionCaptureContext>()
             +size_of::<(&T,&SharedCapturePlan,&PreparedPartitionCaptureRunIdentity,CapturePhase,u64,
-                &[PreparedPartitionCaptureRow<'_>],PartitionCaptureReceiptLimits,&WorkspaceMetadataFunding)>())
+                &[PreparedPartitionCaptureRow<'_>],PartitionCaptureReceiptLimits,&HostMetadataFunding)>())
             .map_err(|cause|fail(cause.into()))?;
         if !run.0.source.same_storage(source)||run.0.setup.participant_count()!=transport.participant_count(){
             return Err(fail(Cause::Source("run source or participant world differs")));
@@ -178,3 +178,5 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
         result.run_identity=Some(run.clone());Ok(result)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

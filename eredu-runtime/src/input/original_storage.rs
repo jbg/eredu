@@ -441,6 +441,12 @@ fn extent_key(extent: InputExtent) -> Result<u32, WorkingMemoryError> {
             u32::try_from(v).map_err(|_| WorkingMemoryError::Overflow)?;
             Ok(1)
         }
+        InputExtent::VideoFrame { group, index, count, first_source_frame, last_source_frame, .. } => {
+            for value in [group, index, count, first_source_frame, last_source_frame] {
+                u32::try_from(value).map_err(|_| WorkingMemoryError::Overflow)?;
+            }
+            Ok(2)
+        }
         _ => Err(WorkingMemoryError::UnknownBound),
     }
 }
@@ -480,6 +486,7 @@ impl<'a, T, U, N, E: std::error::Error> PreparedModelInputSourcePlan<'a, T, U, N
                     match extent {
                         InputExtent::PatchGrid { .. } => 4,
                         InputExtent::AudioValidFrames(_) => 2,
+                        InputExtent::VideoFrame { .. } => 8,
                         _ => return Err(WorkingMemoryError::UnknownBound),
                     },
                 )?;

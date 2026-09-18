@@ -1,8 +1,9 @@
 use super::lexerspec::{LexemeClass, LexemeIdx, LexerSpec};
 use crate::api::{GenGrammarOptions, GrammarId, NodeProps, ParserLimits};
 use crate::hashcons::{HashCons, HashId};
-use crate::{HashMap, HashSet};
-use anyhow::{Result, bail, ensure};
+use derivre::SourceHashMap as HashMap;
+type HashSet<T> = hashbrown::HashSet<T, derivre::RandomState>;
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::{fmt::Debug, hash::Hash};
@@ -75,6 +76,26 @@ impl Default for SymbolProps {
 }
 
 impl SymbolProps {
+    fn copy_with_funding(&self, funding: &derivre::ParserAllocationFunding) -> Result<Self> {
+        Ok(Self {
+            max_tokens: self.max_tokens,
+            capture_name: self
+                .capture_name
+                .as_deref()
+                .map(|name| funding.try_copy_str(name))
+                .transpose()?,
+            stop_capture_name: self
+                .stop_capture_name
+                .as_deref()
+                .map(|name| funding.try_copy_str(name))
+                .transpose()?,
+            temperature: self.temperature,
+            grammar_id: self.grammar_id,
+            is_start: self.is_start,
+            parametric: self.parametric,
+        })
+    }
+
     /// Special nodes can't be removed in grammar optimizations
     pub fn is_special(&self) -> bool {
         self.max_tokens < usize::MAX
@@ -147,13 +168,13 @@ impl Rule {
     }
 }
 
-#[derive(Clone)]
 pub struct Grammar {
     name: Option<String>,
     parametric: bool,
     symbols: Vec<Symbol>,
     symbol_count_cache: HashMap<String, usize>,
     symbol_by_name: HashMap<String, SymIdx>,
+    funding: derivre::ParserAllocationFunding,
 }
 
 #[derive(Clone, Default, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Hash)]
@@ -343,6 +364,12 @@ impl Display for ParamExpr {
 }
 
 impl ParamCond {
+    fn copy_with_funding(&self, funding: &derivre::ParserAllocationFunding) -> Result<Self> {
+        let plan = self.source_copy_plan(funding).map_err(|error| derivre::ParserError::cause(error, funding))?;
+        funding.reserve(plan.requirements().required_bytes())?;
+        Ok(plan.compile())
+    }
+
     pub fn eval(&self, m: ParamValue) -> bool {
         match self {
             ParamCond::True => true,
@@ -405,13 +432,14 @@ impl Display for ParamCond {
 }
 
 impl Grammar {
-    pub fn new(name: Option<String>) -> Self {
+    pub fn new(name: Option<String>, funding: derivre::ParserAllocationFunding) -> Self {
         Grammar {
             name,
             parametric: false,
             symbols: vec![],
             symbol_by_name: HashMap::default(),
             symbol_count_cache: HashMap::default(),
+            funding,
         }
     }
 
@@ -442,8 +470,8 @@ impl Grammar {
         rhs: Vec<(SymIdx, ParamExpr)>,
     ) -> Result<()> {
         let sym = self.sym_data(lhs);
-        ensure!(!sym.is_terminal(), "terminal symbol {}", sym.name);
-        ensure!(
+        ensure!(&self.funding, !sym.is_terminal(), "terminal symbol {}", sym.name);
+        ensure!(&self.funding,
             condition.is_true() || sym.props.parametric,
             "non-parametric symbol {} with condition {}",
             sym.name,
@@ -451,7 +479,7 @@ impl Grammar {
         );
         for (s, p) in &rhs {
             let s = self.sym_data(*s);
-            ensure!(
+            ensure!(&self.funding,
                 s.props.parametric != p.is_null(),
                 "symbol {} : {} with parametric {} and param {}",
                 sym.name,
@@ -459,7 +487,7 @@ impl Grammar {
                 s.props.parametric,
                 p
             );
-            ensure!(
+            ensure!(&self.funding,
                 !p.needs_param() || sym.props.parametric,
                 "symbol {} : {} with param {} needs param but is non-parametric",
                 sym.name,
@@ -467,54 +495,57 @@ impl Grammar {
                 p
             );
         }
+        let funding = self.funding.clone();
         let sym = self.sym_data_mut(lhs);
-        sym.rules.push(Rule {
-            condition,
-            lhs,
-            rhs,
-        });
+        funding.try_push(
+            &mut sym.rules,
+            Rule {
+                condition,
+                lhs,
+                rhs,
+            },
+        )?;
         Ok(())
     }
 
     pub fn add_rule(&mut self, lhs: SymIdx, rhs: Vec<SymIdx>) -> Result<()> {
-        let sym = self.sym_data_mut(lhs);
-        ensure!(!sym.is_terminal(), "terminal symbol {}", sym.name);
-        sym.rules.push(Rule {
-            condition: ParamCond::True,
-            lhs,
-            rhs: rhs.into_iter().map(|r| (r, ParamExpr::Null)).collect(),
-        });
-        Ok(())
+        let mut terms = Vec::new();
+        self.funding.try_grow_vec(&mut terms, rhs.len())?;
+        for symbol in rhs {
+            terms.push((symbol, ParamExpr::Null));
+        }
+        self.add_rule_ext(lhs, ParamCond::True, terms)
     }
 
     pub fn link_gen_grammar(&mut self, lhs: SymIdx, grammar: SymIdx) -> Result<()> {
-        let sym = self.sym_data_mut(lhs);
-        ensure!(
+        let sym = self.sym_data(lhs);
+        ensure!(&self.funding,
             sym.gen_grammar.is_some(),
             "no grammar options for {}",
             sym.name
         );
-        ensure!(sym.rules.is_empty(), "symbol {} has rules", sym.name);
-        self.add_rule(lhs, vec![grammar])?;
-        Ok(())
+        ensure!(&self.funding, sym.rules.is_empty(), "symbol {} has rules", sym.name);
+        let mut rhs = Vec::new();
+        self.funding.try_push(&mut rhs, grammar)?;
+        self.add_rule(lhs, rhs)
     }
 
     pub fn check_empty_symbol_parametric_ok(&self, sym: SymIdx) -> Result<()> {
         let sym = self.sym_data(sym);
-        ensure!(sym.rules.is_empty(), "symbol {} has rules", sym.name);
-        ensure!(
+        ensure!(&self.funding, sym.rules.is_empty(), "symbol {} has rules", sym.name);
+        ensure!(&self.funding,
             sym.gen_grammar.is_none(),
             "symbol {} has grammar options",
             sym.name
         );
-        ensure!(sym.lexeme.is_none(), "symbol {} has lexeme", sym.name);
+        ensure!(&self.funding, sym.lexeme.is_none(), "symbol {} has lexeme", sym.name);
         Ok(())
     }
 
     pub fn check_empty_symbol(&self, sym: SymIdx) -> Result<()> {
         self.check_empty_symbol_parametric_ok(sym)?;
         let sym = self.sym_data(sym);
-        ensure!(!sym.props.parametric, "symbol {} is parametric", sym.name);
+        ensure!(&self.funding, !sym.props.parametric, "symbol {} is parametric", sym.name);
         Ok(())
     }
 
@@ -533,12 +564,14 @@ impl Grammar {
     ) -> Result<()> {
         self.check_empty_symbol(lhs)?;
         if lexer_spec.is_nullable(lex) {
-            let wrap = self.fresh_symbol_ext(
-                format!("rx_null_{}", self.sym_name(lhs)).as_str(),
-                self.sym_data(lhs).props.for_wrapper(),
-            );
+            let name = self
+                .funding
+                .try_format(format_args!("rx_null_{}", self.sym_name(lhs)))?;
+            let wrap = self.fresh_symbol_ext(&name, self.sym_data(lhs).props.for_wrapper())?;
             self.sym_data_mut(wrap).lexeme = Some(lex);
-            self.add_rule(lhs, vec![wrap])?;
+            let mut rhs = Vec::new();
+            self.funding.try_push(&mut rhs, wrap)?;
+            self.add_rule(lhs, rhs)?;
             self.add_rule(lhs, vec![])?;
         } else {
             self.sym_data_mut(lhs).lexeme = Some(lex);
@@ -602,41 +635,64 @@ impl Grammar {
         )
     }
 
-    fn copy_from(&mut self, other: &Grammar, sym: SymIdx) -> SymIdx {
-        let sym_data = other.sym_data(sym);
-        if let Some(sym) = self.symbol_by_name.get(&sym_data.name) {
-            return *sym;
+    fn copy_from(&mut self, other: &Grammar, sym: SymIdx) -> Result<SymIdx> {
+        let source = other.sym_data(sym);
+        if let Some(sym) = self.symbol_by_name.get(&source.name) {
+            return Ok(*sym);
         }
-        let r = self.fresh_symbol_ext(&sym_data.name, sym_data.props.clone());
-        let self_sym = self.sym_data_mut(r);
-        self_sym.lexeme = sym_data.lexeme;
-        self_sym.gen_grammar = sym_data.gen_grammar.clone();
-        r
+        let props = source.props.copy_with_funding(&self.funding)?;
+        let options = source
+            .gen_grammar
+            .as_ref()
+            .map(|options| {
+                let GrammarId::Name(name) = &options.grammar;
+                Ok::<_, derivre::ParserStorageError>(GenGrammarOptions {
+                    grammar: GrammarId::Name(self.funding.try_copy_str(name)?),
+                    temperature: options.temperature,
+                })
+            })
+            .transpose()?;
+        let result = self.fresh_symbol_ext(&source.name, props)?;
+        let symbol = self.sym_data_mut(result);
+        symbol.lexeme = source.lexeme;
+        symbol.gen_grammar = options;
+        Ok(result)
     }
 
-    fn rename(&mut self) {
-        let name_repl = vec![("zero_or_more", "z"), ("one_or_more", "o")];
+    fn rename(&mut self) -> Result<()> {
+        let replacements = [("zero_or_more", "z"), ("one_or_more", "o")];
         for sym in &mut self.symbols {
-            for (from, to) in &name_repl {
+            for (from, to) in &replacements {
                 if sym.name.starts_with(from) {
-                    sym.name = format!("{}_{}", to, &sym.name[from.len()..]);
+                    sym.name = self.funding.try_format(format_args!(
+                        "{}_{}",
+                        to,
+                        &sym.name[from.len()..]
+                    ))?;
                 }
             }
         }
-        self.symbol_by_name = self
-            .symbols
-            .iter()
-            .map(|s| (s.name.clone(), s.idx))
-            .collect();
-        assert!(self.symbols.len() == self.symbol_by_name.len());
+        let mut names = HashMap::default();
+        self.funding
+            .try_reserve_map(&mut names, self.symbols.len())?;
+        for symbol in &self.symbols {
+            let name = self.funding.try_copy_str(&symbol.name)?;
+            names.insert(name, symbol.idx);
+        }
+        self.symbol_by_name = names;
+        assert_eq!(self.symbols.len(), self.symbol_by_name.len());
+        Ok(())
     }
 
     fn is_special_symbol(&self, sym: &Symbol) -> bool {
         sym.idx == self.start() || sym.gen_grammar.is_some() || sym.props.is_special()
     }
 
-    fn expand_shortcuts(&self) -> Self {
-        let mut definition = vec![None; self.symbols.len()];
+    fn expand_shortcuts(&self) -> Result<Self> {
+        let mut definition = Vec::new();
+        self.funding
+            .try_grow_vec(&mut definition, self.symbols.len())?;
+        definition.resize(self.symbols.len(), None);
         for sym in &self.symbols {
             // don't inline special symbols (commit points, captures, ...) or start symbol
             if self.is_special_symbol(sym) {
@@ -666,7 +722,10 @@ impl Grammar {
 
         let defn = |s: SymIdx| definition[s.as_usize()].unwrap_or(s);
 
-        let mut the_user_of = vec![None; self.symbols.len()];
+        let mut the_user_of = Vec::new();
+        self.funding
+            .try_grow_vec(&mut the_user_of, self.symbols.len())?;
+        the_user_of.resize(self.symbols.len(), None);
         for sym in &self.symbols {
             if definition[sym.idx.as_usize()].is_some() {
                 continue;
@@ -699,7 +758,7 @@ impl Grammar {
 
         // println!("the_user_of: {:?}", the_user_of);
 
-        let mut repl = crate::HashMap::default();
+        let mut repl = HashMap::default();
 
         for sym in &self.symbols {
             if self.is_special_symbol(sym) {
@@ -710,33 +769,31 @@ impl Grammar {
                 && sym.rules[0].condition.is_true()
             {
                 // we will eliminate sym.idx
-                repl.insert(
-                    sym.idx,
-                    sym.rules[0]
-                        .rhs
-                        .iter()
-                        .map(|e| (defn(e.0), e.1.clone()))
-                        .collect::<Vec<_>>(),
-                );
+                let mut terms = Vec::new();
+                self.funding
+                    .try_grow_vec(&mut terms, sym.rules[0].rhs.len())?;
+                for (symbol, parameter) in &sym.rules[0].rhs {
+                    terms.push((defn(*symbol), parameter.clone()));
+                }
+                self.funding.try_insert(&mut repl, sym.idx, terms)?;
             }
         }
 
         // println!("repl: {:?}", repl);
 
         // these are keys of repl that may need to be used outside of repl itself
-        let repl_roots = repl
-            .keys()
-            .filter(|s| !repl.contains_key(the_user_of[s.as_usize()].as_ref().unwrap()))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        // println!("repl_roots: {:?}", repl_roots);
-
-        let mut to_eliminate = HashSet::from_iter(repl.keys().copied());
+        let mut repl_roots = Vec::new();
+        let mut to_eliminate = HashSet::default();
+        for symbol in repl.keys() {
+            if !repl.contains_key(the_user_of[symbol.as_usize()].as_ref().unwrap()) {
+                self.funding.try_push(&mut repl_roots, *symbol)?;
+            }
+            self.funding.try_insert_set(&mut to_eliminate, *symbol)?;
+        }
         for (idx, m) in definition.iter().enumerate() {
             if m.is_some() {
                 let src = SymIdx(idx as u32);
-                to_eliminate.insert(src);
+                self.funding.try_insert_set(&mut to_eliminate, src)?;
             }
         }
 
@@ -745,7 +802,9 @@ impl Grammar {
 
         let mut stack = vec![];
         for sym in repl_roots {
-            stack.push(vec![(sym, ParamExpr::Null)]);
+            let mut root = Vec::new();
+            self.funding.try_push(&mut root, (sym, ParamExpr::Null))?;
+            self.funding.try_push(&mut stack, root)?;
             let mut res = vec![];
             while let Some(mut lst) = stack.pop() {
                 while let Some((e, p)) = lst.pop() {
@@ -753,17 +812,17 @@ impl Grammar {
                         assert!(p.is_null() || p.is_self_ref());
                         lst2.reverse();
                         if !lst.is_empty() {
-                            stack.push(lst);
+                            self.funding.try_push(&mut stack, lst)?;
                         }
-                        stack.push(lst2);
+                        self.funding.try_push(&mut stack, lst2)?;
                         break;
                     }
                     assert!(!to_eliminate.contains(&e));
-                    res.push((e, p));
+                    self.funding.try_push(&mut res, (e, p))?;
                 }
             }
             // println!("res: {:?} -> {:?}", sym, res);
-            new_repl.insert(sym, res);
+            self.funding.try_insert(&mut new_repl, sym, res)?;
         }
 
         repl = new_repl;
@@ -772,12 +831,20 @@ impl Grammar {
             if let Some(trg) = m {
                 if !to_eliminate.contains(trg) {
                     let param = self.sym_data(*trg).props.neutral_param();
-                    repl.insert(SymIdx(idx as u32), vec![(*trg, param)]);
+                    let mut terms = Vec::new();
+                    self.funding.try_push(&mut terms, (*trg, param))?;
+                    self.funding
+                        .try_insert(&mut repl, SymIdx(idx as u32), terms)?;
                 }
             }
         }
 
-        let mut outp = Grammar::new(self.name.clone());
+        let name = self
+            .name
+            .as_deref()
+            .map(|name| self.funding.try_copy_str(name))
+            .transpose()?;
+        let mut outp = Grammar::new(name, self.funding.clone());
 
         let start_data = self.sym_data(self.start());
         if start_data.is_terminal()
@@ -791,53 +858,64 @@ impl Grammar {
                     is_start: true,
                     ..Default::default()
                 },
-            );
-            outp.add_rule(new_start, vec![SymIdx(1)]).unwrap();
+            )?;
+            let mut terms = Vec::new();
+            self.funding.try_push(&mut terms, SymIdx(1))?;
+            outp.add_rule(new_start, terms)?;
         }
 
         for sym in &self.symbols {
             if repl.contains_key(&sym.idx) {
                 continue;
             }
-            let lhs = outp.copy_from(self, sym.idx);
+            let lhs = outp.copy_from(self, sym.idx)?;
             for rule in &sym.rules {
-                let mut rhs = Vec::with_capacity(rule.rhs.len());
+                let mut rhs = Vec::new();
+                self.funding.try_grow_vec(&mut rhs, rule.rhs.len())?;
                 for s in &rule.rhs {
                     if let Some(repl) = repl.get(&s.0) {
                         assert!(s.1.is_null() || s.1.is_self_ref());
-                        rhs.extend(
-                            repl.iter()
-                                .map(|r| (outp.copy_from(self, r.0), r.1.clone())),
-                        );
+                        for (symbol, parameter) in repl {
+                            let symbol = outp.copy_from(self, *symbol)?;
+                            self.funding
+                                .try_push(&mut rhs, (symbol, parameter.clone()))?;
+                        }
                     } else {
-                        rhs.push((outp.copy_from(self, s.0), s.1.clone()));
+                        let symbol = outp.copy_from(self, s.0)?;
+                        self.funding.try_push(&mut rhs, (symbol, s.1.clone()))?;
                     }
                 }
-                outp.add_rule_ext(lhs, rule.condition.clone(), rhs).unwrap();
+                let condition = rule.condition.copy_with_funding(&self.funding)?;
+                outp.add_rule_ext(lhs, condition, rhs)?;
             }
         }
-        outp
+        Ok(outp)
     }
 
-    pub fn optimize(&self) -> Self {
-        let mut r = self.expand_shortcuts();
-        r = r.expand_shortcuts();
-        r.rename();
-        r
+    pub fn optimize(&self) -> Result<Self> {
+        let mut r = self.expand_shortcuts()?;
+        r = r.expand_shortcuts()?;
+        r.rename()?;
+        Ok(r)
     }
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
-    pub fn compile(&self, lexer_spec: LexerSpec, limits: &ParserLimits) -> Result<CGrammar> {
-        CGrammar::from_grammar(self, lexer_spec, limits)
+    pub fn compile(
+        &self,
+        lexer_spec: LexerSpec,
+        limits: &ParserLimits,
+        funding: derivre::ParserAllocationFunding,
+    ) -> Result<CGrammar> {
+        CGrammar::from_grammar(self, lexer_spec, limits, funding)
     }
 
     pub fn resolve_grammar_refs(
         &mut self,
         lexer_spec: &mut LexerSpec,
-        ctx: &HashMap<GrammarId, (SymIdx, LexemeClass)>,
+        ctx: impl Fn(&GrammarId) -> Option<(SymIdx, LexemeClass)>,
     ) -> Result<()> {
         let mut rules = vec![];
         let mut temperatures: HashMap<LexemeClass, f32> = HashMap::default();
@@ -848,17 +926,17 @@ impl Grammar {
                     let rhs = &sym.rules[0].rhs[0];
                     assert!(rhs.1.is_null());
                     self.sym_data(rhs.0).props.grammar_id
-                } else if let Some((idx, cls)) = ctx.get(&opts.grammar).cloned() {
-                    rules.push((sym.idx, idx));
+                } else if let Some((idx, cls)) = ctx(&opts.grammar) {
+                    self.funding.try_push(&mut rules, (sym.idx, idx))?;
                     cls
                 } else {
-                    bail!("unknown grammar {}", opts.grammar);
+                    bail!(&self.funding, "unknown grammar {}", opts.grammar);
                 };
 
                 let temp = opts.temperature.unwrap_or(0.0);
                 if let Some(&existing) = temperatures.get(&cls) {
                     if existing != temp {
-                        bail!(
+                        bail!(&self.funding,
                             "temperature mismatch for nested grammar {:?}: {} vs {}",
                             opts.grammar,
                             existing,
@@ -866,11 +944,13 @@ impl Grammar {
                         );
                     }
                 }
-                temperatures.insert(cls, temp);
+                self.funding.try_insert(&mut temperatures, cls, temp)?;
             }
         }
         for (lhs, rhs) in rules {
-            self.add_rule(lhs, vec![rhs])?;
+            let mut terms = Vec::new();
+            self.funding.try_push(&mut terms, rhs)?;
+            self.add_rule(lhs, terms)?;
         }
 
         for sym in self.symbols.iter_mut() {
@@ -885,39 +965,51 @@ impl Grammar {
         Ok(())
     }
 
-    fn fresh_name(&mut self, name0: &str) -> String {
-        let mut name = name0.to_string();
-        let mut idx = self.symbol_count_cache.get(&name).cloned().unwrap_or(2);
-        // don't allow empty names
+    fn fresh_name(&mut self, name0: &str) -> Result<String> {
+        let mut name = self.funding.try_copy_str(name0)?;
+        let mut idx = self.symbol_count_cache.get(&name).copied().unwrap_or(2);
         while name.is_empty() || self.symbol_by_name.contains_key(&name) {
-            name = format!("{name0}#{idx}");
-            idx += 1;
+            name = self.funding.try_format(format_args!("{name0}#{idx}"))?;
+            idx = idx
+                .checked_add(1)
+                .ok_or_else(|| self.funding.storage_overflow())?;
         }
-        self.symbol_count_cache.insert(name0.to_string(), idx);
-        name
+        if let Some(value) = self.symbol_count_cache.get_mut(name0) {
+            *value = idx;
+        } else {
+            let key = self.funding.try_copy_str(name0)?;
+            self.funding
+                .try_insert(&mut self.symbol_count_cache, key, idx)?;
+        }
+        Ok(name)
     }
 
-    pub fn fresh_symbol_ext(&mut self, name0: &str, mut symprops: SymbolProps) -> SymIdx {
-        let name = self.fresh_name(name0);
-
+    pub fn fresh_symbol_ext(&mut self, name0: &str, mut symprops: SymbolProps) -> Result<SymIdx> {
+        let name = self.fresh_name(name0)?;
+        let stored_name = self.funding.try_copy_str(&name)?;
         let parametric = std::mem::take(&mut symprops.parametric);
-
-        let idx = SymIdx(self.symbols.len() as u32);
+        let idx =
+            SymIdx(u32::try_from(self.symbols.len()).map_err(|_| self.funding.storage_overflow())?);
+        let required = self
+            .symbols
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.funding.storage_overflow())?;
+        self.funding.try_grow_vec(&mut self.symbols, required)?;
+        self.funding.try_reserve_map(&mut self.symbol_by_name, 1)?;
         self.symbols.push(Symbol {
-            name: name.clone(),
+            name: stored_name,
             lexeme: None,
             idx,
-            rules: vec![],
+            rules: Vec::new(),
             props: symprops,
             gen_grammar: None,
         });
         self.symbol_by_name.insert(name, idx);
-
         if parametric {
-            self.make_parametric(idx).unwrap();
+            self.make_parametric(idx)?;
         }
-
-        idx
+        Ok(idx)
     }
 
     pub fn stats(&self) -> String {
@@ -985,15 +1077,17 @@ impl Grammar {
         Ok(())
     }
 
-    pub fn rename_symbol(&mut self, idx: SymIdx, name: &str) {
-        let curr_name = self.sym_name(idx).to_string();
-        if name == curr_name {
-            return; // nothing to do
+    pub fn rename_symbol(&mut self, idx: SymIdx, name: &str) -> Result<()> {
+        if name == self.sym_name(idx) {
+            return Ok(());
         }
-        self.symbol_by_name.remove(&curr_name);
-        let name = self.fresh_name(name);
-        self.sym_data_mut(idx).name = name.clone();
+        let name = self.fresh_name(name)?;
+        let stored_name = self.funding.try_copy_str(&name)?;
+        self.funding.try_reserve_map(&mut self.symbol_by_name, 1)?;
+        let old_name = std::mem::replace(&mut self.sym_data_mut(idx).name, stored_name);
+        self.symbol_by_name.remove(&old_name);
         self.symbol_by_name.insert(name, idx);
+        Ok(())
     }
 }
 
@@ -1138,6 +1232,9 @@ pub struct CGrammar {
     rhs_ptr_to_sym_idx: Vec<CSymIdx>,
     // this is cache, rhs_ptr_to_sym_flags[x] == symbols[rhs_ptr_to_sym_idx[x]].sym_flags
     rhs_ptr_to_sym_flags: Vec<SymFlags>,
+    // The original compiler allocation account survives every retained source.
+    // Explicit independent source copies use their destination's outer policy.
+    pub(super) compilation_funding: derivre::ParserAllocationFunding,
 }
 
 const RULE_SHIFT: usize = 2;
@@ -1207,31 +1304,36 @@ impl CGrammar {
         &self.sym_data(sym).rules
     }
 
-    fn add_symbol(&mut self, mut sym: CSymbol) -> CSymIdx {
+    fn add_symbol(&mut self, mut sym: CSymbol) -> Result<CSymIdx> {
         let idx = CSymIdx::new_checked(self.symbols.len());
         sym.idx = idx;
-        self.symbols.push(sym);
-        idx
+        self.compilation_funding.try_push(&mut self.symbols, sym)?;
+        Ok(idx)
     }
 
     fn from_grammar(
         grammar: &Grammar,
         lexer_spec: LexerSpec,
         limits: &ParserLimits,
+        funding: derivre::ParserAllocationFunding,
     ) -> Result<Self> {
         let mut outp = CGrammar {
             start_symbol: CSymIdx::NULL, // replaced
             lexer_spec,
             parametric: grammar.parametric,
             symbols: vec![],
-            rhs_elements: vec![CSymIdx::NULL], // make sure RhsPtr::NULL is invalid
-            rhs_params: vec![ParamExpr::Null],
+            rhs_elements: Vec::new(),
+            rhs_params: Vec::new(),
             rhs_ptr_to_sym_idx: vec![],
             rhs_ptr_to_sym_flags: vec![],
+            compilation_funding: funding.clone(),
         };
+        // Keep the null pointer invalid, funding both actual destinations.
+        funding.try_push(&mut outp.rhs_elements, CSymIdx::NULL)?;
+        funding.try_push(&mut outp.rhs_params, ParamExpr::Null)?;
         outp.add_symbol(CSymbol {
             idx: CSymIdx::NULL,
-            name: "NULL".to_string(),
+            name: funding.try_copy_str("NULL")?,
             is_terminal: true,
             is_nullable: false,
             cond_nullable: vec![],
@@ -1241,9 +1343,12 @@ impl CGrammar {
             sym_flags: SymFlags(0),
             gen_grammar: None,
             lexeme: None,
-        });
+        })?;
 
-        let mut sym_map = crate::HashMap::default();
+        // Logical symbol IDs are dense and immutable throughout compilation.
+        let mut sym_map = Vec::new();
+        funding.try_grow_vec(&mut sym_map, grammar.symbols.len())?;
+        sym_map.resize(grammar.symbols.len(), CSymIdx::NULL);
 
         assert!(grammar.symbols.len() < u16::MAX as usize - 10);
 
@@ -1252,18 +1357,18 @@ impl CGrammar {
             if let Some(lx) = sym.lexeme {
                 let new_idx = outp.add_symbol(CSymbol {
                     idx: CSymIdx::NULL,
-                    name: sym.name.clone(),
+                    name: funding.try_copy_str(&sym.name)?,
                     is_terminal: true,
                     is_nullable: false,
                     cond_nullable: vec![],
                     rules: vec![],
                     rules_cond: vec![],
-                    props: sym.props.clone(),
+                    props: sym.props.copy_with_funding(&funding)?,
                     sym_flags: SymFlags(0),
                     gen_grammar: None,
                     lexeme: Some(lx),
-                });
-                sym_map.insert(sym.idx, new_idx);
+                })?;
+                sym_map[sym.idx.as_usize()] = new_idx;
             }
         }
 
@@ -1273,27 +1378,37 @@ impl CGrammar {
             }
             let cidx = outp.add_symbol(CSymbol {
                 idx: CSymIdx::NULL,
-                name: sym.name.clone(),
+                name: funding.try_copy_str(&sym.name)?,
                 is_terminal: false,
                 is_nullable: false,
                 cond_nullable: vec![],
                 rules: vec![],
                 rules_cond: vec![],
-                props: sym.props.clone(),
+                props: sym.props.copy_with_funding(&funding)?,
                 sym_flags: SymFlags(0),
-                gen_grammar: sym.gen_grammar.clone(),
+                gen_grammar: sym
+                    .gen_grammar
+                    .as_ref()
+                    .map(|options| {
+                        let GrammarId::Name(name) = &options.grammar;
+                        Ok::<_, derivre::ParserStorageError>(GenGrammarOptions {
+                            grammar: GrammarId::Name(funding.try_copy_str(name)?),
+                            temperature: options.temperature,
+                        })
+                    })
+                    .transpose()?,
                 lexeme: None,
-            });
-            sym_map.insert(sym.idx, cidx);
+            })?;
+            sym_map[sym.idx.as_usize()] = cidx;
         }
 
-        outp.start_symbol = sym_map[&grammar.start()];
+        outp.start_symbol = sym_map[grammar.start().as_usize()];
         for sym in &grammar.symbols {
             if sym.is_terminal() {
                 assert!(sym.rules.is_empty());
                 continue;
             }
-            let idx = sym_map[&sym.idx];
+            let idx = sym_map[sym.idx.as_usize()];
             for rule in &sym.rules {
                 // we handle the empty rule separately via is_nullable field
                 if rule.rhs.is_empty() {
@@ -1301,29 +1416,35 @@ impl CGrammar {
                     if rule.condition.is_true() {
                         csym.is_nullable = true;
                     } else {
-                        csym.cond_nullable.push(rule.condition.clone());
+                        funding.try_push(
+                            &mut csym.cond_nullable,
+                            rule.condition.copy_with_funding(&funding)?,
+                        )?;
                     }
                     continue;
                 }
                 let curr = RhsPtr(outp.rhs_elements.len().try_into().unwrap());
                 let csym = outp.sym_data_mut(idx);
-                csym.rules.push(curr);
-                csym.rules_cond.push(rule.condition.clone());
+                funding.try_push(&mut csym.rules, curr)?;
+                funding.try_push(
+                    &mut csym.rules_cond,
+                    rule.condition.copy_with_funding(&funding)?,
+                )?;
                 // outp.rules.push(idx);
                 for (r, e) in &rule.rhs {
-                    outp.rhs_elements.push(sym_map[r]);
-                    outp.rhs_params.push(e.clone());
+                    funding.try_push(&mut outp.rhs_elements, sym_map[r.as_usize()])?;
+                    funding.try_push(&mut outp.rhs_params, e.clone())?;
                 }
-                outp.rhs_elements.push(CSymIdx::NULL);
-                outp.rhs_params.push(ParamExpr::Null);
+                funding.try_push(&mut outp.rhs_elements, CSymIdx::NULL)?;
+                funding.try_push(&mut outp.rhs_params, ParamExpr::Null)?;
             }
             while !outp.rhs_elements.len().is_multiple_of(1 << RULE_SHIFT) {
-                outp.rhs_elements.push(CSymIdx::NULL);
-                outp.rhs_params.push(ParamExpr::Null);
+                funding.try_push(&mut outp.rhs_elements, CSymIdx::NULL)?;
+                funding.try_push(&mut outp.rhs_params, ParamExpr::Null)?;
             }
             let rlen = outp.rhs_elements.len() >> RULE_SHIFT;
             while outp.rhs_ptr_to_sym_idx.len() < rlen {
-                outp.rhs_ptr_to_sym_idx.push(idx);
+                funding.try_push(&mut outp.rhs_ptr_to_sym_idx, idx)?;
             }
         }
 
@@ -1335,24 +1456,27 @@ impl CGrammar {
             }
         }
 
-        outp.rhs_ptr_to_sym_flags = outp
-            .rhs_ptr_to_sym_idx
-            .iter()
-            .map(|s| outp.sym_data(*s).sym_flags)
-            .collect();
+        funding.try_grow_vec(
+            &mut outp.rhs_ptr_to_sym_flags,
+            outp.rhs_ptr_to_sym_idx.len(),
+        )?;
+        for s in &outp.rhs_ptr_to_sym_idx {
+            outp.rhs_ptr_to_sym_flags.push(outp.sym_data(*s).sym_flags);
+        }
 
-        outp.set_nullable();
+        outp.set_nullable()?;
         if outp.parametric {
-            ParametricNullableCtx::new(limits).set_cond_nullable(&mut outp)?;
+            ParametricNullableCtx::new(limits, funding.clone()).set_cond_nullable(&mut outp)?;
             debug!("parametric grammar:\n{:?}", outp);
         }
 
         Ok(outp)
     }
 
-    fn set_nullable(&mut self) {
+    fn set_nullable(&mut self) -> Result<()> {
+        let mut to_null = Vec::new();
         loop {
-            let mut to_null = vec![];
+            to_null.clear();
             for sym in &self.symbols {
                 if sym.is_nullable {
                     continue;
@@ -1367,17 +1491,18 @@ impl CGrammar {
                         .iter()
                         .all(|elt| self.sym_data(*elt).is_nullable)
                     {
-                        to_null.push(sym.idx);
+                        self.compilation_funding.try_push(&mut to_null, sym.idx)?;
                     }
                 }
             }
             if to_null.is_empty() {
                 break;
             }
-            for sym in to_null {
+            for &sym in &to_null {
                 self.sym_data_mut(sym).is_nullable = true;
             }
         }
+        Ok(())
     }
 
     pub fn sym_name(&self, sym: CSymIdx) -> &str {
@@ -1443,6 +1568,7 @@ struct ParametricNullableCtx {
     atoms: HashCons<ParamCond>,
     clauses: HashCons<Clause>,
     fuel: u64,
+    funding: derivre::ParserAllocationFunding,
 }
 
 impl ParametricNullableCtx {
@@ -1457,7 +1583,7 @@ impl ParametricNullableCtx {
 
     fn sub_fuel(&mut self, n: usize) -> Result<()> {
         if n > self.fuel as usize {
-            bail!("DNF too large, fuel exhausted");
+            bail!(&self.funding, "DNF too large, fuel exhausted");
         }
         self.fuel -= n as u64;
         Ok(())
@@ -1470,27 +1596,34 @@ impl ParametricNullableCtx {
         let mut res = vec![];
         for a in &a {
             for b in &b {
-                let mut c = self.clauses.get(*a).to_vec();
-                c.extend_from_slice(self.clauses.get(*b));
+                let mut c = Vec::new();
+                self.funding.try_extend_copy(&mut c, self.clauses.get(*a))?;
+                self.funding.try_extend_copy(&mut c, self.clauses.get(*b))?;
                 self.sub_fuel(c.len())?;
                 c.sort_unstable();
                 c.dedup();
-                res.push(self.clauses.insert(c));
+                let clause = self.clauses.insert(c)?;
+                self.funding.try_push(&mut res, clause)?;
             }
         }
         self.simplify_dnf(&mut res)?;
         Ok(res)
     }
 
-    fn dnf_or(&mut self, mut a: Dnf, mut b: Dnf) -> Result<Dnf> {
-        a.append(&mut b);
+    fn dnf_or(&mut self, mut a: Dnf, b: Dnf) -> Result<Dnf> {
+        self.funding.try_extend_copy(&mut a, &b)?;
         self.simplify_dnf(&mut a)?;
         Ok(a)
     }
 
     fn dnf(&mut self, cond: &ParamCond, neg: bool) -> Result<Dnf> {
         let r = match cond {
-            ParamCond::True => vec![self.clauses.insert(vec![])],
+            ParamCond::True => {
+                let clause = self.clauses.insert(Vec::new())?;
+                let mut result = Vec::new();
+                self.funding.try_push(&mut result, clause)?;
+                result
+            }
             ParamCond::NE(_, _)
             | ParamCond::EQ(_, _)
             | ParamCond::LE(_, _)
@@ -1504,12 +1637,20 @@ impl ParametricNullableCtx {
             | ParamCond::BitCountGE(_, _)
             | ParamCond::BitCountGT(_, _) => {
                 let cond = if neg {
-                    ParamCond::Not(Box::new(cond.clone()))
+                    ParamCond::Not(
+                        self.funding
+                            .try_box(cond.copy_with_funding(&self.funding)?)?,
+                    )
                 } else {
-                    cond.clone()
+                    cond.copy_with_funding(&self.funding)?
                 };
-                let a = self.atoms.insert(cond);
-                vec![self.clauses.insert(vec![a])]
+                let a = self.atoms.insert(cond)?;
+                let mut clause = Vec::new();
+                self.funding.try_push(&mut clause, a)?;
+                let clause = self.clauses.insert(clause)?;
+                let mut result = Vec::new();
+                self.funding.try_push(&mut result, clause)?;
+                result
             }
             ParamCond::And(a, b) | ParamCond::Or(a, b) => {
                 let a = self.dnf(a, neg)?;
@@ -1525,42 +1666,46 @@ impl ParametricNullableCtx {
         Ok(r)
     }
 
-    fn new(limits: &ParserLimits) -> ParametricNullableCtx {
+    fn new(
+        limits: &ParserLimits,
+        funding: derivre::ParserAllocationFunding,
+    ) -> ParametricNullableCtx {
         ParametricNullableCtx {
-            atoms: HashCons::default(),
-            clauses: HashCons::default(),
+            atoms: HashCons::new(funding.clone()),
+            clauses: HashCons::new(funding.clone()),
             fuel: limits.initial_lexer_fuel,
+            funding,
         }
     }
 
-    fn and_list(&self, lst: &[HashId<ParamCond>]) -> ParamCond {
-        if lst.is_empty() {
+    fn and_list(&self, lst: &[HashId<ParamCond>]) -> Result<ParamCond> {
+        Ok(if lst.is_empty() {
             ParamCond::True
         } else if lst.len() == 1 {
-            self.atoms.get(lst[0]).clone()
+            self.atoms.get(lst[0]).copy_with_funding(&self.funding)?
         } else {
             let mid = lst.len() / 2;
-            ParamCond::And(
-                Box::new(self.and_list(&lst[0..mid])),
-                Box::new(self.and_list(&lst[mid..])),
-            )
-        }
+            let left = self.and_list(&lst[..mid])?;
+            let left = self.funding.try_box(left)?;
+            let right = self.and_list(&lst[mid..])?;
+            let right = self.funding.try_box(right)?;
+            ParamCond::And(left, right)
+        })
     }
 
     fn set_cond_nullable(&mut self, grm: &mut CGrammar) -> Result<()> {
-        let mut null_cond: Vec<Dnf> = grm
-            .symbols
-            .iter()
-            .map(|s| {
-                let mut dnf = vec![];
-                for c in s.cond_nullable.iter() {
-                    let mut dnf2 = self.dnf(c, false)?;
-                    dnf.append(&mut dnf2);
-                }
-                self.simplify_dnf(&mut dnf)?;
-                Ok(dnf)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut null_cond = Vec::new();
+        self.funding
+            .try_grow_vec(&mut null_cond, grm.symbols.len())?;
+        for symbol in &grm.symbols {
+            let mut dnf = Vec::new();
+            for condition in &symbol.cond_nullable {
+                let next = self.dnf(condition, false)?;
+                self.funding.try_extend_copy(&mut dnf, &next)?;
+            }
+            self.simplify_dnf(&mut dnf)?;
+            null_cond.push(dnf);
+        }
 
         loop {
             let mut num_added = 0;
@@ -1581,16 +1726,19 @@ impl ParametricNullableCtx {
                             if grm.sym_data(elt).is_nullable {
                                 continue;
                             }
-                            dnf = self.dnf_and(dnf, null_cond[elt.as_index()].clone())?;
+                            let mut other = Vec::new();
+                            self.funding
+                                .try_extend_copy(&mut other, &null_cond[elt.as_index()])?;
+                            dnf = self.dnf_and(dnf, other)?;
                         }
-                        new_dnf.append(&mut dnf);
+                        self.funding.try_extend_copy(&mut new_dnf, &dnf)?;
                     }
                     if new_dnf.is_empty() {
                         continue; // no new nullable rules
                     }
                     let n = &mut null_cond[sym.idx.as_index()];
                     let len0 = n.len();
-                    n.append(&mut new_dnf);
+                    self.funding.try_extend_copy(n, &new_dnf)?;
                     self.simplify_dnf(n)?;
                     if len0 != n.len() {
                         num_added += 1;
@@ -1606,10 +1754,12 @@ impl ParametricNullableCtx {
         for sym in &mut grm.symbols {
             let dnf = &null_cond[sym.idx.as_index()];
             if !dnf.is_empty() {
-                sym.cond_nullable = dnf
-                    .iter()
-                    .map(|c| self.and_list(self.clauses.get(*c)))
-                    .collect();
+                let mut conditions = Vec::new();
+                self.funding.try_grow_vec(&mut conditions, dnf.len())?;
+                for clause in dnf {
+                    conditions.push(self.and_list(self.clauses.get(*clause))?);
+                }
+                sym.cond_nullable = conditions;
             } else {
                 assert!(sym.cond_nullable.is_empty());
             }
@@ -1705,22 +1855,21 @@ fn uf_compress_all(map: &mut [Option<SymIdx>]) {
 }
 
 mod source_copy;
+mod shared;
+pub use shared::{SharedGrammar, SharedGrammarFailure};
 pub use source_copy::{
     CompiledGrammarCopyFailure, CompiledGrammarCopyPlan, CompiledGrammarCopyRequirements,
     ConditionCopyPlan, ConditionCopyRequirements, ConditionSourceError,
 };
-impl Clone for CGrammar {
-    fn clone(&self) -> Self {
-        self.source_copy_plan()
-            .expect("ordinary compiled grammar source geometry")
-            .compile()
-            .expect("ordinary compiled grammar source copy")
-    }
-}
 impl Clone for ParamCond {
     fn clone(&self) -> Self {
-        self.source_copy_plan()
+        self.source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
             .expect("ordinary condition source geometry")
             .compile()
     }
 }
+
+mod retained_capacity;
+
+#[cfg(test)]
+mod construction_funding_tests;

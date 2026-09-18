@@ -174,7 +174,7 @@ fn summed_observer_prices_raw_terms_and_publishes_only_after_shared_completion()
                                     original.request(),
                                 )
                                 .unwrap();
-                            let mut session = CaptureSession::new(plan);
+                            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
                             session
                                 .configure_partition_capture(identity.clone())
                                 .unwrap();
@@ -276,7 +276,7 @@ fn summed_observer_prices_raw_terms_and_publishes_only_after_shared_completion()
                 .iter()
                 .all(|step| step.cumulative_usage == results[0].cumulative_usage));
             if committed {
-                let mut ordinary = CaptureSession::new(plan_for(transform.clone(), false));
+                let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan_for(transform.clone(), false)));
                 ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
                 ordinary
                     .observe(&mut Backend::default(), "block.output", &global())

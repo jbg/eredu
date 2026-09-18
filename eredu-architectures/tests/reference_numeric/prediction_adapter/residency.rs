@@ -19,8 +19,8 @@ fn prediction_rank_resources_count_tensor_shards_and_pipeline_expert_replicas() 
     let context = NumericContext::default();
     struct Bytes(u64);
     impl<'a> ParameterVisitor<'a, NumericTensor> for Bytes {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-            if metadata.alias_of.is_none() {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+            if metadata.alias_of().is_none() {
                 self.0 += value.shape.iter().map(|&n| n as u64).product::<u64>() * 4;
             }
         }

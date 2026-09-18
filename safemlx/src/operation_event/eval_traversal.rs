@@ -324,6 +324,8 @@ impl Drop for ScheduledNested<'_> {
 impl OperationEvent {
     /// Submit already-scheduled roots under the current finite resident bank.
     /// Only the new Synchronizer executes; lazy roots and count drift refuse.
+    /// CPU signal tasks and their Records settle before the bank is restored;
+    /// GPU submission retains its asynchronous Event and normal owner lifecycle.
     pub fn submit_nested_scheduled<'a>(
         outputs: impl IntoIterator<Item = &'a Array>,
         count: usize,

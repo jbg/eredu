@@ -62,11 +62,11 @@ where
         let bytes = controls::<S, E, L>(plan.metadata_bytes())
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    eredu_nn::workspace::WorkspaceMetadataFunding,
+                    eredu_nn::workspace::HostMetadataFunding,
                 >()?)
             })
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)

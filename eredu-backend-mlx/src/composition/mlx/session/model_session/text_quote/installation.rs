@@ -27,7 +27,7 @@ pub(super) struct AcceptedInstallation<'a> {
     // Source and diagnostic fields retire before the accepted accounting owner.
     pub(super) reservation: eredu_runtime::working_memory::WorkingMemoryReservation,
     // Last: the actual planning account retains every moved cold destination.
-    pub(super) planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(super) planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl<'a> AcceptedInstallation<'a> {
     pub(super) fn install<C: TokenFilterController>(
@@ -224,7 +224,7 @@ impl<'a> AcceptedInstallation<'a> {
         }
         // Extract from the same accepted source before any original role begins.
         // Native creation runs after the capture/span interior borrow has ended.
-        let native_storage = if let Some(mechanism) = model.erased().native_storage_mechanism()? {
+        let native_storage = if let Some(mechanism) = model.native_storage_mechanism()? {
             use eredu_runtime::working_memory::OriginalNativeStorageMechanism as _;
             let bank = if let Some(capture) = &capture {
                 capture.take_native_storage(&funding, mechanism.selection())?
@@ -316,7 +316,7 @@ impl<'a> AcceptedInstallation<'a> {
             .map(CaptureQuotation::control_guard)
             .or_else(|| sequence.as_ref().map(SequenceQuotation::control_guard))
             .map(crate::backend::runtime::execution::generic::OriginalOperationRegistration::new);
-        #[cfg(test)]
+        #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
         prefill_tests::capture_host_destinations(sequence.as_mut())?;
         let needs_host_bank = match &prefill_scopes {
             Some(scopes) => scopes
@@ -385,7 +385,8 @@ impl<'a> AcceptedInstallation<'a> {
             prefill_scopes,
             record_quota,
             graph_quota,
-            native_recipe,
+            sampling_revision: RefCell::new(None),
+        native_recipe,
             native_storage,
             parallel_control,
             addressable: RefCell::new(None),

@@ -62,6 +62,16 @@ impl PrefillControlPlan {
         geometry
             .validate_fixed()
             .map_err(|_| WorkingMemoryError::IdentityMismatch)?;
+        // Valid empty geometry is a terminal saved-state placement. It has no
+        // source factory, decoder invocation or final score-indexing role.
+        if geometry.input_positions == 0 {
+            return Ok(Self {
+                geometry,
+                retained_input_transaction,
+                spans: 0,
+                scopes: 0,
+            });
+        }
         // Quotient/remainder avoids overflowing input + chunk - 1.
         let spans = geometry.input_positions / geometry.prefill_chunk_positions
             + u64::from(geometry.input_positions % geometry.prefill_chunk_positions != 0);
@@ -120,18 +130,28 @@ impl PrefillControlPlan {
             (3, false) | (4, true) => PrefillSpanControlPhase::PostBoundary,
             _ => unreachable!("fixed phase population"),
         };
-        self.chunk(span).map(|chunk| PrefillControlRole::for_chunk(phase, &chunk))
+        self.chunk(span)
+            .map(|chunk| PrefillControlRole::for_chunk(phase, &chunk))
     }
     /// Exact physical invocation geometry used by the shared driver. Auxiliary
     /// occurrence plans borrow these coordinates rather than reproducing chunks.
     pub fn chunk(self, span: u64) -> Option<super::PrefillChunk> {
-        if span >= self.spans { return None; }
+        if span >= self.spans {
+            return None;
+        }
         let input_start = span * self.geometry.prefill_chunk_positions;
-        let input_end = input_start + self.geometry.prefill_chunk_positions.min(self.geometry.input_positions - input_start);
+        let input_end = input_start
+            + self
+                .geometry
+                .prefill_chunk_positions
+                .min(self.geometry.input_positions - input_start);
         Some(super::PrefillChunk {
             input: input_start..input_end,
             position: self.geometry.cached_positions + input_start,
-            output: self.geometry.output.for_chunk(input_end == self.geometry.input_positions),
+            output: self
+                .geometry
+                .output
+                .for_chunk(input_end == self.geometry.input_positions),
         })
     }
 }

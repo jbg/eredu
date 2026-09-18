@@ -14,6 +14,17 @@ impl std::io::Write for DigestWriter {
     }
 }
 
+/// Fixed serializer/hash controls. The concrete closed policy's own value and
+/// result controls are supplied by its enclosing original preparation producer.
+pub(super) fn control_bytes() -> usize {
+    std::mem::size_of::<DigestWriter>()
+        + std::mem::size_of::<Sha256>()
+        + std::mem::size_of::<serde_json::Serializer<&mut DigestWriter>>()
+        + std::mem::size_of::<std::io::Result<usize>>()
+        + std::mem::size_of::<Result<[u8;32], serde_json::Error>>()
+        + std::mem::size_of::<[u8;32]>()
+}
+
 pub(super) fn digest(value: &impl Serialize) -> Result<[u8; 32], serde_json::Error> {
     let mut writer = DigestWriter(Sha256::new());
     serde_json::to_writer(&mut writer, value)?;
@@ -23,13 +34,12 @@ pub(super) fn digest(value: &impl Serialize) -> Result<[u8; 32], serde_json::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::control::OutputMode;
     use eredu_core::TextInferencePolicy;
 
     #[test]
     fn streamed_identity_preserves_legacy_bytes_for_controlled_policy_and_text() {
         let long_stop = "é\n\"\\🙂".repeat(8192);
-        for mode in [OutputMode::Text, OutputMode::Semantic] {
+        for mode in ["Text", "Semantic"] {
             for capacity in [None, Some(0), Some(16 << 20), Some(u64::MAX)] {
                 let input = (
                     2_u32,

@@ -160,38 +160,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
-        mut reduce: F,
+        reduce: F,
     ) -> Result<B::Tensor, Error>
     where
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let routes = match source {
-            RouteSource::Learned => self.router.select(input, context)?,
-            RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
-        };
-        let routed = provider
-            .forward_grouped_tensor_parallel(
-                &mut self.experts,
-                RoutedExpertRequest {
-                    unit_observer: None,
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: self.layer,
-                    input,
-                    routes: &routes,
-                    pass,
-                },
-                1,
-                context,
-            )
-            .map_err(Error::backend_source)?;
-        let shared = self.forward_shared(
-            input,
-            context,
-            &mut crate::decoder::ComponentInstrumentation::disabled(),
-        )?;
-        Self::combine_tensor_parallel(routed, shared, context, &mut reduce)
+        self.forward_tensor_parallel_with_provider_observed(
+            "routed_feed_forward", input, source, pass, provider, context,
+            &mut eredu_runtime::NoopObserver, reduce,
+        )
     }
 
     // Keep the ordinary fused reduction and literal post-reduction bias identical
@@ -348,16 +327,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         )
         .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
         let shared = {
-            let path = format!("{path}.shared");
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
             let mut instrumentation =
-                crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed);
-            let shared = self.forward_shared(input, context, &mut instrumentation)?;
-            let shared = instrumentation.apply("write", shared)?;
-            instrumentation.apply("output", shared)?
+                crate::decoder::ComponentInstrumentation::new(path, &mut borrowed);
+            instrumentation.with_scope("shared", |instrumentation| {
+                let shared = self.forward_shared(input, context, instrumentation)?;
+                let shared = instrumentation.apply("write", shared)?;
+                instrumentation.apply("output", shared)
+            })?
         };
         let combined = Self::combine_tensor_parallel(routed, shared, context, &mut reduce)?;
-        observe_and_intervene(observer, &format!("{path}.output"), &combined)
+        if observer.observes_activations() {
+            observe_and_intervene(observer, &format!("{path}.output"), &combined)
+        } else {
+            Ok(combined)
+        }
     }
 
     /// Executes routed/shared experts with normalized route observation and a
@@ -409,15 +393,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         )
         .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
         let shared = {
-            let path = format!("{path}.shared");
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
             let mut instrumentation =
-                crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed);
-            let shared = self.forward_shared(input, context, &mut instrumentation)?;
-            let shared = instrumentation.apply("write", shared)?;
-            instrumentation.apply("output", shared)?
+                crate::decoder::ComponentInstrumentation::new(path, &mut borrowed);
+            instrumentation.with_scope("shared", |instrumentation| {
+                let shared = self.forward_shared(input, context, instrumentation)?;
+                let shared = instrumentation.apply("write", shared)?;
+                instrumentation.apply("output", shared)
+            })?
         };
         let combined = routed.add(&shared, context)?;
+        if !observer.observes_activations() {
+            return Ok(combined);
+        }
         observer.observe_routing(RoutingObservation {
             path,
             selected_experts: routes.group_indices(),

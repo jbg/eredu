@@ -161,7 +161,7 @@ mod tests {
         .iter()
         .cloned()
         .collect();
-        assert_eq!(model.vocab, expected_vocab);
+        assert_eq!(crate::Model::get_vocab(&model), expected_vocab.into_iter().collect());
 
         // If we specify a min_frequency
         trainer.min_frequency = 15;
@@ -177,6 +177,6 @@ mod tests {
         .cloned()
         .collect();
 
-        assert_eq!(model.vocab, expected_vocab);
+        assert_eq!(crate::Model::get_vocab(&model), expected_vocab.into_iter().collect());
     }
 }

@@ -239,8 +239,8 @@ impl Fixture {
     fn bind(&self, executable: &mut Executable<MlxNeuralBackend>) {
         struct Bind<'a>(&'a BTreeMap<String, MlxTensor>);
         impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-            fn visit_mut(&mut self, m: ParameterMetadata, t: &'a mut MlxTensor) {
-                *t = self.0[m.id.as_str()].clone();
+            fn visit_mut(&mut self, m: eredu_nn::ParameterMetadataView<'_>, t: &'a mut MlxTensor) {
+                *t = self.0[m.id().as_str()].clone();
             }
         }
         let mut bind = Bind(&self.values);

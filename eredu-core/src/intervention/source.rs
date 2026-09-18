@@ -2,7 +2,9 @@
 use super::*;
 use crate::{HostPreparationAuthority, capture::plan_copy::Worker};
 use std::{alloc::Layout, mem::size_of, sync::Arc};
-mod copy;
+pub(super) mod copy;
+mod request;
+pub use request::PreparedInterventionRequestCopy;
 
 /// Fixed source-validation failure. No error formatting or source clone occurs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -260,7 +262,7 @@ impl AdmittedInterventionPlan {
         .try_fold(0usize, usize::checked_add)
     }
 }
-fn write_hex(out: &mut [u8], digest: &[u8; 32]) {
+pub(super) fn write_hex(out: &mut [u8], digest: &[u8; 32]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for (out, &byte) in out.chunks_exact_mut(2).zip(digest) {
         out[0] = HEX[(byte >> 4) as usize];

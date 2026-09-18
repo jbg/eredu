@@ -171,8 +171,8 @@ fn make_model(
         BTreeMap<String, Vec<usize>>,
     );
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let name = metadata.id().as_str();
             let original = self.0.get(name).unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(value.shape, original.shape, "{name}");
             value.data.clone_from(&original.data);
@@ -194,7 +194,7 @@ fn make_model(
     for unit in model.units_mut().iter_mut().flatten() {
         unit.visit_parameters_mut(&mut populate);
     }
-    let description = model.architecture().parameter_description(context).unwrap();
+    let description = model.architecture().parameter_description(context).unwrap().into_owned();
     let expected = description
         .groups()
         .iter()
@@ -205,14 +205,13 @@ fn make_model(
         populate.1, expected,
         "all physical parameter slots initialized before token/state"
     );
-    let declarations=<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(model.architecture()).unwrap();
+    let declarations=<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(model.architecture(), None).unwrap();
     assert_eq!(declarations.len(), 10 + 4 * f.args.text.num_hidden_layers());
     for i in 0..f.args.text.num_hidden_layers() {
         let base = <Architecture as LayeredArchitecture<NumericBackend, State>>::unit_path(
             model.architecture(),
             2,
-            i,
-        )
+            i, None)
         .unwrap();
         assert_eq!(base, format!("model.language_model.layers.{i}"));
         for suffix in ["input", "input.effective", "output", "output.effective"] {

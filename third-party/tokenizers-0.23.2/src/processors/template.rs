@@ -142,9 +142,7 @@ impl Piece {
     fn with_type_id(self, type_id: u32) -> Self {
         match self {
             Self::Sequence { id, .. } => Self::Sequence { id, type_id },
-            Self::SpecialToken { id, .. } => {
-                Self::SpecialToken { id, type_id }
-            }
+            Self::SpecialToken { id, .. } => Self::SpecialToken { id, type_id },
         }
     }
 }
@@ -230,14 +228,9 @@ impl From<(u32, &str)> for SpecialToken {
 }
 
 impl SpecialToken {
-    pub fn new(
-        id: String,
-        ids: Vec<u32>,
-        tokens: Vec<String>,
-    ) -> Result<Self> {
+    pub fn new(id: String, ids: Vec<u32>, tokens: Vec<String>) -> Result<Self> {
         if ids.len() != tokens.len() {
-            Err("SpecialToken: ids and tokens must be of the same length"
-                .into())
+            Err("SpecialToken: ids and tokens must be of the same length".into())
         } else {
             Ok(Self { id, ids, tokens })
         }
@@ -303,8 +296,7 @@ impl TryFrom<&str> for Template {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, Eq)]
 #[serde(transparent)]
 pub struct Tokens(
-    #[serde(serialize_with = "crate::utils::ordered_map")]
-    pub  AHashMap<String, SpecialToken>,
+    #[serde(serialize_with = "crate::utils::ordered_map")] pub AHashMap<String, SpecialToken>,
 );
 
 impl<T: Into<SpecialToken>> From<Vec<T>> for Tokens {
@@ -344,140 +336,66 @@ impl From<AHashMap<String, SpecialToken>> for Tokens {
 ///     .unwrap();
 /// ```
 ///
-#[derive(Debug, Clone, PartialEq, Builder, Serialize, Deserialize, Eq)]
-#[serde(tag = "type", from = "TemplateProcessingDeserializer")]
-#[builder(build_fn(validate = "Self::validate"))]
-pub struct TemplateProcessing {
-    #[builder(try_setter, default = "\"$0\".try_into().unwrap()")]
-    pub single: Template,
-    #[builder(try_setter, default = "\"$A:0 $B:1\".try_into().unwrap()")]
-    pair: Template,
-    #[builder(setter(skip), default = "self.default_added(true)")]
-    #[serde(skip)]
-    added_single: usize,
-    #[builder(setter(skip), default = "self.default_added(false)")]
-    #[serde(skip)]
-    added_pair: usize,
-    #[builder(setter(into), default)]
-    special_tokens: Tokens,
-}
+pub use compiled::TemplateProcessing;
 
-impl TemplateProcessing {
-    // Getter for `single`
-    pub fn get_single(&self) -> String {
-        format!("{:?}", self.single)
-    }
-
-    // Setter for `single`
-    pub fn set_single(&mut self, single: Template) {
-        self.single = single;
-    }
-
-    // Getter for `pair`
-    pub fn get_pair(&self) -> &Template {
-        &self.pair
-    }
-
-    // Setter for `pair`
-    pub fn set_pair(&mut self, pair: Template) {
-        self.pair = pair;
-    }
-
-    // Getter for `added_single`
-    pub fn get_added_single(&self) -> usize {
-        self.added_single
-    }
-
-    // Setter for `added_single`
-    pub fn set_added_single(&mut self, added_single: usize) {
-        self.added_single = added_single;
-    }
-
-    // Getter for `added_pair`
-    pub fn get_added_pair(&self) -> usize {
-        self.added_pair
-    }
-
-    // Setter for `added_pair`
-    pub fn set_added_pair(&mut self, added_pair: usize) {
-        self.added_pair = added_pair;
-    }
-
-    // Getter for `special_tokens`
-    pub fn get_special_tokens(&self) -> &Tokens {
-        &self.special_tokens
-    }
-
-    // Setter for `special_tokens`
-    pub fn set_special_tokens(&mut self, special_tokens: Tokens) {
-        self.special_tokens = special_tokens;
-    }
-}
-
-impl From<&str> for TemplateProcessingBuilderError {
-    fn from(e: &str) -> Self {
-        e.to_string().into()
-    }
-}
-
-impl PartialEq for TemplateProcessingBuilderError {
-    fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
-    }
-}
-
-/// We use this custom deserializer to provided the values for `added_single`
-/// and `added_pair` during deserialization, while not having to serialize them
-#[doc(hidden)]
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-struct TemplateProcessingDeserializer {
+/// Temporary user-facing construction input; execution retains only packed tables.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename = "TemplateProcessing", tag = "type")]
+struct TemplateSource {
     single: Template,
     pair: Template,
     special_tokens: Tokens,
 }
-impl From<TemplateProcessingDeserializer> for TemplateProcessing {
-    fn from(t: TemplateProcessingDeserializer) -> Self {
-        let added_single = count_added(&t.single, Some(&t.special_tokens));
-        let added_pair = count_added(&t.pair, Some(&t.special_tokens));
-        Self {
-            single: t.single,
-            pair: t.pair,
-            added_single,
-            added_pair,
-            special_tokens: t.special_tokens,
-        }
+#[derive(Debug, Clone, Default)]
+pub struct TemplateProcessingBuilder {
+    single: Option<Template>,
+    pair: Option<Template>,
+    special_tokens: Option<Tokens>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct TemplateProcessingBuilderError(String);
+impl From<&str> for TemplateProcessingBuilderError {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
     }
 }
-
-/// Count the number of added tokens in the given template
-fn count_added(
-    container: &Template,
-    special_tokens: Option<&Tokens>,
-) -> usize {
-    container
-        .0
-        .iter()
-        .map(|p| match p {
-            Piece::Sequence { .. } => 0,
-            Piece::SpecialToken { id, .. } => special_tokens
-                .map_or(0, |spt| spt.0.get(id).map_or(0, |s| s.ids.len())),
-        })
-        .sum()
-}
-
 impl TemplateProcessingBuilder {
-    fn default_added(&self, is_single: bool) -> usize {
-        let container = if is_single {
-            self.single.as_ref()
-        } else {
-            self.pair.as_ref()
-        };
-        container.map_or(0, |pieces| {
-            count_added(pieces, self.special_tokens.as_ref())
-        })
+    pub fn try_single<T: TryInto<Template>>(&mut self, value: T) -> StdResult<&mut Self, T::Error> {
+        self.single = Some(value.try_into()?);
+        Ok(self)
     }
-
+    pub fn try_pair<T: TryInto<Template>>(&mut self, value: T) -> StdResult<&mut Self, T::Error> {
+        self.pair = Some(value.try_into()?);
+        Ok(self)
+    }
+    pub fn single(&mut self, value: Template) -> &mut Self {
+        self.single = Some(value);
+        self
+    }
+    pub fn pair(&mut self, value: Template) -> &mut Self {
+        self.pair = Some(value);
+        self
+    }
+    pub fn special_tokens<T: Into<Tokens>>(&mut self, value: T) -> &mut Self {
+        self.special_tokens = Some(value.into());
+        self
+    }
+    pub fn build(&self) -> StdResult<TemplateProcessing, TemplateProcessingBuilderError> {
+        self.validate().map_err(TemplateProcessingBuilderError)?;
+        TemplateProcessing::from_source(TemplateSource {
+            single: self
+                .single
+                .clone()
+                .unwrap_or_else(|| "$0".try_into().unwrap()),
+            pair: self
+                .pair
+                .clone()
+                .unwrap_or_else(|| "$A:0 $B:1".try_into().unwrap()),
+            special_tokens: self.special_tokens.clone().unwrap_or_default(),
+        })
+        .map_err(TemplateProcessingBuilderError)
+    }
     fn validate(&self) -> std::result::Result<(), String> {
         let pair_has_both = self.pair.as_ref().is_none_or(|pair| {
             let mut has_a = false;
@@ -539,92 +457,82 @@ impl TemplateProcessingBuilder {
 
 impl Default for TemplateProcessing {
     fn default() -> Self {
-        Self {
+        Self::from_source(TemplateSource {
             single: "$0".try_into().unwrap(),
             pair: "$1".try_into().unwrap(),
-            added_single: 0,
-            added_pair: 0,
             special_tokens: Tokens::default(),
-        }
+        })
+        .expect("default template is valid")
     }
 }
-
+impl<'de> Deserialize<'de> for TemplateProcessing {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> StdResult<Self, D::Error> {
+        let source = TemplateSource::deserialize(deserializer)?;
+        Self::from_source(source).map_err(serde::de::Error::custom)
+    }
+}
 impl TemplateProcessing {
     pub fn builder() -> TemplateProcessingBuilder {
         TemplateProcessingBuilder::default()
     }
-
-    fn apply_template(
-        &self,
-        template: &[Piece],
-        encodings: Vec<Encoding>,
-        add_special_tokens: bool,
-    ) -> Result<Vec<Encoding>> {
-        let pieces = template
-            .iter()
-            .filter(|piece| {
-                add_special_tokens || matches!(piece, Piece::Sequence { .. })
-            })
-            .map(|piece| match piece {
-                Piece::Sequence { id, type_id } => {
-                    visit::PieceView::Sequence {
-                        index: usize::from(*id != Sequence::A),
-                        type_id: *type_id,
-                    }
-                }
-                Piece::SpecialToken { id, type_id } => {
-                    let token = &self.special_tokens.0[id];
-                    visit::PieceView::Special {
-                        ids: &token.ids,
-                        tokens: visit::Texts::Legacy(&token.tokens),
-                        type_id: *type_id,
-                    }
-                }
-            });
-        visit::encodings(pieces, encodings, add_special_tokens)
-    }
-}
-
-impl PostProcessor for TemplateProcessing {
-    fn added_tokens(&self, is_pair: bool) -> usize {
-        if is_pair {
-            self.added_pair
-        } else {
-            self.added_single
+    fn from_source(source: TemplateSource) -> StdResult<Self, String> {
+        use compiled::{Kind, Piece as PackedPiece, Special, TextRange};
+        fn text(bytes: &mut Vec<u8>, value: &str) -> TextRange {
+            let start = bytes.len();
+            bytes.extend_from_slice(value.as_bytes());
+            TextRange {
+                start,
+                len: value.len(),
+            }
         }
-    }
-
-    fn process_encodings(
-        &self,
-        encodings: Vec<Encoding>,
-        add_special_tokens: bool,
-    ) -> Result<Vec<Encoding>> {
-        // let (encoding, pair): (Encoding, Option<Encoding>) = match encodings.len() {
-        //     1 => (
-        //         encodings
-        //             .pop()
-        //             .ok_or(ProcessorError::InvalidEncodingsVecLength)?,
-        //         None,
-        //     ),
-        //     2 => {
-        //         let pair = encodings
-        //             .pop()
-        //             .ok_or(ProcessorError::InvalidEncodingsVecLength)?;
-        //         let encoding = encodings
-        //             .pop()
-        //             .ok_or(ProcessorError::InvalidEncodingsVecLength)?;
-        //         (encoding, Some(pair))
-        //     }
-        //     _ => return Err(Box::new(ProcessorError::InvalidEncodingsVecLength)),
-        // };
-        let template = match encodings.len() {
-            2 => &self.pair.0,
-            1 => &self.single.0,
-            _ => todo!(),
-        };
-        let encodings =
-            self.apply_template(template, encodings, add_special_tokens)?;
-        Ok(encodings)
+        let mut result = Self::empty();
+        let mut specials = source.special_tokens.0.into_iter().collect::<Vec<_>>();
+        specials.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, special) in specials {
+            if special.ids.len() != special.tokens.len() {
+                return Err("special token IDs and spellings have different lengths".into());
+            }
+            let key = text(&mut result.bytes, &key);
+            let id = text(&mut result.bytes, &special.id);
+            let start = result.ids.len();
+            result.ids.extend(special.ids);
+            for token in special.tokens {
+                result.tokens.push(text(&mut result.bytes, &token));
+            }
+            result.specials.push(Special {
+                key,
+                id,
+                start,
+                len: result.ids.len() - start,
+            });
+        }
+        for (phase, template) in [source.single, source.pair].iter().enumerate() {
+            for piece in &template.0 {
+                let (kind, type_id) = match piece {
+                    Piece::Sequence { id, type_id } => {
+                        (Kind::Sequence(usize::from(*id != Sequence::A)), *type_id)
+                    }
+                    Piece::SpecialToken { id, type_id } => {
+                        match result
+                            .specials
+                            .iter()
+                            .position(|s| s.key.text(&result.bytes) == id)
+                        {
+                            Some(index) => {
+                                result.added[phase] += result.specials[index].len;
+                                (Kind::Special(index), *type_id)
+                            }
+                            None => (Kind::MissingSpecial(text(&mut result.bytes, id)), *type_id),
+                        }
+                    }
+                };
+                result.pieces.push(PackedPiece { kind, type_id });
+            }
+            if phase == 0 {
+                result.single_len = result.pieces.len();
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -719,8 +627,7 @@ mod tests {
             vec!["convert".into(), "to".into(), "FR".into()],
         )
         .unwrap();
-        let complete_s =
-            r#"{"id":"[2FR]","ids":[1,2,3],"tokens":["convert","to","FR"]}"#;
+        let complete_s = r#"{"id":"[2FR]","ids":[1,2,3],"tokens":["convert","to","FR"]}"#;
         assert_eq!(serde_json::to_string(&complete).unwrap(), complete_s);
         assert_eq!(
             serde_json::from_str::<SpecialToken>(complete_s).unwrap(),
@@ -753,7 +660,8 @@ mod tests {
                 type_id: 0,
             },
         ]);
-        let template_s = r#"[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[CLS]","type_id":0}}]"#;
+        let template_s =
+            r#"[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[CLS]","type_id":0}}]"#;
         assert_eq!(serde_json::to_string(&template).unwrap(), template_s);
         assert_eq!(
             serde_json::from_str::<Template>(template_s).unwrap(),
@@ -823,10 +731,8 @@ mod tests {
             .unwrap()
             .build();
 
-        let err_a =
-            Err("Missing SpecialToken(s) with id(s) `[SEP], [CLS]`".into());
-        let err_b =
-            Err("Missing SpecialToken(s) with id(s) `[CLS], [SEP]`".into());
+        let err_a = Err("Missing SpecialToken(s) with id(s) `[SEP], [CLS]`".into());
+        let err_b = Err("Missing SpecialToken(s) with id(s) `[CLS], [SEP]`".into());
         assert!(processor == err_a || processor == err_b);
     }
 
@@ -844,12 +750,8 @@ mod tests {
             ],
             0,
         );
-        let pair = Encoding::from_tokens(
-            vec![Token::new(15, "pair".into(), (0, 4))],
-            0,
-        );
-        let single_encoding =
-            processor.process(encoding.clone(), None, true).unwrap();
+        let pair = Encoding::from_tokens(vec![Token::new(15, "pair".into(), (0, 4))], 0);
+        let single_encoding = processor.process(encoding.clone(), None, true).unwrap();
         assert_eq!(
             single_encoding,
             Encoding::new(
@@ -871,8 +773,7 @@ mod tests {
         );
         assert_eq!(single_encoding.token_to_sequence(2), Some(0));
         assert_eq!(single_encoding.token_to_sequence(3), None);
-        let pair_encoding =
-            processor.process(encoding, Some(pair), true).unwrap();
+        let pair_encoding = processor.process(encoding, Some(pair), true).unwrap();
         assert_eq!(
             pair_encoding,
             Encoding::new(
@@ -914,10 +815,7 @@ mod tests {
             ],
             0,
         );
-        let overflowing = Encoding::from_tokens(
-            vec![Token::new(13, "you".into(), (12, 15))],
-            0,
-        );
+        let overflowing = Encoding::from_tokens(vec![Token::new(13, "you".into(), (12, 15))], 0);
         encoding.set_overflowing(vec![overflowing]);
 
         let mut pair = Encoding::from_tokens(
@@ -927,14 +825,11 @@ mod tests {
             ],
             0,
         );
-        let pair_overflowing = Encoding::from_tokens(
-            vec![Token::new(17, "info".into(), (10, 14))],
-            0,
-        );
+        let pair_overflowing =
+            Encoding::from_tokens(vec![Token::new(17, "info".into(), (10, 14))], 0);
         pair.set_overflowing(vec![pair_overflowing]);
 
-        let single_encoding =
-            processor.process(encoding.clone(), None, true).unwrap();
+        let single_encoding = processor.process(encoding.clone(), None, true).unwrap();
         assert_eq!(
             single_encoding,
             Encoding::new(
@@ -966,8 +861,7 @@ mod tests {
         );
         assert_eq!(single_encoding.token_to_sequence(2), Some(0));
         assert_eq!(single_encoding.token_to_sequence(3), None);
-        let pair_encoding =
-            processor.process(encoding, Some(pair), true).unwrap();
+        let pair_encoding = processor.process(encoding, Some(pair), true).unwrap();
         println!("{pair_encoding:#?}");
         assert_eq!(
             pair_encoding,
@@ -1051,14 +945,7 @@ mod tests {
                             "[SEP]".into()
                         ],
                         vec![None, None, None, None, None, None],
-                        vec![
-                            (0, 0),
-                            (0, 5),
-                            (6, 11),
-                            (0, 0),
-                            (10, 14),
-                            (0, 0)
-                        ],
+                        vec![(0, 0), (0, 5), (6, 11), (0, 0), (10, 14), (0, 0)],
                         vec![1, 0, 0, 1, 0, 1],
                         vec![1, 1, 1, 1, 1, 1],
                         vec![Encoding::new(

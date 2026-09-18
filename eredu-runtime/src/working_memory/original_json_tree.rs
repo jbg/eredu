@@ -1,7 +1,7 @@
 //! Immutable paid values produced by the actual serde event deserializer.
 use super::OriginalJsonValueKind;
 use eredu_core::{HostPreparationAuthority, SpeculativeBuffer, SpeculativeBufferAllocationError};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use serde_json::bounded_events::{Event, Plan, PlanError, Sink};
 use std::{
     cmp::Ordering,
@@ -10,13 +10,22 @@ use std::{
 
 /// Exact primitive number emitted by the selected ordinary serde parser.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum OriginalJsonNumber {
+pub enum OriginalJsonNumber<'a> {
     /// Signed integer token.
     I64(i64),
     /// Unsigned integer token.
     U64(u64),
     /// Finite floating token, including its signed zero.
     F64(f64),
+    /// Borrowed exact number from the original optional numeric representation.
+    Exact(&'a serde_json::Number),
+}
+#[derive(Clone, Copy, Debug)]
+enum StoredNumber {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Exact(usize),
 }
 #[derive(Clone, Copy, Debug)]
 struct Span {
@@ -37,7 +46,7 @@ enum Value {
     },
     Array(Children),
     String(Span),
-    Number(OriginalJsonNumber),
+    Number(StoredNumber),
     Bool(bool),
     Null,
 }
@@ -55,9 +64,11 @@ enum Cause {
     #[error(transparent)]
     Syntax(#[from] serde_json::Error),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Allocation(#[from] SpeculativeBufferAllocationError),
+    #[error(transparent)]
+    JsonAllocation(#[from] serde_json::allocation::AllocationError),
     #[error("original JSON tree destination is full")]
     Capacity,
     #[error("original JSON tree source extent overflow")]
@@ -73,7 +84,8 @@ enum Cause {
 pub struct OriginalJsonTree {
     records: SpeculativeBuffer<Record>,
     text: SpeculativeBuffer<u8>,
-    funding: WorkspaceMetadataFunding,
+    numbers: SpeculativeBuffer<serde_json::Number>,
+    funding: HostMetadataFunding,
 }
 /// Failure retains all produced rows and decoded strings, including an escaped
 /// partial root. The parser's first callback failure remains independently owned.
@@ -97,16 +109,16 @@ impl OriginalJsonTree {
     }
     fn buffer<T>(
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<SpeculativeBuffer<T>, Cause> {
         let bytes = SpeculativeBuffer::<T>::retained_control_bytes(capacity)
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .and_then(|n| n.checked_add(size_of::<Result<SpeculativeBuffer<T>, Cause>>()))
-            .and_then(|n| n.checked_add(size_of::<(usize, &WorkspaceMetadataFunding)>()))
+            .and_then(|n| n.checked_add(size_of::<(usize, &HostMetadataFunding)>()))
             .ok_or(Cause::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(SpeculativeBuffer::try_new_retained(
@@ -121,7 +133,7 @@ impl OriginalJsonTree {
             size_of::<OriginalJsonTreeError>(),
             size_of::<Cause>(),
             size_of::<Option<Cause>>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Plan<'_>>(),
             size_of::<Result<Plan<'_>, PlanError>>(),
             size_of::<serde_json::bounded_events::Requirements>(),
@@ -129,7 +141,7 @@ impl OriginalJsonTree {
             size_of::<Result<Self, OriginalJsonTreeError>>(),
             size_of::<Result<(), Cause>>(),
             size_of::<Result<(), serde_json::Error>>(),
-            size_of::<(&str, &WorkspaceMetadataFunding)>(),
+            size_of::<(&str, &HostMetadataFunding)>(),
         ];
         let event = [
             size_of::<Event<'_>>(),
@@ -166,12 +178,13 @@ impl OriginalJsonTree {
     /// one source byte; decoded UTF-8 strings cannot exceed their source spelling.
     pub fn parse(
         input: &str,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalJsonTreeError> {
         let mut builder = Builder {
             tree: Self {
                 records: SpeculativeBuffer::default(),
                 text: SpeculativeBuffer::default(),
+                numbers: SpeculativeBuffer::default(),
                 funding: funding.clone(),
             },
             current: None,
@@ -184,10 +197,15 @@ impl OriginalJsonTree {
             funding.reserve_metadata(requirements.required_bytes())?;
             builder.tree.records = Self::buffer(input.len(), funding)?;
             builder.tree.text = Self::buffer(input.len(), funding)?;
-            plan.parse(&mut builder)?;
+            let allocation = super::original_json_allocation::JsonAllocation::new(funding)?;
+            let parsed = plan.parse(&mut builder, &allocation);
+            if let Some(cause) = allocation.failure() {
+                return Err(cause.into());
+            }
             if let Some(cause) = builder.failure.take() {
                 return Err(cause);
             }
+            parsed?;
             if builder.current.is_some() || builder.tree.records.is_empty() {
                 return Err(Cause::Source);
             }
@@ -276,7 +294,11 @@ impl Builder {
                                 replace = true;
                                 break;
                             }
-                            Ordering::Greater if !serde_json::bounded_events::preserves_object_order() => break,
+                            Ordering::Greater
+                                if !serde_json::bounded_events::preserves_object_order() =>
+                            {
+                                break
+                            }
                             _ => {
                                 previous = Some(other);
                                 next = self.tree.records[other].next;
@@ -345,15 +367,36 @@ impl Builder {
                 let span = self.text(value)?;
                 self.append(Value::String(span))
             }
-            Event::I64(value) => self.append(Value::Number(OriginalJsonNumber::I64(value))),
-            Event::U64(value) => self.append(Value::Number(OriginalJsonNumber::U64(value))),
-            Event::F64(value) => self.append(Value::Number(OriginalJsonNumber::F64(value))),
+            Event::I64(value) => self.append(Value::Number(StoredNumber::I64(value))),
+            Event::U64(value) => self.append(Value::Number(StoredNumber::U64(value))),
+            Event::F64(value) => self.append(Value::Number(StoredNumber::F64(value))),
+            Event::Number(value) => {
+                if self.tree.numbers.capacity() == 0 {
+                    self.tree.numbers =
+                        OriginalJsonTree::buffer(self.tree.records.capacity(), &self.tree.funding)?;
+                }
+                let allocation =
+                    super::original_json_allocation::JsonAllocation::new(&self.tree.funding)?;
+                let cloned = value.try_clone_with_allocations(&allocation);
+                if let Some(cause) = allocation.failure() {
+                    return Err(cause.into());
+                }
+                let index = self.tree.numbers.len();
+                self.tree
+                    .numbers
+                    .try_push(cloned?)
+                    .map_err(|_| Cause::Capacity)?;
+                self.append(Value::Number(StoredNumber::Exact(index)))
+            }
             Event::Bool(value) => self.append(Value::Bool(value)),
             Event::Null => self.append(Value::Null),
         }
     }
 }
 impl Sink for Builder {
+    fn stopped(&self) -> bool {
+        self.failure.is_some()
+    }
     fn event(&mut self, event: Event<'_>) {
         if self.failure.is_none() {
             if let Err(cause) = self.event_inner(event) {
@@ -393,9 +436,14 @@ impl<'a> OriginalJsonNode<'a> {
         }
     }
     /// Exact primitive parsed number.
-    pub fn number(self) -> Option<OriginalJsonNumber> {
+    pub fn number(self) -> Option<OriginalJsonNumber<'a>> {
         if let Value::Number(value) = self.record().value {
-            Some(value)
+            Some(match value {
+                StoredNumber::I64(n) => OriginalJsonNumber::I64(n),
+                StoredNumber::U64(n) => OriginalJsonNumber::U64(n),
+                StoredNumber::F64(n) => OriginalJsonNumber::F64(n),
+                StoredNumber::Exact(index) => OriginalJsonNumber::Exact(&self.tree.numbers[index]),
+            })
         } else {
             None
         }
@@ -469,3 +517,104 @@ impl<'a> Iterator for OriginalJsonChildren<'a> {
 }
 impl ExactSizeIterator for OriginalJsonChildren<'_> {}
 impl std::iter::FusedIterator for OriginalJsonChildren<'_> {}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+    use eredu_core::HostMetadataAccount;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    #[derive(Debug)]
+    struct State {
+        calls: AtomicUsize,
+        stop: AtomicUsize,
+        failed: AtomicBool,
+        retired: AtomicBool,
+    }
+    #[derive(Debug)]
+    struct Account(Arc<State>);
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+            assert!(
+                !self.0.failed.load(Ordering::SeqCst),
+                "tree reached original payer after refusal"
+            );
+            let call = self.0.calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.0.stop.load(Ordering::SeqCst) {
+                self.0.failed.store(true, Ordering::SeqCst);
+                Err(HostMetadataFundingError::Capacity {
+                    required: bytes as u64,
+                    available: 0,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl Drop for Account {
+        fn drop(&mut self) {
+            self.0.retired.store(true, Ordering::SeqCst);
+        }
+    }
+    fn account(stop: usize) -> (HostMetadataFunding, Arc<State>) {
+        let state = Arc::new(State {
+            calls: AtomicUsize::new(0),
+            stop: AtomicUsize::new(usize::MAX),
+            failed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+        });
+        let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
+        state.calls.store(0, Ordering::SeqCst);
+        state.stop.store(stop, Ordering::SeqCst);
+        (funding, state)
+    }
+    #[test]
+    fn original_numeric_carrier_preserves_values_and_failure_custody() {
+        let input = r#"[1.234567890123456789012345678901234567890,-0.0,18446744073709551616,{"nested":2.25e-30}]"#;
+        let expected: serde_json::Value = serde_json::from_str(input).unwrap();
+        let (funding, state) = account(usize::MAX);
+        let tree = OriginalJsonTree::parse(input, &funding).unwrap();
+        for ((_, actual), expected) in tree
+            .root()
+            .children()
+            .unwrap()
+            .take(3)
+            .zip(expected.as_array().unwrap())
+        {
+            let actual = match actual.number().unwrap() {
+                OriginalJsonNumber::I64(n) => serde_json::Number::from(n),
+                OriginalJsonNumber::U64(n) => serde_json::Number::from(n),
+                OriginalJsonNumber::F64(n) => serde_json::Number::from_f64(n).unwrap(),
+                OriginalJsonNumber::Exact(n) => n.clone(),
+            };
+            assert_eq!(&actual, expected.as_number().unwrap());
+            assert_eq!(
+                actual.source_text(),
+                expected.as_number().unwrap().source_text()
+            );
+        }
+        let count = state.calls.load(Ordering::SeqCst);
+        drop(funding);
+        assert!(!state.retired.load(Ordering::SeqCst));
+        drop(tree);
+        assert!(state.retired.load(Ordering::SeqCst));
+        for stop in 0..count {
+            let (funding, state) = account(stop);
+            let error = OriginalJsonTree::parse(input, &funding).unwrap_err();
+            assert!(
+                matches!(
+                    error.cause,
+                    Cause::Funding(HostMetadataFundingError::Capacity { .. })
+                ),
+                "refusal {stop}: {error:?}"
+            );
+            assert_eq!(state.calls.load(Ordering::SeqCst), stop + 1);
+            drop(funding);
+            assert!(!state.retired.load(Ordering::SeqCst));
+            drop(error);
+            assert!(state.retired.load(Ordering::SeqCst));
+        }
+    }
+}

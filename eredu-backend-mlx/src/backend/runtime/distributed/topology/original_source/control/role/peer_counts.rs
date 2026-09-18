@@ -53,7 +53,7 @@ enum Consensus {
     Logical(SharedStorageOwner<table::PeerCountTable>),
 }
 impl Consensus {
-    fn loan<'a>(&'a self, funding: &'a WorkspaceMetadataFunding) -> PreparedPeerCountLoan<'a> {
+    fn loan<'a>(&'a self, funding: &'a HostMetadataFunding) -> PreparedPeerCountLoan<'a> {
         match self {
             Self::Physical(table) => PreparedPeerCountLoan::new(table.local(), funding, Some(table.clone().erase())),
             Self::Logical(table) => PreparedPeerCountLoan::new(table.local(), funding, Some(table.clone().erase())),
@@ -64,7 +64,7 @@ impl OriginalParallelControlProjection {
     pub(crate) fn with_peer_count_consensus<T, E, F>(
         &self, local: &[i32], group: &Group, context: &Group, executor: &Stream, run: F,
     ) -> Result<Result<T, E>, Error>
-    where F: for<'loan> FnOnce(Option<(&'loan [i32], &'loan WorkspaceMetadataFunding)>) -> Result<T, E>,
+    where F: for<'loan> FnOnce(Option<(&'loan [i32], &'loan HostMetadataFunding)>) -> Result<T, E>,
     {
         self.with_peer_count_source(local, group, context, executor, |loan| {
             let parts = loan.map(PreparedPeerCountLoan::into_parts);

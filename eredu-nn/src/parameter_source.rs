@@ -23,52 +23,79 @@ use crate::{LinearCompanionRole, LinearRowLayout, ParameterId, ParameterMetadata
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ParameterMetadataView<'a> {
-    spec: &'a ParameterSpec,
+    id: &'a ParameterId,
     trainable: bool,
+    alias_of: Option<&'a ParameterId>,
+    group: Option<&'a str>,
+    linear_companion: Option<LinearCompanionRole>,
+    linear_companion_of: Option<&'a ParameterId>,
+    linear_row_layout: LinearRowLayout,
 }
 impl<'a> ParameterMetadataView<'a> {
     /// Borrows the actual specification; creates no names or owning metadata.
-    pub const fn from_spec(spec: &'a ParameterSpec, trainable: bool) -> Self {
-        Self { spec, trainable }
+    pub fn from_spec(spec: &'a ParameterSpec, trainable: bool) -> Self {
+        Self {
+            id: &spec.id,
+            trainable,
+            alias_of: spec.alias_of.as_ref(),
+            group: spec.group.as_deref(),
+            linear_companion: spec.linear_companion,
+            linear_companion_of: spec.linear_companion_of.as_ref(),
+            linear_row_layout: spec.linear_row_layout,
+        }
     }
     /// Exact retained authoritative parameter identity.
     pub const fn id(self) -> &'a ParameterId {
-        &self.spec.id
+        self.id
     }
     /// Current trainability, which can differ from the construction default.
     pub const fn trainable(self) -> bool {
         self.trainable
     }
     /// Exact authoritative target for a logical alias, if declared.
-    pub fn alias_of(self) -> Option<&'a ParameterId> {
-        self.spec.alias_of.as_ref()
+    pub const fn alias_of(self) -> Option<&'a ParameterId> {
+        self.alias_of
     }
     /// Borrowed atomic encoding/sharding group.
-    pub fn group(self) -> Option<&'a str> {
-        self.spec.group.as_deref()
+    pub const fn group(self) -> Option<&'a str> {
+        self.group
     }
     /// Physical linear-companion role.
     pub const fn linear_companion(self) -> Option<LinearCompanionRole> {
-        self.spec.linear_companion
+        self.linear_companion
     }
     /// Primary weight to which this physical companion belongs.
-    pub fn linear_companion_of(self) -> Option<&'a ParameterId> {
-        self.spec.linear_companion_of.as_ref()
+    pub const fn linear_companion_of(self) -> Option<&'a ParameterId> {
+        self.linear_companion_of
     }
     /// Exact independent row-block origins from the same declaration.
     pub const fn linear_row_layout(self) -> LinearRowLayout {
-        self.spec.linear_row_layout
+        self.linear_row_layout
     }
-    /// Ordinary owned conversion; this explicitly clones retained names.
+    /// Explicit owned output conversion; clones retained names at the caller boundary.
     pub fn to_owned(self) -> ParameterMetadata {
         ParameterMetadata {
-            id: self.spec.id.clone(),
+            id: self.id.clone(),
             trainable: self.trainable,
-            alias_of: self.spec.alias_of.clone(),
-            group: self.spec.group.clone(),
-            linear_companion: self.spec.linear_companion,
-            linear_companion_of: self.spec.linear_companion_of.clone(),
-            linear_row_layout: self.spec.linear_row_layout,
+            alias_of: self.alias_of.cloned(),
+            group: self.group.map(str::to_owned),
+            linear_companion: self.linear_companion,
+            linear_companion_of: self.linear_companion_of.cloned(),
+            linear_row_layout: self.linear_row_layout,
+        }
+    }
+}
+impl ParameterMetadata {
+    /// Borrows an explicitly retained metadata output without cloning its names.
+    pub fn as_view(&self) -> ParameterMetadataView<'_> {
+        ParameterMetadataView {
+            id: &self.id,
+            trainable: self.trainable,
+            alias_of: self.alias_of.as_ref(),
+            group: self.group.as_deref(),
+            linear_companion: self.linear_companion,
+            linear_companion_of: self.linear_companion_of.as_ref(),
+            linear_row_layout: self.linear_row_layout,
         }
     }
 }
@@ -76,9 +103,6 @@ impl<'a> ParameterMetadataView<'a> {
 /// Fixed failure of a strict borrowed source traversal, never an owned diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ParameterSourceError {
-    /// The participant has no strict borrowed companion.
-    #[error("borrowed parameter source is unavailable")]
-    Unavailable,
     /// A skipped field has no complete retained-payload classification.
     #[error("parameter source contains an unclassified retained field")]
     UnclassifiedRetainedField,

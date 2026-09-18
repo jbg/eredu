@@ -623,7 +623,7 @@ pub(super) fn error_control_bytes() -> Option<usize> {
     [
         Stream::device_type_control_bytes()?,
         routed_partition::control_bytes()?,
-        eredu_nn::Error::retained_source_control_bytes::<Error>()?,
+        eredu_nn::Error::retained_source_construction_bytes::<Error>()?,
         crate::backend::array_copy::capture_original_error_control_bytes()?.checked_mul(2)?,
         size_of::<NativeScheduledCapture<'static>>(),
         size_of::<Option<safemlx::OriginalScopeObserver>>(),

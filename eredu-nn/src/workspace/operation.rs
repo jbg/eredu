@@ -173,8 +173,15 @@ pub enum WorkspaceOperationKindView<'a> {
     },
     /// Reduction over one validated axis, retaining numerical precision policy.
     Reduction(&'static str, i32, bool),
-    /// Final-axis normalization; name distinguishes RMS and layer normalization.
+    /// Final-axis RMS or related normalization, including optional grouping.
     Normalization(&'static str, Option<i32>),
+    /// Layer normalization with the exact optional affine operand roles.
+    LayerNorm {
+        /// A learned multiplicative weight follows the input.
+        weight: bool,
+        /// An additive bias follows the input and optional weight.
+        bias: bool,
+    },
     /// Constructed normalization, including learned-offset and grouping policy.
     ConstructedNormalization(&'a crate::NormalizationConstructionSpec),
     /// Fused gated product with exact clipping and activation policy.
@@ -393,6 +400,7 @@ impl WorkspaceOperationKind {
             },
             Self::Reduction(a0, a1, a2) => V::Reduction(*a0, *a1, *a2),
             Self::Normalization(a0, a1) => V::Normalization(*a0, *a1),
+            Self::LayerNorm { weight, bias } => V::LayerNorm { weight: *weight, bias: *bias },
             Self::ConstructedNormalization(a0) => V::ConstructedNormalization(a0),
             Self::GatedProduct(a0) => V::GatedProduct(*a0),
             Self::GatedDeltaScan => V::GatedDeltaScan,

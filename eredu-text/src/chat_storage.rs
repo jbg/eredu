@@ -145,7 +145,30 @@ pub struct ChatTemplatePlan<'a> {
 impl<'a> ChatTemplatePlan<'a> {
     /// Borrow exact UTF-8 template source under the ordinary chat settings/name.
     pub fn prepare_utf8(source: &'a str, model_id: &'a str) -> Result<Self, ChatSourceError> {
-        let name = vm::TemplateName::Single(model_id);
+        Self::prepare_source(source, vm::TemplateName::Single(model_id))
+    }
+    /// Borrow the actual loaded template selected for this request. Selection,
+    /// normalization and compilation create no intermediate source or name copy.
+    pub fn prepare_model(
+        template: &'a crate::tokenizer::ModelChatTemplate,
+        model_id: &'a str,
+        has_tools: bool,
+    ) -> Result<Self, ChatSourceError> {
+        let (source, entry) = template
+            .selected_source(has_tools)
+            .ok_or(ChatSourceError::MissingTemplate)?;
+        let name = entry.map_or(vm::TemplateName::Single(model_id), |entry| {
+            vm::TemplateName::Named {
+                model: model_id,
+                entry,
+            }
+        });
+        Self::prepare_source(source, name)
+    }
+    fn prepare_source(
+        source: &'a str,
+        name: vm::TemplateName<'a>,
+    ) -> Result<Self, ChatSourceError> {
         let settings = vm::TemplateSettings::text_chat();
         let inner = if source == vm::supported_source() {
             CompilerPlan::Image(
@@ -164,12 +187,16 @@ impl<'a> ChatTemplatePlan<'a> {
         };
         Self::finish(Input::Utf8(source), Ok(inner), None)
     }
-    /// Validate complete JSON grammar and plan its actual text default without
+    /// Validate complete JSON grammar and plan its request-selected source without
     /// owned config values. Numeric conversion uses the ordinary scalar parser
     /// only during admitted compilation; its error precedes a retained selection
     /// failure. No serde map, normalization String, Environment or previously
     /// compiled source is constructed or adopted.
-    pub fn prepare_config(config: &'a [u8], model_id: &'a str) -> Result<Self, ChatSourceError> {
+    pub fn prepare_config(
+        config: &'a [u8],
+        model_id: &'a str,
+        has_tools: bool,
+    ) -> Result<Self, ChatSourceError> {
         let document = Document::parse(config).map_err(ChatSourceError::Json)?;
         let numeric = NumericPlan::prepare(document)?;
         let planned = (|| {
@@ -183,15 +210,18 @@ impl<'a> ChatTemplatePlan<'a> {
             if value.is_null() {
                 return Err(ChatSourceError::MissingTemplate);
             }
-            let (selected, named) = if let Some(source) = value.string() {
-                (source, false)
+            let (selected, entry) = if let Some(source) = value.string() {
+                (source, None)
             } else {
-                (select_default(value)?, true)
+                let (source, name) = select_named(value, has_tools)?;
+                (source, Some(name))
             };
-            let name = if named {
-                vm::TemplateName::Default(model_id)
-            } else {
-                vm::TemplateName::Single(model_id)
+            let name = match entry {
+                Some(entry) => vm::TemplateName::Named {
+                    model: model_id,
+                    entry,
+                },
+                None => vm::TemplateName::Single(model_id),
             };
             let settings = vm::TemplateSettings::text_chat();
             // The generic path retains the actual validated decoded-byte iterator.
@@ -245,6 +275,10 @@ impl<'a> ChatTemplatePlan<'a> {
             numeric.as_ref().map_or(0, NumericPlan::controls),
             Document::control_bytes().ok_or(ChatSourceError::Overflow)?,
             size_of::<Input<'a>>(),
+            size_of::<(&[u8], &str, bool)>(),
+            size_of::<(Value<'a>, bool)>(),
+            size_of::<[Option<StringValue<'a>>; 2]>(),
+            size_of::<Result<(StringValue<'a>, &'static str), ChatSourceError>>(),
             size_of::<Self>(),
             size_of::<Result<Self, ChatSourceError>>(),
             size_of::<ChatSourceError>(),
@@ -361,9 +395,13 @@ fn entry(value: Value<'_>) -> Result<(StringValue<'_>, StringValue<'_>), ChatSou
     }
     Ok((name, template))
 }
-fn select_default(value: Value<'_>) -> Result<StringValue<'_>, ChatSourceError> {
+fn select_named(
+    value: Value<'_>,
+    has_tools: bool,
+) -> Result<(StringValue<'_>, &'static str), ChatSourceError> {
     let array = value.array().ok_or(ChatSourceError::TemplateProfile)?;
-    let mut selected = None;
+    let mut default = None;
+    let mut tools = None;
     let mut count = 0usize;
     for (index, item) in array.enumerate() {
         let (name, template) = entry(item)?;
@@ -374,14 +412,22 @@ fn select_default(value: Value<'_>) -> Result<StringValue<'_>, ChatSourceError> 
             }
         }
         if name.is("default") {
-            selected = Some(template);
+            default = Some(template);
+        } else if name.is("tool_use") {
+            tools = Some(template);
         }
         count = count.checked_add(1).ok_or(ChatSourceError::Overflow)?;
     }
     if count == 0 {
         return Err(ChatSourceError::TemplateProfile);
     }
-    selected.ok_or(ChatSourceError::MissingTemplate)
+    let name = crate::tokenizer::selected_chat_template_name(has_tools, tools.is_some());
+    let source = match name {
+        "tool_use" => tools,
+        _ => default,
+    }
+    .ok_or(ChatSourceError::MissingTemplate)?;
+    Ok((source, name))
 }
 /// Fresh closed source with named readonly projections, no raw VM escape.
 #[derive(Debug)]
@@ -406,13 +452,36 @@ impl PreparedChatTemplate {
             ModelChatTemplate::Single(source) => {
                 self.identity == SourceIdentity::new(source.bytes()) && self.name() == model_id
             }
-            ModelChatTemplate::Named(templates) => {
-                templates
-                    .get("default")
-                    .is_some_and(|source| self.identity == SourceIdentity::new(source.bytes()))
-                    && self.name().strip_prefix(model_id) == Some("::chat_template::default")
-            }
+            ModelChatTemplate::Named(templates) => self
+                .name()
+                .strip_prefix(model_id)
+                .and_then(|suffix| suffix.strip_prefix("::chat_template::"))
+                .and_then(|name| templates.get(name))
+                .is_some_and(|source| self.identity == SourceIdentity::new(source.bytes())),
         }
+    }
+
+    /// Checks both the exact source and request-dependent named selection.
+    pub fn matches_selection(
+        &self,
+        template: &crate::tokenizer::ModelChatTemplate,
+        model_id: &str,
+        has_tools: bool,
+    ) -> bool {
+        template
+            .selected_source(has_tools)
+            .is_some_and(|(source, name)| {
+                self.identity == SourceIdentity::new(source.bytes())
+                    && match name {
+                        None => self.name() == model_id,
+                        Some(name) => {
+                            self.name()
+                                .strip_prefix(model_id)
+                                .and_then(|suffix| suffix.strip_prefix("::chat_template::"))
+                                == Some(name)
+                        }
+                    }
+            })
     }
 
     /// Legacy message-only render calls preserve these defaults because they do
@@ -730,6 +799,6 @@ mod tests;
 
 /// Immutable input records for source-owned profile probes; no object callbacks.
 pub use minijinja::bounded::{
-    RecordField as ChatRecordField, RecordFields as ChatRecordFields,
+    InputArray as ChatInputArray, RecordField as ChatRecordField, RecordFields as ChatRecordFields,
     RecordValue as ChatRecordValue,
 };

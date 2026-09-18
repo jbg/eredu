@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use anyhow::{Result, ensure};
+use crate::{ParserResult as Result, parser_ensure as ensure};
 use regex_syntax::ParserBuilder;
 
 use crate::{
@@ -10,7 +10,6 @@ use crate::{
         byteset_set,
     },
     mapper::map_ast,
-    pp::{byte_to_string, byteset_to_string},
     simplify::ConcatElement,
 };
 
@@ -27,6 +26,8 @@ pub struct RegexBuilder {
 
 type QuoteCache = hashbrown::HashMap<ExprRef, ExprRef, crate::RandomState>;
 mod source_copy;
+mod diagnostic;
+pub use diagnostic::AstDisplay;
 pub use source_copy::{
     RegexBuilderCopyFailure, RegexBuilderCopyPlan, RegexBuilderCopyRequirements,
 };
@@ -147,7 +148,7 @@ mod ast_copy;
 pub use ast_copy::{RegexAstCopyFailure, RegexAstCopyPlan, RegexAstCopyRequirements};
 impl Clone for RegexAst {
     fn clone(&self) -> Self {
-        self.source_copy_plan()
+        self.source_copy_plan(&crate::ParserAllocationFunding::unenforced())
             .expect("ordinary AST source geometry")
             .compile()
             .expect("ordinary AST source allocation")
@@ -203,157 +204,53 @@ impl RegexAst {
         }
     }
 
-    pub fn write_to_str(&self, dst: &mut String, max_len: usize, exprset: Option<&ExprSet>) {
-        let mut todo = vec![Some(self)];
-        while let Some(ast) = todo.pop() {
-            if dst.len() >= max_len {
-                dst.push_str("...");
-                break;
-            }
-            if ast.is_none() {
-                dst.push(')');
-                continue;
-            }
-            let ast = ast.unwrap();
-            dst.push_str(" (");
-            dst.push_str(ast.tag());
-            todo.push(None);
-            match ast {
-                RegexAst::And(_)
-                | RegexAst::Or(_)
-                | RegexAst::Concat(_)
-                | RegexAst::LookAhead(_)
-                | RegexAst::Not(_) => {}
-                RegexAst::Byte(b) => {
-                    dst.push(' ');
-                    dst.push_str(&byte_to_string(*b));
-                }
-                RegexAst::ByteSet(bs) => {
-                    dst.push(' ');
-                    if bs.len() == 256 / 32 {
-                        dst.push_str(&byteset_to_string(bs));
-                    } else {
-                        dst.push_str(&format!("invalid byteset len: {}", bs.len()))
-                    }
-                }
-                RegexAst::SearchRegex(s) | RegexAst::Regex(s) => {
-                    dst.push(' ');
-                    write_regex(dst, s);
-                }
-                RegexAst::Literal(s) => {
-                    dst.push_str(&format!(" {:?}", s));
-                }
-                RegexAst::ByteLiteral(s) => {
-                    dst.push_str(&format!(" {:?}", String::from_utf8_lossy(s)));
-                }
-                RegexAst::ExprRef(r) => {
-                    if let Some(es) = exprset {
-                        let e_len = max_len.saturating_sub(dst.len());
-                        dst.push_str(&format!(" {}", es.expr_to_string_max_len(*r, e_len)));
-                    } else {
-                        dst.push_str(&format!(" {}", r.as_usize()));
-                    }
-                }
-                RegexAst::Repeat(_, min, max) => {
-                    dst.push_str(&format!("{{{},{}}} ", min, max));
-                }
-                RegexAst::MultipleOf(d, s) => {
-                    if *s == 0 {
-                        dst.push_str(&format!(" % {} == 0 ", d));
-                    } else {
-                        dst.push_str(&format!(" % {}x10^-{} == 0", d, s));
-                    }
-                }
-                RegexAst::JsonQuote(_, opts) => {
-                    dst.push_str(&format!(" {:?}", opts));
-                }
-                RegexAst::EmptyString | RegexAst::NoMatch => {}
-            }
-            for c in ast.get_args().iter().rev() {
-                todo.push(Some(c));
-            }
-        }
+    pub fn display<'a>(&'a self, maximum: usize, expressions: Option<&'a ExprSet>) -> AstDisplay<'a> {
+        AstDisplay { source: self, maximum, expressions }
     }
-}
 
-pub(crate) fn write_regex(dst: &mut String, regex: &str) {
-    dst.push('/');
-    let mut escaped = false;
-    for c in regex.chars() {
-        match c {
-            '\\' if !escaped => {
-                escaped = true;
-                continue;
-            }
-            '/' => {
-                dst.push('\\');
-                dst.push(c);
-            }
-            '\n' => {
-                dst.push_str("\\n");
-            }
-            '\r' => {
-                dst.push_str("\\r");
-            }
-            '\t' => {
-                dst.push_str("\\t");
-            }
-            _ => {
-                if c < ' ' {
-                    dst.push_str(&format!("\\x{:02X}", c as u32));
-                } else {
-                    if escaped {
-                        dst.push('\\');
-                    }
-                    dst.push(c);
-                }
-            }
-        }
-        escaped = false;
+    pub fn write_to_str(&self, dst: &mut String, max_len: usize, exprset: Option<&ExprSet>) {
+        use std::fmt::Write;
+        let available = max_len.saturating_sub(dst.len());
+        write!(dst, "{}", self.display(available, exprset)).expect("String formatting");
     }
-    if escaped {
-        dst.push_str("\\\\");
-    }
-    dst.push('/');
 }
 
 impl Debug for RegexAst {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut s = String::new();
-        self.write_to_str(&mut s, 512, None);
-        write!(f, "{}", s)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.display(512, None), formatter)
     }
 }
 
 impl Default for RegexBuilder {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::ParserAllocationFunding::unenforced()).expect("unenforced regex builder")
     }
 }
 
 impl RegexBuilder {
-    pub fn new() -> Self {
-        Self {
-            parser_builder: ParserBuilder::new(),
-            exprset: ExprSet::new(256),
-            json_quote_cache: QuoteCache::default(),
-        }
+    pub fn new(funding: crate::ParserAllocationFunding) -> Result<Self> {
+        Ok(Self { parser_builder: ParserBuilder::new(), exprset: ExprSet::new(256, funding)?, json_quote_cache: QuoteCache::default() })
     }
 
     pub fn to_regex_limited(&self, r: ExprRef, max_fuel: u64) -> Result<Regex> {
-        Regex::new_with_exprset(self.exprset.clone(), r, max_fuel)
+        Regex::new_with_exprset(self.exprset.copy_for_construction()?, r, max_fuel)
     }
 
-    pub fn to_regex(&self, r: ExprRef) -> Regex {
-        Regex::new_with_exprset(self.exprset.clone(), r, u64::MAX).unwrap()
+    pub fn to_regex(&self, r: ExprRef) -> Result<Regex> {
+        self.to_regex_limited(r, u64::MAX)
     }
 
     pub fn into_regex_limited(self, r: ExprRef, max_fuel: u64) -> Result<Regex> {
         Regex::new_with_exprset(self.exprset, r, max_fuel)
     }
 
-    pub fn into_regex(self, r: ExprRef) -> Regex {
-        Regex::new_with_exprset(self.exprset, r, u64::MAX).unwrap()
+    pub fn into_regex(self, r: ExprRef) -> Result<Regex> {
+        self.into_regex_limited(r, u64::MAX)
+    }
+
+    /// The retained original producer account for extensions building expressions.
+    pub fn allocation_funding(&self) -> Result<&crate::ParserAllocationFunding> {
+        Ok(self.exprset.construction_funding()?)
     }
 
     pub fn exprset(&self) -> &ExprSet {
@@ -364,8 +261,8 @@ impl RegexBuilder {
         self.exprset
     }
 
-    pub fn reserve(&mut self, size: usize) {
-        self.exprset.reserve(size);
+    pub fn reserve(&mut self, size: usize) -> Result<()> {
+        Ok(self.exprset.reserve(size)?)
     }
 
     pub fn json_quote(&mut self, e: ExprRef, options: &JsonQuoteOptions) -> Result<ExprRef> {
@@ -384,8 +281,8 @@ impl RegexBuilder {
         }
 
         // byteset of all possible single-char quotes
-        fn single_quote_byteset(include_nl: bool, options: &JsonQuoteOptions) -> Vec<u32> {
-            let mut quoted_bs = byteset_256();
+        fn single_quote_byteset(include_nl: bool, options: &JsonQuoteOptions) -> [u32; 8] {
+            let mut quoted_bs = [0; 8];
             for c in b"\"\\bfrt" {
                 options.set_if_allowed(&mut quoted_bs, *c);
             }
@@ -396,8 +293,8 @@ impl RegexBuilder {
         }
 
         // all hex digits, including A or not
-        fn hex_byteset(include_nl: bool) -> Vec<u32> {
-            let mut hex_bs = byteset_256();
+        fn hex_byteset(include_nl: bool) -> [u32; 8] {
+            let mut hex_bs = [0; 8];
             for c in b"0123456789bcdefBCDEF" {
                 byteset_set(&mut hex_bs, *c as usize);
             }
@@ -409,51 +306,64 @@ impl RegexBuilder {
         }
 
         // all control characters, including \n or not
+        fn funded_or(exprset: &mut ExprSet, args: &[ExprRef]) -> Result<ExprRef> {
+            let funding = exprset.construction_funding()?.clone();
+            let mut values = Vec::new();
+            funding.try_extend_copy(&mut values, args)?;
+            Ok(exprset.mk_or(&mut values)?)
+        }
         fn quote_all_ctrl(
             exprset: &mut ExprSet,
             include_nl: bool,
             options: &JsonQuoteOptions,
-        ) -> ExprRef {
-            let upref = exprset.mk_literal("u00");
-            let backslash = exprset.mk_byte(b'\\');
-            let single_quote = exprset.mk_byte_set(&single_quote_byteset(include_nl, options));
+        ) -> Result<ExprRef> {
+            let funding = exprset.construction_funding()?.clone();
+            let upref = exprset.mk_literal("u00")?;
+            let backslash = exprset.mk_byte(b'\\')?;
+            let single_quote = exprset.mk_byte_set(&single_quote_byteset(include_nl, options))?;
             let u0000 = if !options.is_allowed(b'u') {
                 ExprRef::NO_MATCH
             } else if include_nl {
-                let hex0 = exprset.mk_byte_set(&byteset_from_range(b'0', b'1'));
-                let hex1 = exprset.mk_byte_set(&hex_byteset(include_nl));
-                exprset.mk_concat_vec(&[upref, hex0, hex1])
+                let hex0 = exprset.mk_byte_set(&range_byteset(b'0', b'1'))?;
+                let hex1 = exprset.mk_byte_set(&hex_byteset(include_nl))?;
+                exprset.mk_concat_vec(&[upref, hex0, hex1])?
             } else {
-                let n0 = exprset.mk_byte(b'0');
-                let n1 = exprset.mk_byte(b'1');
-                let hex0 = exprset.mk_byte_set(&hex_byteset(false));
-                let hex0 = exprset.mk_concat(n0, hex0);
-                let hex1 = exprset.mk_byte_set(&hex_byteset(true));
-                let hex1 = exprset.mk_concat(n1, hex1);
-                let hex01 = exprset.mk_or(&mut vec![hex0, hex1]);
-                exprset.mk_concat(upref, hex01)
+                let n0 = exprset.mk_byte(b'0')?;
+                let n1 = exprset.mk_byte(b'1')?;
+                let hex0 = exprset.mk_byte_set(&hex_byteset(false))?;
+                let hex0 = exprset.mk_concat(n0, hex0)?;
+                let hex1 = exprset.mk_byte_set(&hex_byteset(true))?;
+                let hex1 = exprset.mk_concat(n1, hex1)?;
+                let hex01 = funded_or(exprset, &[hex0, hex1])?;
+                exprset.mk_concat(upref, hex01)?
             };
 
-            let u_or_single = exprset.mk_or(&mut vec![u0000, single_quote]);
-            exprset.mk_concat(backslash, u_or_single)
+            let u_or_single = funded_or(exprset, &[u0000, single_quote])?;
+            Ok(exprset.mk_concat(backslash, u_or_single)?)
         }
 
+        fn range_byteset(first: u8, last: u8) -> [u32; 8] {
+            let mut words = [0; 8];
+            for byte in first..=last { byteset_set(&mut words, usize::from(byte)); }
+            words
+        }
         fn quote_byteset(
             exprset: &mut ExprSet,
-            bs: Vec<u32>,
+            bs: [u32; 8],
             options: &JsonQuoteOptions,
-        ) -> ExprRef {
-            let upref = exprset.mk_literal("u00");
-            let backslash = exprset.mk_byte(b'\\');
+        ) -> Result<ExprRef> {
+            let funding = exprset.construction_funding()?.clone();
+            let upref = exprset.mk_literal("u00")?;
+            let backslash = exprset.mk_byte(b'\\')?;
 
             let quoted = if bs[0] == !(1 << b'\n') {
                 // everything except for \n
-                quote_all_ctrl(exprset, false, options)
+                quote_all_ctrl(exprset, false, options)?
             } else if bs[0] == 0xffff_ffff {
                 // everything
-                quote_all_ctrl(exprset, true, options)
+                quote_all_ctrl(exprset, true, options)?
             } else {
-                let mut quoted_bs = byteset_256();
+                let mut quoted_bs = [0; 8];
                 let mut other_bytes = vec![];
                 for b in 0..32 {
                     if byteset_contains(&bs, b) {
@@ -461,51 +371,55 @@ impl RegexBuilder {
                             options.set_if_allowed(&mut quoted_bs, q);
                         }
                         if options.is_allowed(b'u') {
-                            let other = exprset.mk_literal(&format!("{:02x}", b));
-                            other_bytes.push(other);
-                            let other = exprset.mk_literal(&format!("{:02X}", b));
-                            other_bytes.push(other);
+                            let digits = b"0123456789abcdef";
+                            let other = exprset.mk_byte_literal(&[digits[b / 16], digits[b % 16]])?;
+                            funding.try_push(&mut other_bytes, other)?;
+                            let digits = b"0123456789ABCDEF";
+                            let other = exprset.mk_byte_literal(&[digits[b / 16], digits[b % 16]])?;
+                            funding.try_push(&mut other_bytes, other)?;
                         }
                     }
                 }
 
-                let quoted_bs = exprset.mk_byte_set(&quoted_bs);
-                let other_bytes = exprset.mk_or(&mut other_bytes);
-                let other_bytes = exprset.mk_concat(upref, other_bytes);
+                let quoted_bs = exprset.mk_byte_set(&quoted_bs)?;
+                let other_bytes = exprset.mk_or(&mut other_bytes)?;
+                let other_bytes = exprset.mk_concat(upref, other_bytes)?;
 
-                let quoted_or_other = exprset.mk_or(&mut vec![quoted_bs, other_bytes]);
-                exprset.mk_concat(backslash, quoted_or_other)
+                let quoted_or_other = funded_or(exprset, &[quoted_bs, other_bytes])?;
+                exprset.mk_concat(backslash, quoted_or_other)?
             };
 
             let mut bs_without_ctrl = bs;
             bs_without_ctrl[0] = 0;
-            let mut alts = vec![quoted];
+            let mut alts = Vec::new();
+            funding.try_push(&mut alts, quoted)?;
             if byteset_contains(&bs_without_ctrl, b'\\' as usize) {
                 if options.is_allowed(b'\\') {
-                    alts.push(exprset.mk_literal("\\\\"));
+                    funding.try_push(&mut alts, exprset.mk_literal("\\\\")?)?;
                 }
                 byteset_clear(&mut bs_without_ctrl, b'\\' as usize);
             }
             if byteset_contains(&bs_without_ctrl, b'"' as usize) {
                 if options.is_allowed(b'"') {
-                    alts.push(exprset.mk_literal("\\\""));
+                    funding.try_push(&mut alts, exprset.mk_literal("\\\"")?)?;
                 }
                 byteset_clear(&mut bs_without_ctrl, b'"' as usize);
             }
             if byteset_contains(&bs_without_ctrl, 0x7F) {
                 if options.is_allowed(b'u') {
-                    alts.push(exprset.mk_literal("\\u007F"));
-                    alts.push(exprset.mk_literal("\\u007f"));
+                    funding.try_push(&mut alts, exprset.mk_literal("\\u007F")?)?;
+                    funding.try_push(&mut alts, exprset.mk_literal("\\u007f")?)?;
                 }
                 byteset_clear(&mut bs_without_ctrl, 0x7F);
             }
-            let bs_without_ctrl = exprset.mk_byte_set(&bs_without_ctrl);
-            alts.push(bs_without_ctrl);
-            exprset.mk_or(&mut alts)
+            let bs_without_ctrl = exprset.mk_byte_set(&bs_without_ctrl)?;
+            funding.try_push(&mut alts, bs_without_ctrl)?;
+            Ok(exprset.mk_or(&mut alts)?)
         }
 
+        let funding = self.exprset.construction_funding()?.clone();
         for c in options.allowed_escapes.as_bytes() {
-            ensure!(
+            ensure!(&funding,
                 b"\"\\bfnrtu".contains(c),
                 "invalid escape character in allowed_escapes: {}",
                 *c as char
@@ -516,13 +430,14 @@ impl RegexBuilder {
             matches!(b, b'\\' | b'"' | 0x7F | 0..0x20)
         }
 
-        let r = self.exprset.map_with_cache(
+        let r = self.exprset.map(
             e,
             &mut self.json_quote_cache,
             false,
             |e| e,
-            |exprset, args, e| -> ExprRef {
-                match exprset.get(e) {
+            |exprset, args, e| -> Result<ExprRef> {
+                let funding = exprset.construction_funding()?.clone();
+                Ok(match exprset.get(e) {
                     Expr::ByteSet(bs) => {
                         let has_bytes_below_0x20 = bs[0] != 0;
                         if has_bytes_below_0x20
@@ -530,8 +445,8 @@ impl RegexBuilder {
                             || byteset_contains(bs, b'"' as usize)
                             || byteset_contains(bs, 0x7F)
                         {
-                            let bs = bs.to_vec();
-                            quote_byteset(exprset, bs, options)
+                            let bs: [u32; 8] = bs.try_into().expect("byte alphabet width");
+                            quote_byteset(exprset, bs, options)?
                         } else {
                             // no need to quote
                             e
@@ -539,7 +454,7 @@ impl RegexBuilder {
                     }
                     Expr::Byte(b) => {
                         if byte_needs_quote(b) {
-                            quote_byteset(exprset, byteset_from_range(b, b), options)
+                            quote_byteset(exprset, range_byteset(b, b), options)?
                         } else {
                             // no need to quote
                             e
@@ -549,7 +464,9 @@ impl RegexBuilder {
                         if bytes.iter().any(|b| byte_needs_quote(*b)) {
                             let mut acc = vec![];
                             let mut idx = 0;
-                            let bytes = bytes.to_vec();
+                            let mut copy = [0; ExprRef::MAX_BYTE_CONCAT];
+                            copy[..bytes.len()].copy_from_slice(bytes);
+                            let bytes = &copy[..bytes.len()];
                             while idx < bytes.len() {
                                 let idx0 = idx;
                                 while idx < bytes.len() && !byte_needs_quote(bytes[idx]) {
@@ -557,24 +474,26 @@ impl RegexBuilder {
                                 }
                                 let slice = &bytes[idx0..idx];
                                 if !slice.is_empty() {
-                                    ConcatElement::Bytes(slice).push_owned_to(&mut acc);
+                                    ConcatElement::Bytes(slice).push_owned_to(&mut acc, &funding)?;
                                 }
                                 if idx < bytes.len() {
                                     let b = bytes[idx];
                                     let q =
-                                        quote_byteset(exprset, byteset_from_range(b, b), options);
-                                    ConcatElement::Expr(q).push_owned_to(&mut acc);
+                                        quote_byteset(exprset, range_byteset(b, b), options)?;
+                                    ConcatElement::Expr(q).push_owned_to(&mut acc, &funding)?;
                                     idx += 1;
                                 }
                             }
                             // Append the mapped tail so it isn't dropped.
-                            ConcatElement::Expr(args[0]).push_owned_to(&mut acc);
-                            exprset._mk_concat_vec(acc)
+                            ConcatElement::Expr(args[0]).push_owned_to(&mut acc, &funding)?;
+                            exprset._mk_concat_vec(acc)?
                         } else if args[0] == args0 {
                             e
                         } else {
-                            let copy = bytes.to_vec();
-                            exprset.mk_byte_concat(&copy, args[0])
+                            let mut copy = [0; ExprRef::MAX_BYTE_CONCAT];
+                            copy[..bytes.len()].copy_from_slice(bytes);
+                            let len = bytes.len();
+                            exprset.mk_byte_concat(&copy[..len], args[0])?
                         }
                     }
                     // always identity
@@ -582,21 +501,21 @@ impl RegexBuilder {
                     // if all args map to themselves, return back the same expression
                     x if x.args() == args => e,
                     // otherwise, actually map the args
-                    Expr::And(_, _) => exprset.mk_and(args),
-                    Expr::Or(_, _) => exprset.mk_or(args),
-                    Expr::Concat(_, _) => exprset.mk_concat(args[0], args[1]),
-                    Expr::Not(_, _) => exprset.mk_not(args[0]),
-                    Expr::Lookahead(_, _, _) => exprset.mk_lookahead(args[0], 0),
-                    Expr::Repeat(_, _, min, max) => exprset.mk_repeat(args[0], min, max),
-                }
+                    Expr::And(_, _) => exprset.mk_and(args)?,
+                    Expr::Or(_, _) => exprset.mk_or(args)?,
+                    Expr::Concat(_, _) => exprset.mk_concat(args[0], args[1])?,
+                    Expr::Not(_, _) => exprset.mk_not(args[0])?,
+                    Expr::Lookahead(_, _, _) => exprset.mk_lookahead(args[0], 0)?,
+                    Expr::Repeat(_, _, min, max) => exprset.mk_repeat(args[0], min, max)?,
+                })
             },
-        );
+        )?;
 
-        let quote = self.exprset.mk_byte(b'"');
+        let quote = self.exprset.mk_byte(b'"')?;
         let r = if options.raw_mode {
             r
         } else {
-            self.exprset.mk_concat_vec(&[quote, r, quote])
+            self.exprset.mk_concat_vec(&[quote, r, quote])?
         };
         Ok(r)
     }
@@ -612,37 +531,45 @@ impl RegexBuilder {
     }
 
     pub fn mk_regex_and(&mut self, s: &[&str]) -> Result<ExprRef> {
-        let args = s
-            .iter()
-            .map(|s| Ok(RegexAst::ExprRef(self.mk_regex(s)?)))
-            .collect::<Result<Vec<_>>>()?;
-        self.mk(&RegexAst::And(args))
+        let funding = self.exprset.construction_funding()?.clone();
+        let mut args = Vec::new();
+        funding.try_grow_vec(&mut args, s.len())?;
+        for pattern in s { args.push(self.mk_regex(pattern)?); }
+        Ok(self.exprset.mk_and(&mut args)?)
     }
 
     pub fn mk_contained_in(&mut self, small: &str, big: &str) -> Result<ExprRef> {
-        let a = RegexAst::ExprRef(self.mk_regex(small)?);
-        let b = RegexAst::ExprRef(self.mk_regex(big)?);
-        self.mk(&a.contained_in(&b))
+        let a = self.mk_regex(small)?;
+        let b = self.mk_regex(big)?;
+        self.contained_refs(a, b)
     }
 
     pub fn mk_contained_in_ast(&mut self, small: &RegexAst, big: &RegexAst) -> Result<ExprRef> {
-        let a = RegexAst::ExprRef(self.mk(small)?);
-        let b = RegexAst::ExprRef(self.mk(big)?);
-        self.mk(&a.contained_in(&b))
+        let a = self.mk(small)?;
+        let b = self.mk(big)?;
+        self.contained_refs(a, b)
     }
 
+    fn contained_refs(&mut self, small: ExprRef, big: ExprRef) -> Result<ExprRef> {
+        let not = self.exprset.mk_not(big)?;
+        let funding = self.exprset.construction_funding()?.clone();
+        let mut args = Vec::new();
+        funding.try_extend_copy(&mut args, &[small, not])?;
+        Ok(self.exprset.mk_and(&mut args)?)
+    }
     pub fn is_contained_in(&mut self, small: &str, big: &str, max_fuel: u64) -> Result<bool> {
         let r = self.mk_contained_in(small, big)?;
-        Ok(self.clone().to_regex_limited(r, max_fuel)?.always_empty())
+        Ok(self.to_regex_limited(r, max_fuel)?.always_empty())
     }
 
     pub fn mk_prefix_tree(&mut self, branches: Vec<(Vec<u8>, ExprRef)>) -> Result<ExprRef> {
-        Ok(self.exprset.mk_prefix_tree(branches))
+        Ok(self.exprset.mk_prefix_tree(branches)?)
     }
 
     pub fn mk(&mut self, ast: &RegexAst) -> Result<ExprRef> {
+        let funding = self.exprset.construction_funding()?.clone();
         map_ast(
-            ast,
+            ast, &funding,
             |ast| ast.get_args(),
             |ast, new_args| {
                 let r = match ast {
@@ -650,32 +577,32 @@ impl RegexBuilder {
                     RegexAst::SearchRegex(s) => self.mk_regex_for_serach(s)?,
                     RegexAst::JsonQuote(_, opts) => self.json_quote(new_args[0], opts)?,
                     RegexAst::ExprRef(r) => {
-                        ensure!(self.exprset.is_valid(*r), "invalid ref");
+                        ensure!(&funding, self.exprset.is_valid(*r), "invalid ref");
                         *r
                     }
-                    RegexAst::And(_) => self.exprset.mk_and(new_args),
-                    RegexAst::Or(_) => self.exprset.mk_or(new_args),
-                    RegexAst::Concat(_) => self.exprset.mk_concat_vec(new_args),
-                    RegexAst::Not(_) => self.exprset.mk_not(new_args[0]),
-                    RegexAst::LookAhead(_) => self.exprset.mk_lookahead(new_args[0], 0),
+                    RegexAst::And(_) => self.exprset.mk_and(new_args)?,
+                    RegexAst::Or(_) => self.exprset.mk_or(new_args)?,
+                    RegexAst::Concat(_) => self.exprset.mk_concat_vec(new_args)?,
+                    RegexAst::Not(_) => self.exprset.mk_not(new_args[0])?,
+                    RegexAst::LookAhead(_) => self.exprset.mk_lookahead(new_args[0], 0)?,
                     RegexAst::EmptyString => ExprRef::EMPTY_STRING,
                     RegexAst::NoMatch => ExprRef::NO_MATCH,
-                    RegexAst::Literal(s) => self.exprset.mk_literal(s),
-                    RegexAst::ByteLiteral(s) => self.exprset.mk_byte_literal(s),
+                    RegexAst::Literal(s) => self.exprset.mk_literal(s)?,
+                    RegexAst::ByteLiteral(s) => self.exprset.mk_byte_literal(s)?,
                     RegexAst::Repeat(_, min, max) => {
-                        self.exprset.mk_repeat(new_args[0], *min, *max)
+                        self.exprset.mk_repeat(new_args[0], *min, *max)?
                     }
                     RegexAst::MultipleOf(d, s) => {
-                        ensure!(*d > 0, "invalid multiple of");
-                        self.exprset.mk_remainder_is(*d, *d, *s, false)
+                        ensure!(&funding, *d > 0, "invalid multiple of");
+                        self.exprset.mk_remainder_is(*d, *d, *s, false)?
                     }
-                    RegexAst::Byte(b) => self.exprset.mk_byte(*b),
+                    RegexAst::Byte(b) => self.exprset.mk_byte(*b)?,
                     RegexAst::ByteSet(bs) => {
-                        ensure!(
+                        ensure!(&funding,
                             bs.len() == self.exprset.alphabet_words,
                             "invalid byteset len"
                         );
-                        self.exprset.mk_byte_set(bs)
+                        self.exprset.mk_byte_set(bs)?
                     }
                 };
                 Ok(r)

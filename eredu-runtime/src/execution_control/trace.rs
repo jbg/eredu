@@ -18,7 +18,6 @@ pub struct TraceLimits {
 pub struct TraceBudget {
     limits: TraceLimits,
     emitted_bytes: u64,
-    prepared: bool,
 }
 impl TraceBudget {
     /// Starts a fresh non-rewindable transport budget.
@@ -26,22 +25,12 @@ impl TraceBudget {
         Self {
             limits,
             emitted_bytes: 0,
-            prepared: false,
         }
     }
-    // Used only by the runtime's closed speculative record producer. This is
-    // not admission for arbitrary user Serialize implementations or payloads.
-    pub(crate) fn new_prepared(limits: TraceLimits) -> Self {
-        Self {
-            limits,
-            emitted_bytes: 0,
-            prepared: true,
-        }
-    }
-    pub(crate) fn is_prepared(&self) -> bool {
-        self.prepared
-    }
-    pub(crate) fn prepared_control_bytes() -> Option<usize> {
+    /// Exact controls of the shared allocation-free compact-JSON counter.
+    /// The caller pays these before counting its closed, funded record type.
+    #[doc(hidden)]
+    pub fn counting_control_bytes() -> Option<usize> {
         let parts = [
             std::mem::size_of::<TraceCounter>(),
             std::mem::size_of::<serde_json::Serializer<&mut TraceCounter>>(),
@@ -63,7 +52,6 @@ impl TraceBudget {
         let mut sink = TraceCounter {
             used: 0,
             limit: remaining.min(self.limits.per_record_bytes),
-            prepared: self.prepared,
             exceeded: false,
         };
         serde_json::to_writer(&mut sink, record).map_err(|_| CaptureError::Limit {
@@ -84,7 +72,6 @@ impl TraceBudget {
 struct TraceCounter {
     used: u64,
     limit: u64,
-    prepared: bool,
     exceeded: bool,
 }
 impl std::io::Write for TraceCounter {
@@ -92,17 +79,10 @@ impl std::io::Write for TraceCounter {
         let next = u64::try_from(bytes.len())
             .ok()
             .and_then(|n| self.used.checked_add(n));
-        if self.prepared {
-            // Closed records continue the same serialization without creating
-            // an io/serde error object at the first budget crossing. Overflow
-            // and limits become the same fixed policy error after the count.
-            self.exceeded |= next.is_none_or(|n| n > self.limit);
-            self.used = next.unwrap_or(u64::MAX);
-        } else {
-            self.used = next
-                .filter(|n| *n <= self.limit)
-                .ok_or_else(|| std::io::Error::other("trace byte limit"))?;
-        }
+        // Finish the same counting pass without allocating an I/O or serde
+        // error at a limit boundary. The fixed transport refusal follows below.
+        self.exceeded |= next.is_none_or(|n| n > self.limit);
+        self.used = next.unwrap_or(u64::MAX);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -114,7 +94,7 @@ impl std::io::Write for TraceCounter {
 mod tests {
     use super::*;
     #[test]
-    fn prepared_trace_matches_wire_limits_and_refusal_keeps_consumption() {
+    fn trace_matches_wire_limits_and_refusal_keeps_consumption() {
         #[derive(Serialize)]
         struct Record<'a> {
             text: &'a str,
@@ -130,12 +110,9 @@ mod tests {
             total_bytes: 2 * bytes - 1,
         };
         let mut ordinary = TraceBudget::new(limits);
-        let mut prepared = TraceBudget::new_prepared(limits);
         ordinary.charge(&record).unwrap();
-        prepared.charge(&record).unwrap();
         assert_eq!(ordinary.emitted_bytes(), bytes);
-        assert_eq!(prepared.emitted_bytes(), bytes);
-        for result in [ordinary.charge(&record), prepared.charge(&record)] {
+        for result in [ordinary.charge(&record), ordinary.charge(&record)] {
             assert!(matches!(
                 result,
                 Err(CaptureError::Limit {
@@ -145,8 +122,7 @@ mod tests {
             ));
         }
         assert_eq!(ordinary.emitted_bytes(), bytes);
-        assert_eq!(prepared.emitted_bytes(), bytes);
-        let mut small = TraceBudget::new_prepared(TraceLimits {
+        let mut small = TraceBudget::new(TraceLimits {
             per_record_bytes: bytes - 1,
             total_bytes: u64::MAX,
         });

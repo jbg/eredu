@@ -9,7 +9,7 @@ pub use prefill::{InterventionPrefillWindow,InterventionPrefillSourceError,Inter
 use crate::capture::{
     CaptureExecutionError, CaptureSession, bounded_diagnostic, metadata_reservation,
 };
-use eredu_core::{ObservationPosition, capture::*, intervention::*};
+use eredu_core::{capture::*, intervention::*};
 pub use hook::{ActivationHook, activation_hook};
 
 mod activation;

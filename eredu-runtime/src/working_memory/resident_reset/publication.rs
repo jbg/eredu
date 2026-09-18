@@ -4,7 +4,7 @@ use super::*;
 /// Projection of the complete resident state, never a selected subcomponent.
 /// Both methods must return the same whole state and perform no allocation,
 /// callback, native work or mutation. Unsupported representations return None.
-pub trait ResidentResetProjection<S: ResidentKvResetState> {
+pub trait ResidentResetProjection<S: ResidentTableResetState> {
     /// Borrows the exact whole state used by immutable source inspection.
     fn resident_reset_ref(&self) -> Option<&S>;
     /// Borrows that same state for an already validated infallible exchange.
@@ -38,7 +38,7 @@ pub(crate) struct PublicationBinding {
     revision: Option<super::super::InferenceStateRevision>,
 }
 impl PublicationBinding {
-    fn new<S: ResidentKvResetState>(source: &ResidentResetSource<'_, S>) -> Self {
+    fn new<S: ResidentTableResetState>(source: &ResidentResetSource<'_, S>) -> Self {
         Self {
             state: std::ptr::from_ref(source.state) as usize,
             selected: std::ptr::from_ref(source.selected) as usize,
@@ -61,7 +61,7 @@ impl PublicationBinding {
             revision: source.revision.cloned(),
         }
     }
-    pub(crate) fn matches<S: ResidentKvResetState>(
+    pub(crate) fn matches<S: ResidentTableResetState>(
         &self,
         source: &ResidentResetSource<'_, S>,
     ) -> bool {
@@ -85,7 +85,7 @@ impl PublicationBinding {
             && Arc::ptr_eq(&self.control, source.control)
             && self.revision.as_ref() == source.revision
     }
-    pub(crate) fn matches_state<S: ResidentKvResetState>(&self, state: &S) -> bool {
+    pub(crate) fn matches_state<S: ResidentTableResetState>(&self, state: &S) -> bool {
         self.state == std::ptr::from_ref(state) as usize
             && &self.table
                 == state
@@ -99,12 +99,12 @@ impl PublicationBinding {
 /// A freshly constructed, originally funded state bound to its exact old source.
 /// Its only owning exits are checked shared-session installation or an owning
 /// construction error. Native readiness is not established by this value.
-pub struct ResidentResetInstallation<S: ResidentKvResetState> {
+pub struct ResidentResetInstallation<S: ResidentTableResetState> {
     pub(crate) state: S,
     pub(crate) binding: PublicationBinding,
     pub(crate) custody: ResetCustody,
 }
-impl<S: ResidentKvResetState> ResidentResetInstallation<S> {
+impl<S: ResidentTableResetState> ResidentResetInstallation<S> {
     /// Rejects before publication, keeping the complete destination and same
     /// original allowance in the existing concrete portable error source.
     pub fn into_error(self, cause: WorkingMemoryError) -> ResidentResetError<S> {
@@ -128,7 +128,7 @@ impl<S: ResidentKvResetState> ResidentResetInstallation<S> {
 
 /// Whole displaced state and prompt source; native callers must put this into
 /// their already prepared retirement owner before ending the publication entry.
-pub struct ResidentResetDisplaced<S: ResidentKvResetState> {
+pub struct ResidentResetDisplaced<S: ResidentTableResetState> {
     pub(crate) state: S,
     pub(crate) prompt: Option<crate::SharedPreparedInputCacheIdentity>,
     pub(crate) binding: PublicationBinding,
@@ -141,7 +141,7 @@ struct PreparedPublication<P> {
     custody: ResetCustody,
 }
 
-impl<'a, S: ResidentKvResetState, K: HostSlotStorageKey> PreparedResidentKvReset<'a, S, K> {
+impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvReset<'a, S, K> {
     /// Exact constructor plus this provider's single prepared publication owner.
     /// No account, owner or destination allocation is created by reporting it.
     pub fn publication_required_bytes<P: ResidentResetPublicationProfile>(&self) -> Option<u64> {

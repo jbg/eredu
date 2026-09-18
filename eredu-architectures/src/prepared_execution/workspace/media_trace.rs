@@ -2,13 +2,13 @@
 use super::*;
 use crate::{
     composite_execution::{
-        CompositeArchitecture, CompositeMediaIngressArchitecture, PreparedCompositeArchitecture,
+        CompositeMediaIngressArchitecture, PreparedCompositeArchitecture,
         PreparedCompositeInput,
     },
     media_plan::BoundPreparedMediaSemantics,
 };
 use eredu_nn::workspace::{
-    WorkspaceMetadataFunding, WorkspaceReportScalars, WorkspaceStateSpanReport,
+    HostMetadataFunding, WorkspaceReportScalars, WorkspaceStateSpanReport,
     WorkspaceTensorBufferReport, WorkspaceTraceReport,
 };
 use eredu_runtime::working_memory::{
@@ -23,7 +23,7 @@ use std::{borrow::Borrow, cell::RefCell, ops::Deref, rc::Rc};
 #[derive(Clone, Copy)]
 pub(super) struct MediaEquationRef<'a> {
     pub(super) input: &'a RefCell<Option<OriginalMediaWorkspaceInput>>,
-    pub(super) intervals: &'a RefCell<Vec<MediaEquationInterval>>,
+    pub(super) intervals: Option<&'a RefCell<Vec<MediaEquationInterval>>>,
 }
 struct Cut {
     report: WorkspaceReportScalars,
@@ -35,7 +35,7 @@ struct Cut {
 // The final Rc shell retires before its independent planning-account alias.
 struct TraceOwner {
     report: Option<Rc<WorkspaceTraceReport>>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl TraceOwner {
     fn new(report: WorkspaceTraceReport, context: &WorkspaceContext) -> Result<Self, Error> {
@@ -167,9 +167,10 @@ pub struct OriginalMediaWorkspaceReport {
     tables: OriginalPreparedInputProjection,
     source_storage: eredu_runtime::input::OriginalPreparedWorkspaceSource,
     ordinary: Option<WorkingMemoryUnquotedLease>,
-    _planning: Option<WorkspaceMetadataFunding>,
+    _planning: Option<HostMetadataFunding>,
 }
 impl OriginalMediaWorkspaceReport {
+    pub(super) fn into_equations(self) -> InferenceWorkspaceReport { self.equations }
     /// Moves the completed equation/sampling reports into the shared generation
     /// composer. The caller already retains the exact source registration; no
     /// report, source tensor or sampling history is cloned by this conversion.
@@ -226,7 +227,7 @@ pub struct OriginalMediaWorkspaceTraceError {
     tables: OriginalPreparedInputProjection,
     source_storage: eredu_runtime::input::OriginalPreparedWorkspaceSource,
     ordinary: Option<WorkingMemoryUnquotedLease>,
-    _planning: Option<WorkspaceMetadataFunding>,
+    _planning: Option<HostMetadataFunding>,
 }
 impl std::fmt::Display for OriginalMediaWorkspaceTraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,7 +257,7 @@ pub struct OriginalMediaWorkspaceTraceFailure {
     original: BoundPreparedMediaSemantics,
     tables: OriginalPreparedInputProjection,
     ordinary: Option<WorkingMemoryUnquotedLease>,
-    _planning: Option<WorkspaceMetadataFunding>,
+    _planning: Option<HostMetadataFunding>,
 }
 impl std::fmt::Debug for OriginalMediaWorkspaceTraceFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -317,7 +318,7 @@ impl PreparedInferenceBlueprint {
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         self.quote_original_media_with_trace(
-            input, current, geometry, state, context, parameters, None, None, None,
+            input, current, geometry, state, context, parameters, None, None, None, None,
         )
     }
 
@@ -334,6 +335,7 @@ impl PreparedInferenceBlueprint {
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
         observer: &mut dyn InferenceEquationTraceObserver,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         let observer = RefCell::new(observer);
         self.quote_original_media_with_trace(
@@ -346,6 +348,7 @@ impl PreparedInferenceBlueprint {
             Some(TextSamplingInput::Configured(config, filter.into())),
             Some(EquationTraceRef(&observer)),
             None,
+            communication,
         )
     }
 
@@ -361,6 +364,7 @@ impl PreparedInferenceBlueprint {
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
         sampling: BorrowedTextSamplingWorkspace<'_>,
         observer: &mut dyn InferenceEquationTraceObserver,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         let observer = RefCell::new(observer);
         self.quote_original_media_with_trace(
@@ -373,6 +377,7 @@ impl PreparedInferenceBlueprint {
             Some(TextSamplingInput::Borrowed(sampling)),
             Some(EquationTraceRef(&observer)),
             None,
+            communication,
         )
     }
 
@@ -392,6 +397,7 @@ impl PreparedInferenceBlueprint {
         paths: &eredu_runtime::SharedLayeredObservationPaths,
         observer: &mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver,
         trace: &mut dyn InferenceEquationTraceObserver,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         let observer = RefCell::new(observer);
         let trace = RefCell::new(trace);
@@ -400,6 +406,7 @@ impl PreparedInferenceBlueprint {
             Some(TextSamplingInput::Configured(config, filter.into())),
             Some(EquationTraceRef(&trace)),
             Some(observed::ObservationRef { paths, observer: &observer, invocation_prediction: None }),
+            communication,
         )
     }
 
@@ -417,6 +424,7 @@ impl PreparedInferenceBlueprint {
         paths: &eredu_runtime::SharedLayeredObservationPaths,
         observer: &mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver,
         trace: &mut dyn InferenceEquationTraceObserver,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         let observer = RefCell::new(observer);
         let trace = RefCell::new(trace);
@@ -425,10 +433,11 @@ impl PreparedInferenceBlueprint {
             Some(TextSamplingInput::Borrowed(sampling)),
             Some(EquationTraceRef(&trace)),
             Some(observed::ObservationRef { paths, observer: &observer, invocation_prediction: None }),
+            communication,
         )
     }
 
-    fn quote_original_media_with_trace(
+    pub(super) fn quote_original_media_with_trace(
         &self,
         input: OriginalMediaWorkspaceInput,
         current: &eredu_runtime::working_memory::MediaSessionBinding,
@@ -439,6 +448,7 @@ impl PreparedInferenceBlueprint {
         sampling: Option<TextSamplingInput<'_>>,
         trace: Option<EquationTraceRef<'_, '_>>,
         observation: Option<observed::ObservationRef<'_, '_>>,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<OriginalMediaWorkspaceReport, OriginalMediaWorkspaceTraceError> {
         let original = input.original.clone();
         let tables = input.tables.clone();
@@ -500,11 +510,11 @@ impl PreparedInferenceBlueprint {
             // The actual projected layer variants, context and page geometry
             // must match the retained selection. Native source pins and span
             // catalogs stay with the enclosing completed-input quote owner.
-            eredu_runtime::working_memory::validate_workspace_state_realization(
-                state,
-                self.selected().text_realization().state(),
-                context,
-            ).map_err(PreparedExecutionError::Metadata)?;
+            if self.selected().execution().parallel_topology().is_none() {
+                eredu_runtime::working_memory::validate_workspace_state_realization(
+                    state, self.selected().text_realization().state(), context,
+                ).map_err(PreparedExecutionError::Metadata)?;
+            }
             if parameters.is_some()
                 && !matches!(
                     self.selected().text_realization().residency(),
@@ -517,7 +527,7 @@ impl PreparedInferenceBlueprint {
                     format_args!("media parameter provider differs from selected residency"),
                 ));
             }
-            EquationVisitor {
+            let visitor = EquationVisitor {
                 geometry,
                 state,
                 context,
@@ -532,10 +542,17 @@ impl PreparedInferenceBlueprint {
                 trace,
                 media: Some(MediaEquationRef {
                     input: &inputs,
-                    intervals: &intervals,
+                    intervals: Some(&intervals),
                 }),
             }
-            .construct(self)
+            ;
+            if self.selected().execution().parallel_topology().is_some() {
+                let source = self.sources.construction_semantics().direct_partition.get()
+                    .ok_or_else(|| preparation_message(context, format_args!("completed partition media source is unavailable")))?;
+                source.quote_media(&self.sources, communication, visitor).map_err(PreparedExecutionError::Metadata)
+            } else {
+                visitor.construct(self)
+            }
         })();
         // Any unconsumed input retires before its outer ordinary custody.
         drop(inputs);
@@ -563,7 +580,7 @@ impl PreparedInferenceBlueprint {
         }
     }
 }
-struct CutHook {
+pub(super) struct CutHook {
     cut: Option<Cut>,
 }
 impl<C> eredu_runtime::LayeredTraversalHook<WorkspaceBackend, C, Error> for CutHook {
@@ -626,7 +643,7 @@ impl EquationVisitor<'_, '_, '_> {
             PreparedCompositeArchitecture<A>,
         >,
         admission: A::AdmissionConfig,
-        mut provider:super::EquationRoutedProvider,
+        provider:super::EquationRoutedProvider,
     ) -> Result<EquationQuote, Error>
     where
         A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error>
@@ -640,37 +657,56 @@ impl EquationVisitor<'_, '_, '_> {
             )));
         }
         let reference = self.media.expect("typed media visitor");
-        let input = reference.input.borrow_mut().take().ok_or_else(|| {
-            self.context.metadata_error(format_args!(
-                "media equation source consumed more than once"
-            ))
-        })?;
-        let mut original_roots = self.context.metadata_vec(0)?;
-        for value in input.prepared.parts().iter().flat_map(|part| {
-            std::iter::once(part.payload().value()).chain(part.metadata().values())
-        }) {
-            self.context.reserve_metadata_vec(&mut original_roots, 1)?;
-            original_roots.push(value.clone());
+        if reference.intervals.is_none() {
+            return self.quote_composite_whole_media(modules, provider);
         }
-        let plan = A::prepare_original_workspace_ingress_plan_with_metadata(
-            input,
-            self.geometry,
-            self.context,
-        )?;
+        let (original_roots, plan) = self.prepare_media_interval_source::<A>()?;
         modules.retain_composite_graph(self.context)?;
-        let mut runtime =
+        let runtime =
             EquationRuntime::from_prepared(
                 modules, self.parameters, self.context,
                 self.observation.map(|observation| observation.paths), false,
             )?;
-        let observation_host_peak = runtime.observation_host_peak_bytes()?;
-        let mut source =
-            eredu_runtime::media_prefill::workspace::MediaEquationSource::new_with_prepared_graph(
-                runtime.architecture(),
-                plan,
-                runtime.prepared_graph()?,
-                self.context,
-            )?;
+        self.context.charge_metadata(std::mem::size_of::<runtime::Serial<'_, A>>())?;
+        let mut driver = runtime::Serial { runtime, provider };
+        self.quote_media_intervals::<A, _>(admission, original_roots, plan, &mut driver)
+    }
+
+    pub(super) fn prepare_media_interval_source<A>(&self) -> Result<(
+        Vec<WorkspaceTensor>, A::IngressPlan,
+    ), Error>
+    where A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error> + 'static,
+        A::InputPartPlan: 'static,
+    {
+        let reference = self.media.expect("typed media visitor");
+        let input = reference.input.borrow_mut().take().ok_or_else(|| {
+            self.context.metadata_error(format_args!("media equation source consumed more than once"))
+        })?;
+        let mut roots = self.context.metadata_vec(0)?;
+        for value in input.prepared.parts().iter().flat_map(|part| {
+            std::iter::once(part.payload().value()).chain(part.metadata().values())
+        }) {
+            self.context.reserve_metadata_vec(&mut roots, 1)?;
+            roots.push(value.clone());
+        }
+        let plan = A::prepare_original_workspace_ingress_plan_with_metadata(input, self.geometry, self.context)?;
+        Ok((roots, plan))
+    }
+
+    pub(super) fn quote_media_intervals<A, D>(self, admission: A::AdmissionConfig,
+        original_roots: Vec<WorkspaceTensor>, plan: A::IngressPlan, driver: &mut D,
+    ) -> Result<EquationQuote, Error>
+    where A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error> + 'static,
+        A::InputPartPlan: 'static,
+        D: runtime::Driver<A>,
+    {
+        self.context.charge_metadata(std::mem::size_of::<(
+            &mut D, A::AdmissionConfig, A::IngressPlan, Vec<WorkspaceTensor>,
+            Result<EquationQuote, Error>,
+        )>())?;
+        let intervals = self.media.expect("typed media visitor").intervals.expect("retained media intervals");
+        let observation_host_peak = driver.observation_host_peak_bytes(self.context)?;
+        let mut source = driver.prepare_source(plan, self.context)?;
         let mut state = self.state.try_clone_workspace(self.context)?;
         let mut score_source = sampling::SamplingScores::default();
         let equations =
@@ -680,10 +716,11 @@ impl EquationVisitor<'_, '_, '_> {
                     .admit::<MediaEquationInterval>()
                     .map_err(|cause| metadata.error(cause))?;
                 {
-                    let mut intervals = reference.intervals.borrow_mut();
+                    let mut intervals = intervals.borrow_mut();
                     self.context.reserve_metadata_vec(&mut intervals, 1)?;
                 }
                 let (position, count, mut demand) = match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
                     InferenceWorkspaceSpan::Prefill(chunk) => {
                         (chunk.position, chunk.input.end - chunk.input.start, chunk.output)
                     }
@@ -725,16 +762,17 @@ impl EquationVisitor<'_, '_, '_> {
                 let mut forward = None;
                 let mut input_operation = None;
                 let scores = match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
                     InferenceWorkspaceSpan::Prefill(chunk) => {
                         let mut chunk = chunk.clone();
                         chunk.output = demand;
                         let (scores, context) = if active {
                             let mut observer = self.observation.expect("active observation").observer.borrow_mut();
-                            runtime.forward_media_routed(&mut source, &chunk, &mut state, self.context,
-                                &mut hook, &mut provider, Some(&mut **observer))?
+                            driver.prefill(&mut source, &chunk, &mut state, self.context,
+                                &mut hook, Some(&mut **observer))?
                         } else {
-                            runtime.forward_media_routed(&mut source, &chunk, &mut state, self.context,
-                                &mut hook, &mut provider, None)?
+                            driver.prefill(&mut source, &chunk, &mut state, self.context,
+                                &mut hook, None)?
                         };
                         forward = Some(context);
                         scores
@@ -749,7 +787,7 @@ impl EquationVisitor<'_, '_, '_> {
                             )>()
                             .map_err(|cause| metadata.error(cause))?;
                         input_operation = Some(self.context.operation_count());
-                        let tokens = WorkspaceTensor::full_i32(
+                        let tokens = WorkspaceTensor::full_u32(
                             0,
                             &[self.geometry.batch_size as i32, 1],
                             self.context,
@@ -781,18 +819,16 @@ impl EquationVisitor<'_, '_, '_> {
                         )?;
                         if active {
                             let mut observer = self.observation.expect("active observation").observer.borrow_mut();
-                            runtime.forward_routed_with_capture(input, &mut state, self.context, demand, Some(&mut **observer),false,
-                                eredu_runtime::ExpertPass::Decode,&mut provider)?.0
+                            driver.decode(input, &mut state, self.context, demand, Some(&mut **observer))?
                         } else {
-                            runtime.forward_routed_with_capture(input, &mut state, self.context, demand, None,false,
-                                eredu_runtime::ExpertPass::Decode,&mut provider)?.0
+                            driver.decode(input, &mut state, self.context, demand, None)?
                         }
                     }
                 };
                 let scores = if active {
                     let mut observer = self.observation.expect("active observation").observer.borrow_mut();
-                    observed::finish_logits(&mut **observer, scores, demand, self.context)?
-                } else { scores };
+                    driver.finish_logits(scores, demand, Some(&mut **observer), self.context)?
+                } else { driver.finish_logits(scores, demand, None, self.context)? };
                 // Match the native text output selection after complete logits
                 // observation; its source backing remains in the observer roots.
                 let scores = if self.observation.is_some() && self.sampling.is_some() {
@@ -856,7 +892,7 @@ impl EquationVisitor<'_, '_, '_> {
                     )?;
                 }
                 let report = TraceOwner::new(report, self.context)?;
-                let mut intervals = reference.intervals.borrow_mut();
+                let mut intervals = intervals.borrow_mut();
                 intervals.push(MediaEquationInterval {
                     span: span.clone(),
                     report: report.clone(),
@@ -888,6 +924,8 @@ impl EquationVisitor<'_, '_, '_> {
         Ok((equations, sampling))
     }
 }
+
+pub(super) mod runtime;
 
 #[cfg(test)]
 mod tests;

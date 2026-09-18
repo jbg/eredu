@@ -11,6 +11,8 @@ use std::sync::{
 #[derive(Debug, Default)]
 pub(super) struct SequenceFacts {
     enabled: bool,
+    pub(super) explicit_control: bool,
+    pub(super) controls: usize,
     fail_admit: bool,
     fail_extract: bool,
     bad_result: bool,

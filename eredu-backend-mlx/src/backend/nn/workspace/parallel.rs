@@ -15,6 +15,7 @@ use crate::backend::runtime::distributed::topology::original_source::parallel::{
 pub(crate) struct MlxParallelWorkspaceMechanisms {
     ordinary: ResidentExecutionMechanisms,
     source: OriginalParallelSource,
+    addressable: Option<AddressableSources>,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ParallelFactError {
@@ -32,7 +33,7 @@ impl MlxParallelWorkspaceMechanisms {
         ordinary: ResidentExecutionMechanisms,
         source: OriginalParallelSource,
     ) -> Self {
-        Self { ordinary, source }
+        Self { ordinary, source, addressable: None }
     }
     pub(crate) fn prepare_workspace(self) -> Result<MlxParallelWorkspace, Error> {
         self.prepare_workspace_source(None)
@@ -40,7 +41,8 @@ impl MlxParallelWorkspaceMechanisms {
     pub(crate) fn prepare_workspace_with_addressable(self,addressable:AddressableSources)->Result<MlxParallelWorkspace,Error>{
         self.prepare_workspace_source(Some(addressable))
     }
-    fn prepare_workspace_source(self,addressable:Option<AddressableSources>)->Result<MlxParallelWorkspace,Error>{
+    fn prepare_workspace_source(mut self,addressable:Option<AddressableSources>)->Result<MlxParallelWorkspace,Error>{
+        self.addressable = addressable.clone();
         let source = self.source.clone();
         let ordinary = self.ordinary;
         source
@@ -84,7 +86,7 @@ impl MlxParallelWorkspace {
     /// This is descriptive preparation; no native invocation is entered here.
     pub(crate) fn prepare_invocation(&self,report:&WorkspaceTraceReport)
         ->Result<crate::backend::runtime::distributed::topology::original_source::parallel::OriginalParallelInvocation,Error> {
-        self.source.prepare_invocation_with_boundary(&report.operations,Some(self.ordinary))
+        self.source.prepare_invocation_with_boundary(&report.operations,Some(self.ordinary),self.addressable.as_ref())
             .map_err(|cause|self.source.neural_error(cause))
     }
     pub(crate) fn context(&self) -> &WorkspaceContext {
@@ -116,7 +118,7 @@ impl WorkspaceMechanisms for MlxParallelWorkspaceMechanisms {
         output: usize,
     ) -> Option<WorkspaceRepresentation> {
         if matches!(operation.kind,WorkspaceOperationKindView::ExpertRegion(_)) {
-            let quote=ExpertLocalQuote::prepare(&self.source,operation,self.ordinary).ok()?;
+            let quote=ExpertLocalQuote::prepare(&self.source,operation,self.ordinary,self.addressable.as_ref()).ok()?;
             let dtype=quote.outputs.get(output)?.representation()?.dtype();
             // Final typed zeros/ScatterAxis writes complete contiguous rows.
             return Some(WorkspaceRepresentation::new(dtype,true));
@@ -127,20 +129,7 @@ impl WorkspaceMechanisms for MlxParallelWorkspaceMechanisms {
         ) {
             return representation::collective(&self.ordinary, operation, output);
         }
-        let representation = self.ordinary.output_representation(operation, output);
-        if representation.is_none()
-            && operation.outputs.get(output).is_some_and(|layout| layout.dtype() == WorkspaceDtype::Float32)
-            && !matches!(operation.kind, WorkspaceOperationKindView::ParameterPlaceholder)
-            && std::env::var_os("EREDU_TRACE_PARALLEL_REPRESENTATION").is_some()
-        {
-            eprintln!("EREDU_PARALLEL_REPRESENTATION missing producer={:?} output={output} layout={:?}",
-                operation.kind, operation.outputs.get(output));
-            for (index, input) in operation.inputs.iter().enumerate() {
-                eprintln!("EREDU_PARALLEL_REPRESENTATION input={index} shape={:?} dtype={:?} actual={:?}",
-                    input.shape(), input.dtype(), input.representation());
-            }
-        }
-        representation
+        self.ordinary.output_representation(operation, output)
     }
     fn projection_input_observation_mechanism(
         &self,
@@ -175,7 +164,7 @@ impl WorkspaceFactMechanisms for MlxParallelWorkspaceMechanisms {
     fn with_prepared_facts<T>(
         &self,
         operation: WorkspaceOperationView<'_>,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
         visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
     ) -> Result<T, Self::Error> {
         if matches!(operation.kind,
@@ -188,7 +177,7 @@ impl WorkspaceFactMechanisms for MlxParallelWorkspaceMechanisms {
                 | WorkspaceCollectiveView::Boundary { .. })) {
             if let Some(funding)=funding {
                 funding.reserve_metadata(std::mem::size_of::<(
-                    &Self,WorkspaceOperationView<'_>,Option<&WorkspaceMetadataFunding>,
+                    &Self,WorkspaceOperationView<'_>,Option<&HostMetadataFunding>,
                     Result<T,ParallelFactError>,
                 )>()).map_err(|cause|ParallelFactError::Source(
                     crate::backend::error::Error::WorkspacePlanning(cause)))?;
@@ -247,7 +236,7 @@ impl MlxParallelWorkspaceMechanisms {
     fn with_selected_facts<T>(
         &self,
         operation: WorkspaceOperationView<'_>,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
         visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = ParallelFactError>) -> T,
     ) -> Result<T, ParallelFactError> {
         if let WorkspaceOperationKindView::ExpertInactiveWave(declaration)=operation.kind {
@@ -276,19 +265,11 @@ impl MlxParallelWorkspaceMechanisms {
             funding.reserve_metadata(std::mem::size_of::<(PreparedRegion,Result<T,ParallelFactError>)>()
                 +std::mem::size_of_val(&visit)).map_err(|cause|ParallelFactError::Source(
                     crate::backend::error::Error::WorkspacePlanning(cause)))?;
-            let quote=ExpertLocalQuote::prepare(&self.source,operation,self.ordinary).map_err(ParallelFactError::Boundary)?;
+            let quote=ExpertLocalQuote::prepare(&self.source,operation,self.ordinary,self.addressable.as_ref()).map_err(ParallelFactError::Boundary)?;
             return Ok(visit(&PreparedRegion::Local(quote)));
         }
         if funding.is_none() {
             return Err(ParallelFactError::Unfunded);
-        }
-        if std::env::var_os("EREDU_TRACE_PARALLEL_REPRESENTATION").is_some() {
-            for (index, input) in operation.inputs.iter().enumerate() {
-                if input.dtype() == WorkspaceDtype::Float32 && input.representation().is_none() {
-                    eprintln!("EREDU_PARALLEL_REPRESENTATION consuming collective={:?} input={index} shape={:?}",
-                        operation.kind, input.shape());
-                }
-            }
         }
         let controls = [
             std::mem::size_of::<PreparedCollective<'_>>(),
@@ -297,7 +278,7 @@ impl MlxParallelWorkspaceMechanisms {
             std::mem::size_of::<(
                 &Self,
                 WorkspaceOperationView<'_>,
-                Option<&WorkspaceMetadataFunding>,
+                Option<&HostMetadataFunding>,
             )>(),
             std::mem::size_of_val(&visit),
         ];
@@ -305,7 +286,7 @@ impl MlxParallelWorkspaceMechanisms {
             .into_iter()
             .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
             .ok_or(ParallelFactError::Source(crate::backend::error::Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             )))?;
         self.source
             .funding()

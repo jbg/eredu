@@ -203,9 +203,9 @@ fn external_copied_tensor_keeps_its_new_owner_with_escaped_native_aliases() {
 
 #[test]
 fn exact_copy_funding_refusal_crosses_the_executor_boundary_without_reboxing() {
-    use eredu_nn::workspace::{WorkspaceMetadataError, WorkspaceMetadataFundingError};
+    use eredu_nn::workspace::{WorkspaceMetadataError, HostMetadataFundingError};
     use std::error::Error as _;
-    let cause = WorkspaceMetadataFundingError::Capacity {
+    let cause = HostMetadataFundingError::Capacity {
         required: 8193,
         available: 47,
     };
@@ -217,7 +217,7 @@ fn exact_copy_funding_refusal_crosses_the_executor_boundary_without_reboxing() {
         // error. Same-display wrappers must expose the fixed leaf itself.
         let mut source: &(dyn std::error::Error + 'static) = &error;
         let retained = loop {
-            if let Some(retained) = source.downcast_ref::<WorkspaceMetadataFundingError>() {
+            if let Some(retained) = source.downcast_ref::<HostMetadataFundingError>() {
                 break retained;
             }
             source = source.source().expect("exact funding source remains reachable");

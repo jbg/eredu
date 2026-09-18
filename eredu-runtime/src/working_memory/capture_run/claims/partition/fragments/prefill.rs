@@ -10,7 +10,7 @@ pub(super) struct Target { slot:TargetSlot, next:u64, pending:bool }
 fn row_source<'a>(receipt:&'a PartitionCaptureReceiptPlan,producer:usize,fragment:usize,
     inference:InferenceGeometry)->Result<CapturePrefillRowAssembly<'a>,CaptureRunHostError>
 {
-    let source=receipt.shared_plan_source().ok_or(CaptureRunHostError::ReceiptMismatch)?;
+    let source=receipt.shared_plan_source();
     if receipt.context().phase!=CapturePhase::Prefill || receipt.context().prediction!=0
         || receipt.context().invocation.is_some() {return Err(CaptureRunHostError::ReceiptMismatch);}
     let projection=receipt.producer(producer).ok_or(CaptureRunHostError::ReceiptMismatch)?;
@@ -57,7 +57,7 @@ impl<'a> PartitionFragmentHostPlan<'a> {
             }
         }}
         let additive=receipt.combination()==PartitionCaptureCombination::SumF64ToF32 && matches!(
-            receipt.shared_plan_source().expect("checked source").admission().plan().selections[receipt.context().selection_index].transform,
+            receipt.shared_plan_source().admission().plan().selections[receipt.context().selection_index].transform,
             CaptureTransform::Summary|CaptureTransform::Histogram{..});
         let routed=receipt.producers().any(|(producer,_)|receipt.routed_producer(producer).is_some());
         let controls=(if routed{routed::prefill_control_bytes()}else if reductions::selected(receipt){reductions::control_bytes(receipt)}else{control_bytes(additive)}).and_then(|n|u64::try_from(n).ok()).ok_or(WorkingMemoryError::Overflow)?;

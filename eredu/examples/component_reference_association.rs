@@ -1,13 +1,13 @@
 //! Three-prefix public parameter-edit consumer, checked against the independent oracle.
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use eredu::{api::*, runtime::chat::ChatTemplateRequest};
 use eredu_core::{
-    capture::*, component::ComponentReadRole, parameters::*, ArchitectureDescriptor,
-    GenerationConfigOverrides,
+    ArchitectureDescriptor, GenerationConfigOverrides, capture::*, component::ComponentReadRole,
+    parameters::*,
 };
 use std::{collections::BTreeMap, ops::ControlFlow};
 
-pub fn run<B: ParameterBackend>(
+pub fn run<B: ParameterBackend + eredu_runtime::working_memory::OriginalChatBackend>(
     model: &mut LoadedModel<B>,
     architecture: &ArchitectureDescriptor,
     reference: &serde_json::Value,
@@ -38,15 +38,34 @@ pub fn run<B: ParameterBackend>(
         "association topology mismatch"
     );
     let cases = reference["cases"].as_array().context("association cases")?;
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .context("cancelled before source compilation")?;
+    let policy = ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user","content":"association output contract"})],
         add_generation_prompt: true,
         ..Default::default()
-    })?;
+    };
+    let chat = model
+        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(0.0),
             max_new_tokens: Some(1),
+            ..Default::default()
+        },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
             ..Default::default()
         },
         seed: 17,
@@ -122,56 +141,60 @@ pub fn run<B: ParameterBackend>(
                     token_ids: vec![target],
                 },
             });
-            let prepared = model.prepare_observed_token_ids(
-                &chat,
-                prefix,
-                settings,
-                CapturePlan {
-                    schema_version: CAPTURE_SCHEMA_VERSION,
-                    selections,
-                    limits: CaptureLimits {
-                        per_step: usage,
-                        cumulative: usage,
-                        physical_native_bytes: None,
-                        on_limit: CaptureLimitPolicy::Fail,
-                    },
+            let capture = CapturePlan {
+                schema_version: CAPTURE_SCHEMA_VERSION,
+                selections,
+                limits: CaptureLimits {
+                    per_step: usage,
+                    cumulative: usage,
+                    physical_native_bytes: None,
+                    on_limit: CaptureLimitPolicy::Fail,
                 },
-                TraceLimits {
-                    per_record_bytes: 8 << 20,
-                    total_bytes: 16 << 20,
-                },
-            )?;
+            };
+            let mut request = PreparedChatRequest::new(&chat, settings);
+            request.input = PreparedChatPrompt::TokenIds(&prefix);
+            request.output_mode = PreparedChatOutputMode::Text;
+            request.capture = Some(&capture);
+            let trace = TraceLimits {
+                per_record_bytes: 8 << 20,
+                total_bytes: 16 << 20,
+            };
             let mut records = vec![];
-            let output =
-                model.generate_observed_text(prepared, &[], Default::default(), |record| {
-                    records.push(record);
-                    ControlFlow::Continue(())
-                })?;
+            let mut collect = |record| {
+                records.push(record);
+                ControlFlow::Continue(())
+            };
+            let mut run = model
+                .start_controlled_chat(request, trace, Default::default(), &mut collect)?
+                .context("cancelled before reference association")?;
+            run.run(&mut collect)?;
             ensure!(
-                output.token_ids == [expected["winner"].as_u64().context("winner")? as u32],
+                run.token_ids() == [expected["winner"].as_u64().context("winner")? as u32],
                 "association winner differs"
             );
+            let winner = run.token_ids()[0];
+            drop(run);
             let mut logits = None;
             let mut score = None;
             let mut activation = None;
             for record in records {
-                if let ObservedGenerationEvent::Token {
+                if let Some(ObservedGenerationEvent::Token {
                     forced,
                     captures: Some(step),
                     ..
-                } = record.event
+                }) = record.event.progress()
                 {
                     ensure!(!forced, "association token must not be forced");
                     ensure!(
                         record.parameter_overlay_id.is_some() == (phase == "edited"),
                         "association edit provenance"
                     );
-                    for capture in step.records {
+                    for capture in &step.records {
                         ensure!(
                             capture.outcome == CaptureOutcome::Captured,
                             "association missing capture"
                         );
-                        match capture.payload {
+                        match &capture.payload {
                             Some(CapturePayload::Tensor(tensor)) => {
                                 let eredu_core::TensorObservationData::F32(values) = tensor.data()
                                 else {
@@ -226,7 +249,7 @@ pub fn run<B: ParameterBackend>(
             println!(
                 "{}",
                 serde_json::json!({"association_phase":phase,"case":case["kind"],
-                "prefix":case["text"],"winner":output.token_ids[0],"target":target,"target_score":score.target.score,
+                "prefix":case["text"],"winner":winner,"target":target,"target_score":score.target.score,
                 "target_log_probability":score.log_probability,"rank":score.rank,"unit_value":activation,
                 "claim":"Illustrative read/write construction; held-out behavior is measured, not guaranteed"})
             );

@@ -62,6 +62,13 @@ pub struct SpeculativeInvocationRequirements {
     source: Option<SpeculativeSourceFacts>,
 }
 impl SpeculativeInvocationRequirements {
+    /// Actual declared physical, graph, record and control byte populations, in
+    /// that order, including any already joined source-construction banks.
+    /// Reading these facts issues no role or allocation authority.
+    pub fn allocation_bytes(&self) -> [u64; 4] {
+        [self.physical, self.graph, self.record, self.controls]
+    }
+
     /// Retains the actual completed equation report. Missing operation domains
     /// cannot become a role; native requirements come from its exact producer.
     pub fn new(
@@ -415,10 +422,6 @@ impl OriginalSpeculativeRequest {
                 ticket: Some(ticket),
             });
         }
-        if std::env::var_os("EREDU_WORKSPACE_LEDGER_TRACE").is_some() {
-            eprintln!("WORKSPACE_LEDGER_COMPONENT id={} kind=model ordinal={} physical={} graph={} record={} controls={}",
-                ticket.id(), ordinal, requirements.physical, requirements.graph, requirements.record, controls);
-        }
         let SpeculativeInvocationRequirements {
             plan,
             physical,
@@ -652,14 +655,7 @@ impl Clone for RoleAccount {
 impl Drop for RoleAccount {
     fn drop(&mut self) {
         if let Some(owner) = self.0.take() {
-            let retired = Arc::into_inner(owner);
-            let id = retired.as_ref().map(|value| value.ticket.id());
-            drop(retired);
-            if let Some(id) = id {
-                if std::env::var_os("EREDU_WORKSPACE_LEDGER_TRACE").is_some() {
-                    eprintln!("WORKSPACE_LEDGER_RETIRED id={} kind=model", id);
-                }
-            }
+            drop(Arc::into_inner(owner));
         }
     }
 }
@@ -674,6 +670,16 @@ pub struct OriginalSpeculativeRole {
     account: RoleAccount,
 }
 impl OriginalSpeculativeRole {
+    /// Checks the exact accepted prefill geometry without starting or claiming
+    /// a span. Source constructors use this before retaining ingress metadata.
+    pub(crate) fn validate_prefill_geometry(&self, geometry: eredu_core::InferenceGeometry)
+        -> Result<(), WorkingMemoryError> {
+        if self.invocation.execution_pass() != crate::ExpertPass::Prefill
+            || self.plan.geometry() != geometry
+            || self.plan.records().iter().any(|row| !matches!(row.span(), InferenceWorkspaceSpan::Prefill(_))) {
+            Err(WorkingMemoryError::IdentityMismatch)
+        } else { Ok(()) }
+    }
     pub(crate) fn begin_prefill(
         &self,
         execution: &InferenceExecutionIdentity,
@@ -872,7 +878,7 @@ impl OriginalSpeculativePrefillSpan {
     pub fn chunk(&self) -> &crate::prefill::PrefillChunk {
         match self.record().span() {
             InferenceWorkspaceSpan::Prefill(chunk) => chunk,
-            InferenceWorkspaceSpan::Decode { .. } => unreachable!("only prefill rows are claimed"),
+            InferenceWorkspaceSpan::Decode { .. } | InferenceWorkspaceSpan::Sampling(_) => unreachable!("only prefill rows are claimed"),
         }
     }
     /// Same retained equation record, without constructing a competing plan.

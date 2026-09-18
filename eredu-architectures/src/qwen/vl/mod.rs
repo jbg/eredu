@@ -3,6 +3,7 @@
 mod checkpoint;
 mod config;
 mod model;
+pub(crate) use model::RetainedModelSource;
 mod parallel;
 pub(crate) mod positions;
 

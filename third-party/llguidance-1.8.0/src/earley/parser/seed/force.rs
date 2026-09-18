@@ -1,4 +1,5 @@
 //! Original deterministic-byte history through the shared forcing worker.
+use crate::earley::PreparedFunding as _;
 use super::super::{advance, force as shared, speculation, token};
 use super::{advance::Context, Cause, PreparedEarleySeed, PreparedEarleySeedError};
 use crate::{api::ParserLimits, earley::PreparedLexer};
@@ -6,7 +7,7 @@ use advance::Context as _;
 use derivre::NextByte;
 use std::mem::{size_of, size_of_val};
 use toktrie::{TokTrie, TokenId};
-impl<F: Fn(usize) -> Result<(), E>, E> shared::Context for Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> shared::Context for Context<'_, F> {
     fn accepting(&mut self) -> Result<bool, Self::Error> {
         self.speculative(|context| {
             if !token::flush(context)? {
@@ -50,7 +51,7 @@ impl PreparedEarleySeed {
     /// Appends exactly the deterministic bytes found by the ordinary quick hint
     /// and speculative unique-byte probe. Numeric token spellings use the same
     /// fixed decimal worker as ordinary parsing. Applied token history is kept.
-    pub fn force_bytes<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn force_bytes<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -70,7 +71,7 @@ impl PreparedEarleySeed {
                 size_of::<std::slice::Iter<'_, u8>>(),
                 size_of::<std::ops::RangeInclusive<u32>>(),
             ];
-            (context.funding)(
+            context.funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)

@@ -15,19 +15,24 @@ pub fn supported_source() -> &'static str {
     recipe::SOURCE
 }
 
-/// Actual template/cache name selected by the text-only sidecar route.
+/// Actual template name selected by the caller's source policy.
 #[derive(Clone, Copy, Debug)]
 pub enum TemplateName<'a> {
     /// An unqualified template uses this exact existing name.
     Single(&'a str),
-    /// A selected named `default` entry uses the ordinary composed name.
-    Default(&'a str),
+    /// A selected checkpoint entry uses the ordinary composed name.
+    Named {
+        /// Existing model identifier, borrowed through compilation.
+        model: &'a str,
+        /// Exact checkpoint entry selected by the request.
+        entry: &'a str,
+    },
 }
 impl<'a> TemplateName<'a> {
-    pub(super) fn parts(self) -> [&'a str; 2] {
+    pub(super) fn parts(self) -> [&'a str; 3] {
         match self {
-            Self::Single(name) => [name, ""],
-            Self::Default(name) => [name, "::chat_template::default"],
+            Self::Single(name) => [name, "", ""],
+            Self::Named { model, entry } => [model, "::chat_template::", entry],
         }
     }
     pub(super) fn byte_len(self) -> Result<usize, SourceError> {
@@ -35,14 +40,13 @@ impl<'a> TemplateName<'a> {
         parts[0]
             .len()
             .checked_add(parts[1].len())
+            .and_then(|n| n.checked_add(parts[2].len()))
             .ok_or(SourceError::Overflow)
     }
     pub(super) fn escape(self) -> AutoEscape {
         match self {
             Self::Single(name) => default_auto_escape_callback(name),
-            // The actual composed name ends in ::chat_template::default, so
-            // none of the ordinary filename suffixes can select escaping.
-            Self::Default(_) => default_auto_escape_callback("::chat_template::default"),
+            Self::Named { entry, .. } => crate::defaults::auto_escape_from_name(entry, true),
         }
     }
 }

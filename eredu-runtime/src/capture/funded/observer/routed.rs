@@ -9,15 +9,6 @@ fn same_routing(source:&AdmittedCapturePlan,first:usize,index:usize)->bool {
     crate::capture::partition::PartitionCaptureRoutedHooks::same_routing(source,first,index)
 }
 impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'_, T, E, N> {
-    fn routed_stage_error(&self, cause: FundedCaptureError<E>, stage: &'static str) -> eredu_nn::Error {
-        let cause = match cause {
-            FundedCaptureError::Protocol(CaptureProtocolError::Transaction) =>
-                FundedCaptureError::Protocol(CaptureProtocolError::TransactionPhase(stage)),
-            other => other,
-        };
-        self.backend.routed_error(cause)
-    }
-
     fn routed_batch(
         &mut self,
         batch: &crate::RoutedUnitBatch<'_, T>,
@@ -165,26 +156,26 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::RoutedUnitObserv
             self.routed_active = true;
             Ok(())
         })();
-        result.map_err(|cause| self.routed_stage_error(cause, "routed invocation entry"))
+        result.map_err(|cause| self.backend.routed_error(cause))
     }
     fn finish_invocation(&mut self, success: bool) -> Result<(), eredu_nn::Error> {
         self.finish_routed_invocation(success)
-            .map_err(|cause| self.routed_stage_error(cause, "routed invocation completion"))
+            .map_err(|cause| self.backend.routed_error(cause))
     }
     fn observe(&mut self, batch: &crate::RoutedUnitBatch<'_, T>) -> Result<(), eredu_nn::Error> {
         self.routed_batch(batch, false)
-            .map_err(|cause| self.routed_stage_error(cause, "routed activation batch"))
+            .map_err(|cause| self.backend.routed_error(cause))
     }
     fn intervene(&mut self,batch:&crate::RoutedUnitBatch<'_,T>)->Result<Option<T>,eredu_nn::Error>{
         self.intervene_routed_batch(batch)
-            .map_err(|cause|self.routed_stage_error(cause,"routed activation intervention"))
+            .map_err(|cause|self.backend.routed_error(cause))
     }
     fn observe_effective(
         &mut self,
         batch: &crate::RoutedUnitBatch<'_, T>,
     ) -> Result<(), eredu_nn::Error> {
         self.routed_batch(batch, true)
-            .map_err(|cause| self.routed_stage_error(cause, "routed effective batch"))
+            .map_err(|cause| self.backend.routed_error(cause))
     }
 }
 pub(in crate::capture::funded) fn control_bytes() -> Option<usize> {

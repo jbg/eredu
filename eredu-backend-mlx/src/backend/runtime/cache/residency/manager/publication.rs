@@ -1,6 +1,6 @@
 //! The same publication record with ordinary or source-paid metadata backing.
 use super::*;
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
 use std::mem::size_of;
 
 /// Metadata only. It cannot publish a block, enter a native scope or authorize
@@ -12,7 +12,7 @@ pub(crate) struct CacheBlockMetadata {
     dtypes: [String; 2],
     native_dtypes: [Dtype; 2],
     bytes: u64,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl CacheBlockMetadata {
     pub(super) fn ordinary(arrays: &CacheBlockArrays) -> Self {
@@ -418,3 +418,5 @@ pub(super) fn insert_record(
     debug_assert!(prior.is_none());
     Ok(())
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

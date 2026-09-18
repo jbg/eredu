@@ -5,6 +5,7 @@
 //! Activation only fills that node; it creates no Scope, carrier, or allocation.
 use super::*;
 use safemlx::ScopedSubmissionProgress;
+use crate::backend::runtime::execution::generic::{RegisteredScopeRetirementCause, RegisteredScopeRetirementFailure};
 
 pub(crate) mod bank;
 pub(crate) mod operation;
@@ -15,6 +16,10 @@ pub(crate) struct Observation {
     pub(crate) outcome: ScopedSubmissionProgress,
     pub(crate) status: Status,
 }
+/// The one existing nonblocking retirement attempt distinguishes a retained
+/// pending node from a consumed node whose exact cleanup refused advancement.
+#[derive(Debug)]
+pub(crate) enum RetirementAttempt { Pending, Retired, Stopped(RegisteredScopeRetirementFailure) }
 impl Observation {
     fn busy() -> Self {
         Self {
@@ -130,18 +135,18 @@ impl<T: Retention, C: 'static> Retention for ObservedRetention<T, C> {
             value.observe(status);
         }
     }
-    fn retire_node<P: Probe>(mut node: Box<Node<Self, P>>) {
+    fn retire_node<P: Probe>(mut node: Box<Node<Self, P>>) -> Result<(), RegisteredScopeRetirementFailure> {
         let Some(value) = node.retention.value.take() else {
             // Never-started nodes and already-handed-off empty cleanup nodes
             // retire directly; neither invokes a user payload hook or cycles.
-            retire_typed_node(node);
-            return;
+            return retire_typed_node(node);
         };
         let cleanup = OriginalRetirementCleanup {
             _node: Some(PendingOwner(Some(node))),
         };
         // The same Box/observer/C are owned before the typed hook can unwind.
         value.retire_original(cleanup);
+        Ok(())
     }
 }
 
@@ -304,7 +309,7 @@ impl<T: Retention, C: 'static, P: Observer> CompletedObservedRetention<T, C, P> 
                 pending: None,
             }),
             Err(cause) => Err(CompletedReleaseError {
-                cause: FinishRetainingError::Native(cause),
+                cause,
                 pending: None,
             }),
         }
@@ -356,6 +361,7 @@ where
 pub(crate) enum FinishRetainingError<E> {
     Observation(Observation),
     Native(E),
+    Retirement(RegisteredScopeRetirementCause),
 }
 
 impl<T: Retention, C: 'static, P: Observer> PreparedObservedRecovery<T, C, P> {
@@ -369,10 +375,12 @@ impl<T: Retention, C: 'static, P: Observer> PreparedObservedRecovery<T, C, P> {
                 seal_attempted: false,
                 seal_finished: false,
                 callback_failed: Cell::new(false),
+                last_status: Cell::new(None),
                 retention: ObservedRetention {
                     value: None,
                     _custody: custody,
                 },
+                registration: None,
             })))),
         }
     }
@@ -437,6 +445,8 @@ impl<T: Retention, C: 'static, P: Observer> PreparedObservedRecovery<T, C, P> {
             size_of::<CompletedReleaseError<T, C, P>>(),
             size_of::<Result<Observation, CompletedReleaseError<T, C, P>>>(),
             size_of::<FinishRetainingError<P::Error>>(),
+            size_of::<Result<Observation, FinishRetainingError<P::Error>>>(),
+            size_of::<Option<Result<Observation, FinishRetainingError<P::Error>>>>(),
             size_of::<Result<CompletedObservedRetention<T, C, P>, FinishRetainingError<P::Error>>>(
             ),
             size_of::<Result<Option<T>, FinishRetainingError<P::Error>>>(),
@@ -514,6 +524,7 @@ impl<T: Retention, C: 'static, P: Observer> ObservedRecovery<T, C, P> {
         let _health = CallbackHealth::new(&node.callback_failed);
         let observed = node.probe.as_ref().expect("active observer").0.observe()?;
         node.retention.observe(observed.retention_status());
+        node.last_status.set(Some(observed.retention_status()));
         Ok(observed)
     }
     fn retire_terminal_guarded(&self) -> Result<bool, P::Error> {
@@ -567,42 +578,46 @@ impl<T: Retention, C: 'static, P: Observer> ObservedRecovery<T, C, P> {
         }
     }
     /// One non-consuming completion attempt. Pending work, runtime/registry
-    /// contention and errors leave this exact node owned by the caller. A true
-    /// result means the successful terminal payload was retired; do not inspect
-    /// the emptied recovery again. This never waits or enters a global reaper.
-    pub(crate) fn try_finish_successfully(&mut self) -> Result<bool, P::Error> {
+    /// contention and native errors leave this exact node owned by the caller.
+    /// Retired or Stopped consumes the node; only Pending permits another
+    /// attempt. This never waits or enters a global reaper.
+    pub(crate) fn try_finish_successfully(&mut self) -> Result<RetirementAttempt, P::Error> {
         self.seal();
         safemlx::try_with_submission_retirement(|| {
             let observed = self.progress_guarded()?;
             if observed.outcome == ScopedSubmissionProgress::Busy {
-                return Ok(false);
+                return Ok(RetirementAttempt::Pending);
             }
             if let Some(cause) = self.consuming_error(observed) {
                 return Err(cause);
             }
             if !observed.can_retire() || observed.status.failed || observed.status.blocked {
-                return Ok(false);
+                return Ok(RetirementAttempt::Pending);
             }
             if !self.retire_terminal_guarded()? {
-                return Ok(false);
+                return Ok(RetirementAttempt::Pending);
             }
-            self.inner
+            let released = self.inner
                 .node
                 .take()
                 .expect("active observed node")
                 .into_pending()
                 .retire();
-            Ok(true)
+            Ok(match released {
+                Ok(()) => RetirementAttempt::Retired,
+                Err(cause) => RetirementAttempt::Stopped(cause),
+            })
         })
-        .unwrap_or(Ok(false))
+        .unwrap_or(Ok(RetirementAttempt::Pending))
     }
 
     pub(crate) fn try_finish_control_bytes() -> Option<u64> {
         [
             size_of::<Observation>(),
             size_of::<Option<P::Error>>(),
-            size_of::<Result<bool, P::Error>>(),
-            size_of::<Option<Result<bool, P::Error>>>(),
+            size_of::<RetirementAttempt>(),
+            size_of::<Result<RetirementAttempt, P::Error>>(),
+            size_of::<Option<Result<RetirementAttempt, P::Error>>>(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -611,26 +626,32 @@ impl<T: Retention, C: 'static, P: Observer> ObservedRecovery<T, C, P> {
     /// Retire only under the same runtime guard that observed terminal native
     /// lifetime. Refusal/error drops into unchanged owning quarantine; it never
     /// abandons the original custody or substitutes ordinary progress.
-    pub(crate) fn finish(mut self) -> Result<Observation, P::Error> {
+    pub(crate) fn finish(mut self) -> Result<Observation, FinishRetainingError<P::Error>> {
         self.seal();
         loop {
             let observed = safemlx::try_with_submission_retirement(|| {
-                let mut observed = self.progress_guarded()?;
-                // Capture a failed/fixed observation's owning native cause
-                // before a successful terminal pass can retire the observer.
+                let mut observed = self.progress_guarded().map_err(FinishRetainingError::Native)?;
+                // Retain the original failed/fixed cause before consuming the
+                // same node. A later cleanup refusal cannot replace that cause.
                 let mut cause = self.consuming_error(observed);
                 if observed.can_retire() {
                     let retired = match self.retire_terminal_guarded() {
                         Ok(retired) => retired,
-                        Err(error) => return Err(cause.unwrap_or(error)),
+                        Err(error) => return Err(FinishRetainingError::Native(cause.unwrap_or(error))),
                     };
                     if retired {
-                        self.inner
+                        let released = self.inner
                             .node
                             .take()
                             .expect("active observed node")
                             .into_pending()
                             .retire();
+                        if let Err(retirement) = released {
+                            return Err(match cause {
+                                Some(cause) => FinishRetainingError::Native(cause),
+                                None => FinishRetainingError::Retirement(retirement.into_cause()),
+                            });
+                        }
                     } else {
                         observed.outcome = ScopedSubmissionProgress::Busy;
                         if cause.is_none() {
@@ -639,14 +660,14 @@ impl<T: Retention, C: 'static, P: Observer> ObservedRecovery<T, C, P> {
                     }
                 }
                 match cause {
-                    Some(cause) => Err(cause),
-                    None => Ok::<Observation, P::Error>(observed),
+                    Some(cause) => Err(FinishRetainingError::Native(cause)),
+                    None => Ok(observed),
                 }
             })
             .unwrap_or_else(|| {
                 let observed = Observation::busy();
                 match self.consuming_error(observed) {
-                    Some(cause) => Err(cause),
+                    Some(cause) => Err(FinishRetainingError::Native(cause)),
                     None => Ok(observed),
                 }
             })?;

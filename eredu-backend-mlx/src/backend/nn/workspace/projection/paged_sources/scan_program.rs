@@ -22,7 +22,7 @@ pub(super) struct PreparedPagedScan {
     pub(super) tail_start: i64,
     pub(super) used: bool,
     pub(super) completed: bool,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 pub(super) struct ScanSourceRow {
     pub(super) id: CacheBlockId,
@@ -36,7 +36,7 @@ pub(super) struct ScanSourceRow {
 pub(crate) struct ScanSourcePair {
     pub(super) arrays: [Option<Array>; 2],
     pub(super) slots: [PreparedArrayClone; 2],
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 pub(super) fn retirement_control_bytes() -> Option<usize> {
     let frames = [
@@ -310,3 +310,5 @@ fn prepare_one(
         _funding: context.metadata_funding(),
     })
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -165,7 +165,7 @@ impl ExpertMovementQuote {
         self.profiles.iter().map(|p|(p.capacity,p.births,p.bytes,p.controls,p.kernels))
     }
 }
-fn trace(profile:&Profile,count:usize,mechanism:ResidentExecutionMechanisms,funding:&WorkspaceMetadataFunding)
+fn trace(profile:&Profile,count:usize,mechanism:ResidentExecutionMechanisms,funding:&HostMetadataFunding)
     ->Result<SpeculativeNumericalRecipe,Error> {
     let context=WorkspaceContext::new_with_metadata_funding(mechanism,funding.clone())?;
     context.charge_metadata(size_of::<(WorkspaceContext,WorkspaceTraceReport,[WorkspaceTensor;3],Result<SpeculativeNumericalRecipe,Error>)>())?;
@@ -189,3 +189,5 @@ fn trace(profile:&Profile,count:usize,mechanism:ResidentExecutionMechanisms,fund
     let report=context.finish_report(&[output])?;
     SpeculativeNumericalRecipe::inspect_owned_child(&report,1,mechanism,&context)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -128,7 +128,7 @@ use crate::value::Value;
 use crate::vm::State;
 use crate::{AutoEscape, Output};
 mod string_views;
-pub(crate) use string_views::{SplitParts, split_parts, split_parts_limit, strip_range, string_view_control_bytes};
+pub(crate) use string_views::{SplitParts, split_parts_limit, strip_range, string_view_control_bytes};
 
 /// Deprecated alias
 #[deprecated = "Use the minijinja::functions::Function instead"]

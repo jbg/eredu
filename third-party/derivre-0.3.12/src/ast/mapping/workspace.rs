@@ -204,8 +204,7 @@ impl<'a, V> Plan<'a, V> {
     pub(crate) fn prepared_bounds(mut self) -> Result<Self, ConstructionFailure<V>> {
         let (_, nodes, encoded) = self
             .source
-            .prepared_extents()
-            .map_err(|_| fail(ConstructionCause::Source))?;
+            .storage_extents();
         let args = encoded
             .checked_sub(1)
             .ok_or_else(|| fail(ConstructionCause::Source))?;
@@ -461,10 +460,10 @@ mod tests {
     }
     #[test]
     fn source_bound_mapping_buffers_keep_mutations_memo_prefixes_and_failed_scope_state() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk(Expr::Byte(b'a'));
-        let b = source.mk(Expr::Byte(b'b'));
-        let root = source.mk(Expr::Concat(ExprFlags::POSITIVE, [a, b]));
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk(Expr::Byte(b'a')).unwrap();
+        let b = source.mk(Expr::Byte(b'b')).unwrap();
+        let root = source.mk(Expr::Concat(ExprFlags::POSITIVE, [a, b])).unwrap();
         let initial_nodes = source.len();
         let plan = source.mapping_workspace_plan::<ExprRef>().unwrap();
         let requirements = plan.requirements();
@@ -489,7 +488,7 @@ mod tests {
                 |value| Ok(*value),
                 |expressions, _, node| {
                     if node == a {
-                        created = Some(expressions.mk(Expr::Byte(b'z')));
+                        created = Some(expressions.mk(Expr::Byte(b'z')).unwrap());
                     }
                     Ok(node)
                 },
@@ -574,7 +573,7 @@ mod tests {
         drop(workspace);
         assert!(source.is_valid(created));
 
-        source.mk(Expr::Not(ExprFlags::POSITIVE, ExprRef::new(u32::MAX)));
+        source.mk(Expr::Not(ExprFlags::POSITIVE, ExprRef::new(u32::MAX))).unwrap();
         let failure = source.mapping_workspace_plan::<ExprRef>().unwrap_err();
         assert!(matches!(failure.cause, ConstructionCause::Source));
         assert_eq!(failure.scratch.nodes.capacity(), 0);

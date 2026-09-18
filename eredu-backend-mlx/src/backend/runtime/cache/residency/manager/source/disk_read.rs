@@ -56,14 +56,14 @@ struct ReadBody {
     pin: PinnedCacheBlock,
     reservation: DiskReadOccupancy,
     transfer: CachePoolReservation,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Actual physical Host reservation shared by source arenas, task and pending row.
 #[derive(Clone)]
 pub(crate) struct DiskReadOccupancy {
     inner: Arc<Mutex<CachePoolReservation>>,
     host_bytes: u64,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for DiskReadOccupancy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,7 +109,7 @@ struct ReadCompletion {
 #[derive(Clone)]
 pub(crate) struct PreparedDiskReadOutput {
     inner: Arc<OnceLock<ReadCompletion>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DiskReadFailure {

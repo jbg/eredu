@@ -1,0 +1,89 @@
+{
+  "date": "2026-09-18",
+  "scope": "Complete retained GGUF tokenizer and embedded template source compilation. Source-only; no tensor payload or native model numerical inference.",
+  "git_head": "77e08045401912c502e6ab1600e8b622c3563478",
+  "source_state": "Uncommitted working tree; relevant source hashes below identify this validation input.",
+  "rustc": "1.98.0-aarch64-apple-darwin",
+  "artifact": {
+    "publisher_repository": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+    "snapshot": "6767265158422fb8a19c62ceb45f16f05363615b",
+    "file": "LFM2.5-1.2B-Instruct-BF16.gguf",
+    "bytes": 2343326528,
+    "sha256": "3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b",
+    "provenance": "Read-only existing Hugging Face snapshot; independently computed whole-file SHA-256 matches its addressed blob. No new network provenance check in this validation."
+  },
+  "released_source_result": {
+    "passed": 1,
+    "elapsed_seconds": 2.24,
+    "load_ms": 333.394,
+    "tokenizer_compile_ms": 1842.198,
+    "template_compile_ms": 1.632,
+    "token_count": 66045,
+    "retained_tokenizer_source_bytes": 7811903,
+    "retained_template_source_bytes": 17486858,
+    "peak_pool_bytes": 63838491,
+    "final_pool_bytes": 0,
+    "exact_encoding_comparisons": 12,
+    "exact_template_render_comparisons": 2,
+    "prefix_error_bytes": 168,
+    "log": "/tmp/native-official-gguf-source-final-test-3.log"
+  },
+  "focused_results": {
+    "public_retained_source_tests": {
+      "passed": 3,
+      "ignored_released_fixture": 1,
+      "log": "/tmp/native-retained-source-facade-final-2.log"
+    },
+    "original_tokenizer_runtime_tests": {
+      "passed": 60,
+      "log": "/tmp/native-prefix-boxed-final-tests.log"
+    },
+    "pristine_regex_source_comparisons": {
+      "comparisons": 7020,
+      "sources": 9,
+      "log": "/tmp/native-gguf-regex-pristine.log"
+    },
+    "serializer_complete_byte_comparisons": {
+      "comparisons": 9,
+      "log": "/tmp/native-tokenizer-serialization-reference-2.log"
+    },
+    "recipe_reproduction": {
+      "identical_generated_files": 42,
+      "prior_endian_images_unchanged": 32,
+      "log": "/tmp/native-gguf-regex-emitter-repeat.log"
+    },
+    "native_example_rust_only_check": {
+      "passed": true,
+      "elapsed_seconds": 51.42,
+      "log": "/tmp/native-gguf-example-check-2.log",
+      "limitation": "DOCS_RS=1 typecheck only; no native link or execution."
+    }
+  },
+  "commands": [
+    "RUSTC=/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin/rustc CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/eredu-numeric-check EREDU_PINNED_GGUF_SOURCE=<verified GGUF path> cargo test -p eredu --no-default-features --test portable_facade pinned_gguf_retained_source_preserves_ids_template_and_retirement -- --ignored --nocapture",
+    "/private/tmp/eredu-numeric-check/debug/deps/portable_facade-1159072e18ee7922 retained_sources --nocapture",
+    "RUSTC=<pinned rustc> CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/eredu-numeric-check cargo test -p eredu-runtime --lib original_tokenizer",
+    "cargo run --manifest-path /private/tmp/eredu-wordlevel-reference/Cargo.toml --release --offline --bin serialization",
+    "cargo run --manifest-path /private/tmp/eredu-fancy-cargo-reference/Cargo.toml --release --offline --bin gguf_sources"
+  ],
+  "binary_sha256": {
+    "/private/tmp/eredu-numeric-check/debug/deps/portable_facade-1159072e18ee7922": "3ba1a3d67c676348d02434c1e2f2e22dfa2c4516b3e3570ff21e68999b6f28bd"
+  },
+  "source_sha256": {
+    "third-party/tokenizers-0.23.2/src/tokenizer/source_serialization.rs": "42c64686438c41a91362b49be4b84f41c5793efa3c05105e5022ffb4838f91cb",
+    "third-party/tokenizers-0.23.2/src/tokenizer/serialization.rs": "5efed14c75a06b89304ce2901f0e073edbd48db88f9a90695b4c405215dd55f4",
+    "eredu-text/src/tokenizer_storage.rs": "cecbca6e02aeac6c59fc3b9f37b0c04be6d757725a7a300cda012f0344ceb7d5",
+    "eredu-text/src/tokenizer_storage/prefix.rs": "1e1fb8ace7597173cbfaa1cec041af2e62ec90d59a04f35dde2d44e467bc6770",
+    "eredu-runtime/src/working_memory/original_tokenizer.rs": "10b17b49c35ad661199135f5758886eefe111d511b43bf419ceb940ae38237ad",
+    "eredu-runtime/src/working_memory/original_tokenizer/input.rs": "f3d5b2ba3c6ea70f98359d81ce6f70b97d3f1a3663599589a1cb07a7f58349f3",
+    "eredu/tests/portable_facade/retained_sources.rs": "60c164c8b382187be1211eed65887a3bee24b127d9fa5609aa91d3aef9e4bc26",
+    "doc/validation/tokenizer-source-serialize-compare.rs": "6996a9411c25f5b92da016743fbf244722c6495e9cbea8148708c37ee8bc4565",
+    "doc/validation/gguf-tokenizer-regex-compare.rs": "a66684fb9203d43b021e3a53dfb779227535f77eafd4a8e9a337beac5c6395da",
+    "Cargo.lock": "2addf61ea7cd7585a356750fad5a97e05018238be6fca9fc12668a92c15d851d"
+  },
+  "limits": [
+    "No released-model numerical equivalence claim.",
+    "Non-serialized mutable Unigram sampling settings must match exactly; serialization cannot silently reset them.",
+    "Tokenizer compiler profile gaps remain explicit typed refusals; retained source selection does not substitute a different engine."
+  ]
+}

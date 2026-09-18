@@ -868,3 +868,12 @@ impl Default for Builder {
         Builder::new()
     }
 }
+
+#[cfg(feature = "alloc")]
+impl Regex<dense::DFA<alloc::vec::Vec<u32>>> {
+    /// Visit actual retained storage in both owned DFA directions.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        self.forward().visit_source_storage(visitor)?;
+        self.reverse().visit_source_storage(visitor)
+    }
+}

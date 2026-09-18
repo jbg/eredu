@@ -83,10 +83,10 @@ impl MlxWorkspaceFactCause {
     pub(super) fn ordinary(self) -> Error {
         match self {
             Self::Layout(error) => error.into(),
-            Self::Integer(error) => Error::backend_source(error),
-            Self::F32Initialization(error) => Error::backend_source(error),
-            Self::ProjectionObservation(error) => Error::backend_source(error),
-            Self::RotaryTable(error) => Error::backend_source(error),
+            Self::Integer(error) => Error::backend_retained_source(error),
+            Self::F32Initialization(error) => Error::backend_retained_source(error),
+            Self::ProjectionObservation(error) => Error::backend_retained_source(error),
+            Self::RotaryTable(error) => Error::backend_retained_source(error),
             other => Error::backend(other),
         }
     }

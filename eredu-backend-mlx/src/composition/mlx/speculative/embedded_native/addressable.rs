@@ -14,7 +14,7 @@ fn total(parts:&[usize])->Option<usize>{parts.iter().copied().try_fold(size_of_v
 pub(crate) struct AddressableModelSource {
     pending:RefCell<Option<SpeculativeAddressableSpan>>,
     access:RefCell<Option<OriginalSelectedResidencyAccess>>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 struct Call<'a,'r,W,Q,R:ModelRole,T,F>{
     run:Option<F>,work:&'a mut W,payload:&'a Q,active:&'a ActiveEmbeddedNativeInvocation<'r,R>,
@@ -30,13 +30,13 @@ where F:FnOnce(&mut W,&Q,&ActiveEmbeddedNativeInvocation<'_,R>)->Result<T,Error>
 }
 impl AddressableModelSource {
     pub(crate) fn prepare(records:&[ResidentSpanRecipe],target:Option<HostSourceConstructionFacts>,
-        funding:&WorkspaceMetadataFunding)->Result<(Option<Self>,Option<HostSourceConstructionFacts>,u64),Error>{
+        funding:&HostMetadataFunding)->Result<(Option<Self>,Option<HostSourceConstructionFacts>,u64),Error>{
         if records.len()!=1{return Err(identity());}
         let Some(mut source)=SpeculativeAddressableSources::prepare(records,target,funding)? else{return Ok((None,target,0))};
         funding.reserve_metadata(total(&[size_of::<Self>(),size_of::<SpeculativeAddressableSources>(),
             size_of::<Result<(Option<Self>,Option<HostSourceConstructionFacts>,u64),Error>>(),
             size_of::<Vec<Option<HostSourceConstructionFacts>>>(),size_of::<Option<SpeculativeAddressableSpan>>(),
-            size_of::<(&[ResidentSpanRecipe],Option<HostSourceConstructionFacts>,&WorkspaceMetadataFunding)>(),
+            size_of::<(&[ResidentSpanRecipe],Option<HostSourceConstructionFacts>,&HostMetadataFunding)>(),
             size_of::<u64>()]).ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)?;
         let mut facts=source.take_facts()?;
         if facts.len()!=1{return Err(identity());}

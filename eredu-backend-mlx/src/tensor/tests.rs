@@ -35,6 +35,40 @@ fn arrays_close(actual: &Array, expected: &Array) {
 }
 
 #[test]
+#[ignore = "requires local MLX CPU and Metal execution"]
+fn masked_scatter_uses_prefix_rows_and_preserves_logical_order() {
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        let execution = ExecutionContext::new(Device::new(device, 0));
+        let stream = execution.stream();
+        let input = MlxTensor::from_array(Array::from_slice(
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[2, 3, 2],
+        ));
+        let mask = MlxTensor::from_array(Array::from_slice(&[false, true, false, true, false, true], &[2, 3]));
+        let rows = MlxTensor::from_array(Array::from_slice(&[-1.0_f32, -2.0, -3.0, -4.0, -5.0, -6.0], &[3, 2]));
+        close(input.masked_scatter(&mask, &rows, stream).unwrap().as_array(),
+            &[1.0, 2.0, -1.0, -2.0, 5.0, 6.0, -3.0, -4.0, 9.0, 10.0, -5.0, -6.0]);
+        let strided = MlxTensor::from_array(Array::from_slice(
+            &[-1.0_f32, -3.0, -5.0, -2.0, -4.0, -6.0], &[2, 3],
+        )).transpose(stream).unwrap();
+        close(input.masked_scatter(&mask, &strided, stream).unwrap().as_array(),
+            &[1.0, 2.0, -1.0, -2.0, 5.0, 6.0, -3.0, -4.0, 9.0, 10.0, -5.0, -6.0]);
+        let rows = MlxTensor::from_array(Array::from_slice(&[20_i32, 30, 40], &[3, 1]));
+        close(input.masked_scatter(&mask, &rows, stream).unwrap().as_array(),
+            &[1.0, 2.0, 20.0, 20.0, 5.0, 6.0, 30.0, 30.0, 9.0, 10.0, 40.0, 40.0]);
+        let row = MlxTensor::from_array(Array::from_slice(&[50.0_f32, 60.0], &[2]));
+        close(input.masked_scatter(&mask, &row, stream).unwrap().as_array(),
+            &[1.0, 2.0, 50.0, 60.0, 5.0, 6.0, 50.0, 60.0, 9.0, 10.0, 50.0, 60.0]);
+        let elements = input.reshape(&[12], stream).unwrap();
+        let mask = MlxTensor::from_array(Array::from_slice(
+            &[true, false, false, true, false, false, false, false, false, false, false, true], &[12],
+        ));
+        let scalar = MlxTensor::from_array(Array::from_slice(&[-9.0_f32], &[]));
+        close(elements.masked_scatter(&mask, &scalar, stream).unwrap().as_array(),
+            &[-9.0, 2.0, 3.0, -9.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, -9.0]);
+    }
+}
+
+#[test]
 fn wrapper_is_one_transparent_native_handle() {
     fn assert_contract<T: Tensor + AsRef<Array> + From<Array>>() {}
     fn assert_native_conversion<T: Into<Array>>() {}

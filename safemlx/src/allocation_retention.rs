@@ -121,6 +121,25 @@ impl Drop for RetirementBatch {
     }
 }
 
+// Shared ordinary/specific retirement exclusion. Acquiring this guard never
+// enters the native runtime or progresses an unrelated owner.
+struct ReclamationGuard;
+fn begin_reclamation() -> Option<ReclamationGuard> {
+    if !runtime_lock::can_reclaim_submission_resources()
+        || RECLAIMING
+            .try_with(|running| running.replace(true))
+            .unwrap_or(true)
+    {
+        return None;
+    }
+    Some(ReclamationGuard)
+}
+impl Drop for ReclamationGuard {
+    fn drop(&mut self) {
+        let _ = RECLAIMING.try_with(|running| running.set(false));
+    }
+}
+
 /// Drops owners whose covered native allocation has retired (backing or Scope metadata).
 ///
 /// Returns the number reclaimed from the current queue. This never waits for
@@ -133,20 +152,9 @@ impl Drop for RetirementBatch {
 /// here on an ordinary host thread. A queued owner continues retaining its
 /// resources until reclaimed. A panicking destructor leaves other owners queued.
 pub fn reclaim_allocation_owners() -> usize {
-    if !runtime_lock::can_reclaim_submission_resources()
-        || RECLAIMING
-            .try_with(|running| running.replace(true))
-            .unwrap_or(true)
-    {
+    let Some(_reset) = begin_reclamation() else {
         return 0;
-    }
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            let _ = RECLAIMING.try_with(|running| running.set(false));
-        }
-    }
-    let _reset = Reset;
+    };
     let mut batch = RetirementBatch(RETIRED.swap(ptr::null_mut(), Ordering::Acquire));
     let mut reclaimed = 0usize;
     while !batch.0.is_null() {
@@ -280,7 +288,7 @@ mod prepared;
 pub(crate) mod scope;
 pub use prepared::{
     AllocationOwnerLayout, PreparedAllocationOwner, PreparedAllocationOwnerCause,
-    PreparedAllocationOwnerError,
+    PreparedAllocationOwnerError, PreparedAllocationRetirement,
 };
 
 mod record_quota;
@@ -300,7 +308,7 @@ pub use graph_quota::{
     RetirementCapacityOwner, RetirementCapacityPermit, SubmissionGraphQuota,
     SubmissionGraphQuotaCause, SubmissionGraphQuotaError, SubmissionGraphQuotaLayout,
 };
-pub use host_alias::HostTransferArrayAliasWitness;
+pub use host_alias::{HostTransferArrayAliasWitness, HostTransferArrayViewWitness};
 pub use original_buffer::{
     ImmutableSourceInspection, ImmutableSourceWitness, OrdinaryBufferInspection,
     OrdinaryBufferWitness, OriginalBufferAliasWitness, OriginalBufferBudget,
@@ -324,7 +332,10 @@ mod scheduler;
 pub use scheduler::*;
 
 mod stream_copy;
-pub use stream_copy::{CpuMatmulFacts, CpuMatmulKernel, PreparedStreamCopy, StreamCopyCause, StreamCopyError, StreamCopyPlan};
+pub use stream_copy::{
+    CpuMatmulFacts, CpuMatmulKernel, PreparedStreamCopy, StreamCopyCause, StreamCopyError,
+    StreamCopyPlan,
+};
 
 mod cpu_worker;
 pub use cpu_worker::*;

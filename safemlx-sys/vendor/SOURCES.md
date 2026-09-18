@@ -41,3 +41,23 @@ nonempty views still share their original backing and logical offset. These
 cases are reachable through the safe array API, including overlapping strided
 views. The patch is applied to the build-tree copy after the existing patches;
 the pinned MLX archive, its digest and upstream attribution remain unchanged.
+
+`mlx-kernel-name-fold.patch` keeps the original kernel-name formatting worker
+and its by-value argument snapshots, replacing recursive suffix copies with a
+borrowed fold. Its portable helper is shared by Metal selectors and host-only
+tests. The selector control query prices the resulting actual parameter and
+temporary population; name-allocation and kernel-attempt bounds are unchanged.
+See `doc/bounded-followup-kernel-name.md` for pristine-source parity and layout
+evidence.
+
+`mlx-cpu-host-transfer-source.patch` qualifies the existing CPU Host-transfer
+workers through their shared General-copy Eval storage. It preserves ordinary
+copy equations and independently authenticated original Host/stream ownership;
+its query distinguishes an accepted store destination from a new load output.
+The pinned archive and upstream attribution remain unchanged.
+
+`mlx-host-transfer-source-witness.patch` exposes the existing immutable Host
+allocation constructor provenance alongside its nonrecycled generation and full
+capacity. Direct Host owners and completed Array aliases use these same facts;
+inspection creates no allocation, evaluation, or new source authority. The pinned
+archive and ordinary/prepared allocation lifetimes remain unchanged.

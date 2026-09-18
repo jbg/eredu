@@ -56,7 +56,7 @@ impl ErasedRealtimeExecutionContract for TestExecution {
         _: &[crate::MlxTensor],
         _: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         _: &Stream,
-        _: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        _: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         (
             Option<crate::MlxTensor>,

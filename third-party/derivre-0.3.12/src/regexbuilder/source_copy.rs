@@ -87,6 +87,17 @@ impl std::error::Error for RegexBuilderCopyFailure {
     }
 }
 impl RegexBuilder {
+    /// Existing builder/source inspection frames; no source traversal occurs.
+    pub fn source_inspection_control_bytes() -> Option<usize> {
+        RegexBuilderCopyPlan::wrapper_controls()?
+            .checked_add(ExprSet::prepared_source_inspection_control_bytes()?)
+    }
+    /// Actual expression and memo capacities owned by this compiler instance.
+    /// Parser configuration is inline; constructing a syntax parser is separate.
+    pub fn retained_capacity_bytes(&self) -> Option<usize> {
+        self.exprset.retained_capacity_bytes()?.checked_add(self.json_quote_cache.allocation_size())
+    }
+
     /// Loans the exact compiled expression owner and parser configuration. The
     /// parser-builder configuration is inline (flags/limits), not a built parser.
     pub fn source_copy_plan(&self) -> Result<RegexBuilderCopyPlan<'_>, RegexBuilderCopyFailure> {
@@ -98,17 +109,7 @@ impl RegexBuilder {
     }
 }
 impl<'a> RegexBuilderCopyPlan<'a> {
-    fn prepare(source: &'a RegexBuilder) -> Result<Self, Cause> {
-        let exprset = source
-            .exprset
-            .source_copy_plan()
-            .map_err(Cause::Expressions)?;
-        let table_bytes = source.json_quote_cache.allocation_size();
-        let buffers = exprset
-            .requirements()
-            .buffer_bytes()
-            .checked_add(table_bytes)
-            .ok_or(Cause::Overflow)?;
+    fn wrapper_controls() -> Option<usize> {
         let parts = [
             size_of::<Self>(),
             size_of::<RegexBuilder>(),
@@ -128,9 +129,20 @@ impl<'a> RegexBuilderCopyPlan<'a> {
             size_of::<Result<(), hashbrown::TryReserveError>>(),
             size_of::<Option<ExprRef>>(),
         ];
-        let controls = parts
-            .into_iter()
-            .try_fold(size_of_val(&parts), usize::checked_add)
+        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+    }
+    fn prepare(source: &'a RegexBuilder) -> Result<Self, Cause> {
+        let exprset = source
+            .exprset
+            .source_copy_plan()
+            .map_err(Cause::Expressions)?;
+        let table_bytes = source.json_quote_cache.allocation_size();
+        let buffers = exprset
+            .requirements()
+            .buffer_bytes()
+            .checked_add(table_bytes)
+            .ok_or(Cause::Overflow)?;
+        let controls = Self::wrapper_controls()
             .and_then(|n| n.checked_add(exprset.requirements().control_bytes()))
             .ok_or(Cause::Overflow)?;
         let total = buffers.checked_add(controls).ok_or(Cause::Overflow)?;
@@ -208,7 +220,7 @@ mod tests {
     use crate::{JsonQuoteOptions, RegexAst};
     #[test]
     fn exact_builder_copy_preserves_unicode_json_configuration_and_failed_prefix() {
-        let mut source = RegexBuilder::new();
+        let mut source = RegexBuilder::new(crate::ParserAllocationFunding::unenforced()).unwrap();
         source.case_insensitive(true).ignore_whitespace(true);
         let unicode = source.mk_regex("[α-ω]+ | [Ж-Я]+").unwrap();
         let literal = source.mk(&RegexAst::Literal("a\n\"".into())).unwrap();
@@ -239,8 +251,8 @@ mod tests {
             (unicode, "ab", false),
             (quoted, "\"a\\n\\\"\"", true),
         ] {
-            assert_eq!(copy.to_regex(expression).is_match(text), expected);
-            assert_eq!(ordinary.to_regex(expression).is_match(text), expected);
+            assert_eq!(copy.to_regex(expression).unwrap().is_match(text).unwrap(), expected);
+            assert_eq!(ordinary.to_regex(expression).unwrap().is_match(text).unwrap(), expected);
         }
         let mut fail = source.source_copy_plan().unwrap();
         fail.table_bytes = 0;

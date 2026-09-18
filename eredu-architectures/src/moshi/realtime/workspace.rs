@@ -45,11 +45,11 @@ where S:eredu_runtime::Sampler<WorkspaceSamplingBackend>,
         context.validate_values(temporal)?;
         let mut model=source.workspace_model(context)?;
         eredu_runtime::working_memory::bind_prepared_workspace_parameters(
-            model.static_modules_mut(),static_bindings,context)?;
+            model.static_modules_mut(),static_bindings,context, |_| false)?;
         let graph=source.execution_graph();
         let mut counts=context.metadata_vec(graph.groups().len())?;
         for group in 0..graph.groups().len() {
-            counts.push(<Model as LayeredArchitecture<WorkspaceBackend,State>>::group_unit_count(&model,group)?);
+            counts.push(<Model as LayeredArchitecture<WorkspaceBackend,State>>::group_unit_count(&model,group, None)?);
         }
         let layout=eredu_runtime::ExecutionUnitLayout::new_with_metadata(graph,&counts,context)?;
         let policy=WorkspaceLayerwisePolicy::for_layout(parameters,&layout,context)?;

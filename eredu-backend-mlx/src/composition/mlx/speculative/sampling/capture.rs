@@ -257,7 +257,7 @@ impl OriginalCapture {
             let recorded = owner.records.try_push(SpeculativePredictionCapture {
                 role,
                 position: history.len() as u64,
-                capture: CapturedStepDelivery::Shared(frame),
+                capture: frame,
             });
             if let Err(cause) = recorded {
                 // Capacity was prepared before entry. Preserve any primary native

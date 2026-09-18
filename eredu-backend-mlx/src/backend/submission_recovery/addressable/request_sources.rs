@@ -4,15 +4,15 @@ use crate::backend::{error::Error,nn::workspace::{AddressableInvocation,Addressa
     runtime::{execution::generic::OriginalSelectedResidencyAccess,residency::{
         manager::{ForegroundDiskSourceCapacity,ForegroundDiskSourceSeries},
         parameter_bank::IndexedConstructorPartitions}}};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding,HostMetadataFundingError};
 use eredu_runtime::working_memory::{HostSourceConstructionFacts,HostSourceConstructionProgram,
     OriginalHostSourceBank,OriginalHostSourceProgramBanks,WorkingMemoryError};
 use std::{cell::RefCell,mem::{size_of,size_of_val}};
 fn memory(cause:WorkingMemoryError)->Error {Error::PrefillControl(cause)}
-fn overflow()->Error {Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
+fn overflow()->Error {Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
 fn identity()->Error {memory(WorkingMemoryError::IdentityMismatch)}
 fn sum(parts:&[usize])->Option<usize> {parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)}
-fn reserve(funding:&WorkspaceMetadataFunding,bytes:Option<usize>)->Result<(),Error> {
+fn reserve(funding:&HostMetadataFunding,bytes:Option<usize>)->Result<(),Error> {
     funding.reserve_metadata(bytes.ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
 /// Original report coordinates and exact immutable source for one physical use.
@@ -33,7 +33,7 @@ pub(crate) struct AddressableRequestSourcePlan {
     program:HostSourceConstructionProgram,
     target:Option<usize>,
     paged:Option<usize>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl AddressableRequestSourcePlan {
     /// Rows are the actual retained reports and their finite physical occurrence
@@ -41,7 +41,7 @@ impl AddressableRequestSourcePlan {
     /// With no indexed rows, this same program composes only the actual target
     /// and paged sources; no constructor component or allowance is invented.
     pub(crate) fn prepare(rows:&[(&AddressableInvocation,usize)],target:Option<HostSourceConstructionFacts>,paged:Option<HostSourceConstructionFacts>,
-        funding:&WorkspaceMetadataFunding)->Result<Self,Error> {
+        funding:&HostMetadataFunding)->Result<Self,Error> {
         let count=rows.iter().try_fold(0usize,|sum,(row,repeats)|sum.checked_add(row.occurrences().len().checked_mul(*repeats)?))
             .ok_or_else(overflow)?;
         if count==0&&target.is_none()&&paged.is_none(){return Err(identity());}
@@ -142,8 +142,8 @@ impl AddressableRequestSourcePlan {
     fn planning_control_bytes()->Option<usize> {
         sum(&[size_of::<Self>(),size_of::<Result<Self,Error>>(),size_of::<AddressableSourceOccurrence>(),
             size_of::<Reader>(),size_of::<Vec<Reader>>(),size_of::<Vec<AddressableSourceOccurrence>>(),
-            size_of::<(&[(&AddressableInvocation,usize)],Option<HostSourceConstructionFacts>,Option<HostSourceConstructionFacts>,&WorkspaceMetadataFunding)>(),
-            size_of::<[usize;7]>(),size_of::<u64>(),size_of::<Option<usize>>(),size_of::<WorkspaceMetadataFunding>(),
+            size_of::<(&[(&AddressableInvocation,usize)],Option<HostSourceConstructionFacts>,Option<HostSourceConstructionFacts>,&HostMetadataFunding)>(),
+            size_of::<[usize;7]>(),size_of::<u64>(),size_of::<Option<usize>>(),size_of::<HostMetadataFunding>(),
             size_of::<std::slice::Iter<'_,(usize,AddressableQuoteRef)>>(),
             HostSourceConstructionProgram::plan_control_bytes()?])
     }
@@ -151,7 +151,7 @@ impl AddressableRequestSourcePlan {
         sum(&[size_of::<AddressableRequestSources>(),size_of::<State>(),size_of::<ReaderState>(),
             size_of::<Result<AddressableRequestSources,Error>>(),size_of::<OriginalHostSourceProgramBanks>(),
             size_of::<OriginalHostSourceBank>(),size_of::<(Self,OriginalHostSourceBank)>(),
-            size_of::<WorkspaceMetadataFunding>(),size_of::<Option<OriginalHostSourceBank>>()*2])
+            size_of::<HostMetadataFunding>(),size_of::<Option<OriginalHostSourceBank>>()*2])
     }
     fn take_control_bytes()->Option<usize> {
         sum(&[size_of::<(&AddressableRequestSources,usize,&OriginalSelectedResidencyAccess)>(),
@@ -233,3 +233,5 @@ impl AddressableRequestSources {
                 &&root.remaining_attempts()==0&&root.remaining_partitions()==0))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

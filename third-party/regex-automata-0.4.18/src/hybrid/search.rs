@@ -1,9 +1,11 @@
 use crate::{
     hybrid::{
         dfa::{Cache, OverlappingState, DFA},
+        error::CacheError,
         id::LazyStateID,
     },
     util::{
+        allocation::Allocation,
         prefilter::Prefilter,
         search::{HalfMatch, Input, MatchError, Span},
     },
@@ -14,6 +16,7 @@ pub(crate) fn find_fwd(
     dfa: &DFA,
     cache: &mut Cache,
     input: &Input<'_>,
+    funding: &dyn Allocation,
 ) -> Result<Option<HalfMatch>, MatchError> {
     if input.is_done() {
         return Ok(None);
@@ -33,15 +36,15 @@ pub(crate) fn find_fwd(
     // four routines *tends* to help latency more than throughput.
     if pre.is_some() {
         if input.get_earliest() {
-            find_fwd_imp(dfa, cache, input, pre, true)
+            find_fwd_imp(dfa, cache, input, pre, true, funding)
         } else {
-            find_fwd_imp(dfa, cache, input, pre, false)
+            find_fwd_imp(dfa, cache, input, pre, false, funding)
         }
     } else {
         if input.get_earliest() {
-            find_fwd_imp(dfa, cache, input, None, true)
+            find_fwd_imp(dfa, cache, input, None, true, funding)
         } else {
-            find_fwd_imp(dfa, cache, input, None, false)
+            find_fwd_imp(dfa, cache, input, None, false, funding)
         }
     }
 }
@@ -53,11 +56,12 @@ fn find_fwd_imp(
     input: &Input<'_>,
     pre: Option<&'_ Prefilter>,
     earliest: bool,
+    funding: &dyn Allocation,
 ) -> Result<Option<HalfMatch>, MatchError> {
     // See 'prefilter_restart' docs for explanation.
     let universal_start = dfa.get_nfa().look_set_prefix_any().is_empty();
     let mut mat = None;
-    let mut sid = init_fwd(dfa, cache, input)?;
+    let mut sid = init_fwd(dfa, cache, input, funding)?;
     let mut at = input.start();
     // This could just be a closure, but then I think it would be unsound
     // because it would need to be safe to invoke. This way, the lack of safety
@@ -76,7 +80,7 @@ fn find_fwd_imp(
             Some(ref span) => {
                 at = span.start;
                 if !universal_start {
-                    sid = prefilter_restart(dfa, cache, &input, at)?;
+                    sid = prefilter_restart(dfa, cache, &input, at, funding)?;
                 }
             }
         }
@@ -86,8 +90,8 @@ fn find_fwd_imp(
         if sid.is_tagged() {
             cache.search_update(at);
             sid = dfa
-                .next_state(cache, sid, input.haystack()[at])
-                .map_err(|_| gave_up(at))?;
+                .next_state_with_allocations(cache, sid, input.haystack()[at], funding)
+                .map_err(|err| cache_error(err, at))?;
         } else {
             // SAFETY: There are two safety invariants we need to uphold
             // here in the loops below: that 'sid' and 'prev_sid' are valid
@@ -117,7 +121,7 @@ fn find_fwd_imp(
             // And there are three different configurations:
             //
             //     nounroll: this entire 'else' block vanishes and we just
-            //               always use 'dfa.next_state(..)'.
+            //               always use 'dfa.next_state_with_allocations(.., funding)'.
             //      unroll1: just the outer loop below
             //      unroll2: just the inner loop below
             //      unroll3: both the outer and inner loops below
@@ -225,8 +229,8 @@ fn find_fwd_imp(
             if sid.is_unknown() {
                 cache.search_update(at);
                 sid = dfa
-                    .next_state(cache, prev_sid, input.haystack()[at])
-                    .map_err(|_| gave_up(at))?;
+                    .next_state_with_allocations(cache, prev_sid, input.haystack()[at], funding)
+                    .map_err(|err| cache_error(err, at))?;
             }
         }
         if sid.is_tagged() {
@@ -256,9 +260,7 @@ fn find_fwd_imp(
                                 if span.start > at {
                                     at = span.start;
                                     if !universal_start {
-                                        sid = prefilter_restart(
-                                            dfa, cache, &input, at,
-                                        )?;
+                                        sid = prefilter_restart(dfa, cache, &input, at, funding)?;
                                     }
                                     continue;
                                 }
@@ -293,7 +295,7 @@ fn find_fwd_imp(
         }
         at += 1;
     }
-    eoi_fwd(dfa, cache, input, &mut sid, &mut mat)?;
+    eoi_fwd(dfa, cache, input, &mut sid, &mut mat, funding)?;
     cache.search_finish(input.end());
     Ok(mat)
 }
@@ -303,14 +305,15 @@ pub(crate) fn find_rev(
     dfa: &DFA,
     cache: &mut Cache,
     input: &Input<'_>,
+    funding: &dyn Allocation,
 ) -> Result<Option<HalfMatch>, MatchError> {
     if input.is_done() {
         return Ok(None);
     }
     if input.get_earliest() {
-        find_rev_imp(dfa, cache, input, true)
+        find_rev_imp(dfa, cache, input, true, funding)
     } else {
-        find_rev_imp(dfa, cache, input, false)
+        find_rev_imp(dfa, cache, input, false, funding)
     }
 }
 
@@ -320,9 +323,10 @@ fn find_rev_imp(
     cache: &mut Cache,
     input: &Input<'_>,
     earliest: bool,
+    funding: &dyn Allocation,
 ) -> Result<Option<HalfMatch>, MatchError> {
     let mut mat = None;
-    let mut sid = init_rev(dfa, cache, input)?;
+    let mut sid = init_rev(dfa, cache, input, funding)?;
     // In reverse search, the loop below can't handle the case of searching an
     // empty slice. Ideally we could write something congruent to the forward
     // search, i.e., 'while at >= start', but 'start' might be 0. Since we use
@@ -330,7 +334,7 @@ fn find_rev_imp(
     // this extra case handling by using a signed offset, but Rust makes it
     // annoying to do. So... We just handle the empty case separately.
     if input.start() == input.end() {
-        eoi_rev(dfa, cache, input, &mut sid, &mut mat)?;
+        eoi_rev(dfa, cache, input, &mut sid, &mut mat, funding)?;
         return Ok(mat);
     }
 
@@ -346,8 +350,8 @@ fn find_rev_imp(
         if sid.is_tagged() {
             cache.search_update(at);
             sid = dfa
-                .next_state(cache, sid, input.haystack()[at])
-                .map_err(|_| gave_up(at))?;
+                .next_state_with_allocations(cache, sid, input.haystack()[at], funding)
+                .map_err(|err| cache_error(err, at))?;
         } else {
             // SAFETY: See comments in 'find_fwd' for a safety argument.
             //
@@ -374,9 +378,7 @@ fn find_rev_imp(
             let mut prev_sid = sid;
             while at >= input.start() {
                 prev_sid = unsafe { next_unchecked!(sid, at) };
-                if prev_sid.is_tagged()
-                    || at <= input.start().saturating_add(3)
-                {
+                if prev_sid.is_tagged() || at <= input.start().saturating_add(3) {
                     core::mem::swap(&mut prev_sid, &mut sid);
                     break;
                 }
@@ -407,8 +409,8 @@ fn find_rev_imp(
             if sid.is_unknown() {
                 cache.search_update(at);
                 sid = dfa
-                    .next_state(cache, prev_sid, input.haystack()[at])
-                    .map_err(|_| gave_up(at))?;
+                    .next_state_with_allocations(cache, prev_sid, input.haystack()[at], funding)
+                    .map_err(|err| cache_error(err, at))?;
             }
         }
         if sid.is_tagged() {
@@ -441,7 +443,7 @@ fn find_rev_imp(
         at -= 1;
     }
     cache.search_finish(input.start());
-    eoi_rev(dfa, cache, input, &mut sid, &mut mat)?;
+    eoi_rev(dfa, cache, input, &mut sid, &mut mat, funding)?;
     Ok(mat)
 }
 
@@ -451,6 +453,7 @@ pub(crate) fn find_overlapping_fwd(
     cache: &mut Cache,
     input: &Input<'_>,
     state: &mut OverlappingState,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     state.mat = None;
     if input.is_done() {
@@ -462,9 +465,9 @@ pub(crate) fn find_overlapping_fwd(
         dfa.get_config().get_prefilter()
     };
     if pre.is_some() {
-        find_overlapping_fwd_imp(dfa, cache, input, pre, state)
+        find_overlapping_fwd_imp(dfa, cache, input, pre, state, funding)
     } else {
-        find_overlapping_fwd_imp(dfa, cache, input, None, state)
+        find_overlapping_fwd_imp(dfa, cache, input, None, state, funding)
     }
 }
 
@@ -475,13 +478,14 @@ fn find_overlapping_fwd_imp(
     input: &Input<'_>,
     pre: Option<&'_ Prefilter>,
     state: &mut OverlappingState,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     // See 'prefilter_restart' docs for explanation.
     let universal_start = dfa.get_nfa().look_set_prefix_any().is_empty();
     let mut sid = match state.id {
         None => {
             state.at = input.start();
-            init_fwd(dfa, cache, input)?
+            init_fwd(dfa, cache, input, funding)?
         }
         Some(sid) => {
             if let Some(match_index) = state.next_match_index {
@@ -510,8 +514,8 @@ fn find_overlapping_fwd_imp(
     cache.search_start(state.at);
     while state.at < input.end() {
         sid = dfa
-            .next_state(cache, sid, input.haystack()[state.at])
-            .map_err(|_| gave_up(state.at))?;
+            .next_state_with_allocations(cache, sid, input.haystack()[state.at], funding)
+            .map_err(|err| cache_error(err, state.at))?;
         if sid.is_tagged() {
             state.id = Some(sid);
             if sid.is_start() {
@@ -523,9 +527,7 @@ fn find_overlapping_fwd_imp(
                             if span.start > state.at {
                                 state.at = span.start;
                                 if !universal_start {
-                                    sid = prefilter_restart(
-                                        dfa, cache, &input, state.at,
-                                    )?;
+                                    sid = prefilter_restart(dfa, cache, &input, state.at, funding)?;
                                 }
                                 continue;
                             }
@@ -543,10 +545,7 @@ fn find_overlapping_fwd_imp(
                 return Ok(());
             } else if sid.is_quit() {
                 cache.search_finish(state.at);
-                return Err(MatchError::quit(
-                    input.haystack()[state.at],
-                    state.at,
-                ));
+                return Err(MatchError::quit(input.haystack()[state.at], state.at));
             } else {
                 debug_assert!(sid.is_unknown());
                 unreachable!("sid being unknown is a bug");
@@ -556,7 +555,7 @@ fn find_overlapping_fwd_imp(
         cache.search_update(state.at);
     }
 
-    let result = eoi_fwd(dfa, cache, input, &mut sid, &mut state.mat);
+    let result = eoi_fwd(dfa, cache, input, &mut sid, &mut state.mat, funding);
     state.id = Some(sid);
     if state.mat.is_some() {
         // '1' is always correct here since if we get to this point, this
@@ -575,6 +574,7 @@ pub(crate) fn find_overlapping_rev(
     cache: &mut Cache,
     input: &Input<'_>,
     state: &mut OverlappingState,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     state.mat = None;
     if input.is_done() {
@@ -582,7 +582,7 @@ pub(crate) fn find_overlapping_rev(
     }
     let mut sid = match state.id {
         None => {
-            let sid = init_rev(dfa, cache, input)?;
+            let sid = init_rev(dfa, cache, input, funding)?;
             state.id = Some(sid);
             if input.start() == input.end() {
                 state.rev_eoi = true;
@@ -622,8 +622,8 @@ pub(crate) fn find_overlapping_rev(
     cache.search_start(state.at);
     while !state.rev_eoi {
         sid = dfa
-            .next_state(cache, sid, input.haystack()[state.at])
-            .map_err(|_| gave_up(state.at))?;
+            .next_state_with_allocations(cache, sid, input.haystack()[state.at], funding)
+            .map_err(|err| cache_error(err, state.at))?;
         if sid.is_tagged() {
             state.id = Some(sid);
             if sid.is_start() {
@@ -639,10 +639,7 @@ pub(crate) fn find_overlapping_rev(
                 return Ok(());
             } else if sid.is_quit() {
                 cache.search_finish(state.at);
-                return Err(MatchError::quit(
-                    input.haystack()[state.at],
-                    state.at,
-                ));
+                return Err(MatchError::quit(input.haystack()[state.at], state.at));
             } else {
                 debug_assert!(sid.is_unknown());
                 unreachable!("sid being unknown is a bug");
@@ -655,7 +652,7 @@ pub(crate) fn find_overlapping_rev(
         cache.search_update(state.at);
     }
 
-    let result = eoi_rev(dfa, cache, input, &mut sid, &mut state.mat);
+    let result = eoi_rev(dfa, cache, input, &mut sid, &mut state.mat, funding);
     state.rev_eoi = true;
     state.id = Some(sid);
     if state.mat.is_some() {
@@ -674,8 +671,9 @@ fn init_fwd(
     dfa: &DFA,
     cache: &mut Cache,
     input: &Input<'_>,
+    funding: &dyn Allocation,
 ) -> Result<LazyStateID, MatchError> {
-    let sid = dfa.start_state_forward(cache, input)?;
+    let sid = dfa.start_state_forward_with_allocations(cache, input, funding)?;
     // Start states can never be match states, since all matches are delayed
     // by 1 byte.
     debug_assert!(!sid.is_match());
@@ -687,8 +685,9 @@ fn init_rev(
     dfa: &DFA,
     cache: &mut Cache,
     input: &Input<'_>,
+    funding: &dyn Allocation,
 ) -> Result<LazyStateID, MatchError> {
-    let sid = dfa.start_state_reverse(cache, input)?;
+    let sid = dfa.start_state_reverse_with_allocations(cache, input, funding)?;
     // Start states can never be match states, since all matches are delayed
     // by 1 byte.
     debug_assert!(!sid.is_match());
@@ -702,12 +701,14 @@ fn eoi_fwd(
     input: &Input<'_>,
     sid: &mut LazyStateID,
     mat: &mut Option<HalfMatch>,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     let sp = input.get_span();
     match input.haystack().get(sp.end) {
         Some(&b) => {
-            *sid =
-                dfa.next_state(cache, *sid, b).map_err(|_| gave_up(sp.end))?;
+            *sid = dfa
+                .next_state_with_allocations(cache, *sid, b, funding)
+                .map_err(|err| cache_error(err, sp.end))?;
             if sid.is_match() {
                 let pattern = dfa.match_pattern(cache, *sid, 0);
                 *mat = Some(HalfMatch::new(pattern, sp.end));
@@ -717,8 +718,8 @@ fn eoi_fwd(
         }
         None => {
             *sid = dfa
-                .next_eoi_state(cache, *sid)
-                .map_err(|_| gave_up(input.haystack().len()))?;
+                .next_eoi_state_with_allocations(cache, *sid, funding)
+                .map_err(|err| cache_error(err, input.haystack().len()))?;
             if sid.is_match() {
                 let pattern = dfa.match_pattern(cache, *sid, 0);
                 *mat = Some(HalfMatch::new(pattern, input.haystack().len()));
@@ -738,13 +739,14 @@ fn eoi_rev(
     input: &Input<'_>,
     sid: &mut LazyStateID,
     mat: &mut Option<HalfMatch>,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     let sp = input.get_span();
     if sp.start > 0 {
         let byte = input.haystack()[sp.start - 1];
         *sid = dfa
-            .next_state(cache, *sid, byte)
-            .map_err(|_| gave_up(sp.start))?;
+            .next_state_with_allocations(cache, *sid, byte, funding)
+            .map_err(|err| cache_error(err, sp.start))?;
         if sid.is_match() {
             let pattern = dfa.match_pattern(cache, *sid, 0);
             *mat = Some(HalfMatch::new(pattern, sp.start));
@@ -752,8 +754,9 @@ fn eoi_rev(
             return Err(MatchError::quit(byte, sp.start - 1));
         }
     } else {
-        *sid =
-            dfa.next_eoi_state(cache, *sid).map_err(|_| gave_up(sp.start))?;
+        *sid = dfa
+            .next_eoi_state_with_allocations(cache, *sid, funding)
+            .map_err(|err| cache_error(err, sp.start))?;
         if sid.is_match() {
             let pattern = dfa.match_pattern(cache, *sid, 0);
             *mat = Some(HalfMatch::new(pattern, 0));
@@ -795,14 +798,18 @@ fn prefilter_restart(
     cache: &mut Cache,
     input: &Input<'_>,
     at: usize,
+    funding: &dyn Allocation,
 ) -> Result<LazyStateID, MatchError> {
     let mut input = input.clone();
     input.set_start(at);
-    init_fwd(dfa, cache, &input)
+    init_fwd(dfa, cache, &input, funding)
 }
 
 /// A convenience routine for constructing a "gave up" match error.
 #[cfg_attr(feature = "perf-inline", inline(always))]
-fn gave_up(offset: usize) -> MatchError {
-    MatchError::gave_up(offset)
+fn cache_error(error: CacheError, offset: usize) -> MatchError {
+    error
+        .allocation_error()
+        .map(MatchError::from)
+        .unwrap_or_else(|| MatchError::gave_up(offset))
 }

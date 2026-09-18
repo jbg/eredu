@@ -229,6 +229,11 @@ pub(super) fn control_bytes() -> Option<u64> {
         .checked_add(size_of::<
             Result<SubmissionResources, Rc<SubmissionResources>>,
         >())?
-        .checked_add(size_of::<Option<SubmissionResources>>())?;
+        .checked_add(size_of::<Option<SubmissionResources>>())?
+        // Direct model/observation finish preserves a returned cleanup cause
+        // while its same owner is fenced, without a new error allocation.
+        .checked_add(size_of::<&SubmissionResourcesOwner>())?
+        .checked_add(size_of::<Result<super::Status, crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause>>())?
+        .checked_add(size_of::<Result<super::Status, Error>>())?;
     u64::try_from(bytes).ok()
 }

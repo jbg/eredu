@@ -83,7 +83,7 @@ impl OriginalParallelInvocation {
     pub(crate) fn with_context<T,E,F>(
         &self,observer:&OriginalScopeObserver,compute:&Stream,run:F,
     )->Result<Result<T,E>,Error>
-    where F:FnOnce(&mut Group,&WorkspaceMetadataFunding)->Result<T,E>,
+    where F:FnOnce(&mut Group,&HostMetadataFunding)->Result<T,E>,
     {
         self.with_context_control(observer,compute,None,run)
     }
@@ -93,14 +93,14 @@ impl OriginalParallelInvocation {
         &self,observer:&OriginalScopeObserver,compute:&Stream,
         control:Option<&super::super::control::OriginalParallelControlProjection>,run:F,
     )->Result<Result<T,E>,Error>
-    where F:FnOnce(&mut Group,&WorkspaceMetadataFunding)->Result<T,E>,
+    where F:FnOnce(&mut Group,&HostMetadataFunding)->Result<T,E>,
     {
         let state=self.state();
         reserve(&self.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),
             size_of::<Option<&super::super::control::OriginalParallelControlProjection>>(),
             size_of::<Option<super::super::control::OriginalParallelControlProjection>>(),
             size_of::<Result<T,E>>(),size_of::<Result<Result<T,E>,Error>>(),
-            size_of::<(&Self,&mut Group,&OriginalScopeObserver,&Stream,&WorkspaceMetadataFunding)>(),
+            size_of::<(&Self,&mut Group,&OriginalScopeObserver,&Stream,&HostMetadataFunding)>(),
             self.context.retention_copy_bytes().ok_or_else(overflow)?,
             failure_control_bytes().ok_or_else(overflow)?,
         ])?;

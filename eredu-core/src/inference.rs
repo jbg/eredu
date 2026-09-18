@@ -174,6 +174,13 @@ impl InferenceGeometry {
     /// the same rejection order and establishes no admission or execution
     /// authority; callers still use the shared admission policy and grant.
     pub fn validate_fixed(self) -> Result<(), crate::AdmissionPolicyError> {
+        // A completed saved-state placement has no next input or prediction.
+        // Its copy work is separately admitted; this shape grants no forward.
+        if self.batch_size > 0 && self.input_positions == 0
+            && self.prefill_chunk_positions == 0 && self.max_output_tokens == 0
+            && self.output == OutputDemand::StateOnly {
+            return Ok(());
+        }
         if self.batch_size == 0
             || self.input_positions == 0
             || self.prefill_chunk_positions == 0

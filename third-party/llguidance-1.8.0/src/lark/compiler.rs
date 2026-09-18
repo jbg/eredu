@@ -1,18 +1,18 @@
+mod frames;
+use frames::FundingScope;
 use crate::{
     earley::{ParamCond, ParamExpr},
     grammar_builder::{GrammarResult, RegexId},
     substring::substring,
-    HashMap,
 };
-use anyhow::{anyhow, bail, ensure, Result};
-use derivre::RegexAst;
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
+use derivre::{RegexAst, ParserAllocationFunding, SourceHashMap as HashMap};
 use serde::Deserialize;
 
 use crate::{
     api::{
         GenGrammarOptions, GenOptions, GrammarId, LLGuidanceOptions, NodeProps, RegexExt, SkipSpec,
     },
-    json::json_merge,
     substring::{chunk_into_chars, chunk_into_words},
     GrammarBuilder, JsonCompileOptions, NodeRef,
 };
@@ -28,12 +28,33 @@ const DEBUG: bool = false;
 
 /// Options accepted by Lark's `%llguidance` directive. `ignore_once` is
 /// Lark-specific because it controls how `%ignore` expressions are compiled.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct LarkLLGuidanceOptions {
-    #[serde(flatten)]
     general: LLGuidanceOptions,
-    #[serde(default)]
     ignore_once: bool,
+}
+
+impl LarkLLGuidanceOptions {
+    // The directive has only scalar boolean fields. Consume its already parsed
+    // object directly instead of serializing, cloning, or collecting flatten
+    // intermediates. Omitted fields keep the prior directive's value.
+    fn apply_value(&mut self, value: serde_json::Value, funding: &ParserAllocationFunding, frames: &FundingScope<'_>) -> Result<()> {
+        let _frame = frames::enter::<frames::ApplyOptions<'_>>(frames, funding)?;
+        let serde_json::Value::Object(object) = value else {
+            bail!(funding, "failed to parse %llguidance declaration: expected object");
+        };
+        for (name, value) in object {
+            let target = match name.as_str() {
+                "no_forcing" => &mut self.general.no_forcing,
+                "allow_invalid_utf8" => &mut self.general.allow_invalid_utf8,
+                "allow_initial_skip" => &mut self.general.allow_initial_skip,
+                "ignore_once" => &mut self.ignore_once,
+                _ => continue,
+            };
+            *target = match value { serde_json::Value::Bool(value) => value, _ => bail!(funding, "expected a boolean in %llguidance declaration") };
+        }
+        Ok(())
+    }
 }
 
 macro_rules! debug {
@@ -50,7 +71,7 @@ struct Grammar {
     rules: HashMap<String, Rule>,
     tokens: HashMap<String, TokenDef>,
     ignore: Vec<Expansions>,
-    llguidance_options: serde_json::Value,
+    llguidance_options: LarkLLGuidanceOptions,
 }
 
 impl Default for Grammar {
@@ -59,7 +80,7 @@ impl Default for Grammar {
             rules: HashMap::default(),
             tokens: HashMap::default(),
             ignore: vec![],
-            llguidance_options: serde_json::Value::Object(serde_json::Map::new()),
+            llguidance_options: LarkLLGuidanceOptions::default(),
         }
     }
 }
@@ -69,8 +90,9 @@ enum PendingGrammar {
     Lark(Vec<Item>),
 }
 
-struct Compiler {
-    builder: GrammarBuilder,
+struct Compiler<'t, 'f> {
+    frames: &'f FundingScope<'f>,
+    builder: GrammarBuilder<'t>,
     parsed: ParsedLark,
     grammar: Grammar,
     node_ids: HashMap<String, NodeRef>,
@@ -79,8 +101,10 @@ struct Compiler {
     pending_grammars: Vec<(NodeRef, Location, PendingGrammar)>,
 }
 
-fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarResult> {
+fn compile_lark<'t, 'f>(builder: GrammarBuilder<'t>, parsed: ParsedLark, frames: &'f FundingScope<'f>) -> Result<GrammarResult<'t>> {
+    let _frame = frames::enter::<frames::Compile<'_, 't, 'f>>(frames, &builder.funding)?;
     let c = Compiler {
+        frames,
         builder,
         parsed,
         grammar: Grammar::default(),
@@ -92,61 +116,71 @@ fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarRe
     c.execute()
 }
 
-pub fn lark_to_llguidance(mut builder: GrammarBuilder, lark: &str) -> Result<GrammarResult> {
-    let parsed = parse_lark(lark)?;
+pub fn lark_to_llguidance<'t>(
+    mut builder: GrammarBuilder<'t>,
+    lark: &str,
+) -> Result<GrammarResult<'t>> {
+    let funding = builder.funding.clone();
+    let scope = derivre::prepared_funding::Scope::new(&funding)
+        .map_err(|error| frames::failure(error, &funding))?;
+    let _frame = frames::enter::<frames::Public<'_, 't>>(&scope, &funding)?;
+    let parsed = parse_lark(lark, builder.funding.clone())?;
 
-    let n = std::cmp::min(lark.len() / 8, 1_000_000);
-    builder.regex.spec.regex_builder.reserve(n);
-
-    compile_lark(builder, parsed)
+    compile_lark(builder, parsed, &scope)
 }
 
-impl Compiler {
+impl<'t, 'f> Compiler<'t, 'f> {
+    fn enter<T>(&self) -> Result<derivre::prepared_funding::Frame<'f>> {
+        frames::enter::<T>(self.frames, &self.builder.funding)
+    }
     fn do_token(&mut self, name: &str) -> Result<RegexId> {
+        let _frame = self.enter::<frames::Token<'_, 't, 'f>>()?;
         if let Some(id) = self.regex_ids.get(name) {
             return Ok(*id);
         }
         if self.in_progress.contains_key(name) {
-            bail!("circular reference in token {:?} definition", name);
+            bail!(&self.builder.funding, "circular reference in token {:?} definition", name);
         }
-        self.in_progress.insert(name.to_string(), false);
+        self.builder.funding.try_insert(&mut self.in_progress, self.builder.funding.try_copy_str(name)?, false)?;
         let token = self
             .grammar
             .tokens
             .remove(name)
-            .ok_or_else(|| anyhow!("unknown name: {:?}", name))?;
+            .ok_or_else(|| anyhow!(&self.builder.funding, "unknown name: {:?}", name))?;
         let id = self.do_token_expansions(token.expansions)?;
-        self.regex_ids.insert(name.to_string(), id);
+        self.builder.funding.try_insert(&mut self.regex_ids, self.builder.funding.try_copy_str(name)?, id)?;
         self.in_progress.remove(name);
         Ok(id)
     }
 
     fn mk_regex(&mut self, info: &str, rx: String) -> Result<RegexId> {
-        self.builder
-            .regex
-            .regex(&rx)
-            .map_err(|e| anyhow!("invalid regex {rx:?} (in {info}): {e}"))
+        let _frame = self.enter::<frames::Regex<'_, 't, 'f>>()?;
+        self.builder.regex.regex(&rx).map_err(|error| {
+            if crate::earley::is_grammar_storage_failure(&error) { error }
+            else { error.context(format_args!("invalid regex {rx:?} (in {info})"), &self.builder.funding) }
+        })
     }
 
     fn do_token_atom(&mut self, atom: Atom) -> Result<RegexId> {
+        let _frame = self.enter::<frames::TokenAtom<'_, 't, 'f>>()?;
         self.builder.check_limits()?;
         match atom {
             Atom::Group(expansions) => self.do_token_expansions(expansions),
             Atom::Maybe(expansions) => {
                 let id = self.do_token_expansions(expansions)?;
-                Ok(self.builder.regex.optional(id))
+                Ok(self.builder.regex.optional(id)?)
             }
             Atom::Not(inner) => {
                 let id = self.do_token_atom(*inner)?;
-                Ok(self.builder.regex.not(id))
+                Ok(self.builder.regex.not(id)?)
             }
             Atom::Value(value) => match value {
                 Value::LiteralRange(a, b) => {
-                    ensure!(
+                    ensure!(&self.builder.funding,
                         a.chars().count() == 1,
                         "range start must be a single character"
                     );
-                    ensure!(
+                    ensure!(&self.builder.funding,
                         b.chars().count() == 1,
                         "range end must be a single character"
                     );
@@ -155,14 +189,12 @@ impl Compiler {
                     if a <= b {
                         self.mk_regex(
                             "range",
-                            format!(
-                                "[{}-{}]",
-                                regex_syntax::escape(&a.to_string()),
-                                regex_syntax::escape(&b.to_string())
-                            ),
+                            self.builder.funding.try_format(format_args!(
+                                "[{}-{}]", EscapedChar(a), EscapedChar(b)
+                            ))?,
                         )
                     } else {
-                        bail!("invalid range order: {:?}..{:?}", a, b);
+                        bail!(&self.builder.funding, "invalid range order: {:?}..{:?}", a, b);
                     }
                 }
                 Value::Name(n) => self.do_token(&n),
@@ -170,51 +202,52 @@ impl Compiler {
                     if flags.contains("i") {
                         self.mk_regex(
                             "string with i-flag",
-                            format!("(?i){}", regex_syntax::escape(&val)),
+                            self.builder.funding.try_format(format_args!("(?i){}", Escaped(&val)))?,
                         )
                     } else {
-                        Ok(self.builder.regex.literal(val))
+                        Ok(self.builder.regex.literal(&val)?)
                     }
                 }
                 Value::LiteralRegex(val, flags) => {
-                    ensure!(!flags.contains("l"), "l-flag is not supported in regexes");
+                    ensure!(&self.builder.funding, !flags.contains("l"), "l-flag is not supported in regexes");
                     let rx = if flags.is_empty() {
                         val
                     } else {
-                        format!("(?{flags}){val}")
+                        self.builder.funding.try_format(format_args!("(?{flags}){val}"))?
                     };
                     self.mk_regex("regex", rx)
                 }
-                Value::RegexExt(s) => compile_lark_regex(&mut self.builder, s),
+                Value::RegexExt(s) => compile_lark_regex(&mut self.builder, s, self.frames),
                 Value::SpecialToken(s) => {
-                    bail!("special tokens (like {:?}) cannot be used in terminals", s);
+                    bail!(&self.builder.funding, "special tokens (like {:?}) cannot be used in terminals", s);
                 }
                 Value::Json(_) => {
-                    bail!("%json literals cannot be used in terminals");
+                    bail!(&self.builder.funding, "%json literals cannot be used in terminals");
                 }
                 Value::GrammarRef(g) => {
-                    bail!(
+                    bail!(&self.builder.funding,
                         "grammar references (like {:?}) cannot be used in terminals",
                         g
                     );
                 }
                 Value::NestedLark(_) => {
-                    bail!("nested %lark {{ ... }} cannot be used in terminals");
+                    bail!(&self.builder.funding, "nested %lark {{ ... }} cannot be used in terminals");
                 }
                 Value::NameParam(_, _) => {
-                    bail!("name::param cannot be used in terminals");
+                    bail!(&self.builder.funding, "name::param cannot be used in terminals");
                 }
-                Value::TemplateUsage { .. } => bail!("template usage not supported yet"),
+                Value::TemplateUsage { .. } => bail!(&self.builder.funding, "template usage not supported yet"),
             },
         }
     }
 
     fn do_token_expr(&mut self, expr: Expr) -> Result<RegexId> {
+        let _frame = self.enter::<frames::TokenExpr<'_, 't, 'f>>()?;
         let atom = self.do_token_atom(expr.atom)?;
         if let Some(range) = &expr.range {
-            ensure!(expr.op.is_none(), "ranges not supported with operators");
-            ensure!(range.0 >= 0, "range start must be >= 0, got {:?}", range);
-            ensure!(
+            ensure!(&self.builder.funding, expr.op.is_none(), "ranges not supported with operators");
+            ensure!(&self.builder.funding, range.0 >= 0, "range start must be >= 0, got {:?}", range);
+            ensure!(&self.builder.funding,
                 range.1 >= range.0,
                 "range end must be >= start, got {:?}",
                 range
@@ -227,15 +260,15 @@ impl Compiler {
                 } else {
                     Some(range.1 as u32)
                 },
-            ))
+            )?)
         } else {
             match &expr.op {
                 Some(op) => match op.0.as_str() {
-                    "*" => Ok(self.builder.regex.zero_or_more(atom)),
-                    "+" => Ok(self.builder.regex.one_or_more(atom)),
-                    "?" => Ok(self.builder.regex.optional(atom)),
+                    "*" => Ok(self.builder.regex.zero_or_more(atom)?),
+                    "+" => Ok(self.builder.regex.one_or_more(atom)?),
+                    "?" => Ok(self.builder.regex.optional(atom)?),
                     _ => {
-                        bail!("unsupported operator: {:?}", op.0);
+                        bail!(&self.builder.funding, "unsupported operator: {:?}", op.0);
                     }
                 },
                 None => Ok(atom),
@@ -244,36 +277,30 @@ impl Compiler {
     }
 
     fn do_token_expansions(&mut self, expansions: Expansions) -> Result<RegexId> {
+        let _frame = self.enter::<frames::TokenExpansions<'_, 't, 'f>>()?;
         self.builder.check_limits()?;
-        let options = expansions
-            .1
-            .into_iter()
-            .map(|alias| {
-                ensure!(
-                    alias.param_cond.is_true(),
-                    "'%if' is not supported in terminals"
-                );
-                let args = alias
-                    .conjuncts
-                    .into_iter()
-                    .map(|exp| {
-                        let args = exp
-                            .0
-                            .into_iter()
-                            .map(|e| self.do_token_expr(e))
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(self.builder.regex.concat(args))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(self.builder.regex.and(args))
-            })
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| expansions.0.augment(e))?;
-        Ok(self.builder.regex.select(options))
+        let mut options = Vec::new();
+        for alias in expansions.1 {
+            ensure!(&self.builder.funding, alias.param_cond.is_true(), "'%if' is not supported in terminals");
+            let mut args = Vec::new();
+            for exp in alias.conjuncts {
+                let mut concat = Vec::new();
+                for expr in exp.0 {
+                    let expr = self.do_token_expr(expr).map_err(|error| expansions.0.augment(error))?;
+                    self.builder.funding.try_push(&mut concat, expr)?;
+                }
+                let expr = self.builder.regex.concat(&concat)?;
+                self.builder.funding.try_push(&mut args, expr)?;
+            }
+            let expr = self.builder.regex.and(&args)?;
+            self.builder.funding.try_push(&mut options, expr)?;
+        }
+        Ok(self.builder.regex.select(&options)?)
     }
 
     fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
-        Ok(self.builder.lexeme(rx_id))
+        let _frame = self.enter::<frames::Lift<'_, 't, 'f>>()?;
+        Ok(self.builder.lexeme(rx_id)?)
     }
 
     fn do_nested(
@@ -283,29 +310,31 @@ impl Compiler {
         temperature: Option<f32>,
         props: NodeProps,
     ) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::Nested<'_, 't, 'f>>()?;
         let inner = match v {
             Value::NestedLark(items) => PendingGrammar::Lark(items),
             Value::Json(json) => PendingGrammar::Json(json),
-            _ => bail!("expected %lark or %json, got {:?}", v),
+            _ => bail!(&self.builder.funding, "expected %lark or %json, got {:?}", v),
         };
-        let name = format!("%nested---{}", self.builder.num_nodes());
+        let name = self.builder.funding.try_format(format_args!("%nested---{}", self.builder.num_nodes()))?;
         let gg = self.builder.gen_grammar(
             GenGrammarOptions {
                 grammar: GrammarId::Name(name),
                 temperature,
             },
             props,
-        );
-        self.pending_grammars.push((gg, loc.clone(), inner));
+        )?;
+        self.builder.funding.try_push(&mut self.pending_grammars, (gg, loc.clone(), inner))?;
         Ok(gg)
     }
 
     fn do_atom(&mut self, loc: &Location, expr: Atom) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::AtomFrame<'_, 't, 'f>>()?;
         match expr {
             Atom::Group(expansions) => self.do_expansions(expansions),
             Atom::Maybe(expansions) => {
                 let id = self.do_expansions(expansions)?;
-                Ok(self.builder.optional(id))
+                Ok(self.builder.optional(id)?)
             }
             Atom::Not(_) => {
                 // treat as token
@@ -331,35 +360,27 @@ impl Compiler {
                             let s = if negate { &s[1..] } else { s };
                             if s == "*" {
                                 if negate {
-                                    bail!("negated wildcard token <[^*]> is not supported");
+                                    bail!(&self.builder.funding, "negated wildcard token <[^*]> is not supported");
                                 }
                                 return self.builder.any_token();
                             } else if s.contains('*') {
-                                bail!(
+                                bail!(&self.builder.funding,
                                     "wildcard token range '*' must not contain additional tokens"
                                 );
                             }
                             let mut ranges = vec![];
                             for range in s.split(",") {
-                                let ends: Vec<&str> = range.split('-').map(|s| s.trim()).collect();
-                                ensure!(
-                                    ends.len() == 1 || ends.len() == 2,
-                                    "invalid token range: {:?}",
-                                    range
-                                );
-                                if ends.len() == 1 && ends[0].is_empty() {
-                                    continue;
-                                }
-                                let start = ends[0].parse::<u32>()?;
-                                let end = if ends.len() == 2 {
-                                    ends[1].parse::<u32>()?
-                                } else {
-                                    start
-                                };
-                                ensure!(start <= end, "invalid token range: {:?}", range);
-                                ranges.push(start..=end);
+                                let mut ends = range.split('-').map(str::trim);
+                                let first = ends.next().unwrap();
+                                let second = ends.next();
+                                ensure!(&self.builder.funding, ends.next().is_none(), "invalid token range: {:?}", range);
+                                if second.is_none() && first.is_empty() { continue; }
+                                let start = first.parse::<u32>().map_err(|error| derivre::ParserError::cause(error, &self.builder.funding))?;
+                                let end = match second { Some(end) => end.parse::<u32>().map_err(|error| derivre::ParserError::cause(error, &self.builder.funding))?, None => start };
+                                ensure!(&self.builder.funding, start <= end, "invalid token range: {:?}", range);
+                                self.builder.funding.try_push(&mut ranges, start..=end)?;
                             }
-                            ensure!(!ranges.is_empty(), "empty token range");
+                            ensure!(&self.builder.funding, !ranges.is_empty(), "empty token range");
                             return if negate {
                                 self.builder.negated_token_ranges(ranges)
                             } else {
@@ -375,7 +396,9 @@ impl Compiler {
                         return self.do_nested(loc, value, None, NodeProps::default());
                     }
                     // special case "" literal, so it doesn't pollute grammar with epsilon regex
-                    Value::LiteralString(s, _) if s.is_empty() => return Ok(self.builder.empty()),
+                    Value::LiteralString(s, _) if s.is_empty() => {
+                        return Ok(self.builder.empty()?)
+                    }
                     Value::RegexExt(_)
                     | Value::LiteralRange(_, _)
                     | Value::LiteralString(_, _)
@@ -383,7 +406,7 @@ impl Compiler {
                         // treat as token
                     }
                     Value::TemplateUsage { .. } => {
-                        bail!("template usage not supported yet");
+                        bail!(&self.builder.funding, "template usage not supported yet");
                     }
                 };
                 let rx = self.do_token_atom(Atom::Value(value))?;
@@ -393,12 +416,13 @@ impl Compiler {
     }
 
     fn do_expr(&mut self, loc: &Location, expr: Expr) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::ExprFrame<'_, 't, 'f>>()?;
         let atom = self.do_atom(loc, expr.atom)?;
 
         if let Some((a, b)) = expr.range {
-            ensure!(expr.op.is_none(), "ranges not supported with operators");
-            ensure!(a <= b, "range end must be >= start, got {:?}", (a, b));
-            ensure!(a >= 0, "range start must be >= 0, got {:?}", a);
+            ensure!(&self.builder.funding, expr.op.is_none(), "ranges not supported with operators");
+            ensure!(&self.builder.funding, a <= b, "range end must be >= start, got {:?}", (a, b));
+            ensure!(&self.builder.funding, a >= 0, "range start must be >= 0, got {:?}", a);
             Ok(self.builder.repeat(
                 atom,
                 a as usize,
@@ -407,15 +431,15 @@ impl Compiler {
                 } else {
                     Some(b as usize)
                 },
-            ))
+            )?)
         } else {
             match &expr.op {
                 Some(op) => match op.0.as_str() {
-                    "*" => Ok(self.builder.zero_or_more(atom)),
-                    "+" => Ok(self.builder.one_or_more(atom)),
-                    "?" => Ok(self.builder.optional(atom)),
+                    "*" => Ok(self.builder.zero_or_more(atom)?),
+                    "+" => Ok(self.builder.one_or_more(atom)?),
+                    "?" => Ok(self.builder.optional(atom)?),
                     _ => {
-                        bail!("unsupported operator: {}", op.0);
+                        bail!(&self.builder.funding, "unsupported operator: {}", op.0);
                     }
                 },
                 None => Ok(atom),
@@ -424,34 +448,25 @@ impl Compiler {
     }
 
     fn do_expansions(&mut self, expansions: Expansions) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::ExpansionsFrame<'_, 't, 'f>>()?;
         self.builder.check_limits()?;
         let loc = expansions.0;
         let mut conds = vec![];
         let needs_cond = expansions.1.iter().any(|alias| !alias.param_cond.is_true());
-        let options = expansions
-            .1
-            .into_iter()
-            .map(|mut alias| {
-                ensure!(
-                    alias.conjuncts.len() == 1,
-                    "& is only supported for tokens, not rules; try renaming the rule to UPPERCASE"
-                );
-                let args = alias
-                    .conjuncts
-                    .pop()
-                    .unwrap()
-                    .0
-                    .into_iter()
-                    .map(|e| self.do_expr(&loc, e))
-                    .collect::<Result<Vec<_>>>()?;
-                if needs_cond {
-                    conds.push(alias.param_cond);
-                }
-                Ok(self.builder.join_props(&args, NodeProps::default()))
-            })
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| loc.augment(e))?;
-        Ok(self.builder.select_with_cond(&options, conds))
+        let mut options = Vec::new();
+        for mut alias in expansions.1 {
+            ensure!(&self.builder.funding, alias.conjuncts.len() == 1,
+                "& is only supported for tokens, not rules; try renaming the rule to UPPERCASE");
+            let mut args = Vec::new();
+            for expr in alias.conjuncts.pop().unwrap().0 {
+                let expr = self.do_expr(&loc, expr).map_err(|error| loc.augment(error))?;
+                self.builder.funding.try_push(&mut args, expr)?;
+            }
+            if needs_cond { self.builder.funding.try_push(&mut conds, alias.param_cond)?; }
+            let option = self.builder.join_props(&args, NodeProps::default())?;
+            self.builder.funding.try_push(&mut options, option)?;
+        }
+        Ok(self.builder.select_with_cond(&options, conds)?)
     }
 
     fn is_rule(&self, name: &str) -> bool {
@@ -461,12 +476,13 @@ impl Compiler {
     }
 
     fn do_rule(&mut self, name: &str, param: Option<ParamExpr>) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::Rule<'_, 't, 'f>>()?;
         if let Some(id) = self.node_ids.get(name) {
             return self.builder.apply(*id, param);
         }
         if let Some(&is_param) = self.in_progress.get(name) {
-            let id = self.builder.new_param_node(&format!("{name}_"), is_param);
-            self.node_ids.insert(name.to_string(), id);
+            let id = self.builder.new_param_node(&self.builder.funding.try_format(format_args!("{name}_"))?, is_param)?;
+            self.builder.funding.try_insert(&mut self.node_ids, self.builder.funding.try_copy_str(name)?, id)?;
             return self.builder.apply(id, param);
         }
 
@@ -474,11 +490,11 @@ impl Compiler {
         let id = self.do_rule_core(name)?;
 
         if let Some(placeholder) = self.node_ids.get(name) {
-            self.builder.set_placeholder(*placeholder, id);
+            self.builder.set_placeholder(*placeholder, id)?;
         }
-        self.node_ids.insert(name.to_string(), id);
+        self.builder.funding.try_insert(&mut self.node_ids, self.builder.funding.try_copy_str(name)?, id)?;
         self.in_progress.remove(name);
-        self.builder.rename(id, name);
+        self.builder.rename(id, name)?;
         debug!("END rule {}", name);
         self.builder.apply(id, param)
     }
@@ -489,53 +505,56 @@ impl Compiler {
         temperature: Option<f32>,
         props: NodeProps,
     ) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::GenGrammar<'_, 't, 'f>>()?;
         assert!(name.starts_with("@"));
         // see if name[1..] is an integer
         let name = if name[1..].parse::<usize>().is_ok() {
-            bail!("numeric grammar references no longer supported");
+            bail!(&self.builder.funding, "numeric grammar references no longer supported");
         } else {
-            name[1..].to_string()
+            self.builder.funding.try_copy_str(&name[1..])?
         };
         let id = self.builder.gen_grammar(
             GenGrammarOptions {
-                grammar: GrammarId::Name(name.clone()),
+                grammar: GrammarId::Name(name),
                 temperature,
             },
             props,
-        );
+        )?;
         Ok(id)
     }
 
     fn do_rule_core(&mut self, name: &str) -> Result<NodeRef> {
+        let _frame = self.enter::<frames::RuleCore<'_, 't, 'f>>()?;
         let mut rule = self
             .grammar
             .rules
             .remove(name)
-            .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
+            .ok_or_else(|| anyhow!(&self.builder.funding, "rule {:?} not found", name))?;
 
-        self.in_progress
-            .insert(name.to_string(), rule.is_parametric);
+        self.builder.funding.try_insert(&mut self.in_progress,
+            self.builder.funding.try_copy_str(name)?, rule.is_parametric)?;
 
+        let has_capture = rule.capture_name.is_some();
         let props = NodeProps {
             max_tokens: rule.max_tokens,
-            capture_name: rule.capture_name.clone(),
+            capture_name: rule.capture_name.take(),
             ..Default::default()
         };
 
         if rule.stop.is_some() && rule.suffix.is_some() {
-            bail!("stop= and suffix= cannot be used together");
+            bail!(&self.builder.funding, "stop= and suffix= cannot be used together");
         }
 
         if rule.is_parametric && rule.stop_like().is_some() {
-            bail!("stop-like is not supported for parametric rules");
+            bail!(&self.builder.funding, "stop-like is not supported for parametric rules");
         }
 
         if rule.is_parametric && rule.temperature.is_some() {
-            bail!("temperature= is not supported for parametric rules");
+            bail!(&self.builder.funding, "temperature= is not supported for parametric rules");
         }
 
         if rule.is_parametric && rule.max_tokens.is_some() {
-            bail!("max_tokens= is not supported for parametric rules");
+            bail!(&self.builder.funding, "max_tokens= is not supported for parametric rules");
         }
 
         if rule.max_tokens == Some(0) {
@@ -546,7 +565,7 @@ impl Compiler {
             // emits an opening token and then never terminates. Treat it the
             // same as an empty-string body `""`.
             // See https://github.com/guidance-ai/llguidance/issues/236
-            return Ok(self.builder.string(""));
+            return Ok(self.builder.string("")?);
         }
 
         let id = if let Some(stop) = rule.stop_like() {
@@ -565,7 +584,7 @@ impl Compiler {
                     } else {
                         RegexAst::ExprRef(stop_id)
                     },
-                    stop_capture_name: rule.stop_capture_name.clone(),
+                    stop_capture_name: rule.stop_capture_name.take(),
                     lazy: Some(lazy),
                     temperature: rule.temperature,
                     is_suffix: Some(is_suffix),
@@ -573,7 +592,7 @@ impl Compiler {
                 props,
             )?
         } else {
-            ensure!(
+            ensure!(&self.builder.funding,
                 rule.stop_capture_name.is_none(),
                 "stop_capture_name requires stop= or suffix="
             );
@@ -592,13 +611,11 @@ impl Compiler {
                     _ => {
                         // try as terminal
                         let rx_id = self.do_token_expansions(rule.expansions).map_err(|e| {
-                            anyhow::anyhow!(
-                                "{}; temperature= and max_tokens= only \
-                                supported on TERMINALS and @subgrammars",
-                                e
-                            )
+                            if crate::earley::is_grammar_storage_failure(&e) { e } else {
+                                e.context("temperature= and max_tokens= only supported on TERMINALS and @subgrammars", &self.builder.funding)
+                            }
                         })?;
-                        return Ok(self.builder.lexeme_ext(rx_id, rule.temperature, props));
+                        return Ok(self.builder.lexeme_ext(rx_id, rule.temperature, props)?);
                     }
                 }
             }
@@ -609,14 +626,14 @@ impl Compiler {
 
             if rule.is_parametric && !inner_needs_param {
                 // TODO unclear if this should be an error or not
-                bail!(
+                bail!(&self.builder.funding,
                     "rule {:?} is parametric, but its body doesn't need parameters",
                     name
                 );
             }
             if !rule.is_parametric && inner_needs_param {
                 //println!("inner {} needs parameters", self.builder.node_to_string(inner));
-                bail!(
+                bail!(&self.builder.funding,
                     "rule {:?} is not parametric, but its body requires parameters",
                     name
                 );
@@ -630,13 +647,13 @@ impl Compiler {
                     NodeProps {
                         max_tokens: Some(max_tokens),
                         // assume the user also wants capture
-                        capture_name: Some(name.to_string()),
+                        capture_name: Some(self.builder.funding.try_copy_str(name)?),
                         ..Default::default()
                     },
-                )
-            } else if rule.capture_name.is_some() || (inner.is_parametric() && !rule.is_parametric)
+                )?
+            } else if has_capture || (inner.is_parametric() && !rule.is_parametric)
             {
-                self.builder.join_props(&[inner], props)
+                self.builder.join_props(&[inner], props)?
             } else {
                 inner
             }
@@ -644,14 +661,15 @@ impl Compiler {
         Ok(id)
     }
 
-    fn execute(mut self) -> Result<GrammarResult> {
+    fn execute(mut self) -> Result<GrammarResult<'t>> {
+        let _frame = self.enter::<frames::Execute<'_, 't, 'f>>()?;
         let mut grm = Grammar::default();
         for item in std::mem::take(&mut self.parsed.items) {
             let loc = item.location().clone();
-            grm.process_item(item).map_err(|e| loc.augment(e))?;
+            grm.process_item(item, &self.builder.funding, self.frames).map_err(|e| loc.augment(e))?;
         }
         let start_name = "start";
-        ensure!(
+        ensure!(&self.builder.funding,
             grm.rules.contains_key(start_name),
             "no {} rule found",
             start_name
@@ -659,15 +677,14 @@ impl Compiler {
         let ignore = std::mem::take(&mut grm.ignore);
         self.grammar = grm;
 
-        let opts: LarkLLGuidanceOptions =
-            serde_json::from_value(self.grammar.llguidance_options.clone())
-                .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
+        let opts = std::mem::take(&mut self.grammar.llguidance_options);
 
-        let ignore = ignore
-            .into_iter()
-            .map(|exp| Ok(RegexAst::ExprRef(self.do_token_expansions(exp)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let skip_regex = RegexAst::Or(ignore);
+        let mut skip_exprs = Vec::new();
+        for exp in ignore {
+            let expr = RegexAst::ExprRef(self.do_token_expansions(exp)?);
+            self.builder.funding.try_push(&mut skip_exprs, expr)?;
+        }
+        let skip_regex = RegexAst::Or(skip_exprs);
         let skip = if opts.ignore_once {
             SkipSpec::once(skip_regex)
         } else {
@@ -676,15 +693,15 @@ impl Compiler {
         let id = self.builder.add_grammar_with_skip(opts.general, skip)?;
 
         let start = self.do_rule(start_name, None)?;
-        self.builder.set_start_node(start);
+        self.builder.set_start_node(start)?;
 
         let mut builder = self.builder;
         for (gg, loc, grm) in self.pending_grammars {
             let res = match grm {
-                PendingGrammar::Json(json_schema) => JsonCompileOptions::default()
+                PendingGrammar::Json(json_schema) => JsonCompileOptions::new(&builder.funding)?
                     .json_to_llg_with_overrides(builder, json_schema)
-                    .map_err(|e| loc.augment(anyhow!("failed to compile JSON schema: {}", e)))?,
-                PendingGrammar::Lark(items) => compile_lark(builder, ParsedLark { items })?,
+                    .map_err(|e| loc.augment(e))?,
+                PendingGrammar::Lark(items) => compile_lark(builder, ParsedLark { items }, self.frames)?,
             };
             builder = res.builder;
             builder.link_gen_grammar(gg, res.start_node)?;
@@ -695,115 +712,114 @@ impl Compiler {
 }
 
 impl Grammar {
-    fn add_token_def(&mut self, loc: &Location, local_name: String, regex: &str) -> Result<()> {
-        ensure!(
+    fn add_token_def(&mut self, loc: &Location, local_name: String, regex: &str, funding: &ParserAllocationFunding, frames: &FundingScope<'_>) -> Result<()> {
+        let _frame = frames::enter::<frames::AddToken<'_>>(frames, funding)?;
+        ensure!(funding,
             !self.tokens.contains_key(&local_name),
             "duplicate token (in import): {:?}",
             local_name
         );
 
+        let mut exprs = Vec::new();
+        funding.try_push(&mut exprs, Expr {
+            atom: Atom::Value(Value::LiteralRegex(funding.try_copy_str(regex)?, String::new())),
+            op: None, range: None,
+        })?;
+        let mut conjuncts = Vec::new();
+        funding.try_push(&mut conjuncts, Expansion(exprs))?;
+        let mut aliases = Vec::new();
+        funding.try_push(&mut aliases, Alias { conjuncts, param_cond: ParamCond::True, alias: None })?;
         let t = TokenDef {
-            name: local_name,
-            params: None,
-            priority: None,
-            expansions: Expansions(
-                loc.clone(),
-                vec![Alias {
-                    conjuncts: vec![Expansion(vec![Expr {
-                        atom: Atom::Value(Value::LiteralRegex(regex.to_string(), "".to_string())),
-                        op: None,
-                        range: None,
-                    }])],
-                    param_cond: ParamCond::True,
-                    alias: None,
-                }],
-            ),
+            name: local_name, params: None, priority: None,
+            expansions: Expansions(loc.clone(), aliases),
         };
-        self.tokens.insert(t.name.clone(), t);
+        funding.try_insert(&mut self.tokens, funding.try_copy_str(&t.name)?, t)?;
         Ok(())
     }
 
-    fn do_statement(&mut self, loc: &Location, statement: Statement) -> Result<()> {
+    fn do_statement(&mut self, loc: &Location, statement: Statement, funding: &ParserAllocationFunding, frames: &FundingScope<'_>) -> Result<()> {
+        let _frame = frames::enter::<frames::StatementFrame<'_>>(frames, funding)?;
         match statement {
             Statement::Ignore(exp) => {
-                self.ignore.push(exp);
+                funding.try_push(&mut self.ignore, exp)?;
             }
             Statement::Import { path, alias } => {
-                let regex = lookup_common_regex(&path)?;
-                let local_name =
-                    alias.unwrap_or_else(|| path.split('.').next_back().unwrap().to_string());
-                self.add_token_def(loc, local_name, regex)?;
+                let regex = lookup_common_regex(&path, funding)?;
+                let local_name = match alias {
+                    Some(alias) => alias,
+                    None => funding.try_copy_str(path.split('.').next_back().unwrap())?,
+                };
+                self.add_token_def(loc, local_name, regex, funding, frames)?;
             }
             Statement::MultiImport { path, names } => {
                 for n in names {
-                    let qname = format!("{path}.{n}");
-                    let regex = lookup_common_regex(&qname)?;
-                    self.add_token_def(loc, n.to_string(), regex)?;
+                    let qname = funding.try_format(format_args!("{path}.{n}"))?;
+                    let regex = lookup_common_regex(&qname, funding)?;
+                    self.add_token_def(loc, n, regex, funding, frames)?;
                 }
             }
             Statement::LLGuidance(json_value) => {
-                // merge-in at the JSON level
-                json_merge(&mut self.llguidance_options, &json_value);
-                // but also check if it's valid format and all the right types
-                let _v: LarkLLGuidanceOptions = serde_json::from_value(json_value)
-                    .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
+                self.llguidance_options.apply_value(json_value, funding, frames)?;
             }
             Statement::OverrideRule(_) => {
-                bail!("override statement not supported yet");
+                bail!(funding, "override statement not supported yet");
             }
             Statement::Declare(_) => {
-                bail!("declare statement not supported yet");
+                bail!(funding, "declare statement not supported yet");
             }
         }
         Ok(())
     }
 
-    fn process_item(&mut self, item: Item) -> Result<()> {
+    fn process_item(&mut self, item: Item, funding: &ParserAllocationFunding, frames: &FundingScope<'_>) -> Result<()> {
+        let _frame = frames::enter::<frames::ItemFrame<'_>>(frames, funding)?;
         match item {
             Item::Rule(rule) => {
-                ensure!(rule.params.is_none(), "params not supported yet");
-                ensure!(rule.priority.is_none(), "priority not supported yet");
-                ensure!(
+                ensure!(funding, rule.params.is_none(), "params not supported yet");
+                ensure!(funding, rule.priority.is_none(), "priority not supported yet");
+                ensure!(funding,
                     !self.rules.contains_key(&rule.name),
                     "duplicate rule: {:?}",
                     rule.name
                 );
-                self.rules.insert(rule.name.clone(), rule);
+                funding.try_insert(&mut self.rules, funding.try_copy_str(&rule.name)?, rule)?;
             }
             Item::Token(token_def) => {
-                ensure!(token_def.params.is_none(), "params not supported yet");
-                ensure!(token_def.priority.is_none(), "priority not supported yet");
-                ensure!(
+                ensure!(funding, token_def.params.is_none(), "params not supported yet");
+                ensure!(funding, token_def.priority.is_none(), "priority not supported yet");
+                ensure!(funding,
                     !self.tokens.contains_key(&token_def.name),
                     "duplicate token: {:?}",
                     token_def.name
                 );
-                self.tokens.insert(token_def.name.clone(), token_def);
+                funding.try_insert(&mut self.tokens, funding.try_copy_str(&token_def.name)?, token_def)?;
             }
             Item::Statement(loc, statement) => {
-                self.do_statement(&loc, statement)?;
+                self.do_statement(&loc, statement, funding, frames)?;
             }
         }
         Ok(())
     }
 }
 
-fn compile_lark_regex(builder: &mut GrammarBuilder, l: RegexExt) -> Result<RegexId> {
-    let mut fields_set = vec![];
+fn compile_lark_regex(builder: &mut GrammarBuilder, l: RegexExt, frames: &FundingScope<'_>) -> Result<RegexId> {
+    let _frame = frames::enter::<frames::ExtendedRegex<'_, '_>>(frames, &builder.funding)?;
+    let mut fields_set = [""; 3];
+    let mut fields_len = 0;
     if l.substring_chunks.is_some() {
-        fields_set.push("substring_chunks");
+        fields_set[fields_len] = "substring_chunks"; fields_len += 1;
     }
     if l.substring_words.is_some() {
-        fields_set.push("substring_words");
+        fields_set[fields_len] = "substring_words"; fields_len += 1;
     }
     if l.substring_chars.is_some() {
-        fields_set.push("substring_chars");
+        fields_set[fields_len] = "substring_chars"; fields_len += 1;
     }
-    if fields_set.is_empty() {
-        bail!("no fields set on %regex");
+    if fields_len == 0 {
+        bail!(&builder.funding, "no fields set on %regex");
     }
-    if fields_set.len() > 1 {
-        bail!("only one field can be set on %regex; got {:?}", fields_set);
+    if fields_len > 1 {
+        bail!(&builder.funding, "only one field can be set on %regex; got {:?}", &fields_set[..fields_len]);
     }
 
     let bld = &mut builder.regex.spec.regex_builder;
@@ -813,10 +829,25 @@ fn compile_lark_regex(builder: &mut GrammarBuilder, l: RegexExt) -> Result<Regex
     } else if let Some(s) = l.substring_chars {
         substring(bld, chunk_into_chars(&s))?
     } else if let Some(s) = l.substring_chunks {
-        substring(bld, s.iter().map(|s| s.as_str()).collect())?
+        substring(bld, s.iter().map(|s| s.as_str()))?
     } else {
         unreachable!()
     };
 
     Ok(eref)
+}
+
+struct Escaped<'a>(&'a str);
+impl std::fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for ch in self.0.chars() { std::fmt::Display::fmt(&EscapedChar(ch), f)?; }
+        Ok(())
+    }
+}
+struct EscapedChar(char);
+impl std::fmt::Display for EscapedChar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if regex_syntax::is_meta_character(self.0) { f.write_str("\\")?; }
+        std::fmt::Write::write_char(f, self.0)
+    }
 }

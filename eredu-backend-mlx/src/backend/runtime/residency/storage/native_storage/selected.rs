@@ -1,7 +1,7 @@
 //! Actual resident program populations and one replacement of their old peaks.
 use super::*;
 use crate::backend::runtime::residency::storage::StorageIdentity;
-use crate::backend::{error::Error, nn::workspace::ResidentNativeRecipe};
+use crate::backend::{error::Error, nn::workspace::{ResidentNativeRecipe, ResidentSamplingProgram}};
 use eredu_core::{ExecutionWorkspaceEstimate, WorkspaceBound};
 use eredu_nn::workspace::WorkspaceTraceReport;
 use eredu_runtime::working_memory::{
@@ -14,6 +14,7 @@ use eredu_runtime::working_memory::{
 struct ConstructedPreparationPopulation {
     bytes: u64,
     births: usize,
+    retained_roots: usize,
     controls: u64,
     credit: u64,
     replacement: u64,
@@ -42,6 +43,20 @@ pub(crate) struct NativeProgramStorage {
     works: usize,
 }
 impl NativeProgramStorage {
+    pub(crate) fn capacity_bytes(&self) -> u64 { self.capacity }
+    pub(crate) fn direct_control_bytes(&self, mechanism: &MlxNativeStorage,
+        metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>)
+        -> Result<Option<u64>, Error> {
+        metadata.admit::<(super::control_storage::NativePublicationOwnerLayout, Option<super::control_storage::NativePublicationOwnerLayout>,
+            Result<Option<super::control_storage::NativePublicationOwnerLayout>, NativeStorageCause>,
+            Result<Option<u64>, Error>, &Self, &MlxNativeStorage, usize)>()
+            .map_err(|cause| Error::Neural(metadata.error(cause)))?;
+        let capacity = usize::try_from(self.capacity)
+            .map_err(|_| Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        mechanism.publication_owner_layout(capacity)
+            .map_err(|cause| metadata.source(cause)).map_err(Error::Neural)
+            .map(|layout| layout.and_then(|layout| layout.control_bytes(self.attempts, self.rows)))
+    }
     pub(crate) fn attempts(&self) -> usize {
         self.attempts
     }
@@ -107,7 +122,57 @@ fn add(left: u64, right: u64) -> Result<u64, Error> {
     left.checked_add(right)
         .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
 }
+pub(crate) struct NativeSamplingPopulation {
+    pub(crate) bytes: u64,
+    pub(crate) controls: u64,
+    pub(crate) carryover: Option<u64>,
+    work_rows: super::work_rows::WorkRows,
+}
 impl MlxNativeStorage {
+    pub(crate) fn sampling_population(&self, program: &ResidentSamplingProgram) -> Result<Option<NativeSamplingPopulation>, Error> {
+        self.sampling_population_with(program, |_| {})
+    }
+    fn sampling_population_with(&self, program: &ResidentSamplingProgram,
+        mut generation: impl FnMut(u64)) -> Result<Option<NativeSamplingPopulation>, Error> {
+        if let Some(funding) = program.planning_metadata() {
+            funding.reserve_metadata(std::mem::size_of::<(
+                super::work_rows::WorkRows, &super::work_rows::WorkRows,
+                Option<eredu_nn::workspace::WorkspaceStoragePopulation>, Option<usize>, usize,
+            )>()).map_err(Error::WorkspacePlanning)?;
+        }
+        let mut sampling_bytes = 0u64;
+        let mut population_controls = std::mem::size_of::<super::work_rows::WorkRows>() as u64;
+        let mut work_rows = super::work_rows::WorkRows::default();
+        let mut sampling_carryover = Some(0u64);
+        for row in program.rows() {
+            let closing =
+                self.carryover_population(row.closing_roots(), &mut population_controls)?;
+            sampling_carryover = sampling_carryover.zip(closing).map(|(a, b)| a.max(b));
+            let Some(storage) = row.mutable_storage() else {
+                return Ok(None);
+            };
+            let Some(closing) = row.closing_roots() else {
+                return Ok(None);
+            };
+            work_rows.sampling(storage.maximum_births(), closing.maximum_allocations)
+                .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+            let Some(population) =
+                self.original_population(storage.mutable_bytes(), storage.maximum_births())?
+            else {
+                return Ok(None);
+            };
+            generation(population.capacity() as u64);
+            sampling_bytes = add(sampling_bytes, population.capacity() as u64)?;
+            population_controls = add(population_controls, population.control_bytes() as u64)?;
+        }
+        Ok(Some(NativeSamplingPopulation {
+            bytes: sampling_bytes,
+            work_rows,
+            controls: population_controls,
+            carryover: sampling_carryover,
+        }))
+    }
+
     fn original_population(
         &self,
         requested_bytes: u64,
@@ -165,6 +230,7 @@ impl MlxNativeStorage {
         prompt: &TextPromptWorkspaceReport,
         sampling: &SamplingWorkspaceReport,
         opening_rows: Option<usize>,
+        paged_sources: bool,
     ) -> Result<Option<NativeProgramStorage>, Error> {
         let geometry = recipe.plan().geometry();
         let Some(prompt_facts) = self
@@ -182,9 +248,11 @@ impl MlxNativeStorage {
             recipe,
             sampling,
             opening_rows,
+            paged_sources,
             PreparationPopulation::Constructed(ConstructedPreparationPopulation {
                 bytes: prompt_bytes,
                 births: prompt_facts.maximum_births(),
+                retained_roots: 1, // actual constructed prompt array
                 controls: 0,
                 credit: prompt_credit,
                 replacement: prompt_bytes,
@@ -203,6 +271,7 @@ impl MlxNativeStorage {
         pending: &WorkspaceTraceReport,
         sampling: &SamplingWorkspaceReport,
         opening_rows: Option<usize>,
+        paged_sources: bool,
     ) -> Result<Option<NativeProgramStorage>, Error> {
         let Some(copy) = recipe.resume_copy() else {
             return Ok(None);
@@ -244,9 +313,11 @@ impl MlxNativeStorage {
             recipe,
             sampling,
             opening_rows,
+            paged_sources,
             PreparationPopulation::Constructed(ConstructedPreparationPopulation {
                 bytes: physical.max(priced),
                 births: copy.births(),
+                retained_roots: copy.roots(),
                 controls,
                 credit: 0,
                 replacement: physical.saturating_sub(priced),
@@ -262,11 +333,13 @@ impl MlxNativeStorage {
         source: &eredu_runtime::input::OriginalPreparedWorkspaceSource,
         sampling: &SamplingWorkspaceReport,
         opening_rows: Option<usize>,
+        paged_sources: bool,
     ) -> Result<Option<NativeProgramStorage>, Error> {
         self.program(
             recipe,
             sampling,
             opening_rows,
+            paged_sources,
             PreparationPopulation::Completed(source),
         )
     }
@@ -276,8 +349,15 @@ impl MlxNativeStorage {
         recipe: &ResidentNativeRecipe,
         sampling: &SamplingWorkspaceReport,
         opening_rows: Option<usize>,
+        paged_sources: bool,
         preparation: PreparationPopulation<'_>,
     ) -> Result<Option<NativeProgramStorage>, Error> {
+        if let Some(funding) = recipe.planning_metadata() {
+            funding.reserve_metadata(std::mem::size_of::<(
+                super::work_rows::WorkRows, &super::work_rows::WorkRows,
+                Option<eredu_nn::workspace::WorkspaceStoragePopulation>, Option<usize>, usize, bool,
+            )>()).map_err(Error::WorkspacePlanning)?;
+        }
         let preparation = match preparation {
             PreparationPopulation::Constructed(population) => population,
             PreparationPopulation::Completed(source) => {
@@ -289,6 +369,7 @@ impl MlxNativeStorage {
                 ConstructedPreparationPopulation {
                     bytes: 0,
                     births: 0,
+                    retained_roots: 0,
                     controls: 0,
                     credit: 0,
                     replacement: 0,
@@ -313,10 +394,11 @@ impl MlxNativeStorage {
             return Ok(None);
         }
         let mut capacity = 0u64;
-        let mut births = 0usize;
+        let mut work_rows = super::work_rows::WorkRows::default();
         let profile_controls = u64::try_from(
             std::mem::size_of::<PreparationPopulation<'_>>()
                 .checked_add(std::mem::size_of::<ConstructedPreparationPopulation>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<super::work_rows::WorkRows>()))
                 .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?,
         )
         .map_err(|_| Error::PrefillControl(WorkingMemoryError::Overflow))?;
@@ -365,6 +447,20 @@ impl MlxNativeStorage {
             ) else {
                 return Ok(None);
             };
+            let (Some(opening_roots), Some(validations)) =
+                (native.opening_state(), native.validation_roots()) else {
+                return Ok(None);
+            };
+            let prefill = match native.span() {
+                eredu_runtime::working_memory::InferenceWorkspaceSpan::Prefill(_) => true,
+                eredu_runtime::working_memory::InferenceWorkspaceSpan::Decode { .. } => false,
+                eredu_runtime::working_memory::InferenceWorkspaceSpan::Sampling(_) => return Ok(None),
+            };
+            work_rows.equation(
+                prefill,
+                storage.maximum_births(), native.capture_roots(), validations,
+                opening_roots.maximum_allocations, native.closing_state().maximum_allocations,
+            ).ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
             let Some(population) =
                 self.original_population(storage.mutable_bytes(), storage.maximum_births())?
             else {
@@ -389,9 +485,6 @@ impl MlxNativeStorage {
                 .map_err(Error::PrefillControl)?;
             capacity = add(capacity, construction)?;
             population_controls = add(population_controls, population.control_bytes() as u64)?;
-            births = births
-                .checked_add(storage.maximum_births())
-                .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
         }
         let envelope = envelope.finish().map_err(Error::PrefillControl)?;
         if envelope.original_equation_bytes() != capacity {
@@ -408,31 +501,15 @@ impl MlxNativeStorage {
             capacity=add(capacity,u64::try_from(control.backing)
                 .map_err(|_|Error::PrefillControl(WorkingMemoryError::Overflow))?)?;
         }
-        let mut sampling_bytes = 0u64;
-        let mut sampling_carryover = Some(0u64);
-        for row in recipe.sampling_records() {
-            let closing =
-                self.carryover_population(row.closing_roots(), &mut population_controls)?;
-            sampling_carryover = sampling_carryover.zip(closing).map(|(a, b)| a.max(b));
-            let Some(storage) = row.mutable_storage() else {
-                return Ok(None);
-            };
-            let Some(population) =
-                self.original_population(storage.mutable_bytes(), storage.maximum_births())?
-            else {
-                return Ok(None);
-            };
-            sampling_bytes = add(sampling_bytes, population.capacity() as u64)?;
-            population_controls = add(population_controls, population.control_bytes() as u64)?;
-            births = births
-                .checked_add(storage.maximum_births())
-                .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
-        }
+        let Some(sampling_population) = self.sampling_population(recipe.sampling_program())? else {
+            return Ok(None);
+        };
+        let sampling_bytes = sampling_population.bytes;
+        let sampling_carryover = sampling_population.carryover;
+        population_controls = add(population_controls, sampling_population.controls)?;
+        work_rows.include_sampling(&sampling_population.work_rows);
         let prompt_bytes = preparation.bytes;
         capacity = add(add(capacity, prompt_bytes)?, sampling_bytes)?;
-        births = births
-            .checked_add(preparation.births)
-            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
         let capture_publications = recipe.records().iter().try_fold(0usize, |n, row| {
             n.checked_add(row.capture_publications())
                 .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
@@ -449,20 +526,11 @@ impl MlxNativeStorage {
         let works = steps
             .checked_add(2)
             .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
-        // Exact source/intermediate alias population from each accepted callback.
-        // Raw transfers keep six; ordered-score workers keep their actual full
-        // scalar program. No early per-chunk release is assumed for admission.
-        let capture_roots = recipe.records().iter().try_fold(0usize, |n, row| {
-            n.checked_add(row.capture_roots())
-                .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
-        })?;
-        let rows = opening_rows
-            .checked_add(births)
-            .and_then(|n| n.checked_add(capture_roots))
-            .and_then(|n| n.checked_add(recipe.foreground_source_publication_rows()))
-            // The actual TextInputIdentityPlan constructs one shared metadata
-            // identity. Its payload/control budget is separate from native P.
-            .and_then(|n| n.checked_add(1))
+        // This same bound sizes each real Work's clone/metadata inventories and
+        // each publication's registry/attachment destinations. Other Work owners
+        // retain their own histories; none is copied into the current inventory.
+        let rows = work_rows.finish(opening_rows, preparation.births,
+            preparation.retained_roots, recipe.foreground_source_publication_rows(), paged_sources)
             .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
         Ok(Some(NativeProgramStorage {
             plan: recipe.plan().clone(),
@@ -565,5 +633,69 @@ impl MlxNativeStorage {
         } else {
             Ok(plan)
         }
+    }
+}
+
+/// Sampling-only projection of the same physical population worker. Every
+/// generation is retained; no retirement credit is inferred from a cold trace.
+pub(crate) struct NativeSamplingStorage {
+    plan: InferenceSpanWorkspacePlan,
+    selection: NativeStorageSelection,
+    generations: Vec<u64>,
+    population: NativeSamplingPopulation,
+    attempts: usize,
+    rows: usize,
+    works: usize,
+}
+impl NativeSamplingStorage {
+    pub(crate) fn attempts(&self) -> usize { self.attempts }
+    pub(crate) fn rows(&self) -> usize { self.rows }
+    pub(crate) fn works(&self) -> usize { self.works }
+}
+impl MlxNativeStorage {
+    pub(crate) fn sampling_program(&self, workspace: &InferenceSpanWorkspace,
+        program: &ResidentSamplingProgram, reseed: bool, funding: &eredu_core::HostMetadataFunding) -> Result<NativeSamplingStorage, Error> {
+        use eredu_nn::workspace::WorkspaceMetadataAllocation;
+        funding.reserve_metadata(std::mem::size_of::<NativeSamplingStorage>()
+            + std::mem::size_of::<Result<NativeSamplingStorage, Error>>()
+            + std::mem::size_of::<NativeSamplingPopulation>())
+            .map_err(Error::WorkspacePlanning)?;
+        if workspace.plan().records().len() != program.rows().len()
+            || workspace.plan().records().iter().zip(program.rows()).any(|(neutral, native)|
+                neutral.span() != &eredu_runtime::working_memory::InferenceWorkspaceSpan::Sampling(native.phase())) {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        let mut generations = funding.metadata_vec(program.rows().len()).map_err(Error::Neural)?;
+        let population = self.sampling_population_with(program, |bytes| generations.push(bytes))?
+            .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+        let works = program.steps().and_then(|n| n.checked_add(usize::from(reseed)))
+            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        // Each actual replacement Work contains one phase; its invocation
+        // sources and both explicit handoff retains remain covered separately.
+        let rows = population.work_rows.sampling_only()
+            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        Ok(NativeSamplingStorage { plan: workspace.plan().clone(), selection: self.selection.clone(),
+            generations, population, attempts: works, rows, works })
+    }
+    pub(crate) fn sampling_plan(&self, workspace: &InferenceSpanWorkspace,
+        program: &NativeSamplingStorage, collector_controls: u64)
+        -> Result<PreparedNativeStoragePlan<Self>, Error> {
+        if !program.plan.same_plan(workspace.plan()) || !program.selection.same_selection(&self.selection) {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        let capacity = usize::try_from(program.population.bytes)
+            .map_err(|_| Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        let direct = self.publication_owner_layout(capacity)
+            .map_err(|cause| Error::Other(Box::new(cause)))?
+            .and_then(|layout| layout.control_bytes(program.attempts, program.rows))
+            .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+        let provider = direct.checked_add(collector_controls)
+            .and_then(|n| n.checked_add(program.population.controls))
+            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        PreparedNativeStoragePlan::prepare_qualified(workspace, self, Some(program.population.bytes),
+            Some((program.attempts, program.rows)),
+            workspace.plan().records().iter().map(|row| row.new_tensor_allocation_bytes()), Some(provider))
+            .and_then(|plan| plan.with_retained_equation_generations(program.generations.iter().copied().map(Some)))
+            .map_err(Error::PrefillControl)
     }
 }

@@ -7,7 +7,7 @@ use eredu_core::{
 };
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::{
     fmt,
@@ -47,10 +47,10 @@ pub struct WorkspaceReportMetadata<'a>(Option<ReportDestination<'a>>);
 #[derive(Clone, Copy)]
 enum ReportDestination<'a> {
     Context(&'a WorkspaceContext),
-    Funding(&'a WorkspaceMetadataFunding),
+    Funding(&'a HostMetadataFunding),
 }
 impl ReportDestination<'_> {
-    fn funding(self) -> Option<WorkspaceMetadataFunding> {
+    fn funding(self) -> Option<HostMetadataFunding> {
         match self {
             Self::Context(context) => context.metadata_funding(),
             Self::Funding(funding) => Some(funding.clone()),
@@ -94,7 +94,7 @@ impl<'a> WorkspaceReportMetadata<'a> {
     /// Borrows an existing planning account after its equation Context retires.
     /// No Context, new allowance or source credit is constructed. The caller
     /// must retain this same account through every returned report and error.
-    pub fn with_funding(funding: &'a WorkspaceMetadataFunding) -> Self {
+    pub fn with_funding(funding: &'a HostMetadataFunding) -> Self {
         Self(Some(ReportDestination::Funding(funding)))
     }
     /// Ordinary diagnostic construction; supplies no finite preparation claim.
@@ -106,14 +106,14 @@ impl<'a> WorkspaceReportMetadata<'a> {
         self.0.is_some()
     }
     /// Closed alias of the current host planning account, without native authority.
-    pub fn funding(self) -> Option<eredu_nn::workspace::WorkspaceMetadataFunding> {
+    pub fn funding(self) -> Option<eredu_nn::workspace::HostMetadataFunding> {
         self.0.and_then(ReportDestination::funding)
     }
     /// Retains a typed producer failure only after paying its exact error owner.
     pub fn source<E: std::error::Error + Send + Sync + 'static>(self, error: E) -> Error {
         match self.0 {
             Some(context) => context.metadata_source(error),
-            None => Error::backend_source(error),
+            None => Error::backend_retained_source(error),
         }
     }
     /// Preserve an already paid error; pay before retaining a fixed policy cause.
@@ -122,7 +122,7 @@ impl<'a> WorkspaceReportMetadata<'a> {
             WorkspaceReportError::Metadata(error) => error,
             WorkspaceReportError::Policy(error) => match self.0 {
                 Some(context) => context.metadata_source(error),
-                None => Error::backend_source(CapabilityError::from(error)),
+                None => Error::backend_retained_source(CapabilityError::from(error)),
             },
         }
     }
@@ -327,3 +327,5 @@ impl<'a> WorkspaceReportMetadata<'a> {
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

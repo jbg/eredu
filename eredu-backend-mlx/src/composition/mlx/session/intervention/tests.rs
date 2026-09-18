@@ -496,6 +496,8 @@ fn static_activation_all_actions_match_strided_host_oracle_and_trace_population(
         assert_eq!(input.to_f32_vec(&stream).unwrap(),values,"source mutated");
         let program=PreparedStaticActivation::new(&action,&slice,&[2,7],dtype).unwrap();
         let population=program.population().unwrap();
+        #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+        {
         let mechanism=MlxMetalWorkspaceMechanisms::current_host().unwrap();
         let context=WorkspaceContext::new(mechanism);
         let source=WorkspaceTensor::existing(context.layout(&[2,7],WorkspaceDtype::Float32).unwrap(),&context).unwrap();
@@ -513,6 +515,7 @@ fn static_activation_all_actions_match_strided_host_oracle_and_trace_population(
         }
         let wrong=WorkspaceTensor::existing(context.layout(&[1,14],WorkspaceDtype::Float32).unwrap(),&context).unwrap();
         assert!(program.trace(&wrong,&context,&mut Vec::new()).is_err());
+        }
     }
 }
 

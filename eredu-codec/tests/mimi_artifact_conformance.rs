@@ -434,12 +434,16 @@ struct ExtensionUnit {
 }
 
 impl Parameterized<NumericTensor> for ExtensionUnit {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
-        self.weight.visit_parameters(visitor);
-    }
+ let mut __source_result = Ok(());
+
+__source_result = __source_result.and(        self.weight.visit_parameter_sources(visitor));
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where

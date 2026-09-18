@@ -1,9 +1,9 @@
 //! Validators for `contentMediaType`, `contentEncoding`, and `contentSchema` keywords.
 use crate::{
     compiler,
-    content_encoding::{ContentEncodingCheckType, ContentEncodingConverterType},
-    content_media_type::ContentMediaTypeCheckType,
-    error::ValidationError,
+    content_encoding::{ContentEncodingSource, ConversionError},
+    content_media_type::ContentMediaTypeSource,
+    error::{ValidationError, ValidationErrorKind},
     evaluation::Annotations,
     keywords::CompilationResult,
     paths::{LazyLocation, Location, RefTracker},
@@ -17,115 +17,130 @@ use std::{borrow::Cow, sync::Arc};
 /// Validator for `contentMediaType` keyword.
 pub(crate) struct ContentMediaTypeValidator {
     media_type: String,
-    func: ContentMediaTypeCheckType,
+    func: ContentMediaTypeSource,
     location: Location,
 }
 
 impl ContentMediaTypeValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        media_type: &str,
-        func: ContentMediaTypeCheckType,
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        media_type: &'a str,
+        func: ContentMediaTypeSource,
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        Ok(Box::new(ContentMediaTypeValidator {
-            media_type: media_type.to_string(),
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ContentMediaTypeValidator {
+            media_type: ctx.funding().copy_str(media_type)?,
             func,
             location,
-        }))
+        })?)
     }
 }
 
-/// Validator delegates validation to the stored function.
 impl<F: Json> Validate<F> for ContentMediaTypeValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
-        if let Some(item) = instance.as_string() {
-            (self.func)(&item)
-        } else {
-            true
-        }
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        source.string(&self.media_type)?;
+        source.location(&self.location)
     }
-
-    fn validate<'i>(
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            std::mem::size_of::<Option<Cow<'_, str>>>(),
+            std::mem::size_of::<(ContentMediaTypeSource, bool)>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
+        instance
+            .as_string()
+            .map_or(true, |item| self.func.check(&item, ctx))
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if (self.func)(&item) {
-                Ok(())
-            } else {
-                let loc = &self.location;
-                Err(ValidationError::content_media_type(
-                    loc.clone(),
-                    crate::paths::capture_evaluation_path(tracker, loc),
-                    location.into(),
-                    instance.to_value(),
-                    &self.media_type,
-                ))
-            }
-        } else {
-            Ok(())
+        if !<Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(ValidationErrorKind::ContentMediaType {
+                    content_media_type: funding.copy_str(&self.media_type)?,
+                })
+            });
         }
+        Ok(())
     }
 }
 
 /// Validator for `contentEncoding` keyword.
 pub(crate) struct ContentEncodingValidator {
     encoding: String,
-    func: ContentEncodingCheckType,
+    func: ContentEncodingSource,
     location: Location,
 }
 
 impl ContentEncodingValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        encoding: &str,
-        func: ContentEncodingCheckType,
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        encoding: &'a str,
+        func: ContentEncodingSource,
         location: Location,
-    ) -> CompilationResult<'_, F> {
-        Ok(Box::new(ContentEncodingValidator {
-            encoding: encoding.to_string(),
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ContentEncodingValidator {
+            encoding: ctx.funding().copy_str(encoding)?,
             func,
             location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for ContentEncodingValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
-        if let Some(item) = instance.as_string() {
-            (self.func)(&item)
-        } else {
-            true
-        }
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        source.string(&self.encoding)?;
+        source.location(&self.location)
     }
-
-    fn validate<'i>(
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            std::mem::size_of::<Option<Cow<'_, str>>>(),
+            std::mem::size_of::<(ContentEncodingSource, bool)>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
+        instance
+            .as_string()
+            .map_or(true, |item| self.func.check(&item, ctx))
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if (self.func)(&item) {
-                Ok(())
-            } else {
-                let loc = &self.location;
-                Err(ValidationError::content_encoding(
-                    loc.clone(),
-                    crate::paths::capture_evaluation_path(tracker, loc),
-                    location.into(),
-                    instance.to_value(),
-                    &self.encoding,
-                ))
-            }
-        } else {
-            Ok(())
+        if !<Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(ValidationErrorKind::ContentEncoding {
+                    content_encoding: funding.copy_str(&self.encoding)?,
+                })
+            });
         }
+        Ok(())
     }
 }
 
@@ -133,96 +148,127 @@ impl<F: Json> Validate<F> for ContentEncodingValidator {
 pub(crate) struct ContentMediaTypeAndEncodingValidator {
     media_type: String,
     encoding: String,
-    func: ContentMediaTypeCheckType,
-    converter: ContentEncodingConverterType,
+    func: ContentMediaTypeSource,
+    converter: ContentEncodingSource,
     location: Location,
 }
 
 impl ContentMediaTypeAndEncodingValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         media_type: &'a str,
         encoding: &'a str,
-        func: ContentMediaTypeCheckType,
-        converter: ContentEncodingConverterType,
+        func: ContentMediaTypeSource,
+        converter: ContentEncodingSource,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(ContentMediaTypeAndEncodingValidator {
-            media_type: media_type.to_string(),
-            encoding: encoding.to_string(),
+        Ok(ctx.funding().boxed(ContentMediaTypeAndEncodingValidator {
+            media_type: ctx.funding().copy_str(media_type)?,
+            encoding: ctx.funding().copy_str(encoding)?,
             func,
             converter,
             location,
-        }))
+        })?)
     }
 }
 
-/// Decode the input value & check media type
+/// Decode the input value and check the selected media type with the same workers.
 impl<F: Json> Validate<F> for ContentMediaTypeAndEncodingValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        self.converter.qualify()?;
+        source.string(&self.media_type)?;
+        source.string(&self.encoding)?;
+        source.location(&self.location)
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        self.func.qualify()?;
+        self.converter.qualify()?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            std::mem::size_of::<Option<Cow<'_, str>>>(),
+            std::mem::size_of::<Option<Result<Option<String>, ConversionError>>>(),
+            std::mem::size_of::<(ContentMediaTypeSource, ContentEncodingSource, bool)>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Location>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
-            match (self.converter)(&item) {
-                Ok(None) | Err(_) => false,
-                Ok(Some(converted)) => (self.func)(&converted),
+            match self.converter.convert(&item, ctx) {
+                Some(Ok(Some(converted))) => self.func.check(&converted, ctx),
+                _ => false,
             }
         } else {
             true
         }
     }
-
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(item) = instance.as_string() {
-            match (self.converter)(&item) {
+            let Some(converted) = self.converter.convert(&item, ctx) else {
+                return Ok(());
+            };
+            match converted {
                 Ok(None) => {
-                    let encoding_location = self.location.join("contentEncoding");
-                    let eval_path =
-                        crate::paths::capture_evaluation_path(tracker, &encoding_location);
-                    Err(ValidationError::content_encoding(
-                        encoding_location,
-                        eval_path,
-                        location.into(),
-                        instance.to_value(),
-                        &self.encoding,
-                    ))
+                    let Some(path) = ctx.produce(|funding| {
+                        self.location.join_with_funding("contentEncoding", funding)
+                    }) else {
+                        return Ok(());
+                    };
+                    return ctx.diagnostic::<F>(instance, location, tracker, &path, |funding| {
+                        Ok(ValidationErrorKind::ContentEncoding {
+                            content_encoding: funding.copy_str(&self.encoding)?,
+                        })
+                    });
                 }
                 Ok(Some(converted)) => {
-                    if (self.func)(&converted) {
-                        Ok(())
-                    } else {
-                        let media_type_location = self.location.join("contentMediaType");
-                        let eval_path =
-                            crate::paths::capture_evaluation_path(tracker, &media_type_location);
-                        Err(ValidationError::content_media_type(
-                            media_type_location,
-                            eval_path,
-                            location.into(),
-                            instance.to_value(),
-                            &self.media_type,
-                        ))
+                    if !self.func.check(&converted, ctx) {
+                        let Some(path) = ctx.produce(|funding| {
+                            self.location.join_with_funding("contentMediaType", funding)
+                        }) else {
+                            return Ok(());
+                        };
+                        return ctx.diagnostic::<F>(
+                            instance,
+                            location,
+                            tracker,
+                            &path,
+                            |funding| {
+                                Ok(ValidationErrorKind::ContentMediaType {
+                                    content_media_type: funding.copy_str(&self.media_type)?,
+                                })
+                            },
+                        );
                     }
                 }
-                Err(e) => {
-                    let encoding_location = self.location.join("contentEncoding");
-                    let eval_path =
-                        crate::paths::capture_evaluation_path(tracker, &encoding_location);
-                    Err(ValidationError::new(
-                        instance.to_value(),
-                        e.into_parts().kind,
-                        location.into(),
-                        encoding_location,
-                        eval_path,
-                    ))
+                Err(error) => {
+                    let Some(path) = ctx.produce(|funding| {
+                        self.location.join_with_funding("contentEncoding", funding)
+                    }) else {
+                        return Ok(());
+                    };
+                    return ctx.diagnostic::<F>(instance, location, tracker, &path, |_| {
+                        Ok(match error {
+                            ConversionError::Utf8(error) => ValidationErrorKind::FromUtf8 { error },
+                            ConversionError::Schema(error) => error.into_parts().kind,
+                        })
+                    });
                 }
             }
-        } else {
-            Ok(())
         }
+        Ok(())
     }
 }
 
@@ -236,8 +282,9 @@ pub(crate) fn compile_media_type<'a, F: Json>(
         let func = ctx.get_content_media_type_check(media_type.as_str())?;
         if let Some(content_encoding) = schema.get("contentEncoding") {
             if let Value::String(content_encoding) = content_encoding {
-                let converter = ctx.get_content_encoding_convert(content_encoding)?;
+                let converter = ctx.get_content_encoding(content_encoding)?;
                 Some(ContentMediaTypeAndEncodingValidator::compile(
+                    ctx,
                     media_type,
                     content_encoding,
                     func,
@@ -245,31 +292,46 @@ pub(crate) fn compile_media_type<'a, F: Json>(
                     ctx.location().clone(),
                 ))
             } else {
-                let location = ctx.location().join("contentEncoding");
-                Some(Err(ValidationError::single_type_error(
-                    location.clone(),
-                    location,
-                    Location::new(),
-                    Cow::Borrowed(content_encoding),
-                    JsonType::String,
-                )))
+                let location = crate::keywords::try_compile!(ctx
+                    .location()
+                    .join_with_funding("contentEncoding", ctx.funding()));
+                Some(Err(crate::keywords::try_compile!(
+                    ValidationError::single_type_error_with_funding(
+                        location.clone(),
+                        location,
+                        crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                        Cow::Borrowed(content_encoding),
+                        JsonType::String,
+                        ctx.funding()
+                    )
+                )
+                .into()))
             }
         } else {
             Some(ContentMediaTypeValidator::compile(
+                ctx,
                 media_type,
                 func,
-                ctx.location().join("contentMediaType"),
+                crate::keywords::try_compile!(ctx
+                    .location()
+                    .join_with_funding("contentMediaType", ctx.funding())),
             ))
         }
     } else {
-        let location = ctx.location().join("contentMediaType");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(subschema),
-            JsonType::String,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("contentMediaType", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(subschema),
+                JsonType::String,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 
@@ -285,21 +347,30 @@ pub(crate) fn compile_content_encoding<'a, F: Json>(
         return None;
     }
     if let Value::String(content_encoding) = subschema {
-        let func = ctx.get_content_encoding_check(content_encoding)?;
+        let func = ctx.get_content_encoding(content_encoding)?;
         Some(ContentEncodingValidator::compile(
+            ctx,
             content_encoding,
             func,
-            ctx.location().join("contentEncoding"),
+            crate::keywords::try_compile!(ctx
+                .location()
+                .join_with_funding("contentEncoding", ctx.funding())),
         ))
     } else {
-        let location = ctx.location().join("contentEncoding");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(subschema),
-            JsonType::String,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("contentEncoding", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(subschema),
+                JsonType::String,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 
@@ -312,14 +383,20 @@ pub(crate) struct ContentMediaTypeAnnotationValidator {
 
 impl ContentMediaTypeAnnotationValidator {
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         _ctx: &compiler::Context<F>,
         _schema: &'a Map<String, Value>,
         subschema: &'a Value,
     ) -> Option<CompilationResult<'a, F>> {
         if let Value::String(_) = subschema {
-            Some(Ok(Box::new(ContentMediaTypeAnnotationValidator {
-                annotation: Arc::new(subschema.clone()),
-            })))
+            Some(Ok(
+                match ctx.funding().boxed(ContentMediaTypeAnnotationValidator {
+                    annotation: crate::keywords::try_compile!(ctx.funding().annotation(subschema)),
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error.into())),
+                },
+            ))
         } else {
             None
         }
@@ -327,20 +404,28 @@ impl ContentMediaTypeAnnotationValidator {
 }
 
 impl<F: Json> Validate<F> for ContentMediaTypeAnnotationValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        if source.arc(&self.annotation)? { source.value(&self.annotation)?; }
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         // The selected ordinary assertion body is the existing constant true.
         // Annotation emission belongs to the separate ordinary evaluate API.
-        crate::validator::workspace::body_controls::<F,Self>(&[std::mem::size_of::<bool>()])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<bool>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, _instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         _instance: &F::Node<'i>,
         _location: &LazyLocation,
@@ -372,7 +457,7 @@ pub(crate) fn compile_media_type_annotation<'a, F: Json>(
     schema: &'a Map<String, Value>,
     subschema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    ContentMediaTypeAnnotationValidator::compile(ctx, schema, subschema)
+    ContentMediaTypeAnnotationValidator::compile(ctx, ctx, schema, subschema)
 }
 
 /// Annotation-only validator for `contentEncoding` (Draft 2019-09 / 2020-12).
@@ -384,14 +469,20 @@ pub(crate) struct ContentEncodingAnnotationValidator {
 
 impl ContentEncodingAnnotationValidator {
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         _ctx: &compiler::Context<F>,
         _schema: &'a Map<String, Value>,
         subschema: &'a Value,
     ) -> Option<CompilationResult<'a, F>> {
         if let Value::String(_) = subschema {
-            Some(Ok(Box::new(ContentEncodingAnnotationValidator {
-                annotation: Arc::new(subschema.clone()),
-            })))
+            Some(Ok(
+                match ctx.funding().boxed(ContentEncodingAnnotationValidator {
+                    annotation: crate::keywords::try_compile!(ctx.funding().annotation(subschema)),
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error.into())),
+                },
+            ))
         } else {
             None
         }
@@ -399,20 +490,28 @@ impl ContentEncodingAnnotationValidator {
 }
 
 impl<F: Json> Validate<F> for ContentEncodingAnnotationValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        if source.arc(&self.annotation)? { source.value(&self.annotation)?; }
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         // The selected ordinary assertion body is the existing constant true.
         // Annotation emission belongs to the separate ordinary evaluate API.
-        crate::validator::workspace::body_controls::<F,Self>(&[std::mem::size_of::<bool>()])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<bool>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, _instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         _instance: &F::Node<'i>,
         _location: &LazyLocation,
@@ -444,7 +543,7 @@ pub(crate) fn compile_content_encoding_annotation<'a, F: Json>(
     schema: &'a Map<String, Value>,
     subschema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    ContentEncodingAnnotationValidator::compile(ctx, schema, subschema)
+    ContentEncodingAnnotationValidator::compile(ctx, ctx, schema, subschema)
 }
 
 /// Annotation-only validator for `contentSchema` (Draft 2019-09 / 2020-12).
@@ -457,15 +556,21 @@ pub(crate) struct ContentSchemaAnnotationValidator {
 
 impl ContentSchemaAnnotationValidator {
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         _ctx: &compiler::Context<F>,
         schema: &'a Map<String, Value>,
         subschema: &'a Value,
     ) -> Option<CompilationResult<'a, F>> {
         // contentSchema only annotates when contentMediaType is also present
         if schema.contains_key("contentMediaType") {
-            Some(Ok(Box::new(ContentSchemaAnnotationValidator {
-                annotation: Arc::new(subschema.clone()),
-            })))
+            Some(Ok(
+                match ctx.funding().boxed(ContentSchemaAnnotationValidator {
+                    annotation: crate::keywords::try_compile!(ctx.funding().annotation(subschema)),
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error.into())),
+                },
+            ))
         } else {
             None
         }
@@ -477,7 +582,7 @@ impl<F: Json> Validate<F> for ContentSchemaAnnotationValidator {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         _instance: &F::Node<'i>,
         _location: &LazyLocation,
@@ -509,7 +614,7 @@ pub(crate) fn compile_content_schema_annotation<'a, F: Json>(
     schema: &'a Map<String, Value>,
     subschema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    ContentSchemaAnnotationValidator::compile(ctx, schema, subschema)
+    ContentSchemaAnnotationValidator::compile(ctx, ctx, schema, subschema)
 }
 
 #[cfg(test)]

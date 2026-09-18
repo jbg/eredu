@@ -1,12 +1,12 @@
 //! Same neutral fixed sequence provider, funded before every actual birth.
 use super::*;
 use eredu_core::{HostPreparationAuthority, SpeculativeSequence, SpeculativeSequenceRef};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 
 fn controls(maximum: usize, eos: usize) -> Option<usize> {
     let parts = [
         SpeculativeSequence::retained_control_bytes(maximum, eos)?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()?,
         std::mem::size_of::<Result<SpeculativeSequence, Error>>(),
         std::mem::size_of::<(usize, &[u32], SpeculativeExecutionStreams<'static>)>(),
         std::mem::size_of::<(
@@ -32,7 +32,7 @@ fn authority(
     sources: &crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
 ) -> Result<HostPreparationAuthority, Error> {
     let bytes = controls(maximum, eos).ok_or(Error::WorkspacePlanning(
-        WorkspaceMetadataFundingError::Overflow,
+        HostMetadataFundingError::Overflow,
     ))?;
     sources
         .metadata_funding()

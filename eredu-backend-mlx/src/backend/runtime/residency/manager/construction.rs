@@ -7,6 +7,7 @@ use crate::backend::runtime::execution::layerwise::{
     OriginalDenseControllerFacts, PreparedDenseController, PreparedDenseControllerError,
 };
 use eredu_runtime::ExecutionUnitLayout;
+use crate::backend::runtime::execution::generic::ParameterConstructors;
 use eredu_runtime::working_memory::{
     OriginalHostMetadataCustody, SharedNativeInitializationCustody,
     SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
@@ -60,6 +61,8 @@ pub(crate) struct OriginalManagerPlan {
 // Target execution topology is distinct from the actual bank source protocol.
 // A source-only manager has no target layout, selection or dense controller.
 struct OriginalTargetPlan {
+    parameter_exclusions: Vec<String>,
+    parameter_constructors: Option<Vec<ParameterConstructors>>,
     layout: ExecutionUnitLayout,
     depth: usize,
     selected_ids: Vec<OffloadUnitId>,
@@ -68,6 +71,8 @@ struct OriginalTargetPlan {
 }
 #[derive(Clone, Copy)]
 struct OriginalTargetInputs<'a> {
+    parameter_exclusions: &'a BTreeSet<String>,
+    parameter_constructors: Option<&'a [ParameterConstructors]>,
     layout: &'a ExecutionUnitLayout,
     depth: usize,
     selected_ids: &'a [OffloadUnitId],
@@ -268,6 +273,12 @@ impl SharedNativeInitializer for OriginalManagerPlan {
             add(plan.storage_bytes(self)?)?;
         }
         if let Some(target) = &self.target {
+            add(crate::backend::runtime::execution::generic::MlxParameterExclusions::construction_bytes(
+                &target.parameter_exclusions)?)?;
+            if let Some(constructors) = &target.parameter_constructors {
+                add(Layout::array::<ParameterConstructors>(constructors.len())
+                    .map_err(|_| WorkingMemoryError::Overflow)?.size())?;
+            }
             if let Some(facts) = target.dense_controller {
                 add(PreparedDenseController::storage_bytes(
                     facts, &target.layout, &target.selected_ids,
@@ -293,6 +304,10 @@ impl SharedNativeInitializer for OriginalManagerPlan {
             size_of::<Duration>(),
             size_of::<ConstructionError>(),
             size_of::<Result<ResidencyManager, ConstructionError>>(),
+            size_of::<(Option<&OriginalTargetPlan>, &OriginalTargetPlan,
+                Option<&Vec<ParameterConstructors>>, &Vec<ParameterConstructors>,
+                &[ParameterConstructors], Vec<ParameterConstructors>,
+                Option<Vec<ParameterConstructors>>)>() ,
         ] {
             add(n)?;
         }
@@ -341,6 +356,12 @@ impl SharedNativeInitializer for OriginalManagerPlan {
             let mut manager = ResidencyManager {
                 inner: ManagerOwner::new(
                     ManagerInner {
+                        parameter_constructors: self.target.as_ref()
+                            .and_then(|target| target.parameter_constructors.as_ref())
+                            .map(|constructors| constructors.to_vec()),
+                        parameter_exclusions: self.target.as_ref().map(|target|
+                            crate::backend::runtime::execution::generic::MlxParameterExclusions::construct(
+                                &target.parameter_exclusions, custody.clone())),
                         sources,
                         host_workspace: std::sync::OnceLock::new(),
                         dense_controller: std::sync::OnceLock::new(),
@@ -556,6 +577,15 @@ impl std::error::Error for OriginalManagerError {
     }
 }
 impl ResidencyManager {
+    pub(crate) fn parameter_constructors(&self, ordinal: usize) -> Option<ParameterConstructors> {
+        self.inner.parameter_constructors.as_ref()?.get(ordinal).copied()
+    }
+
+    pub(crate) fn original_parameter_exclusions(&self)
+        -> Option<&crate::backend::runtime::execution::generic::MlxParameterExclusions> {
+        self.inner.parameter_exclusions.as_ref()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_original_host(
         primary: eredu_checkpoint::store::RetainedCheckpointSource,
@@ -566,6 +596,8 @@ impl ResidencyManager {
         selected_ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
+        parameter_exclusions: &BTreeSet<String>,
+        parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
         pool: &WorkingMemoryPool,
@@ -576,7 +608,7 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { selected_ids, layout, depth, dense_controller: None }),
+            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: None }),
             source_stream,
             execution_stream,
             pool,
@@ -593,6 +625,8 @@ impl ResidencyManager {
         selected_ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
+        parameter_exclusions: &BTreeSet<String>,
+        parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
         pool: &WorkingMemoryPool,
@@ -603,7 +637,7 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { selected_ids, layout, depth, dense_controller: None }),
+            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: None }),
             source_stream,
             execution_stream,
             pool,
@@ -620,6 +654,8 @@ impl ResidencyManager {
         selected_ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
+        parameter_exclusions: &BTreeSet<String>,
+        parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
         pool: &WorkingMemoryPool,
@@ -631,7 +667,7 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { selected_ids, layout, depth, dense_controller: Some(dense_controller) }),
+            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: Some(dense_controller) }),
             source_stream,
             execution_stream,
             pool,
@@ -652,6 +688,10 @@ impl ResidencyManager {
         foreground: bool,
     ) -> Result<Option<Self>, OriginalManagerError> {
         (|| -> Result<_, PreparationFailure> {
+            if target.as_ref().is_some_and(|target| target.parameter_constructors
+                .is_some_and(|rows| rows.len() != target.selected_ids.len())) {
+                return Err(WorkingMemoryError::IdentityMismatch.into());
+            }
             let has_disk = plan
                 .units()
                 .iter()
@@ -666,13 +706,11 @@ impl ResidencyManager {
             {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
-            if safemlx::StreamCopyPlan::<ManagerCustody>::capture(execution_stream)
-                .map_err(|_| WorkingMemoryError::UnknownBound)?
-                .device_type()
-                != DeviceType::Gpu
-            {
-                return Ok(None);
-            }
+            // Both native destinations use the same prepared source manager.
+            // The retained selected stream determines the actual copy worker;
+            // no ordinary manager is substituted for CPU execution.
+            safemlx::StreamCopyPlan::<ManagerCustody>::capture(execution_stream)
+                .map_err(|_| WorkingMemoryError::UnknownBound)?;
             let Some(reads) = read_source_plan::prepare_reads(units, |id| {
                 sources.get(id).unwrap_or(&primary).as_ref()
             })?
@@ -708,6 +746,8 @@ impl ResidencyManager {
                         .ok_or(WorkingMemoryError::IdentityMismatch)
                 }).collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, WorkingMemoryError>(OriginalTargetPlan {
+                    parameter_exclusions: target.parameter_exclusions.iter().cloned().collect(),
+                    parameter_constructors: target.parameter_constructors.map(<[_]>::to_vec),
                     selected_ids: target.selected_ids.to_vec(), selected_definitions,
                     layout: target.layout.clone(), depth: target.depth,
                     dense_controller: target.dense_controller,
@@ -836,3 +876,6 @@ impl ResidencyManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod exclusions_tests;

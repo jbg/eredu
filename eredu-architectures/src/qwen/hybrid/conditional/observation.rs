@@ -65,9 +65,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         let path = format!("model.layers.{index}");
         let points = eredu_runtime::RoutedObservationPoints::new(
             eredu_runtime::RoutedBankId::new(0),
-            format!("{path}.mlp"),
-            self.parsed.text.num_experts,
-        );
+            format_args!("{path}.mlp"),
+            self.parsed.text.num_experts, None)?;
         let lane = state
             .layer(self.state_index(group, index)?)
             .map_err(Error::backend)?;
@@ -164,9 +163,8 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         let path = format!("model.layers.{index}");
         let points = eredu_runtime::RoutedObservationPoints::new(
             eredu_runtime::RoutedBankId::new(0),
-            format!("{path}.mlp"),
-            self.parsed.text.num_experts,
-        );
+            format_args!("{path}.mlp"),
+            self.parsed.text.num_experts, None)?;
         let lane = state
             .layer(self.state_index(group, index)?)
             .map_err(Error::backend)?;

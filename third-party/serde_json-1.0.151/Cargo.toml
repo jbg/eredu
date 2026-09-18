@@ -160,3 +160,11 @@ features = ["diff"]
 [target."cfg(any())".dependencies.serde]
 version = "1.0.220"
 default-features = false
+
+[[test]]
+name = "pointer_allocation"
+path = "tests/pointer_allocation.rs"
+
+[dependencies.eredu-collections]
+version = "0.1.0"
+path = "../../eredu-collections"

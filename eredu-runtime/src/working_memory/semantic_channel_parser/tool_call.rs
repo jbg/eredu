@@ -1,7 +1,7 @@
 //! Paid call fields and escaped events; completion keeps full-schema authority separate.
 use super::super::{OriginalJsonObject, OriginalJsonObjectError, OriginalSemanticChannelSource};
 use eredu_core::{HostPreparationAuthority, SemanticEvent, SemanticText, SpeculativeBuffer};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_text::json_fragments::{
     generated_call_id_control_bytes, write_generated_call_id, JsonFieldError, JsonFieldRole,
     GENERATED_CALL_ID_BYTES,
@@ -14,7 +14,7 @@ use std::{
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Fields(#[from] JsonFieldError),
     #[error(transparent)]
@@ -39,7 +39,7 @@ pub(in crate::working_memory) struct Call {
     started: bool,
     complete: bool,
     source: OriginalSemanticChannelSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug)]
 pub(in crate::working_memory) struct Failure {
@@ -101,10 +101,10 @@ impl Call {
             size_of::<Result<Self, Failure>>(),
             size_of::<Result<(Self, usize, bool), Failure>>(),
             size_of::<Result<(), Cause>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Result<(), eredu_core::GenerationError>>(),
             size_of::<Identifier>(),
-            size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &HostMetadataFunding)>(),
             size_of::<(&mut Self, &str, &mut SpeculativeBuffer<SemanticEvent>)>(),
             size_of::<eredu_text::semantic_channels::JsonToolProgram<'_>>(),
             size_of::<Option<&str>>(),
@@ -134,7 +134,7 @@ impl Call {
         source: &OriginalSemanticChannelSource,
         bytes: usize,
         index: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Failure> {
         let mut call = Self {
             object: None,
@@ -169,7 +169,7 @@ impl Call {
         let bytes = SemanticText::retained_control_bytes(text.len())
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .and_then(|n| {
@@ -306,22 +306,22 @@ impl Call {
     }
     pub(in crate::working_memory) fn try_copy(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Failure> {
         let bytes = self.copy_bytes().ok_or_else(|| self.empty_copy(funding).failure(Cause::Overflow))?;
         funding.reserve_metadata(bytes).map_err(|cause| self.empty_copy(funding).failure(cause.into()))?;
         self.copy_prepaid(HostPreparationAuthority::retain(funding.clone()), funding)
     }
-    fn empty_copy(&self, funding: &WorkspaceMetadataFunding) -> Self {
+    fn empty_copy(&self, funding: &HostMetadataFunding) -> Self {
         Self { object: None, failed: None, name: self.name.clone(), id: self.id.clone(),
             emitted: self.emitted, index: self.index, started: self.started, complete: self.complete,
             source: self.source.clone(), funding: funding.clone() }
     }
-    pub(super) fn rebind_funding(&mut self, funding: &WorkspaceMetadataFunding) {
+    pub(super) fn rebind_funding(&mut self, funding: &HostMetadataFunding) {
         self.funding = funding.clone();
         if let Some(object) = &mut self.object { object.rebind_funding(funding); }
     }
-    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &WorkspaceMetadataFunding) -> Result<Self, Failure> {
+    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &HostMetadataFunding) -> Result<Self, Failure> {
         let mut copy = self.empty_copy(funding);
         let Some(object) = self.object.as_ref() else { return Err(copy.failure(Cause::Source)); };
         match object.copy_prepaid(host, funding) {
@@ -339,7 +339,7 @@ impl Call {
     ) -> Result<Self, CompletionFailure<E>>
     where
         E: std::error::Error + 'static,
-        F: FnOnce(&str, &str, &WorkspaceMetadataFunding) -> Result<(), E>,
+        F: FnOnce(&str, &str, &HostMetadataFunding) -> Result<(), E>,
     {
         let parts = [
             Self::controls(),
@@ -348,7 +348,7 @@ impl Call {
             Some(size_of::<Result<(), E>>()),
             Some(size_of::<CompletionFailure<E>>()),
             Some(size_of::<Result<Self, CompletionFailure<E>>>()),
-            Some(size_of::<(&str, &str, &WorkspaceMetadataFunding)>()),
+            Some(size_of::<(&str, &str, &HostMetadataFunding)>()),
         ];
         let controls = parts
             .into_iter()

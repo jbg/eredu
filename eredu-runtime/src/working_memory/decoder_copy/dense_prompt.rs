@@ -449,7 +449,7 @@ impl<'a, S, D, K: HostSlotStorageKey> FundedDenseHostSlots<'a, S, D, K> {
         (HostSlotTable<D>, Option<InferencePreparationStage>),
         DenseDecoderHandoffError<'a, S, D, K>,
     > {
-        let result = crate::working_memory::storage::publish_dense_host_slots_prepared(
+        let result = crate::working_memory::storage::publish_dense_host_slots(
             &self.slots,
             &mut self.custody,
             &self.execution,

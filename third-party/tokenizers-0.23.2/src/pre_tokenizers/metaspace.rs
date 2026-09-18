@@ -79,11 +79,21 @@ impl<'de> Deserialize<'de> for Metaspace {
 
 impl Metaspace {
     pub fn new(replacement: char, prepend_scheme: PrependScheme, split: bool) -> Self {
+        Self::from_replacement_parts(replacement, prepend_scheme, split, replacement.to_string())
+    }
+
+    pub(crate) fn from_replacement_parts(
+        replacement: char,
+        prepend_scheme: PrependScheme,
+        split: bool,
+        str_rep: String,
+    ) -> Self {
+        debug_assert!(str_rep.chars().eq(std::iter::once(replacement)));
         Self {
             replacement,
-            str_rep: replacement.to_string(),
             prepend_scheme,
             split,
+            str_rep,
         }
     }
 
@@ -153,22 +163,34 @@ impl Decoder for Metaspace {
             .iter()
             .enumerate()
             .map(|(i, token)| {
-                token
-                    .chars()
-                    .flat_map(|c| {
-                        if c == self.replacement {
-                            if i == 0 && self.prepend_scheme != PrependScheme::Never {
-                                None
-                            } else {
-                                Some(' ')
-                            }
-                        } else {
-                            Some(c)
-                        }
-                    })
+                decode_piece(token, self.replacement, i == 0 && self.prepend_scheme != PrependScheme::Never)
                     .collect::<String>()
             })
             .collect())
+    }
+}
+
+/// Shared character traversal for ordinary and fixed-destination Metaspace
+/// decoding. The first retained token removes every replacement scalar when
+/// prefix removal is selected, including replacements after its first scalar.
+pub fn decode_piece(token: &str, replacement: char, remove: bool) -> DecodePiece<'_> {
+    DecodePiece { chars: token.chars(), replacement, remove }
+}
+
+/// Allocation-free traversal of one actual token spelling.
+pub struct DecodePiece<'a> {
+    chars: std::str::Chars<'a>,
+    replacement: char,
+    remove: bool,
+}
+impl Iterator for DecodePiece<'_> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> {
+        loop {
+            let c = self.chars.next()?;
+            if c != self.replacement { return Some(c); }
+            if !self.remove { return Some(' '); }
+        }
     }
 }
 

@@ -1,11 +1,11 @@
 //! Paid immutable prospective-choice replacement; no native work or RNG advance.
 use super::*;
 use eredu_core::speculative::SpeculativeOutputError;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::execution_control::TokenChoiceError;
 use eredu_runtime::TokenDomain;
 
-fn host_failure(cause: WorkspaceMetadataFundingError) -> SpeculativeControlError {
+fn host_failure(cause: HostMetadataFundingError) -> SpeculativeControlError {
     SpeculativeControlError::Output(SpeculativeOutputError::HostFunding(cause))
 }
 fn unsupported() -> SpeculativeControlError {
@@ -26,14 +26,14 @@ fn choice_failure(
     }
 }
 fn prepare_host<S, E, L>(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     copy_bytes: usize,
 ) -> Result<HostPreparationAuthority, SpeculativeControlError> {
     let parts = [
         controls::<S, E, L>(copy_bytes)
-            .ok_or_else(|| host_failure(WorkspaceMetadataFundingError::Overflow))?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-            .ok_or_else(|| host_failure(WorkspaceMetadataFundingError::Overflow))?,
+            .ok_or_else(|| host_failure(HostMetadataFundingError::Overflow))?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+            .ok_or_else(|| host_failure(HostMetadataFundingError::Overflow))?,
         size_of::<Option<PreparedSpeculativeController<'_, S>>>(),
         size_of::<Result<S, PreparedControllerError>>(),
         size_of::<Result<(), PreparedControllerError>>(),
@@ -48,7 +48,7 @@ fn prepare_host<S, E, L>(
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or_else(|| host_failure(WorkspaceMetadataFundingError::Overflow))?;
+        .ok_or_else(|| host_failure(HostMetadataFundingError::Overflow))?;
     funding.reserve_metadata(bytes).map_err(host_failure)?;
     Ok(HostPreparationAuthority::retain(funding.clone()))
 }

@@ -258,3 +258,5 @@ pub use tools::{JsonEnvelope, JsonToolLayout, JsonToolProgram, JsonToolShape};
 
 mod framing;
 pub use framing::{JsonDelimiter, JsonFrame, JsonFrameError, JsonFrameFailure, JsonFrameStep, json_frame_control_bytes, json_frame_step};
+
+pub mod tagged;

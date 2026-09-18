@@ -86,7 +86,7 @@ fn recovery_node_keeps_actual_original_custody_through_typed_and_erased_retireme
         assert_eq!(pool.used_bytes().unwrap(), expected);
         recovery.seal();
         if terminal_at_finish {
-            let status = recovery.finish();
+            let status = recovery.finish().unwrap();
             assert!(status.settled && !status.failed && !status.blocked);
         } else {
             let marker = Arc::new(());

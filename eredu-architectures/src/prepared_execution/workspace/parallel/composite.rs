@@ -1,7 +1,10 @@
 //! Retained composite constructor lowered through its ordinary partition executor.
+use crate::prepared_execution::workspace::layerwise::QuoteError;
 use super::*;
 use super::pipeline::{Allocator, parallel_context};
-use crate::composite_execution::{CompositeArchitecture, PreparedCompositeArchitecture, PreparedCompositeInput};
+use crate::composite_execution::{CompositeMediaIngressArchitecture, PreparedCompositeArchitecture, PreparedCompositeInput};
+mod media;
+mod cut_observer;
 use crate::composite_partitioned::PreparedCompositeExecutorPlan;
 use eredu_nn::workspace::WorkspaceParallelContext;
 use eredu_runtime::{
@@ -16,6 +19,8 @@ use eredu_runtime::working_memory::{workspace_partition_communication,
 pub(crate) enum PreparedCompositeModelSource {
     Gemma4(crate::gemma4::model::RetainedModelSource,
         Option<crate::gemma4::model::RetainedModelSource>),
+    QwenVl(crate::qwen::vl::RetainedModelSource,
+        Option<crate::qwen::vl::RetainedModelSource>),
 }
 struct Composite {
     model: PreparedCompositeModelSource,
@@ -57,8 +62,7 @@ impl DirectPartitionSource for Composite {
         visitor:EquationVisitor<'_, '_, '_>) -> Result<EquationQuote,Error> {
         let context=visitor.context;
         context.charge_metadata(std::mem::size_of::<(&Self,&PreparedModelSources,
-            EquationVisitor<'_, '_, '_>,Result<EquationQuote,Error>,
-            crate::gemma4::LayeredModel<WorkspaceBackend>, Option<crate::gemma4::LayeredModel<WorkspaceBackend>>)>())?;
+            EquationVisitor<'_, '_, '_>,Result<EquationQuote,Error>)>())?;
         if !actual.selected().same_complete_selection(&self.selected)
             || actual.selected().execution().parallel_topology()!=Some(self.rank) {
             return Err(context.metadata_error(format_args!(
@@ -72,10 +76,22 @@ impl DirectPartitionSource for Composite {
         eredu_runtime::working_memory::validate_workspace_state_realization(visitor.state,&self.state,context)?;
         match &self.model {
             PreparedCompositeModelSource::Gemma4(target,source) => {
+                context.charge_metadata(std::mem::size_of::<(crate::gemma4::LayeredModel<WorkspaceBackend>,
+                    Option<crate::gemma4::LayeredModel<WorkspaceBackend>>)>() )?;
                 let _source=source.as_ref().map(|source|
                     crate::gemma4::LayeredModel::<WorkspaceBackend>::new_with_source(source.clone(),context)).transpose()?;
                 let architecture=crate::gemma4::LayeredModel::<WorkspaceBackend>::new_with_source(target.clone(),context)?;
                 quote_model(self,architecture,communication,visitor)
+            }
+            PreparedCompositeModelSource::QwenVl(target, source) => {
+                context.charge_metadata(std::mem::size_of::<(
+                    crate::qwen::vl::LayeredModel<WorkspaceBackend>,
+                    Option<crate::qwen::vl::LayeredModel<WorkspaceBackend>>,
+                )>())?;
+                let _source = source.as_ref().map(|source|
+                    crate::qwen::vl::LayeredModel::<WorkspaceBackend>::new_with_source(source.clone(), context)).transpose()?;
+                let architecture = crate::qwen::vl::LayeredModel::<WorkspaceBackend>::new_with_source(target.clone(), context)?;
+                quote_model(self, architecture, communication, visitor)
             }
         }
     }
@@ -91,7 +107,7 @@ type Runtime<A,Q> = PartitionedTextRuntime<Model<A>,WorkspaceBackend,ResidentSta
 
 fn quote_model<A>(source:&Composite,architecture:A,communication:&eredu_runtime::RetainedCommunicationSource,
     visitor:EquationVisitor<'_, '_, '_>) -> Result<EquationQuote,Error>
-where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
+where A:CompositeMediaIngressArchitecture<WorkspaceBackend,ResidentState,Error=Error>
         +eredu_runtime::PartitionedLayeredArchitecture<WorkspaceBackend,ResidentState>
         +eredu_runtime::ParallelLayeredArchitecture<WorkspaceBackend,ResidentState>+'static,
     A::InputPartPlan:'static,
@@ -101,7 +117,7 @@ where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
         A::AdmissionConfig,Vec<eredu_runtime::ExecutionUnitAddress>,Result<EquationQuote,Error>)>())?;
     let admission=A::retain_admission_config_with_metadata(&architecture.admission_config(), context)?;
     let architecture=PreparedCompositeArchitecture::new(architecture);
-    let layout=architecture.state_layout_with_metadata(context)?;
+    let layout=architecture.state_layout(Some(context))?;
     let end=source.state_offset.checked_add(visitor.state.layout().len())
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
     let local=layout.slice_with_metadata(source.state_offset..end,context)
@@ -127,7 +143,7 @@ where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
 
 fn spans<A,Q>(source:&Composite,architecture:A,admission:A::AdmissionConfig,policy:Q,bounded:Option<Q>,
     communication:&eredu_runtime::RetainedCommunicationSource,visitor:EquationVisitor<'_, '_, '_>) -> Result<EquationQuote,Error>
-where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
+where A:CompositeMediaIngressArchitecture<WorkspaceBackend,ResidentState,Error=Error>
         +eredu_runtime::PartitionedLayeredArchitecture<WorkspaceBackend,ResidentState>
         +eredu_runtime::ParallelLayeredArchitecture<WorkspaceBackend,ResidentState>+'static,
     A::InputPartPlan:'static,
@@ -157,9 +173,16 @@ where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
         context.metadata_error(format_args!("composite selection has no output publication owner")))?.owner_rank;
     let paths=visitor.observation.map(|observation|
         <Strategy<A,Q> as ReplicatedTextExecutionStrategy<Model<A>,WorkspaceBackend,ResidentState,Q,Q>>::bind_observation_paths(
-            &runtime,observation.paths)).transpose().map_err(|cause|context.metadata_source(cause))?;
+            &runtime,observation.paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error)))).transpose().map_err(|cause|cause.into_quote_error(context))?;
     let hook_bytes=paths.as_ref().map(|paths|paths.traversal_host_peak_bytes()
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)).transpose()?.unwrap_or(0);
+    if visitor.media.is_some() {
+        context.charge_metadata(std::mem::size_of::<media::Partition<A, Q>>())?;
+        let mut driver = media::Partition { runtime, paths, publication, control, output_owner,
+            local_rank: communication.manifest().rank(), funding };
+        let (roots, plan) = visitor.prepare_media_interval_source::<A>()?;
+        return visitor.quote_media_intervals::<A, _>(admission, roots, plan, &mut driver);
+    }
     visitor.quote_spans_with_prepublication_observation(hook_bytes,|tokens,state,demand,mut observer,span| {
         <Strategy<A,Q> as ReplicatedTextExecutionStrategy<Model<A>,WorkspaceBackend,ResidentState,Q,Q>>::with_borrowed_parallel_control_context(
             &mut runtime,&mut control,&funding,|runtime| {
@@ -173,7 +196,8 @@ where A:CompositeArchitecture<WorkspaceBackend,ResidentState,Error=Error>
                 let input=PreparedCompositeInput::new_with_diagnostic(&input,&admitted,|message|
                     context.metadata_error(format_args!("{message}")))?;
                 let mut strategy=Strategy::<A,Q>::new();
-                let pass=match span {InferenceWorkspaceSpan::Prefill(_)=>eredu_runtime::ExpertPass::Prefill,
+                let pass=match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),InferenceWorkspaceSpan::Prefill(_)=>eredu_runtime::ExpertPass::Prefill,
                     InferenceWorkspaceSpan::Decode{..}=>eredu_runtime::ExpertPass::Decode};
                 let mut execute=|observer:&mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor,Error>| {
                     match paths.as_ref() {

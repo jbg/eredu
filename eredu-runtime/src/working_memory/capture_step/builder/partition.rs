@@ -1,22 +1,22 @@
 //! One prepaid evidence table owned by the same original frame through abort.
 use super::*;
 use crate::capture::partition::PreparedPartitionCaptureEvidence;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use std::mem::{size_of, size_of_val};
 
 impl PreparedCaptureStep<'_> {
     pub(in crate::working_memory) fn prepare_partition_evidence(
-        &mut self, metadata: &WorkspaceMetadataFunding,
+        &mut self, metadata: &HostMetadataFunding,
     ) -> Result<(), CaptureStepError> {
         self.custody.validate()?;
         if self.partition_metadata.is_some() || !self.frame.partitions.is_empty() {
             return Err(CaptureStepError::PartitionState { index: 0 });
         }
-        let controls = [size_of::<(&mut Self, &WorkspaceMetadataFunding)>(),
+        let controls = [size_of::<(&mut Self, &HostMetadataFunding)>(),
             size_of::<CaptureStepError>(), size_of::<Result<(), CaptureStepError>>(),
             size_of::<Vec<PartitionCaptureEvidence>>() * 2,
             size_of::<PreparedPartitionCaptureEvidence>() * 2,
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             size_of::<(&PartitionCaptureContext, &CaptureRecord)>(), size_of::<usize>() * 2,
             size_of::<(&CaptureTransform, &Option<CapturePayload>, bool)>(),
             size_of::<Option<&eredu_core::ObservationValueType>>()];
@@ -79,3 +79,5 @@ impl PreparedCaptureStep<'_> {
         &self.frame.partitions
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

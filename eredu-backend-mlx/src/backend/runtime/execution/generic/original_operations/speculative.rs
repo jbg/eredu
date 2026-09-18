@@ -15,7 +15,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
     }
     fn prepare_speculative_source(
         mut self, pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         let source = self.retained_sources.ok_or_else(unknown)?;
         let windows = self.window_sources.as_ref().ok_or_else(unknown)?;
@@ -217,7 +217,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
 impl<U: 'static> SelectedOriginalOperationPlan<'_, U> {
     pub(crate) fn prepare_speculative_source(
         self, pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         match self {
             Self::Bounded(plan) => plan.prepare_speculative_source(pool, funding).map(Self::Bounded),

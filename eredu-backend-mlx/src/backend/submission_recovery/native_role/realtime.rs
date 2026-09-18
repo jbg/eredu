@@ -11,7 +11,7 @@ type Custody=OriginalRealtimeBudgetCustody;
 pub(crate) struct RealtimeRoleContext<'a> {
     native:&'a NativeRoleContext<'a>,
     custody:&'a Custody,
-    funding:&'a WorkspaceMetadataFunding,
+    funding:&'a HostMetadataFunding,
     operations_issued:std::cell::Cell<bool>,
 }
 /// Move-only operation-bank claim. Failure consumes the claim permanently;
@@ -20,7 +20,7 @@ pub(crate) struct RealtimeOperationClaim<'a> {
     source:&'a RealtimeRoleContext<'a>,
 }
 impl RealtimeRoleContext<'_> {
-    pub(crate) fn metadata_funding(&self)->&WorkspaceMetadataFunding { self.funding }
+    pub(crate) fn metadata_funding(&self)->&HostMetadataFunding { self.funding }
     pub(crate) fn budget_custody(&self)->Custody { self.custody.clone() }
     pub(crate) fn native(&self)->&NativeRoleContext<'_> { self.native }
     pub(crate) fn claim_operations(&self)->Result<RealtimeOperationClaim<'_>,Error> {
@@ -48,7 +48,7 @@ type FrameCallback<'a,I,T,E>=dyn FnMut(&I,&RealtimeRoleContext<'_>)->Result<Resu
 // its layout and is never callable authority; the active worker supplies all
 // three actual loans. No closure size is inferred from capture field sizes.
 fn operation_callback<'a,I,T,E>(mut run:Option<&'a mut FrameCallback<'a,I,T,E>>,
-    custody:Option<&'a Custody>,funding:Option<&'a WorkspaceMetadataFunding>)
+    custody:Option<&'a Custody>,funding:Option<&'a HostMetadataFunding>)
     ->impl FnOnce(&I,&NativeRoleContext<'_>)->Result<Result<T,E>,Error>+'a {
     move |invocation,native| {
         let context=RealtimeRoleContext{native,custody:custody.expect("active realtime custody"),
@@ -82,7 +82,7 @@ fn fixed_preparation_control_bytes<I,T,E>(callback_bytes:usize)->Result<usize,Na
         size_of::<(&OriginalRealtimeNative,&PreparedInputRuntime)>(),
         size_of::<(&PreparedInputRuntime,NativeRoleCapacity,usize)>(),
         size_of::<Option<safemlx::PreparedPipelineCachePlan>>(),
-        size_of::<(&WorkspaceMetadataFunding,Option<std::time::Duration>)>(),
+        size_of::<(&HostMetadataFunding,Option<std::time::Duration>)>(),
         size_of::<Result<Option<OriginalScopeObserver>,safemlx::error::Exception>>(),
         size_of::<Result<(),eredu_runtime::working_memory::WorkingMemoryError>>(),
         size_of::<Result<Result<T,E>,eredu_core::BackendFailure>>(),
@@ -119,7 +119,7 @@ pub(crate) fn control_bytes<I:'static,T,E>(runtime:&PreparedInputRuntime,
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run<I,T,E,F>(invocation:I,claim:OriginalRealtimeNative,
     runtime:&PreparedInputRuntime,pipeline:Option<safemlx::PreparedPipelineCachePlan>,
-    funding:&WorkspaceMetadataFunding,timeout:Option<std::time::Duration>,mut run:F)
+    funding:&HostMetadataFunding,timeout:Option<std::time::Duration>,mut run:F)
     ->Result<Result<T,E>,eredu_core::BackendFailure>
 where I:'static,F:FnMut(&I,&RealtimeRoleContext<'_>)->Result<Result<T,E>,Error> {
     let custody=claim.budget_custody();

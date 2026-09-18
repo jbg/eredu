@@ -30,7 +30,7 @@ pub(crate) fn commit_probability(
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)

@@ -15,6 +15,7 @@ pub(crate) struct AddressableNumericalPopulation {
     arrays: usize,
     edges: usize,
     streams: usize,
+    captures: usize,
     cpu_entries: usize,
     cpu_edges: usize,
     cpu_births: usize,
@@ -52,6 +53,7 @@ impl AddressableNumericalPopulation {
             arrays: limits.arrays.checked_sub(limits.roots)?.checked_sub(1)?,
             edges: limits.input_edges.checked_sub(limits.roots)?,
             streams: limits.streams,
+            captures: limits.captures,
             cpu_entries: if dispatch.cpu_model.is_some() {
                 0
             } else {
@@ -131,6 +133,7 @@ impl AddressableNumericalPopulation {
         self.rank = self.rank.max(other.rank);
         self.operands = self.operands.max(other.operands);
         self.streams = self.streams.max(other.streams);
+        self.captures = self.captures.max(other.captures);
         self.worker_rank = self.worker_rank.max(other.worker_rank);
         self.nested_roots = self.nested_roots.max(other.nested_roots);
         self.grouped = GroupedOutputStorage {
@@ -145,8 +148,12 @@ impl AddressableNumericalPopulation {
         self.cpu = match (self.cpu, other.cpu) {
             (None, None) => None,
             (Some(a), Some(b)) => Some(super::super::super::cpu::CpuPopulation {
+                construction_entries: count(a.construction_entries, b.construction_entries)?,
                 primitives: count(a.primitives, b.primitives)?,
                 input_edges: count(a.input_edges, b.input_edges)?,
+                hidden_leaves: count(a.hidden_leaves, b.hidden_leaves)?,
+                maximum_operands: a.maximum_operands.max(b.maximum_operands),
+                maximum_captures: a.maximum_captures.max(b.maximum_captures),
                 births: count(a.births, b.births)?,
                 extents: count(a.extents, b.extents)?,
                 controls: count(a.controls, b.controls)?,
@@ -155,26 +162,6 @@ impl AddressableNumericalPopulation {
         };
         Some(self)
     }
-    pub(crate) fn finish_with_residency(
-        self, outputs: usize, id_completions: usize,
-        residency: &crate::backend::runtime::residency::parameter_bank::IndexedResidencyPlan,
-        context: &WorkspaceContext,
-    ) -> Result<SpeculativeNumericalRecipe, Error> {
-        use super::super::host_copies::PreparedSourceCopies;
-        let invalid = || context.metadata_error(format_args!(
-            "addressable transfer source differs from its actual numerical population"));
-        context.charge_metadata(std::mem::size_of::<(
-            PreparedSourceCopies, ResidentCompletionRecipe, ResidentDispatchPopulation,
-            OperationEvalTraversalLimits, SpeculativeNumericalRecipe,
-            Result<SpeculativeNumericalRecipe, Error>, [usize; 8],
-        )>())?;
-        context.charge_metadata(PreparedSourceCopies::inspection_control_bytes().ok_or_else(invalid)?)?;
-        let source = residency.with_native_copy_source(|source, window, calls|
-            PreparedSourceCopies::inspect(source, window, calls))
-            .map_err(|cause|context.metadata_source(cause))?;
-        self.finish(outputs, id_completions, context)?.with_prepared_source_copies(source, context)
-    }
-
     pub(crate) fn finish(
         self,
         outputs: usize,
@@ -194,6 +181,7 @@ impl AddressableNumericalPopulation {
             OperationEvalTraversalLimits,
             Result<SpeculativeNumericalRecipe, Error>,
             [usize; 12],
+            &super::super::super::cpu::CpuPopulation,
         )>())?;
         let roots = outputs.checked_add(self.validations).ok_or_else(invalid)?;
         let nested = self
@@ -203,7 +191,8 @@ impl AddressableNumericalPopulation {
         let root_capacity = roots
             .max(self.nested_roots)
             .max(usize::from(id_completions != 0));
-        let tape = self.primitives.checked_add(1).ok_or_else(invalid)?;
+        let tape = match &self.cpu { Some(cpu) => cpu.primitives, None => self.primitives }
+            .checked_add(1).ok_or_else(invalid)?;
         let arrays = self
             .arrays
             .checked_add(root_capacity)
@@ -219,7 +208,7 @@ impl AddressableNumericalPopulation {
             input_edges: edges,
             output_slots: tape,
             streams: self.streams,
-            captures: base.capture_slots().max(1),
+            captures: base.capture_slots().max(self.captures).max(1),
         })
         .ok_or_else(invalid)?;
         let graph = OperationEvent::resident_graph_layout_with_shells(
@@ -346,7 +335,24 @@ mod tests {
     #[test]
     fn addressable_population_composes_one_scope_and_real_nested_frontiers() {
         let metal = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let mechanism = ResidentExecutionMechanisms::Metal(metal);
+        check_composition(ResidentExecutionMechanisms::Metal(metal));
+    }
+
+    #[test]
+    fn addressable_cpu_population_composes_one_scope_and_real_nested_frontiers() {
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        check_composition(ResidentExecutionMechanisms::Cpu {
+            ordinary,
+            cpu: super::super::super::super::MlxCpuWorkspaceMechanisms::new(
+                ordinary.allocation(),
+                super::super::super::super::MlxCpuMatmulMechanism::select(
+                    eredu_nn::CpuMatmulImplementation::Float32Tiles,
+                ).unwrap(),
+            ),
+        });
+    }
+
+    fn check_composition(mechanism: ResidentExecutionMechanisms) {
         for width in [1, 19, 257] {
             let child_context = WorkspaceContext::new(mechanism);
             let input = value(&child_context, width);
@@ -417,6 +423,11 @@ mod tests {
                 joined.completion.nested_completions, 4,
                 "two ID reads and two completed chunk outputs"
             );
+            if let Some(cpu) = joined.completion.dispatch.unwrap().cpu_model {
+                let tape = joined.completion.traversal.limits().tape_entries;
+                assert_eq!(tape, cpu.primitives + 1);
+                assert_eq!(joined.completion.dispatch.unwrap().cpu_entries, tape);
+            }
             assert!(joined.graph_capacity >= full.graph_capacity);
             assert!(joined.record_capacity >= full.record_capacity);
         }

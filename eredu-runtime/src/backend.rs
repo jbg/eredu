@@ -184,7 +184,7 @@ pub trait CommunicationBackend: SubmissionBackend {
         context: &Self::ParallelContext, run: F,
     ) -> Result<Result<T, E>, Self::CommunicationError>
     where F: FnOnce(Option<(&Self::ParallelContext,
-        &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         let _ = context;
         Ok(run(None))
@@ -198,7 +198,7 @@ pub trait CommunicationBackend: SubmissionBackend {
     fn with_prepared_control_group<T, E, F>(
         event: crate::replicated_session::ParallelControlEvent,
         group: &Self::CommunicationGroup, prepared: &Self::ParallelContext,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         executor: &Self::Executor, run: F,
     ) -> Result<Result<T, E>, Self::CommunicationError>
     where F: FnOnce(Option<&Self::CommunicationGroup>) -> Result<T, E>,
@@ -219,7 +219,7 @@ pub trait CommunicationBackend: SubmissionBackend {
     /// Authenticates an exact quoted publication group against the selected
     /// stored resource. None keeps missing prepared support explicit.
     fn with_prepared_publication_group<T,E,F>(group:&Self::CommunicationGroup,
-        prepared:&Self::ParallelContext,funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        prepared:&Self::ParallelContext,funding:&eredu_nn::workspace::HostMetadataFunding,
         executor:&Self::Executor,run:F)->Result<Result<T,E>,Self::CommunicationError>
     where F:FnOnce(Option<&Self::CommunicationGroup>)->Result<T,E> {
         let _=(group,prepared,funding,executor);Ok(run(None))
@@ -342,7 +342,7 @@ pub trait CommunicationBackend: SubmissionBackend {
         executor: &Self::Executor, run: F,
     ) -> Result<Result<T, E>, Self::CommunicationError>
     where F: for<'loan> FnOnce(Option<(&'loan [i32],
-        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &'loan eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         let _ = (value, context, executor);
         Ok(run(None))
@@ -356,7 +356,7 @@ pub trait CommunicationBackend: SubmissionBackend {
         context: &Self::ParallelContext, executor: &Self::Executor, run: F,
     ) -> Result<Result<T, E>, Self::CommunicationError>
     where F: for<'loan> FnOnce(Option<(&'loan [i32],
-        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &'loan eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         let _ = (local, group, context, executor);
         Ok(run(None))
@@ -385,6 +385,23 @@ pub trait CommunicationBackend: SubmissionBackend {
 
 /// Sum reduction on an opaque communication group.
 pub trait SumReductionBackend: CommunicationBackend {
+    /// Constructs every exact retained occurrence before completing the wave.
+    /// This preserves lazy cross-rank ordering: completing one member before
+    /// constructing its peers can deadlock an active rank's combined graph.
+    /// The validator borrows the actual source payer before any constructor,
+    /// then validates the complete output list after completion. Native failures
+    /// already own their typed source and custody. None means no retained source
+    /// was selected; an invalid source must fail without calling ordinary work.
+    fn complete_model_sum_wave<E, V>(
+        values: &[Self::Tensor], group: &Self::CommunicationGroup,
+        context: &Self::ParallelContext, executor: &Self::Executor,
+        validate: V,
+    ) -> Result<Option<Vec<Self::Tensor>>, eredu_core::BackendFailure>
+    where E: std::error::Error + Send + Sync + 'static, V: FnMut(&[Self::Tensor], &eredu_nn::workspace::HostMetadataFunding, bool) -> Result<(), E>,
+    {
+        let _ = (values, group, context, executor, validate);
+        Ok(None)
+    }
     /// Execute and complete a sum using the exact retained model occurrence.
     /// The borrowed input permits ordinary fallback without copying when None.
     /// Some must retain authority until successful completion; an invalid
@@ -449,7 +466,7 @@ pub trait VariableAllToAllBackend: CommunicationBackend {
         value: &Self::Tensor, counts: &CommunicationPeerCounts, axis: usize,
         matrix: &crate::CommunicationPeerMatrix<'_>, group: &Self::CommunicationGroup,
         context: &Self::ParallelContext, executor: &Self::Executor,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Option<Self::Tensor>, Self::CommunicationError> {
         let _=(value,counts,axis,matrix,group,context,executor,funding); Ok(None)
     }

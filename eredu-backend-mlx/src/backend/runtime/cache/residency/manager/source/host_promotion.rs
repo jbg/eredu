@@ -35,12 +35,13 @@ pub(crate) struct PreparedCacheHostPromotion {
     manager: CacheResidencyManager,
     generation: u64,
     pin: PinnedCacheBlock,
-    reservation: CachePoolReservation,
+    reservation: Option<CachePoolReservation>,
+    device_retirement: super::device_retirement::DeviceRetirement,
     attempted: bool,
     completed: bool,
     published: bool,
     context: WorkspaceContext,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl CacheBlockSourceLoan<'_> {
     /// All dynamic destinations are prepared before the final canonical pin.
@@ -155,6 +156,7 @@ impl CacheBlockSourceLoan<'_> {
                 ..CachePoolUsage::default()
             })
             .map_err(|e| CacheSourceFailure::metadata(context.metadata_source(e), context))?;
+        let device_retirement = super::device_retirement::DeviceRetirement::prepare(context)?;
         // No fallible preparation follows the pin: a failed prefix never drops
         // the last pin or native host owner while this manager is borrowed.
         let pin = self
@@ -178,7 +180,8 @@ impl CacheBlockSourceLoan<'_> {
             manager: self.manager().clone(),
             generation: self.generation(),
             pin,
-            reservation,
+            reservation: Some(reservation),
+            device_retirement,
             attempted: false,
             completed: false,
             published: false,
@@ -194,6 +197,8 @@ pub(super) fn dtype_matches(dtype: Dtype, name: &str) -> bool {
     )
 }
 impl PreparedCacheHostPromotion {
+    pub(crate) fn reclaim_replaced_device(&mut self) { self.device_retirement.reclaim(); }
+
     fn validate_host_source(&self, proof: &OriginalPagedScanSource<'_>) -> Result<(), Exception> {
         match (&self.stored_source, &self.read_source) {
             (Some(source), None) => source.validate(proof, &self.id, self.host.buffers()),
@@ -220,7 +225,7 @@ impl PreparedCacheHostPromotion {
         self.host.buffers()
     }
     pub(crate) fn values(&self) -> Option<[&Array; 2]> {
-        self.published.then(|| {
+        (self.published && !self.demoted).then(|| {
             [
                 self.outputs[0].as_ref().expect("published first"),
                 self.outputs[1].as_ref().expect("published second"),
@@ -327,6 +332,7 @@ impl PreparedCacheHostPromotion {
             {
                 return Err(proof.error(CacheSourceError::Geometry));
             }
+            roots.retire_completed(array).map_err(|cause| proof.error(cause))?;
             self.canonical[index] =
                 Some(self.aliases[index].fill_in_original_scope(array, proof.observer())?);
         }
@@ -383,7 +389,7 @@ impl PreparedCacheHostPromotion {
             .expect("same locked stable host phase");
         if let Err(cause) = reporting::update_report_totals_prepared_replacement(
             &mut state,
-            &mut self.reservation,
+            self.reservation.as_mut().expect("unpublished reservation"),
             &self.manager.inner.pool_membership,
         ) {
             let arrays = state
@@ -540,3 +546,5 @@ fn require_device_capacity(
 #[path = "host_promotion/initial_disk.rs"]
 mod initial_disk;
 pub(crate) use initial_disk::PreparedInitialDiskReturn;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

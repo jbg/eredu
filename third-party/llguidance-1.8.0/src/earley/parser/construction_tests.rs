@@ -11,9 +11,14 @@ fn limits(precompute: bool) -> ParserLimits {
     }
 }
 
-fn grammar(first: &str, allow_initial_skip: bool) -> Arc<CGrammar> {
+fn grammar(first: &str, allow_initial_skip: bool) -> SharedGrammar {
     let limits = limits(false);
-    let mut builder = GrammarBuilder::new(None, limits.clone());
+    let mut builder = GrammarBuilder::new(
+        None,
+        limits.clone(),
+        derivre::ParserAllocationFunding::unenforced(),
+    )
+    .unwrap();
     builder
         .add_grammar(
             LLGuidanceOptions {
@@ -23,32 +28,36 @@ fn grammar(first: &str, allow_initial_skip: bool) -> Arc<CGrammar> {
             RegexAst::Literal(" ".to_owned()),
         )
         .unwrap();
-    let first = builder.string(first);
-    let suffix = builder.string(":23\n");
-    let sequence = builder.join(&[first, suffix]);
-    builder.set_start_node(sequence);
-    Arc::new(
+    let first = builder.string(first).unwrap();
+    let suffix = builder.string(":23\n").unwrap();
+    let sequence = builder.join(&[first, suffix]).unwrap();
+    builder.set_start_node(sequence).unwrap();
+    SharedGrammar::new(
         builder
             .grammar
-            .compile(builder.regex.spec, &limits)
+            .compile(
+                builder.regex.spec,
+                &limits,
+                derivre::ParserAllocationFunding::unenforced(),
+            )
             .unwrap(),
-    )
+    ).unwrap()
 }
 
 fn new_state(
-    grammar: &Arc<CGrammar>,
+    grammar: &SharedGrammar,
     env: TokEnv,
     limits: ParserLimits,
 ) -> Result<(ParserState, Lexer)> {
     ParserState::new(
         env,
-        Arc::clone(grammar),
+        grammar.clone(),
         limits,
         Arc::new(ParserPerfCounters::new()),
     )
 }
 
-fn construction_error(grammar: &Arc<CGrammar>, env: TokEnv, limits: ParserLimits) -> anyhow::Error {
+fn construction_error(grammar: &SharedGrammar, env: TokEnv, limits: ParserLimits) -> anyhow::Error {
     match new_state(grammar, env, limits) {
         Ok(_) => panic!("construction unexpectedly published a parser"),
         Err(error) => error,
@@ -135,7 +144,7 @@ fn initial_skip_exhaustion_preserves_the_lexer_cause_after_a_valid_first_row() {
     assert_lexer_error(&error, "initial skip selection", &original);
 }
 
-fn large_lexeme_fixture() -> (Arc<CGrammar>, TokEnv) {
+fn large_lexeme_fixture() -> (SharedGrammar, TokEnv) {
     let first = "marigold".repeat(150);
     let grammar = grammar(&first, true);
     let base = ApproximateTokEnv::single_byte_env();
@@ -154,7 +163,7 @@ fn large_selection(grammar: &CGrammar, lexer: &mut Lexer) -> LexemeSet {
         .lexer_spec()
         .lexemes
         .iter()
-        .filter_map(|lexeme| (lexer.dfa.lexeme_weight(lexeme.idx) > 1000).then_some(lexeme.idx))
+        .filter_map(|lexeme| (lexer.dfa.lexeme_weight(lexeme.idx).unwrap() > 1000).then_some(lexeme.idx))
         .collect();
     assert_eq!(
         large.len(),
@@ -241,7 +250,7 @@ fn high_weight_precompute_fuel_exhaustion_is_not_relabelled_as_a_state_limit() {
 fn prepared_earley_seed_uses_actual_scratch_predictions_and_retains_failed_destinations() {
     use std::cell::Cell;
     let grammar = grammar("marigold", true);
-    let mut ordinary = Scratch::new(Arc::clone(&grammar));
+    let mut ordinary = Scratch::new(grammar.clone());
     ordinary.grammar_stack.push(GrammarStackNode::root());
     seed_predictions(&grammar, |item, param| {
         ordinary.add_unique_arg(item, "init", param);
@@ -250,7 +259,7 @@ fn prepared_earley_seed_uses_actual_scratch_predictions_and_retains_failed_desti
     .unwrap();
     let calls = Cell::new(0usize);
     let spent = Cell::new(0usize);
-    let seed = PreparedEarleySeed::prepare(Arc::clone(&grammar), &|bytes| {
+    let seed = PreparedEarleySeed::prepare(grammar.clone(), &|bytes| {
         calls.set(calls.get() + 1);
         spent.set(spent.get() + bytes);
         Ok::<(), &'static str>(())
@@ -275,7 +284,7 @@ fn prepared_earley_seed_uses_actual_scratch_predictions_and_retains_failed_desti
     let mut escaped = None;
     for stop in 1..=total {
         let seen = Cell::new(0usize);
-        let failure = PreparedEarleySeed::prepare(Arc::clone(&grammar), &|_| {
+        let failure = PreparedEarleySeed::prepare(grammar.clone(), &|_| {
             seen.set(seen.get() + 1);
             if seen.get() == stop {
                 Err("seed funding")
@@ -288,15 +297,15 @@ fn prepared_earley_seed_uses_actual_scratch_predictions_and_retains_failed_desti
         assert_eq!(failure.to_string(), "seed funding");
         escaped = Some(failure);
     }
-    let weak = Arc::downgrade(&grammar);
+    let retained = grammar.clone();
     drop((seed, ordinary, grammar));
     let failed = escaped.unwrap();
-    assert!(weak.upgrade().is_some());
+    assert!(retained.strong_count() > 1);
     let scratch = failed.prefix.scratch.as_ref().unwrap();
     assert_eq!(scratch.grammar_stack.len(), 1);
     assert!(!scratch.push_allowed_grammar_ids.as_slice().is_empty());
     drop(failed);
-    assert!(weak.upgrade().is_none());
+    assert_eq!(retained.strong_count(), 1);
 }
 
 #[test]
@@ -304,45 +313,54 @@ fn prepared_initial_agenda_preserves_nullable_capture_order_and_partial_chart_cu
     use crate::api::NodeProps;
     use std::cell::Cell;
     let config = limits(false);
-    let mut builder = GrammarBuilder::new(None, config.clone());
+    let mut builder = GrammarBuilder::new(
+        None,
+        config.clone(),
+        derivre::ParserAllocationFunding::unenforced(),
+    )
+    .unwrap();
     builder
         .add_grammar(LLGuidanceOptions::default(), RegexAst::Literal(" ".into()))
         .unwrap();
-    let word = builder.string("ivy");
-    let optional = builder.optional(word);
+    let word = builder.string("ivy").unwrap();
+    let optional = builder.optional(word).unwrap();
     let first = builder.join_props(
         &[optional],
         NodeProps {
             capture_name: Some("nullable".into()),
             ..NodeProps::default()
         },
-    );
+    ).unwrap();
     let second = builder.join_props(
         &[optional],
         NodeProps {
             capture_name: Some("nullable".into()),
             ..NodeProps::default()
         },
-    );
+    ).unwrap();
     let append = builder.join_props(
         &[optional],
         NodeProps {
             capture_name: Some("__LIST_APPEND:nullable".into()),
             ..NodeProps::default()
         },
-    );
-    let suffix = builder.string("marigold");
-    let sequence = builder.join(&[first, second, append, append, suffix]);
-    builder.set_start_node(sequence);
-    let grammar = Arc::new(
+    ).unwrap();
+    let suffix = builder.string("marigold").unwrap();
+    let sequence = builder.join(&[first, second, append, append, suffix]).unwrap();
+    builder.set_start_node(sequence).unwrap();
+    let grammar = SharedGrammar::new(
         builder
             .grammar
-            .compile(builder.regex.spec, &config)
+            .compile(
+                builder.regex.spec,
+                &config,
+                derivre::ParserAllocationFunding::unenforced(),
+            )
             .unwrap(),
-    );
+    ).unwrap();
     let (ordinary, _) = new_state(&grammar, ApproximateTokEnv::single_byte_env(), config).unwrap();
     let seed =
-        PreparedEarleySeed::prepare(Arc::clone(&grammar), &|_| Ok::<_, &'static str>(())).unwrap();
+        PreparedEarleySeed::prepare(grammar.clone(), &|_| Ok::<_, &'static str>(())).unwrap();
     let calls = Cell::new(0);
     let owner = seed
         .close_initial_agenda(&|bytes| {
@@ -392,7 +410,7 @@ fn prepared_initial_agenda_preserves_nullable_capture_order_and_partial_chart_cu
     let mut escaped = None;
     for stop in 1..=calls.get() {
         let seed =
-            PreparedEarleySeed::prepare(Arc::clone(&grammar), &|_| Ok::<_, &'static str>(()))
+            PreparedEarleySeed::prepare(grammar.clone(), &|_| Ok::<_, &'static str>(()))
                 .unwrap();
         let seen = Cell::new(0);
         let error = seed
@@ -411,19 +429,19 @@ fn prepared_initial_agenda_preserves_nullable_capture_order_and_partial_chart_cu
         assert!(error.prefix.scratch.as_ref().is_some());
         escaped = Some(error);
     }
-    let weak = Arc::downgrade(&grammar);
+    let retained = grammar.clone();
     drop((owner, ordinary, grammar));
-    assert!(weak.upgrade().is_some());
+    assert!(retained.strong_count() > 1);
     let error = escaped.unwrap();
     assert!(error.prefix.initial_item_count() > 0);
     drop(error);
-    assert!(weak.upgrade().is_none());
+    assert_eq!(retained.strong_count(), 1);
 }
 
 #[test]
 fn prepared_initial_row_uses_actual_skip_states_and_retains_partial_publication() {
     use crate::earley::{regexvec::prepared::PreparedRegexVector, PreparedLexer};
-    use derivre::raw::PreparedHashConsFunding;
+    use derivre::raw::ParserAllocationFunding;
     use std::cell::Cell;
     fn lexer(grammar: &CGrammar, mut config: ParserLimits) -> PreparedLexer {
         let source = grammar.lexer_spec();
@@ -434,7 +452,7 @@ fn prepared_initial_row_uses_actual_skip_states_and_retains_partial_publication(
             .unwrap()
             .ordinary(source.regex_builder.exprset().clone())
             .unwrap();
-        let funding = PreparedHashConsFunding::prepare(|_| Ok::<_, std::io::Error>(())).unwrap();
+        let funding = ParserAllocationFunding::prepare(|_| Ok::<_, std::io::Error>(())).unwrap();
         let vector =
             PreparedRegexVector::prepare_with_backing(input, &mut config, Some(funding), &|_| {
                 Ok::<_, std::io::Error>(())
@@ -448,7 +466,7 @@ fn prepared_initial_row_uses_actual_skip_states_and_retains_partial_publication(
             new_state(&source, ApproximateTokEnv::single_byte_env(), limits(false)).unwrap();
         let mut actual_lexer = lexer(&source, limits(false));
         let seed =
-            PreparedEarleySeed::prepare(Arc::clone(&source), &|_| Ok::<_, std::io::Error>(()))
+            PreparedEarleySeed::prepare(source.clone(), &|_| Ok::<_, std::io::Error>(()))
                 .unwrap()
                 .close_initial_agenda(&|_| Ok::<_, std::io::Error>(()))
                 .unwrap();
@@ -512,7 +530,7 @@ fn prepared_initial_row_uses_actual_skip_states_and_retains_partial_publication(
             let mut final_error = None;
             for stop in 1..=calls.get() {
                 let mut lexical = lexer(&source, limits(false));
-                let seed = PreparedEarleySeed::prepare(Arc::clone(&source), &|_| {
+                let seed = PreparedEarleySeed::prepare(source.clone(), &|_| {
                     Ok::<_, std::io::Error>(())
                 })
                 .unwrap()
@@ -538,18 +556,18 @@ fn prepared_initial_row_uses_actual_skip_states_and_retains_partial_publication(
             assert_eq!(error.prefix.rows.len(), 1);
             assert_eq!(error.prefix.row_infos.len(), 1);
             assert!(error.prefix.initial_selection.is_some());
-            let weak = Arc::downgrade(&source);
+            let retained = source.clone();
             drop((owner, ordinary, source));
-            assert!(weak.upgrade().is_some());
+            assert!(retained.strong_count() > 1);
             drop(error);
-            assert!(weak.upgrade().is_none());
+            assert_eq!(retained.strong_count(), 1);
         }
     }
 }
 
-fn prepared_chart(source: &Arc<CGrammar>) -> (PreparedEarleySeed, crate::earley::PreparedLexer) {
+fn prepared_chart(source: &SharedGrammar) -> (PreparedEarleySeed, crate::earley::PreparedLexer) {
     use crate::earley::{regexvec::prepared::PreparedRegexVector, PreparedLexer};
-    use derivre::raw::PreparedHashConsFunding;
+    use derivre::raw::ParserAllocationFunding;
     let reserve = |_| Ok::<_, std::io::Error>(());
     let spec = source.lexer_spec();
     let input = spec
@@ -559,7 +577,7 @@ fn prepared_chart(source: &Arc<CGrammar>) -> (PreparedEarleySeed, crate::earley:
         .unwrap()
         .ordinary(spec.regex_builder.exprset().clone())
         .unwrap();
-    let backing = PreparedHashConsFunding::prepare(reserve).unwrap();
+    let backing = ParserAllocationFunding::prepare(reserve).unwrap();
     let vector = PreparedRegexVector::prepare_with_backing(
         input,
         &mut limits(false),
@@ -568,7 +586,7 @@ fn prepared_chart(source: &Arc<CGrammar>) -> (PreparedEarleySeed, crate::earley:
     )
     .unwrap();
     let mut lexer = PreparedLexer::prepare(vector, &reserve).unwrap();
-    let seed = PreparedEarleySeed::prepare(Arc::clone(source), &reserve)
+    let seed = PreparedEarleySeed::prepare(source.clone(), &reserve)
         .unwrap()
         .close_initial_agenda(&reserve)
         .unwrap()
@@ -582,27 +600,36 @@ fn prepared_definitive_bytes_share_scan_skip_captures_and_failed_history_custody
     use crate::api::NodeProps;
     use std::cell::Cell;
     let config = limits(false);
-    let mut builder = GrammarBuilder::new(None, config.clone());
+    let mut builder = GrammarBuilder::new(
+        None,
+        config.clone(),
+        derivre::ParserAllocationFunding::unenforced(),
+    )
+    .unwrap();
     builder
         .add_grammar(LLGuidanceOptions::default(), RegexAst::Literal(" ".into()))
         .unwrap();
-    let word = builder.string("ivy");
+    let word = builder.string("ivy").unwrap();
     let word = builder.join_props(
         &[word],
         NodeProps {
             capture_name: Some("word".into()),
             ..NodeProps::default()
         },
-    );
-    let suffix = builder.string(":23\n");
-    let sequence = builder.join(&[word, suffix]);
-    builder.set_start_node(sequence);
-    let grammar = Arc::new(
+    ).unwrap();
+    let suffix = builder.string(":23\n").unwrap();
+    let sequence = builder.join(&[word, suffix]).unwrap();
+    builder.set_start_node(sequence).unwrap();
+    let grammar = SharedGrammar::new(
         builder
             .grammar
-            .compile(builder.regex.spec, &config)
+            .compile(
+                builder.regex.spec,
+                &config,
+                derivre::ParserAllocationFunding::unenforced(),
+            )
             .unwrap(),
-    );
+    ).unwrap();
     let env = ApproximateTokEnv::single_byte_env();
     let (mut ordinary, ordinary_lexer) = new_state(&grammar, env.clone(), config).unwrap();
     ordinary.shared_box.lexer_opt = Some(ordinary_lexer);
@@ -691,11 +718,11 @@ fn prepared_definitive_bytes_share_scan_skip_captures_and_failed_history_custody
         assert!(failure.prefix.initial_item_count() > 0);
         escaped = Some(failure);
     }
-    let weak = Arc::downgrade(&grammar);
+    let retained = grammar.clone();
     drop((owner, ordinary, grammar));
-    assert!(weak.upgrade().is_some());
+    assert!(retained.strong_count() > 1);
     drop(escaped);
-    assert!(weak.upgrade().is_none());
+    assert_eq!(retained.strong_count(), 1);
 }
 
 #[test]
@@ -811,11 +838,11 @@ fn prepared_trie_walk_restores_committed_history_and_retains_failed_mask_source(
         }
         escaped = Some(failure);
     }
-    let weak = Arc::downgrade(&source);
+    let retained = source.clone();
     drop((owner, ordinary, source));
-    assert!(weak.upgrade().is_some());
+    assert!(retained.strong_count() > 1);
     drop(escaped);
-    assert!(weak.upgrade().is_none());
+    assert_eq!(retained.strong_count(), 1);
 }
 
 #[test]
@@ -884,15 +911,20 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
         let source = if case == 0 {
             grammar("ivy", false)
         } else {
-            let mut builder = GrammarBuilder::new(Some(env.clone()), config.clone());
+            let mut builder = GrammarBuilder::new(
+                Some(env.tok_trie()),
+                config.clone(),
+                derivre::ParserAllocationFunding::unenforced(),
+            )
+            .unwrap();
             builder
                 .add_grammar(LLGuidanceOptions::default(), RegexAst::Literal(" ".into()))
                 .unwrap();
             let start = if case == 1 {
-                let prefix = builder.string("hi");
+                let prefix = builder.string("hi").unwrap();
                 let numeric = builder.token_ranges(vec![6..=6]).unwrap();
-                let suffix = builder.string("!");
-                builder.join(&[prefix, numeric, suffix])
+                let suffix = builder.string("!").unwrap();
+                builder.join(&[prefix, numeric, suffix]).unwrap()
             } else {
                 let body = builder
                     .gen(
@@ -916,19 +948,23 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
                     )
                     .unwrap();
                 if case == 2 {
-                    let suffix = builder.string("!");
-                    builder.join(&[body, suffix])
+                    let suffix = builder.string("!").unwrap();
+                    builder.join(&[body, suffix]).unwrap()
                 } else {
                     body
                 }
             };
-            builder.set_start_node(start);
-            Arc::new(
+            builder.set_start_node(start).unwrap();
+            SharedGrammar::new(
                 builder
                     .grammar
-                    .compile(builder.regex.spec, &config)
+                    .compile(
+                        builder.regex.spec,
+                        &config,
+                        derivre::ParserAllocationFunding::unenforced(),
+                    )
                     .unwrap(),
-            )
+            ).unwrap()
         };
         let (mut ordinary, ordinary_lexer) =
             new_state(&source, env.clone(), config.clone()).unwrap();
@@ -1081,7 +1117,7 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
     assert!(calls.get() > 4);
     for stop in [1, 2, calls.get() / 2] {
         let source = grammar("ivy", false);
-        let weak = Arc::downgrade(&source);
+        let retained = source.clone();
         let (owner, mut lexer) = prepared_chart(&source);
         let attempted = Cell::new(0);
         let error = owner
@@ -1104,13 +1140,13 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
         assert!(error.to_string().contains("token validation refused"));
         assert!(error.prefix.bytes().is_empty());
         drop((source, lexer));
-        assert!(weak.upgrade().is_some());
+        assert!(retained.strong_count() > 1);
         drop(error);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.strong_count(), 1);
     }
     for stop in [1, 2] {
         let source = grammar("ivy", false);
-        let weak = Arc::downgrade(&source);
+        let retained = source.clone();
         let (chart, mut lexer) = prepared_chart(&source);
         let chart = chart
             .push_byte(&mut lexer, env.tok_trie(), Some(b'i'), &reserve)
@@ -1131,14 +1167,14 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
         assert!(failure.to_string().contains("token chop refused"));
         assert_eq!(failure.prefix.bytes(), b"i");
         drop((source, lexer));
-        assert!(weak.upgrade().is_some());
+        assert!(retained.strong_count() > 1);
         drop(failure);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.strong_count(), 1);
     }
     assert!(observed_calls > 4);
     for stop in [1, 2, observed_calls / 2] {
         let source = grammar("ivy", false);
-        let weak = Arc::downgrade(&source);
+        let retained = source.clone();
         let (owner, mut lexer) = prepared_chart(&source);
         let owner = owner
             .push_byte(&mut lexer, env.tok_trie(), Some(b'i'), &reserve)
@@ -1166,9 +1202,9 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
         assert!(error.to_string().contains("token history destination"));
         assert!(error.prefix.bytes().starts_with(b"i"));
         drop((source, lexer));
-        assert!(weak.upgrade().is_some());
+        assert!(retained.strong_count() > 1);
         drop(error);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.strong_count(), 1);
     }
     for token in [0, 9, 10, u32::MAX] {
         let mut expected = format!("X[{token}]").into_bytes();
@@ -1179,21 +1215,30 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
     for numeric in [false, true] {
         let config = limits(false);
         let source = if numeric {
-            let mut builder = GrammarBuilder::new(Some(env.clone()), config.clone());
+            let mut builder = GrammarBuilder::new(
+                Some(env.tok_trie()),
+                config.clone(),
+                derivre::ParserAllocationFunding::unenforced(),
+            )
+            .unwrap();
             builder
                 .add_grammar(LLGuidanceOptions::default(), RegexAst::NoMatch)
                 .unwrap();
-            let prefix = builder.string("hi");
+            let prefix = builder.string("hi").unwrap();
             let special = builder.token_ranges(vec![6..=6]).unwrap();
-            let suffix = builder.string("!");
-            let root = builder.join(&[prefix, special, suffix]);
-            builder.set_start_node(root);
-            Arc::new(
+            let suffix = builder.string("!").unwrap();
+            let root = builder.join(&[prefix, special, suffix]).unwrap();
+            builder.set_start_node(root).unwrap();
+            SharedGrammar::new(
                 builder
                     .grammar
-                    .compile(builder.regex.spec, &config)
+                    .compile(
+                        builder.regex.spec,
+                        &config,
+                        derivre::ParserAllocationFunding::unenforced(),
+                    )
                     .unwrap(),
-            )
+            ).unwrap()
         } else {
             grammar("ivy", false)
         };
@@ -1240,7 +1285,7 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
     assert!(force_calls > 4);
     for stop in [1, 2, force_calls / 2] {
         let source = grammar("ivy", false);
-        let weak = Arc::downgrade(&source);
+        let retained = source.clone();
         let (owner, mut lexer) = prepared_chart(&source);
         let seen = Cell::new(0);
         let failure = owner
@@ -1256,9 +1301,9 @@ fn prepared_tokens_share_forced_numeric_limits_stop_eos_and_failed_history() {
         assert_eq!(seen.get(), stop);
         assert!(failure.to_string().contains("forced-byte destination"));
         drop((source, lexer));
-        assert!(weak.upgrade().is_some());
+        assert!(retained.strong_count() > 1);
         drop(failure);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.strong_count(), 1);
     }
     let source = grammar("ivy", false);
     let (owner, mut lexer) = prepared_chart(&source);
@@ -1297,15 +1342,15 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
     for eos in [false, true] {
         let mut ordinary = factory.create_parser(request()).unwrap();
         ordinary.start_without_prompt();
-        let source = Arc::new(
+        let source = SharedGrammar::new(
             ordinary
                 .parser
                 .grammar()
-                .source_copy_plan()
+                .source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
                 .unwrap()
                 .compile()
                 .unwrap(),
-        );
+        ).unwrap();
         let (chart, mut lexer) = prepared_chart(&source);
         let config = factory.limits().clone();
         let mut owner = PreparedTokenParser::prepare(
@@ -1366,43 +1411,67 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
         let lexer_copy_calls = Cell::new(0usize);
         let lexer_required = lexer.copy_required_bytes::<std::io::Error>().unwrap();
         let lexer_spent = Cell::new(0usize);
-        let mut copied_lexer = lexer.try_copy(None, &|bytes| {
-            lexer_copy_calls.set(lexer_copy_calls.get() + 1);
-            let next = lexer_spent.get().checked_add(bytes).unwrap();
-            if next > lexer_required { return Err(std::io::Error::other("copy bound exceeded")); }
-            lexer_spent.set(next);
-            Ok::<_, std::io::Error>(())
-        }).unwrap();
+        let mut copied_lexer = lexer
+            .try_copy(None, &|bytes| {
+                lexer_copy_calls.set(lexer_copy_calls.get() + 1);
+                let next = lexer_spent.get().checked_add(bytes).unwrap();
+                if next > lexer_required {
+                    return Err(std::io::Error::other("copy bound exceeded"));
+                }
+                lexer_spent.set(next);
+                Ok::<_, std::io::Error>(())
+            })
+            .unwrap();
         assert_eq!(lexer_spent.get(), lexer_required);
         let short = Cell::new(0usize);
-        let error = lexer.try_copy(None, &|bytes| {
-            let next = short.get().checked_add(bytes).unwrap();
-            if next >= lexer_required { return Err(std::io::Error::other("one byte short")); }
-            short.set(next); Ok(())
-        }).unwrap_err();
+        let error = lexer
+            .try_copy(None, &|bytes| {
+                let next = short.get().checked_add(bytes).unwrap();
+                if next >= lexer_required {
+                    return Err(std::io::Error::other("one byte short"));
+                }
+                short.set(next);
+                Ok(())
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("one byte short"));
         drop(error);
-        assert_eq!(copied_lexer.vector().transitions_attempted(), lexer.vector().transitions_attempted());
+        assert_eq!(
+            copied_lexer.vector().transitions_attempted(),
+            lexer.vector().transitions_attempted()
+        );
         assert_eq!(copied_lexer.vector().fuel(), lexer.vector().fuel());
         assert_eq!(copied_lexer.vector().roots(), lexer.vector().roots());
         let copy_calls = Cell::new(0usize);
         let required = owner.copy_required_bytes::<std::io::Error>().unwrap();
         let spent = Cell::new(0usize);
-        let copied = owner.try_copy(&|bytes| {
-            copy_calls.set(copy_calls.get() + 1);
-            let next = spent.get().checked_add(bytes).unwrap();
-            if next > required { return Err(std::io::Error::other("copy bound exceeded")); }
-            spent.set(next);
-            Ok::<_, std::io::Error>(())
-        }).unwrap();
+        let copied = owner
+            .try_copy(&|bytes| {
+                copy_calls.set(copy_calls.get() + 1);
+                let next = spent.get().checked_add(bytes).unwrap();
+                if next > required {
+                    return Err(std::io::Error::other("copy bound exceeded"));
+                }
+                spent.set(next);
+                Ok::<_, std::io::Error>(())
+            })
+            .unwrap();
         assert_eq!(spent.get(), required);
-        assert_eq!(owner.copy_required_bytes::<std::io::Error>(), Some(required));
+        assert_eq!(
+            owner.copy_required_bytes::<std::io::Error>(),
+            Some(required)
+        );
         let short = Cell::new(0usize);
-        let error = owner.try_copy(&|bytes| {
-            let next = short.get().checked_add(bytes).unwrap();
-            if next >= required { return Err(std::io::Error::other("one byte short")); }
-            short.set(next); Ok(())
-        }).unwrap_err();
+        let error = owner
+            .try_copy(&|bytes| {
+                let next = short.get().checked_add(bytes).unwrap();
+                if next >= required {
+                    return Err(std::io::Error::other("one byte short"));
+                }
+                short.set(next);
+                Ok(())
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("one byte short"));
         drop(error);
         assert_eq!(copied.tokens(), owner.tokens());
@@ -1410,74 +1479,122 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
         assert_ne!(copied.bytes().as_ptr(), owner.bytes().as_ptr());
         assert_ne!(copied.tokens().as_ptr(), owner.tokens().as_ptr());
         assert_eq!(copied.token_mask(), owner.token_mask());
-        assert_ne!(copied.token_mask().unwrap().as_slice().as_ptr(), owner.token_mask().unwrap().as_slice().as_ptr());
-        assert!(std::ptr::eq(copied.chart().grammar(), owner.chart().grammar()));
-        assert_eq!(copied.chart().initial_captures().collect::<Vec<_>>(), owner.chart().initial_captures().collect::<Vec<_>>());
+        assert_ne!(
+            copied.token_mask().unwrap().as_slice().as_ptr(),
+            owner.token_mask().unwrap().as_slice().as_ptr()
+        );
+        assert!(std::ptr::eq(
+            copied.chart().grammar(),
+            owner.chart().grammar()
+        ));
+        assert_eq!(
+            copied.chart().initial_captures().collect::<Vec<_>>(),
+            owner.chart().initial_captures().collect::<Vec<_>>()
+        );
         let original_tokens = owner.tokens().len();
-        let copied = copied.rollback(&mut copied_lexer, env.tok_trie(), &config, 1, &reserve).unwrap();
+        let copied = copied
+            .rollback(&mut copied_lexer, env.tok_trie(), &config, 1, &reserve)
+            .unwrap();
         assert_eq!(owner.tokens().len(), original_tokens);
         assert_eq!(copied.tokens().len(), original_tokens - 1);
-        let copied = copied.compute_mask(&mut copied_lexer, env.tok_trie(), &config, None, &[], &reserve).unwrap();
+        let copied = copied
+            .compute_mask(
+                &mut copied_lexer,
+                env.tok_trie(),
+                &config,
+                None,
+                &[],
+                &reserve,
+            )
+            .unwrap();
         assert!(copied.token_mask().is_some());
         assert_eq!(owner.tokens().len(), original_tokens);
         drop((copied, copied_lexer));
         for cutoff in [1, lexer_copy_calls.get() / 2, lexer_copy_calls.get()] {
             let attempted = Cell::new(0usize);
-            let error = lexer.try_copy(None, &|_| {
-                attempted.set(attempted.get() + 1);
-                if attempted.get() == cutoff { Err(std::io::Error::other("lexer copy refused")) }
-                else { Ok(()) }
-            }).unwrap_err();
+            let error = lexer
+                .try_copy(None, &|_| {
+                    attempted.set(attempted.get() + 1);
+                    if attempted.get() == cutoff {
+                        Err(std::io::Error::other("lexer copy refused"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
             assert_eq!(attempted.get(), cutoff);
             assert!(error.to_string().contains("lexer copy refused"));
         }
         for cutoff in [1, copy_calls.get() / 2, copy_calls.get()] {
             let attempted = Cell::new(0);
-            let error = owner.try_copy(&|_| {
-                attempted.set(attempted.get() + 1);
-                if attempted.get() == cutoff { Err(std::io::Error::other("token copy refused")) }
-                else { Ok(()) }
-            }).unwrap_err();
+            let error = owner
+                .try_copy(&|_| {
+                    attempted.set(attempted.get() + 1);
+                    if attempted.get() == cutoff {
+                        Err(std::io::Error::other("token copy refused"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
             assert_eq!(attempted.get(), cutoff);
             assert!(error.to_string().contains("token copy refused"));
             assert_eq!(owner.tokens().len(), original_tokens);
         }
         ordinary.rollback(1).unwrap();
-        owner = owner.rollback(&mut lexer, env.tok_trie(), &config, 1, &reserve).unwrap();
+        owner = owner
+            .rollback(&mut lexer, env.tok_trie(), &config, 1, &reserve)
+            .unwrap();
         assert!(owner.token_mask().is_none());
         assert_eq!(owner.bytes(), ordinary.final_bytes());
         assert_eq!(owner.tokens().len(), ordinary.num_tokens());
         assert_eq!(owner.stop_reason(), ordinary.stop_reason());
         let expected_mask = ordinary.compute_mask().unwrap();
-        owner = owner.compute_mask(&mut lexer, env.tok_trie(), &config, None, &[], &reserve).unwrap();
+        owner = owner
+            .compute_mask(&mut lexer, env.tok_trie(), &config, None, &[], &reserve)
+            .unwrap();
         assert_eq!(owner.token_mask().unwrap(), &expected_mask);
         ordinary.reset().unwrap();
-        owner = owner.reset(&mut lexer, env.tok_trie(), &config, &reserve).unwrap();
+        owner = owner
+            .reset(&mut lexer, env.tok_trie(), &config, &reserve)
+            .unwrap();
         assert!(owner.bytes().is_empty());
         assert!(owner.tokens().is_empty());
         assert_eq!(owner.bytes(), ordinary.final_bytes());
         let expected_mask = ordinary.compute_mask().unwrap();
-        owner = owner.compute_mask(&mut lexer, env.tok_trie(), &config, None, &[], &reserve).unwrap();
+        owner = owner
+            .compute_mask(&mut lexer, env.tok_trie(), &config, None, &[], &reserve)
+            .unwrap();
         assert_eq!(owner.token_mask().unwrap(), &expected_mask);
         let before_tokens = owner.tokens().len();
-        let ordinary_error = ordinary.rollback(before_tokens + 1).unwrap_err().to_string();
-        let error = owner.rollback(&mut lexer, env.tok_trie(), &config, before_tokens + 1, &reserve).unwrap_err();
+        let ordinary_error = ordinary
+            .rollback(before_tokens + 1)
+            .unwrap_err()
+            .to_string();
+        let error = owner
+            .rollback(
+                &mut lexer,
+                env.tok_trie(),
+                &config,
+                before_tokens + 1,
+                &reserve,
+            )
+            .unwrap_err();
         assert_eq!(error.to_string(), ordinary_error);
-
     }
     let mut capped = request();
     capped.max_tokens = Some(1);
     let mut ordinary = factory.create_parser(capped).unwrap();
     ordinary.start_without_prompt();
-    let source = Arc::new(
+    let source = SharedGrammar::new(
         ordinary
             .parser
             .grammar()
-            .source_copy_plan()
+            .source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
             .unwrap()
             .compile()
             .unwrap(),
-    );
+    ).unwrap();
     let (chart, mut lexer) = prepared_chart(&source);
     let config = factory.limits().clone();
     let owner = PreparedTokenParser::prepare(
@@ -1507,15 +1624,15 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
         .contains("max_tokens_total reached"));
     drop((ordinary, lexer, source));
     let ordinary = factory.create_parser(request()).unwrap();
-    let source = Arc::new(
+    let source = SharedGrammar::new(
         ordinary
             .parser
             .grammar()
-            .source_copy_plan()
+            .source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
             .unwrap()
             .compile()
             .unwrap(),
-    );
+    ).unwrap();
     let (chart, mut lexer) = prepared_chart(&source);
     let owner =
         PreparedTokenParser::prepare(chart, &mut lexer, env.tok_trie(), &config, None, &reserve)
@@ -1533,16 +1650,16 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
     assert!(calls.get() > 4);
     for stop in [1, 2, calls.get() / 2] {
         let ordinary = factory.create_parser(request()).unwrap();
-        let source = Arc::new(
+        let source = SharedGrammar::new(
             ordinary
                 .parser
                 .grammar()
-                .source_copy_plan()
+                .source_copy_plan(&derivre::ParserAllocationFunding::unenforced())
                 .unwrap()
                 .compile()
                 .unwrap(),
-        );
-        let weak = Arc::downgrade(&source);
+        ).unwrap();
+        let retained = source.clone();
         let (chart, mut lexer) = prepared_chart(&source);
         let owner = PreparedTokenParser::prepare(
             chart,
@@ -1567,8 +1684,8 @@ fn prepared_token_session_shares_matcher_commit_stop_limits_and_failed_owner() {
         assert_eq!(attempted.get(), stop);
         assert!(failure.to_string().contains("token session refused"));
         drop((source, lexer, ordinary));
-        assert!(weak.upgrade().is_some());
+        assert!(retained.strong_count() > 1);
         drop(failure);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.strong_count(), 1);
     }
 }

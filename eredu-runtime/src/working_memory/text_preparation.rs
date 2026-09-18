@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 mod no_decoder;
 mod run;
-pub use run::{InferenceTextStep, InferenceTextStepReceipt};
+pub use run::{InferenceTextStep, InferenceTextStepReceipt, PendingSamplingExtension, PendingTextBranchExchange};
+pub(in crate::working_memory) use run::SamplingExtensionBinding;
 
 #[derive(Debug)]
 pub(super) enum RequestStart {

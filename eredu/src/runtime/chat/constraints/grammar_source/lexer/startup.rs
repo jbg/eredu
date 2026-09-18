@@ -4,18 +4,18 @@ use super::{
     OriginalGrammarLexerError, OriginalGrammarLexerInputError, OriginalGrammarLexerInputs,
     OriginalGrammarLexerOperationError, OriginalGrammarLexerVector,
     OriginalGrammarLexerVectorError, OriginalGrammarSlicer, OriginalGrammarState,
-    OriginalGrammarStateConstructionError, OriginalGrammarTokenParser, OriginalGrammarTokenParserError,
+    OriginalGrammarStateConstructionError, OriginalGrammarTokenParser,
+    OriginalGrammarTokenParserError,
 };
 use crate::runtime::chat::constraints::{
+    ConstraintBlueprint,
     grammar_source::{
         OriginalGrammarSlicerError, OriginalGrammarVocabulary, OriginalGrammarVocabularyError,
     },
-    ConstraintBlueprint,
 };
-use eredu_core::{BackendFailure, SharedControllerBytes};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
-use eredu_runtime::working_memory::{OriginalChatBackend, OriginalTokenizer};
-use eredu_text::tokenizer_storage::TokenizerPlan;
+use eredu_core::SharedControllerBytes;
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
+use eredu_runtime::working_memory::OriginalControllerCompilation;
 use llguidance::api::ParserLimits;
 use std::mem::{size_of, size_of_val};
 
@@ -24,14 +24,14 @@ enum Control {
     #[error("original grammar startup extent overflow")]
     Overflow,
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error("original grammar startup extent overflow")]
     Overflow,
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error("{cause}")]
     Unstarted {
         #[source]
@@ -69,44 +69,31 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarStartupError {
     #[source]
     cause: Cause,
     source: SharedControllerBytes,
-    funding: WorkspaceMetadataFunding,
+    compilation: OriginalControllerCompilation,
+    funding: HostMetadataFunding,
 }
 impl ConstraintBlueprint {
-    pub(in crate::runtime::chat::constraints) fn original_grammar_state<B: OriginalChatBackend>(
+    pub(in crate::runtime::chat::constraints) fn original_grammar_state(
         &self,
-        runtime: &eredu_core::ModelRuntime<B>,
-        funding: &WorkspaceMetadataFunding,
+        compilation: &OriginalControllerCompilation,
+        funding: &HostMetadataFunding,
     ) -> Result<OriginalGrammarState, OriginalGrammarStartupError> {
-        self.original_grammar_state_with(funding, |plan| {
-            B::compile_original_tokenizer(runtime, plan)
-        })
-    }
-    // The same complete constructor also accepts the existing exact-tokenizer
-    // backend callback used by the vocabulary source. No ordinary Matcher enters.
-    pub(in crate::runtime::chat::constraints) fn original_grammar_state_with<'a, F>(
-        &'a self,
-        funding: &WorkspaceMetadataFunding,
-        compile: F,
-    ) -> Result<OriginalGrammarState, OriginalGrammarStartupError>
-    where
-        F: FnOnce(TokenizerPlan<'a>) -> Result<OriginalTokenizer, BackendFailure>,
-    {
         let result = (|| -> Result<OriginalGrammarState, Cause> {
             let parts = [
                 size_of::<&Self>(),
-                size_of::<F>(),
+                size_of::<OriginalControllerCompilation>(),
                 size_of::<Cause>(),
                 size_of::<OriginalGrammarStartupError>(),
                 size_of::<OriginalGrammarState>(),
                 size_of::<OriginalGrammarVocabulary>(),
                 size_of::<SharedControllerBytes>(),
-                size_of::<WorkspaceMetadataFunding>(),
+                size_of::<HostMetadataFunding>(),
                 size_of::<ParserLimits>(),
                 size_of::<Result<OriginalGrammarState, OriginalGrammarStartupError>>(),
                 size_of::<Result<OriginalGrammarState, Cause>>(),
                 size_of::<Result<OriginalGrammarVocabulary, OriginalGrammarVocabularyError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-                size_of::<(&Self, &WorkspaceMetadataFunding, F)>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
+                size_of::<(&Self, &OriginalControllerCompilation, &HostMetadataFunding)>(),
             ];
             funding.reserve_metadata(
                 parts
@@ -114,11 +101,12 @@ impl ConstraintBlueprint {
                     .try_fold(size_of_val(&parts), usize::checked_add)
                     .ok_or(Cause::Overflow)?,
             )?;
-            construct(self.original_grammar_vocabulary_with(funding, compile)?)
+            construct(self.original_grammar_vocabulary(compilation, funding)?)
         })();
         result.map_err(|cause| OriginalGrammarStartupError {
             cause,
             source: self.recipe.source().clone(),
+            compilation: compilation.clone(),
             funding: funding.clone(),
         })
     }
@@ -141,7 +129,7 @@ fn construct(source: OriginalGrammarVocabulary) -> Result<OriginalGrammarState, 
             size_of::<Result<OriginalGrammarEarleySeed, OriginalGrammarEarleySeedError>>(),
             size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserError>>(),
             size_of::<Result<OriginalGrammarState, OriginalGrammarStateConstructionError>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Result<(), Control>>(),
         ];
         source.funding.reserve_metadata(

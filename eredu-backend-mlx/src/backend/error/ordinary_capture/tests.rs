@@ -49,7 +49,7 @@ fn native_capture_and_escaped_neural_aliases_preserve_actual_unquoted_source_and
     }
     assert!(control_peak_bytes().unwrap() >= std::mem::size_of::<OrdinaryCaptureFailure>());
     assert!(
-        eredu_nn::Error::retained_source_control_bytes::<Error>().unwrap()
+        eredu_nn::Error::retained_source_construction_bytes::<Error>().unwrap()
             >= std::mem::size_of::<Error>()
     );
 }

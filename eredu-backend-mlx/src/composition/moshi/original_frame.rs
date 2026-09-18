@@ -1,7 +1,7 @@
 //! Source-funded retention around the unchanged selected realtime equation.
 use super::*;
 use crate::backend::submission_recovery::native_role::realtime::RealtimeRoleContext;
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::working_memory::{OriginalRealtimeBudgetCustody,WorkingMemoryError};
 use safemlx::OriginalScopeObserver;
 use crate::backend::runtime::distributed::{Group,topology::original_source::parallel::OriginalParallelInvocation};
@@ -13,7 +13,7 @@ struct State {
     entered:Cell<bool>,
     observer:RefCell<Option<OriginalScopeObserver>>,
     custody:OriginalRealtimeBudgetCustody,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -38,14 +38,14 @@ impl OriginalRealtimeModelLease {
             size_of::<(&MlxRealtimeExecution,&RealtimeRoleContext<'_>)>(),
             size_of::<Option<OriginalScopeObserver>>(),OriginalScopeObserver::control_bytes()?.checked_mul(2)?,
             size_of::<std::cell::RefMut<'static,Option<Rc<OrdinaryRetirement<RealtimeExecutionPayload>>>>>(),
-            size_of::<OriginalRealtimeBudgetCustody>(),size_of::<WorkspaceMetadataFunding>(),
-            size_of::<Option<&WorkspaceMetadataFunding>>(),
+            size_of::<OriginalRealtimeBudgetCustody>(),size_of::<HostMetadataFunding>(),
+            size_of::<Option<&HostMetadataFunding>>(),
             size_of::<moshi::MoshiRealtimeExecutionError<Error>>(),
             WorkspaceContext::metadata_source_bytes::<execution_failure::Source>()?];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
     pub(crate) fn prepare<T>(model:&MlxRealtimeExecution,custody:OriginalRealtimeBudgetCustody,
-        funding:&WorkspaceMetadataFunding)->Result<Self,Error> {
+        funding:&HostMetadataFunding)->Result<Self,Error> {
         funding.reserve_metadata(Self::control_bytes::<T>().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         model.ensure_healthy()?;
@@ -111,7 +111,7 @@ type Forward=(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>);
 struct ParallelFrame<'a> {
     model:&'a mut MlxRealtimeExecution,state:&'a mut MlxKeyValueState,temporal:&'a [crate::MlxTensor],
     driver:&'a mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
-    stream:&'a Stream,funding:&'a WorkspaceMetadataFunding,
+    stream:&'a Stream,funding:&'a HostMetadataFunding,
 }
 impl ParallelFrame<'_> {
     fn run(&mut self,parallel:&Group)->Result<Forward,Error> {

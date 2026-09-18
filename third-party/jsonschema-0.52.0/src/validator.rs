@@ -3,10 +3,10 @@
 //! everything needed to perform such validation in runtime.
 use std::collections::hash_map::Entry;
 pub(crate) mod cache;
-pub(crate) mod workspace;
 pub(crate) mod original;
 pub(crate) mod source;
 mod unique;
+pub(crate) mod workspace;
 
 use crate::{
     error::ErrorIterator,
@@ -73,10 +73,12 @@ pub struct ValidationContext<'a> {
     /// Lazy-initialized cache for recursive schema validation.
     is_valid_cache: Option<cache::Cache<(usize, NodeIdentity), bool>>,
     /// Lazy-initialized cache for ECMA regex transformation results during format "regex" validation.
-    ecma_regex_cache: Option<AHashMap<String, bool>>,
+    ecma_regex_cache: Option<cache::Cache<String, bool>>,
     evaluation_path_cache: Option<Box<EvaluationPathCache>>,
     evaluation_path_calls: u32,
     pub(crate) workspace: workspace::Workspace<'a>,
+    diagnostic_failure: Option<crate::CompilationError>,
+    diagnostic_funding: crate::compilation::Funding,
 }
 
 /// Evaluation paths are only cached once this many have been built.
@@ -191,49 +193,213 @@ impl ValidationContext<'_> {
 
     /// Check if an ECMA regex pattern is valid.
     pub(crate) fn is_valid_ecma_regex(&mut self, pattern: &str) -> bool {
-        if self.workspace.original() {
-            return self.workspace.refuse(workspace::Error::Unqualified(
-                workspace::Component::RegexSyntax,
-            ));
+        if self.workspace.failed() {
+            return false;
         }
         if let Some(cache) = &self.ecma_regex_cache {
             if let Some(&result) = cache.get(pattern) {
                 return result;
             }
         }
-        let result = jsonschema_regex::is_valid_ecma_regex(pattern);
-        self.ecma_regex_cache
-            .get_or_insert_with(AHashMap::new)
-            .insert(pattern.to_owned(), result);
+        let Some(result) = self.workspace.ecma_regex(pattern) else {
+            return false;
+        };
+        let Some(key) = self.workspace.copy_string(pattern) else {
+            return false;
+        };
+        let cache = self
+            .ecma_regex_cache
+            .get_or_insert_with(|| cache::Cache::new(self.workspace.hasher()));
+        if !cache.insert(key, result, &mut self.workspace) {
+            return false;
+        }
         result
     }
 }
 
 impl<'a> ValidationContext<'a> {
+    pub(crate) fn branch_errors<'i, F: Json>(
+        &mut self,
+        schemas: &[SchemaNode<F>],
+        instance: &F::Node<'i>,
+        location: &LazyLocation,
+        tracker: Option<&RefTracker>,
+    ) -> Option<Vec<Vec<ValidationError<'i>>>> {
+        let mut branches = self.produce(|funding| {
+            let mut branches = Vec::new();
+            funding.grow(&mut branches, schemas.len())?;
+            Ok(branches)
+        })?;
+        for schema in schemas {
+            let mut branch = Vec::new();
+            schema.collect_errors(instance, location, tracker, self, &mut branch);
+            if self.workspace.failed() {
+                return None;
+            }
+            branches.push(branch);
+        }
+        Some(branches)
+    }
+    pub(crate) fn with_string_node<F: Json, T>(
+        &mut self,
+        buffer: &mut F::StringBuffer,
+        text: &str,
+        operation: impl for<'n> FnOnce(F::Node<'n>, &mut Self) -> T,
+    ) -> Option<T> {
+        if !self.workspace.string_constructor(false) {
+            return None;
+        }
+        if self.workspace.original() {
+            let node = self.workspace.prepare_string_node::<F>(buffer, text)?;
+            Some(operation(node, self))
+        } else {
+            Some(F::with_string_node(buffer, text, |node| {
+                operation(node, self)
+            }))
+        }
+    }
+    pub(crate) fn set_diagnostic_funding(&mut self, funding: crate::compilation::Funding) {
+        self.diagnostic_funding = funding;
+    }
+    pub(crate) fn take_diagnostic_failure(&mut self) -> Option<crate::CompilationError> {
+        self.diagnostic_failure.take()
+    }
+    pub(crate) fn produce<T>(
+        &mut self,
+        operation: impl FnOnce(&crate::compilation::Funding) -> Result<T, crate::CompilationError>,
+    ) -> Option<T> {
+        if self.workspace.failed() {
+            return None;
+        }
+        let controls = std::mem::size_of_val(&operation)
+            .checked_add(std::mem::size_of::<Result<T, crate::CompilationError>>())
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<(&mut Self, &crate::compilation::Funding)>())
+            });
+        if !self.workspace.reserve(controls) {
+            return None;
+        }
+        match operation(&self.diagnostic_funding) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.diagnostic_failure = Some(error);
+                self.workspace.refuse(workspace::Error::Funding);
+                None
+            }
+        }
+    }
+    pub(crate) fn diagnostic<'i, F: Json>(
+        &mut self,
+        instance: &F::Node<'i>,
+        location: &LazyLocation,
+        tracker: Option<&RefTracker>,
+        schema_path: &Location,
+        kind: impl FnOnce(
+            &crate::compilation::Funding,
+        ) -> Result<crate::error::ValidationErrorKind, crate::CompilationError>,
+    ) -> Result<(), ValidationError<'i>> {
+        if self.workspace.failed() {
+            return Ok(());
+        }
+        let controls = std::mem::size_of_val(&kind)
+            .checked_add(std::mem::size_of::<crate::error::ValidationErrorKind>())
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<
+                    Result<ValidationError<'i>, crate::CompilationError>,
+                >())
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<(
+                    &mut Self,
+                    &F::Node<'i>,
+                    &LazyLocation<'_, '_>,
+                    Option<&RefTracker<'_>>,
+                    &Location,
+                )>())
+            });
+        if !self.workspace.reserve(controls) {
+            return Ok(());
+        }
+        let result = (|| {
+            let funding = &self.diagnostic_funding;
+            let kind = kind(funding)?;
+            let instance = funding.input_value::<F>(instance)?;
+            let instance_path = Location::from_lazy_with_funding(location, funding)?;
+            let tracker =
+                crate::paths::capture_evaluation_path_with_funding(tracker, schema_path, funding)?;
+            ValidationError::new_with_funding(
+                instance,
+                kind,
+                instance_path,
+                schema_path.clone(),
+                tracker,
+                funding,
+            )
+        })();
+        match result {
+            Ok(error) => Err(error),
+            Err(error) => {
+                self.diagnostic_failure = Some(error);
+                self.workspace.refuse(workspace::Error::Funding);
+                Ok(())
+            }
+        }
+    }
+
     /// Same selected borrowed equality worker as ordinary SerdeJson; custom
     /// ordinary representations retain their existing override semantics.
     fn equality_charge(&mut self, charge: crate::cmp::EqualityCharge) -> bool {
         let bytes = match charge {
-            crate::cmp::EqualityCharge::Frame(bytes) => bytes.and_then(|n| n.checked_add(self.workspace.input_controls())),
+            crate::cmp::EqualityCharge::Frame(bytes) => {
+                bytes.and_then(|n| n.checked_add(self.workspace.input_controls()))
+            }
             crate::cmp::EqualityCharge::Number(Some(bytes)) => Some(bytes),
-            crate::cmp::EqualityCharge::Number(None) => return self.workspace.refuse(workspace::Error::Unqualified(workspace::Component::Validator("arbitrary-precision structural equality"))),
+            crate::cmp::EqualityCharge::Number(None) => {
+                if !self.workspace.original() {
+                    return true;
+                }
+                return self.workspace.refuse(workspace::Error::Unqualified(
+                    workspace::Component::Validator("arbitrary-precision structural equality"),
+                ));
+            }
         };
-        self.workspace.reserve(bytes.and_then(|bytes| bytes.checked_add(
-            std::mem::size_of::<(&mut Self, crate::cmp::EqualityCharge, Option<usize>, bool)>(),
-        )))
+        self.workspace.reserve(bytes.and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<(
+                &mut Self,
+                crate::cmp::EqualityCharge,
+                Option<usize>,
+                bool,
+            )>())
+        }))
     }
-    pub(crate) fn equals_value<F: Json>(&mut self, input: &F::Node<'_>, expected: &serde_json::Value) -> bool {
+    pub(crate) fn equals_value<F: Json>(
+        &mut self,
+        input: &F::Node<'_>,
+        expected: &serde_json::Value,
+    ) -> bool {
         use crate::Node;
-        if !self.workspace.original() { return input.equals_value(expected); }
-        if self.workspace.failed() { return false; }
+        if !self.workspace.original() {
+            return input.equals_value(expected);
+        }
+        if self.workspace.failed() {
+            return false;
+        }
         crate::cmp::equal_node_with::<F, _>(input, expected, &mut |charge| {
             self.equality_charge(charge)
         })
     }
-    pub(crate) fn equals_literal<F: Json>(&mut self, input: &F::Node<'_>, expected: &jsonschema_value::literal::Literal) -> bool {
+    pub(crate) fn equals_literal<F: Json>(
+        &mut self,
+        input: &F::Node<'_>,
+        expected: &jsonschema_value::literal::Literal,
+    ) -> bool {
         use crate::Node;
-        if !self.workspace.original() { return input.equals_literal(expected); }
-        if self.workspace.failed() { return false; }
+        if !self.workspace.original() {
+            return input.equals_literal(expected);
+        }
+        if self.workspace.failed() {
+            return false;
+        }
         crate::cmp::equal_literal_with::<F, _>(input, expected, &mut |charge| {
             self.equality_charge(charge)
         })
@@ -280,39 +446,138 @@ pub(crate) trait Validate<F: Json = SerdeJson>: Send + Sync {
         ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
+        if ctx.workspace.failed() {
+            return;
+        }
+        if ctx.workspace.original() {
+            let controls = match self.original_diagnostic_controls() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    ctx.workspace.refuse(error);
+                    return;
+                }
+            };
+            if !ctx
+                .workspace
+                .reserve(controls.checked_add(std::mem::size_of::<(
+                    &Self,
+                    &F::Node<'i>,
+                    &LazyLocation<'_, '_>,
+                    Option<&RefTracker<'_>>,
+                    &mut ValidationContext<'_>,
+                    &mut Vec<ValidationError<'i>>,
+                )>()))
+            {
+                return;
+            }
+        }
+        self.collect_errors_body(instance, location, tracker, ctx, errors);
+    }
+    fn collect_errors_body<'i>(
+        &self,
+        instance: &F::Node<'i>,
+        location: &LazyLocation,
+        tracker: Option<&RefTracker>,
+        ctx: &mut ValidationContext,
+        errors: &mut Vec<ValidationError<'i>>,
+    ) {
         if let Err(error) = self.validate(instance, location, tracker, ctx) {
-            errors.push(error);
+            ctx.workspace.push(errors, error);
         }
     }
 
     /// Cold immutable allocation census, independent of runtime qualification.
     fn original_source(&self, _: &mut source::Inspector<F>) -> Result<(), workspace::Error> {
-        Err(workspace::Error::Unqualified(workspace::Component::Source(std::any::type_name::<Self>())))
+        Err(workspace::Error::Unqualified(workspace::Component::Source(
+            std::any::type_name::<Self>(),
+        )))
     }
 
     /// Intrinsic execution qualification, separate from immutable schema storage.
     /// Each body is closed additively; an unknown/custom body never runs paid.
     fn original_controls(&self) -> Result<usize, workspace::Error> {
-        Err(workspace::Error::Unqualified(workspace::Component::Validator(std::any::type_name::<Self>())))
+        Err(workspace::Error::Unqualified(
+            workspace::Component::Validator(std::any::type_name::<Self>()),
+        ))
     }
 
     fn is_valid(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
-        if ctx.workspace.failed() { return false; }
+        if ctx.workspace.failed() {
+            return false;
+        }
         if ctx.workspace.original() {
-            let controls = match self.original_controls().and_then(|bytes| bytes.checked_add(ctx.workspace.input_controls()).ok_or(workspace::Error::Overflow)) {
+            let controls = match self.original_controls().and_then(|bytes| {
+                bytes
+                    .checked_add(ctx.workspace.input_controls())
+                    .ok_or(workspace::Error::Overflow)
+            }) {
                 Ok(controls) => controls,
                 Err(error) => return ctx.workspace.refuse(error),
             };
-            let parts = [controls, std::mem::size_of::<(&Self, &F::Node<'_>, &mut ValidationContext<'_>)>(),
-                std::mem::size_of::<Result<usize, workspace::Error>>(), std::mem::size_of::<bool>()];
-            if !ctx.workspace.reserve(parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)) { return false; }
+            let parts = [
+                controls,
+                std::mem::size_of::<(&Self, &F::Node<'_>, &mut ValidationContext<'_>)>(),
+                std::mem::size_of::<Result<usize, workspace::Error>>(),
+                std::mem::size_of::<bool>(),
+            ];
+            if !ctx.workspace.reserve(
+                parts
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&parts), usize::checked_add),
+            ) {
+                return false;
+            }
         }
         self.is_valid_body(instance, ctx)
     }
 
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool;
 
+    fn original_diagnostic_controls(&self) -> Result<usize, workspace::Error> {
+        Err(workspace::Error::Unqualified(
+            workspace::Component::Validator(std::any::type_name::<Self>()),
+        ))
+    }
     fn validate<'i>(
+        &self,
+        instance: &F::Node<'i>,
+        location: &LazyLocation,
+        tracker: Option<&RefTracker>,
+        ctx: &mut ValidationContext,
+    ) -> Result<(), ValidationError<'i>> {
+        if ctx.workspace.failed() {
+            return Ok(());
+        }
+        if ctx.workspace.original() {
+            let controls = self.original_diagnostic_controls().and_then(|bytes| {
+                bytes
+                    .checked_add(ctx.workspace.input_controls())
+                    .ok_or(workspace::Error::Overflow)
+            });
+            let controls = match controls {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    ctx.workspace.refuse(error);
+                    return Ok(());
+                }
+            };
+            if !ctx
+                .workspace
+                .reserve(controls.checked_add(std::mem::size_of::<(
+                    &Self,
+                    &F::Node<'i>,
+                    &LazyLocation<'_, '_>,
+                    Option<&RefTracker<'_>>,
+                    &mut ValidationContext<'_>,
+                    Result<(), ValidationError<'i>>,
+                )>()))
+            {
+                return Ok(());
+            }
+        }
+        self.validate_body(instance, location, tracker, ctx)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -462,6 +727,7 @@ impl From<EvaluationNode> for EvaluationResult {
 pub struct Validator<F: Json = SerdeJson> {
     pub(crate) root: SchemaNode<F>,
     pub(crate) draft: Draft,
+    pub(crate) funding: crate::compilation::Funding,
 }
 
 impl<F: Json> Clone for Validator<F> {
@@ -469,6 +735,7 @@ impl<F: Json> Clone for Validator<F> {
         Self {
             root: self.root.clone(),
             draft: self.draft,
+            funding: self.funding.clone(),
         }
     }
 }
@@ -553,6 +820,34 @@ impl Validator<SerdeJson> {
 // call ergonomics (`&Value`, not `&&Value`) across every representation.
 #[allow(clippy::needless_pass_by_value)]
 impl<F: Json> Validator<F> {
+    /// Compile using default options and prospective source funding.
+    ///
+    /// Default configuration, reference preparation, the compiled graph and
+    /// diagnostics use the same workers as ordinary compilation. The returned
+    /// graph or error keeps the original source until its storage is retired.
+    ///
+    /// `None` is the explicit unenforced policy for the same worker.
+    ///
+    /// # Errors
+    /// Returns a typed original storage refusal, a precise unqualified producer,
+    /// or the ordinary schema/reference diagnostic.
+    pub fn build_with_funding(
+        schema: &serde_json::Value,
+        source: Option<std::sync::Arc<dyn crate::CompilationFunding>>,
+    ) -> Result<Self, crate::CompilationError> {
+        let funding = source
+            .map(crate::compilation::Funding::enforced)
+            .unwrap_or_default();
+        funding.reserve(std::mem::size_of::<(
+            crate::ValidationOptions<'_, std::sync::Arc<dyn referencing::Retrieve>, F>,
+            &serde_json::Value,
+            crate::compilation::Funding,
+            Result<Self, crate::CompilationError>,
+        )>())?;
+        let options = crate::ValidationOptions::<_, F>::default_with_funding(&funding)?;
+        crate::compiler::build_validator_with_funding(&options, schema, &funding)
+            .map_err(|error| error.into_compilation(&funding))
+    }
     /// Validate `instance` against `schema` and return the first error if any.
     ///
     /// # Errors

@@ -53,15 +53,15 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(bytes)
             })
             .map(|_| ())
-            .map_err(|left| WorkspaceMetadataFundingError::Capacity {
+            .map_err(|left| HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: left as u64,
             })
@@ -74,14 +74,14 @@ impl Drop for Account {
 }
 struct Retained<T> {
     _value: T,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn rows(value: &impl Parameterized<WorkspaceTensor>) -> Vec<(String, Vec<i32>, WorkspaceDtype)> {
     struct Rows(Vec<(String, Vec<i32>, WorkspaceDtype)>);
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Rows {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a WorkspaceTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
             self.0.push((
-                metadata.id.as_str().to_owned(),
+                metadata.id().as_str().to_owned(),
                 value.shape().to_vec(),
                 value.layout().dtype(),
             ));
@@ -136,17 +136,18 @@ fn retained_inkling_graph_units_preserve_sparse_shared_media_state_and_source_re
     let coordinates = [(0, 0), (0, 1), (0, 2), (0, 3), (2, 0), (2, 1)];
     let expected = coordinates
         .map(|(group, index)| rows(&unit(&ordinary, group, index, &ordinary_context).unwrap()));
-    let layout = eredu_runtime::ArchitectureParameters::state_layout(&ordinary).unwrap();
+    let layout = eredu_runtime::ArchitectureParameters::state_layout(&ordinary, None).unwrap();
     let state_geometry = eredu_runtime::PartitionState::new(layout.clone(), 0).unwrap();
     let identity = eredu_runtime::ArchitectureParameters::state_identity(
         &ordinary,
         &state_geometry,
         PromptCacheTopology::default(),
+        None,
     )
     .unwrap();
     let graph =
         <Model as LayeredArchitecture<WorkspaceBackend, StateType>>::execution_graph(&ordinary)
-            .unwrap();
+            .unwrap().into_owned();
     let transports = std::array::from_fn::<_, 3, _>(|group| {
         <Model as LayeredArchitecture<WorkspaceBackend, StateType>>::group_transport(
             &ordinary, group,
@@ -183,7 +184,7 @@ fn retained_inkling_graph_units_preserve_sparse_shared_media_state_and_source_re
         remaining: AtomicUsize::new(usize::MAX),
         retired: AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     let context = WorkspaceContext::new_with_metadata_funding(Facts, funding).unwrap();
     assert!(
         source
@@ -199,13 +200,13 @@ fn retained_inkling_graph_units_preserve_sparse_shared_media_state_and_source_re
     let first = Model::new_with_source(source.clone(), &context).unwrap();
     let second = Model::new_with_source(source.clone(), &context).unwrap();
     assert_eq!(
-        eredu_runtime::ArchitectureParameters::state_layout_with_metadata(&first, &context)
+        eredu_runtime::ArchitectureParameters::state_layout(&first, Some(&context))
             .unwrap(),
         layout
     );
     assert!(
-        <Model as LayeredArchitecture<WorkspaceBackend, StateType>>::execution_graph_with_metadata(
-            &first, &context
+        <Model as LayeredArchitecture<WorkspaceBackend, StateType>>::execution_graph(
+            &first
         )
         .unwrap()
         .matches(&graph)
@@ -217,16 +218,16 @@ fn retained_inkling_graph_units_preserve_sparse_shared_media_state_and_source_re
         >>::group_transport_matches(&first, group, transport));
     }
     assert_eq!(
-        eredu_runtime::ArchitectureParameters::state_identity_with_metadata(
+        eredu_runtime::ArchitectureParameters::state_identity(
             &first,
             &state_geometry,
             PromptCacheTopology::default(),
-            &context
+            Some(&context)
         )
         .unwrap(),
         identity
     );
-    let description = eredu_runtime::ArchitectureParameters::parameter_description_with_metadata(
+    let description = eredu_runtime::ArchitectureParameters::parameter_description(
         &first, &context,
     )
     .unwrap();
@@ -249,7 +250,7 @@ fn retained_inkling_graph_units_preserve_sparse_shared_media_state_and_source_re
     let refusal = unit(&first, 2, 1, &context).err().unwrap();
     assert!(matches!(
         refusal.into_metadata_funding_error(),
-        Ok(WorkspaceMetadataFundingError::Capacity { .. })
+        Ok(HostMetadataFundingError::Capacity { .. })
     ));
     assert_eq!(context.metadata_census().unwrap().context_bytes(), consumed);
     drop((first, second, source, context));

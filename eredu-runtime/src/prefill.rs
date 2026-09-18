@@ -44,42 +44,18 @@ pub trait PrefillExecutor<R = InferenceRequest> {
     /// Concrete submission failure (translated at the public facade boundary).
     type Error;
 
-    /// Agrees cancellation at a boundary where no chunk remains outstanding.
-    /// Local execution uses the supplied value. Parallel executors must return
-    /// cancellation if any participant requests it, and retain the reservation
-    /// through native consensus and its failure recovery. Every active rank
-    /// enters this boundary, including ranks with no local cancellation request.
-    fn agree_cancellation(
-        &mut self,
-        locally_cancelled: bool,
-        _reservation: R,
-    ) -> Result<bool, Self::Error> {
-        Ok(locally_cancelled)
-    }
-
-    /// Agrees cancellation from the current shared token at the same boundary.
-    /// The default preserves the existing boolean callback. Executors performing
-    /// guarded retirement before consensus override this method to sample after
-    /// that work, immediately before their existing cancellation vote.
-    fn agree_cancellation_with_token(
-        &mut self,
-        cancellation: &GenerationCancellationToken,
-        reservation: R,
-    ) -> Result<bool, Self::Error> {
-        self.agree_cancellation(cancellation.is_cancelled(), reservation)
-    }
-
-    /// The actual shared-driver boundary, including which side of a span was
-    /// reached. The compatibility path preserves existing cancellation hooks.
-    /// A finite control bank must authenticate this descriptor with the same
-    /// request and source; the scalar descriptor itself grants no work.
+    /// Agrees cancellation at the exact shared-driver boundary after retiring
+    /// the preceding span. Local execution samples the current shared token.
+    /// Parallel executors authenticate this boundary against the same request
+    /// and source, retain its reservation through retirement and consensus, and
+    /// sample the token immediately before the vote. Every rank participates.
     fn agree_cancellation_at(
         &mut self,
         _boundary: PrefillBoundary,
         cancellation: &GenerationCancellationToken,
-        reservation: R,
+        _reservation: R,
     ) -> Result<bool, Self::Error> {
-        self.agree_cancellation_with_token(cancellation, reservation)
+        Ok(cancellation.is_cancelled())
     }
 
     /// Submits exactly one admitted span. No state-only vocabulary projection.

@@ -5,7 +5,7 @@ use safemlx::distributed::GroupStorageInventory;
 pub(crate) struct OriginalCommunicatorInventory<'a> {
     native: GroupStorageInventory<'a>,
     source: RetainedCommunicationSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl OriginalCommunicatorInventory<'_> {
     pub(crate) fn native(&self) -> &GroupStorageInventory<'_> { &self.native }
@@ -20,11 +20,11 @@ impl<'a> OriginalCommunicationSource<'a> {
             size_of::<Option<(&Group, &CommunicationGroupDescriptor, bool)>>(),
             size_of::<Option<(&CommunicationRouteRealization, &CommunicationRouteDescriptor, bool)>>(),
             size_of::<Result<(), Error>>(), size_of::<Option<&Group>>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             NativeGroup::storage_inventory_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)
     }
     fn inventory(&self, group: &'a Group) -> Result<OriginalCommunicatorInventory<'a>, Error> {

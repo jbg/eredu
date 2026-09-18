@@ -13,6 +13,44 @@ pub(crate) struct ResidentRecordStorage {
     pub(crate) full_capacity: Option<u64>,
 }
 impl ResidentRecordStorage {
+    fn include_sampling(&mut self, rows: &[ResidentSamplingRecipe], extents: &mut usize) -> Result<bool, crate::backend::error::Error> {
+        let error = crate::backend::error::Error::PrefillControl;
+        let mut complete = true;
+        for row in rows {
+            match row.phase() {
+                SamplingWorkspacePhase::Preparation => {
+                    // Only an observed empty trace or the closed eager U32 key
+                    // constructor has no native evaluation/Record submission.
+                    complete &= row.preparation.is_some() && row.completion().is_none();
+                }
+                SamplingWorkspacePhase::Step { .. } => match row.completion() {
+                    Some(completion) => {
+                        self
+                            .include(completion.traversal, extents)
+                            .map_err(error)?;
+                        self
+                            .include_nested(
+                                completion.traversal,
+                                NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
+                                extents,
+                            )
+                            .map_err(error)?;
+                    }
+                    None => complete = false,
+                },
+            }
+        }
+        Ok(complete)
+    }
+    fn finish_capacity(&mut self, complete: bool, extents: usize) -> Result<(), crate::backend::error::Error> {
+        if complete {
+            let capacity = safemlx::SubmissionRecordQuota::fresh_capacity_for_extents(extents)
+                .ok_or(crate::backend::error::Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            self.full_capacity = Some(u64::try_from(capacity)
+                .map_err(|_| crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow))?);
+        }
+        Ok(())
+    }
     fn include_source_copies(&mut self, copies: host_copies::HostCopies,
         transfers: host_copies::HostTransfers, forwards: usize, extents: &mut usize)
         -> Result<(), WorkingMemoryError> {
@@ -174,7 +212,7 @@ impl ResidentNativeRecipe {
             .map_err(|_| error(WorkingMemoryError::Overflow))?;
             extents = layout.record_extents;
         }
-        let mut complete = !records.is_empty();
+        let mut complete = !records.is_empty() || self.is_terminal_resume();
         for row in records {
             match row.traversal() {
                 Some(traversal) => {
@@ -221,31 +259,7 @@ impl ResidentNativeRecipe {
         }
         // finish() already authenticates the exact plan, every equation row,
         // and Preparation followed by one sampling row per output attempt.
-        for row in self.sampling_records() {
-            match row.phase() {
-                SamplingWorkspacePhase::Preparation => {
-                    // Only an observed empty trace or the closed eager U32 key
-                    // constructor has no native evaluation/Record submission.
-                    complete &= row.preparation.is_some() && row.completion().is_none();
-                }
-                SamplingWorkspacePhase::Step { .. } => match row.completion() {
-                    Some(completion) => {
-                        requirement
-                            .include(completion.traversal, &mut extents)
-                            .map_err(error)?;
-                        requirement
-                            .include_nested(
-                                completion.traversal,
-                                NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
-                                &mut extents,
-                            )
-                            .map_err(error)?;
-                    }
-                    None => complete = false,
-                },
-            }
-        }
-        if complete {
+        complete &= requirement.include_sampling(self.sampling_records(), &mut extents)?;
             // Each Roots/ModelExecution collector is consumed once, even on
             // constructor failure. SamplingEvent has the same submitted-once
             // guard. Sum all attempted constructors: cancellation/failed prefixes
@@ -257,11 +271,17 @@ impl ResidentNativeRecipe {
             // bounded-policy consumer WaitRecords were added separately above.
             // Cross-stream Event/Fence
             // operations execute inside the counted Fixed Eval Record.
-            let capacity = safemlx::SubmissionRecordQuota::fresh_capacity_for_extents(extents)
-                .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?;
-            requirement.full_capacity =
-                Some(u64::try_from(capacity).map_err(|_| error(WorkingMemoryError::Overflow))?);
-        }
+        requirement.finish_capacity(complete, extents)?;
         Ok(requirement)
+    }
+}
+
+impl ResidentSamplingProgram {
+    pub(crate) fn record_storage_requirement(&self) -> Result<ResidentRecordStorage, crate::backend::error::Error> {
+        let mut required = ResidentRecordStorage::default();
+        let mut extents = 0;
+        let complete = required.include_sampling(self.rows(), &mut extents)?;
+        required.finish_capacity(complete, extents)?;
+        Ok(required)
     }
 }

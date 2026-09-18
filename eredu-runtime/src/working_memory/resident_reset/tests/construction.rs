@@ -1,11 +1,11 @@
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 pub(super) const PAYLOAD: usize = 37;
 pub(super) const BYTES: usize =
     PAYLOAD + std::mem::size_of::<Owner>() + std::mem::size_of::<Result<(), BackendFailure>>();
 struct Owner {
     values: Vec<u8>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(false) };
@@ -14,7 +14,7 @@ thread_local! {
 pub(super) fn enabled() -> bool {
     ENABLED.get()
 }
-pub(super) fn prepare(funding: &WorkspaceMetadataFunding) -> Result<(), BackendFailure> {
+pub(super) fn prepare(funding: &HostMetadataFunding) -> Result<(), BackendFailure> {
     funding
         .reserve_metadata(BYTES)
         .map_err(BackendFailure::from_error)?;
@@ -31,7 +31,7 @@ pub(super) fn prepare(funding: &WorkspaceMetadataFunding) -> Result<(), BackendF
     });
     assert!(matches!(
         funding.reserve_metadata(1),
-        Err(WorkspaceMetadataFundingError::Capacity { .. })
+        Err(HostMetadataFundingError::Capacity { .. })
     ));
     Ok(())
 }

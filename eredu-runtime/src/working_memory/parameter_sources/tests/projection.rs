@@ -18,14 +18,18 @@ impl WorkspaceFactMechanisms for Facts {
 }
 struct Module { specs: Vec<ParameterSpec>, values: Vec<WorkspaceTensor> }
 impl Parameterized<WorkspaceTensor> for Module {
-    fn visit_parameters<'a,V:ParameterVisitor<'a,WorkspaceTensor>>(&'a self, visitor:&mut V) {
+    fn visit_parameter_sources<'a,V:eredu_nn::ParameterSourceVisitor<'a,WorkspaceTensor>>(&'a self, visitor:&mut V) -> std::result::Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
         for (spec,value) in self.specs.iter().zip(&self.values) {
-            visitor.visit_borrowed(ParameterMetadataView::from_spec(spec,true),value);
+            visitor.parameter(ParameterMetadataView::from_spec(spec,true),value);
         }
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a,V:ParameterVisitorMut<'a,WorkspaceTensor>>(&'a mut self, visitor:&mut V) {
         for (spec,value) in self.specs.iter().zip(&mut self.values) {
-            visitor.visit_mut_borrowed(ParameterMetadataView::from_spec(spec,true),value);
+            visitor.visit_mut(ParameterMetadataView::from_spec(spec,true),value);
         }
     }
     fn set_trainable(&mut self,_:bool) {}
@@ -85,4 +89,50 @@ fn projection_refuses_foreign_context_and_local_address_before_replacing_slots()
     drop(projection);
     source.addresses.as_mut().unwrap()[1]=source.layout.address(0).unwrap().with_index(7);
     assert!(WorkspaceParameterSourceLoan::new(&source).count().is_err());
+}
+
+#[test]
+fn projection_uses_explicit_independent_ownership_without_hiding_missing_bindings() {
+    use std::error::Error as _;
+    let mut source = source();
+    source.excluded.push("independent.bank".into());
+    let context = WorkspaceContext::new_recording_facts(Facts);
+    let mut projected = WorkspaceParameterSourceLoan::new(&source)
+        .prepare_projection(&context).unwrap();
+    let make = || {
+        let mut unit = module(&source, 0, &context);
+        unit.specs.push(ParameterSpec::trainable("independent.bank").unwrap());
+        unit.values.push(WorkspaceTensor::existing(
+            context.layout(&[3], WorkspaceDtype::Float32).unwrap(), &context).unwrap());
+        unit
+    };
+    let mut unit = make();
+    let bank = unit.values[2].clone();
+    projected.bind(&mut unit, 0, source.execution_address(0).unwrap(), &context).unwrap();
+    assert_eq!(retained(&context, &unit.values), 20);
+    assert_eq!(retained(&context, &[bank.clone(), unit.values[2].clone()]), 12,
+        "the independent bank slot retains its existing owner without a replacement");
+
+    let mut ordinary = make();
+    let weights = source.units[0].1.iter().zip(&unit.values).map(|(row, value)|
+        (eredu_nn::ParameterId::new(row.binding.name()).unwrap(), value.clone())).collect();
+    crate::working_memory::bind_workspace_parameters(&mut ordinary, weights,
+        |id| source.excludes_parameter(id.as_str())).unwrap();
+    assert_eq!(retained(&context, &ordinary.values), 20);
+
+    let mut missing = make();
+    missing.specs[1] = ParameterSpec::trainable("missing.unit.weight").unwrap();
+    let before = missing.values.clone();
+    let error = projected.bind(&mut missing, 0, source.execution_address(0).unwrap(), &context).unwrap_err();
+    assert!(matches!(error.source().unwrap().downcast_ref::<crate::PreparedParameterBindingError<
+        crate::working_memory::PreparedWorkspaceBindingCause>>(),
+        Some(crate::PreparedParameterBindingError::MissingBinding)));
+    assert_eq!(retained(&context, &before.into_iter().chain(missing.values).collect::<Vec<_>>()), 28,
+        "a missing nonbank parameter refuses before any earlier slot is replaced");
+
+    drop(projected);
+    drop(source);
+    assert_eq!(retained(&context, &unit.values), 20,
+        "bound and excluded values retain their owners after the source projection retires");
+    assert_eq!(context.report_scalars(&unit.values).unwrap().tensor_buffers.total_bytes, Some(0));
 }

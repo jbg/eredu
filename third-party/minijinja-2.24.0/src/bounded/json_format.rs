@@ -211,6 +211,7 @@ impl Format<'_> {
                 if let Node::Custom(custom) = value {
                     match view.project(custom)? {
                         Projection::Json(json) => value = Node::Json(json),
+                        Projection::JsonArray(values) => value = Node::JsonArray(values),
                         Projection::Record(record) => value = Node::Record(record),
                         Projection::Scalar => view.scalar(self, output, custom)?,
                         Projection::Container { object, length } => {
@@ -224,6 +225,14 @@ impl Format<'_> {
                     }
                 }
                 match value {
+                    Node::JsonArray(values) => {
+                        if values.is_empty() {
+                            output.write_str("[]")?;
+                        } else {
+                            scratch.push_array(values)?;
+                            output.write_char('[')?;
+                        }
+                    }
                     Node::Json(Value::Array(values)) if values.is_empty() => {
                         output.write_str("[]")?
                     }

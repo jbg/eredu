@@ -13,6 +13,7 @@ mod reservation_metadata;
 mod speculative;
 mod thread_startup;
 mod workspace_planning;
+pub use workspace_planning::SessionResetPreparationFunding;
 use control_mutex::ControlMutex;
 pub use original_prepared_input::{OriginalPreparedHostInput, OriginalPreparedHostInputError};
 pub(crate) use qualified_storage::shared_bytes as qualified_shared_bytes;
@@ -88,6 +89,7 @@ pub(crate) use capture_run::{CaptureRunLedger, CaptureRunLedgerGuard};
 
 mod text_preparation;
 pub use text_preparation::{
+    PendingSamplingExtension, PendingTextBranchExchange,
     InferencePreparationStage, InferencePromptCompletion, InferenceSamplerCompletion,
     InferenceTextPreparation, InferenceTextStep, InferenceTextStepReceipt,
 };
@@ -162,6 +164,7 @@ pub use decoder_copy::{
 mod controller;
 pub use controller::{
     ControllerStorageContract, ControllerStorageError, ControllerWorkspaceContribution,
+    PreparedControllerBinding, PreparedControllerBindingError,
     ControllerWorkspaceEstimate, ControllerWorkspaceMetadataError, RegisteredControllerStorage,
 };
 mod preparation;
@@ -187,7 +190,7 @@ pub use layerwise_window::{
 };
 mod sampling;
 pub use sampling::{
-    SamplingWorkspaceObserver, SamplingWorkspacePhase, SamplingWorkspaceReport,
+    SamplingWorkspaceObserver, SamplingWorkspacePhase, SamplingWorkspaceReport, SamplingWorkspaceInputPlan,
     WorkspaceSamplingBackend, WorkspaceSamplingInput, WorkspaceSamplingRandomState,
     WorkspaceSamplingSource, quote_sampling_workspace, quote_sampling_workspace_with_observer,
 };
@@ -195,7 +198,7 @@ mod trace;
 pub use trace::with_equation_workspace;
 mod inference;
 pub use inference::{
-    InferenceObservationError, InferenceResidualWorkspace, InferenceSpanWorkspacePlan,
+    InferenceObservationError, InferenceResidualWorkspace, InferenceSpanWorkspacePlan, SamplingWorkspacePlanCollector,
     InferenceSpanWorkspaceRecord, InferenceWorkspaceError, InferenceWorkspaceObserver,
     InferenceWorkspaceReport, InferenceWorkspaceSpan, quote_inference_workspace,
     quote_inference_workspace_with_context, quote_inference_workspace_with_report_owner,
@@ -203,6 +206,7 @@ pub use inference::{
 mod residual;
 pub use residual::{
     AdmittedCaptureContinuation, AdmittedPrefillCapture, AggregateGenerationDecoderInput,
+    SamplingExtensionQuote, OriginalTextSamplingExtension,
     CopyPreparationInferenceQuote, FailedCapturePlanPublication, GraphMetadataFacts,
     HostDestinationCause, HostDestinationFacts, HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, IncompleteWorkspace,
     IncrementalInferenceQuote, InferenceSpanWorkspace, LoadedGenerationDecoderInput,
@@ -421,20 +425,29 @@ fn plan_prefill_candidates<Q, T>(
             // are not smaller-chunk rejections; preserve their original cause.
             Err(error) => return Err(CandidateFailure::Terminal(error)),
         };
-        result.map_err(|error| match error {
-            error @ PrefillPlanningError::IncompleteWorkspace(_)
-            | error @ PrefillPlanningError::Reservation(
-                WorkingMemoryError::BudgetExceeded { .. }
-                | WorkingMemoryError::SubmissionTrackingCapacity { .. }
-                | WorkingMemoryError::GraphMetadataCapacity { .. },
-            )
-            | error @ PrefillPlanningError::Admission(
-                eredu_core::AdmissionRejection::MemoryBudgetExceeded { .. }
-                | eredu_core::AdmissionRejection::EstimationUnsupported { .. },
-            ) => CandidateFailure::SmallerChunk(error),
-            error => CandidateFailure::Terminal(error),
+        result.map_err(|error| match candidate_can_shrink(&error) {
+            true => CandidateFailure::SmallerChunk(error),
+            false => CandidateFailure::Terminal(error),
         })
     })
+}
+
+fn candidate_can_shrink(error: &PrefillPlanningError) -> bool {
+    match error {
+        PrefillPlanningError::IncompleteWorkspace(_)
+        | PrefillPlanningError::Reservation(
+            WorkingMemoryError::BudgetExceeded { .. }
+            | WorkingMemoryError::SubmissionTrackingCapacity { .. }
+            | WorkingMemoryError::GraphMetadataCapacity { .. },
+        )
+        | PrefillPlanningError::Admission(
+            eredu_core::AdmissionRejection::MemoryBudgetExceeded { .. }
+            | eredu_core::AdmissionRejection::EstimationUnsupported { .. },
+        ) => true,
+        PrefillPlanningError::Reservation(WorkingMemoryError::ReservationMetadata(error)) =>
+            error.planning_error().is_some_and(candidate_can_shrink),
+        _ => false,
+    }
 }
 
 // One traversal for legacy owned diagnostics and original borrowed requirements.
@@ -454,7 +467,9 @@ fn select_prefill_candidate<T, E>(
             Ok(output) => return Ok(output),
             Err(CandidateFailure::Terminal(error)) => return Err(error),
             Err(CandidateFailure::SmallerChunk(error)) => {
-                if geometry.prefill_chunk_positions == 1 {
+                // A terminal saved-state placement has no prefill at all.
+                // Its refusal cannot be repaired by choosing a smaller chunk.
+                if geometry.prefill_chunk_positions <= 1 {
                     return Err(error);
                 }
                 geometry.prefill_chunk_positions -= 1;
@@ -797,13 +812,6 @@ impl<'h> PreparedAccountCommit<'h> {
                     used_bytes: used,
                 })?;
         if required > available {
-            if std::env::var_os("EREDU_WORKSPACE_LEDGER_TRACE").is_some() {
-                eprintln!(
-                    "WORKSPACE_LEDGER_REFUSAL required={required} available={available} capacity={capacity_bytes} existing={} usage={usage:?}",
-                    pool.0.existing
-                );
-                usage.funding.trace_accounts();
-            }
             return Err(WorkingMemoryError::BudgetExceeded {
                 required_bytes: required,
                 available_bytes: available,
@@ -1012,7 +1020,7 @@ impl WorkingMemoryPool {
         residual: Option<(u64, residual::RegisteredStoragePin)>,
         handoffs: &[WorkingMemoryCapacityHandoff],
         source: Option<&dyn saved_source::SavedSourceValidation>,
-        planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<WorkingMemoryReservation, WorkingMemoryError> {
         // This owner is declared before all staged metadata and the usage loan.
         // Fixed failures release their unpublished prefixes before it retires.
@@ -1271,7 +1279,7 @@ struct Reservation {
     span_workspace: Option<residual::SpanWorkspaceIdentity>,
     start: ControlMutex<text_preparation::RequestStart>,
     // Independent initial metadata admission, last through the closed owner.
-    planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 #[derive(Debug)]
@@ -1598,7 +1606,7 @@ pub use storage::{
 pub(crate) mod resident_reset;
 pub use resident_reset::{
     HostSlotSource, OriginalResidentResetSource, PreparedResidentEmptyState,
-    PreparedResidentKvReset, ResidentEmptyStateError, ResidentKvResetLayer, ResidentKvResetState,
+    PreparedResidentKvReset, ResidentEmptyStateError, ResidentKvResetLayer,
     ResidentResetDisplaced, ResidentResetError, ResidentResetInstallation, ResidentResetProjection,
     ResidentResetPublicationCustody, ResidentResetPublicationProfile, ResidentResetSession,
     ResidentResetSource, ResidentTableResetState, UnquotedOriginalSlotSources,
@@ -1607,22 +1615,24 @@ pub use resident_reset::{
 mod original_chat;
 mod original_file;
 pub use original_chat::{
-    OriginalChatBackend, OriginalChatFileError, OriginalChatOperationError,
+    ControllerCompilationOutput, ControllerCompilationSources, OriginalControllerCompiler,
+    OriginalControllerCompilation, OriginalControllerCompilationError,
+    OriginalChatBackend, OriginalChatFileError, OriginalChatSourceError, OriginalChatRenderOperationError,
     OriginalChatProfileError, OriginalChatProfilePreparation, OriginalChatRenderError,
-    OriginalChatTemplate, OriginalChatTemplateError, OriginalRenderedChat,
+    OriginalChatTemplate, OriginalChatTemplateError, OriginalRenderedChat, OriginalChatConsumer, OriginalChatConsumerError,
 };
 
 mod original_tokenizer;
 pub use original_tokenizer::{
     OriginalEncodedTokenIds, OriginalTextSourceBudget, OriginalTextSourceBudgetError,
-    OriginalTextSourceError, OriginalTokenizer, OriginalTokenizerBackend,
-    OriginalTokenizerEncodeError, OriginalTokenizerError, OriginalTokenizerFileError,
+    OriginalTextSourceError, OriginalTokenizerSourceError, OriginalTokenizer, OriginalTokenizerBackend,
+    OriginalTokenizerEncodeError, OriginalTokenizerError, OriginalTokenizerPrefixError, OriginalTokenizerInput, OriginalTokenizerInputError,
 };
 
 mod original_composite_semantics;
 pub use original_composite_semantics::{
     BoundCompositeSemanticStorage, CompositeSemanticCoordinates, CompositeSemanticDiagnostic,
-    CompositeSemanticPartRecord, CompositeSemanticRole, CopiedMediaStateBinding,
+    CompositeChatProjection, CompositeGeneratedText, CompositeSemanticPartRecord, CompositeSemanticRole, CopiedMediaStateBinding,
     MediaSessionBinding, OriginalCompositeSemanticStorage, OriginalCompositeSemanticStorageError,
     PreparedCompositeSemanticBuilder, PreparedCompositeSemanticLayout,
     PreparedCompositeSemanticRecipe,
@@ -1640,10 +1650,10 @@ pub use residual::{
     NativeStorageCarryoverReport,
 };
 
-mod speculative_plain_text;
-pub use speculative_plain_text::{
-    OriginalSpeculativeHostError, OriginalSpeculativePlainText,
-    OriginalSpeculativeSemanticPreparation,
+mod prepared_semantic;
+pub use prepared_semantic::{
+    OriginalSpeculativeHostError, PreparedSemanticState,
+    PreparedSemanticSource,
 };
 mod decoder_transition;
 
@@ -1658,7 +1668,7 @@ pub use original_intervention_source::{
 // Closed fixed summary destinations share the existing original capture account.
 pub use capture_run::{
     CaptureHistogramClaim, CaptureHistogramFailure, CaptureHistogramHostPlan, CaptureSummaryClaim,
-    CaptureSummaryFailure, CaptureSummaryHostPlan, ClaimedCaptureHistogram, ClaimedCaptureSummary,
+    CaptureSummaryFailure, CaptureSummaryHostPlan, CaptureHostF32, ClaimedCaptureHistogram, ClaimedCaptureSummary,
     ScheduledCaptureHistogram, ScheduledCaptureHistogramTransfer, ScheduledCaptureSummaryTransfer,
 };
 mod original_forbidden_source;
@@ -1702,6 +1712,7 @@ pub(crate) use capture_run::{PartitionLocalCaptureHook,PartitionCaptureHookConti
 
 pub(crate) use capture_run::{PreparedPartitionFragmentDelivery,PartitionCaptureRankSource};
 
+mod original_json_allocation;
 mod original_json_tree;
 pub use original_json_tree::{
     OriginalJsonChildren, OriginalJsonNode, OriginalJsonNumber, OriginalJsonTree, OriginalJsonTreeError,

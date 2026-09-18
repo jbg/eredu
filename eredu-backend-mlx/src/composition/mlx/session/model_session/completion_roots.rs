@@ -278,7 +278,7 @@ mod tests {
                 validation_handle
             );
             assert_eq!(roots.validate_completed().is_ok(), token < 4);
-            let status = observation.finish();
+            let status = observation.finish().unwrap();
             assert!(status.settled && !status.failed && !status.blocked);
             authority.require_idle().unwrap();
         }

@@ -24,9 +24,9 @@ impl MinPropertiesValidator {
         location: Location,
     ) -> CompilationResult<'a, F> {
         let Some(limit) = size_limit(ctx, schema) else {
-            return Err(fail_on_non_positive_integer(schema, location));
+            return Err(fail_on_non_positive_integer(schema, location).into());
         };
-        Ok(Box::new(MinPropertiesValidator { limit, location }))
+        Ok(ctx.funding().boxed(MinPropertiesValidator { limit, location })?)
     }
 }
 
@@ -41,6 +41,9 @@ impl<F: Json> Validate<F> for MinPropertiesValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             if (object.len() as u64) < self.limit {
@@ -50,22 +53,16 @@ impl<F: Json> Validate<F> for MinPropertiesValidator {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(object) = instance.as_object() {
             if (object.len() as u64) < self.limit {
-                return Err(ValidationError::min_properties(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.limit,
-                ));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| Ok(crate::error::ValidationErrorKind::MinProperties { limit: self.limit }));
             }
         }
         Ok(())
@@ -78,7 +75,7 @@ pub(crate) fn compile<'a, F: Json>(
     _: &'a Map<String, Value>,
     schema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    let location = ctx.location().join("minProperties");
+    let location = crate::keywords::try_compile!(ctx.location().join_with_funding("minProperties", ctx.funding()));
     Some(MinPropertiesValidator::compile(ctx, schema, location))
 }
 

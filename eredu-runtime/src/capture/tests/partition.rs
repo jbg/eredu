@@ -245,7 +245,7 @@ fn partition_fragments_reconstruct_global_strided_values_and_exact_integer_ids()
             shape: vec![3, 20],
             data,
         };
-        let mut ordinary = CaptureSession::new(plan.clone());
+        let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
         ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
         ordinary
             .observe(&mut Backend::default(), "block.output", &global)

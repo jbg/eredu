@@ -83,6 +83,8 @@ impl MlxNeuralBackend {
     /// If the owner thread exits before reclamation, these resources remain retained.
     /// If a resource destructor panics, the rest of that detached batch remains
     /// permanently retained instead of running more destructors during unwinding.
+    /// Ready submission, host, ordinary and native-owner queues are drained until
+    /// no owner retires. Unresolved submissions remain quarantined without waiting.
     pub fn reclaim_retired_resources() {
         if !safemlx::can_reclaim_submission_resources() {
             return;
@@ -98,33 +100,40 @@ impl MlxNeuralBackend {
                 }
             }
             let _reset = Reset(reclaiming);
-            crate::backend::submission_recovery::reap();
-            let pending = RETIRED_HOST_RESOURCES
-                .try_with(|retired| {
-                    retired
-                        .try_borrow_mut()
-                        .ok()
-                        .and_then(|mut retired| retired.0.take())
-                })
-                .ok()
-                .flatten();
-            let mut pending = RetiredHostResources(pending);
-            while let Some(node) = pending.0.as_mut() {
-                if let Some(value) = node.values.pop() {
-                    // If this destructor panics, the snapshot's Drop retains
-                    // every remaining value rather than invoking more user
-                    // destructors during unwinding.
-                    drop(value);
-                } else {
-                    let mut node = pending.0.take().expect("current retired node");
-                    pending.0 = node.next.take();
-                    drop(node);
+            loop {
+                let mut reclaimed = crate::backend::submission_recovery::reap_with_progress();
+                let pending = RETIRED_HOST_RESOURCES
+                    .try_with(|retired| {
+                        retired
+                            .try_borrow_mut()
+                            .ok()
+                            .and_then(|mut retired| retired.0.take())
+                    })
+                    .ok()
+                    .flatten();
+                let mut pending = RetiredHostResources(pending);
+                while let Some(node) = pending.0.as_mut() {
+                    if let Some(value) = node.values.pop() {
+                        // If this destructor panics, the snapshot's Drop retains
+                        // every remaining value rather than invoking more user
+                        // destructors during unwinding.
+                        drop(value);
+                        reclaimed = true;
+                    } else {
+                        let mut node = pending.0.take().expect("current retired node");
+                        pending.0 = node.next.take();
+                        drop(node);
+                        reclaimed = true;
+                    }
+                }
+                reclaimed |= crate::backend::ordinary_retirement::reclaim();
+                // Array retirement callbacks can stage more host/ordinary owners,
+                // and their destructors can in turn retire more native backing.
+                reclaimed |= safemlx::reclaim_allocation_owners() != 0;
+                if !reclaimed {
+                    break;
                 }
             }
-            crate::backend::ordinary_retirement::reclaim();
-            // Dropping retired arrays can enqueue the last physical allocation
-            // owner. Publish that retirement before the next domain admission.
-            safemlx::reclaim_allocation_owners();
         });
     }
 }
@@ -354,6 +363,67 @@ mod consumer_scope_tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn explicit_reclamation_finishes_cross_queue_retirement_without_waiting_for_pending_work() {
+        use crate::backend::ordinary_retirement::OrdinaryRetirement;
+
+        struct HostToOrdinary(Arc<AtomicUsize>);
+        impl Drop for HostToOrdinary {
+            fn drop(&mut self) {
+                drop(OrdinaryRetirement::new(DropWitness(Arc::clone(&self.0))));
+            }
+        }
+        struct NativeToHost(Arc<AtomicUsize>);
+        impl Drop for NativeToHost {
+            fn drop(&mut self) {
+                assert!(safemlx::can_reclaim_submission_resources());
+                drop(HostResources::new(vec![Box::new(HostToOrdinary(Arc::clone(
+                    &self.0,
+                )))]));
+            }
+        }
+        struct PendingRetention(Arc<AtomicUsize>);
+        impl Retention for PendingRetention {
+            fn observe(&self, _: Status) {}
+        }
+        impl Drop for PendingRetention {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pending_drops = Arc::new(AtomicUsize::new(0));
+        let pending_status = Rc::new(Cell::new(Status {
+            settled: false,
+            failed: false,
+            blocked: false,
+        }));
+        drop(Recovery::with_probe(
+            PendingRetention(Arc::clone(&pending_drops)),
+            FakeProbe(Rc::clone(&pending_status)),
+        ));
+
+        let array = Array::from_slice(&[1.25f32, -2.5], &[2]);
+        array.evaluated().unwrap();
+        array
+            .retain_allocation_owner(NativeToHost(Arc::clone(&drops)))
+            .unwrap();
+        drop(OrdinaryRetirement::new(array));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        MlxNeuralBackend::reclaim_retired_resources();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(pending_drops.load(Ordering::SeqCst), 0);
+
+        pending_status.set(Status {
+            settled: true,
+            failed: false,
+            blocked: false,
+        });
+        MlxNeuralBackend::reclaim_retired_resources();
+        assert_eq!(pending_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -634,14 +704,14 @@ impl CommunicationBackend for MlxNeuralBackend {
     fn with_prepared_expert_route_indices<T,E,F>(value:&MlxTensor,context:&Group,
         executor:&Stream,run:F)->Result<Result<T,E>,Self::CommunicationError>
     where F:for<'loan> FnOnce(Option<(&'loan[i32],
-        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+        &'loan eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
         prepared_collectives::expert_input::with_indices(value,context,executor,run)
     }
     fn with_prepared_peer_count_consensus<T, E, F>(
         local: &[i32], group: &Group, context: &Group, executor: &Stream, run: F,
     ) -> Result<Result<T, E>, Self::CommunicationError>
     where F: for<'loan> FnOnce(Option<(&'loan [i32],
-        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &'loan eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         Self::with_parallel_control_context(context, |source| {
             let Some(_) = source else { return Ok(run(None)); };
@@ -687,7 +757,7 @@ impl CommunicationBackend for MlxNeuralBackend {
         Ok(None)
     }
     fn with_prepared_publication_group<T,E,F>(group:&Group,prepared:&Group,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,executor:&Stream,run:F)
+        funding:&eredu_nn::workspace::HostMetadataFunding,executor:&Stream,run:F)
         ->Result<Result<T,E>,Self::CommunicationError>
     where F:FnOnce(Option<&Group>)->Result<T,E> {
         prepared.with_prepared_publication_group(group,funding,executor,run)
@@ -695,7 +765,7 @@ impl CommunicationBackend for MlxNeuralBackend {
 
     fn with_parallel_control_context<T,E,F>(prepared:&Group,run:F)
         ->Result<Result<T,E>,Self::CommunicationError>
-    where F:FnOnce(Option<(&Group,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&Group,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>, {
         if let Some(request)=prepared.original_control_request() {
             return request.with_context(prepared,run);
         }
@@ -709,7 +779,7 @@ impl CommunicationBackend for MlxNeuralBackend {
     }
     fn with_prepared_control_group<T,E,F>(
         event:eredu_runtime::replicated_session::ParallelControlEvent,
-        group:&Group,prepared:&Group,funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        group:&Group,prepared:&Group,funding:&eredu_nn::workspace::HostMetadataFunding,
         executor:&Stream,run:F,
     )->Result<Result<T,E>,Self::CommunicationError>
     where F:FnOnce(Option<&Group>)->Result<T,E>, {
@@ -771,23 +841,23 @@ impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
     for MlxCommunicationTensorMetadata
 {
     fn matches_shape_with_funding(&self,tensor:&MlxTensor,shape:&[i32],
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
-        ->Result<Option<bool>,eredu_nn::workspace::WorkspaceMetadataFundingError>{
-        let parts=[std::mem::size_of::<(&Self,&MlxTensor,&[i32],&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
-            std::mem::size_of::<Result<Option<bool>,eredu_nn::workspace::WorkspaceMetadataFundingError>>()];
+        funding:&eredu_nn::workspace::HostMetadataFunding)
+        ->Result<Option<bool>,eredu_nn::workspace::HostMetadataFundingError>{
+        let parts=[std::mem::size_of::<(&Self,&MlxTensor,&[i32],&eredu_nn::workspace::HostMetadataFunding)>(),
+            std::mem::size_of::<Result<Option<bool>,eredu_nn::workspace::HostMetadataFundingError>>()];
         funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow)?)?;
+            .ok_or(eredu_nn::workspace::HostMetadataFundingError::Overflow)?)?;
         Ok(Some(tensor.as_array().shape()==shape))
     }
     fn fixed_metadata_with_funding(&self,tensor:&MlxTensor,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
-        ->Result<Option<(TensorDtype,usize,Option<usize>)>,eredu_nn::workspace::WorkspaceMetadataFundingError> {
-        use eredu_nn::workspace::WorkspaceMetadataFundingError;
-        let frames=[std::mem::size_of::<(&Self,&MlxTensor,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+        funding:&eredu_nn::workspace::HostMetadataFunding)
+        ->Result<Option<(TensorDtype,usize,Option<usize>)>,eredu_nn::workspace::HostMetadataFundingError> {
+        use eredu_nn::workspace::HostMetadataFundingError;
+        let frames=[std::mem::size_of::<(&Self,&MlxTensor,&eredu_nn::workspace::HostMetadataFunding)>(),
             std::mem::size_of::<(TensorDtype,usize,Option<usize>)>(),std::mem::size_of::<std::slice::Iter<'_,i32>>(),
-            std::mem::size_of::<Result<Option<(TensorDtype,usize,Option<usize>)>,WorkspaceMetadataFundingError>>()];
+            std::mem::size_of::<Result<Option<(TensorDtype,usize,Option<usize>)>,HostMetadataFundingError>>()];
         funding.reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-            .ok_or(WorkspaceMetadataFundingError::Overflow)?)?;
+            .ok_or(HostMetadataFundingError::Overflow)?)?;
         let array=tensor.as_array();
         let elements=array.shape().iter().try_fold(1usize,|count,&dim|usize::try_from(dim).ok().and_then(|dim|count.checked_mul(dim)));
         Ok(Some((crate::tensor::portable_dtype(array.dtype()),array.ndim(),elements)))
@@ -808,6 +878,11 @@ impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
 }
 
 impl SumReductionBackend for MlxNeuralBackend {
+    fn complete_model_sum_wave<E,V>(values:&[MlxTensor],group:&Group,context:&Group,executor:&Stream,validate:V)
+        ->Result<Option<Vec<MlxTensor>>,eredu_core::BackendFailure>
+    where E: std::error::Error + Send + Sync + 'static, V:FnMut(&[MlxTensor],&eredu_nn::workspace::HostMetadataFunding,bool)->Result<(),E> {
+        prepared_collectives::sum_wave(values,group,context,executor,validate)
+    }
     fn complete_model_sum(value:&MlxTensor,group:&Group,context:&Group,executor:&Stream)
         ->Result<Option<MlxTensor>,Self::CommunicationError>{
         prepared_collectives::sum(value,group,context,executor)
@@ -906,7 +981,7 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
         value: &MlxTensor, counts: &CommunicationPeerCounts, axis: usize,
         matrix: &eredu_runtime::CommunicationPeerMatrix<'_>, group: &Group,
         context: &Group, executor: &Stream,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Option<MlxTensor>, Self::CommunicationError> {
         Self::with_parallel_control_context(context, |source| {
             let Some((_, actual)) = source else { return Ok(None); };
@@ -1036,7 +1111,7 @@ impl BroadcastBackend for MlxNeuralBackend {
                 std::mem::size_of::<Submission<MlxTensor,Self::CommunicationCompletion>>(),
                 std::mem::size_of::<Result<Submission<MlxTensor,Self::CommunicationCompletion>,Self::CommunicationError>>()];
             funding.reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-                .ok_or(crate::backend::error::Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+                .ok_or(crate::backend::error::Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
                 .map_err(crate::backend::error::Error::WorkspacePlanning)?;
         }
         if let Some(result)=group.publish_original(value.as_array(),root,executor) {

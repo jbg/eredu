@@ -134,17 +134,10 @@ pub(in crate::composition::mlx::session) fn retain_failure(
         _host: authority.clone(),
     }))
 }
-#[track_caller]
 pub(super) fn retain_operation_failure(
     cause: Error,
     authority: &HostPreparationAuthority,
 ) -> Error {
-    if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-        eprintln!(
-            "HOST_SAVED_OPERATION_FAILURE at {}: {cause:?}",
-            std::panic::Location::caller()
-        );
-    }
     Error::StorageSource(BackendFailure::from_error(SourceOperationFailure {
         cause,
         _host: authority.clone(),
@@ -195,23 +188,17 @@ impl PreparedTextComponentsCopy<'_> {
                 ),
             ),
         };
-        inspect_live(runtime, sampling, decode, capture).map_err(|cause| {
-            diagnose("live-source", &cause);
-            match cause {
-                SourcePreparationCause::Memory(cause) => cause,
-                SourcePreparationCause::Sampler(SamplerCopyError::Overflow) => {
-                    WorkingMemoryError::Overflow
-                }
-                _ => WorkingMemoryError::UnknownBound,
+        inspect_live(runtime, sampling, decode, capture).map_err(|cause| match cause {
+            SourcePreparationCause::Memory(cause) => cause,
+            SourcePreparationCause::Sampler(SamplerCopyError::Overflow) => {
+                WorkingMemoryError::Overflow
             }
+            _ => WorkingMemoryError::UnknownBound,
         })?;
         let owner = DecoderCopyOwner::Live(runtime.session().payload.clone());
-        let decoder = owner.prepare_fixed().map_err(|cause| {
-            diagnose("decoder-source", &cause);
-            match cause {
-                ResidentDecoderPreparationError::Memory(cause) => cause,
-                _ => WorkingMemoryError::UnknownBound,
-            }
+        let decoder = owner.prepare_fixed().map_err(|cause| match cause {
+            ResidentDecoderPreparationError::Memory(cause) => cause,
+            _ => WorkingMemoryError::UnknownBound,
         })?;
         let mechanisms = runtime
             .session()
@@ -230,24 +217,11 @@ impl PreparedTextComponentsCopy<'_> {
             mechanisms,
             runtime.backend(),
         )
-        .map_err(|cause| {
-            diagnose("finite-copy", &cause);
-            match cause {
-                finite_preparation::FinitePreparationCause::Memory(cause) => cause,
-                finite_preparation::FinitePreparationCause::Overflow => {
-                    WorkingMemoryError::Overflow
-                }
-                _ => WorkingMemoryError::UnknownBound,
-            }
+        .map_err(|cause| match cause {
+            finite_preparation::FinitePreparationCause::Memory(cause) => cause,
+            finite_preparation::FinitePreparationCause::Overflow => WorkingMemoryError::Overflow,
+            _ => WorkingMemoryError::UnknownBound,
         })?;
         Ok(plan.known_component_bytes())
-    }
-}
-
-// Temporary opt-in diagnostic while the reached public Host lifecycle is being
-// localized. It changes no source/admission decision and runs only on refusal.
-fn diagnose(stage: &str, cause: &impl std::fmt::Debug) {
-    if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-        eprintln!("HOST_SAVED_SOURCE_FAILURE {stage}: {cause:?}");
     }
 }

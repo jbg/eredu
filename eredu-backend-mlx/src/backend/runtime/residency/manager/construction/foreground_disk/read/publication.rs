@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::runtime::residency::storage::filled_host;
 use eredu_runtime::working_memory::{HostSourcePeakSelection, OriginalHostSourceReceipt};
-pub(super) use filled_host::{Pending, SourceCause, SourceError};
+pub(super) use filled_host::{Pending, PublishedHostSource, SourceCause, SourceError};
 
 struct Peak<'a> {
     capacity: &'a ForegroundDiskSourceCapacity,
@@ -44,6 +44,6 @@ pub(super) fn begin<'a>(
 }
 pub(super) fn finish(
     pending: Pending,
-) -> Result<(ImmutableHostTransferBuffer, safemlx::AllocationInfo), SourceError> {
+) -> Result<PublishedHostSource, SourceError> {
     filled_host::finish(pending)
 }

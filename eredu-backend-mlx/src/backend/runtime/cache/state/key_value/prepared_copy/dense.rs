@@ -91,7 +91,7 @@ impl<'a> PreparedResidentKvCopy<'a> {
     pub(crate) fn copy_dense_with_preparation(
         self,
         host: &eredu_core::HostPreparationAuthority,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<MlxKeyValueState, Error> {
@@ -359,3 +359,5 @@ impl std::error::Error for DenseResidentKvPublishError<'_> {
     not(feature = "cuda")
 ))]
 mod tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

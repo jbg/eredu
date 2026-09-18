@@ -19,7 +19,7 @@ fn independent_batch_cursors_keep_geometry_spending_and_continuation_per_request
     let execution = InferenceExecutionIdentity::default();
     let funding = pool.prepare_workspace_metadata(&execution, 1 << 20).unwrap();
     let bytes = SpeculativeBuffer::<RefCell<AutoregressiveOccurrenceCursor<'_>>>::retained_control_bytes(2).unwrap()
-        + HostPreparationAuthority::retention_bytes::<eredu_nn::workspace::WorkspaceMetadataFunding>().unwrap();
+        + HostPreparationAuthority::retention_bytes::<eredu_nn::workspace::HostMetadataFunding>().unwrap();
     funding.reserve_metadata(bytes).unwrap();
     let mut cursors = SpeculativeBuffer::try_new_retained(2, HostPreparationAuthority::retain(funding.clone())).unwrap();
     cursors.try_push(RefCell::new(first.into_cursor())).unwrap();

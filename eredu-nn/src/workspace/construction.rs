@@ -49,7 +49,7 @@ impl WorkspaceContext {
             size_of::<WorkspaceMetadataError>(),
             size_of::<Result<Self, WorkspaceMetadataError>>(),
             size_of::<Result<(), WorkspaceMetadataError>>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             metadata_funding::reservation_control_bytes(),
             size_of::<RefCell<Option<WorkspaceBorrowedStorage>>>(),
         ];
@@ -97,7 +97,7 @@ impl WorkspaceImportError {
     pub(super) fn ordinary(self) -> Error {
         match self {
             Self::Context => Error::backend("existing storage belongs to another workspace trace"),
-            Self::Reserve(cause) => Error::backend_source(cause),
+            Self::Reserve(cause) => Error::backend_retained_source(cause),
             Self::Metadata(cause) => cause,
         }
     }

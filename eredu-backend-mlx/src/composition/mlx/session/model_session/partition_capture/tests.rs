@@ -123,7 +123,8 @@ fn verify_capture_failures(device: safemlx::DeviceType) {
                     },
                 )
                 .unwrap();
-                let mut capture = CaptureSession::new(plan);
+                let mut capture =
+                    CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
                 let checkpoint = capture.checkpoint(&discovery).unwrap();
                 let prediction = u64::from(decode);
                 if fail {
@@ -185,7 +186,10 @@ fn verify_capture_failures(device: safemlx::DeviceType) {
                         find_source::<Exception>(&public).expect("original native cause");
                     assert_eq!(original.what(), expected.0);
                     assert_eq!(original.location(), expected.1);
-                    let failed = capture.take_step().unwrap();
+                    let failed = capture
+                        .take_shared_step()
+                        .map(|frame| frame.as_step().clone())
+                        .unwrap();
                     assert!(matches!(
                         failed.records[0].outcome,
                         CaptureOutcome::Failed {
@@ -222,7 +226,10 @@ fn verify_capture_failures(device: safemlx::DeviceType) {
                 .wait()
                 .unwrap();
                 let logits = output.evaluated().unwrap().as_slice::<f32>().to_vec();
-                let captured = capture.take_step().unwrap();
+                let captured = capture
+                    .take_shared_step()
+                    .map(|frame| frame.as_step().clone())
+                    .unwrap();
                 let CapturePayload::Tensor(units) = captured.records[0].payload.as_ref().unwrap()
                 else {
                     panic!("component tensor");

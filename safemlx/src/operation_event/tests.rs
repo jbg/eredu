@@ -6,6 +6,7 @@ mod graph_construction;
 mod original_array;
 mod owned_host_copy;
 mod prepared_clones;
+mod scheduled_nested;
 use crate::{
     Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy, PrefillRootsRuntime,
     PreparedPrefillFailure, PreparedSubmissionGraphQuota, PreparedSubmissionRecordQuota,
@@ -27,6 +28,9 @@ struct Original {
 const GRAPH_CAPACITY: usize = 4 << 20;
 impl Original {
     fn new() -> Self {
+        Self::with_failure_owner(())
+    }
+    fn with_failure_owner(owner: impl Send + 'static) -> Self {
         let graph = PreparedSubmissionGraphQuota::try_new(GRAPH_CAPACITY, ())
             .unwrap()
             .try_allocate()
@@ -35,7 +39,7 @@ impl Original {
             .unwrap()
             .try_allocate()
             .unwrap();
-        let failure = PreparedPrefillFailure::try_new(())
+        let failure = PreparedPrefillFailure::try_new(owner)
             .unwrap()
             .try_allocate()
             .unwrap();

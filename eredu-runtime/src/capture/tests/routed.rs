@@ -8,7 +8,7 @@ fn draining_an_incomplete_sparse_step_fails_every_pending_selection() {
         selection.id = id.into();
         plan.selections.push(selection);
     }
-    let mut session = CaptureSession::new(admit(plan, &catalog, &support, &capabilities).unwrap());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &capabilities).unwrap()));
     let mut backend = Backend {
         calls: 0,
         fail: false,
@@ -168,7 +168,7 @@ fn sparse_capture_reserves_once_validates_receipts_and_waits_for_commit() {
         end: 3,
         stride: 1,
     }];
-    let mut session = CaptureSession::new(admit(plan, &catalog, &support, &capabilities).unwrap());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &capabilities).unwrap()));
     let mut backend = Backend {
         calls: 0,
         fail: false,
@@ -223,7 +223,7 @@ fn sparse_capture_rejects_incomplete_duplicate_and_failed_work_without_refunds()
     for failure in ["missing", "duplicate", "backend"] {
         let (plan, catalog, support, capabilities) = fixture();
         let mut session =
-            CaptureSession::new(admit(plan, &catalog, &support, &capabilities).unwrap());
+            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &capabilities).unwrap()));
         let mut backend = Backend {
             calls: 0,
             fail: false,
@@ -269,7 +269,7 @@ fn sparse_capture_skip_reserves_no_native_work_and_dense_transform_is_rejected()
     assert!(admit(wrong, &catalog, &support, &capabilities).is_err());
     plan.limits.on_limit = CaptureLimitPolicy::Skip;
     plan.limits.per_step.retained_bytes = 0;
-    let mut session = CaptureSession::new(admit(plan, &catalog, &support, &capabilities).unwrap());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &capabilities).unwrap()));
     let mut backend = Backend {
         calls: 0,
         fail: false,
@@ -372,7 +372,7 @@ fn independent_cached_invocation_geometry_controls_sparse_receipt_completeness()
     let admitted = plan
         .admit_invocations(&catalog, &support, &capabilities, bounds)
         .unwrap();
-    let mut session = CaptureSession::new(admitted);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admitted));
     let mut backend = Backend {
         calls: 0,
         fail: false,
@@ -438,7 +438,7 @@ fn sparse_invocation_windows_preserve_logical_stride_actual_ranges_and_spending(
             },
         )
         .unwrap();
-    let mut session = CaptureSession::new(admitted);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admitted));
     let mut backend = Backend {
         calls: 0,
         fail: false,

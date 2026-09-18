@@ -1,12 +1,12 @@
 //! Checked single-input projection through the same ordered template visitor.
 use super::*;
 use crate::processors::{
-    template::{compiled::CompiledTemplate, visit::PieceView},
+    template::{compiled::TemplateProcessing, visit::PieceView},
     PostProcessorWrapper,
 };
 
 pub(super) struct PostPlan<'a> {
-    template: Option<&'a CompiledTemplate>,
+    template: Option<&'a TemplateProcessing>,
     add_special_tokens: bool,
     special_ids: usize,
 }
@@ -31,17 +31,10 @@ impl<'a> PostPlan<'a> {
         }
         Ok(result)
     }
-    fn accept(
-        &mut self,
-        item: &'a PostProcessorWrapper,
-    ) -> Result<(), EncodeIdsError> {
+    fn accept(&mut self, item: &'a PostProcessorWrapper) -> Result<(), EncodeIdsError> {
         match item {
-            PostProcessorWrapper::ByteLevel(byte) if !byte.trim_offsets => {
-                Ok(())
-            }
-            PostProcessorWrapper::CompiledTemplate(template)
-                if self.template.is_none() =>
-            {
+            PostProcessorWrapper::ByteLevel(byte) if !byte.trim_offsets => Ok(()),
+            PostProcessorWrapper::Template(template) if self.template.is_none() => {
                 self.special_ids = template
                     .single_ids(self.add_special_tokens)
                     .ok_or(EncodeIdsError::PipelineProfile)?;
@@ -61,7 +54,7 @@ impl<'a> PostPlan<'a> {
             size_of::<std::slice::Iter<'_, PostProcessorWrapper>>(),
             size_of::<Result<(), EncodeIdsError>>(),
             size_of::<Option<&[u32]>>(),
-            CompiledTemplate::visit_control_bytes()?,
+            TemplateProcessing::visit_control_bytes()?,
         ]
         .iter()
         .try_fold(0usize, |n, v| n.checked_add(*v))
@@ -71,8 +64,7 @@ impl<'a> PostPlan<'a> {
         encoder: &mut PostInputEncoder<'_, '_>,
     ) -> Result<(), EncodeIdsError> {
         if let Some(template) = self.template {
-            template.visit_single(self.add_special_tokens, |piece| match piece
-            {
+            template.visit_single(self.add_special_tokens, |piece| match piece {
                 PieceView::Sequence { index, .. } => {
                     debug_assert_eq!(index, 0);
                     encoder.piece(None)

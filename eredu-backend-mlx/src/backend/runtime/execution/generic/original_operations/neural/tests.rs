@@ -1,5 +1,5 @@
 use super::*;
-use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
+use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec, GroupSubmissionMechanism};
 
 fn geometry(input: u64, chunk: u64, outputs: u64) -> eredu_core::InferenceGeometry {
     eredu_core::InferenceGeometry {
@@ -27,6 +27,43 @@ fn graphs() -> Vec<ExecutionGraph> {
     ]
 }
 #[test]
+fn manual_group_traversal_retains_only_actual_policy_final_submissions() {
+    for graph in graphs() {
+        let layout = ExecutionUnitLayout::new(&graph,
+            std::iter::repeat_n(3, graph.groups().len())).unwrap();
+        for g in [geometry(5, 2, 4), geometry(1, 1, 1), geometry(5, 5, 2)] {
+            let forwards = g.input_positions.div_ceil(g.prefill_chunk_positions)
+                + g.max_output_tokens - 1;
+            for final_submission in [false, true] {
+                let population = NeuralPopulation::from_execution(&layout, g,
+                    eredu_runtime::GroupSubmissionMechanism::PolicyOnly,
+                    final_submission).unwrap();
+                assert_eq!(population.submissions,
+                    usize::try_from(forwards).unwrap() * usize::from(final_submission));
+                assert_eq!(population.per_forward, usize::from(final_submission));
+                assert_eq!(population.shape.consumers(), 0);
+                let live = Rc::new(Cell::new(0));
+                let controls = Custody::new(&live);
+                let mut bank = PreparedOperationBank::try_new(population.submissions,
+                    factory::<Custody, NeverObserved>(population.shape, Some(controls.clone())))
+                    .unwrap();
+                let mut completed = Vec::new();
+                for _ in 0..forwards {
+                    if final_submission { completed.push(bank.checkout().unwrap()); }
+                }
+                assert!(bank.checkout().is_err(), "manual traversal has no group submission");
+                drop(bank);
+                drop(controls);
+                assert_eq!(live.get() == 0, completed.is_empty(),
+                    "issued final-completion slots retain their original custody");
+                drop(completed);
+                retire_to(&live, 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn neural_request_population_follows_graph_boundaries_and_actual_prefill_decode_calls() {
     for graph in graphs() {
         for units in [0, 3] {
@@ -34,7 +71,7 @@ fn neural_request_population_follows_graph_boundaries_and_actual_prefill_decode_
                 ExecutionUnitLayout::new(&graph, std::iter::repeat_n(units, graph.groups().len()))
                     .unwrap();
             for g in [geometry(5, 2, 4), geometry(1, 1, 1), geometry(5, 5, 2)] {
-                let population = NeuralPopulation::from_layout(&layout, g).unwrap();
+                let population = NeuralPopulation::from_execution(&layout, g, GroupSubmissionMechanism::LayeredGraph, true).unwrap();
                 let mut invocations = 0;
                 let mut position = 0;
                 while position < g.input_positions {
@@ -95,7 +132,7 @@ fn neural_request_population_follows_graph_boundaries_and_actual_prefill_decode_
 fn neural_uniform_bank_prices_all_slots_not_only_reached_waits_and_rejects_overflow() {
     let graph = graphs().pop().unwrap();
     let layout = ExecutionUnitLayout::new(&graph, [0, 1, 0]).unwrap();
-    let population = NeuralPopulation::from_layout(&layout, geometry(1, 1, 1)).unwrap();
+    let population = NeuralPopulation::from_execution(&layout, geometry(1, 1, 1), GroupSubmissionMechanism::LayeredGraph, true).unwrap();
     assert_eq!(
         (population.submissions, population.shape.consumers()),
         (5, 2)
@@ -167,15 +204,15 @@ fn neural_uniform_bank_prices_all_slots_not_only_reached_waits_and_rejects_overf
     // Keep the geometry valid so the five-submission population itself
     // overflows, rather than failing the earlier context-frontier check.
     assert!(matches!(
-        NeuralPopulation::from_layout(&layout, geometry(1, 1, u64::MAX - 1)),
+        NeuralPopulation::from_execution(&layout, geometry(1, 1, u64::MAX - 1), GroupSubmissionMechanism::LayeredGraph, true),
         Err(Error::PrefillControl(WorkingMemoryError::Overflow))
     ));
     assert!(matches!(
-        NeuralPopulation::from_layout(&layout, geometry(1, 1, u64::MAX)),
+        NeuralPopulation::from_execution(&layout, geometry(1, 1, u64::MAX), GroupSubmissionMechanism::LayeredGraph, true),
         Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))
     ));
     assert!(matches!(
-        NeuralPopulation::from_layout(&layout, geometry(1, 0, 1)),
+        NeuralPopulation::from_execution(&layout, geometry(1, 0, 1), GroupSubmissionMechanism::LayeredGraph, true),
         Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))
     ));
 }
@@ -329,9 +366,9 @@ fn realtime_bounded_bank_retains_final_submission_after_actual_group_boundaries(
             std::iter::repeat_n(1, graph.groups().len())).unwrap();
         let bounded = NeuralPopulation::single_forward(&layout, true).unwrap();
         let resident = NeuralPopulation::single_forward(&layout, false).unwrap();
-        assert_eq!(bounded, NeuralPopulation::from_layout(&layout, geometry(1, 1, 1)).unwrap());
-        assert_eq!(resident, NeuralPopulation::from_layout_with_final(
-            &layout, geometry(1, 1, 1), false).unwrap());
+        assert_eq!(bounded, NeuralPopulation::from_execution(&layout, geometry(1, 1, 1), GroupSubmissionMechanism::LayeredGraph, true).unwrap());
+        assert_eq!(resident, NeuralPopulation::from_execution(
+            &layout, geometry(1, 1, 1), GroupSubmissionMechanism::LayeredGraph, false).unwrap());
         let live = Rc::new(Cell::new(0));
         let controls = Custody::new(&live);
         let mut bank = PreparedOperationBank::try_new(bounded.submissions,

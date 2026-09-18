@@ -1,7 +1,8 @@
 //! Shared expression traversal; storage, copies and node processing may refuse.
-use super::{Expr, ExprRef, ExprSet, MappingCache};
+use super::{Expr, ExprRef, ExprSet};
+use crate::{ParserAllocationFunding, ParserStorageError, SourceHashMap};
 pub(crate) mod workspace;
-use std::{convert::Infallible, hash::Hash};
+use std::hash::Hash;
 
 // These are internal mechanisms, not public allocation witnesses. Original
 // consumers must supply their concrete paid constructors for all four mutation
@@ -33,40 +34,52 @@ impl<V> Scratch<V> {
         }
     }
 }
-pub(super) struct OrdinaryCache<'a, M>(pub(super) &'a mut M);
-impl<K, V, M: MappingCache<K, V>> Cache<K, V> for OrdinaryCache<'_, M> {
-    type Error = Infallible;
-    fn get(&self, key: &K) -> Option<&V> {
-        self.0.get(key)
+/// Copying mapping values is an explicit producer operation. Inline values
+/// and vectors of inline values share these checked constructors.
+pub trait MappingValue: Sized {
+    fn copy_with_funding(&self, funding: &ParserAllocationFunding) -> Result<Self, ParserStorageError>;
+}
+impl MappingValue for ExprRef {
+    fn copy_with_funding(&self, _: &ParserAllocationFunding) -> Result<Self, ParserStorageError> { Ok(*self) }
+}
+impl<T: Copy> MappingValue for Vec<T> {
+    fn copy_with_funding(&self, funding: &ParserAllocationFunding) -> Result<Self, ParserStorageError> {
+        let mut copy = Vec::new();
+        funding.try_extend_copy(&mut copy, self)?;
+        Ok(copy)
     }
-    fn contains_key(&self, key: &K) -> bool {
-        self.0.contains_key(key)
-    }
+}
+pub(super) struct GrowingCache<'a, K, V> {
+    pub(super) values: &'a mut SourceHashMap<K, V>,
+    pub(super) funding: &'a ParserAllocationFunding,
+}
+impl<K: Eq + Hash, V> Cache<K, V> for GrowingCache<'_, K, V> {
+    type Error = crate::ParserError;
+    fn get(&self, key: &K) -> Option<&V> { self.values.get(key) }
+    fn contains_key(&self, key: &K) -> bool { self.values.contains_key(key) }
     fn insert(&mut self, key: K, value: V) -> Result<(), Self::Error> {
-        self.0.insert(key, value);
+        self.funding.try_insert(self.values, key, value)?;
         Ok(())
     }
 }
-pub(super) struct OrdinaryMemory;
-impl<V: Clone> Memory<V> for OrdinaryMemory {
-    type Error = Infallible;
+pub(super) struct GrowingMemory<'a>(pub(super) &'a ParserAllocationFunding);
+impl<V: MappingValue> Memory<V> for GrowingMemory<'_> {
+    type Error = crate::ParserError;
     fn begin(&mut self, scratch: &mut Scratch<V>, root: ExprRef) -> Result<(), Self::Error> {
-        scratch.nodes = vec![root];
-        scratch.values = Vec::with_capacity(128);
+        self.0.try_push(&mut scratch.nodes, root)?;
         Ok(())
     }
-    fn copy(&mut self, value: &V) -> Result<V, Self::Error> {
-        Ok(value.clone())
-    }
+    fn copy(&mut self, value: &V) -> Result<V, Self::Error> { Ok(value.copy_with_funding(self.0)?) }
     fn push_node(&mut self, nodes: &mut Vec<ExprRef>, node: ExprRef) -> Result<(), Self::Error> {
-        nodes.push(node);
+        self.0.try_push(nodes, node)?;
         Ok(())
     }
     fn push_value(&mut self, values: &mut Vec<V>, value: V) -> Result<(), Self::Error> {
-        values.push(value);
+        self.0.try_push(values, value)?;
         Ok(())
     }
 }
+
 impl ExprSet {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_map_with_storage<K: Eq + Hash, V, E>(
@@ -247,11 +260,11 @@ mod tests {
     }
     #[test]
     fn fallible_mapping_keeps_nullable_skip_order_cache_hits_and_failed_publication_prefixes() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk(Expr::Byte(b'a'));
-        let b = source.mk(Expr::Byte(b'b'));
-        let concat = source.mk(Expr::Concat(ExprFlags::POSITIVE, [a, b]));
-        let bytes = source.mk(Expr::ByteConcat(ExprFlags::POSITIVE, b"xy", b));
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk(Expr::Byte(b'a')).unwrap();
+        let b = source.mk(Expr::Byte(b'b')).unwrap();
+        let concat = source.mk(Expr::Concat(ExprFlags::POSITIVE, [a, b])).unwrap();
+        let bytes = source.mk(Expr::ByteConcat(ExprFlags::POSITIVE, b"xy", b)).unwrap();
         for (root, skip, expected) in [
             (concat, false, vec![a, b, concat]),
             (concat, true, vec![a, concat]),
@@ -273,9 +286,9 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(result, expected);
-            let mut ordinary = crate::HashMap::default();
+            let mut ordinary = crate::SourceHashMap::default();
             assert_eq!(
-                source.map(root, &mut ordinary, skip, |r| r, process),
+                source.map(root, &mut ordinary, skip, |r| r, |e, v, r| Ok(process(e, v, r))).unwrap(),
                 expected
             );
             assert_eq!(memory.begins, 1);

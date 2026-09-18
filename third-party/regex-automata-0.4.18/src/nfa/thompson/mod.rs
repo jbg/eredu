@@ -79,6 +79,3 @@ pub use self::{
 };
 #[cfg(feature = "syntax")]
 pub use compiler::{Compiler, Config, WhichCaptures};
-
-#[cfg(feature = "nfa-pikevm")]
-pub use nfa::source;

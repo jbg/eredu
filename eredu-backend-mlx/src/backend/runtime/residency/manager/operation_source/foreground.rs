@@ -30,6 +30,7 @@ struct Data {
     materialization: WorkspaceBound,
     source: ForegroundDiskDescriptors,
     domain: eredu_core::SharedStorageDomain,
+    destination: safemlx::StreamCopyPlan<()>,
 }
 /// Shares exact source metadata, not an active disk receipt or source grant.
 #[derive(Clone)]
@@ -52,6 +53,9 @@ impl PartialEq for ForegroundDiskIdentity {
 }
 impl Eq for ForegroundDiskIdentity {}
 impl ForegroundDiskIdentity {
+    pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
+        self.value.destination.device_type()
+    }
     pub(crate) fn layout(&self) -> &ExecutionUnitLayout {
         &self.value.layout
     }
@@ -189,6 +193,7 @@ impl ForegroundDiskIdentity {
 
     fn construct(
         control: &ResidencyController,
+        destination: safemlx::StreamCopyPlan<()>,
         source: &ForegroundDiskDescriptors,
         runtime: &safemlx::PreparedInputRuntime,
         domain: &eredu_core::SharedStorageDomain,
@@ -224,6 +229,7 @@ impl ForegroundDiskIdentity {
             materialization: WorkspaceBound::bounded(0, ASSUMPTIONS),
             source: source.clone(),
             domain: domain.clone(),
+            destination,
         };
         value
             .units
@@ -306,7 +312,8 @@ impl ForegroundDiskIdentity {
                 let (shape, _) = source
                     .native_output(definition.id(), binding.name())
                     .ok_or_else(bad)?;
-                if metadata.byte_len() != binding.expected_bytes()
+                if !super::super::host_workspace::copy_shape_is_supported(destination.device_type(), shape)
+                    || metadata.byte_len() != binding.expected_bytes()
                     || shape.len() != metadata.shape().len()
                     || !shape
                         .iter()
@@ -431,6 +438,11 @@ impl ResidencyManager {
             )?;
         let fixed = [
             size_of::<Data>(),
+            safemlx::StreamCopyPlan::<()>::capture_control_bytes()
+                .map_err(|_| WorkingMemoryError::UnknownBound)?,
+            size_of::<safemlx::StreamCopyPlan<()>>(),
+            size_of::<Result<safemlx::StreamCopyPlan<()>, safemlx::StreamCopyCause>>(),
+            size_of::<(safemlx::DeviceType, &[i32], std::slice::Iter<'_, i32>, Option<i32>, bool)>(),
             size_of::<ForegroundDiskIdentity>(),
             size_of::<Unit>(),
             size_of::<Row>(),
@@ -531,6 +543,8 @@ impl ResidencyManager {
         // facts and neither invokes runtime callbacks nor constructs storage.
         let identity = ForegroundDiskIdentity::construct(
             &state.control,
+            safemlx::StreamCopyPlan::<()>::capture(&state.device_stream)
+                .map_err(|_| OperationSourceFailure::Layout)?,
             descriptor,
             &runtime,
             pool.shared_storage_domain(),

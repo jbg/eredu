@@ -1,4 +1,5 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use crate::util::allocation::Allocator;
+use alloc::vec::Vec;
 
 use crate::{
     dfa::{
@@ -10,7 +11,7 @@ use crate::{
         self,
         alphabet::{self, ByteSet},
         determinize::{State, StateBuilderEmpty, StateBuilderNFA},
-        primitives::{PatternID, StateID},
+        primitives::StateID,
         search::{Anchored, MatchKind},
         sparse_set::SparseSets,
         start::Start,
@@ -46,9 +47,11 @@ impl Config {
         &self,
         nfa: &thompson::NFA,
         dfa: &mut dense::OwnedDFA,
+        allocation: Allocator<'_>,
     ) -> Result<(), BuildError> {
-        let dead = State::dead();
-        let quit = State::dead();
+        allocation.reserve(core::mem::size_of::<Runner<'_>>())?;
+        let dead = State::dead_with_allocations(allocation.policy())?;
+        let quit = State::dead_with_allocations(allocation.policy())?;
         let mut cache = StateMap::default();
         // We only insert the dead state here since its representation is
         // identical to the quit state. And we never want anything pointing
@@ -60,16 +63,20 @@ impl Config {
         // DFA state uses the "location after the DEAD state." That is, it
         // is assumed that the quit state is always the state immediately
         // following the DEAD state.
-        cache.insert(dead.clone(), DEAD);
+        allocation.insert(&mut cache, dead.clone(), DEAD)?;
+        let mut builder_states = Vec::new();
+        allocation.push(&mut builder_states, dead)?;
+        allocation.push(&mut builder_states, quit)?;
 
         let runner = Runner {
             config: self.clone(),
             nfa,
             dfa,
-            builder_states: alloc::vec![dead, quit],
+            builder_states,
+            allocation,
             cache,
             memory_usage_state: 0,
-            sparses: SparseSets::new(nfa.states().len()),
+            sparses: SparseSets::new_with_allocations(nfa.states().len(), allocation.policy())?,
             stack: alloc::vec![],
             scratch_state_builder: StateBuilderEmpty::new(),
         };
@@ -107,10 +114,7 @@ impl Config {
 
     /// The limit, in bytes of the heap, that determinization itself is allowed
     /// to use. This does not include the size of the DFA being built.
-    pub fn determinize_size_limit(
-        &mut self,
-        bytes: Option<usize>,
-    ) -> &mut Config {
+    pub fn determinize_size_limit(&mut self, bytes: Option<usize>) -> &mut Config {
         self.determinize_size_limit = bytes;
         self
     }
@@ -133,6 +137,7 @@ impl Config {
 /// whichever is shorter.
 #[derive(Debug)]
 struct Runner<'a> {
+    allocation: Allocator<'a>,
     /// The configuration used to initialize determinization.
     config: Config,
     /// The NFA we're converting into a DFA.
@@ -197,22 +202,20 @@ struct Runner<'a> {
     scratch_state_builder: StateBuilderEmpty,
 }
 
-/// A map from states to state identifiers. When using std, we use a standard
-/// hashmap, since it's a bit faster for this use case. (Other maps, like
-/// one's based on FNV, have not yet been benchmarked.)
-///
-/// The main purpose of this map is to reuse states where possible. This won't
-/// fully minimize the DFA, but it works well in a lot of cases.
-#[cfg(feature = "std")]
-type StateMap = std::collections::HashMap<State, StateID>;
-#[cfg(not(feature = "std"))]
-type StateMap = BTreeMap<State, StateID>;
+/// Canonical prospective state cache in both std and no-std profiles.
+type StateMap = hashbrown::HashMap<State, StateID>;
 
 impl<'a> Runner<'a> {
     /// Build the DFA. If there was a problem constructing the DFA (e.g., if
     /// the chosen state identifier representation is too small), then an error
     /// is returned.
     fn run(mut self) -> Result<(), BuildError> {
+        self.allocation.reserve(
+            core::mem::size_of::<Vec<alphabet::Unit>>()
+                + core::mem::size_of::<Vec<StateID>>()
+                + core::mem::size_of::<dense::StateMap<Vec<crate::util::primitives::PatternID>>>()
+                + core::mem::size_of::<Result<(), BuildError>>(),
+        )?;
         if self.nfa.look_set_any().contains_word_unicode()
             && !self.config.quit.contains_range(0x80, 0xFF)
         {
@@ -225,16 +228,17 @@ impl<'a> Runner<'a> {
         // transitions for bytes that are guaranteed to produce identical
         // results. Since computing the representatives needs to do a little
         // work, we do it once here because we'll be iterating over them a lot.
-        let representatives: Vec<alphabet::Unit> =
-            self.dfa.byte_classes().representatives(..).collect();
+        let mut representatives = Vec::new();
+        for unit in self.dfa.byte_classes().representatives(..) {
+            self.allocation.push(&mut representatives, unit)?;
+        }
         // The set of all DFA state IDs that still need to have their
         // transitions set. We start by seeding this with all starting states.
         let mut uncompiled = alloc::vec![];
         self.add_all_starts(&mut uncompiled)?;
         while let Some(dfa_id) = uncompiled.pop() {
             for &unit in &representatives {
-                if unit.as_u8().map_or(false, |b| self.config.quit.contains(b))
-                {
+                if unit.as_u8().map_or(false, |b| self.config.quit.contains(b)) {
                     continue;
                 }
                 // In many cases, the state we transition to has already been
@@ -246,7 +250,7 @@ impl<'a> Runner<'a> {
                 // If the state ID we got back is newly created, then we need
                 // to compile it, so add it to our uncompiled frontier.
                 if is_new {
-                    uncompiled.push(next_dfa_id);
+                    self.allocation.push(&mut uncompiled, next_dfa_id)?;
                 }
             }
         }
@@ -262,23 +266,25 @@ impl<'a> Runner<'a> {
         // A map from DFA state ID to one or more NFA match IDs. Each NFA match
         // ID corresponds to a distinct regex pattern that matches in the state
         // corresponding to the key.
-        let mut matches: BTreeMap<StateID, Vec<PatternID>> = BTreeMap::new();
+        let mut matches = dense::StateMap::new(self.dfa.stride2());
         self.cache.clear();
         #[cfg(feature = "logging")]
         let mut total_pat_len = 0;
         for (i, state) in self.builder_states.into_iter().enumerate() {
-            if let Some(pat_ids) = state.match_pattern_ids() {
+            if let Some(pat_ids) =
+                state.match_pattern_ids_with_allocations(self.allocation.policy())?
+            {
                 let id = self.dfa.to_state_id(i);
                 log! {
                     total_pat_len += pat_ids.len();
                 }
-                matches.insert(id, pat_ids);
+                matches.insert(id, pat_ids, self.allocation)?;
             }
         }
         log! {
             use core::mem::size_of;
-            let per_elem = size_of::<StateID>() + size_of::<Vec<PatternID>>();
-            let pats = total_pat_len * size_of::<PatternID>();
+            let per_elem = size_of::<StateID>() + size_of::<Vec<crate::util::primitives::PatternID>>();
+            let pats = total_pat_len * size_of::<crate::util::primitives::PatternID>();
             let mem = (matches.len() * per_elem) + pats;
             log::debug!("matches map built, memory usage: {mem}");
         }
@@ -286,7 +292,7 @@ impl<'a> Runner<'a> {
         // This permits a DFA's match loop to detect a match condition (among
         // other things) by merely inspecting the current state's identifier,
         // and avoids the need for any additional auxiliary storage.
-        self.dfa.shuffle(matches)?;
+        self.dfa.shuffle(matches, self.allocation)?;
         Ok(())
     }
 
@@ -305,7 +311,7 @@ impl<'a> Runner<'a> {
     ) -> Result<(StateID, bool), BuildError> {
         // Compute the set of all reachable NFA states, including epsilons.
         let empty_builder = self.get_state_builder();
-        let builder = util::determinize::next(
+        let builder = util::determinize::next_with_allocations(
             self.nfa,
             self.config.match_kind,
             &mut self.sparses,
@@ -313,16 +319,14 @@ impl<'a> Runner<'a> {
             &self.builder_states[self.dfa.to_index(dfa_id)],
             unit,
             empty_builder,
-        );
+            self.allocation.policy(),
+        )?;
         self.maybe_add_state(builder)
     }
 
     /// Compute the set of DFA start states and add their identifiers in
     /// 'dfa_state_ids' (no duplicates are added).
-    fn add_all_starts(
-        &mut self,
-        dfa_state_ids: &mut Vec<StateID>,
-    ) -> Result<(), BuildError> {
+    fn add_all_starts(&mut self, dfa_state_ids: &mut Vec<StateID>) -> Result<(), BuildError> {
         // These should be the first states added.
         assert!(dfa_state_ids.is_empty());
         // We only want to add (un)anchored starting states that is consistent
@@ -371,9 +375,7 @@ impl<'a> Runner<'a> {
         let nfa_start = match anchored {
             Anchored::No => self.nfa.start_unanchored(),
             Anchored::Yes => self.nfa.start_anchored(),
-            Anchored::Pattern(pid) => {
-                self.nfa.start_pattern(pid).expect("valid pattern ID")
-            }
+            Anchored::Pattern(pid) => self.nfa.start_pattern(pid).expect("valid pattern ID"),
         };
 
         // When compiling start states, we're careful not to build additional
@@ -392,60 +394,51 @@ impl<'a> Runner<'a> {
         // somewhat rare, after all, for multiple patterns in the same regex to
         // have different prefix look-arounds.
 
-        let (id, is_new) =
-            self.add_one_start(nfa_start, Start::NonWordByte)?;
+        let (id, is_new) = self.add_one_start(nfa_start, Start::NonWordByte)?;
         self.dfa.set_start_state(anchored, Start::NonWordByte, id);
         if is_new {
-            dfa_state_ids.push(id);
+            self.allocation.push(dfa_state_ids, id)?;
         }
 
         if !self.nfa.look_set_prefix_any().contains_word() {
             self.dfa.set_start_state(anchored, Start::WordByte, id);
         } else {
-            let (id, is_new) =
-                self.add_one_start(nfa_start, Start::WordByte)?;
+            let (id, is_new) = self.add_one_start(nfa_start, Start::WordByte)?;
             self.dfa.set_start_state(anchored, Start::WordByte, id);
             if is_new {
-                dfa_state_ids.push(id);
+                self.allocation.push(dfa_state_ids, id)?;
             }
         }
         if !self.nfa.look_set_prefix_any().contains_anchor() {
             self.dfa.set_start_state(anchored, Start::Text, id);
             self.dfa.set_start_state(anchored, Start::LineLF, id);
             self.dfa.set_start_state(anchored, Start::LineCR, id);
-            self.dfa.set_start_state(
-                anchored,
-                Start::CustomLineTerminator,
-                id,
-            );
+            self.dfa
+                .set_start_state(anchored, Start::CustomLineTerminator, id);
         } else {
             let (id, is_new) = self.add_one_start(nfa_start, Start::Text)?;
             self.dfa.set_start_state(anchored, Start::Text, id);
             if is_new {
-                dfa_state_ids.push(id);
+                self.allocation.push(dfa_state_ids, id)?;
             }
 
             let (id, is_new) = self.add_one_start(nfa_start, Start::LineLF)?;
             self.dfa.set_start_state(anchored, Start::LineLF, id);
             if is_new {
-                dfa_state_ids.push(id);
+                self.allocation.push(dfa_state_ids, id)?;
             }
 
             let (id, is_new) = self.add_one_start(nfa_start, Start::LineCR)?;
             self.dfa.set_start_state(anchored, Start::LineCR, id);
             if is_new {
-                dfa_state_ids.push(id);
+                self.allocation.push(dfa_state_ids, id)?;
             }
 
-            let (id, is_new) =
-                self.add_one_start(nfa_start, Start::CustomLineTerminator)?;
-            self.dfa.set_start_state(
-                anchored,
-                Start::CustomLineTerminator,
-                id,
-            );
+            let (id, is_new) = self.add_one_start(nfa_start, Start::CustomLineTerminator)?;
+            self.dfa
+                .set_start_state(anchored, Start::CustomLineTerminator, id);
             if is_new {
-                dfa_state_ids.push(id);
+                self.allocation.push(dfa_state_ids, id)?;
             }
         }
 
@@ -468,26 +461,26 @@ impl<'a> Runner<'a> {
         // configuration, and the determine the epsilon closure. While
         // computing the epsilon closure, we only follow conditional epsilon
         // transitions that satisfy the look-behind assertions in 'look_have'.
-        let mut builder_matches = self.get_state_builder().into_matches();
-        util::determinize::set_lookbehind_from_start(
-            self.nfa,
-            &start,
-            &mut builder_matches,
-        );
+        let mut builder_matches = self
+            .get_state_builder()
+            .into_matches_with_allocations(self.allocation.policy())?;
+        util::determinize::set_lookbehind_from_start(self.nfa, &start, &mut builder_matches);
         self.sparses.set1.clear();
-        util::determinize::epsilon_closure(
+        util::determinize::epsilon_closure_with_allocations(
             self.nfa,
             nfa_start,
             builder_matches.look_have(),
             &mut self.stack,
             &mut self.sparses.set1,
-        );
+            self.allocation.policy(),
+        )?;
         let mut builder = builder_matches.into_nfa();
-        util::determinize::add_nfa_states(
+        util::determinize::add_nfa_states_with_allocations(
             &self.nfa,
             &self.sparses.set1,
             &mut builder,
-        );
+            self.allocation.policy(),
+        )?;
         self.maybe_add_state(builder)
     }
 
@@ -502,10 +495,7 @@ impl<'a> Runner<'a> {
     /// and a fresh ID is allocated (if ID allocation fails, then an error is
     /// returned) and returned. (Along with 'true', indicating that a new state
     /// was added.)
-    fn maybe_add_state(
-        &mut self,
-        builder: StateBuilderNFA,
-    ) -> Result<(StateID, bool), BuildError> {
+    fn maybe_add_state(&mut self, builder: StateBuilderNFA) -> Result<(StateID, bool), BuildError> {
         if let Some(&cached_id) = self.cache.get(builder.as_bytes()) {
             // Since we have a cached state, put the constructed state's
             // memory back into our scratch space, so that it can be reused.
@@ -523,26 +513,21 @@ impl<'a> Runner<'a> {
     ///
     /// If adding the state would exceed the maximum value for StateID, then an
     /// error is returned.
-    fn add_state(
-        &mut self,
-        builder: StateBuilderNFA,
-    ) -> Result<StateID, BuildError> {
-        let id = self.dfa.add_empty_state()?;
+    fn add_state(&mut self, builder: StateBuilderNFA) -> Result<StateID, BuildError> {
+        let id = self.dfa.add_empty_state(self.allocation)?;
         if !self.config.quit.is_empty() {
             for b in self.config.quit.iter() {
-                self.dfa.set_transition(
-                    id,
-                    alphabet::Unit::u8(b),
-                    self.dfa.quit_id(),
-                );
+                self.dfa
+                    .set_transition(id, alphabet::Unit::u8(b), self.dfa.quit_id());
             }
         }
-        let state = builder.to_state();
+        let state = builder.to_state_with_allocations(self.allocation.policy())?;
         // States use reference counting internally, so we only need to count
         // their memory usage once.
         self.memory_usage_state += state.memory_usage();
-        self.builder_states.push(state.clone());
-        self.cache.insert(state, id);
+        self.allocation
+            .push(&mut self.builder_states, state.clone())?;
+        self.allocation.insert(&mut self.cache, state, id)?;
         self.put_state_builder(builder);
         if let Some(limit) = self.config.dfa_size_limit {
             if self.dfa.memory_usage() > limit {
@@ -551,9 +536,7 @@ impl<'a> Runner<'a> {
         }
         if let Some(limit) = self.config.determinize_size_limit {
             if self.memory_usage() > limit {
-                return Err(BuildError::determinize_exceeded_size_limit(
-                    limit,
-                ));
+                return Err(BuildError::determinize_exceeded_size_limit(limit));
             }
         }
         Ok(id)
@@ -566,10 +549,7 @@ impl<'a> Runner<'a> {
     /// Callers must put the state builder back with 'put_state_builder',
     /// otherwise the allocation reuse won't work.
     fn get_state_builder(&mut self) -> StateBuilderEmpty {
-        core::mem::replace(
-            &mut self.scratch_state_builder,
-            StateBuilderEmpty::new(),
-        )
+        core::mem::replace(&mut self.scratch_state_builder, StateBuilderEmpty::new())
     }
 
     /// Puts the given state builder back into this determinizer for reuse.
@@ -577,10 +557,7 @@ impl<'a> Runner<'a> {
     /// Note that building a 'State' from a builder always creates a new
     /// alloc, so callers should always put the builder back.
     fn put_state_builder(&mut self, builder: StateBuilderNFA) {
-        let _ = core::mem::replace(
-            &mut self.scratch_state_builder,
-            builder.clear(),
-        );
+        let _ = core::mem::replace(&mut self.scratch_state_builder, builder.clear());
     }
 
     /// Return the memory usage, in bytes, of this determinizer at the current

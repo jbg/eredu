@@ -1,8 +1,33 @@
 //! Prepared physical-backing attachment; no funding or completion authority.
+use super::RetiredOwner;
 use super::original_buffer::{OriginalBufferCause, OriginalBufferError};
-use super::{OwnedNode, RetiredOwner, destroy, retire, take_owner};
 use crate::{Array, error::Exception, utils::guard::Guarded, utils::runtime_lock};
 use std::{alloc::Layout, ffi::c_void, fmt, mem, ptr::NonNull};
+
+mod retirement;
+pub use retirement::PreparedAllocationRetirement;
+
+// The optional completion slot belongs to this exact prepared attachment.
+// Other allocation-owner producers keep their existing node representation.
+#[repr(C)]
+struct OwnedNode<T> {
+    retired: RetiredOwner,
+    retirement: Option<std::sync::Arc<retirement::Slot>>,
+    owner: T,
+}
+fn take_owner<T>(node: Box<OwnedNode<T>>) -> T {
+    let OwnedNode {
+        retirement, owner, ..
+    } = *node;
+    // Actual node and optional shared shell retire before the accounted payload.
+    drop(retirement);
+    owner
+}
+unsafe fn destroy<T>(node: *mut RetiredOwner) {
+    // SAFETY: repr(C) places this exact node's retirement header first.
+    let owner = take_owner(unsafe { Box::from_raw(node.cast::<OwnedNode<T>>()) });
+    drop(owner);
+}
 
 /// Fixed representation facts for one attachment of owner type `T`. Existing
 /// payload allocations, allocator bookkeeping and backing are excluded. These
@@ -195,7 +220,8 @@ enum AllocationExpectation {
     Original(Option<safemlx_sys::mlx_original_buffer_budget>),
     Ordinary,
     Immutable,
-    HostTransfer,
+    HostTransfer(bool),
+    HostTransferView(u64),
 }
 
 impl<T: Send + 'static> PreparedAllocationOwner<T> {
@@ -220,10 +246,19 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
                 + mem::size_of::<super::original_buffer::OriginalBufferAliasWitness<'static>>()
                 + mem::size_of::<super::original_buffer::ImmutableSourceWitness<'static>>()
                 + mem::size_of::<super::original_buffer::OrdinaryBufferWitness<'static>>()
+                + mem::size_of::<(
+                    &Array,
+                    safemlx_sys::mlx_original_buffer_info,
+                    AllocationExpectation,
+                )>()
                 + mem::size_of::<AllocationExpectation>()
                 + mem::size_of::<safemlx_sys::mlx_original_buffer_info>()
                 + mem::size_of::<Option<safemlx_sys::mlx_original_buffer_budget>>()
-                + mem::size_of::<Result<(), OriginalBufferError<Self>>>()
+                // The checked wrapper and shared node-move worker each own
+                // their actual handoff/result frame; callback transport above
+                // remains separate from these two ownership representations.
+                + mem::size_of::<Self>()
+                + mem::size_of::<Result<(), OriginalBufferError<Self>>>() * 2
                 + mem::size_of::<Result<(), OriginalBufferCause>>()
                 + mem::size_of::<runtime_lock::RuntimeLockGuard>()
                 + mem::size_of::<u32>()
@@ -285,6 +320,7 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
                     next: std::ptr::null_mut(),
                     destroy: destroy::<T>,
                 },
+                retirement: None,
                 owner: preparation.owner.take().unwrap(),
             });
             Box::from_raw(node)
@@ -314,7 +350,7 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
                 array.as_ptr(),
                 node,
                 payload,
-                Some(retire),
+                Some(retirement::retire::<T>),
             )
         })
     }
@@ -329,7 +365,7 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
                 buffer,
                 node,
                 payload,
-                Some(retire),
+                Some(retirement::retire::<T>),
             )
         })
     }
@@ -360,15 +396,114 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
     pub(super) fn attach_host_array(
         self,
         array: &Array,
-        expected: safemlx_sys::mlx_original_buffer_info,
+        expected: safemlx_sys::mlx_immutable_host_transfer_info,
     ) -> Result<(), OriginalBufferError<Self>> {
-        self.attach_checked(array, expected, AllocationExpectation::HostTransfer)
+        self.attach_checked(
+            array,
+            expected.backing,
+            AllocationExpectation::HostTransfer(expected.prepared_source),
+        )
+    }
+    pub(super) fn attach_host_view(
+        self,
+        array: &Array,
+        expected: safemlx_sys::mlx_host_transfer_view_info,
+    ) -> Result<(), OriginalBufferError<Self>> {
+        self.attach_checked(
+            array,
+            expected.backing,
+            AllocationExpectation::HostTransferView(expected.view_identity),
+        )
+    }
+    pub(crate) fn attach_immutable_host(
+        self,
+        buffer: safemlx_sys::mlx_host_transfer_buffer,
+        expected: safemlx_sys::mlx_immutable_host_transfer_info,
+    ) -> Result<(), OriginalBufferError<Self>> {
+        self.attach_original_with(|node, payload| unsafe {
+            // SAFETY: called only by a live borrowed immutable Host witness.
+            safemlx_sys::mlx_immutable_host_transfer_attach(
+                buffer,
+                &expected,
+                node,
+                payload,
+                Some(retirement::retire::<T>),
+            )
+        })
     }
     fn attach_checked(
-        mut self,
+        self,
         array: &Array,
         expected: safemlx_sys::mlx_original_buffer_info,
         kind: AllocationExpectation,
+    ) -> Result<(), OriginalBufferError<Self>> {
+        self.attach_original_with(|node, payload| unsafe {
+            // SAFETY: the borrowed witness retains the actual source; the
+            // shared worker supplies exclusive nodes under one runtime loan.
+            match kind {
+                AllocationExpectation::Original(Some(budget)) => {
+                    safemlx_sys::mlx_original_buffer_array_attach(
+                        array.as_ptr(),
+                        budget,
+                        &expected,
+                        node,
+                        payload,
+                        Some(retirement::retire::<T>),
+                    )
+                }
+                AllocationExpectation::Original(None) => {
+                    safemlx_sys::mlx_original_buffer_array_alias_attach(
+                        array.as_ptr(),
+                        &expected,
+                        node,
+                        payload,
+                        Some(retirement::retire::<T>),
+                    )
+                }
+                AllocationExpectation::Immutable => safemlx_sys::mlx_immutable_source_array_attach(
+                    array.as_ptr(),
+                    &expected,
+                    node,
+                    payload,
+                    Some(retirement::retire::<T>),
+                ),
+                AllocationExpectation::HostTransfer(prepared_source) => {
+                    safemlx_sys::mlx_host_transfer_array_alias_attach(
+                        array.as_ptr(),
+                        &safemlx_sys::mlx_immutable_host_transfer_info {
+                            backing: expected,
+                            prepared_source,
+                        },
+                        node,
+                        payload,
+                        Some(retirement::retire::<T>),
+                    )
+                }
+                AllocationExpectation::HostTransferView(view_identity) => {
+                    safemlx_sys::mlx_host_transfer_array_view_attach(
+                        array.as_ptr(),
+                        &safemlx_sys::mlx_host_transfer_view_info {
+                            backing: expected,
+                            view_identity,
+                        },
+                        node,
+                        payload,
+                        Some(retirement::retire::<T>),
+                    )
+                }
+                AllocationExpectation::Ordinary => safemlx_sys::mlx_ordinary_buffer_array_attach(
+                    array.as_ptr(),
+                    &expected,
+                    node,
+                    payload,
+                    Some(retirement::retire::<T>),
+                ),
+            }
+        })
+    }
+    fn attach_original_with(
+        mut self,
+        attach: impl FnOnce(*mut c_void, *mut c_void) -> u32,
     ) -> Result<(), OriginalBufferError<Self>> {
         let status = {
             let Some(_loan) = runtime_lock::try_enter_for_recovery() else {
@@ -379,59 +514,8 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
             };
             let node = self.native.as_ref().unwrap().0.as_ptr();
             let payload = std::ptr::from_mut(&mut self.node.as_mut().unwrap().retired).cast();
-            // SAFETY: these are the original unique, empty native/Rust nodes;
-            // only status zero consumes them. The actual Array remains borrowed,
-            // and the originating witness also retains its expected safe budget.
-            unsafe {
-                match kind {
-                    AllocationExpectation::Original(Some(budget)) => {
-                        safemlx_sys::mlx_original_buffer_array_attach(
-                            array.as_ptr(),
-                            budget,
-                            &expected,
-                            node,
-                            payload,
-                            Some(retire),
-                        )
-                    }
-                    AllocationExpectation::Original(None) => {
-                        safemlx_sys::mlx_original_buffer_array_alias_attach(
-                            array.as_ptr(),
-                            &expected,
-                            node,
-                            payload,
-                            Some(retire),
-                        )
-                    }
-                    AllocationExpectation::Immutable => {
-                        safemlx_sys::mlx_immutable_source_array_attach(
-                            array.as_ptr(),
-                            &expected,
-                            node,
-                            payload,
-                            Some(retire),
-                        )
-                    }
-                    AllocationExpectation::HostTransfer => {
-                        safemlx_sys::mlx_host_transfer_array_alias_attach(
-                            array.as_ptr(),
-                            &expected,
-                            node,
-                            payload,
-                            Some(retire),
-                        )
-                    }
-                    AllocationExpectation::Ordinary => {
-                        safemlx_sys::mlx_ordinary_buffer_array_attach(
-                            array.as_ptr(),
-                            &expected,
-                            node,
-                            payload,
-                            Some(retire),
-                        )
-                    }
-                }
-            }
+            // Only status zero consumes these original exclusive nodes.
+            attach(node, payload)
         };
         // Release the runtime loan before any caller-owned failure can retire.
         match OriginalBufferCause::check(status) {

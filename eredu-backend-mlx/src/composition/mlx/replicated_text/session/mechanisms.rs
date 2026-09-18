@@ -464,7 +464,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let graph = architecture
             .execution_graph()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?.into_owned();
         let layout = eredu_runtime::partitioned_materialization_unit_layout(&graph, addresses)
             .map_err(Error::ArchitectureModel)?;
         (self.prepared_parameters, self.parameter_declarations) =
@@ -546,10 +546,15 @@ where
                 ignored_sources.extend(recipe.source_keys().into_iter().map(str::to_owned));
             }
         }
+        let populator = match self.prepared_layerwise_manager.as_ref() {
+            Some(manager) => MlxSelectiveUnitPopulator::from_prepared(
+                manager.parameter_exclusions(&prepared.excluded_parameters)?),
+            None => MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
+        };
         let (policy, _) = crate::backend::runtime::execution::generic::prepare_layerwise_policy_with_prepared_manager(
             self.store.clone(),
             architecture,
-            MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
+            populator,
             PhantomData::<S>,
             selected.residency(),
             &self.stream,
@@ -648,7 +653,7 @@ where
     fn with_execution_parallel_control<T,E,F>(
         &self,event:eredu_runtime::replicated_session::ParallelControlEvent,context:&Stream,run:F,
     )->Result<Result<T,E>,eredu_core::BackendFailure>
-    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>, {
         let projection={
             let slot=self.parallel_control.try_borrow()
                 .map_err(|_|eredu_core::PreparedRequestRejection::Busy.into_backend_failure())?;
@@ -660,7 +665,7 @@ where
     fn with_execution_parallel_control_context<T,E,F>(
         &self,_context:&Stream,run:F,
     )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut Option<Box<<MlxNeuralBackend as NeuralBackend>::ParallelContext>>,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    where F:FnOnce(Option<(&mut Option<Box<<MlxNeuralBackend as NeuralBackend>::ParallelContext>>,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
     {
         let control={
             let slot=self.parallel_control.try_borrow().map_err(|_|
@@ -684,7 +689,7 @@ where
     fn with_execution_parallel<T,E,F>(
         &self,context:&Stream,run:F,
     )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut <MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    where F:FnOnce(Option<(&mut <MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
     {
         // Release the mechanism slot loan before model work or nested policy
         // calls. The copied view is weak and shares the submission activation.
@@ -708,7 +713,7 @@ where
 
     fn with_execution_parallel_publication<T,E,F>(&self,context:&Stream,run:F)
         ->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
         match &self.prefill_roots {
             Some(roots)=>roots.with_parallel_publication(context,run),
             None=>Ok(run(None)),
@@ -1351,7 +1356,7 @@ mod prefill_reservation_tests {
                 PrefillReservationRetention(reservation.into()),
                 Deferred(status.clone()),
             );
-            let observed = recovery.finish();
+            let observed = recovery.finish().unwrap();
             assert!(!observed.settled);
             assert_eq!(
                 pool.used_bytes().unwrap(),

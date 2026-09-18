@@ -17,6 +17,7 @@ mod prefill;
 mod retention;
 mod segments;
 mod span_exclusion;
+mod host_summary;
 
 thread_local! {
     static CLAIM_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };

@@ -174,7 +174,7 @@ impl InterventionEvidenceCompanion {
     pub(crate) fn into_shared(self, host: crate::HostPreparationAuthority) -> Self {
         let geometry = match self.geometry {
             EvidenceGeometry::Copied(plan) =>
-                EvidenceGeometry::Shared(SharedCapturePlan::from_prepared_copy(plan, host)),
+                EvidenceGeometry::Shared(SharedCapturePlan::from_prepared_copy(plan, host, None)),
             EvidenceGeometry::Shared(plan) => EvidenceGeometry::Shared(plan),
         };
         Self { operation: self.operation, geometry }

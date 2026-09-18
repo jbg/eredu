@@ -2026,6 +2026,14 @@ where
     pub fn allocation_size(&self) -> usize {
         self.table.allocation_size()
     }
+
+    /// Exact complete allocation requested by the next `try_reserve` on this
+    /// current table, including overlap with the old allocation. `None` also
+    /// covers an in-place rehash. This inspection never hashes or mutates keys.
+    #[inline]
+    pub fn try_reserve_layout(&self, additional: usize) -> Result<Option<core::alloc::Layout>, TryReserveError> {
+        self.table.try_reserve_layout(additional)
+    }
 }
 
 impl<K, V, S, A> PartialEq for HashMap<K, V, S, A>

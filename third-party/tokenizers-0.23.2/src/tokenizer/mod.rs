@@ -39,7 +39,6 @@ pub use compile::{
 pub use fancy_regex::workspace::{
     construction::{
         ConstructionFailure as TokenizerRegexConstructionFailure,
-        ScratchFailureBuffer as TokenizerRegexScratchBuffer,
     },
     Buffer as TokenizerRegexBuffer,
     DelegateBuffer as TokenizerRegexDelegateBuffer,
@@ -47,6 +46,9 @@ pub use fancy_regex::workspace::{
 };
 mod cache_policy;
 mod encode_ids;
+mod normalization_source;
+mod input_view;
+pub use input_view::TokenizerInput;
 mod encoding;
 pub use encode_ids::{
     EncodeIdsError, EncodeIdsFailure, EncodeIdsOutput, EncodeIdsPlan,
@@ -56,6 +58,7 @@ pub mod normalizer;
 pub mod pattern;
 pub mod pre_tokenizer;
 mod serialization;
+pub mod source_serialization;
 pub use cache_policy::{ModelCachePolicy, TokenizerSeed};
 
 // Re-export wrappers
@@ -853,7 +856,6 @@ where
     pub fn get_added_tokens_decoder(&self) -> AHashMap<u32, AddedToken> {
         self.added_vocabulary
             .get_added_tokens_decoder()
-            .into_owned()
     }
 
     /// Get the size of the vocabulary

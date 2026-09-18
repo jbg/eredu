@@ -14,41 +14,84 @@ fn run(mode: &str) -> serde_json::Value {
 }
 
 fn run_artifacts(mode: &str, target: Fixture, draft: Fixture) -> serde_json::Value {
-    run_artifacts_at(mode,target,draft,DraftPlacementPlan::Target,0.0)
+    run_artifacts_at(mode, target, draft, DraftPlacementPlan::Target, 0.0)
 }
-fn run_artifacts_at(mode:&str,target:Fixture,draft:Fixture,placement:DraftPlacementPlan,temperature:f32)->serde_json::Value {
-    run_artifacts_configured(mode,target,draft,placement,settings(temperature))
+fn run_artifacts_at(
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    placement: DraftPlacementPlan,
+    temperature: f32,
+) -> serde_json::Value {
+    run_artifacts_configured(mode, target, draft, placement, settings(temperature))
 }
-fn run_artifacts_configured(mode:&str,target:Fixture,draft:Fixture,placement:DraftPlacementPlan,
-    generation:PreparedChatGenerationSettings)->serde_json::Value {
-    run_artifacts_on(mode,target,draft,eredu_core::DevicePlan::new("mlx","metal:0").unwrap(),placement,generation)
+fn run_artifacts_configured(
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    placement: DraftPlacementPlan,
+    generation: PreparedChatGenerationSettings,
+) -> serde_json::Value {
+    run_artifacts_on(
+        mode,
+        target,
+        draft,
+        eredu_core::DevicePlan::new("mlx", "metal:0").unwrap(),
+        placement,
+        generation,
+    )
 }
-fn run_artifacts_on(mode:&str,target:Fixture,draft:Fixture,target_device:eredu_core::DevicePlan,
-    placement:DraftPlacementPlan,generation:PreparedChatGenerationSettings)->serde_json::Value {
-    run_artifacts_on_with_rounds(mode,target,draft,target_device,placement,generation).0
+fn run_artifacts_on(
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    target_device: eredu_core::DevicePlan,
+    placement: DraftPlacementPlan,
+    generation: PreparedChatGenerationSettings,
+) -> serde_json::Value {
+    run_artifacts_on_with_rounds(mode, target, draft, target_device, placement, generation).0
 }
 // Share the exact driver while exposing completed rounds to cached-dtype coverage.
-fn run_artifacts_on_with_rounds(mode:&str,target:Fixture,draft:Fixture,target_device:eredu_core::DevicePlan,
-    placement:DraftPlacementPlan,generation:PreparedChatGenerationSettings)->(serde_json::Value,usize) {
-    run_artifacts_on_inspected(mode,target,draft,target_device,placement,generation,|plan|plan,None)
+fn run_artifacts_on_with_rounds(
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    target_device: eredu_core::DevicePlan,
+    placement: DraftPlacementPlan,
+    generation: PreparedChatGenerationSettings,
+) -> (serde_json::Value, usize) {
+    run_artifacts_on_inspected(
+        mode,
+        target,
+        draft,
+        target_device,
+        placement,
+        generation,
+        |plan| plan,
+        None,
+    )
 }
-fn run_artifacts_on_inspected(mode:&str,target:Fixture,draft:Fixture,target_device:eredu_core::DevicePlan,
-    placement:DraftPlacementPlan,generation:PreparedChatGenerationSettings,
-    configure:impl FnOnce(ExecutionPlan)->ExecutionPlan,
-    inspect:Option<fn(&LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>)>,
-)->(serde_json::Value,usize) {
+fn run_artifacts_on_inspected(
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    target_device: eredu_core::DevicePlan,
+    placement: DraftPlacementPlan,
+    generation: PreparedChatGenerationSettings,
+    configure: impl FnOnce(ExecutionPlan) -> ExecutionPlan,
+    inspect: Option<fn(&LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>)>,
+) -> (serde_json::Value, usize) {
     let target = managed_fixture(target);
     let draft = managed_fixture(draft);
-    let execution =
-        ExecutionPlan::fully_resident(target_device)
-            .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
-            .with_drafting(DraftingPlan::External {
-                model: draft.0.display().to_string(),
-                placement,
-                max_draft_tokens: 1,
-                lookahead: false,
-                adaptive_lookahead: false,
-            });
+    let execution = ExecutionPlan::fully_resident(target_device)
+        .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
+        .with_drafting(DraftingPlan::External {
+            model: draft.0.display().to_string(),
+            placement,
+            max_draft_tokens: 1,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
     let execution = configure(execution);
     let mut loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &execution)
@@ -63,30 +106,50 @@ fn run_artifacts_on_inspected(mode:&str,target:Fixture,draft:Fixture,target_devi
         }
     };
     if mode == "ordinary" {
-        let chat = model.prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
-            add_generation_prompt: false, tool_choice: ToolChoice::None,
-            ..Default::default()
-        }).unwrap();
+        let chat = model
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
+                    add_generation_prompt: false,
+                    tool_choice: ToolChoice::None,
+                    ..Default::default()
+                },
+                8 * 1024 * 1024 * 1024,
+            )
+            .unwrap();
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
         let mut ordinary = generation;
         ordinary.inference.managed_memory_capacity_bytes = None;
-        let output = model.generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::token_ids(&chat, ids),
-            drafting: drafting.as_speculative_draft().unwrap(), settings: ordinary, options,
-            caller_stop_sequences: &[], cancellation: Default::default(), on_event,
-        }).unwrap_or_else(report_failure);
+        let output = model
+            .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&ids),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
+                drafting: drafting.as_speculative_draft().unwrap(),
+                settings: chat_settings(&chat, ordinary),
+                options,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event,
+            })
+            .unwrap_or_else(report_failure);
         assert_eq!(output.token_ids().len(), 4);
         assert!(output.stats().rounds() >= 1);
-        let rounds=output.stats().rounds();
+        let rounds = output.stats().rounds();
         // Ordinary and admitted paths both retain escaped output after the
         // loaded target, assistant and their fixture sources leave the driver.
-        let address=output.token_ids().as_ptr();
-        if let Some(inspect)=inspect { inspect(model); }
+        let address = output.token_ids().as_ptr();
+        if let Some(inspect) = inspect {
+            inspect(model);
+        }
         drop(loaded);
-        assert_eq!(output.token_ids().as_ptr(),address);
-        return (serde_json::json!({"ids": output.token_ids(), "text": visible}),rounds);
+        assert_eq!(output.token_ids().as_ptr(), address);
+        return (
+            serde_json::json!({"ids": output.token_ids(), "text": visible}),
+            rounds,
+        );
     }
     let source = model
         .compile_managed_plain_text_source(
@@ -127,10 +190,15 @@ fn run_artifacts_on_inspected(mode:&str,target:Fixture,draft:Fixture,target_devi
     }
     // Escaped canonical output remains valid after both source and native models retire.
     let address = output.token_ids().as_ptr();
-    if let Some(inspect)=inspect { inspect(model); }
+    if let Some(inspect) = inspect {
+        inspect(model);
+    }
     drop((source, loaded));
     assert_eq!(output.token_ids().as_ptr(), address);
-    (serde_json::json!({"ids": output.token_ids(), "text": visible}),output.stats().rounds())
+    (
+        serde_json::json!({"ids": output.token_ids(), "text": visible}),
+        output.stats().rounds(),
+    )
 }
 
 #[test]
@@ -210,37 +278,58 @@ fn copy_refusal(error: &eredu_core::speculative::SpeculativeControlError) -> boo
     )
 }
 fn run_continuation(mode: &str) -> serde_json::Value {
-    run_continuation_artifacts(mode, fixture(false), fixture(false), DraftPlacementPlan::Target)
+    run_continuation_artifacts(
+        mode,
+        fixture(false),
+        fixture(false),
+        DraftPlacementPlan::Target,
+    )
 }
 fn run_continuation_artifacts(
-    mode: &str, target: Fixture, draft: Fixture, placement: DraftPlacementPlan,
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    placement: DraftPlacementPlan,
 ) -> serde_json::Value {
-    run_continuation_artifacts_configured(mode,target,draft,placement,settings(0.7))
+    run_continuation_artifacts_configured(mode, target, draft, placement, settings(0.7))
 }
 fn run_continuation_artifacts_configured(
-    mode: &str, target: Fixture, draft: Fixture, placement: DraftPlacementPlan,
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    placement: DraftPlacementPlan,
     generation: PreparedChatGenerationSettings,
 ) -> serde_json::Value {
-    run_continuation_artifacts_on(mode,target,draft,eredu_core::DevicePlan::new("mlx","metal:0").unwrap(),placement,generation)
+    run_continuation_artifacts_on(
+        mode,
+        target,
+        draft,
+        eredu_core::DevicePlan::new("mlx", "metal:0").unwrap(),
+        placement,
+        generation,
+    )
 }
 fn run_continuation_artifacts_on(
-    mode:&str,target:Fixture,draft:Fixture,target_device:eredu_core::DevicePlan,
-    placement:DraftPlacementPlan,generation:PreparedChatGenerationSettings,
-)->serde_json::Value {
+    mode: &str,
+    target: Fixture,
+    draft: Fixture,
+    target_device: eredu_core::DevicePlan,
+    placement: DraftPlacementPlan,
+    generation: PreparedChatGenerationSettings,
+) -> serde_json::Value {
     use eredu_core::speculative::SpeculativeControlError;
     use std::{cell::RefCell, rc::Rc};
     let target = managed_fixture(target);
     let draft = managed_fixture(draft);
-    let execution =
-        ExecutionPlan::fully_resident(target_device)
-            .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
-            .with_drafting(DraftingPlan::External {
-                model: draft.0.display().to_string(),
-                placement,
-                max_draft_tokens: 1,
-                lookahead: false,
-                adaptive_lookahead: false,
-            });
+    let execution = ExecutionPlan::fully_resident(target_device)
+        .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
+        .with_drafting(DraftingPlan::External {
+            model: draft.0.display().to_string(),
+            placement,
+            max_draft_tokens: 1,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
     let mut loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &execution)
             .unwrap();
@@ -257,22 +346,28 @@ fn run_continuation_artifacts_on(
         // This is the actual independent speculative baseline, including its
         // target/draft key split and acceptance draws, not autoregressive RNG.
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
-                add_generation_prompt: false,
-                tool_choice: ToolChoice::None,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
+                    add_generation_prompt: false,
+                    tool_choice: ToolChoice::None,
+                    ..Default::default()
+                },
+                8 * 1024 * 1024 * 1024,
+            )
             .unwrap();
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
         let mut ordinary = generation;
         ordinary.inference.managed_memory_capacity_bytes = None;
         let output = model
-            .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, ids),
+            .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&ids),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings: ordinary,
+                settings: chat_settings(&chat, ordinary),
                 options,
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -465,10 +560,16 @@ fn run_continuation_artifacts_on(
             assert!(session.snapshot_usage().cumulative_copy_bytes > before_exchange);
             assert_eq!(session.branch_info(&child)?.token_ids.as_ref(), expected);
             let changed = (expected[1] + 1) % 64;
-            assert!(matches!(session.force_next_token(64), Err(SpeculativeControlError::InvalidToken(64))));
+            assert!(matches!(
+                session.force_next_token(64),
+                Err(SpeculativeControlError::InvalidToken(64))
+            ));
             assert_eq!(session.token_ids(), prefix);
             session.force_next_token(changed)?;
-            assert!(matches!(session.force_next_token(64), Err(SpeculativeControlError::PendingToken)));
+            assert!(matches!(
+                session.force_next_token(64),
+                Err(SpeculativeControlError::PendingToken)
+            ));
             assert!(session.clear_forced_token()?);
             assert!(!session.clear_forced_token()?);
             assert_eq!(session.token_ids(), prefix);
@@ -622,7 +723,6 @@ mod interventions;
 
 #[path = "speculative/batch.rs"]
 mod batch;
-
 
 #[path = "speculative/assistant.rs"]
 mod assistant;

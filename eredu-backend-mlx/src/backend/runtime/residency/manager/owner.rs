@@ -25,6 +25,7 @@ impl Drop for ManagerCustody {
     }
 }
 impl ManagerCustody {
+    pub(crate) fn is_source_funded(&self) -> bool { self.0.is_some() }
     pub(super) fn new(custody: SharedNativeInitializationCustody) -> Self {
         Self(Some(Arc::new(custody)))
     }
@@ -225,6 +226,7 @@ enum HostBufferValue {
 }
 struct PreparedHostBuffer {
     buffer: safemlx::ImmutableHostTransferBuffer,
+    attachment: Option<super::super::storage::PublishedAllocation>,
 }
 impl RetainedHostBuffer {
     pub(super) fn original(
@@ -232,17 +234,41 @@ impl RetainedHostBuffer {
         custody: ManagerCustody,
     ) -> Self {
         Self {
-            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer { buffer })),
+            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer { buffer, attachment: None })),
             custody: HostCustody::Source(custody),
         }
     }
-    pub(super) fn request(
-        buffer: safemlx::ImmutableHostTransferBuffer,
-        custody: eredu_runtime::working_memory::OriginalOperationMetadataCustody,
+    pub(crate) fn request(
+        source: crate::backend::runtime::residency::storage::filled_host::PublishedHostSource,
     ) -> Self {
+        let (buffer, proof, custody) = source.into_parts();
         Self {
-            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer { buffer })),
+            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer {
+                buffer,
+                attachment: proof,
+            })),
             custody: HostCustody::Request(custody),
+        }
+    }
+    pub(crate) fn attachment_receipt_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<&Self>(),
+            size_of::<(&HostBufferValue, &HostCustody)>(),
+            size_of::<Option<super::super::storage::PublishedAllocation>>(),
+            size_of::<safemlx::AllocationInfo>(),
+            // The map closure captures only this existing custody reference.
+            size_of::<&eredu_runtime::working_memory::OriginalOperationMetadataCustody>(),
+            size_of::<super::super::storage::RetainedAllocationReceipt<'_>>(),
+            size_of::<Option<super::super::storage::RetainedAllocationReceipt<'_>>>(),
+        ];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    pub(crate) fn attachment_receipt(&self) -> Option<super::super::storage::RetainedAllocationReceipt<'_>> {
+        match (&self.value, &self.custody) {
+            (HostBufferValue::Original(value), HostCustody::Request(custody)) =>
+                value.attachment.map(|proof| proof.borrow(custody)),
+            _ => None,
         }
     }
     pub(crate) fn prepared_metadata(&self) -> Option<&safemlx::HostTransferMetadataSnapshot> {
@@ -258,7 +284,7 @@ impl RetainedHostBuffer {
             _ => false,
         }
     }
-    pub(super) fn storage_bytes() -> Result<u64, WorkingMemoryError> {
+    pub(crate) fn storage_bytes() -> Result<u64, WorkingMemoryError> {
         OriginalHostMetadataCustody::shared_storage_bytes(Layout::new::<PreparedHostBuffer>())
     }
 }
@@ -297,7 +323,7 @@ pub struct ResidentHostOwner {
     value: Arc<super::ResidentHostBuffers>,
     custody: HostCustody,
     // Publication names/alias rows retire before their exact preparation H.
-    _metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl ResidentHostOwner {
     pub(super) fn original(value: super::ResidentHostBuffers, custody: ManagerCustody) -> Self {
@@ -320,7 +346,7 @@ impl ResidentHostOwner {
     pub(super) fn request_with_metadata(
         value: super::ResidentHostBuffers,
         custody: eredu_runtime::working_memory::OriginalOperationMetadataCustody,
-        metadata: eredu_nn::workspace::WorkspaceMetadataFunding,
+        metadata: eredu_nn::workspace::HostMetadataFunding,
     ) -> Self {
         Self {
             value: Arc::new(value),

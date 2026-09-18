@@ -141,6 +141,9 @@ impl MlxModelSession {
             original.insert(id.to_owned(), value);
         }
         assert!(observed_nonzero);
+        assert_eq!(original.len(), slots.len());
+        assert_eq!(changed.len(), slots.len());
+        assert_eq!(expected.len(), slots.len());
         self.verify_partition_parameter_coordination_for_test(
             stream, reference, &original, &changed, false,
         );
@@ -171,14 +174,11 @@ impl MlxModelSession {
                 .auxiliary_slots,
             self.payload.parameter_state.published.len()
         );
-        assert!(
-            count
-                .counts()
-                .role(ParameterOwnerRole::PublishedOverlay)
-                .parameters
-                .auxiliary_slots
-                > 0
-        );
+        // This transaction installs each declared model slot directly; it does
+        // not create entries in NativeParameterState's separate overlay maps.
+        // The exact map counts above describe those owners. Every installed
+        // slot is checked against its nonzero replacement below, and again
+        // against its original value after coordinated restoration.
         drop(count);
         let owner = crate::composition::mlx::replicated_text::NativeParameterOwnerSource::new(
             self.payload.model.erased(),

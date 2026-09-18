@@ -70,9 +70,6 @@ where
     ) -> PreparedCompositeInput<'a, NumericTensor, A::InputPartPlan> {
         self.source.input(chunk)
     }
-    fn cache_identity(&self) -> Option<eredu_runtime::PreparedInputCacheIdentity> {
-        self.source.cache_identity()
-    }
     fn shared_cache_identity(&self) -> Option<eredu_runtime::SharedPreparedInputCacheIdentity> {
         self.source.shared_cache_identity()
     }

@@ -17,7 +17,7 @@ pub struct PartitionCaptureLocalSource<'a> {
 pub(super) struct LocalSource {pub(super) producer:usize,pub(super) shape:Vec<u64>,pub(super) dtype:TensorDtype}
 impl LocalSource {
     pub(super) fn copy(source:PartitionCaptureLocalSource<'_>,
-        metadata:&WorkspaceMetadataFunding)->Result<Self,Cause> {
+        metadata:&HostMetadataFunding)->Result<Self,Cause> {
         if source.shape.is_empty()||source.shape.len()>32||!matches!(source.dtype,TensorDtype::F16|TensorDtype::F32|TensorDtype::Bf16) {
             return Err(Cause::Source("local physical source differs"));
         }
@@ -138,12 +138,12 @@ pub(super) fn construction_controls()->Option<usize>{
     let parts=[size_of::<Coordinate>()*2,size_of::<Option<PartitionCaptureLocalSource<'_>>>(),size_of::<LocalSource>()*2,size_of::<Option<LocalSource>>(),
         size_of::<Vec<Option<TensorDtype>>>(),size_of::<Option<TensorDtype>>(),size_of::<Sources<'_,'_>>(),size_of::<Source<'_>>(),
         size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureContiguousProducer],&[PartitionCaptureFragmentGeometry<'_>],
-            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,InferenceGeometry,&WorkspaceMetadataFunding)>(),
+            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,InferenceGeometry,&HostMetadataFunding)>(),
         size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureContiguousProducer],&[PartitionCaptureFragmentGeometry<'_>],
-            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,u64,&WorkspaceMetadataFunding)>(),
+            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,u64,&HostMetadataFunding)>(),
         size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureContiguousProducer],&[PartitionCaptureFragmentGeometry<'_>],
-            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,Coordinate,&WorkspaceMetadataFunding)>(),
-        size_of::<(PartitionCaptureLocalSource<'_>,&WorkspaceMetadataFunding)>(),size_of::<Result<LocalSource,Cause>>(),
+            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,Coordinate,&HostMetadataFunding)>(),
+        size_of::<(PartitionCaptureLocalSource<'_>,&HostMetadataFunding)>(),size_of::<Result<LocalSource,Cause>>(),
         size_of::<std::slice::Iter<'_,PartitionCaptureContiguousProducer>>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
@@ -165,3 +165,5 @@ pub(super) fn pending_controls()->Option<usize>{
         size_of::<(TensorDtype,&PartitionCaptureReceiptPlan)>(),size_of::<std::slice::Iter<'_,NativeSource>>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

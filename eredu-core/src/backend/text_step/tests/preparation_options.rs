@@ -324,7 +324,7 @@ fn options_public_routes_share_original_admission_install_and_prediction() {
                     (0..3)
                         .map(|_| {
                             let token = driver.advance(&mut state).unwrap().unwrap().token_id();
-                            driver.take_completed_step(&mut state).unwrap();
+                            driver.take_completed_delivery(&mut state).unwrap();
                             token
                         })
                         .collect::<Vec<_>>()

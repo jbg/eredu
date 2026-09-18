@@ -33,9 +33,11 @@ fn profile_case_0(implicit: bool) {
     let (c, e) = sizes(implicit);
     let json = json(implicit);
     let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
-    assert!(short
-        .compile_tokenizer(TokenizerPlan::prepare_json(json.as_bytes()).unwrap())
-        .is_err());
+    assert!(
+        short
+            .compile_tokenizer(TokenizerPlan::prepare_json(json.as_bytes()).unwrap())
+            .is_err()
+    );
     assert_eq!(short.used_bytes().unwrap(), 0);
     for one_short in [true, false] {
         let pool = WorkingMemoryPool::new(c + e - u64::from(one_short), 0).unwrap();
@@ -100,7 +102,7 @@ fn profile_case_1(implicit: bool) {
     let delegates = EncodeIdsPlan::prepare(&source.payload().model, text, false)
         .unwrap()
         .regex_delegate_count();
-    assert!(delegates > 0);
+    assert_eq!(delegates, 0);
     let inner = [
         D::Epsilon,
         D::CurrentDense,
@@ -110,7 +112,7 @@ fn profile_case_1(implicit: bool) {
         D::CurrentSlots,
         D::NextSlots,
     ];
-    let outer = [B::Delegates, B::Saves, B::Branches, B::Undo, B::Slots];
+    let outer = [B::Saves, B::Branches, B::Undo];
     let targets = outer
         .into_iter()
         .map(F::Outer)
@@ -166,10 +168,7 @@ fn profile_case_1(implicit: bool) {
             text,
             false,
             |p| {
-                p.fail_regex_reservation(F::Delegate {
-                    ordinal: delegates - 1,
-                    buffer: D::NextSlots,
-                })
+                p.fail_regex_reservation(F::Outer(B::Undo))
                 .unwrap()
             },
             || {},
@@ -186,8 +185,8 @@ fn same_regex_source_has_independent_concurrent_original_workspaces_and_no_forei
     profile_case_2(false);
 }
 #[test]
-fn implicit_same_regex_source_has_independent_concurrent_original_workspaces_and_no_foreign_custody(
-) {
+fn implicit_same_regex_source_has_independent_concurrent_original_workspaces_and_no_foreign_custody()
+ {
     profile_case_2(true);
 }
 fn profile_case_2(implicit: bool) {
@@ -272,7 +271,7 @@ fn implicit_cold_regex_partial_and_completed_rejections_hold_one_original_c_unti
     profile_case_3(true);
 }
 fn profile_case_3(implicit: bool) {
-    use eredu_text::tokenizer_storage::{RegexConstructionFailure as F, RegexScratchBuffer as S};
+    use eredu_text::tokenizer_storage::RegexConstructionFailure as F;
     let json = json(implicit);
     let c = WorkingMemoryPool::tokenizer_required_bytes(
         &TokenizerPlan::prepare_json(json.as_bytes()).unwrap(),
@@ -283,9 +282,6 @@ fn profile_case_3(implicit: bool) {
         F::Instructions,
         F::FirstLiteral,
         F::LastDelegate,
-        F::Scratch(S::Stack),
-        F::Scratch(S::Dense),
-        F::Scratch(S::Sparse),
         F::Completed,
     ]
     .into_iter()

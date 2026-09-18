@@ -35,7 +35,7 @@ impl PreparedGroupedUnitError {
             size_of::<GroupedUnitError>(),
             size_of::<Option<safemlx::OriginalScopeObserver>>(),
             size_of::<std::collections::TryReserveError>(),
-            ComputeError::retained_source_control_bytes::<OriginalUnitFailure>()?,
+            ComputeError::retained_source_construction_bytes::<OriginalUnitFailure>()?,
         ]
         .into_iter()
         .try_fold(bytes, usize::checked_add)

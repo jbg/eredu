@@ -204,10 +204,8 @@ mod prepared_capture {
             self.0.as_step()
         }
     }
-    fn retained(delivery: CapturedStepDelivery) -> RetainedFrame {
-        let CapturedStepDelivery::Shared(frame) = delivery else {
-            panic!("prepared ordinary delivery retains its frame")
-        };
+    fn retained(delivery: SharedCapturedStep) -> RetainedFrame {
+        let frame = delivery;
         RetainedFrame(frame)
     }
     struct Captured {
@@ -302,7 +300,6 @@ mod prepared_capture {
                     while let Some(token) = generation.next_cancellable(&cancellation) {
                         ids.push(token.unwrap().token_id());
                         if captured {
-                            assert!(generation.take_captured_step().unwrap().is_none());
                             assert!(generation.capture_pending());
                             frames.push(retained(
                                 generation.take_captured_delivery().unwrap().unwrap(),
@@ -320,7 +317,6 @@ mod prepared_capture {
                     while let Some(token) = generation.next_cancellable(&cancellation) {
                         ids.push(token.unwrap().token_id().unwrap());
                         if captured {
-                            assert!(generation.take_captured_step().unwrap().is_none());
                             assert!(generation.capture_pending());
                             frames.push(retained(
                                 generation.take_captured_delivery().unwrap().unwrap(),
@@ -643,7 +639,6 @@ mod prepared_capture {
                 let native = exception(&error).expect("original native cause");
                 assert_eq!(native.what(), expected.0);
                 assert_eq!(native.location(), expected.1);
-                assert!(generation.take_captured_step().unwrap().is_none());
                 assert!(generation.capture_pending());
                 let frame = retained(
                     generation
@@ -1060,7 +1055,6 @@ mod prepared_capture {
                 for prediction in 0..2 {
                     assert!(generation.next().unwrap().is_ok());
                     assert!(generation.capture_pending());
-                    assert!(generation.take_captured_step().unwrap().is_none());
                     assert!(generation.capture_pending());
                     let value = retained(generation.take_captured_delivery().unwrap().unwrap());
                     assert_eq!(value.prediction_index, prediction);
@@ -1169,7 +1163,6 @@ mod prepared_capture {
             let native = exception(&error).expect("original native cause");
             assert_eq!(native.what(), expected.0);
             assert_eq!(native.location(), expected.1);
-            assert!(generation.take_captured_step().unwrap().is_none());
             assert!(generation.capture_pending());
             let frame = retained(
                 generation

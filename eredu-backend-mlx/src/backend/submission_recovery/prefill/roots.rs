@@ -113,7 +113,7 @@ impl TransientRootsProjection {
 
     /// Borrow the actual enclosing model recipe, preserving its admitted DAG
     /// and nested root capacity. An unquoted boundary remains a typed refusal.
-    pub(crate) fn boundary_traversal(&self, roots:usize, funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+    pub(crate) fn boundary_traversal(&self, roots:usize, funding:&eredu_nn::workspace::HostMetadataFunding)
         ->Result<(safemlx::OriginalScopeObserver,safemlx::OperationEvalTraversalLayout),Error>{
         let observer=self.0.observer()?;
         let owner=RootsOwner(Some(self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?));
@@ -133,7 +133,7 @@ impl TransientRootsProjection {
         Ok((observer,exact))
     }
     pub(crate) fn boundary_traversal_control_bytes()->Option<usize>{
-        let frames=[size_of::<(&Self,usize,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),size_of::<RootsOwner>(),
+        let frames=[size_of::<(&Self,usize,&eredu_nn::workspace::HostMetadataFunding)>(),size_of::<RootsOwner>(),
             size_of::<crate::backend::nn::workspace::ResidentCompletionRecipe>(),
             size_of::<safemlx::OperationEvalTraversalLayout>(),
             size_of::<safemlx::OperationEvalTraversalLimits>(),
@@ -170,6 +170,16 @@ impl TransientRootsProjection {
             .ok_or(Error::PrefillScopeUnavailable)?
             .append(value)
             .map_err(|cause| Error::PrefillRoots(cause.into()))
+    }
+    /// Retire only an exact completed transfer root; native keeps its cumulative
+    /// append debit and validates the same current original scope before release.
+    pub(crate) fn retire_completed(&self, value: &Array) -> Result<(), Error> {
+        self.0.observer()?;
+        let owner = RootsOwner(Some(self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?));
+        let payload = owner.0.as_ref().expect("closed transient root payload");
+        let mut roots = payload.value.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?;
+        roots.as_mut().ok_or(Error::PrefillScopeUnavailable)?
+            .retire_completed_current(value).map_err(Error::PrefillRoots)
     }
     pub(crate) fn publication_settlement_control_bytes()->Option<usize> {
         let frames=[std::mem::size_of::<(&Self,&Array,&safemlx::Stream)>(),
@@ -435,7 +445,7 @@ impl RootsProjection {
     /// Reborrow this exact original invocation for the selected publication.
     /// The extra weak root view stays inside its Q-owned invocation.
     pub(crate) fn with_parallel_publication<T,E,F>(&self,stream:&safemlx::Stream,run:F)->Result<Result<T,E>,Error>
-    where F:FnOnce(Option<(&crate::backend::runtime::distributed::Group,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+    where F:FnOnce(Option<(&crate::backend::runtime::distributed::Group,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
         let owner=self.owner()?;
         let payload=owner.0.as_ref().expect("closed publication root owner");
         let Some(parallel)=payload.parallel.get() else{return Ok(run(None))};

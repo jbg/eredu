@@ -8,7 +8,7 @@ use eredu_runtime::working_memory::{
 // actual External constructor account outlives every provider and escaped copy.
 struct ExternalCopyCustody {
     _startup: OriginalExternalSpeculativeStartup,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 impl OriginalEmbeddedCachePreparation {
@@ -17,7 +17,7 @@ impl OriginalEmbeddedCachePreparation {
     /// slots are empty. No target or assistant equation authority is issued.
     pub(crate) fn new_external(
         startup: OriginalExternalSpeculativeStartup,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         sources: &OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
     ) -> Result<Self, Error> {
@@ -30,7 +30,7 @@ impl OriginalEmbeddedCachePreparation {
             size_of::<ExternalCopyCustody>(),
             size_of::<HostPreparationAuthority>(),
             size_of::<OriginalExternalSpeculativeStartup>(),
-            size_of::<(&OriginalSpeculativeSemanticPreparation,
+            size_of::<(&PreparedSemanticSource,
                 &OriginalSpeculativeNumericalSources, &OriginalCopyEnvironment<'_>)>(),
             size_of::<(&PrefillRootsRuntime, MlxMetalWorkspaceMechanisms)>(),
             size_of::<Result<(), WorkingMemoryError>>(),

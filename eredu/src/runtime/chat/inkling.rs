@@ -1,10 +1,12 @@
 //! Inkling's structurally framed reasoning and visible-text protocol.
 
-use llguidance::api::TopLevelGrammar;
-use serde_json::{json, Value};
+use super::grammar_text::{repeated_rule, Error as GrammarError, Text as GrammarText, structural_literal};
+use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::tool_schema::ToolDefinition;
+use serde_json::Value;
 
 use super::{
-    constraints::{parse_tools, tool_call_bounds},
+    constraints::{tool_call_bounds},
     dialect::{
         ConstraintConfiguration, DialectParameters, FormatDialect, GenerationPromptBehavior,
     },
@@ -73,50 +75,50 @@ impl InklingToolDialect {
     }
 
     fn grammar(
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-    ) -> Result<String, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
         if TOOL_STRUCTURAL_TOKENS.len() != structural_token_ids.len() {
-            return Err(format!(
+            return Err(funding.try_format(format_args!(
                 "Inkling tools declare {} structural tokens but {} tokenizer IDs were resolved",
                 TOOL_STRUCTURAL_TOKENS.len(),
                 structural_token_ids.len()
-            ));
+            ))?.into());
         }
 
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__eredu_inkling_tools_disabled__\"\n".into());
+            return Ok(funding.try_copy_str("start: \"__eredu_inkling_tools_disabled__\"\n")?);
         }
 
-        let tools = parse_tools(tools)?;
         let structural =
-            |text: &str| structural_literal(text, TOOL_STRUCTURAL_TOKENS, structural_token_ids);
-        let mut grammar = String::new();
+            |text: &str| structural_literal(text, TOOL_STRUCTURAL_TOKENS, structural_token_ids, funding);
+        let mut grammar = GrammarText::new(funding)?;
         match tool_choice {
             ToolChoice::Required => {
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "start: reasoning? visible_text? {}\n",
-                    repeated_rule("tool_call", &structural(MESSAGE_MODEL)?, 1, maximum)
-                ));
-                grammar.push_str(&format!(
+                    repeated_rule("tool_call", &structural(MESSAGE_MODEL)?, 1, maximum, funding)?
+                ))?;
+                grammar.push_fmt(format_args!(
                     "reasoning: {} channel_text {} {}\n",
                     structural(CONTENT_THINKING)?,
                     structural(END_MESSAGE)?,
                     structural(MESSAGE_MODEL)?,
-                ));
-                grammar.push_str(&format!(
+                ))?;
+                grammar.push_fmt(format_args!(
                     "visible_text: {} channel_text {} {}\n",
                     structural(CONTENT_TEXT)?,
                     structural(END_MESSAGE)?,
                     structural(MESSAGE_MODEL)?,
-                ));
+                ))?;
                 grammar.push_str(
                     "channel_text: INKLING_TEXT_CHARACTER*\n\
                      INKLING_TEXT_CHARACTER: /[^<]|<[^|]/\n",
-                );
+                )?;
             }
             ToolChoice::Auto => {
                 let tail = match maximum {
@@ -124,14 +126,14 @@ impl InklingToolDialect {
                         return Err("Inkling auto tool activation requires at least one call".into())
                     }
                     Some(1) => String::new(),
-                    Some(maximum) => format!(
+                    Some(maximum) => funding.try_format(format_args!(
                         " ({} tool_call){{0,{}}}",
                         structural(MESSAGE_MODEL)?,
                         maximum - 1
-                    ),
-                    None => format!(" ({} tool_call)*", structural(MESSAGE_MODEL)?),
+                    ))?,
+                    None => funding.try_format(format_args!(" ({} tool_call)*", structural(MESSAGE_MODEL)?))?,
                 };
-                grammar.push_str(&format!("start: auto_tool_call{tail}\n"));
+                grammar.push_fmt(format_args!("start: auto_tool_call{tail}\n"))?;
             }
             ToolChoice::None => unreachable!("disabled tools returned above"),
         }
@@ -140,47 +142,38 @@ impl InklingToolDialect {
             grammar.push_str(
                 "tool_call: \"__eredu_unreachable_inkling_tool_call__\"\n\
                  auto_tool_call: \"__eredu_unreachable_inkling_auto_tool_call__\"\n",
-            );
-            return Ok(grammar);
+            )?;
+            return Ok(grammar.finish());
         }
 
-        grammar.push_str(&format!(
-            "tool_call: {}\nauto_tool_call: {}\n",
-            (0..tools.len())
-                .map(|index| format!("tool_call_{index}"))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            (0..tools.len())
-                .map(|index| format!("auto_tool_call_{index}"))
-                .collect::<Vec<_>>()
-                .join(" | "),
-        ));
+        for (rule, prefix) in [("tool_call", "tool_call"), ("auto_tool_call", "auto_tool_call")] {
+            grammar.push_fmt(format_args!("{rule}: "))?;
+            for index in 0..tools.len() {
+                if index != 0 { grammar.push_str(" | ")?; }
+                grammar.push_fmt(format_args!("{prefix}_{index}"))?;
+            }
+            grammar.push_str("\n")?;
+        }
         for (index, tool) in tools.iter().enumerate() {
-            let name = json_literal(&tool.name);
-            let payload_schema = json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "enum": [tool.name]},
-                    "args": crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "/properties/args")?,
-                },
-                "required": ["name", "args"],
-                "additionalProperties": false,
-            });
-            let payload_schema =
-                serde_json::to_string(&payload_schema).expect("Inkling tool schema serializes");
-            grammar.push_str(&format!(
+            let name = super::grammar_text::Literal(tool.name);
+            let payload_schema = crate::runtime::chat::tool_schema::ToolCallSchema::new(
+                std::slice::from_ref(tool), "name", "args", None,
+            )?;
+            grammar.push_fmt(format_args!(
                 "tool_call_{index}: {name} {} payload_{index} {}\n",
                 structural(CONTENT_INVOKE_TOOL_JSON)?,
                 structural(END_MESSAGE)?,
-            ));
-            grammar.push_str(&format!(
+            ))?;
+            grammar.push_fmt(format_args!(
                 "auto_tool_call_{index}: {} payload_{index} {}\n",
                 structural(CONTENT_INVOKE_TOOL_JSON)?,
                 structural(END_MESSAGE)?,
-            ));
-            grammar.push_str(&format!("payload_{index}: %json {payload_schema}\n"));
+            ))?;
+            grammar.push_fmt(format_args!("payload_{index}: %json "))?;
+            grammar.push_json(&payload_schema)?;
+            grammar.push_str("\n")?;
         }
-        Ok(grammar)
+        Ok(grammar.finish())
     }
 }
 
@@ -208,12 +201,13 @@ impl FormatDialect for InklingMessageDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        _tools: &[Value],
+        _tools: &[ToolDefinition<'_>],
         _tool_choice: ToolChoice,
         _parallel_tool_calls: ParallelToolCallPolicy,
         _resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<InklingMessageParameters>()?;
         Err("Inkling message semantics do not imply constrained tool generation".into())
     }
 
@@ -222,23 +216,25 @@ impl FormatDialect for InklingMessageDialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         _eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<InklingMessageParameters>()?;
         if resolved_structural_token_ids.len() != MESSAGE_STRUCTURAL_TOKENS.len() {
-            return Err(format!(
+            return Err(funding.try_format(format_args!(
                 "Inkling messages declare {} structural tokens but {} tokenizer IDs were resolved",
                 MESSAGE_STRUCTURAL_TOKENS.len(),
                 resolved_structural_token_ids.len()
-            ));
+            ))?.into());
         }
         let structural = |text: &str| {
             structural_literal(
                 text,
                 MESSAGE_STRUCTURAL_TOKENS,
                 resolved_structural_token_ids,
+                funding,
             )
         };
-        let grammar = format!(
+        let grammar = funding.try_format(format_args!(
             "start: reasoning? visible {}\n\
              reasoning: {} channel_text {} {}\n\
              visible: {} channel_text {}\n\
@@ -250,9 +246,9 @@ impl FormatDialect for InklingMessageDialect {
             structural(MESSAGE_MODEL)?,
             structural(CONTENT_TEXT)?,
             structural(END_MESSAGE)?,
-        );
+        ))?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(grammar),
+            grammar: crate::runtime::chat::grammar_text::lark(grammar, funding)?,
         })
     }
 
@@ -313,19 +309,21 @@ impl FormatDialect for InklingToolDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<InklingMessageParameters>()?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(Self::grammar(
+            grammar: crate::runtime::chat::grammar_text::lark(Self::grammar(
                 tools,
                 tool_choice,
                 parallel_tool_calls,
                 resolved_structural_token_ids,
-            )?),
+                funding,
+            )?, funding)?,
         })
     }
 
@@ -364,49 +362,6 @@ impl FormatDialect for InklingToolDialect {
 
 fn json_literal(text: &str) -> String {
     serde_json::to_string(text).expect("strings serialize as Inkling Lark literals")
-}
-
-fn structural_literal(
-    text: &str,
-    structural_tokens: &[&str],
-    structural_token_ids: &[u32],
-) -> Result<String, String> {
-    let mut sequence = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let Some((position, structural_index)) = structural_tokens
-            .iter()
-            .enumerate()
-            .filter_map(|(index, token)| remaining.find(token).map(|position| (position, index)))
-            .min_by_key(|(position, index)| (*position, *index))
-        else {
-            sequence.push(json_literal(remaining));
-            break;
-        };
-        if position > 0 {
-            sequence.push(json_literal(&remaining[..position]));
-        }
-        sequence.push(format!("<[{}]>", structural_token_ids[structural_index]));
-        remaining = &remaining[position + structural_tokens[structural_index].len()..];
-    }
-    if sequence.is_empty() {
-        sequence.push(json_literal(""));
-    }
-    Ok(sequence.join(" "))
-}
-
-fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<usize>) -> String {
-    debug_assert!(minimum > 0);
-    let tail = format!("({separator} {item})");
-    let required = std::iter::once(item.to_owned())
-        .chain(std::iter::repeat_n(tail.clone(), minimum - 1))
-        .collect::<Vec<_>>()
-        .join(" ");
-    match maximum {
-        Some(maximum) if maximum == minimum => required,
-        Some(maximum) => format!("{required} {tail}{{0,{}}}", maximum - minimum),
-        None => format!("{required} {tail}*"),
-    }
 }
 
 #[derive(Debug, Default, Clone)]

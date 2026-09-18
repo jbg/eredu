@@ -23,14 +23,15 @@ impl AllOfValidator<SerdeJson> {
         ctx: &compiler::Context<F>,
         items: &'a [Value],
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("allOf");
-        let mut schemas = Vec::with_capacity(items.len());
+        let ctx = ctx.new_at_location("allOf")?;
+        let mut schemas = Vec::new();
+        ctx.funding().grow(&mut schemas, items.len())?;
         for (idx, item) in items.iter().enumerate() {
-            let ctx = ctx.new_at_location(idx);
+            let ctx = ctx.new_at_location(idx)?;
             let validators = compiler::compile(&ctx, ctx.as_resource_ref(item))?;
             schemas.push(validators);
         }
-        Ok(Box::new(AllOfValidator { schemas }))
+        Ok(ctx.funding().boxed(AllOfValidator { schemas })?)
     }
 }
 
@@ -46,11 +47,14 @@ impl<F: Json> Validate<F> for AllOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.schemas.iter().all(|n| n.is_valid(instance, ctx))
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -59,11 +63,12 @@ impl<F: Json> Validate<F> for AllOfValidator<F> {
     ) -> Result<(), ValidationError<'i>> {
         for schema in &self.schemas {
             schema.validate(instance, location, tracker, ctx)?;
+            if ctx.workspace.failed() { return Ok(()); }
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -73,6 +78,7 @@ impl<F: Json> Validate<F> for AllOfValidator<F> {
     ) {
         for node in &self.schemas {
             node.collect_errors(instance, location, tracker, ctx, errors);
+            if ctx.workspace.failed() { return; }
         }
     }
 
@@ -101,10 +107,10 @@ impl SingleValueAllOfValidator<SerdeJson> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("allOf");
-        let ctx = ctx.new_at_location(0);
+        let ctx = ctx.new_at_location("allOf")?;
+        let ctx = ctx.new_at_location(0)?;
         let node = compiler::compile(&ctx, ctx.as_resource_ref(schema))?;
-        Ok(Box::new(SingleValueAllOfValidator { node }))
+        Ok(ctx.funding().boxed(SingleValueAllOfValidator { node })?)
     }
 }
 
@@ -120,11 +126,14 @@ impl<F: Json> Validate<F> for SingleValueAllOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.node.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -134,7 +143,7 @@ impl<F: Json> Validate<F> for SingleValueAllOfValidator<F> {
         self.node.validate(instance, location, tracker, ctx)
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -174,14 +183,13 @@ pub(crate) fn compile<'a, F: Json>(
             Some(AllOfValidator::compile(ctx, items))
         }
     } else {
-        let location = ctx.location().join("allOf");
-        Some(Err(ValidationError::single_type_error(
+        let location = crate::keywords::try_compile!(ctx.location().join_with_funding("allOf", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(ValidationError::single_type_error_with_funding(
             location.clone(),
             location,
-            Location::new(),
+            crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
             Cow::Borrowed(schema),
-            JsonType::Array,
-        )))
+            JsonType::Array, ctx.funding())).into()))
     }
 }
 

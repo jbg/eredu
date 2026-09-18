@@ -3,9 +3,9 @@ use super::*;
 #[test]
 fn cancellation_after_running_admission_does_not_invent_a_prediction() {
     let mut lifecycle = GenerationLifecycle::default();
-    assert!(lifecycle.cancel_without_prediction().is_err());
+    assert!(lifecycle.finish_without_prediction(FinishReason::Cancelled).is_err());
     lifecycle.begin_prediction().unwrap();
-    lifecycle.cancel_without_prediction().unwrap();
+    lifecycle.finish_without_prediction(FinishReason::Cancelled).unwrap();
     assert_eq!(lifecycle.next_prediction(), 0);
     assert_eq!(lifecycle.status(), GenerationStatus::Cancelled);
     assert!(lifecycle.checkpoint().is_err());
@@ -17,6 +17,7 @@ fn lifecycle_only_snapshots_completed_and_delivered_boundaries() {
     let mut run = GenerationLifecycle::default();
     let initial = run.checkpoint().unwrap();
     run.begin_prediction().unwrap();
+    assert!(run.validate_placement().is_err());
     assert!(run.pause().is_err());
     assert!(run.cancel().is_err());
     assert!(run.checkpoint().is_err());
@@ -44,10 +45,12 @@ fn lifecycle_only_snapshots_completed_and_delivered_boundaries() {
     run.restore(&initial).unwrap();
     assert_eq!(run.next_prediction(), 0);
     run.cancel().unwrap();
+    assert!(run.validate_placement().is_ok());
     assert!(run.checkpoint().is_err());
     assert!(run.restore(&saved).is_err());
     assert_eq!(run.finish_reason(), Some(FinishReason::Cancelled));
     child.fail();
+    assert!(child.validate_placement().is_err());
     assert!(child.checkpoint().is_err());
     assert!(child.restore(&saved).is_err());
 }
@@ -152,4 +155,40 @@ fn unavailable_or_overflowing_estimates_fail_before_reservation() {
     ));
     assert_eq!(budget.usage(), before);
     drop(saved);
+}
+
+#[test]
+fn original_snapshot_budget_prepares_once_and_retains_its_real_payer() {
+    use eredu_core::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct State { calls: AtomicUsize, refuse: AtomicBool, retired: AtomicBool }
+    #[derive(Debug)]
+    struct Account(Arc<State>);
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+            self.0.calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.refuse.load(Ordering::SeqCst) {
+                Err(HostMetadataFundingError::Capacity { required: bytes as u64, available: 0 })
+            } else { Ok(()) }
+        }
+    }
+    impl Drop for Account {
+        fn drop(&mut self) { self.0.retired.store(true, Ordering::SeqCst); }
+    }
+    let state = Arc::new(State::default());
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
+    let limits = SnapshotLimits { max_snapshots: 1, max_branches: 1, retained_bytes: 20, cumulative_copy_bytes: 40 };
+    let before = state.calls.load(Ordering::SeqCst);
+    state.refuse.store(true, Ordering::SeqCst);
+    assert!(matches!(SnapshotBudget::prepare(limits, &funding), Err(HostMetadataFundingError::Capacity { .. })));
+    assert_eq!(state.calls.load(Ordering::SeqCst), before + 1);
+    state.refuse.store(false, Ordering::SeqCst);
+    let budget = SnapshotBudget::prepare(limits, &funding).unwrap();
+    let alias = budget.clone();
+    drop((funding, budget));
+    assert!(!state.retired.load(Ordering::SeqCst));
+    assert_eq!(alias.usage(), SnapshotUsage::default());
+    drop(alias);
+    assert!(state.retired.load(Ordering::SeqCst));
 }

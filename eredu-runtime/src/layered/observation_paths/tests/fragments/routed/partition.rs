@@ -3,19 +3,19 @@ use super::*;
 use crate::capture::partition::*;
 use eredu_core::component::{ComponentCoordinateMap,RoutedComponentCoordinateMap};
 use eredu_core::consensus::{ConsensusTransport,BoundedConsensusTransport};
-use eredu_nn::workspace::{WorkspaceMetadataAccount,WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount,HostMetadataFunding,HostMetadataFundingError};
 use std::{cell::RefCell,convert::Infallible,sync::atomic::{AtomicUsize,Ordering}};
 #[derive(Debug)]
 struct Metadata(Arc<AtomicUsize>);
-impl WorkspaceMetadataAccount for Metadata {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{self.0.fetch_add(bytes,Ordering::SeqCst);Ok(())}
+impl HostMetadataAccount for Metadata {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{self.0.fetch_add(bytes,Ordering::SeqCst);Ok(())}
 }
 struct Done;
 impl Completion for Done {type Error=Infallible;fn is_complete(&self)->Result<bool,Infallible>{Ok(true)}fn wait(&self)->Result<(),Infallible>{Ok(())}}
 impl BoundedCompletion for Done {
     fn wait_bounded(self,_:BoundedCompletionWait)->Result<BoundedCompletionOutcome,Infallible>{Ok(BoundedCompletionOutcome::Completed)}
 }
-struct LocalTransport {metadata:WorkspaceMetadataFunding,calls:RefCell<Vec<PartitionCaptureFrameKind>>}
+struct LocalTransport {metadata:HostMetadataFunding,calls:RefCell<Vec<PartitionCaptureFrameKind>>}
 impl ConsensusTransport for LocalTransport {
     type Error=Infallible;fn participant_count(&self)->usize{1}
     fn all_gather_words(&self,_:&[u32])->Result<Vec<u32>,Infallible>{panic!("untyped transport")}
@@ -87,7 +87,7 @@ impl ScheduledCaptureBackend for PartitionBackend<'_>{
 fn original_partition_routed_observer_returns_sparse_owners_after_uneven_chunks_and_retains_failed_batch(){
     for fail in [false,true]{
         let source=sparse_source();let metadata_used=Arc::new(AtomicUsize::new(0));
-        let metadata=WorkspaceMetadataFunding::new(Metadata(metadata_used.clone())).unwrap();
+        let metadata=HostMetadataFunding::new(Metadata(metadata_used.clone())).unwrap();
         let transport=LocalTransport{metadata:metadata.clone(),calls:RefCell::new(vec![])};
         let global=CaptureRoutedUnitsGeometry::prepare(source.admission(),0,CapturePhase::Prefill,0,None).unwrap();
         let ownership=RoutedUnitCaptureOwnership{coordinates:RoutedComponentCoordinateMap::new(

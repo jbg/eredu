@@ -75,7 +75,7 @@ fn publication_seal_prices_exact_c_outside_one_original_host_hold() {
         ))
     ));
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (_, r, accepted) = sealed_plan(&pool, &q, 64 + required).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &q, 64 + required).unwrap();
     let (r, run) = r.into_funding().unwrap();
     assert!(accepted
         .clone()

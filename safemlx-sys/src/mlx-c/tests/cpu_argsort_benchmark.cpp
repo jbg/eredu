@@ -20,7 +20,7 @@ int main() {
       for (unsigned iteration = 0; iteration < repeats; ++iteration) {
         const auto run_heap = [&] {
           const auto start = clock::now();
-          mlx::core::cpu::detail::argsort_f32_row(values.data(), 1, actual.data(), 1, width);
+          mlx::core::cpu::detail::argsort_row(values.data(), 1, actual.data(), 1, width);
           heap += clock::now() - start;
         };
         const auto run_stable = [&] {

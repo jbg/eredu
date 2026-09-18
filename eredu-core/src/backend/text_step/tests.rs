@@ -16,6 +16,7 @@ mod host_custody;
 mod identity;
 mod preparation_options;
 mod resume;
+mod branch;
 mod sequence_preparation;
 
 #[derive(Debug, Default)]
@@ -45,6 +46,8 @@ struct Facts {
     fail_submission: bool,
     fail_provider_hook: bool,
     fail_finish: bool,
+    fail_branch_exchange: bool,
+    branch_exchanges: Vec<(TextRunIdentity, TextRunIdentity)>,
 }
 
 #[derive(Clone)]
@@ -259,9 +262,36 @@ impl TextGenerationBackend for Backend {
     type TextGenerationState = State;
     type TextCompletion = Pending;
 
+    fn requires_original_preparation_control(runtime: &ModelRuntime<Self>) -> bool {
+        runtime.backend().0.borrow().sequence.explicit_control
+    }
+    fn prepare_text_preparation_control(
+        runtime: &ModelRuntime<Self>,
+        input: &TextPreparationInput<'_, Self::Prompt>,
+        _: TextGenerationConfig,
+        _: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Option<Self::TextPreparationControl>, BackendFailure> {
+        let mut facts = runtime.backend().0.borrow_mut();
+        if !facts.sequence.explicit_control {
+            return Ok(None);
+        }
+        assert!(matches!(input, TextPreparationInput::OriginalPrepared(_)));
+        facts.sequence.controls += 1;
+        Ok(Some(()))
+    }
+    fn agree_text_preparation_with_control(
+        runtime: &ModelRuntime<Self>,
+        control: Option<&Self::TextPreparationControl>,
+        stage: Stage,
+        status: Status,
+    ) -> Result<Outcome, BackendFailure> {
+        assert_eq!(control.is_some(), runtime.backend().0.borrow().sequence.explicit_control);
+        Self::agree_text_preparation(runtime, stage, status)
+    }
+
     fn try_take_text_capture(
         state: &mut Self::TextGenerationState,
-    ) -> Result<Option<crate::capture::CapturedStepDelivery>, Self::Error> {
+    ) -> Result<Option<crate::capture::SharedCapturedStep>, Self::Error> {
         capture_delivery::drain(&state.facts)
     }
     fn text_capture_pending(state: &Self::TextGenerationState) -> bool {
@@ -1137,7 +1167,7 @@ fn read_only_copy_boundary_preserves_subsequent_controlled_and_ordinary_parity()
         }
         assert_eq!(facts.borrow().events, before);
         actual.push(driver.advance(&mut state).unwrap().unwrap().token_id());
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
         let recorded = facts.borrow().contexts.last().unwrap().clone();
         assert_eq!(recorded.attempt(), prediction as u64);
         assert_eq!(recorded.run_identity(), original.run_identity());
@@ -1167,7 +1197,7 @@ fn context_attempts_survive_mutation_and_restore_while_fork_gets_new_run() {
         .unwrap();
     for _ in 0..2 {
         driver.advance(&mut state).unwrap().unwrap();
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
     }
     let first = facts.borrow().contexts[0].clone();
     let second = facts.borrow().contexts[1].clone();
@@ -1176,7 +1206,7 @@ fn context_attempts_survive_mutation_and_restore_while_fork_gets_new_run() {
     assert_eq!((first.attempt(), second.attempt()), (0, 1));
     let _ = state.controller_mut();
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     let third = facts.borrow().contexts[2].clone();
     assert_eq!(third.run_identity(), first.run_identity());
     assert_ne!(third.policy_identity(), first.policy_identity());
@@ -1208,7 +1238,7 @@ fn context_attempts_survive_mutation_and_restore_while_fork_gets_new_run() {
         )
     };
     driver.advance(&mut state).unwrap().unwrap();
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     driver.advance(&mut child).unwrap().unwrap();
     let fourth = facts.borrow().contexts[3].clone();
     let forked = facts.borrow().contexts[4].clone();

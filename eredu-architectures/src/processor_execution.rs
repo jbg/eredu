@@ -604,7 +604,7 @@ where
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
-    for segment in request.segments() {
+    for (source_group, segment) in request.segments().iter().enumerate() {
         match segment {
             TokenizedMultimodalSegment::TokenIds(ids) => {
                 push_tokens(&mut parts, ids, mechanisms)?;
@@ -618,6 +618,7 @@ where
                     InputModality::Image,
                     image,
                     &image_plan,
+                    None,
                     mechanisms,
                 )?);
                 push_tokens(&mut parts, &[image_plan.framing.end_token_id], mechanisms)?;
@@ -633,7 +634,7 @@ where
                         video.sampling(),
                     )
                     .map_err(plan_error)?;
-                push_gemma4_video(&mut parts, video, &video_plan, mechanisms, encode_text)?;
+                push_gemma4_video(&mut parts, source_group, video, &video_plan, mechanisms, encode_text)?;
             }
             TokenizedMultimodalSegment::Media(Media::Audio(audio)) => {
                 let audio_plan = plan.audio().map_err(plan_error)?;
@@ -712,6 +713,7 @@ fn gemma4_image<M, E>(
     modality: InputModality,
     image: &RgbImage,
     plan: &Gemma4ImagePlan,
+    video_origin: Option<InputExtent>,
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
@@ -739,17 +741,18 @@ where
             (InputMetadataKey::PatchGrid, grid_tensor),
             (InputMetadataKey::PatchPositions, positions),
         ],
-        [InputExtent::PatchGrid {
+        std::iter::once(InputExtent::PatchGrid {
             time: extent[0],
             height: extent[1],
             width: extent[2],
-        }],
+        }).chain(video_origin),
     )
     .map_err(ProcessorExecutionError::Prepared)
 }
 
 fn push_gemma4_video<M, E>(
     parts: &mut Vec<PreparedInputPart<M::Tensor>>,
+    source_group: usize,
     video: &eredu_core::Video,
     plan: &Gemma4VideoPlan,
     mechanisms: &mut M,
@@ -759,7 +762,7 @@ where
     M: ProcessorOperations,
     E: std::fmt::Display,
 {
-    for frame in &plan.frames {
+    for (index, frame) in plan.frames.iter().enumerate() {
         let mut prefix =
             encode_text(&frame.timestamp_text).map_err(ProcessorExecutionError::Text)?;
         prefix.push(plan.framing.start_token_id);
@@ -774,6 +777,11 @@ where
             InputModality::Video,
             &video.frames()[frame.source_index],
             &image_plan,
+            Some(InputExtent::VideoFrame {
+                group: source_group, index, count: plan.frames.len(),
+                first_source_frame: frame.source_index, last_source_frame: frame.source_index,
+                source_fps_bits: video.source_fps().unwrap_or(24.0).to_bits(),
+            }),
             mechanisms,
         )?);
         push_tokens(parts, &[plan.framing.end_token_id], mechanisms)?;
@@ -1230,7 +1238,7 @@ where
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
-    for segment in request.segments() {
+    for (source_group, segment) in request.segments().iter().enumerate() {
         match segment {
             TokenizedMultimodalSegment::TokenIds(ids) => {
                 push_tokens(&mut parts, ids, mechanisms)?;
@@ -1254,7 +1262,7 @@ where
                         video.sampling(),
                     )
                     .map_err(plan_error)?;
-                push_qwen_video(&mut parts, video, &video_plan, mechanisms, encode_text)?;
+                push_qwen_video(&mut parts, source_group, video, &video_plan, mechanisms, encode_text)?;
             }
             TokenizedMultimodalSegment::Media(Media::Audio(_)) => {
                 return Err(ProcessorExecutionError::Plan(
@@ -1296,6 +1304,7 @@ where
 
 fn push_qwen_video<M, E>(
     parts: &mut Vec<PreparedInputPart<M::Tensor>>,
+    source_group: usize,
     video: &eredu_core::Video,
     plan: &QwenVideoPlan,
     mechanisms: &mut M,
@@ -1305,7 +1314,7 @@ where
     M: ProcessorOperations,
     E: std::fmt::Display,
 {
-    for group in &plan.groups {
+    for (index, group) in plan.groups.iter().enumerate() {
         let mut prefix =
             encode_text(&group.timestamp_text).map_err(ProcessorExecutionError::Text)?;
         prefix.push(plan.framing.start_token_id);
@@ -1327,10 +1336,16 @@ where
             .tensor_i32(&grid, &[1, 3])
             .map_err(mechanism_error)?;
         parts.push(
-            PreparedInputPart::new(
+            PreparedInputPart::new_with_extents(
                 InputModality::Video,
                 PreparedInputPayload::Tensor(payload),
                 [(InputMetadataKey::PatchGrid, metadata)],
+                [InputExtent::VideoFrame {
+                    group: source_group, index, count: plan.groups.len(),
+                    first_source_frame: group.source_indices[0],
+                    last_source_frame: *group.source_indices.last().expect("nonempty temporal group"),
+                    source_fps_bits: video.source_fps().unwrap_or(24.0).to_bits(),
+                }],
             )
             .map_err(ProcessorExecutionError::Prepared)?,
         );
@@ -1732,6 +1747,35 @@ mod tests {
         assert_eq!(prepared.len(), 3);
         assert_eq!(prepared.parts()[1].modality(), InputModality::Video);
         assert_eq!(prepared.parts()[1].payload().value().shape, [4, 24]);
+        assert_eq!(prepared.parts()[1].extents(), [InputExtent::VideoFrame {
+            group: 0, index: 0, count: 1, first_source_frame: 0, last_source_frame: 1,
+            source_fps_bits: 1.0f64.to_bits(),
+        }]);
+    }
+
+    #[test]
+    fn gemma_video_execution_retains_exact_frame_group_and_shared_timestamp_equation() {
+        let model = br#"{"boi_token_id":43,"eoi_token_id":44,"vision_soft_tokens_per_image":70,
+            "vision_config":{"patch_size":2,"pooling_kernel_size":1}}"#;
+        let processor = PreparedProcessor { kind: ProcessorKind::Gemma4(
+            Gemma4ProcessorPlan::from_hf_json(model, None,
+                Some(br#"{"patch_size":2,"pooling_kernel_size":1,"max_soft_tokens":70,"num_frames":2}"#)).unwrap().unwrap(),
+        ) };
+        let video = Video::new(vec![image(1), image(2)], Some(1.0), VideoSampling::All).unwrap();
+        let request = MultimodalRequest::new(vec![MultimodalSegment::TokenIds(vec![7]),
+            MultimodalSegment::Media(Media::Video(video))]).unwrap().tokenize::<Infallible>(|_| unreachable!()).unwrap();
+        let mut timestamps = Vec::new();
+        let prepared = processor.prepare(&request, &mut TestMechanisms::default(), &mut |value| {
+            timestamps.push(value.to_owned()); Ok::<_, Infallible>(vec![90])
+        }).unwrap();
+        assert_eq!(timestamps, ["00:00 ", " 00:01 "]);
+        assert_eq!(prepared.len(), 7);
+        for (index, part) in [2usize, 5].into_iter().enumerate() {
+            assert!(prepared.parts()[part].extents().contains(&InputExtent::VideoFrame {
+                group: 1, index, count: 2, first_source_frame: index, last_source_frame: index,
+                source_fps_bits: 1.0f64.to_bits(),
+            }));
+        }
     }
 
     #[test]

@@ -40,7 +40,24 @@ pub(super) fn inspect(source:WorkspaceAddressableRegionView<'_>,inputs:&[&Worksp
     let mut layouts=context.metadata_vec(inputs.len())?;
     for input in inputs {layouts.push(context.layout(input.shape(),input.layout().dtype())?
         .with_representation(input.layout().representation()));}
-    let native=context.mechanisms.addressable_observation_layout(source,&layouts,context)?;
+    let value=layout(source,&layouts,context)?;
+    let result=observe(WorkspaceAddressableObservationView{region:source,envelope:value.envelope,
+        units:value.units.as_view(),unit_coordinates:None})?;
+    result.validate()?;
+    if result.unit_dtype!=value.units.representation().map(|v|v.dtype()){
+        return Err(WorkspaceMetadataError::Unqualified.into());
+    }
+    Ok(result)
+}
+
+/// Shared physical Units source for direct and expert-exchanged local providers.
+pub(in crate::workspace) fn layout(source:WorkspaceAddressableRegionView<'_>,inputs:&[WorkspaceLayout],
+    context:&WorkspaceContext)->Result<WorkspaceAddressableObservationLayout,Error> {
+    context.charge_metadata(size_of::<(WorkspaceAddressableRegionView<'_>,&[WorkspaceLayout],&WorkspaceContext,
+        Option<WorkspaceAddressableObservationLayout>,WorkspaceAddressableObservationLayout,
+        Result<WorkspaceAddressableObservationLayout,Error>,WorkspaceGroupedBank,usize,i32,
+        WorkspaceGroupedObservationSchedule,WorkspaceGroupedObservationEnvelope)>())?;
+    let native=context.mechanisms.addressable_observation_layout(source,inputs,context)?;
     let value=match native {
         Some(value)=>value,
         None=>{
@@ -70,13 +87,7 @@ pub(super) fn inspect(source:WorkspaceAddressableRegionView<'_>,inputs:&[&Worksp
         || value.units.shape()!=[selected,unit_columns]||value.units.dtype()!=WorkspaceDtype::Float32 {
         return Err(WorkspaceMetadataError::Unqualified.into());
     }
-    let result=observe(WorkspaceAddressableObservationView{region:source,envelope:value.envelope,
-        units:value.units.as_view(),unit_coordinates:None})?;
-    result.validate()?;
-    if result.unit_dtype!=value.units.representation().map(|v|v.dtype()){
-        return Err(WorkspaceMetadataError::Unqualified.into());
-    }
-    Ok(result)
+    Ok(value)
 }
 
 #[cfg(test)]

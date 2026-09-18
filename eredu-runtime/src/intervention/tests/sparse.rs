@@ -252,7 +252,7 @@ fn plans_for(actions: Vec<InterventionAction>) -> (AdmittedCapturePlan, Admitted
 fn session_for(actions: Vec<InterventionAction>) -> CaptureSession {
     let (capture, plan) = plans_for(actions);
     preflight(&capture, &plan, &Estimates).unwrap();
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(plan, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -649,7 +649,7 @@ fn independent_cached_invocations_edit_sparse_units_using_physical_token_rows() 
         .clone()
         .admit_invocations(&discovery, bounds, "session")
         .unwrap();
-    let mut run = CaptureSession::new(capture);
+    let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     run.enable_interventions(plan, std::sync::Arc::new(Estimates))
         .unwrap();
     run.begin_invocation(

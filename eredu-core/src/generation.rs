@@ -4,10 +4,6 @@ use crate::backend::{
     BoundedCompletionWait, BoundedCompletionWaitError, CompletionCancellationMode,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::Duration;
 
 /// Host timing shared by ordinary, observed, and speculative terminal outputs.
@@ -216,42 +212,9 @@ pub enum FinishReason {
     Cancelled,
 }
 
-/// Cheap thread-safe cooperative cancellation observed between submissions.
-#[derive(Debug, Clone, Default)]
-pub struct GenerationCancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl GenerationCancellationToken {
-    /// Requested shared cancellation cell and fixed constructor controls. This
-    /// queries only the token's actual owner; it grants no memory or execution.
-    pub fn construction_bytes() -> Option<usize> {
-        let allocation = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
-            .extend(std::alloc::Layout::new::<AtomicBool>())
-            .ok()?
-            .0
-            .pad_to_align()
-            .size();
-        allocation
-            .checked_add(std::mem::size_of::<Self>())?
-            .checked_add(std::mem::size_of::<Arc<AtomicBool>>())
-    }
-
-    /// Creates an active token.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Permanently requests cancellation for every clone.
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    /// Returns whether cancellation has been requested.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
+mod cancellation;
+pub use cancellation::GenerationCancellationToken;
+pub(crate) use cancellation::ControlFlag;
 
 /// Terminal signals observed while committing one token.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1497,3 +1460,6 @@ mod tests {
         ));
     }
 }
+
+mod semantic_state;
+pub use semantic_state::{SemanticState, SemanticStateOwner};

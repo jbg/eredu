@@ -15,7 +15,7 @@ use eredu_runtime::{
     RuntimeStateComponents,
     working_memory::{
         InferenceWorkspaceReport, InferenceWorkspaceSpan, SamplingWorkspaceReport,
-        WorkspaceResidentLayerState, WorkspaceResidentStateFactory, quote_inference_workspace,
+        WorkspaceResidentLayerState, WorkspaceResidentStateFactory,
         quote_inference_workspace_with_context,
     },
 };
@@ -176,6 +176,10 @@ pub trait InferenceEquationTraceObserver {
         self.observe_sampling(phase, report)
     }
 
+    /// Retains the actual score-source facts for consumers that later reprice
+    /// sampling without running another model equation.
+    fn observe_sampling_input(&mut self, _input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> { Ok(()) }
+
     fn observe_sampling(
         &mut self,
         _phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
@@ -191,6 +195,9 @@ struct EquationTraceRef<'a, 'observer>(
 );
 
 impl eredu_runtime::working_memory::SamplingWorkspaceObserver for EquationTraceRef<'_, '_> {
+    fn observe_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+        self.0.borrow_mut().observe_sampling_input(input)
+    }
     fn observe(
         &mut self,
         phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
@@ -577,6 +584,7 @@ impl PreparedInferenceBlueprint {
             input_dtype,
             false,
             routed_pass,
+            None,
         )
     }
 
@@ -592,6 +600,7 @@ impl PreparedInferenceBlueprint {
         input_dtype: Option<eredu_nn::workspace::WorkspaceDtype>,
         target_capture: bool,
         routed_pass: Option<eredu_runtime::ExpertPass>,
+        media: Option<MediaEquationRef<'_>>,
     ) -> Result<EquationQuote, PreparedExecutionError<Error>> {
         context
             .charge_metadata(std::mem::size_of::<(bool,Option<eredu_runtime::ExpertPass>)>())
@@ -628,7 +637,7 @@ impl PreparedInferenceBlueprint {
             unpriced_execution: None,
             observation,
             trace,
-            media: None,
+            media,
             input_dtype,
             target_capture,
             routed_pass,
@@ -678,6 +687,7 @@ impl ReplicatedTextArchitectureVisitor<WorkspaceBackend, ResidentState>
 impl EquationVisitor<'_, '_, '_> {
     fn execution_pass(&self,span:&InferenceWorkspaceSpan)->eredu_runtime::ExpertPass {
         self.routed_pass.unwrap_or(match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
             InferenceWorkspaceSpan::Prefill(_)=>eredu_runtime::ExpertPass::Prefill,
             InferenceWorkspaceSpan::Decode{..}=>eredu_runtime::ExpertPass::Decode,
         })
@@ -770,7 +780,7 @@ impl EquationVisitor<'_, '_, '_> {
             self.observation.map(|observer| observer.paths),
             self.target_capture,
         )?;
-        let hook_bytes = runtime.observation_host_peak_bytes()?;
+        let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
         self.quote_spans(hook_bytes, |tokens, state, demand, observer| {
             runtime
                 .forward_with_capture(
@@ -814,7 +824,7 @@ impl EquationVisitor<'_, '_, '_> {
             self.observation.map(|observer| observer.paths),
             self.target_capture,
         )?;
-        let hook_bytes = runtime.observation_host_peak_bytes()?;
+        let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
         self.quote_spans_with_span(hook_bytes, |tokens, state, demand, observer, span| {
             runtime
                 .forward_routed_with_capture(
@@ -900,6 +910,7 @@ impl EquationVisitor<'_, '_, '_> {
         let equations =
             quote_inference_workspace_with_context(self.geometry, self.context, |span| {
                 let (position, count, mut demand) = match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
                     InferenceWorkspaceSpan::Prefill(chunk) => (
                         chunk.position,
                         chunk.input.end - chunk.input.start,
@@ -1127,7 +1138,7 @@ impl EquationVisitor<'_, '_, '_> {
                         cause => self.context.metadata_source(cause),
                     }
                 } else if self.observation.is_some() {
-                    Error::backend_source(error)
+                    Error::backend_retained_source(error)
                 } else {
                     Error::backend(error.to_string())
                 }

@@ -170,7 +170,7 @@ impl Metadata {
         if self.0.uses_checked_metadata() {
             self.0.metadata_source(cause)
         } else {
-            eredu_nn::Error::backend_source(cause)
+            eredu_nn::Error::backend_retained_source(cause)
         }
     }
     #[track_caller]
@@ -1485,6 +1485,7 @@ impl InferenceWorkspaceObserver for CaptureWorkspaceObserver<'_> {
             }
         }
         match span {
+            InferenceWorkspaceSpan::Sampling(_) => Err(metadata.coordinate()),
             InferenceWorkspaceSpan::Prefill(chunk) if self.first_prediction != 0 => {
                 if prediction != 0
                     || self.prefill_complete

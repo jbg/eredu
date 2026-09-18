@@ -22,7 +22,7 @@ pub struct TopLevelGrammar {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone)]
+#[derive(Debug)]
 pub enum GrammarInit {
     Serialized(TopLevelGrammar),
     Internal(Grammar, LexerSpec),

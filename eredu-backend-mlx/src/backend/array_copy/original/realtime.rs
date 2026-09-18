@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::{error::Error,submission_recovery::native_role::{self,NativeRoleCapacity}};
 use eredu_runtime::working_memory::{OriginalRealtimeNative,RealtimeNativeRequirements,WorkingMemoryError};
-use eredu_nn::workspace::{WorkspaceMetadataFunding,WorkspaceContext};
+use eredu_nn::workspace::{HostMetadataFunding,WorkspaceContext};
 use safemlx::PreparedInputRuntime;
 use std::{cell::{Cell,RefCell},convert::Infallible,time::Duration};
 
@@ -35,7 +35,7 @@ impl OriginalCopyLayoutBuilder {
             source_clones:self.source_clones,maximum_rank:self.maximum_rank}))
     }
 }
-struct CopyWork<I> { invocation:I,roots:RefCell<Vec<Array>>,funding:WorkspaceMetadataFunding }
+struct CopyWork<I> { invocation:I,roots:RefCell<Vec<Array>>,funding:HostMetadataFunding }
 /// Private-construction lexical loan to the actual configured copy bank.
 /// Every attempt consumes its counted slot before invoking the shared worker.
 pub(crate) struct RealtimeCopyContext<'a> {
@@ -93,7 +93,7 @@ impl RealtimeCopyPlan<'_> {
             size_of::<&mut CopyCallback<'_,I,T>>(),size_of::<(usize,usize)>(),
             size_of::<Result<Array,Error>>(),size_of::<super::super::NativeCopy<'_>>(),
             size_of::<IsolatedArrayCopy<'_>>(),
-            size_of::<WorkspaceMetadataFunding>()];
+            size_of::<HostMetadataFunding>()];
         sum(&parts)
     }
     pub(crate) fn control_bytes<I:'static,T>(&self,runtime:&PreparedInputRuntime)->Option<usize> {
@@ -107,7 +107,7 @@ impl RealtimeCopyPlan<'_> {
     /// Completion is established by the existing shared native role before this
     /// returns. No current native scope remains across scheduler preparations.
     pub(crate) fn run<I:'static,T>(self,invocation:I,claim:OriginalRealtimeNative,
-        runtime:&PreparedInputRuntime,funding:&WorkspaceMetadataFunding,timeout:Option<Duration>,
+        runtime:&PreparedInputRuntime,funding:&HostMetadataFunding,timeout:Option<Duration>,
         run:&mut CopyCallback<'_,I,T>)->Result<T,BackendFailure> {
         funding.reserve_metadata(self.worker_controls::<I,T>().ok_or_else(||overflow().into_backend_failure())?)
             .map_err(|cause|Error::WorkspacePlanning(cause).into_backend_failure())?;
@@ -122,3 +122,5 @@ impl RealtimeCopyPlan<'_> {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

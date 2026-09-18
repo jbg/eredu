@@ -23,7 +23,7 @@ impl Census {
 }
 
 pub(super) enum Value {
-    Array((u64, Array)),
+    Array((u64, RetainedArray)),
     GroupBuffer((u64,safemlx::distributed::RetainedGroupBuffer)),
     Host((u64, RetainedHostBuffer)),
     Bytes(Arc<[u8]>),
@@ -158,6 +158,10 @@ impl Inventory {
             .ok()
             .map(|i| &self.rows[i].value)
     }
+    pub(super) fn get_mut(&mut self, kind: u8, key: &StorageIdentity) -> Option<&mut Value> {
+        self.rows.binary_search_by(|r| r.value.kind().cmp(&kind).then_with(|| r.key.as_ref().cmp(&Some(key))))
+            .ok().map(|i| &mut self.rows[i].value)
+    }
     pub(super) fn custody(&self) -> &Custody {
         &self.custody
     }
@@ -254,6 +258,7 @@ impl Inventory {
             .ok()?
             .size()
             .checked_add(clones)?
+            .checked_add(RetainedArray::control_bytes()?)?
             .checked_add(keys)?
             .checked_add(size_of::<Self>())?
             .checked_add(size_of::<Row>())?
@@ -290,11 +295,7 @@ pub(super) fn qualified() -> bool {
     // Vec/Arc/Rc qualification; it neither constructs nor issues a budget.
     native_storage::Bank::shared_borrowed_owner_bytes().is_some()
 }
-#[track_caller]
 pub(super) fn failure(cause: WorkingMemoryError) -> ResidencyError {
-    if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-        eprintln!("HOST_SAVED_INVENTORY_FAILURE at {}: {cause:?}",std::panic::Location::caller());
-    }
     ResidencyError::OriginalInventory(cause)
 }
 
@@ -452,9 +453,10 @@ impl RetainedStorage {
     }
     pub(super) fn array_entries(
         &self,
-    ) -> impl Iterator<Item = (&safemlx::AllocationIdentity, &(u64, Array))> {
+    ) -> impl Iterator<Item = (&safemlx::AllocationIdentity, &(u64, RetainedArray))> {
         self.arrays
             .iter()
+            .filter_map(|(key, value)| value.owned().map(|value| (key, value)))
             .chain(
                 self.original
                     .iter()
@@ -470,6 +472,7 @@ impl RetainedStorage {
     ) -> impl Iterator<Item = (&safemlx::AllocationIdentity, &(u64, RetainedHostBuffer))> {
         self.hosts
             .iter()
+            .filter_map(|(key, entry)| entry.owned().map(|value| (key, value)))
             .chain(
                 self.original
                     .iter()
@@ -480,8 +483,8 @@ impl RetainedStorage {
                     }),
             )
     }
-    pub(super) fn array_entry(&self, id: &safemlx::AllocationIdentity) -> Option<&(u64, Array)> {
-        self.arrays.get(id).or_else(|| {
+    pub(super) fn array_entry(&self, id: &safemlx::AllocationIdentity) -> Option<&(u64, RetainedArray)> {
+        self.arrays.get(id).and_then(NativeEntry::owned).or_else(|| {
             match self
                 .original
                 .as_ref()?
@@ -496,7 +499,7 @@ impl RetainedStorage {
         &self,
         id: &safemlx::AllocationIdentity,
     ) -> Option<&(u64, RetainedHostBuffer)> {
-        self.hosts.get(id).or_else(|| {
+        self.hosts.get(id).and_then(NativeEntry::owned).or_else(|| {
             match self
                 .original
                 .as_ref()?

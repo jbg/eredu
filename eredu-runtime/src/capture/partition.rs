@@ -11,7 +11,7 @@ pub(crate) use funded_evidence::{PreparedPartitionCaptureEvidence, PartitionCapt
 pub use funded::{PreparedPartitionInterventionEvidence, PartitionCaptureProducerSource, PartitionCaptureProgramError,
     PreparedPartitionCaptureProgram, PreparedPartitionCaptureRow, PreparedPartitionCaptureRunIdentity, ScheduledPartitionCapture, PartitionCaptureLocalHook,PartitionCaptureRoutedHooks, PreparedPartitionContiguousSource,PreparedPartitionRoutedSource,PartitionCaptureRoutedLocalSource,PartitionCaptureLocalSource};
 mod sum;
-pub(crate) use sum::{sum_f32_at, summarize_f32, fill_histogram_f32, numeric_control_bytes};
+pub(crate) use sum::{sum_f32_at, summarize_f32, summarize_f32_values, fill_histogram_f32, numeric_control_bytes};
 pub use assembly::{assemble_reduced_fragments, assemble_tensor_fragments};
 mod exchange;
 pub(crate) use exchange::{PartitionCaptureDecoder, PartitionCapturePayload};

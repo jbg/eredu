@@ -361,7 +361,7 @@ fn bench_train(c: &mut Criterion) {
         .build()
         .into();
     let mut tokenizer = Tokenizer::new(BPE::default()).into_inner();
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
 
     group.bench_function("bpe-small", |b| {
         b.iter_custom(|iters| {

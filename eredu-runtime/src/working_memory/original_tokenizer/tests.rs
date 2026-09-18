@@ -1,6 +1,8 @@
 use super::*;
 use std::error::Error as _;
 const INPUT: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},"post_processor":{"type":"Sequence","processors":[{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},"decoder":{"type":"Sequence","decoders":[{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},"added_tokens":[{"id":4,"content":"<S>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"model":{"type":"BPE","vocab":{"h":0,"i":1,"hi":2,"Ġ":3},"merges":[["h","i"]]}}"#;
+mod derivative;
+mod metaspace_decoder;
 fn plan(input: &str) -> TokenizerPlan<'_> {
     TokenizerPlan::prepare_json(input.as_bytes()).unwrap()
 }

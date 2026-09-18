@@ -1,6 +1,8 @@
 //! Exact copied lexer declarations, preserving the ordinary semantic owners.
 use super::{LexemeClass, LexemeIdx, LexemeSpec, LexerSpec, MatchingLexemes, SkipRepetition};
 use derivre::{
+    ParserAllocationFunding, ParserAllocationFailure,
+    prepared_funding::{PreparedFunding, FrameError},
     ExprRef, JsonQuoteOptions, RegexAst, RegexAstCopyFailure, RegexAstCopyPlan, RegexBuilder,
     RegexBuilderCopyFailure, SourceHashMap, SourceMapReserveError,
 };
@@ -39,8 +41,9 @@ impl LexerSourceCopyRequirements {
     }
 }
 #[derive(Debug)]
-enum Cause {
+pub(super) enum Cause {
     Overflow,
+    Funding(ParserAllocationFailure),
     Capacity,
     Vector(TryReserveError),
     Table(SourceMapReserveError),
@@ -51,6 +54,7 @@ impl fmt::Display for Cause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Overflow => f.write_str("lexer source-copy geometry overflow"),
+            Self::Funding(error) => fmt::Display::fmt(error, f),
             Self::Capacity => f.write_str("lexer copy destination differs from source"),
             Self::Vector(e) => fmt::Display::fmt(e, f),
             Self::Table(e) => fmt::Display::fmt(e, f),
@@ -62,6 +66,7 @@ impl fmt::Display for Cause {
 impl std::error::Error for Cause {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Funding(error) => Some(error),
             Self::Vector(e) => Some(e),
             Self::Table(e) => Some(e),
             Self::Ast(e) => Some(e),
@@ -69,6 +74,9 @@ impl std::error::Error for Cause {
             _ => None,
         }
     }
+}
+pub(super) fn frame(error: FrameError<ParserAllocationFailure>) -> Cause {
+    match error { FrameError::Overflow => Cause::Overflow, FrameError::Funding(error) => Cause::Funding(error) }
 }
 fn bytes<T>(n: usize) -> Result<usize, Cause> {
     Layout::array::<T>(n)
@@ -135,16 +143,27 @@ impl fmt::Debug for LexemeCopyPlan<'_> {
 }
 impl LexemeSpec {
     /// Copies actual source metadata and AST; no expression compilation occurs.
-    pub fn source_copy_plan(&self) -> Result<LexemeCopyPlan<'_>, LexemeCopyFailure> {
-        LexemeCopyPlan::prepare(self).map_err(|cause| LexemeCopyFailure {
+    pub fn source_copy_plan<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        &self, funding: &F,
+    ) -> Result<LexemeCopyPlan<'_>, LexemeCopyFailure> {
+        LexemeCopyPlan::prepare(self, funding).map_err(|cause| LexemeCopyFailure {
             cause,
             partial: LexemePartial::default(),
         })
     }
 }
+type LexemeInspectionFrame<'a, F> = (
+    &'a LexemeSpec, &'a F, LexemeCopyPlan<'a>, LexerSourceCopyRequirements, LexemeCopyFailure,
+    usize, usize, usize, usize, usize, [usize; 16],
+    Result<LexemeCopyPlan<'a>, Cause>, Result<LexemeCopyPlan<'a>, LexemeCopyFailure>,
+    Result<Layout, std::alloc::LayoutError>, Option<usize>,
+);
 impl<'a> LexemeCopyPlan<'a> {
-    fn prepare(source: &'a LexemeSpec) -> Result<Self, Cause> {
-        let ast = source.rx.source_copy_plan().map_err(Cause::Ast)?;
+    fn prepare<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        source: &'a LexemeSpec, funding: &F,
+    ) -> Result<Self, Cause> {
+        let _frame = funding.frame(size_of::<LexemeInspectionFrame<'_, F>>()).map_err(frame)?;
+        let ast = source.rx.source_copy_plan(funding).map_err(Cause::Ast)?;
         let mut buffers = ast.requirements().buffer_bytes();
         let scratch = ast
             .requirements()
@@ -185,6 +204,11 @@ impl<'a> LexemeCopyPlan<'a> {
             .try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or(Cause::Overflow)?;
         add(&mut controls, ast.requirements().control_bytes())?;
+        // LexerSpec's finite constructor reuses this exact child inspection worker.
+        // Its entire fixed entry/guard population is paid in the child's quote.
+        add(&mut controls, derivre::prepared_funding::frame_control_bytes::<ParserAllocationFailure>(
+            size_of::<LexemeInspectionFrame<'_, F>>()
+        ).ok_or(Cause::Overflow)?)?;
         let total = buffers.checked_add(controls).ok_or(Cause::Overflow)?;
         let retained = buffers.checked_sub(scratch).ok_or(Cause::Overflow)?;
         Ok(Self {
@@ -269,6 +293,11 @@ pub struct LexerSpecCopyFailure {
     lexeme: Option<LexemeCopyFailure>,
     partial: Option<Partial>,
 }
+impl LexerSpecCopyFailure {
+    pub(super) fn inspection(cause: Cause) -> Self {
+        Self { cause: Some(cause), lexeme: None, partial: None }
+    }
+}
 impl fmt::Debug for LexerSpecCopyFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LexerSpecCopyFailure")
@@ -314,12 +343,24 @@ impl fmt::Debug for LexerSpecCopyPlan<'_> {
 }
 impl LexerSpec {
     /// Quotes copying one actual declaration, without running the lexer compiler.
-    pub fn source_copy_plan(&self) -> Result<LexerSpecCopyPlan<'_>, LexerSpecCopyFailure> {
-        LexerSpecCopyPlan::prepare(self)
+    pub fn source_copy_plan<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        &self, funding: &F,
+    ) -> Result<LexerSpecCopyPlan<'_>, LexerSpecCopyFailure> {
+        LexerSpecCopyPlan::prepare(self, funding)
     }
 }
 impl<'a> LexerSpecCopyPlan<'a> {
-    fn prepare(source: &'a LexerSpec) -> Result<Self, LexerSpecCopyFailure> {
+    fn prepare<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        source: &'a LexerSpec, funding: &F,
+    ) -> Result<Self, LexerSpecCopyFailure> {
+        let _frame = funding.frame(size_of::<(
+            &LexerSpec, &F, Self, LexerSourceCopyRequirements, LexerSpecCopyFailure,
+            usize, usize, usize, usize, usize, [usize; 24],
+            std::slice::Iter<'_, LexemeSpec>, std::slice::Iter<'_, (String, usize)>,
+            Result<Self, LexerSpecCopyFailure>, Result<(), Cause>, Option<usize>,
+        )>()).map_err(|error| LexerSpecCopyFailure {
+            cause: Some(frame(error)), lexeme: None, partial: None,
+        })?;
         let mut buffers = 0;
         let mut controls = 0;
         let mut warning_bytes = 0;
@@ -339,6 +380,9 @@ impl<'a> LexerSpecCopyPlan<'a> {
                 add(&mut warning_bytes, text.len())?;
             }
             add(&mut buffers, warning_bytes)?;
+            let _builder_frame = funding.frame(
+                RegexBuilder::source_inspection_control_bytes().ok_or(Cause::Overflow)?
+            ).map_err(frame)?;
             let builder = source
                 .regex_builder
                 .source_copy_plan()
@@ -357,7 +401,7 @@ impl<'a> LexerSpecCopyPlan<'a> {
         }
         for lexeme in &source.lexemes {
             let quote = lexeme
-                .source_copy_plan()
+                .source_copy_plan(funding)
                 .map_err(|lexeme| LexerSpecCopyFailure {
                     cause: None,
                     lexeme: Some(lexeme),
@@ -478,7 +522,8 @@ impl<'a> LexerSpecCopyPlan<'a> {
         }
         run!(reserve(&mut p.lexemes, s.lexemes.len()));
         for source in &s.lexemes {
-            match source.source_copy_plan().and_then(|plan| plan.compile()) {
+            // The enclosing copy quote already includes this child inspection.
+            match source.source_copy_plan(&ParserAllocationFunding::unenforced()).and_then(|plan| plan.compile()) {
                 Ok(lexeme) => p.lexemes.push(lexeme),
                 Err(lexeme) => {
                     return Err(LexerSpecCopyFailure {
@@ -553,6 +598,7 @@ impl<'a> LexerSpecCopyPlan<'a> {
             has_max_tokens: s.has_max_tokens,
             has_temperature: s.has_temperature,
             grammar_warnings: p.warnings,
+            funding: derivre::ParserAllocationFunding::unenforced(),
         })
     }
 }
@@ -565,8 +611,62 @@ mod tests {
         earley::lexer::Lexer,
     };
     #[test]
+    fn lexer_source_inspection_refuses_each_reached_ast_frame_with_original_error_custody() {
+        use derivre::prepared_funding::Scope;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let mut source = LexerSpec::new(ParserAllocationFunding::unenforced()).unwrap();
+        source.setup_lexeme_class(RegexAst::NoMatch).unwrap();
+        let mut ast = RegexAst::Literal("source".into());
+        // Extend beyond the builder inspection peak so AST recursion itself
+        // reaches additional prospective frame growth.
+        for _ in 0..256 { ast = RegexAst::Repeat(Box::new(ast), 1, 1); }
+        source.add_greedy_lexeme("deep".into(), ast, true, None, 31).unwrap();
+        for retained in [false, true] {
+            let run = |cut: usize| {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let owner = Arc::new(());
+                let weak = Arc::downgrade(&owner);
+                let funding = ParserAllocationFunding::prepare(move |_| {
+                    let _keep = &owner;
+                    let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == cut { Err(std::io::Error::from_raw_os_error(n as i32)) } else { Ok(()) }
+                }).unwrap();
+                let scope = Scope::new(&funding);
+                let failure = match scope {
+                    Err(FrameError::Funding(error)) => Some(LexerSpecCopyFailure::inspection(Cause::Funding(error))),
+                    Err(FrameError::Overflow) => panic!("finite scope"),
+                    Ok(scope) => {
+                        if retained { source.retained_capacity_bytes(&scope).err() }
+                        else { source.source_copy_plan(&scope).err() }
+                    }
+                };
+                let n = calls.load(Ordering::SeqCst);
+                drop(funding);
+                if let Some(error) = failure {
+                    assert!(error.partial.is_none());
+                    let mut cause: &dyn std::error::Error = &error;
+                    let original = loop {
+                        if let Some(original) = cause.downcast_ref::<std::io::Error>() { break original; }
+                        cause = cause.source().expect("original typed inspection refusal");
+                    };
+                    assert_eq!(original.raw_os_error(), Some(cut as i32));
+                    assert_eq!(n, cut);
+                    assert!(weak.upgrade().is_some());
+                    drop(error);
+                } else { assert_eq!(cut, usize::MAX); }
+                assert!(weak.upgrade().is_none());
+                n
+            };
+            let reached = run(usize::MAX);
+            assert!(reached > 12, "retained={retained}, reached={reached}");
+            for cut in 2..=reached { run(cut); }
+        }
+    }
+
+    #[test]
     fn copied_lexer_source_preserves_skip_classes_ranges_regexes_and_failed_warning_prefix() {
-        let mut source = LexerSpec::new().unwrap();
+        let mut source = LexerSpec::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         let root = source.setup_lexeme_class(RegexAst::NoMatch).unwrap();
         source
             .add_simple_literal("word".into(), "abc", false)
@@ -600,12 +700,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        source.add_extra_lexemes(&["[0-9]+".into()]);
+        source.add_extra_lexemes(&["[0-9]+".into()]).unwrap();
         source.grammar_warnings = vec![
             ("first source warning".into(), 3),
             ("second source warning".into(), 1),
         ];
-        let plan = source.source_copy_plan().unwrap();
+        let plan = source.source_copy_plan(&ParserAllocationFunding::unenforced()).unwrap();
         let quote = plan.requirements();
         let mut copied = plan.compile().unwrap();
         assert!(quote.required_bytes() > quote.buffer_bytes());
@@ -651,7 +751,7 @@ mod tests {
         assert_eq!(copied_next, source_next);
         assert_ne!(source_next, root);
 
-        let mut failing = source.source_copy_plan().unwrap();
+        let mut failing = source.source_copy_plan(&ParserAllocationFunding::unenforced()).unwrap();
         failing.warning_bytes = source.grammar_warnings[0].0.len();
         let failure = match failing.compile() {
             Err(e) => e,

@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::{
     mem::size_of,
@@ -15,7 +15,7 @@ use std::{
 pub struct PreparedCachePoolRegistration {
     storage: Option<PreparedCacheTable<u64, CachePoolUsage>>,
     pool: CacheResidencyPool,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 /// A refused registration retains its unchanged prepared destination and H.
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +37,7 @@ impl CachePoolRegistrationFailure {
 pub struct CachePoolRegistrationPreparationFailure {
     #[source]
     cause: PreparationCause,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 #[derive(Debug, thiserror::Error)]
 enum PreparationCause {

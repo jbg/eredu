@@ -15,6 +15,7 @@ use std::{cell::Cell, num::NonZeroU8};
 mod capacity_handoff;
 mod controller;
 mod incomplete;
+mod terminal;
 
 #[derive(Debug, Default)]
 struct Facts {
@@ -36,7 +37,7 @@ impl WorkspaceMechanisms for Facts {
                 .map(|layout| {
                     if matches!(
                         operation.kind,
-                        WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. }
+                        WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
                     ) {
                         Ok(WorkspaceOutputStorage::AliasInput(0))
                     } else {
@@ -172,7 +173,6 @@ fn plan(
     capacity: u64,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         ResidualInferenceQuote<u32>,
     ),
@@ -233,15 +233,15 @@ fn replacement_residual_uses_each_span_identity_union_instead_of_scalar_subtract
         ))
     ));
     assert_eq!(used(&pool), (64, 64));
-    let (admission, reservation, accepted) =
+    let (reservation, accepted) =
         plan(&pool, &execution, &quote, request(geometry()), 160).unwrap();
-    assert_eq!(admission.state, *quote.state());
+    assert_eq!(reservation.admission().state, *quote.state());
     assert_eq!(reservation.bytes(), 96);
     assert!(reservation.requires_funding_scope());
     assert_eq!(used(&pool), (160, 160));
     // A lower report is not permission to enter the ordinary full reservation path.
     assert!(matches!(
-        pool.reserve(&execution, &admission),
+        pool.reserve(&execution, reservation.admission()),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop((reservation, accepted, quote, original));
@@ -584,9 +584,9 @@ fn application_budget_safety_and_domain_capacity_use_complete_incremental_cost()
         ))
     ));
     assert_eq!(used(&pool), (64, 64));
-    let (admission, reservation, accepted) = plan(&pool, &execution, &quote, request, 175).unwrap();
-    assert_eq!(admission.incremental_required_bytes, 111);
-    assert_eq!(admission.state, *quote.state());
+    let (reservation, accepted) = plan(&pool, &execution, &quote, request, 175).unwrap();
+    assert_eq!(reservation.admission().incremental_required_bytes, 111);
+    assert_eq!(reservation.admission().state, *quote.state());
     assert_eq!(pool.used_bytes().unwrap(), 175);
     drop((reservation, accepted, quote, original));
     assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -600,6 +600,7 @@ fn chunk_quote(pool: &WorkingMemoryPool, g: InferenceGeometry) -> ResidualInfere
     let report = quote_inference_workspace(g, |span| {
         context.begin_state_span([&old])?;
         let count = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };
@@ -645,7 +646,7 @@ fn residual_chunk_retries_share_planner_policy_without_weakening_full_reservatio
     assert_eq!(full_candidates, [3, 2, 1]);
     assert_eq!(used(&pool), (64, 64));
     let mut residual_candidates = Vec::new();
-    let (admission, reservation, accepted) = plan_prefill_residual_with_capacity(
+    let (reservation, accepted) = plan_prefill_residual_with_capacity(
         &execution,
         &pool,
         &capabilities(),
@@ -660,7 +661,7 @@ fn residual_chunk_retries_share_planner_policy_without_weakening_full_reservatio
     .unwrap();
     assert_eq!(residual_candidates, [3, 2]);
     assert_eq!(reservation.geometry().prefill_chunk_positions, 2);
-    assert_eq!(admission.incremental_required_bytes, 32);
+    assert_eq!(reservation.admission().incremental_required_bytes, 32);
     assert_eq!(accepted.state().requested_state_bytes, 64);
     assert_eq!(used(&pool), (96, 96));
     drop((reservation, accepted, original));
@@ -673,7 +674,7 @@ fn residual_reservation_retains_borrowed_charge_after_quote_and_original_owner_d
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let quote = replacement_quote(&pool, geometry(), 0);
     let execution = InferenceExecutionIdentity::default();
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan(&pool, &execution, &quote, request(geometry()), 160).unwrap();
     let alias = reservation.clone();
     drop((accepted, quote, original, reservation));
@@ -691,7 +692,7 @@ fn conversion_moves_pins_to_live_run_and_scopes_while_metadata_remains_cold_evid
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let quote = replacement_quote(&pool, geometry(), 0);
     let execution = InferenceExecutionIdentity::default();
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan(&pool, &execution, &quote, request(geometry()), 160).unwrap();
     let (metadata, run) = reservation.into_funding().unwrap();
     let scope = run.scope().unwrap();
@@ -721,7 +722,7 @@ fn uncertified_residual_scope_keeps_borrowed_charge_and_remaining_envelope() {
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let quote = replacement_quote(&pool, geometry(), 0);
     let execution = InferenceExecutionIdentity::default();
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan(&pool, &execution, &quote, request(geometry()), 160).unwrap();
     let (metadata, run) = reservation.into_funding().unwrap();
     let scope = run.scope().unwrap();

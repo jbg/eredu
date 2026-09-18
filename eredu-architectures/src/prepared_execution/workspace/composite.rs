@@ -122,7 +122,7 @@ impl EquationVisitor<'_, '_, '_> {
         if let Some(ExternalTargetQuote::Static(operation))=self.external_target {
             return self.quote_external_static(&mut runtime,operation);
         }
-        let hook_bytes = runtime.observation_host_peak_bytes()?;
+        let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
         self.quote_spans_with_span(hook_bytes, |tokens, state, demand, observer,span| {
             self.context.charge_metadata(std::mem::size_of::<(
                 PreparedInputPart<WorkspaceTensor>,
@@ -147,6 +147,20 @@ impl EquationVisitor<'_, '_, '_> {
             let input = PreparedCompositeInput::new_with_diagnostic(&input, &admitted, |message| {
                 self.context.metadata_error(format_args!("{message}"))
             })?;
+            self.forward_composite_input(&mut runtime, input, state, demand, observer, span, &mut provider)
+        })
+    }
+    fn forward_composite_input<A>(
+        &self, runtime: &mut EquationRuntime<PreparedCompositeArchitecture<A>>,
+        input: PreparedCompositeInput<'_, WorkspaceTensor, A::InputPartPlan>,
+        state: &mut ResidentState, demand: eredu_core::OutputDemand,
+        observer: Option<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
+        span: &InferenceWorkspaceSpan, provider: &mut EquationRoutedProvider,
+    ) -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>
+    where A: CompositeArchitecture<WorkspaceBackend, ResidentState, Error = Error>
+            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState> + 'static,
+        A::InputPartPlan: 'static, A::StaticModules: Clone,
+    {
             if let Some(ExternalTargetQuote::Capture{request,..}) = self.external_target {
                 // External target observation is the same passive path capture
                 // used by its ordinary target worker. Assistant observations
@@ -155,7 +169,7 @@ impl EquationVisitor<'_, '_, '_> {
                 let (scores, forward) = runtime.forward_routed_with_context(
                     input, state, self.context, demand, Some(&mut capture),
                     self.execution_pass(span),
-                    &mut provider,
+                    provider,
                 )?;
                 let values = capture.into_values()?;
                 let captured = A::external_prediction_capture_with_metadata(
@@ -166,11 +180,49 @@ impl EquationVisitor<'_, '_, '_> {
                 Ok((scores, Some(EquationCapture::External(captured))))
             } else {
                 runtime.forward_routed_with_capture(input, state, self.context, demand, observer, self.target_capture,
-                    self.execution_pass(span),&mut provider)
+                    self.execution_pass(span),provider)
                     .map(|(scores, capture)| (scores, capture.map(EquationCapture::Embedded)))
             }
+    }
+
+    /// Quotes the same whole composite input consumed by captured native prefill.
+    pub(super) fn quote_composite_whole_media<A>(
+        self,
+        modules: crate::replicated_text::PreparedReplicatedTextModules<PreparedCompositeArchitecture<A>>,
+        mut provider: EquationRoutedProvider,
+    ) -> Result<EquationQuote, Error>
+    where A: crate::composite_execution::CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error>
+            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState> + 'static,
+        A::InputPartPlan: 'static, A::StaticModules: Clone,
+    {
+        if self.geometry.max_output_tokens != 0
+            || self.geometry.input_positions != self.geometry.prefill_chunk_positions {
+            return Err(self.context.metadata_error(format_args!("whole media capture requires its exact complete prefill span")));
+        }
+        let reference = self.media.expect("typed whole media route");
+        let input = reference.input.borrow_mut().take().ok_or_else(||
+            self.context.metadata_error(format_args!("media equation source already consumed")))?;
+        self.context.charge_metadata(std::mem::size_of::<(
+            A::IngressPlan, Result<A::IngressPlan, Error>,
+            PreparedCompositeInput<'_, WorkspaceTensor, A::InputPartPlan>,
+        )>())?;
+        let plan = A::prepare_original_workspace_ingress_plan_with_metadata(input, self.geometry, self.context)?;
+        let mut runtime = EquationRuntime::from_prepared(modules, self.parameters, self.context,
+            self.external_target.and_then(|source| source.paths()).or_else(|| self.observation.map(|source| source.paths)),
+            self.target_capture)?;
+        let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
+        self.quote_spans_with_span(hook_bytes, |_, state, demand, observer, span| {
+            let InferenceWorkspaceSpan::Prefill(chunk) = span else {
+                return Err(self.context.metadata_error(format_args!("whole media capture reached a non-prefill span")));
+            };
+            if chunk.input.start != 0 || chunk.input.end != self.geometry.input_positions {
+                return Err(self.context.metadata_error(format_args!("whole media capture span differs from source")));
+            }
+            let input = A::prepared_ingress_input(&plan);
+            self.forward_composite_input(&mut runtime, input, state, demand, observer, span, &mut provider)
         })
     }
+
 }
 
 impl EquationVisitor<'_, '_, '_> {

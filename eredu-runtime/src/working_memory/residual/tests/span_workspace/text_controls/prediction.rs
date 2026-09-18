@@ -33,7 +33,7 @@ fn prediction_bank_is_original_exact_admission_and_cannot_spend_protected_headro
             required_bytes, available_bytes
         })) if required_bytes == quote.incremental_bytes() && available_bytes + 1 == required_bytes));
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (_, r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     drop(quote);
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();

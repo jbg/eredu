@@ -554,6 +554,13 @@ impl Drop for RetireFundedCompletion {
 /// Original text or copy composition consumes this fact once; no late hold.
 pub(super) fn work_control_bytes() -> Result<u64, Error> {
     capture::common_control_bytes()?
+        .checked_add(crate::composition::mlx::session::output_completion::finish_control_bytes()
+            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+        .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?
+        .checked_add(u64::try_from(crate::backend::runtime::execution::generic::OriginalOperationActivation::control_bytes()
+            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+            .map_err(|_| Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+        .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?
         .checked_add(
             super::text_quote::original_table_work_control_bytes().ok_or_else(|| {
                 Error::Other(Box::new(

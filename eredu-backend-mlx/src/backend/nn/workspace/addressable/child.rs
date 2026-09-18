@@ -18,13 +18,13 @@ impl AddressableChildSource {
         members: usize,
         parameters: &[WorkspaceLayout],
         mechanism: ResidentExecutionMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::prepare_with_observation(source,inputs,members,parameters,mechanism,funding,None,None)
     }
     pub(crate) fn prepare_with_observation(
         source:WorkspaceAddressableRegionView<'_>,inputs:&[WorkspaceLayout],members:usize,
-        parameters:&[WorkspaceLayout],mechanism:ResidentExecutionMechanisms,funding:&WorkspaceMetadataFunding,
+        parameters:&[WorkspaceLayout],mechanism:ResidentExecutionMechanisms,funding:&HostMetadataFunding,
         observation:Option<WorkspaceAddressableObservationSource>,source_groups:Option<&WorkspaceLayout>,
     )->Result<Self,Error>{
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
@@ -153,3 +153,5 @@ impl AddressableChildSource {
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

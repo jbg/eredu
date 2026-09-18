@@ -1,6 +1,24 @@
 use super::*;
 use crate::{DistributedNeuralBackend, LinearSpec, VocabularyParallelRange};
 
+// This fixture executes every floating result as contiguous float32. Publishing
+// that fact lets uneven gathers qualify their padding constructor exactly.
+#[derive(Debug)]
+struct ParallelMechanism;
+impl WorkspaceMechanisms for ParallelMechanism {
+    fn operation_bound(&self, operation: &WorkspaceOperation) -> Result<Option<WorkspaceOperationBound>, Error> {
+        AllocatingMechanism.operation_bound(operation)
+    }
+    fn host_workspace_bound(&self, operation: &WorkspaceOperation) -> Result<Option<WorkspaceHostBound>, Error> {
+        AllocatingMechanism.host_workspace_bound(operation)
+    }
+    fn output_representation(&self, operation: WorkspaceOperationView<'_>, output: usize) -> Option<WorkspaceRepresentation> {
+        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32)
+            .then_some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true))
+    }
+}
+fn context() -> WorkspaceContext { WorkspaceContext::new(ParallelMechanism) }
+
 fn formats() -> Vec<LinearFormatSpec> {
     vec![
         LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap(),
@@ -209,6 +227,10 @@ fn absent_collective_facts_preserve_unknown_even_when_local_projection_is_priced
     #[derive(Debug)]
     struct MissingTransport;
     impl WorkspaceMechanisms for MissingTransport {
+        fn output_representation(&self, operation: WorkspaceOperationView<'_>, output: usize) -> Option<WorkspaceRepresentation> {
+            ParallelMechanism.output_representation(operation, output)
+        }
+
         fn host_workspace_bound(
             &self,
             _: &WorkspaceOperation,
@@ -252,16 +274,15 @@ fn absent_collective_facts_preserve_unknown_even_when_local_projection_is_priced
     let report = context.report(&[output]).unwrap();
     assert_eq!(report.total_bytes, None);
     assert_eq!(report.transient_bytes, None);
-    assert_eq!(report.retained_bytes, None);
-    assert_eq!(report.unpriced_operations, [1]);
+    assert_eq!(report.retained_bytes, Some(2 * 35 * 4));
+    assert_eq!(report.unpriced_operations.len(), 1);
+    assert!(matches!(report.operations[report.unpriced_operations[0]].kind, WorkspaceOperationKind::Collective(_)));
     assert!(matches!(
         report.operations[0].kind,
         WorkspaceOperationKind::Projection(_)
     ));
-    assert!(matches!(
-        report.operations[1].kind,
-        WorkspaceOperationKind::Collective(_)
-    ));
+    assert!(report.operations.iter().any(|operation| matches!(operation.kind,
+        WorkspaceOperationKind::Elementwise("zeros_f32"))));
 }
 
 #[test]
@@ -304,7 +325,9 @@ fn observed_parallel_readout_reports_the_selected_input_and_preserves_collective
     .unwrap();
     assert_eq!(observer.0, [vec![2, 1, 64]]);
     assert_eq!(output.shape(), [2, 1, 35]);
-    assert_eq!(context.report(&[]).unwrap().operations.len(), 2);
+    let before = context.report(&[]).unwrap();
+    assert_eq!(before.operations.iter().filter(|operation| matches!(operation.kind, WorkspaceOperationKind::Projection(_))).count(), 1);
+    assert_eq!(before.operations.iter().filter(|operation| matches!(operation.kind, WorkspaceOperationKind::Collective(_))).count(), 1);
     assert!(
         WorkspaceBackend::vocabulary_parallel_embedding_project_with_input_observer(
             &mut embedding,
@@ -316,5 +339,5 @@ fn observed_parallel_readout_reports_the_selected_input_and_preserves_collective
         .is_err()
     );
     assert_eq!(observer.0.len(), 1);
-    assert_eq!(context.report(&[]).unwrap().operations.len(), 2);
+    assert_eq!(context.report(&[]).unwrap().operations.len(), before.operations.len());
 }

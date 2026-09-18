@@ -590,7 +590,7 @@ impl<C: Clone + 'static> OriginalNeuralSubmissionCompletion<C, OriginalScopeObse
         // status and the remaining exact owners enter ordinary quarantine.
         for slot in consumers.into_inner() {
             if let ConsumerSlot::Active(child) = slot {
-                let observed = child.finish().map_err(FinishRetainingError::Native)?;
+                let observed = child.finish()?;
                 if !observed.can_retire() || observed.status.failed || observed.status.blocked {
                     return Err(FinishRetainingError::Observation(observed));
                 }
@@ -628,6 +628,7 @@ fn refusal(observer: &OriginalScopeObserver, outcome: ScopedSubmissionProgress) 
 fn finish_cause(cause: FinishRetainingError<Exception>) -> crate::backend::error::Error {
     match cause {
         FinishRetainingError::Native(cause) => cause.into(),
+        FinishRetainingError::Retirement(cause) => cause.into_error(),
         FinishRetainingError::Observation(_) => {
             crate::backend::error::Error::PrefillScopeUnavailable
         }

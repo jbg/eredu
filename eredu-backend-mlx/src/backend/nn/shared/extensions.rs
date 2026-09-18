@@ -289,7 +289,7 @@ impl eredu_nn::AuxiliaryConvolutionState<MlxTensor>
             self,
             eredu_core::cache::StateTensorRole::Convolution { slot },
         )
-        .map_err(ComputeError::backend_source)
+        .map_err(ComputeError::backend_retained_source)
     }
 }
 

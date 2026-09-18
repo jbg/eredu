@@ -11,6 +11,7 @@ pub(crate) use storage::BpeIds;
 #[cfg(feature = "parity-aware-bpe")]
 pub mod parity_trainer;
 mod serialization;
+pub(crate) use serialization::Serialization as BpeSerialization;
 pub mod trainer;
 mod word;
 pub(crate) use word::BpeScratch;

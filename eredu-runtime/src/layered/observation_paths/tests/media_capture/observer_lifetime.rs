@@ -82,7 +82,7 @@ fn ordinary_prepared_traversal_survives_prefill_drain_decode_and_restore() {
     // An installed empty selection still authenticates a real prepared source.
     let selected = binding(false, true, limits());
     let d = discovery(&selected);
-    let mut legacy = CaptureSession::new(selected.source().admission().clone());
+    let mut legacy = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(selected.source().admission().clone()));
     assert_mode(&mut legacy, false, false);
     let mut run =
         CaptureSession::with_ordinary_prefill(selected, &HostPreparationAuthority::default())
@@ -91,7 +91,7 @@ fn ordinary_prepared_traversal_survives_prefill_drain_decode_and_restore() {
     assert_mode(&mut run, true, true);
 
     assert!(advance(&mut run, &mut Backend::default(), None, true));
-    let prefill = run.take_ordinary_shared_step().unwrap();
+    let prefill = run.take_shared_step().unwrap();
     assert_eq!(prefill.phase(), CapturePhase::Prefill);
     assert_eq!(prefill.outcome(), CaptureStepOutcome::Committed);
     assert_mode(&mut run, true, false);
@@ -118,7 +118,7 @@ fn ordinary_prepared_traversal_survives_prefill_drain_decode_and_restore() {
         observer.complete_transaction(epoch).unwrap();
         observer.finish_transaction(epoch, true);
     }
-    let decoded = run.take_ordinary_shared_step().unwrap();
+    let decoded = run.take_shared_step().unwrap();
     assert_eq!(decoded.phase(), CapturePhase::Decode);
     assert_eq!(decoded.prediction_index(), 1);
     assert_eq!(decoded.outcome(), CaptureStepOutcome::Committed);
@@ -137,6 +137,6 @@ fn ordinary_prepared_traversal_survives_prefill_drain_decode_and_restore() {
         true,
         epoch.next().unwrap(),
     ));
-    assert!(run.take_ordinary_shared_step().is_some());
+    assert!(run.take_shared_step().is_some());
     assert_mode(&mut run, true, false);
 }

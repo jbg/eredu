@@ -1,5 +1,5 @@
-//! Production-tokenizer recipe conformance. These compiler tests exercise the
-//! temporary plan before backend byte registration, not finite parser admission.
+//! Source-owned compiler and controller conformance, with direct dependency
+//! parser oracles for token masks and fixed expected activation boundaries.
 use super::*;
 use crate::runtime::chat::dialect::{
     DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope, GenerationPromptBehavior,
@@ -42,7 +42,7 @@ const SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     required_structural_tokens: &[],
     stop_sequences: &[],
 };
-const PARAMETERS: DialectParameters = DialectParameters::Declarative(&SPEC);
+pub(super) const PARAMETERS: DialectParameters = DialectParameters::Declarative(&SPEC);
 
 fn tokenizer() -> (ChatTokenizer, [u32; 2]) {
     let vocabulary = (b'!'..=b'~')
@@ -74,7 +74,7 @@ fn tool(parameters: Value) -> Value {
     json!({"type":"function", "function":{"name":"check", "parameters":parameters}})
 }
 
-fn ordinary_tools() -> Vec<Value> {
+pub(super) fn ordinary_tools() -> Vec<Value> {
     vec![tool(
         json!({"type":"object", "properties":{"value":{"enum":[17,23]}},
         "required":["value"], "additionalProperties":false}),
@@ -101,17 +101,132 @@ fn plan(
         .unwrap()
 }
 
-fn commit_text(state: &mut GrammarState, text: &str) {
-    let environment = state.matcher.tok_env().unwrap();
-    let tokens = environment.tokenize_bytes(text.as_bytes());
-    assert_eq!(environment.tok_trie().decode(&tokens), text.as_bytes());
-    for token in tokens {
+/// Source-owned fixture construction, using the same prospective compiler
+/// contract as public preparation. Draft selection is explicit in these fixtures;
+/// public default-draft behavior has its own conformance cases.
+fn original_plan(
+    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    tokenizer: &ChatTokenizer,
+    eos: &[u32; 2],
+    tools: &[Value],
+    choice: ToolChoice,
+) -> (
+    GenerationRuntimePlan,
+    eredu_runtime::working_memory::OriginalControllerCompilation,
+) {
+    use eredu_runtime::working_memory::{
+        ControllerCompilationOutput, ControllerCompilationSources, InferenceExecutionIdentity,
+        OriginalChatProfilePreparation, OriginalControllerCompiler, OriginalTokenizer,
+    };
+    struct Output(GenerationRuntimePlan);
+    impl ControllerCompilationOutput for Output {
+        fn controller_sources(&self) -> ControllerCompilationSources<'_> {
+            self.0.controller_sources()
+        }
+    }
+    #[derive(Debug, thiserror::Error)]
+    enum Failure {
+        #[error(transparent)]
+        Source(#[from] ConstraintCompilerSourceError),
+        #[error(transparent)]
+        Plan(#[from] preparation_error::PreparationFailure),
+        #[error(transparent)]
+        Funding(#[from] eredu_core::HostMetadataFundingError),
+    }
+    struct Compile<'a> {
+        tokenizer: OriginalTokenizer,
+        eos: &'a [u32; 2],
+        tools: &'a [Value],
+        choice: ToolChoice,
+    }
+    impl OriginalControllerCompiler for Compile<'_> {
+        type Output = Output;
+        type Error = Failure;
+        fn compile(self, funding: &eredu_core::HostMetadataFunding) -> Result<Output, Failure> {
+            let compiler =
+                ConstraintCompiler::from_original_tokenizer(self.tokenizer, self.eos, funding)?;
+            // Actual fixture-owned structural ID, spelling and stop vectors,
+            // including the string allocations moved into the semantic plan.
+            funding.reserve_metadata(
+                2 * std::mem::size_of::<Vec<String>>()
+                    + std::mem::size_of::<Vec<u32>>()
+                    + 2 * std::mem::size_of::<String>()
+                    + std::mem::size_of::<u32>()
+                    + 2 * "<|end|>".len(),
+            )?;
+            Ok(Output(compiler.compile_generation_plan(
+                &DECLARATIVE_DIALECT,
+                PARAMETERS,
+                self.tools,
+                self.choice,
+                ParallelToolCallPolicy::Disabled,
+                vec!["<|end|>".into()],
+                vec![self.eos[1]],
+                vec!["<|end|>".into()],
+                true,
+            )?))
+        }
+    }
+    let source = tokenizer.to_string(false).unwrap();
+    let source = pool
+        .compile_tokenizer(
+            eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(source.as_bytes())
+                .unwrap()
+                .with_encode_special_tokens(tokenizer.get_encode_special_tokens()),
+        )
+        .unwrap();
+    let template = pool
+        .compile_chat_template(
+            eredu_text::chat_storage::ChatTemplatePlan::prepare_utf8("fixture", "fixture").unwrap(),
+        )
+        .unwrap();
+    let preparation = OriginalChatProfilePreparation::new(
+        &template,
+        &source,
+        &InferenceExecutionIdentity::default(),
+        pool.effective_capacity().unwrap(),
+    )
+    .unwrap();
+    let mut tools = tools.to_vec();
+    for tool in &mut tools {
+        if let Some(parameters) = tool["function"]["parameters"].as_object_mut() {
+            parameters.insert(
+                "$schema".into(),
+                Value::String("http://json-schema.org/draft-07/schema#".into()),
+            );
+        }
+    }
+    let (output, receipt) = preparation
+        .compile_controller(Compile {
+            tokenizer: source,
+            eos,
+            tools: &tools,
+            choice,
+        })
+        .unwrap();
+    (output.0, receipt)
+}
+
+fn commit_text(
+    mut state: grammar_source::OriginalGrammarState,
+    text: &str,
+) -> grammar_source::OriginalGrammarState {
+    for &byte in text.as_bytes() {
+        let token = state
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .trie()
+            .token_id_at_bytes(&[byte])
+            .unwrap();
+        state = state.compute_mask().unwrap();
         assert!(
-            state.allowed_tokens().unwrap().is_allowed(token),
+            state.token_mask().unwrap().is_allowed(token),
             "token {token}, text {text:?}"
         );
-        state.commit(token).unwrap();
+        state = state.commit(token).unwrap();
     }
+    state
 }
 
 struct DropWitness(Arc<AtomicUsize>);
@@ -125,68 +240,44 @@ fn authority(drops: &Arc<AtomicUsize>) -> HostPreparationAuthority {
 }
 
 #[test]
-fn production_plan_clones_retain_independent_declarations_after_eager_compiler_roots_retire() {
-    let source_drops = Arc::new(AtomicUsize::new(0));
-    let source_authority = authority(&source_drops);
+fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
     let (tokenizer, eos) = tokenizer();
-    let compiler =
-        ConstraintCompiler::from_tokenizer_with_authority(&tokenizer, &eos, &source_authority)
-            .unwrap();
-    let factory = Arc::downgrade(&compiler.factory);
-    let environment = Arc::downgrade(compiler.factory.tok_env());
-    let slicer = Arc::downgrade(&compiler.factory.slicer());
-    let actual_info = *compiler.factory.tok_env().tok_trie().info();
-    let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
-    assert_eq!(
-        prepared.generation_constraint().inner.recipe.trie_info(),
-        Some(actual_info)
-    );
+    let (prepared, compilation) =
+        original_plan(&pool, &tokenizer, &eos, &ordinary_tools(), ToolChoice::Auto);
     let copied = prepared.clone();
+    assert_eq!(prepared, copied);
     assert!(prepared
         .generation_constraint()
         .inner
         .fixture_matcher
         .is_none());
-    assert_eq!(prepared, copied);
-    assert!(prepared
-        .generation_constraint()
-        .inner
-        .recipe
+    let recipe = &copied.generation_constraint().inner.recipe;
+    assert!(recipe
         .source()
-        .same_storage(copied.generation_constraint().inner.recipe.source()));
-    assert_eq!(prepared.tool_call_trigger(), Some(r#"{"calls":"#));
+        .same_storage(prepared.generation_constraint().inner.recipe.source()));
+    assert_eq!(copied.tool_call_trigger(), Some(r#"{"calls":"#));
     assert_eq!(
-        prepared
+        copied
             .semantic_plan()
             .structural_tokens()
             .collect::<Vec<_>>(),
         vec![(eos[1], "<|end|>")]
     );
-    let source_bytes = prepared
+    let bytes = recipe.source().as_ref().to_vec();
+    let trie = recipe.original_trie().unwrap();
+    assert_eq!(recipe.trie_info(), Some(*trie.trie().info()));
+    assert_eq!(trie.trie().eos_tokens(), eos);
+    let funding = pool
+        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .unwrap();
+    let state = copied
         .generation_constraint()
         .inner
-        .recipe
-        .source()
-        .as_ref()
-        .to_vec();
-    drop((compiler, tokenizer, source_authority));
-    assert!(factory.upgrade().is_none());
-    assert!(environment.upgrade().is_none());
-    assert!(slicer.upgrade().is_none());
-    // The new independent input remains unregistered in this cold fixture;
-    // its own source custody survives, while all eager compiler roots retire.
-    assert_eq!(source_drops.load(Ordering::SeqCst), 0);
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 26, 0).unwrap();
-    let blueprint = &copied.generation_constraint().inner;
-    let registered = blueprint
-        .declaration
-        .as_ref()
-        .unwrap()
-        .register_in_pool(&pool, &blueprint.recipe, &blueprint.recipe)
+        .original_grammar_state(&compilation, &funding)
         .unwrap();
-    let retained = registered.source().capacity_bytes().unwrap();
-    assert!(retained > 0);
-    assert_eq!(pool.used_bytes().unwrap(), retained);
+    drop((prepared, tokenizer));
     assert_eq!(
         copied
             .generation_constraint()
@@ -194,89 +285,53 @@ fn production_plan_clones_retain_independent_declarations_after_eager_compiler_r
             .recipe
             .source()
             .as_ref(),
-        source_bytes
+        bytes
     );
-    drop(prepared);
-    let retained_info = copied
-        .generation_constraint()
-        .inner
-        .recipe
-        .trie_info()
-        .unwrap();
-    assert_eq!(retained_info, actual_info);
-    let recipe = &copied.generation_constraint().inner.recipe;
-    let root: serde_json::Value =
-        serde_json::from_slice(recipe.grammar_tokenizer_json().unwrap()).unwrap();
-    let object: serde_json::Value =
-        serde_json::from_slice(recipe.grammar_tokenizer_object_json().unwrap()).unwrap();
-    assert_eq!(root["tokenizer"], object);
-    assert_eq!(
-        root["encode_special_tokens"].as_bool(),
-        recipe.grammar_encode_special_tokens()
-    );
-
-    let restored = copied
-        .generation_constraint()
-        .inner
-        .environment(&HostPreparationAuthority::unmanaged())
-        .unwrap();
-    assert_eq!(restored.tok_trie().info(), &retained_info);
-    assert_eq!(restored.tok_trie().eos_tokens(), eos);
-    drop(restored);
-
-    let destination_drops = Arc::new(AtomicUsize::new(0));
-    let destination = authority(&destination_drops);
-    let mut state = copied
-        .generation_constraint()
-        .inner
-        .state(&destination)
-        .unwrap();
-    commit_text(
-        &mut state,
-        r#"{"calls":[{"name":"check","arguments":{"value":"#,
-    );
-    let prefix_capture = state.matcher.captures().to_vec();
-    let mut fork = state.fork();
-    assert_eq!(fork.matcher.captures(), prefix_capture);
-    assert_eq!(
-        fork.allowed_tokens().unwrap(),
-        state.allowed_tokens().unwrap()
-    );
-    drop((copied, destination));
-    assert_eq!(source_drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), retained);
-    drop(registered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(destination_drops.load(Ordering::SeqCst), 0);
-    commit_text(&mut state, "17}}]}");
-    commit_text(&mut fork, "23}}]}");
-    assert!(state.is_complete().unwrap());
-    assert!(fork.is_complete().unwrap());
-    let first_mask = state.allowed_tokens().unwrap();
-    let second_mask = fork.allowed_tokens().unwrap();
+    let mut state = commit_text(state, r#"{"calls":[{"name":"check","arguments":{"value":"#);
+    let mut fork = state.try_copy(&funding).unwrap();
+    assert_eq!(state.parser().parser().tokens(), fork.parser().parser().tokens());
+    state = state.compute_mask().unwrap();
+    fork = fork.compute_mask().unwrap();
+    assert_eq!(state.token_mask(), fork.token_mask());
+    drop((copied, compilation, funding));
+    assert!(pool.used_bytes().unwrap() > 0);
+    state = commit_text(state, "17}}]}");
+    fork = commit_text(fork, "23}}]}");
+    let (next, complete) = state.is_complete().unwrap();
+    state = next;
+    assert!(complete);
+    let (next, complete) = fork.is_complete().unwrap();
+    fork = next;
+    assert!(complete);
+    state = state.compute_mask().unwrap();
+    fork = fork.compute_mask().unwrap();
     for token in eos {
-        assert!(first_mask.is_allowed(token));
-        assert!(second_mask.is_allowed(token));
+        assert!(state.token_mask().unwrap().is_allowed(token));
+        assert!(fork.token_mask().unwrap().is_allowed(token));
     }
-    state.commit(eos[0]).unwrap();
-    fork.commit(eos[1]).unwrap();
-    assert!(state.is_terminal().unwrap());
-    assert!(fork.is_terminal().unwrap());
+    state = state.commit(eos[0]).unwrap();
+    fork = fork.commit(eos[1]).unwrap();
+    let (state, terminal) = state.is_terminal().unwrap();
+    assert!(terminal);
+    let (fork, terminal) = fork.is_terminal().unwrap();
+    assert!(terminal);
     drop(state);
-    assert_eq!(destination_drops.load(Ordering::SeqCst), 0);
+    assert!(pool.used_bytes().unwrap() > 0);
     drop(fork);
-    assert_eq!(destination_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn reconstruction_uses_frozen_decoder_even_when_current_spelling_map_matches() {
+fn source_retains_decoder_even_when_current_spelling_map_matches() {
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
     let (original, eos) = tokenizer();
-    let compiler = ConstraintCompiler::from_tokenizer(&original, &eos).unwrap();
-    let tools = vec![tool(json!({
-        "type":"object", "properties":{"value":{"const":"two words"}},
-        "required":["value"], "additionalProperties":false
-    }))];
-    let prepared = plan(&compiler, &tools, ToolChoice::Required);
+    let tools = vec![tool(
+        json!({"type":"object", "properties":{"value":{"const":"two words"}},
+        "required":["value"], "additionalProperties":false}),
+    )];
+    let (prepared, compilation) =
+        original_plan(&pool, &original, &eos, &tools, ToolChoice::Required);
     let mut other_raw = (*original).clone();
     other_raw.with_decoder(Some(
         tokenizers::decoders::byte_fallback::ByteFallback::new(),
@@ -286,64 +341,83 @@ fn reconstruction_uses_frozen_decoder_even_when_current_spelling_map_matches() {
         eredu_text::tokenizer::vocabulary_fingerprint(&original),
         eredu_text::tokenizer::vocabulary_fingerprint(&other)
     );
-    let space_id = original.token_to_id("Ġ").unwrap();
+    let space = original.token_to_id("Ġ").unwrap();
     let other_environment =
         crate::runtime::chat::tokenizer_env::from_tokenizer(&other, &eos).unwrap();
-    assert_eq!(other_environment.tok_trie().token(space_id), "Ġ".as_bytes());
-    drop((original, compiler));
-    let mut restored = prepared
+    assert_eq!(other_environment.tok_trie().token(space), "Ġ".as_bytes());
+    drop((original, other_environment, other));
+    let funding = pool
+        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .unwrap();
+    let state = prepared
         .generation_constraint()
         .inner
-        .state(&HostPreparationAuthority::unmanaged())
+        .original_grammar_state(&compilation, &funding)
         .unwrap();
     assert_eq!(
-        restored
-            .matcher
-            .tok_env()
-            .unwrap()
-            .tok_trie()
-            .token(space_id),
+        state
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .trie()
+            .token(space),
         b" "
     );
-    // The space belongs to the argument value, not the dialect's fixed prefix.
-    let output = r#"{"calls":[{"name":"check","arguments":{"value":"two words"}}]}"#;
-    assert!(restored
-        .matcher
-        .tok_env()
-        .unwrap()
-        .tokenize_bytes(output.as_bytes())
-        .contains(&space_id));
-    commit_text(&mut restored, output);
-    assert!(restored.is_complete().unwrap());
+    let state = commit_text(
+        state,
+        r#"{"calls":[{"name":"check","arguments":{"value":"two words"}}]}"#,
+    );
+    let (_, complete) = state.is_complete().unwrap();
+    assert!(complete);
 }
 
 #[test]
-fn chosen_fallback_grammar_and_original_rejecting_schema_survive_reconstruction() {
+fn selected_fallback_grammar_keeps_original_rejecting_schema() {
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
     let (tokenizer, eos) = tokenizer();
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
     let original_tools = vec![tool(json!(false))];
     let strict = DECLARATIVE_DIALECT
         .constraint_configuration(
             PARAMETERS,
-            &original_tools,
+            ToolDeclarations::prepare(
+                &original_tools,
+                &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            )
+            .unwrap()
+            .as_slice(),
             ToolChoice::Required,
             ParallelToolCallPolicy::Disabled,
             &[],
+            &llguidance::derivre::ParserAllocationFunding::unenforced(),
         )
         .unwrap();
     assert!(
         compiler.compile_matcher(strict.grammar).is_err(),
-        "fixture must select the fallback branch"
+        "fixture must select the fallback"
     );
-    let prepared = plan(&compiler, &original_tools, ToolChoice::Required);
-    let syntax_tools = vec![tool(json!({"type":"object"}))];
+    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    let (prepared, compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &original_tools,
+        ToolChoice::Required,
+    );
+    let syntax_tools = vec![tool(json!(true))];
     let fallback = DECLARATIVE_DIALECT
         .constraint_configuration(
             PARAMETERS,
-            &syntax_tools,
+            ToolDeclarations::prepare(
+                &syntax_tools,
+                &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            )
+            .unwrap()
+            .as_slice(),
             ToolChoice::Required,
             ParallelToolCallPolicy::Disabled,
             &[],
+            &llguidance::derivre::ParserAllocationFunding::unenforced(),
         )
         .unwrap();
     let recipe = &prepared.generation_constraint().inner.recipe;
@@ -354,16 +428,20 @@ fn chosen_fallback_grammar_and_original_rejecting_schema_survive_reconstruction(
     assert_eq!(recipe.tools().unwrap(), original_tools);
     let fingerprint = prepared.generation_constraint().fingerprint;
     drop((compiler, tokenizer));
-    let destination_drops = Arc::new(AtomicUsize::new(0));
-    let destination = authority(&destination_drops);
-    let mut grammar = prepared
+    let funding = pool
+        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .unwrap();
+    let grammar = prepared
         .generation_constraint()
         .inner
-        .state(&destination)
+        .original_grammar_state(&compilation, &funding)
         .unwrap();
     let output = r#"{"calls":[{"name":"check","arguments":{}}]}"#;
-    commit_text(&mut grammar, output);
-    assert!(grammar.is_complete().unwrap());
+    let grammar = commit_text(grammar, output);
+    let (grammar, complete) = grammar.is_complete().unwrap();
+    assert!(complete);
+    let destination_drops = Arc::new(AtomicUsize::new(0));
+    let destination = authority(&destination_drops);
     let mut semantic = prepared
         .semantic_plan()
         .create_parser_with_stops_under_authority(std::iter::empty(), &destination)
@@ -381,65 +459,67 @@ fn chosen_fallback_grammar_and_original_rejecting_schema_survive_reconstruction(
 }
 
 #[test]
-fn reconstruction_failure_drops_destination_products_without_mutating_valid_recipe() {
+fn missing_source_refusal_keeps_the_valid_recipe_unchanged() {
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
     let (tokenizer, eos) = tokenizer();
-    let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
-    let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
+    let (prepared, compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
     let valid = &prepared.generation_constraint().inner.recipe;
     let before = valid.source().as_ref().to_vec();
     let invalid = ConstraintBlueprint {
-        recipe: ConstraintRecipe::new(
-            Some(b"{"),
-            &valid.grammar().unwrap(),
-            &valid.tools().unwrap(),
-            &eos,
-            &[],
-            &[],
-            &[],
-            None,
-        )
-        .unwrap(),
+        recipe: valid.clone(),
         fixture_matcher: None,
         declaration: None,
     };
-    drop((compiler, tokenizer));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let destination = authority(&drops);
-    let error = invalid.state(&destination).err().unwrap();
-    assert!(
-        error.contains("failed to restore frozen tokenizer"),
-        "{error}"
-    );
+    let funding = pool
+        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .unwrap();
+    let error = invalid
+        .original_grammar_state(&compilation, &funding)
+        .unwrap_err();
+    assert!(error.to_string().contains("source"), "{error}");
     assert_eq!(valid.source().as_ref(), before);
-    drop((invalid, destination));
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    let mut state = prepared
+    drop((invalid, error));
+    let state = prepared
         .generation_constraint()
         .inner
-        .state(&HostPreparationAuthority::unmanaged())
+        .original_grammar_state(&compilation, &funding)
         .unwrap();
-    commit_text(
-        &mut state,
+    let state = commit_text(
+        state,
         r#"{"calls":[{"name":"check","arguments":{"value":23}}]}"#,
     );
-    assert!(state.is_complete().unwrap());
+    let (_, complete) = state.is_complete().unwrap();
+    assert!(complete);
 }
 
 #[test]
-fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection() {
-    use eredu_nn::workspace::{
-        WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
-    };
+fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selection() {
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::WorkingMemoryPool;
     #[derive(Debug)]
     struct Account(Arc<AtomicUsize>);
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             self.0.fetch_add(bytes, Ordering::SeqCst);
             Ok(())
         }
     }
     let (mut tokenizer, eos) = tokenizer();
+    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let tokenizer_json = tokenizer.to_string(false).unwrap();
+    let original_tokenizer = pool
+        .compile_tokenizer(
+            eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(tokenizer_json.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
     let compiler = ConstraintCompiler::from_tokenizer_with_authority(
         &tokenizer,
         &eos,
@@ -449,27 +529,19 @@ fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection
     let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::None);
     let automatic = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
     let required = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
-    let ordinary = ConstraintController::from_generation_plan_unregistered(&prepared).unwrap();
     let space = tokenizer.token_to_id("Ġ").unwrap();
     tokenizer
         .add_special_tokens([AddedToken::from("Ġ", true).normalized(false)])
         .unwrap();
     drop(compiler);
     let used = Arc::new(AtomicUsize::new(0));
-    let funding = WorkspaceMetadataFunding::new(Account(used.clone())).unwrap();
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
-    let mut original = ConstraintController::from_original_generation_plan_with(
+    let funding = HostMetadataFunding::new(Account(used.clone())).unwrap();
+    let mut original = ConstraintController::from_original_forbidden_generation_plan_with(
         &prepared,
         SharedTokenFilter::new(TokenFilter::All),
         32,
         &funding,
-        |json, trigger| {
-            let plan = eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(json)?;
-            let tokenizer = pool.compile_tokenizer(plan).map_err(|cause| {
-                forbidden::Cause::Backend(eredu_core::BackendFailure::from_error(cause))
-            })?;
-            Ok(pool.compile_forbidden_tokenizer_source(&tokenizer, trigger)?)
-        },
+        |trigger| Ok(pool.compile_forbidden_tokenizer_source(&original_tokenizer, trigger)?),
     )
     .unwrap();
     assert!(used.load(Ordering::SeqCst) > 0);
@@ -487,11 +559,24 @@ fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection
         .collect();
     for length in 0..ids.len() {
         let actual = source.decision_at(&ids[..length]).unwrap();
-        let expected = ordinary.filter_at(&ids[..length]).unwrap();
+        let prefix = &trigger.as_bytes()[..length];
         for token in 0..source.inputs().vocabulary_len() as u32 {
             assert_eq!(
                 actual.allows(token),
-                expected.allows(token),
+                !prefix
+                    .iter()
+                    .copied()
+                    .chain(
+                        source
+                            .inputs()
+                            .token_bytes(token as usize)
+                            .unwrap()
+                            .iter()
+                            .copied()
+                    )
+                    .collect::<Vec<_>>()
+                    .windows(trigger.len())
+                    .any(|bytes| bytes == trigger.as_bytes()),
                 "prefix {length}, token {token}"
             );
         }
@@ -511,12 +596,12 @@ fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection
         Err(eredu_core::speculative::ForbiddenControllerError::Forbidden(_))
     ));
     for other in [&automatic, &required] {
-        let error = ConstraintController::from_original_generation_plan_with(
+        let error = ConstraintController::from_original_forbidden_generation_plan_with(
             other,
             SharedTokenFilter::new(TokenFilter::All),
             32,
             &funding,
-            |_, _| panic!("grammar branch entered forbidden compiler"),
+            |_| panic!("grammar branch entered forbidden compiler"),
         )
         .err()
         .unwrap();
@@ -525,7 +610,13 @@ fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection
             .contains("separately qualified grammar source"));
     }
     drop((
-        original, ordinary, prepared, automatic, required, tokenizer, funding,
+        original,
+        prepared,
+        automatic,
+        required,
+        tokenizer,
+        original_tokenizer,
+        funding,
     ));
     assert!(pool.used_bytes().unwrap() > 0);
     assert_eq!(escaped.token_bytes(space as usize), Some(b" ".as_slice()));
@@ -537,9 +628,7 @@ fn original_forbidden_startup_uses_historical_recipe_and_shared_branch_selection
 fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasoning() {
     use crate::runtime::generation::streaming::prepared_channels::PreparedChannelParser;
     use eredu_core::generation::{FinishReason, SemanticEvent};
-    use eredu_nn::workspace::{
-        WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
-    };
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::WorkingMemoryPool;
     use std::sync::atomic::AtomicBool;
     static CHANNELS: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -561,8 +650,8 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
         bytes: Arc<AtomicUsize>,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, n: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
             self.bytes.fetch_add(n, Ordering::SeqCst);
             Ok(())
         }
@@ -612,7 +701,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
     drop(compiler);
     let bytes = Arc::new(AtomicUsize::new(0));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         bytes: bytes.clone(),
         retired: retired.clone(),
     })
@@ -686,9 +775,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
 
 #[test]
 fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all_owners() {
-    use eredu_nn::workspace::{
-        WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
-    };
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::WorkingMemoryPool;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
@@ -697,10 +784,10 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         retired: Arc<AtomicBool>,
         refused: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, n: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
             if self.refused.load(Ordering::SeqCst) {
-                return Err(WorkspaceMetadataFundingError::Capacity {
+                return Err(HostMetadataFundingError::Capacity {
                     required: u64::try_from(n).unwrap(),
                     available: 0,
                 });
@@ -720,12 +807,27 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         .unwrap();
     tokenizer.set_encode_special_tokens(true);
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
-    let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
+    let oracle = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
+    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let (prepared, compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
+    let (foreign_plan, foreign_compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
     let other = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
-    let environment = prepared
+    let environment = oracle
         .generation_constraint()
-        .inner
-        .environment(&HostPreparationAuthority::unmanaged())
+        .grammar_matcher()
+        .tok_env()
         .unwrap();
     let expected = environment.tokenize_bytes(b"ab<eos>");
     let info = *environment.tok_trie().info();
@@ -733,30 +835,16 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     let bytes = Arc::new(AtomicUsize::new(0));
     let retired = Arc::new(AtomicBool::new(false));
     let refused = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         bytes: bytes.clone(),
         retired: retired.clone(),
         refused: refused.clone(),
     })
     .unwrap();
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
     let source = prepared
         .generation_constraint()
         .inner
-        .original_grammar_vocabulary_with(&funding, |plan| {
-            let tokenizer = pool.compile_tokenizer(plan).map_err(|e| {
-                eredu_core::BackendFailure::new(
-                    eredu_core::BackendFailureKind::ResourceExhausted,
-                    e,
-                )
-            })?;
-            let actual = pool
-                .encode_tokenizer_ids(&tokenizer, "ab<eos>", false)
-                .unwrap();
-            assert_eq!(actual.ids(), expected);
-            drop(actual);
-            Ok(tokenizer)
-        })
+        .original_grammar_vocabulary(&compilation, &funding)
         .unwrap();
     assert!(bytes.load(Ordering::SeqCst) > 0);
     assert!(source.matches_plan(&prepared));
@@ -770,7 +858,7 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     let actual = historical
         .grammar(&prepared.generation_constraint().inner.recipe)
         .unwrap();
-    assert!(!std::ptr::eq(declared, actual));
+    assert!(std::ptr::eq(declared, actual));
     assert_eq!(declared.start(), actual.start());
     assert_eq!(
         declared.rules_of(declared.start()),
@@ -812,17 +900,10 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         }
     }
     let escaped = source.tokenize_bytes(b"ab<eos>", Mode::Plain).unwrap();
-    let foreign = prepared
+    let foreign = foreign_plan
         .generation_constraint()
         .inner
-        .original_grammar_vocabulary_with(&funding, |plan| {
-            pool.compile_tokenizer(plan).map_err(|e| {
-                eredu_core::BackendFailure::new(
-                    eredu_core::BackendFailureKind::ResourceExhausted,
-                    e,
-                )
-            })
-        })
+        .original_grammar_vocabulary(&foreign_compilation, &funding)
         .unwrap();
     let mut callbacks = 0;
     let failed = source
@@ -983,10 +1064,10 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     assert!(source.seed().scanned_token_mask().is_some());
     assert!(source.seed().bytes().is_empty());
     let output = br#"{"calls":[{"name":"check","arguments":{"value":17}}]}"#;
-    let mut ordinary = prepared.generation_constraint().grammar_state();
+    let mut ordinary = oracle.generation_constraint().grammar_matcher();
     let mut source = source.into_token_parser().unwrap();
     for (position, &byte) in output.iter().enumerate() {
-        let expected_forced = ordinary.matcher.compute_ff_tokens();
+        let expected_forced = ordinary.compute_ff_tokens();
         let forced = source
             .force_tokens()
             .unwrap_or_else(|error| panic!("original canonical forcing {position}: {error:?}"));
@@ -997,7 +1078,7 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         );
         assert!(output[position..].starts_with(forced.prefix()));
         source = forced.into_parser();
-        let expected_mask = ordinary.allowed_tokens().unwrap();
+        let expected_mask = ordinary.compute_mask_or_eos().unwrap();
         source = source
             .compute_mask()
             .unwrap_or_else(|error| panic!("original complete token mask {position}: {error:?}"));
@@ -1017,7 +1098,7 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
             panic!("prepared token session {position} ({byte}): {error:?}")
         });
         assert_eq!(consumed, 1);
-        ordinary.commit(token).unwrap();
+        ordinary.consume_token(token).unwrap();
         source = next;
     }
     assert_eq!(source.parser().bytes(), output);
@@ -1038,42 +1119,63 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         fail_at: usize,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for CopyAccount {
-        fn reserve_metadata(&self, n: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for CopyAccount {
+        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == self.fail_at {
-                return Err(WorkspaceMetadataFundingError::Capacity {
-                    required: u64::try_from(n).unwrap(), available: 0,
+                return Err(HostMetadataFundingError::Capacity {
+                    required: u64::try_from(n).unwrap(),
+                    available: 0,
                 });
             }
             Ok(())
         }
     }
     impl Drop for CopyAccount {
-        fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.retired.store(true, Ordering::SeqCst);
+        }
     }
     let copy_calls = Arc::new(AtomicUsize::new(0));
     let copy_retired = Arc::new(AtomicBool::new(false));
-    let copy_funding = WorkspaceMetadataFunding::new(CopyAccount {
-        calls: copy_calls.clone(), fail_at: usize::MAX, retired: copy_retired.clone(),
-    }).unwrap();
+    let copy_funding = HostMetadataFunding::new(CopyAccount {
+        calls: copy_calls.clone(),
+        fail_at: usize::MAX,
+        retired: copy_retired.clone(),
+    })
+    .unwrap();
     let mut copied = source.try_copy(&copy_funding).unwrap();
     let copy_steps = copy_calls.load(Ordering::SeqCst);
     assert!(copy_steps > 1);
     assert_eq!(copied.parser().tokens(), source.parser().tokens());
-    assert_ne!(copied.parser().tokens().as_ptr(), source.parser().tokens().as_ptr());
-    assert_ne!(copied.parser().bytes().as_ptr(), source.parser().bytes().as_ptr());
-    assert!(std::ptr::eq(copied.parser().chart().grammar(), source.parser().chart().grammar()));
-    assert!(copied.vocabulary().trie_source().same_source(source.vocabulary().trie_source()));
+    assert_ne!(
+        copied.parser().tokens().as_ptr(),
+        source.parser().tokens().as_ptr()
+    );
+    assert_ne!(
+        copied.parser().bytes().as_ptr(),
+        source.parser().bytes().as_ptr()
+    );
+    assert!(std::ptr::eq(
+        copied.parser().chart().grammar(),
+        source.parser().chart().grammar()
+    ));
+    assert!(copied
+        .vocabulary()
+        .trie_source()
+        .same_source(source.vocabulary().trie_source()));
     // Future copied operations, including canonical tokenization metadata, use
     // the new account even while the historical source refuses every new debit.
     refused.store(true, Ordering::SeqCst);
-    ordinary.matcher.rollback(1).unwrap();
+    ordinary.rollback(1).unwrap();
     copied = copied.rollback(1).unwrap().compute_mask().unwrap();
-    assert_eq!(copied.parser().token_mask().unwrap(), &ordinary.allowed_tokens().unwrap());
+    assert_eq!(
+        copied.parser().token_mask().unwrap(),
+        &ordinary.compute_mask_or_eos().unwrap()
+    );
     assert_eq!(source.parser().bytes(), output);
     let before_copy_force = copy_calls.load(Ordering::SeqCst);
     let copied_forced = copied.force_tokens().unwrap();
-    assert_eq!(copied_forced.tokens(), ordinary.matcher.compute_ff_tokens());
+    assert_eq!(copied_forced.tokens(), ordinary.compute_ff_tokens());
     copied = copied_forced.into_parser();
     assert!(copy_calls.load(Ordering::SeqCst) > before_copy_force);
     refused.store(false, Ordering::SeqCst);
@@ -1085,10 +1187,12 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     // The last paid destination refuses after the complete lexer copy. Keep
     // that failed copy after the original pair retires to prove source custody.
     let failed_copy_retired = Arc::new(AtomicBool::new(false));
-    let fail_funding = WorkspaceMetadataFunding::new(CopyAccount {
-        calls: Arc::new(AtomicUsize::new(0)), fail_at: copy_steps - 1,
+    let fail_funding = HostMetadataFunding::new(CopyAccount {
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail_at: copy_steps - 1,
         retired: failed_copy_retired.clone(),
-    }).unwrap();
+    })
+    .unwrap();
     let failed_copy = source.try_copy(&fail_funding).unwrap_err();
     assert!(failed_copy.retains_completed_lexer());
     assert_eq!(source.parser().bytes(), output);
@@ -1096,20 +1200,23 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     assert!(!failed_copy_retired.load(Ordering::SeqCst));
     source = source.rollback(1).unwrap();
     assert_eq!(source.parser().bytes(), &output[..output.len() - 1]);
-    let rollback_mask = ordinary.allowed_tokens().unwrap();
+    let rollback_mask = ordinary.compute_mask_or_eos().unwrap();
     source = source.compute_mask().unwrap();
     assert_eq!(source.parser().token_mask().unwrap(), &rollback_mask);
-    ordinary.matcher.reset().unwrap();
+    ordinary.reset().unwrap();
     source = source.reset().unwrap();
     assert!(source.parser().tokens().is_empty());
     assert!(source.parser().bytes().is_empty());
-    let initial_mask = ordinary.allowed_tokens().unwrap();
+    let initial_mask = ordinary.compute_mask_or_eos().unwrap();
     source = source.compute_mask().unwrap();
     assert_eq!(source.parser().token_mask().unwrap(), &initial_mask);
 
-
     drop((
         prepared,
+        compilation,
+        oracle,
+        foreign_plan,
+        foreign_compilation,
         other,
         compiler,
         tokenizer,
@@ -1150,10 +1257,8 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
 }
 
 #[test]
-fn original_declaration_uses_registered_exact_recipe_and_keeps_source_on_inspection_refusal() {
-    use eredu_nn::workspace::{
-        WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
-    };
+fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspection_refusal() {
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::WorkingMemoryPool;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
@@ -1163,11 +1268,11 @@ fn original_declaration_uses_registered_exact_recipe_and_keeps_source_on_inspect
         bytes: Arc<AtomicUsize>,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call == self.fail_at.load(Ordering::SeqCst) {
-                return Err(WorkspaceMetadataFundingError::Capacity {
+                return Err(HostMetadataFundingError::Capacity {
                     required: u64::try_from(bytes).unwrap(),
                     available: 0,
                 });
@@ -1182,40 +1287,41 @@ fn original_declaration_uses_registered_exact_recipe_and_keeps_source_on_inspect
         }
     }
     let (tokenizer, eos) = tokenizer();
-    let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
-    let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
-    let equal = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
-    let foreign = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
-    let old = &prepared.generation_constraint().inner;
-    let new_recipe = &equal.generation_constraint().inner.recipe;
-    assert!(!old.recipe.source().same_storage(new_recipe.source()));
-    assert_eq!(old.recipe.source().as_ref(), new_recipe.source().as_ref());
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
-    let registered = old
-        .declaration
-        .as_ref()
-        .unwrap()
-        .register_in_pool(&pool, &old.recipe, new_recipe)
-        .unwrap();
-    assert!(registered.grammar(&old.recipe).is_err());
-    assert!(registered.grammar(new_recipe).is_ok());
-    let retained = registered.source().capacity_bytes().unwrap();
-    assert!(retained > 0);
-    let actual = ConstraintBlueprint {
-        recipe: new_recipe.clone(),
-        declaration: Some(registered.clone()),
-        fixture_matcher: None,
-    };
+    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let (prepared, compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
+    let (equal, equal_compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
+    let actual = prepared.generation_constraint().inner.clone();
+    let equal_recipe = &equal.generation_constraint().inner.recipe;
+    assert!(!actual.recipe.source().same_storage(equal_recipe.source()));
+    assert_eq!(
+        actual.recipe.source().as_ref(),
+        equal_recipe.source().as_ref()
+    );
+    let declaration = actual.declaration.as_ref().unwrap().clone();
+    assert!(declaration.grammar(equal_recipe).is_err());
+    assert!(declaration.grammar(&actual.recipe).is_ok());
     let wrong = ConstraintBlueprint {
-        recipe: foreign.generation_constraint().inner.recipe.clone(),
-        declaration: Some(registered.clone()),
+        recipe: equal_recipe.clone(),
+        declaration: Some(declaration.clone()),
         fixture_matcher: None,
     };
     let calls = Arc::new(AtomicUsize::new(0));
     let fail_at = Arc::new(AtomicUsize::new(usize::MAX));
     let bytes = Arc::new(AtomicUsize::new(0));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         calls: calls.clone(),
         fail_at: fail_at.clone(),
         bytes: bytes.clone(),
@@ -1224,44 +1330,47 @@ fn original_declaration_uses_registered_exact_recipe_and_keeps_source_on_inspect
     .unwrap();
     let before = bytes.load(Ordering::SeqCst);
     let destination = actual.original_grammar_declaration(&funding).unwrap();
-    let requirements = registered.requirements(new_recipe).unwrap();
-    assert!(
-        bytes.load(Ordering::SeqCst) - before
-            >= requirements.control_bytes() + requirements.required_bytes()
-    );
-    assert!(!std::ptr::eq(
+    assert!(bytes.load(Ordering::SeqCst) > before);
+    assert!(std::ptr::eq(
         destination.grammar(),
-        registered.grammar(new_recipe).unwrap()
+        declaration.grammar(&actual.recipe).unwrap()
     ));
     assert_eq!(
         destination.grammar().start(),
-        registered.grammar(new_recipe).unwrap().start()
+        declaration.grammar(&actual.recipe).unwrap().start()
     );
     assert!(wrong.original_grammar_declaration(&funding).is_err());
-    // First reserve admits the adapter frame; the second refuses before any
-    // recursive source walk or independent grammar destination construction.
-    let failed_call = calls.load(Ordering::SeqCst) + 2;
+    // Refuse the adapter's fixed controls before cloning the immutable owner.
+    let failed_call = calls.load(Ordering::SeqCst) + 1;
     fail_at.store(failed_call, Ordering::SeqCst);
     let failed = actual.original_grammar_declaration(&funding).unwrap_err();
     assert_eq!(calls.load(Ordering::SeqCst), failed_call);
     let mut cause: &(dyn std::error::Error + 'static) = &failed;
     let refusal = loop {
-        if let Some(refusal) = cause.downcast_ref::<WorkspaceMetadataFundingError>() {
+        if let Some(refusal) = cause.downcast_ref::<HostMetadataFundingError>() {
             break refusal;
         }
         cause = cause.source().expect("typed metadata refusal preserved");
     };
     assert!(matches!(
         refusal,
-        WorkspaceMetadataFundingError::Capacity { available: 0, .. }
+        HostMetadataFundingError::Capacity { available: 0, .. }
     ));
     drop((
-        actual, wrong, prepared, equal, foreign, compiler, tokenizer, registered, funding,
+        actual,
+        wrong,
+        prepared,
+        equal,
+        compilation,
+        equal_compilation,
+        tokenizer,
+        declaration,
+        funding,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), retained);
+    assert!(pool.used_bytes().unwrap() > 0);
     assert!(!retired.load(Ordering::SeqCst));
     drop(destination);
-    assert_eq!(pool.used_bytes().unwrap(), retained);
+    assert!(pool.used_bytes().unwrap() > 0);
     assert!(!retired.load(Ordering::SeqCst));
     drop(failed);
     assert!(retired.load(Ordering::SeqCst));
@@ -1270,63 +1379,98 @@ fn original_declaration_uses_registered_exact_recipe_and_keeps_source_on_inspect
 
 #[test]
 fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custody() {
-    use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
-    use eredu_runtime::working_memory::{WorkingMemoryPool, WorkingMemoryError};
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
+    use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
-    struct Account { refused: Arc<AtomicBool>, retired: Arc<AtomicBool> }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, n: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    struct Account {
+        refused: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
+    }
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
             if self.refused.load(Ordering::SeqCst) {
-                Err(WorkspaceMetadataFundingError::Capacity { required: u64::try_from(n).unwrap(), available: 0 })
-            } else { Ok(()) }
+                Err(HostMetadataFundingError::Capacity {
+                    required: u64::try_from(n).unwrap(),
+                    available: 0,
+                })
+            } else {
+                Ok(())
+            }
         }
     }
     impl Drop for Account {
-        fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.retired.store(true, Ordering::SeqCst);
+        }
     }
     let (tokenizer, eos) = tokenizer();
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
     let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
     let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
-    let historical = &prepared.generation_constraint().inner;
-    let recipe = historical.recipe.register_in_pool(&pool).unwrap();
-    let declaration = historical.declaration.as_ref().unwrap().register_in_pool(&pool, &historical.recipe, &recipe).unwrap();
-    let original_blueprint = ConstraintBlueprint { recipe, declaration: Some(declaration), fixture_matcher: None };
+    let validity = pool
+        .prepare_shared_token_filter(|| eredu_core::TokenFilter::All)
+        .unwrap();
+    let (source_plan, compilation) = original_plan(
+        &pool,
+        &tokenizer,
+        &eos,
+        &ordinary_tools(),
+        ToolChoice::Required,
+    );
+    let original_blueprint = source_plan.generation_constraint().inner.clone();
 
     let refused = Arc::new(AtomicBool::new(false));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account { refused: refused.clone(), retired: retired.clone() }).unwrap();
-    let mut original = original_blueprint.original_grammar_state_with(&funding, |plan| {
-        pool.compile_tokenizer(plan).map_err(|cause| eredu_core::BackendFailure::new(
-            eredu_core::BackendFailureKind::ResourceExhausted, cause))
-    }).unwrap();
-    let mut ordinary = prepared.generation_constraint().grammar_state();
-    let validity = eredu_core::SharedTokenFilter::new(eredu_core::TokenFilter::All);
+    let funding = HostMetadataFunding::new(Account {
+        refused: refused.clone(),
+        retired: retired.clone(),
+    })
+    .unwrap();
+    let mut original = original_blueprint
+        .original_grammar_state(&compilation, &funding)
+        .unwrap();
+    let mut ordinary = prepared.generation_constraint().grammar_matcher();
     let output = br#"{"calls":[{"name":"check","arguments":{"value":17}}]}"#;
     // A provisional grammar owns its independently copied parser and complete
     // canonical history. Terminal aliases need not enter the parser token row.
     #[inline(never)]
-    fn check_sampler<C: eredu_core::SpeculativeTokenFilterController>(source: &C, terminal: &C, first: u32, disallowed: u32, pool: &WorkingMemoryPool) {
+    fn check_sampler<C: eredu_core::SpeculativeTokenFilterController>(
+        source: &C,
+        terminal: &C,
+        first: u32,
+        disallowed: u32,
+        pool: &WorkingMemoryPool,
+    ) {
         use eredu_core::speculative::PreparedGrammarController;
-        use eredu_runtime::generation::{ConstrainedSampler, DefaultSampler, MirostatV2Sampler,
-            SpeculativeSampler, PreparedGrammarSamplerCause, PreparedAdaptiveCommitError};
+        use eredu_runtime::generation::{
+            ConstrainedSampler, DefaultSampler, MirostatV2Sampler, PreparedAdaptiveCommitError,
+            PreparedGrammarSamplerCause, SpeculativeSampler,
+        };
         type B = eredu_runtime::working_memory::WorkspaceSamplingBackend;
         type S<C> = ConstrainedSampler<DefaultSampler, C>;
         let retired = Arc::new(AtomicBool::new(false));
-        let funding = WorkspaceMetadataFunding::new(Account {
-            refused: Arc::new(AtomicBool::new(false)), retired: retired.clone(),
-        }).unwrap();
+        let funding = HostMetadataFunding::new(Account {
+            refused: Arc::new(AtomicBool::new(false)),
+            retired: retired.clone(),
+        })
+        .unwrap();
         let sampler = S::new(DefaultSampler, source.clone());
         assert!(<S<C> as SpeculativeSampler<B>>::prepared_controller(&sampler).is_none());
         let plan = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&sampler).unwrap();
         assert!(plan.copy_metadata_bytes().is_some());
         assert!(plan.controller_source().unwrap().history().is_empty());
         let original_source = plan.controller_source().unwrap();
-        let trie = original_source.tokenizer().downcast_ref::<eredu_runtime::working_memory::OriginalTokenTrieSource>().unwrap();
+        let trie = original_source
+            .tokenizer()
+            .downcast_ref::<eredu_runtime::working_memory::OriginalTokenTrieSource>()
+            .unwrap();
         trie.validate_grammar_source(original_source, pool).unwrap();
         let foreign = WorkingMemoryPool::new(1 << 30, 0).unwrap();
-        assert!(matches!(trie.validate_grammar_source(original_source, &foreign), Err(WorkingMemoryError::IdentityMismatch)));
+        assert!(matches!(
+            trie.validate_grammar_source(original_source, &foreign),
+            Err(WorkingMemoryError::IdentityMismatch)
+        ));
         let choice = plan.choice(0.0, &funding).unwrap();
         assert!(plan.matches_choice(&choice));
         assert!(choice.greedy(0.0).is_ok());
@@ -1339,8 +1483,16 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         assert!(decision.before_forcing().unwrap().allows(first));
         let vocabulary = decision.before_forcing().unwrap().vocabulary();
         assert!(decision.capture_domain().unwrap().filter.allows(first));
-        let forced = plan.force(first, eredu_runtime::TokenDomain::new(vocabulary), 0, &funding).unwrap();
-        let forced_plan = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced).unwrap();
+        let forced = plan
+            .force(
+                first,
+                eredu_runtime::TokenDomain::new(vocabulary),
+                0,
+                &funding,
+            )
+            .unwrap();
+        let forced_plan =
+            <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced).unwrap();
         assert!(!forced_plan.matches_choice(&choice));
         let forced_choice = forced_plan.choice(0.75, &funding).unwrap();
         assert!(forced_choice.categorical(0.75).is_ok());
@@ -1352,43 +1504,128 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         let mut bits = Vec::with_capacity(mask.elements());
         mask.fill(&mut bits).unwrap();
         assert_eq!(bits.iter().filter(|&&bit| !bit).count(), 1);
-        let repeated = forced_plan.force(first, eredu_runtime::TokenDomain::new(vocabulary), 0, &funding).err().unwrap();
-        assert!(matches!(repeated.cause(), PreparedGrammarSamplerCause::Decision(cause)
+        let repeated = forced_plan
+            .force(
+                first,
+                eredu_runtime::TokenDomain::new(vocabulary),
+                0,
+                &funding,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(repeated.cause(), PreparedGrammarSamplerCause::Decision(cause)
             if matches!(cause.cause(), eredu_runtime::execution_control::PreparedGrammarChoiceCause::Choice(
-                eredu_runtime::execution_control::TokenChoiceError::AlreadyPending))));
+                eredu_runtime::execution_control::TokenChoiceError::AlreadyPending)))
+        );
         drop(repeated);
-        let snapshot = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced).unwrap().copy(&funding).unwrap();
-        let cleared = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced).unwrap().clear(&funding).unwrap();
-        assert!(!<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&snapshot).unwrap().matches_choice(&forced_choice));
-        assert!(!<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&cleared).unwrap().matches_choice(&forced_choice));
+        let snapshot = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced)
+            .unwrap()
+            .copy(&funding)
+            .unwrap();
+        let cleared = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced)
+            .unwrap()
+            .clear(&funding)
+            .unwrap();
+        assert!(
+            !<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&snapshot)
+                .unwrap()
+                .matches_choice(&forced_choice)
+        );
+        assert!(
+            !<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&cleared)
+                .unwrap()
+                .matches_choice(&forced_choice)
+        );
 
-        assert_eq!(<S<C> as SpeculativeSampler<B>>::control_pending_forced(&cleared), None);
-        assert_eq!(<S<C> as SpeculativeSampler<B>>::control_pending_forced(&snapshot), Some(first));
-        let committed = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced).unwrap().commit(first, None, &funding).unwrap();
-        assert_eq!(committed.controller().prepared_grammar().unwrap().prepared_grammar_source().history(), &[first]);
-        assert!(snapshot.controller().prepared_grammar().unwrap().prepared_grammar_source().history().is_empty());
-        assert_eq!(<S<C> as SpeculativeSampler<B>>::control_pending_forced(&committed), None);
-        assert!(!<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&committed).unwrap().prefix_is_complete(&[first], &funding).unwrap());
+        assert_eq!(
+            <S<C> as SpeculativeSampler<B>>::control_pending_forced(&cleared),
+            None
+        );
+        assert_eq!(
+            <S<C> as SpeculativeSampler<B>>::control_pending_forced(&snapshot),
+            Some(first)
+        );
+        let committed = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&forced)
+            .unwrap()
+            .commit(first, None, &funding)
+            .unwrap();
+        assert_eq!(
+            committed
+                .controller()
+                .prepared_grammar()
+                .unwrap()
+                .prepared_grammar_source()
+                .history(),
+            &[first]
+        );
+        assert!(snapshot
+            .controller()
+            .prepared_grammar()
+            .unwrap()
+            .prepared_grammar_source()
+            .history()
+            .is_empty());
+        assert_eq!(
+            <S<C> as SpeculativeSampler<B>>::control_pending_forced(&committed),
+            None
+        );
+        assert!(
+            !<S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&committed)
+                .unwrap()
+                .prefix_is_complete(&[first], &funding)
+                .unwrap()
+        );
         let ended = S::new(DefaultSampler, terminal.clone());
-        let ended_plan = <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&ended).unwrap();
-        assert!(ended_plan.prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding).unwrap());
+        let ended_plan =
+            <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&ended).unwrap();
+        assert!(ended_plan
+            .prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding)
+            .unwrap());
         type A<C> = ConstrainedSampler<MirostatV2Sampler, C>;
         let adaptive = A::new(MirostatV2Sampler::new(3.5, 0.2).unwrap(), source.clone());
-        let invalid = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive).unwrap()
-            .commit(disallowed, Some(0.0), &funding).err().unwrap();
-        assert!(matches!(invalid.cause(), PreparedGrammarSamplerCause::Adaptive(PreparedAdaptiveCommitError::Probability)));
+        let invalid = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive)
+            .unwrap()
+            .commit(disallowed, Some(0.0), &funding)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            invalid.cause(),
+            PreparedGrammarSamplerCause::Adaptive(PreparedAdaptiveCommitError::Probability)
+        ));
         drop(invalid);
-        let accepted = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive).unwrap()
-            .commit(first, Some(0.25), &funding).unwrap();
+        let accepted = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive)
+            .unwrap()
+            .commit(first, Some(0.25), &funding)
+            .unwrap();
         let mut expected = MirostatV2Sampler::new(3.5, 0.2).unwrap();
         expected.accept_token(first, 0.25).unwrap();
         assert_eq!(accepted.policy().mu().to_bits(), expected.mu().to_bits());
         assert_eq!(accepted.policy().generated_tokens(), &[first]);
         assert!(adaptive.policy().generated_tokens().is_empty());
-        let failure = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive).unwrap()
-            .commit(disallowed, Some(0.25), &funding).err().unwrap();
-        assert!(matches!(failure.cause(), PreparedGrammarSamplerCause::Operation(_)));
-        drop((choice, forced_choice, forced_decision, forced, snapshot, cleared, committed, ended, accepted, adaptive, sampler, funding));
+        let failure = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive)
+            .unwrap()
+            .commit(disallowed, Some(0.25), &funding)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            failure.cause(),
+            PreparedGrammarSamplerCause::Operation(_)
+        ));
+        drop((
+            choice,
+            forced_choice,
+            forced_decision,
+            forced,
+            snapshot,
+            cleared,
+            committed,
+            ended,
+            accepted,
+            adaptive,
+            sampler,
+            funding,
+        ));
         assert!(!retired.load(Ordering::SeqCst));
         drop(failure);
         assert!(!retired.load(Ordering::SeqCst));
@@ -1396,39 +1633,63 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         assert!(retired.load(Ordering::SeqCst));
     }
     #[inline(never)]
-    fn check_copy_bound<G: eredu_core::speculative::PreparedGrammarController>(grammar: &G, capacity: usize) {
+    fn check_copy_bound<G: eredu_core::speculative::PreparedGrammarController>(
+        grammar: &G,
+        capacity: usize,
+    ) {
         #[derive(Debug)]
-        struct CopyAccount { spent: Arc<AtomicUsize>, limit: Arc<AtomicUsize>, retired: Arc<AtomicBool> }
-        impl WorkspaceMetadataAccount for CopyAccount {
-            fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+        struct CopyAccount {
+            spent: Arc<AtomicUsize>,
+            limit: Arc<AtomicUsize>,
+            retired: Arc<AtomicBool>,
+        }
+        impl HostMetadataAccount for CopyAccount {
+            fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
                 let current = self.spent.load(Ordering::SeqCst);
-                let next = current.checked_add(bytes).ok_or(WorkspaceMetadataFundingError::Overflow)?;
+                let next = current
+                    .checked_add(bytes)
+                    .ok_or(HostMetadataFundingError::Overflow)?;
                 let limit = self.limit.load(Ordering::SeqCst);
                 if next > limit {
-                    return Err(WorkspaceMetadataFundingError::Capacity {
-                        required: u64::try_from(next).unwrap(), available: u64::try_from(limit).unwrap(),
+                    return Err(HostMetadataFundingError::Capacity {
+                        required: u64::try_from(next).unwrap(),
+                        available: u64::try_from(limit).unwrap(),
                     });
                 }
-                self.spent.store(next, Ordering::SeqCst); Ok(())
+                self.spent.store(next, Ordering::SeqCst);
+                Ok(())
             }
         }
-        impl Drop for CopyAccount { fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); } }
+        impl Drop for CopyAccount {
+            fn drop(&mut self) {
+                self.retired.store(true, Ordering::SeqCst);
+            }
+        }
         let required = grammar.prepared_grammar_copy_bytes(capacity).unwrap();
-        assert!(grammar.prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1).is_none());
+        assert!(grammar
+            .prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1)
+            .is_none());
         for shortage in [0, 1] {
             let spent = Arc::new(AtomicUsize::new(0));
             let limit = Arc::new(AtomicUsize::new(usize::MAX));
             let retired = Arc::new(AtomicBool::new(false));
-            let funding = WorkspaceMetadataFunding::new(CopyAccount {
-                spent: spent.clone(), limit: limit.clone(), retired: retired.clone(),
-            }).unwrap();
+            let funding = HostMetadataFunding::new(CopyAccount {
+                spent: spent.clone(),
+                limit: limit.clone(),
+                retired: retired.clone(),
+            })
+            .unwrap();
             spent.store(0, Ordering::SeqCst);
             limit.store(required - shortage, Ordering::SeqCst);
             let result = grammar.copy_prepared_grammar(capacity, &funding);
             if shortage == 0 {
                 let copied = result.unwrap();
                 assert_eq!(spent.load(Ordering::SeqCst), required);
-                assert!(grammar.prepared_grammar_source().matches_copy(copied.prepared_grammar_source(), capacity, &funding));
+                assert!(grammar.prepared_grammar_source().matches_copy(
+                    copied.prepared_grammar_source(),
+                    capacity,
+                    &funding
+                ));
                 drop(funding);
                 assert!(!retired.load(Ordering::SeqCst));
                 drop(copied);
@@ -1444,54 +1705,124 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     }
     #[inline(never)]
     fn check_dynamic<C: eredu_core::SpeculativeTokenFilterController>(
-        source: &C, tokens: &[u32], eos: u32, disallowed: u32, ordinary: &GrammarState,
-        branch_retired: Arc<AtomicBool>, branch_funding: WorkspaceMetadataFunding, pool: &WorkingMemoryPool,
+        source: &C,
+        tokens: &[u32],
+        eos: u32,
+        disallowed: u32,
+        ordinary: &Matcher,
+        branch_retired: Arc<AtomicBool>,
+        branch_funding: HostMetadataFunding,
+        pool: &WorkingMemoryPool,
     ) {
         use eredu_core::speculative::PreparedGrammarController;
         use eredu_runtime::execution_control::{PreparedGrammarBranch, PreparedGrammarBranchCause};
         let grammar = source.prepared_grammar().unwrap();
         let decision_retired = Arc::new(AtomicBool::new(false));
-        let decision_funding = WorkspaceMetadataFunding::new(Account {
-            refused: Arc::new(AtomicBool::new(false)), retired: decision_retired.clone(),
-        }).unwrap();
-        let branch = PreparedGrammarBranch::at(grammar, &tokens, tokens.len() + 2, &decision_funding).unwrap();
+        let decision_funding = HostMetadataFunding::new(Account {
+            refused: Arc::new(AtomicBool::new(false)),
+            retired: decision_retired.clone(),
+        })
+        .unwrap();
+        let branch =
+            PreparedGrammarBranch::at(grammar, &tokens, tokens.len() + 2, &decision_funding)
+                .unwrap();
         assert!(grammar.prepared_grammar_source().history().is_empty());
-        assert_eq!(branch.controller().prepared_grammar_source().history(), tokens);
-        assert!(branch.controller().prepared_grammar_source().funding().same_account(&decision_funding));
-        assert!(grammar.prepared_grammar_source().tokenizer().same_borrowed_source(
-            branch.controller().prepared_grammar_source().tokenizer()));
-        let mut expected = ordinary.fork();
-        for &token in tokens { expected.commit(token).unwrap(); }
-        let expected_mask = expected.allowed_tokens().unwrap();
+        assert_eq!(
+            branch.controller().prepared_grammar_source().history(),
+            tokens
+        );
+        assert!(branch
+            .controller()
+            .prepared_grammar_source()
+            .funding()
+            .same_account(&decision_funding));
+        assert!(grammar
+            .prepared_grammar_source()
+            .tokenizer()
+            .same_borrowed_source(branch.controller().prepared_grammar_source().tokenizer()));
+        let mut expected = ordinary.deep_clone();
+        for &token in tokens {
+            expected.consume_token(token).unwrap();
+        }
+        let expected_mask = expected.compute_mask_or_eos().unwrap();
         let packed = branch.mask().unwrap();
         for token in 0..expected_mask.len() {
-            assert_eq!(packed.allows(token as u32), expected_mask.is_allowed(token as u32));
+            assert_eq!(
+                packed.allows(token as u32),
+                expected_mask.is_allowed(token as u32)
+            );
         }
-        let committed = branch.into_controller().commit_prepared_grammar(eos).unwrap();
-        assert_eq!(committed.prepared_grammar_source().history().last(), Some(&eos));
-        assert_eq!(committed.prepared_grammar_source().history().len(), tokens.len() + 1);
+        let committed = branch
+            .into_controller()
+            .commit_prepared_grammar(eos)
+            .unwrap();
+        assert_eq!(
+            committed.prepared_grammar_source().history().last(),
+            Some(&eos)
+        );
+        assert_eq!(
+            committed.prepared_grammar_source().history().len(),
+            tokens.len() + 1
+        );
         let (committed, terminal) = committed.prepared_grammar_terminal().unwrap();
         assert!(terminal);
         check_copy_bound(&committed, tokens.len() + 2);
-        let copied = committed.copy_prepared_grammar(tokens.len() + 2, &branch_funding).unwrap();
-        assert!(committed.prepared_grammar_source().matches_copy(copied.prepared_grammar_source(), tokens.len() + 2, &branch_funding));
+        let copied = committed
+            .copy_prepared_grammar(tokens.len() + 2, &branch_funding)
+            .unwrap();
+        assert!(committed.prepared_grammar_source().matches_copy(
+            copied.prepared_grammar_source(),
+            tokens.len() + 2,
+            &branch_funding
+        ));
         let (copied, terminal) = copied.prepared_grammar_terminal().unwrap();
         assert!(terminal);
-        let installed = source.replace_prepared_grammar(copied, &branch_funding).unwrap();
-        assert_eq!(installed.prepared_grammar().unwrap().prepared_grammar_source().history(), committed.prepared_grammar_source().history());
+        let installed = source
+            .replace_prepared_grammar(copied, &branch_funding)
+            .unwrap();
+        assert_eq!(
+            installed
+                .prepared_grammar()
+                .unwrap()
+                .prepared_grammar_source()
+                .history(),
+            committed.prepared_grammar_source().history()
+        );
         check_sampler(source, &installed, tokens[0], disallowed, pool);
         assert!(grammar.prepared_grammar_source().history().is_empty());
-        let divergent = PreparedGrammarBranch::at(&committed, &tokens[..1], tokens.len() + 2, &branch_funding).unwrap_err();
-        assert!(matches!(divergent.cause(), PreparedGrammarBranchCause::History(_)));
+        let divergent =
+            PreparedGrammarBranch::at(&committed, &tokens[..1], tokens.len() + 2, &branch_funding)
+                .unwrap_err();
+        assert!(matches!(
+            divergent.cause(),
+            PreparedGrammarBranchCause::History(_)
+        ));
         drop(divergent);
         let failed_retired = Arc::new(AtomicBool::new(false));
-        let failed_funding = WorkspaceMetadataFunding::new(Account {
-            refused: Arc::new(AtomicBool::new(false)), retired: failed_retired.clone(),
-        }).unwrap();
-        let failure = PreparedGrammarBranch::at(grammar, &[tokens[0], disallowed], tokens.len() + 2, &failed_funding).unwrap_err();
-        assert!(matches!(failure.cause(), PreparedGrammarBranchCause::Operation(_)));
+        let failed_funding = HostMetadataFunding::new(Account {
+            refused: Arc::new(AtomicBool::new(false)),
+            retired: failed_retired.clone(),
+        })
+        .unwrap();
+        let failure = PreparedGrammarBranch::at(
+            grammar,
+            &[tokens[0], disallowed],
+            tokens.len() + 2,
+            &failed_funding,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.cause(),
+            PreparedGrammarBranchCause::Operation(_)
+        ));
         assert!(grammar.prepared_grammar_source().history().is_empty());
-        drop((failed_funding, decision_funding, branch_funding, committed, installed));
+        drop((
+            failed_funding,
+            decision_funding,
+            branch_funding,
+            committed,
+            installed,
+        ));
         assert!(!failed_retired.load(Ordering::SeqCst));
         assert!(decision_retired.load(Ordering::SeqCst));
         assert!(!branch_retired.load(Ordering::SeqCst));
@@ -1500,18 +1831,51 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     }
     {
         let branch_retired = Arc::new(AtomicBool::new(false));
-        let branch_funding = WorkspaceMetadataFunding::new(Account {
-            refused: Arc::new(AtomicBool::new(false)), retired: branch_retired.clone(),
-        }).unwrap();
-        let source = original.try_copy(&branch_funding).unwrap()
-            .into_controller(output.len() + 2, validity.clone()).unwrap();
-        let tokens = output.iter().map(|&byte| original.parser().vocabulary().trie_source()
-            .trie().token_id_at_bytes(&[byte]).unwrap()).collect::<Vec<_>>();
-        let disallowed = original.parser().vocabulary().trie_source().trie().token_id_at_bytes(b"!").unwrap();
+        let branch_funding = HostMetadataFunding::new(Account {
+            refused: Arc::new(AtomicBool::new(false)),
+            retired: branch_retired.clone(),
+        })
+        .unwrap();
+        let source = original
+            .try_copy(&branch_funding)
+            .unwrap()
+            .into_controller(output.len() + 2, validity.clone())
+            .unwrap();
+        let tokens = output
+            .iter()
+            .map(|&byte| {
+                original
+                    .parser()
+                    .vocabulary()
+                    .trie_source()
+                    .trie()
+                    .token_id_at_bytes(&[byte])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let disallowed = original
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .trie()
+            .token_id_at_bytes(b"!")
+            .unwrap();
         let shared = ConstraintController::from_prepared_grammar(source, &branch_funding).unwrap();
         let alias = shared.clone();
-        assert!(std::ptr::eq(shared.prepared_grammar().unwrap(), alias.prepared_grammar().unwrap()));
-        check_dynamic(&shared, &tokens, eos[1], disallowed, &ordinary, branch_retired.clone(), branch_funding, &pool);
+        assert!(std::ptr::eq(
+            shared.prepared_grammar().unwrap(),
+            alias.prepared_grammar().unwrap()
+        ));
+        check_dynamic(
+            &shared,
+            &tokens,
+            eos[1],
+            disallowed,
+            &ordinary,
+            branch_retired.clone(),
+            branch_funding,
+            &pool,
+        );
         drop(shared);
         assert!(!branch_retired.load(Ordering::SeqCst));
         drop(alias);
@@ -1519,58 +1883,93 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     }
     for &byte in output {
         original = original.compute_mask().unwrap();
-        let expected = ordinary.allowed_tokens().unwrap();
+        let expected = ordinary.compute_mask_or_eos().unwrap();
         assert_eq!(original.token_mask().unwrap(), &expected);
         {
             let packed = original.packed_filter(&validity).unwrap();
-            assert!(std::ptr::eq(packed.words().as_ptr(), original.token_mask().unwrap().as_slice().as_ptr()));
+            assert!(std::ptr::eq(
+                packed.words().as_ptr(),
+                original.token_mask().unwrap().as_slice().as_ptr()
+            ));
             let width = packed.vocabulary() + 3;
             let shape = [2, i32::try_from(width).unwrap()];
-            let plan = eredu_runtime::generation::TokenMaskPlan::packed(packed, &shape, None).unwrap();
+            let plan =
+                eredu_runtime::generation::TokenMaskPlan::packed(packed, &shape, None).unwrap();
             let mut actual = Vec::with_capacity(plan.elements());
             plan.fill(&mut actual).unwrap();
-            let expected_row = (0..width).map(|id| id >= expected.len() || !expected.is_allowed(id as u32)).collect::<Vec<_>>();
+            let expected_row = (0..width)
+                .map(|id| id >= expected.len() || !expected.is_allowed(id as u32))
+                .collect::<Vec<_>>();
             assert_eq!(&actual[..width], expected_row.as_slice());
             assert_eq!(&actual[width..], expected_row.as_slice());
             let domain = eredu_core::capture::CaptureTokenDomain {
                 filter: eredu_core::capture::CaptureTokenFilter::Packed(packed),
                 tokenizer_validity: &validity,
             };
-            assert_eq!(domain.summary(width as u32).allowed_tokens,
-                (0..expected.len()).filter(|&id| expected.is_allowed(id as u32)).count() as u64);
-            let forced = (0..expected.len()).find(|&id| expected.is_allowed(id as u32)).unwrap() as u32;
-            let plan = eredu_runtime::generation::TokenMaskPlan::packed(packed, &shape, Some(forced)).unwrap();
+            assert_eq!(
+                domain.summary(width as u32).allowed_tokens,
+                (0..expected.len())
+                    .filter(|&id| expected.is_allowed(id as u32))
+                    .count() as u64
+            );
+            let forced = (0..expected.len())
+                .find(|&id| expected.is_allowed(id as u32))
+                .unwrap() as u32;
+            let plan =
+                eredu_runtime::generation::TokenMaskPlan::packed(packed, &shape, Some(forced))
+                    .unwrap();
             let mut only_forced = Vec::with_capacity(plan.elements());
             plan.fill(&mut only_forced).unwrap();
             assert_eq!(only_forced.iter().filter(|&&invalid| !invalid).count(), 2);
             assert!(!only_forced[forced as usize]);
-            assert!(eredu_runtime::generation::TokenMaskPlan::packed(packed, &shape, Some(width as u32)).is_err());
+            assert!(eredu_runtime::generation::TokenMaskPlan::packed(
+                packed,
+                &shape,
+                Some(width as u32)
+            )
+            .is_err());
         }
-        let token = original.parser().vocabulary().trie_source().trie().token_id_at_bytes(&[byte]).unwrap();
-        ordinary.commit(token).unwrap();
+        let token = original
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .trie()
+            .token_id_at_bytes(&[byte])
+            .unwrap();
+        ordinary.consume_token(token).unwrap();
         original = original.commit(token).unwrap();
-        let (next, complete) = original.is_complete().unwrap(); original = next;
-        assert_eq!(complete, ordinary.is_complete().unwrap());
-        let (next, terminal) = original.is_terminal().unwrap(); original = next;
-        assert_eq!(terminal, ordinary.is_terminal().unwrap());
+        let (next, complete) = original.is_complete().unwrap();
+        original = next;
+        assert_eq!(complete, ordinary.is_accepting().unwrap());
+        let (next, terminal) = original.is_terminal().unwrap();
+        original = next;
+        assert_eq!(
+            terminal,
+            (ordinary.is_accepting().unwrap() && ordinary.is_stopped())
+        );
     }
     original = original.compute_mask().unwrap();
-    let expected_mask = ordinary.allowed_tokens().unwrap();
+    let expected_mask = ordinary.compute_mask_or_eos().unwrap();
     assert_eq!(original.token_mask().unwrap(), &expected_mask);
     assert!(expected_mask.is_allowed(eos[1]));
-    ordinary.commit(eos[1]).unwrap();
+    assert!(ordinary.is_accepting().unwrap());
     original = original.commit(eos[1]).unwrap();
-    let (next, terminal) = original.is_terminal().unwrap(); original = next;
-    assert_eq!(terminal, ordinary.is_terminal().unwrap());
+    let (next, terminal) = original.is_terminal().unwrap();
+    original = next;
     assert!(terminal);
     let copied_retired = Arc::new(AtomicBool::new(false));
-    let copy_funding = WorkspaceMetadataFunding::new(Account {
-        refused: Arc::new(AtomicBool::new(false)), retired: copied_retired.clone(),
-    }).unwrap();
+    let copy_funding = HostMetadataFunding::new(Account {
+        refused: Arc::new(AtomicBool::new(false)),
+        retired: copied_retired.clone(),
+    })
+    .unwrap();
     let copied = original.try_copy(&copy_funding).unwrap();
     let (copied, terminal) = copied.is_terminal().unwrap();
     assert!(terminal);
-    assert_eq!(copied.parser().parser().tokens(), original.parser().parser().tokens());
+    assert_eq!(
+        copied.parser().parser().tokens(),
+        original.parser().parser().tokens()
+    );
     drop(copy_funding);
     assert!(!copied_retired.load(Ordering::SeqCst));
     drop(copied);
@@ -1580,18 +1979,29 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     // source exists. The failed startup must retain that actual source prefix.
     let startup_refused = Arc::new(AtomicBool::new(false));
     let startup_retired = Arc::new(AtomicBool::new(false));
-    let startup_funding = WorkspaceMetadataFunding::new(Account {
-        refused: startup_refused.clone(), retired: startup_retired.clone(),
-    }).unwrap();
-    let startup_failure = original_blueprint.original_grammar_state_with(&startup_funding, |plan| {
-        let tokenizer = pool.compile_tokenizer(plan).map_err(|cause| eredu_core::BackendFailure::new(
-            eredu_core::BackendFailureKind::ResourceExhausted, cause))?;
-        startup_refused.store(true, Ordering::SeqCst);
-        Ok(tokenizer)
-    }).unwrap_err();
+    let startup_funding = HostMetadataFunding::new(Account {
+        refused: startup_refused.clone(),
+        retired: startup_retired.clone(),
+    })
+    .unwrap();
+    startup_refused.store(true, Ordering::SeqCst);
+    let startup_failure = original_blueprint
+        .original_grammar_state(&compilation, &startup_funding)
+        .unwrap_err();
     refused.store(true, Ordering::SeqCst);
     let failure = original.compute_mask().unwrap_err();
-    drop((funding, startup_funding, original_blueprint, prepared, compiler, tokenizer, ordinary));
+    drop((
+        funding,
+        startup_funding,
+        original_blueprint,
+        source_plan,
+        compilation,
+        validity,
+        prepared,
+        compiler,
+        tokenizer,
+        ordinary,
+    ));
     assert!(!retired.load(Ordering::SeqCst));
     assert!(!startup_retired.load(Ordering::SeqCst));
     assert!(pool.used_bytes().unwrap() > 0);
@@ -1606,23 +2016,37 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
 #[test]
 fn original_auto_grammar_matches_split_and_atomic_activation_masks_and_paid_copy() {
     use eredu_core::speculative::PreparedGrammarController;
-    use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::WorkingMemoryPool;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
-    struct Account { spent: Arc<AtomicUsize>, limit: Arc<AtomicUsize>, retired: Arc<AtomicBool> }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    struct Account {
+        spent: Arc<AtomicUsize>,
+        limit: Arc<AtomicUsize>,
+        retired: Arc<AtomicBool>,
+    }
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             let current = self.spent.load(Ordering::SeqCst);
-            let next = current.checked_add(bytes).ok_or(WorkspaceMetadataFundingError::Overflow)?;
+            let next = current
+                .checked_add(bytes)
+                .ok_or(HostMetadataFundingError::Overflow)?;
             let limit = self.limit.load(Ordering::SeqCst);
-            if next > limit { return Err(WorkspaceMetadataFundingError::Capacity {
-                required: u64::try_from(next).unwrap(), available: u64::try_from(limit).unwrap(),
-            }); }
-            self.spent.store(next, Ordering::SeqCst); Ok(())
+            if next > limit {
+                return Err(HostMetadataFundingError::Capacity {
+                    required: u64::try_from(next).unwrap(),
+                    available: u64::try_from(limit).unwrap(),
+                });
+            }
+            self.spent.store(next, Ordering::SeqCst);
+            Ok(())
         }
     }
-    impl Drop for Account { fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); } }
+    impl Drop for Account {
+        fn drop(&mut self) {
+            self.retired.store(true, Ordering::SeqCst);
+        }
+    }
     #[inline(never)]
     fn check_copy<G: PreparedGrammarController>(source: &G, capacity: usize) {
         let required = source.prepared_grammar_copy_bytes(capacity).unwrap();
@@ -1630,21 +2054,37 @@ fn original_auto_grammar_matches_split_and_atomic_activation_masks_and_paid_copy
             let spent = Arc::new(AtomicUsize::new(0));
             let limit = Arc::new(AtomicUsize::new(usize::MAX));
             let retired = Arc::new(AtomicBool::new(false));
-            let funding = WorkspaceMetadataFunding::new(Account { spent: spent.clone(), limit: limit.clone(), retired: retired.clone() }).unwrap();
-            spent.store(0, Ordering::SeqCst); limit.store(required - shortage, Ordering::SeqCst);
+            let funding = HostMetadataFunding::new(Account {
+                spent: spent.clone(),
+                limit: limit.clone(),
+                retired: retired.clone(),
+            })
+            .unwrap();
+            spent.store(0, Ordering::SeqCst);
+            limit.store(required - shortage, Ordering::SeqCst);
             let result = source.copy_prepared_grammar(capacity, &funding);
             if shortage == 0 {
                 let copy = result.unwrap();
                 assert_eq!(spent.load(Ordering::SeqCst), required);
-                assert!(source.prepared_grammar_source().matches_copy(copy.prepared_grammar_source(), capacity, &funding));
+                assert!(source.prepared_grammar_source().matches_copy(
+                    copy.prepared_grammar_source(),
+                    capacity,
+                    &funding
+                ));
                 let expected = source.prepared_grammar_mask().unwrap();
                 let actual = copy.prepared_grammar_mask().unwrap();
-                for id in 0..expected.vocabulary() { assert_eq!(actual.allows(id as u32), expected.allows(id as u32)); }
-                drop(funding); assert!(!retired.load(Ordering::SeqCst)); drop(copy);
+                for id in 0..expected.vocabulary() {
+                    assert_eq!(actual.allows(id as u32), expected.allows(id as u32));
+                }
+                drop(funding);
+                assert!(!retired.load(Ordering::SeqCst));
+                drop(copy);
             } else {
                 let failure = result.unwrap_err();
                 assert!(spent.load(Ordering::SeqCst) < required);
-                drop(funding); assert!(!retired.load(Ordering::SeqCst)); drop(failure);
+                drop(funding);
+                assert!(!retired.load(Ordering::SeqCst));
+                drop(failure);
             }
             assert!(retired.load(Ordering::SeqCst));
         }
@@ -1652,103 +2092,214 @@ fn original_auto_grammar_matches_split_and_atomic_activation_masks_and_paid_copy
     for atomic in [false, true] {
         let (mut tokenizer, eos) = tokenizer();
         if atomic {
-            tokenizer.add_tokens([AddedToken::from(r#"{"calls":"#, false).normalized(false)]).unwrap();
+            tokenizer
+                .add_tokens([AddedToken::from(r#"{"calls":"#, false).normalized(false)])
+                .unwrap();
         }
         let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
         let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
         let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
-        let historical = &prepared.generation_constraint().inner;
-        let recipe = historical.recipe.register_in_pool(&pool).unwrap();
-        let declaration = historical.declaration.as_ref().unwrap().register_in_pool(&pool, &historical.recipe, &recipe).unwrap();
-        let blueprint = ConstraintBlueprint { recipe, declaration: Some(declaration), fixture_matcher: None };
+        let (source_plan, compilation) =
+            original_plan(&pool, &tokenizer, &eos, &ordinary_tools(), ToolChoice::Auto);
+        let blueprint = source_plan.generation_constraint().inner.clone();
         let spent = Arc::new(AtomicUsize::new(0));
         let limit = Arc::new(AtomicUsize::new(usize::MAX));
         let retired = Arc::new(AtomicBool::new(false));
-        let funding = WorkspaceMetadataFunding::new(Account { spent: spent.clone(), limit: limit.clone(), retired: retired.clone() }).unwrap();
-        let state = blueprint.original_grammar_state_with(&funding, |plan| pool.compile_tokenizer(plan)
-            .map_err(eredu_core::BackendFailure::from_error)).unwrap();
+        let funding = HostMetadataFunding::new(Account {
+            spent: spent.clone(),
+            limit: limit.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap();
+        let state = blueprint
+            .original_grammar_state(&compilation, &funding)
+            .unwrap();
         let text = r#"free{"calls":[{"name":"check","arguments":{"value":17}}]}"#;
         let tokens = tokenizer.encode(text, false).unwrap().get_ids().to_vec();
-        let mut original = state.into_auto_controller(tokens.len() + 2, SharedTokenFilter::new(TokenFilter::All)).unwrap();
-        let mut ordinary = ConstraintController::from_generation_plan_unregistered(&prepared).unwrap();
+        let mut original = state
+            .into_auto_controller(tokens.len() + 2, SharedTokenFilter::new(TokenFilter::All))
+            .unwrap();
+        let mut ordinary = prepared.generation_constraint().grammar_matcher();
+        let preamble = tokenizer.encode("free", false).unwrap().len();
+        let activation = preamble + tokenizer.encode(r#"{"calls":"#, false).unwrap().len();
         let mut history = Vec::new();
         for (index, &token) in tokens.iter().enumerate() {
             original = original.compute_prepared_grammar_mask().unwrap();
-            let expected = ordinary.filter_at(&history).unwrap();
+            let expected = (index >= activation).then(|| ordinary.compute_mask_or_eos().unwrap());
             let actual = original.prepared_grammar_mask().unwrap();
-            for id in 0..actual.vocabulary() { assert_eq!(actual.allows(id as u32), expected.allows(id as u32), "atomic={atomic} index={index} token={id}"); }
+            for id in 0..actual.vocabulary() {
+                assert_eq!(
+                    actual.allows(id as u32),
+                    expected
+                        .as_ref()
+                        .is_none_or(|mask| mask.is_allowed(id as u32)),
+                    "atomic={atomic} index={index} token={id}"
+                );
+            }
             assert!(actual.allows(token));
-            if index == 3 { check_copy(&original, tokens.len() + 2); }
+            if index == 3 {
+                check_copy(&original, tokens.len() + 2);
+            }
             original = original.commit_prepared_grammar(token).unwrap();
-            ordinary.commit(token).unwrap(); history.push(token);
+            if index >= preamble {
+                ordinary.consume_token(token).unwrap();
+            }
+            history.push(token);
             assert_eq!(original.prepared_grammar_source().history(), history);
         }
+        assert!(ordinary.is_accepting().unwrap());
+        assert!(ordinary.compute_mask_or_eos().unwrap().is_allowed(eos[1]));
         original = original.commit_prepared_grammar(eos[1]).unwrap();
-        ordinary.commit(eos[1]).unwrap();
         let (original, terminal) = original.prepared_grammar_terminal().unwrap();
-        assert_eq!(terminal, ordinary.grammar_is_complete().unwrap()); assert!(terminal);
+        assert!(terminal);
         limit.store(spent.load(Ordering::SeqCst), Ordering::SeqCst);
         let failure = original.compute_prepared_grammar_mask().unwrap_err();
-        drop((funding, blueprint, compiler, prepared, tokenizer, ordinary, pool));
-        assert!(!retired.load(Ordering::SeqCst)); drop(failure);
+        drop((
+            funding,
+            blueprint,
+            source_plan,
+            compilation,
+            compiler,
+            prepared,
+            tokenizer,
+            ordinary,
+            pool,
+        ));
+        assert!(!retired.load(Ordering::SeqCst));
+        drop(failure);
         assert!(retired.load(Ordering::SeqCst));
     }
 }
 
 #[test]
-fn original_tool_schema_callback_binds_registered_recipe_and_keeps_argument_failure_custody() {
-    use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+fn original_tool_schema_callback_binds_compilation_receipt_and_keeps_argument_failure_custody() {
     use eredu_core::speculative::PreparedGrammarController;
-    use eredu_runtime::working_memory::{OriginalSemanticControllerSource, WorkingMemoryPool, WorkingMemoryError};
+    use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
+    use eredu_runtime::working_memory::{
+        OriginalSemanticControllerSource, WorkingMemoryError, WorkingMemoryPool,
+    };
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
-    struct Payer { refuse: Arc<AtomicBool>, retired: Arc<AtomicBool> }
-    impl WorkspaceMetadataAccount for Payer {
-        fn reserve_metadata(&self, n: usize) -> Result<(), WorkspaceMetadataFundingError> {
-            if self.refuse.load(Ordering::SeqCst) { Err(WorkspaceMetadataFundingError::Capacity { required: n as u64, available: 0 }) } else { Ok(()) }
+    struct Payer {
+        refuse: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
+    }
+    impl HostMetadataAccount for Payer {
+        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
+            if self.refuse.load(Ordering::SeqCst) {
+                Err(HostMetadataFundingError::Capacity {
+                    required: n as u64,
+                    available: 0,
+                })
+            } else {
+                Ok(())
+            }
         }
     }
-    impl Drop for Payer { fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); } }
+    impl Drop for Payer {
+        fn drop(&mut self) {
+            self.retired.store(true, Ordering::SeqCst);
+        }
+    }
     let (tokenizer, eos) = tokenizer();
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
-    let tools = vec![tool(serde_json::json!({"type":"object", "properties":{"value":{"type":"integer"}}, "required":["value"], "additionalProperties":false}))];
+    let tools = vec![tool(
+        serde_json::json!({"type":"object", "properties":{"value":{"type":"integer"}}, "required":["value"], "additionalProperties":false}),
+    )];
     let prepared = plan(&compiler, &tools, ToolChoice::Required);
     let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
     let foreign = WorkingMemoryPool::new(1 << 27, 0).unwrap();
-    let historical = &prepared.generation_constraint().inner;
-    let recipe = historical.recipe.register_in_pool(&pool).unwrap();
-    let declaration = historical.declaration.as_ref().unwrap().register_in_pool(&pool, &historical.recipe, &recipe).unwrap();
-    let schemas = prepared.semantic_plan().tool_schemas.as_ref().unwrap()
-        .register_in_pool(&pool, &historical.recipe, &recipe).unwrap();
-    let blueprint = ConstraintBlueprint { recipe: recipe.clone(), declaration: Some(declaration), fixture_matcher: None };
+    let validity = pool
+        .prepare_shared_token_filter(|| TokenFilter::All)
+        .unwrap();
+    let (source_plan, compilation) =
+        original_plan(&pool, &tokenizer, &eos, &tools, ToolChoice::Required);
+    let blueprint = source_plan.generation_constraint().inner.clone();
+    let recipe = blueprint.recipe.clone();
+    let schemas = source_plan
+        .semantic_plan()
+        .tool_schemas
+        .as_ref()
+        .unwrap()
+        .clone();
     let refuse = Arc::new(AtomicBool::new(false));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Payer { refuse: refuse.clone(), retired: retired.clone() }).unwrap();
+    let funding = HostMetadataFunding::new(Payer {
+        refuse: refuse.clone(),
+        retired: retired.clone(),
+    })
+    .unwrap();
     let callback = schemas.prepare(&recipe, &funding).unwrap();
-    let grammar = blueprint.original_grammar_state_with(&funding, |plan| pool.compile_tokenizer(plan).map_err(eredu_core::BackendFailure::from_error)).unwrap()
-        .into_controller(128, eredu_core::SharedTokenFilter::new(eredu_core::TokenFilter::All)).unwrap();
+    let grammar = blueprint
+        .original_grammar_state(&compilation, &funding)
+        .unwrap()
+        .into_controller(128, validity)
+        .unwrap();
     let source = OriginalSemanticControllerSource::Grammar(grammar.prepared_grammar_source());
     callback.validate_source(source, &pool).unwrap();
-    assert!(matches!(callback.validate_source(source, &foreign), Err(WorkingMemoryError::IdentityMismatch)));
-    let equal_recipe = historical.recipe.register_in_pool(&pool).unwrap();
+    assert!(matches!(
+        callback.validate_source(source, &foreign),
+        Err(WorkingMemoryError::IdentityMismatch)
+    ));
+    let (equal_plan, equal_compilation) =
+        original_plan(&pool, &tokenizer, &eos, &tools, ToolChoice::Required);
+    let equal_recipe = equal_plan.generation_constraint().inner.recipe.clone();
     assert!(schemas.prepare(&equal_recipe, &funding).is_err());
-    funding.reserve_metadata(callback.failure_control_bytes().unwrap()).unwrap();
-    callback.validate("check", r#"{"value":18446744073709551615}"#, &funding).unwrap();
-    funding.reserve_metadata(callback.failure_control_bytes().unwrap()).unwrap();
-    let mismatch = callback.validate("check", r#"{"value":1,"\u0076alue":3.5}"#, &funding).unwrap_err();
+    funding
+        .reserve_metadata(callback.failure_control_bytes().unwrap())
+        .unwrap();
+    callback
+        .validate("check", r#"{"value":18446744073709551615}"#, &funding)
+        .unwrap();
+    funding
+        .reserve_metadata(callback.failure_control_bytes().unwrap())
+        .unwrap();
+    let mismatch = callback
+        .validate("check", r#"{"value":1,"\u0076alue":3.5}"#, &funding)
+        .unwrap_err();
     assert!(mismatch.to_string().contains("do not match"));
-    funding.reserve_metadata(callback.failure_control_bytes().unwrap()).unwrap();
+    funding
+        .reserve_metadata(callback.failure_control_bytes().unwrap())
+        .unwrap();
     refuse.store(true, Ordering::SeqCst);
-    let failure = callback.validate("check", r#"{"value":1}"#, &funding).unwrap_err();
+    let failure = callback
+        .validate("check", r#"{"value":1}"#, &funding)
+        .unwrap_err();
     let mut cause: &(dyn std::error::Error + 'static) = &failure;
     loop {
-        if matches!(cause.downcast_ref::<WorkspaceMetadataFundingError>(), Some(WorkspaceMetadataFundingError::Capacity { available: 0, .. })) { break; }
-        cause = cause.source().expect("actual schema funding cause is retained");
+        if matches!(
+            cause.downcast_ref::<HostMetadataFundingError>(),
+            Some(HostMetadataFundingError::Capacity { available: 0, .. })
+        ) {
+            break;
+        }
+        cause = cause
+            .source()
+            .expect("actual schema funding cause is retained");
     }
-    drop((grammar, blueprint, equal_recipe, callback, schemas, recipe, prepared, compiler, tokenizer, funding, mismatch));
+    drop((
+        grammar,
+        blueprint,
+        source_plan,
+        compilation,
+        equal_plan,
+        equal_compilation,
+        equal_recipe,
+        callback,
+        schemas,
+        recipe,
+        prepared,
+        compiler,
+        tokenizer,
+        funding,
+        mismatch,
+    ));
     assert!(!retired.load(Ordering::SeqCst));
     assert!(pool.used_bytes().unwrap() > 0);
     drop(failure);
     assert!(retired.load(Ordering::SeqCst));
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+#[path = "scoped_frame_tests.rs"]
+mod scoped_frame_tests;

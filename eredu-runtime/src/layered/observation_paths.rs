@@ -53,12 +53,12 @@ impl SharedLayeredObservationPaths {
         A: LayeredArchitecture<B, S>,
     {
         let graph = architecture.execution_graph()?;
-        let mut groups = Vec::with_capacity(graph.groups().len());
-        for (group, spec) in graph.groups().iter().enumerate() {
-            let count = architecture.group_unit_count(group)?;
+        let mut groups = Vec::with_capacity(graph.group_count());
+        for group in 0..graph.group_count() {
+            let count = architecture.group_unit_count(group, None)?;
             let mut units = Vec::with_capacity(count);
             for index in 0..count {
-                let unit = architecture.unit_path(group, index)?;
+                let unit = architecture.unit_path(group, index, None)?;
                 let input = eredu_core::UnitObservation::Input.path(&unit);
                 let output = eredu_core::UnitObservation::Output.path(&unit);
                 units.push(UnitPaths {
@@ -70,19 +70,19 @@ impl SharedLayeredObservationPaths {
                 });
             }
             groups.push(GroupPaths {
-                id: spec.id().to_owned(),
+                id: graph.group_id(group).expect("source group").to_owned(),
                 units: units.into_boxed_slice(),
-                input: architecture.group_input_observation_path(group)?,
-                output: architecture.group_output_observation_path(group)?,
+                input: architecture.group_input_observation_path(group, None)?,
+                output: architecture.group_output_observation_path(group, None)?,
             });
         }
         Ok(Self(Arc::new(PathsInner {
             payload: groups.into_boxed_slice(),
             media_prefill: architecture
-                .media_prefill_observation_declarations()?
+                .media_prefill_observation_declarations(None)?
                 .into_boxed_slice(),
             prefill: architecture
-                .prefill_observation_declarations()?
+                .prefill_observation_declarations(None)?
                 .into_boxed_slice(),
             #[cfg(test)]
             retired: None,
@@ -93,14 +93,24 @@ impl SharedLayeredObservationPaths {
     fn validate<B, S, A>(
         &self,
         architecture: &A,
+        destination: &metadata::Destination<A::Error>,
     ) -> Result<(), PreparedLayeredObservationError<A::Error>>
     where
         B: NeuralBackend,
         S: RuntimeState<B>,
         A: LayeredArchitecture<B, S>,
     {
+        destination.controls::<(&Self, &A, &metadata::Destination<A::Error>, usize, usize,
+            Vec<PrefillObservationDeclaration>, String, Option<String>,
+            crate::ArchitectureExecutionGraph<'_>,
+            std::iter::Enumerate<std::slice::Iter<'_, GroupPaths>>,
+            std::iter::Enumerate<std::slice::Iter<'_, UnitPaths>>,
+            Result<Vec<PrefillObservationDeclaration>, A::Error>,
+            Result<String, A::Error>, Result<Option<String>, A::Error>,
+            Result<(), PreparedLayeredObservationError<A::Error>>)>()
+            .map_err(PreparedLayeredObservationError::Execution)?;
         if architecture
-            .prefill_observation_declarations()
+            .prefill_observation_declarations(destination.context())
             .map_err(PreparedLayeredObservationError::Execution)?
             .as_slice()
             != self.0.prefill.as_ref()
@@ -108,7 +118,7 @@ impl SharedLayeredObservationPaths {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
         if architecture
-            .media_prefill_observation_declarations()
+            .media_prefill_observation_declarations(destination.context())
             .map_err(PreparedLayeredObservationError::Execution)?
             .as_slice()
             != self.0.media_prefill.as_ref()
@@ -118,23 +128,22 @@ impl SharedLayeredObservationPaths {
         let graph = architecture
             .execution_graph()
             .map_err(PreparedLayeredObservationError::Execution)?;
-        if graph.groups().len() != self.0.payload.len() {
+        if graph.group_count() != self.0.payload.len() {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
-        for (group, (spec, retained)) in
-            graph.groups().iter().zip(self.0.payload.iter()).enumerate()
+        for (group, retained) in self.0.payload.iter().enumerate()
         {
             let count = architecture
-                .group_unit_count(group)
+                .group_unit_count(group, destination.context())
                 .map_err(PreparedLayeredObservationError::Execution)?;
-            if spec.id() != retained.id
+            if graph.group_id(group) != Some(retained.id.as_str())
                 || count != retained.units.len()
                 || architecture
-                    .group_input_observation_path(group)
+                    .group_input_observation_path(group, destination.context())
                     .map_err(PreparedLayeredObservationError::Execution)?
                     != retained.input
                 || architecture
-                    .group_output_observation_path(group)
+                    .group_output_observation_path(group, destination.context())
                     .map_err(PreparedLayeredObservationError::Execution)?
                     != retained.output
             {
@@ -142,15 +151,15 @@ impl SharedLayeredObservationPaths {
             }
             for (index, retained) in retained.units.iter().enumerate() {
                 let path = architecture
-                    .unit_path(group, index)
+                    .unit_path(group, index, destination.context())
                     .map_err(PreparedLayeredObservationError::Execution)?;
                 // Declaration temporaries belong to cold preparation. Every unit
                 // is validated, including architecture-owned internal boundaries.
                 if retained.outer == architecture.observes_unit_boundaries(group, index)
-                    || eredu_core::UnitObservation::Input.path(&path) != retained.input
-                    || eredu_core::UnitObservation::Output.path(&path) != retained.output
-                    || format!("{}.effective", retained.input) != retained.effective_input
-                    || format!("{}.effective", retained.output) != retained.effective_output
+                    || !retained.input.strip_suffix(".input").is_some_and(|unit| unit == path)
+                    || !retained.output.strip_suffix(".output").is_some_and(|unit| unit == path)
+                    || retained.effective_input.strip_suffix(".effective") != Some(retained.input.as_str())
+                    || retained.effective_output.strip_suffix(".effective") != Some(retained.output.as_str())
                 {
                     return Err(PreparedLayeredObservationError::SemanticMismatch);
                 }
@@ -275,7 +284,13 @@ fn extent<T>(count: usize) -> Option<u64> {
 /// Runtime-local generation of the shared immutable layered observation source.
 /// Initial collection and semantic rebinding belong to authorized preparation;
 /// this identity grants neither model work nor native storage permission.
-pub struct ObservationBinding(OnceLock<Arc<()>>);
+#[derive(Debug, Clone)]
+struct BindingOwner {
+    runtime: Arc<()>,
+    // The physical Arc (including any Weak aliases) retires before its payer.
+    funding: Option<eredu_core::HostMetadataFunding>,
+}
+pub struct ObservationBinding(OnceLock<BindingOwner>);
 impl ObservationBinding {
     /// Creates an empty generation without allocating an identity.
     pub const fn new() -> Self {
@@ -289,16 +304,21 @@ impl ObservationBinding {
     pub fn prepare_architecture<B, S, A>(&self, architecture: &A)
         -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
     where B: NeuralBackend, S: RuntimeState<B>, A: LayeredArchitecture<B, S> {
-        Ok(self.prepare(SharedLayeredObservationPaths::collect::<B, S, A>(architecture)
-            .map_err(PreparedLayeredObservationError::Execution)?))
+        self.prepare(SharedLayeredObservationPaths::collect::<B, S, A>(architecture)
+            .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None))
+            .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Validate declarations and bind an existing source at a cold boundary.
-    pub fn bind_architecture<B, S, A>(&self, architecture: &A, source: &SharedLayeredObservationPaths)
+    pub fn bind_architecture<B, S, A>(&self, architecture: &A, source: &SharedLayeredObservationPaths, metadata: Option<LayeredMetadata<A::Error>>)
         -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
     where B: NeuralBackend, S: RuntimeState<B>, A: LayeredArchitecture<B, S> {
-        source.validate::<B, S, A>(architecture)?;
-        Ok(self.prepare(source.clone()))
+        let destination = metadata::Destination(metadata);
+        destination.controls::<(&Self, &A, &SharedLayeredObservationPaths,
+            metadata::Destination<A::Error>, Result<PreparedLayeredObservationPaths,
+            PreparedLayeredObservationError<A::Error>>)>().map_err(PreparedLayeredObservationError::Execution)?;
+        source.validate::<B, S, A>(architecture, &destination)?;
+        self.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Check this exact generation without rebuilding declarations or allocating.
@@ -307,11 +327,21 @@ impl ObservationBinding {
         self.validate(paths)
     }
 
-    fn prepare(&self, source: SharedLayeredObservationPaths) -> PreparedLayeredObservationPaths {
-        PreparedLayeredObservationPaths {
-            source,
-            runtime: self.0.get_or_init(|| Arc::new(())).clone(),
+    fn prepare<E>(&self, source: SharedLayeredObservationPaths, destination: &metadata::Destination<E>)
+        -> Result<PreparedLayeredObservationPaths, E> {
+        destination.controls::<(&Self, SharedLayeredObservationPaths, &metadata::Destination<E>,
+            BindingOwner, PreparedLayeredObservationPaths, Result<BindingOwner, BindingOwner>,
+            Result<PreparedLayeredObservationPaths, E>)>()?;
+        if self.0.get().is_none() {
+            let runtime = match destination.context() {
+                Some(context) => context.metadata_arc(()).map_err(|cause| destination.map(cause.into()))?,
+                None => Arc::new(()),
+            };
+            let funding = destination.context().and_then(eredu_nn::workspace::WorkspaceContext::metadata_funding);
+            // A racing producer drops its own paid shell, preserving the first identity.
+            let _ = self.0.set(BindingOwner { runtime, funding });
         }
+        Ok(PreparedLayeredObservationPaths { source, runtime: self.0.get().expect("initialized binding").clone() })
     }
     fn validate<E>(
         &self,
@@ -320,7 +350,7 @@ impl ObservationBinding {
         if !self
             .0
             .get()
-            .is_some_and(|runtime| Arc::ptr_eq(runtime, &paths.runtime))
+            .is_some_and(|runtime| Arc::ptr_eq(&runtime.runtime, &paths.runtime.runtime))
         {
             return Err(PreparedLayeredObservationError::BindingMismatch);
         }
@@ -346,7 +376,7 @@ impl Default for ObservationBinding {
 #[derive(Debug)]
 pub struct PreparedLayeredObservationPaths {
     source: SharedLayeredObservationPaths,
-    runtime: Arc<()>,
+    runtime: BindingOwner,
 }
 /// Non-Clone fingerprint of one already prepared runtime generation.
 /// It grants no traversal, rebinding, submission or current-state authority.
@@ -355,11 +385,12 @@ pub struct PreparedLayeredObservationPaths {
 #[derive(Debug)]
 pub struct PreparedObservationBindingIdentity {
     runtime: Weak<()>,
+    funding: Option<eredu_core::HostMetadataFunding>,
 }
 impl PreparedObservationBindingIdentity {
     /// Compare with an actual token without upgrading or allocating.
     pub fn matches(&self, current: &PreparedLayeredObservationPaths) -> bool {
-        self.runtime.strong_count() != 0 && self.runtime.as_ptr() == Arc::as_ptr(&current.runtime)
+        self.runtime.strong_count() != 0 && self.runtime.as_ptr() == Arc::as_ptr(&current.runtime.runtime)
     }
 
     /// Retained Arc control block plus fingerprint construction/move overlap.
@@ -376,7 +407,8 @@ impl PreparedLayeredObservationPaths {
     /// Retain only the identity of this existing generation, not its authority.
     pub fn binding_identity(&self) -> PreparedObservationBindingIdentity {
         PreparedObservationBindingIdentity {
-            runtime: Arc::downgrade(&self.runtime),
+            runtime: Arc::downgrade(&self.runtime.runtime),
+            funding: self.runtime.funding.clone(),
         }
     }
 
@@ -524,18 +556,22 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
-    fn validate_observation_shape(&self) -> Result<(), PreparedLayeredObservationError<A::Error>> {
+    fn validate_observation_shape(&self, destination: &metadata::Destination<A::Error>) -> Result<(), PreparedLayeredObservationError<A::Error>> {
+        destination.controls::<(&Self, &metadata::Destination<A::Error>, usize,
+            crate::ArchitectureExecutionGraph<'_>, Result<usize, A::Error>,
+            Result<(), PreparedLayeredObservationError<A::Error>>)>()
+            .map_err(PreparedLayeredObservationError::Execution)?;
         let graph = self
             .architecture
             .execution_graph()
             .map_err(PreparedLayeredObservationError::Execution)?;
-        if graph != *self.graph || graph.groups().len() != self.units.len() {
+        if !graph.matches(&self.graph) || graph.group_count() != self.units.len() {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
         for (group, units) in self.units.iter().enumerate() {
             if self
                 .architecture
-                .group_unit_count(group)
+                .group_unit_count(group, destination.context())
                 .map_err(PreparedLayeredObservationError::Execution)?
                 != units.len()
             {
@@ -549,11 +585,11 @@ where
     pub fn prepare_observation_paths(
         &self,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
-        self.validate_observation_shape()?;
-        Ok(self.observation_binding.prepare(
+        self.validate_observation_shape(&metadata::Destination(None))?;
+        self.observation_binding.prepare(
             SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
-                .map_err(PreparedLayeredObservationError::Execution)?,
-        ))
+                .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None),
+        ).map_err(PreparedLayeredObservationError::Execution)
     }
     /// Coldly validates actual semantic declarations and binds the same retained
     /// payload to this runtime, e.g. for a metadata equation projection. Temporary
@@ -561,10 +597,15 @@ where
     pub fn bind_observation_paths(
         &self,
         source: &SharedLayeredObservationPaths,
+        metadata: Option<LayeredMetadata<A::Error>>,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
-        self.validate_observation_shape()?;
-        source.validate::<B, S, A>(&self.architecture)?;
-        Ok(self.observation_binding.prepare(source.clone()))
+        let destination = metadata::Destination(metadata);
+        destination.controls::<(&Self, &SharedLayeredObservationPaths, metadata::Destination<A::Error>,
+            Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>)>()
+            .map_err(PreparedLayeredObservationError::Execution)?;
+        self.validate_observation_shape(&destination)?;
+        source.validate::<B, S, A>(&self.architecture, &destination)?;
+        self.observation_binding.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
     }
     /// Checks only the existing private runtime token, without allocating,
     /// reconstructing declarations, evaluating tensors or granting execution.
@@ -662,21 +703,26 @@ where
         if self.geometry_stale {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
-        Ok(self.observation_binding.prepare(
+        self.observation_binding.prepare(
             SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
-                .map_err(PreparedLayeredObservationError::Execution)?,
-        ))
+                .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None),
+        ).map_err(PreparedLayeredObservationError::Execution)
     }
     /// Reuses the exact retained source after cold semantic declaration checks.
     pub fn bind_observation_paths(
         &self,
         source: &SharedLayeredObservationPaths,
+        metadata: Option<LayeredMetadata<A::Error>>,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
+        let destination = metadata::Destination(metadata);
+        destination.controls::<(&Self, &SharedLayeredObservationPaths, metadata::Destination<A::Error>,
+            Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>)>()
+            .map_err(PreparedLayeredObservationError::Execution)?;
         if self.geometry_stale {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
-        source.validate::<B, S, A>(&self.architecture)?;
-        Ok(self.observation_binding.prepare(source.clone()))
+        source.validate::<B, S, A>(&self.architecture, &destination)?;
+        self.observation_binding.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
     }
     /// Checks only the existing private runtime token, without allocating,
     /// reconstructing declarations, evaluating tensors or granting execution.

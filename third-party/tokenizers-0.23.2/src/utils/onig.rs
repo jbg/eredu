@@ -4,13 +4,15 @@ use onig::Regex;
 use std::error::Error;
 
 #[derive(Debug)]
-pub struct SysRegex {
+pub(super) struct GeneralRegex {
     regex: Regex,
+    pattern: String,
 }
 
-impl SysRegex {
-    pub fn find_iter<'r, 't>(&'r self, inside: &'t str) -> onig::FindMatches<'r, 't> {
-        self.regex.find_iter(inside)
+impl GeneralRegex {
+    pub(super) fn pattern(&self) -> &str { &self.pattern }
+    pub fn find_iter<'a>(&'a self, inside: &'a str) -> impl Iterator<Item = Result<Offsets>> + 'a {
+        self.regex.find_iter(inside).map(Ok)
     }
 
     pub fn new(
@@ -18,6 +20,7 @@ impl SysRegex {
     ) -> std::result::Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         Ok(Self {
             regex: Regex::new(regex_str)?,
+            pattern: regex_str.to_owned(),
         })
     }
 }

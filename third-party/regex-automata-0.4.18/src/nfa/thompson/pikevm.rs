@@ -8,6 +8,7 @@ resolving all spans of capturing groups that participate in a match.
 #[cfg(feature = "internal-instrument-pikevm")]
 use core::cell::RefCell;
 
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 use alloc::{vec, vec::Vec};
 
 use crate::{
@@ -17,9 +18,7 @@ use crate::{
         empty, iter,
         prefilter::Prefilter,
         primitives::{NonMaxUsize, PatternID, SmallIndex, StateID},
-        search::{
-            Anchored, HalfMatch, Input, Match, MatchKind, PatternSet, Span,
-        },
+        search::{Anchored, HalfMatch, Input, Match, MatchError, MatchKind, PatternSet, Span},
         sparse_set::SparseSet,
     },
 };
@@ -265,11 +264,20 @@ impl Builder {
 
     /// Build a `PikeVM` from the given patterns.
     #[cfg(feature = "syntax")]
-    pub fn build_many<P: AsRef<str>>(
+    pub fn build_many<P: AsRef<str>>(&self, patterns: &[P]) -> Result<PikeVM, BuildError> {
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Compile the original source with prospective admission.
+    #[cfg(feature = "syntax")]
+    pub fn build_many_with_allocations<P: AsRef<str>>(
         &self,
         patterns: &[P],
+        funding: &dyn Allocation,
     ) -> Result<PikeVM, BuildError> {
-        let nfa = self.thompson.build_many(patterns)?;
+        let nfa = self
+            .thompson
+            .build_many_with_allocations(patterns, funding)?;
         self.build_from_nfa(nfa)
     }
 
@@ -280,7 +288,10 @@ impl Builder {
     /// given here is already built.
     pub fn build_from_nfa(&self, nfa: NFA) -> Result<PikeVM, BuildError> {
         nfa.look_set_any().available().map_err(BuildError::word)?;
-        Ok(PikeVM { config: self.config.clone(), nfa })
+        Ok(PikeVM {
+            config: self.config.clone(),
+            nfa,
+        })
     }
 
     /// Apply the given `PikeVM` configuration options to this builder.
@@ -298,10 +309,7 @@ impl Builder {
     /// These settings only apply when constructing a PikeVM directly from a
     /// pattern.
     #[cfg(feature = "syntax")]
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Builder {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Builder {
         self.thompson.syntax(config);
         self
     }
@@ -392,11 +400,6 @@ pub struct PikeVM {
 }
 
 impl PikeVM {
-    // Called only after the closed source plan validates look availability.
-    pub(crate) fn from_source_nfa(nfa: NFA) -> PikeVM {
-        PikeVM { config: Config::default(), nfa }
-    }
-
     /// Parse the given regular expression using the default configuration and
     /// return the corresponding `PikeVM`.
     ///
@@ -443,9 +446,7 @@ impl PikeVM {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[cfg(feature = "syntax")]
-    pub fn new_many<P: AsRef<str>>(
-        patterns: &[P],
-    ) -> Result<PikeVM, BuildError> {
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<PikeVM, BuildError> {
         PikeVM::builder().build_many(patterns)
     }
 
@@ -771,13 +772,21 @@ impl PikeVM {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn is_match<'h, I: Into<Input<'h>>>(
+    pub fn is_match<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> bool {
+        self.is_match_with_allocations(cache, input, &Unenforced)
+            .expect("ordinary Pike match allocation")
+    }
+
+    /// Test for a match through the same prospectively admitted search.
+    pub fn is_match_with_allocations<'h, I: Into<Input<'h>>>(
         &self,
         cache: &mut Cache,
         input: I,
-    ) -> bool {
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
         let input = input.into().earliest(true);
-        self.search_slots(cache, &input, &mut []).is_some()
+        self.search_slots_with_allocations(cache, &input, &mut [], funding)
+            .map(|pid| pid.is_some())
     }
 
     /// Executes a leftmost forward search and returns a `Match` if one exists.
@@ -819,26 +828,52 @@ impl PikeVM {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn find<'h, I: Into<Input<'h>>>(
+    pub fn find<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> Option<Match> {
+        self.find_with_allocations(cache, input, &Unenforced)
+            .expect("ordinary Pike find allocation")
+    }
+
+    /// Find the same match with prospectively admitted temporary slots.
+    pub fn find_with_allocations<'h, I: Into<Input<'h>>>(
         &self,
         cache: &mut Cache,
         input: I,
-    ) -> Option<Match> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
         let input = input.into();
-        if self.get_nfa().pattern_len() == 1 {
-            let mut slots = [None, None];
-            let pid = self.search_slots(cache, &input, &mut slots)?;
-            let start = slots[0]?.get();
-            let end = slots[1]?.get();
-            return Some(Match::new(pid, Span { start, end }));
-        }
-        let ginfo = self.get_nfa().group_info();
-        let slots_len = ginfo.implicit_slot_len();
-        let mut slots = vec![None; slots_len];
-        let pid = self.search_slots(cache, &input, &mut slots)?;
-        let start = slots[pid.as_usize() * 2]?.get();
-        let end = slots[pid.as_usize() * 2 + 1]?.get();
-        Some(Match::new(pid, Span { start, end }))
+        let allocation = Allocator::new(funding);
+        allocation.reserve(
+            core::mem::size_of::<Vec<Option<NonMaxUsize>>>()
+                + core::mem::size_of::<[Option<NonMaxUsize>; 2]>(),
+        )?;
+        let mut pair = [None, None];
+        let mut temporary = Vec::new();
+        let slots = if self.get_nfa().pattern_len() == 1 {
+            &mut pair[..]
+        } else {
+            allocation.resize_copy(
+                &mut temporary,
+                self.get_nfa().group_info().implicit_slot_len(),
+                None,
+            )?;
+            &mut temporary
+        };
+        let Some(pid) = self.search_slots_with_allocations(cache, &input, slots, funding)? else {
+            return Ok(None);
+        };
+        let Some(start) = slots[pid.as_usize() * 2] else {
+            return Ok(None);
+        };
+        let Some(end) = slots[pid.as_usize() * 2 + 1] else {
+            return Ok(None);
+        };
+        Ok(Some(Match::new(
+            pid,
+            Span {
+                start: start.get(),
+                end: end.get(),
+            },
+        )))
     }
 
     /// Executes a leftmost forward search and writes the spans of capturing
@@ -900,7 +935,12 @@ impl PikeVM {
     ) -> FindMatches<'r, 'c, 'h> {
         let caps = Captures::matches(self.get_nfa().group_info().clone());
         let it = iter::Searcher::new(input.into());
-        FindMatches { re: self, cache, caps, it }
+        FindMatches {
+            re: self,
+            cache,
+            caps,
+            it,
+        }
     }
 
     /// Returns an iterator over all non-overlapping `Captures` values. If no
@@ -943,7 +983,12 @@ impl PikeVM {
     ) -> CapturesMatches<'r, 'c, 'h> {
         let caps = self.create_captures();
         let it = iter::Searcher::new(input.into());
-        CapturesMatches { re: self, cache, caps, it }
+        CapturesMatches {
+            re: self,
+            cache,
+            caps,
+            it,
+        }
     }
 }
 
@@ -1024,15 +1069,23 @@ impl PikeVM {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn search(
+    pub fn search(&self, cache: &mut Cache, input: &Input<'_>, caps: &mut Captures) {
+        self.search_with_allocations(cache, input, caps, &Unenforced)
+            .expect("ordinary Pike capture allocation")
+    }
+
+    /// Capture through the same fallible search; refusal never reports a match.
+    pub fn search_with_allocations(
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
         caps: &mut Captures,
-    ) {
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         caps.set_pattern(None);
-        let pid = self.search_slots(cache, input, caps.slots_mut());
+        let pid = self.search_slots_with_allocations(cache, input, caps.slots_mut(), funding)?;
         caps.set_pattern(pid);
+        Ok(())
     }
 
     /// Executes a leftmost forward search and writes the spans of capturing
@@ -1101,41 +1154,58 @@ impl PikeVM {
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
     ) -> Option<PatternID> {
+        self.search_slots_with_allocations(cache, input, slots, &Unenforced)
+            .expect("ordinary Pike search allocation")
+    }
+
+    /// Run the original search with admission before adaptive storage growth.
+    /// The caller retains the actual authority through cache/error retirement.
+    pub fn search_slots_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        slots: &mut [Option<NonMaxUsize>],
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        let allocation = Allocator::new(funding);
+        allocation.reserve(Self::search_control_bytes())?;
+        self.search_slots_allocated(cache, input, slots, allocation)
+    }
+
+    fn search_control_bytes() -> usize {
+        core::mem::size_of::<FollowEpsilon>()
+            + core::mem::size_of::<Vec<Option<NonMaxUsize>>>()
+            + core::mem::size_of::<[Option<NonMaxUsize>; 2]>()
+            + core::mem::size_of::<Input<'_>>()
+            + core::mem::size_of::<Option<HalfMatch>>()
+            + core::mem::size_of::<Result<Option<PatternID>, MatchError>>()
+    }
+
+    fn search_slots_allocated(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        slots: &mut [Option<NonMaxUsize>],
+        allocation: Allocator<'_>,
+    ) -> Result<Option<PatternID>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        if !utf8empty {
-            let hm = self.search_slots_imp(cache, input, slots)?;
-            return Some(hm.pattern());
-        }
-        // There is an unfortunate special case where if the regex can
-        // match the empty string and UTF-8 mode is enabled, the search
-        // implementation requires that the slots have at least as much space
-        // to report the bounds of any match. This is so zero-width matches
-        // that split a codepoint can be filtered out.
-        //
-        // Note that if utf8empty is true, we specialize the case for when
-        // the number of patterns is 1. In that case, we can just use a stack
-        // allocation. Otherwise we resort to a heap allocation, which we
-        // convince ourselves we're fine with due to the pathological nature of
-        // this case.
         let min = self.get_nfa().group_info().implicit_slot_len();
-        if slots.len() >= min {
-            let hm = self.search_slots_imp(cache, input, slots)?;
-            return Some(hm.pattern());
+        if !utf8empty || slots.len() >= min {
+            return Ok(self
+                .search_slots_imp(cache, input, slots, allocation)?
+                .map(|hm| hm.pattern()));
         }
         if self.get_nfa().pattern_len() == 1 {
             let mut enough = [None, None];
-            let got = self.search_slots_imp(cache, input, &mut enough);
-            // This is OK because we know `enough` is strictly bigger than
-            // `slots`, otherwise this special case isn't reached.
+            let got = self.search_slots_imp(cache, input, &mut enough, allocation)?;
             slots.copy_from_slice(&enough[..slots.len()]);
-            return got.map(|hm| hm.pattern());
+            return Ok(got.map(|hm| hm.pattern()));
         }
-        let mut enough = vec![None; min];
-        let got = self.search_slots_imp(cache, input, &mut enough);
-        // This is OK because we know `enough` is strictly bigger than `slots`,
-        // otherwise this special case isn't reached.
+        let mut enough = Vec::new();
+        allocation.resize_copy(&mut enough, min, None)?;
+        let got = self.search_slots_imp(cache, input, &mut enough, allocation)?;
         slots.copy_from_slice(&enough[..slots.len()]);
-        got.map(|hm| hm.pattern())
+        Ok(got.map(|hm| hm.pattern()))
     }
 
     /// This is the actual implementation of `search_slots_imp` that
@@ -1148,20 +1218,19 @@ impl PikeVM {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<HalfMatch> {
+        allocation: Allocator<'_>,
+    ) -> Result<Option<HalfMatch>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        let hm = match self.search_imp(cache, input, slots) {
-            None => return None,
-            Some(hm) if !utf8empty => return Some(hm),
+        let hm = match self.search_imp(cache, input, slots, allocation)? {
+            None => return Ok(None),
+            Some(hm) if !utf8empty => return Ok(Some(hm)),
             Some(hm) => hm,
         };
         empty::skip_splits_fwd(input, hm, hm.offset(), |input| {
             Ok(self
-                .search_imp(cache, input, slots)
+                .search_imp(cache, input, slots, allocation)?
                 .map(|hm| (hm, hm.offset())))
         })
-        // OK because the PikeVM never errors.
-        .unwrap()
     }
 
     /// Writes the set of patterns that match anywhere in the given search
@@ -1218,7 +1287,21 @@ impl PikeVM {
         input: &Input<'_>,
         patset: &mut PatternSet,
     ) {
-        self.which_overlapping_imp(cache, input, patset)
+        self.which_overlapping_matches_with_allocations(cache, input, patset, &Unenforced)
+            .expect("ordinary Pike overlapping allocation")
+    }
+
+    /// Run the original overlapping search with prospective adaptive growth.
+    pub fn which_overlapping_matches_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        patset: &mut PatternSet,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        let allocation = Allocator::new(funding);
+        allocation.reserve(Self::search_control_bytes())?;
+        self.which_overlapping_imp(cache, input, patset, allocation)
     }
 }
 
@@ -1233,10 +1316,16 @@ impl PikeVM {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<HalfMatch> {
+        allocation: Allocator<'_>,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        // A caller may reuse a slot buffer larger than this NFA's group table.
+        // Only this source's slots have state rows; the unrelated tail must not
+        // increase the per-state stride or spill into the next state's row.
+        let used = slots.len().min(self.get_nfa().group_info().slot_len());
+        let slots = &mut slots[..used];
         cache.setup_search(slots.len());
         if input.is_done() {
-            return None;
+            return Ok(None);
         }
         // Why do we even care about this? Well, in our 'Captures'
         // representation, we use usize::MAX as a sentinel to indicate "no
@@ -1252,16 +1341,22 @@ impl PikeVM {
 
         // Whether we want to visit all match states instead of emulating the
         // 'leftmost' semantics of typical backtracking regex engines.
-        let allmatches =
-            self.config.get_match_kind().continue_past_first_match();
+        let allmatches = self.config.get_match_kind().continue_past_first_match();
         let (anchored, start_id) = match self.start_config(input) {
-            None => return None,
+            None => return Ok(None),
             Some(config) => config,
         };
 
-        let pre =
-            if anchored { None } else { self.get_config().get_prefilter() };
-        let Cache { ref mut stack, ref mut curr, ref mut next } = cache;
+        let pre = if anchored {
+            None
+        } else {
+            self.get_config().get_prefilter()
+        };
+        let Cache {
+            ref mut stack,
+            ref mut curr,
+            ref mut next,
+        } = cache;
         let mut hm = None;
         // Yes, our search doesn't end at input.end(), but includes it. This
         // is necessary because matches are delayed by one byte, just like
@@ -1351,9 +1446,7 @@ impl PikeVM {
             // search. If we re-computed it at every position, we would be
             // simulating an unanchored search when we were tasked to perform
             // an anchored search.
-            if (hm.is_none() || allmatches)
-                && (!anchored || at == input.start())
-            {
+            if (hm.is_none() || allmatches) && (!anchored || at == input.start()) {
                 // Since we are adding to the 'curr' active states and since
                 // this is for the start ID, we use a slots slice that is
                 // guaranteed to have the right length but where every element
@@ -1368,10 +1461,9 @@ impl PikeVM {
                 // transitions, and thus must be able to write offsets to the
                 // slots given which are later copied to slot values in 'curr'.
                 let slots = next.slot_table.all_absent();
-                self.epsilon_closure(stack, slots, curr, input, at, start_id);
+                self.epsilon_closure(stack, slots, curr, input, at, start_id, allocation)?;
             }
-            if let Some(pid) = self.nexts(stack, curr, next, input, at, slots)
-            {
+            if let Some(pid) = self.nexts(stack, curr, next, input, at, slots, allocation)? {
                 hm = Some(HalfMatch::new(pid, at));
             }
             // Unless the caller asked us to return early, we need to mush on
@@ -1386,7 +1478,7 @@ impl PikeVM {
             at += 1;
         }
         instrument!(|c| c.eprint(&self.nfa));
-        hm
+        Ok(hm)
     }
 
     /// The implementation for the 'which_overlapping_matches' API. Basically,
@@ -1401,7 +1493,8 @@ impl PikeVM {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), MatchError> {
         // NOTE: This is effectively a copy of 'search_imp' above, but with no
         // captures support and instead writes patterns that matched directly
         // to 'patset'. See that routine for better commentary about what's
@@ -1417,7 +1510,7 @@ impl PikeVM {
 
         cache.setup_search(0);
         if input.is_done() {
-            return;
+            return Ok(());
         }
         assert!(
             input.haystack().len() < core::usize::MAX,
@@ -1425,14 +1518,17 @@ impl PikeVM {
         );
         instrument!(|c| c.reset(&self.nfa));
 
-        let allmatches =
-            self.config.get_match_kind().continue_past_first_match();
+        let allmatches = self.config.get_match_kind().continue_past_first_match();
         let (anchored, start_id) = match self.start_config(input) {
-            None => return,
+            None => return Ok(()),
             Some(config) => config,
         };
 
-        let Cache { ref mut stack, ref mut curr, ref mut next } = cache;
+        let Cache {
+            ref mut stack,
+            ref mut curr,
+            ref mut next,
+        } = cache;
         for at in input.start()..=input.end() {
             let any_matches = !patset.is_empty();
             if curr.set.is_empty() {
@@ -1445,9 +1541,9 @@ impl PikeVM {
             }
             if !any_matches || allmatches {
                 let slots = &mut [];
-                self.epsilon_closure(stack, slots, curr, input, at, start_id);
+                self.epsilon_closure(stack, slots, curr, input, at, start_id, allocation)?;
             }
-            self.nexts_overlapping(stack, curr, next, input, at, patset);
+            self.nexts_overlapping(stack, curr, next, input, at, patset, allocation)?;
             // If we found a match and filled our set, then there is no more
             // additional info that we can provide. Thus, we can quit. We also
             // quit if the caller asked us to stop at the earliest point that
@@ -1459,6 +1555,7 @@ impl PikeVM {
             next.set.clear();
         }
         instrument!(|c| c.eprint(&self.nfa));
+        Ok(())
     }
 
     /// Process the active states in 'curr' to find the states (written to
@@ -1479,12 +1576,16 @@ impl PikeVM {
         input: &Input<'_>,
         at: usize,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
+        allocation: Allocator<'_>,
+    ) -> Result<Option<PatternID>, MatchError> {
         instrument!(|c| c.record_state_set(&curr.set));
         let mut pid = None;
-        let ActiveStates { ref set, ref mut slot_table } = *curr;
+        let ActiveStates {
+            ref set,
+            ref mut slot_table,
+        } = *curr;
         for sid in set.iter() {
-            pid = match self.next(stack, slot_table, next, input, at, sid) {
+            pid = match self.next(stack, slot_table, next, input, at, sid, allocation)? {
                 None => continue,
                 Some(pid) => Some(pid),
             };
@@ -1493,7 +1594,7 @@ impl PikeVM {
                 break;
             }
         }
-        pid
+        Ok(pid)
     }
 
     /// Like 'nexts', but for the overlapping case. This doesn't write any
@@ -1507,13 +1608,16 @@ impl PikeVM {
         input: &Input<'_>,
         at: usize,
         patset: &mut PatternSet,
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), MatchError> {
         instrument!(|c| c.record_state_set(&curr.set));
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        let ActiveStates { ref set, ref mut slot_table } = *curr;
+        let ActiveStates {
+            ref set,
+            ref mut slot_table,
+        } = *curr;
         for sid in set.iter() {
-            let pid = match self.next(stack, slot_table, next, input, at, sid)
-            {
+            let pid = match self.next(stack, slot_table, next, input, at, sid, allocation)? {
                 None => continue,
                 Some(pid) => pid,
             };
@@ -1532,6 +1636,7 @@ impl PikeVM {
                 break;
             }
         }
+        Ok(())
     }
 
     /// Starting from 'sid', if the position 'at' in the 'input' haystack has a
@@ -1553,9 +1658,10 @@ impl PikeVM {
         input: &Input<'_>,
         at: usize,
         sid: StateID,
-    ) -> Option<PatternID> {
+        allocation: Allocator<'_>,
+    ) -> Result<Option<PatternID>, MatchError> {
         instrument!(|c| c.record_step(sid));
-        match *self.nfa.state(sid) {
+        Ok(match *self.nfa.state(sid) {
             State::Fail
             | State::Look { .. }
             | State::Union { .. }
@@ -1567,9 +1673,7 @@ impl PikeVM {
                     // OK because 'at <= haystack.len() < usize::MAX', so
                     // adding 1 will never wrap.
                     let at = at.wrapping_add(1);
-                    self.epsilon_closure(
-                        stack, slots, next, input, at, trans.next,
-                    );
+                    self.epsilon_closure(stack, slots, next, input, at, trans.next, allocation)?;
                 }
                 None
             }
@@ -1579,9 +1683,7 @@ impl PikeVM {
                     // OK because 'at <= haystack.len() < usize::MAX', so
                     // adding 1 will never wrap.
                     let at = at.wrapping_add(1);
-                    self.epsilon_closure(
-                        stack, slots, next, input, at, next_sid,
-                    );
+                    self.epsilon_closure(stack, slots, next, input, at, next_sid, allocation)?;
                 }
                 None
             }
@@ -1591,14 +1693,12 @@ impl PikeVM {
                     // OK because 'at <= haystack.len() < usize::MAX', so
                     // adding 1 will never wrap.
                     let at = at.wrapping_add(1);
-                    self.epsilon_closure(
-                        stack, slots, next, input, at, next_sid,
-                    );
+                    self.epsilon_closure(stack, slots, next, input, at, next_sid, allocation)?;
                 }
                 None
             }
             State::Match { pattern_id } => Some(pattern_id),
-        }
+        })
     }
 
     /// Compute the epsilon closure of 'sid', writing the closure into 'next'
@@ -1623,24 +1723,33 @@ impl PikeVM {
         input: &Input<'_>,
         at: usize,
         sid: StateID,
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), MatchError> {
         instrument!(|c| {
             c.record_closure(sid);
             c.record_stack_push(sid);
         });
-        stack.push(FollowEpsilon::Explore(sid));
+        allocation.push(stack, FollowEpsilon::Explore(sid))?;
         while let Some(frame) = stack.pop() {
             match frame {
                 FollowEpsilon::RestoreCapture { slot, offset: pos } => {
                     curr_slots[slot] = pos;
                 }
                 FollowEpsilon::Explore(sid) => {
-                    self.epsilon_closure_explore(
-                        stack, curr_slots, next, input, at, sid,
-                    );
+                    if let Err(error) = self.epsilon_closure_explore(
+                        stack, curr_slots, next, input, at, sid, allocation,
+                    ) {
+                        while let Some(frame) = stack.pop() {
+                            if let FollowEpsilon::RestoreCapture { slot, offset } = frame {
+                                curr_slots[slot] = offset;
+                            }
+                        }
+                        return Err(error);
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// Explore all of the epsilon transitions out of 'sid'. This is mostly
@@ -1676,7 +1785,8 @@ impl PikeVM {
         input: &Input<'_>,
         at: usize,
         mut sid: StateID,
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), MatchError> {
         // We can avoid pushing some state IDs on to our stack in precisely
         // the cases where a 'push(x)' would be immediately followed by a 'x
         // = pop()'. This is achieved by this outer-loop. We simply set 'sid'
@@ -1688,7 +1798,7 @@ impl PikeVM {
             // Record this state as part of our next set of active states. If
             // we've already explored it, then no need to do it again.
             if !next.set.insert(sid) {
-                return;
+                return Ok(());
             }
             match *self.nfa.state(sid) {
                 State::Fail
@@ -1697,24 +1807,24 @@ impl PikeVM {
                 | State::Sparse { .. }
                 | State::Dense { .. } => {
                     next.slot_table.for_state(sid).copy_from_slice(curr_slots);
-                    return;
+                    return Ok(());
                 }
                 State::Look { look, next } => {
                     // OK because we don't permit building a searcher with a
                     // Unicode word boundary if the requisite Unicode data is
                     // unavailable.
-                    if !self.nfa.look_matcher().matches_inline(
-                        look,
-                        input.haystack(),
-                        at,
-                    ) {
-                        return;
+                    if !self
+                        .nfa
+                        .look_matcher()
+                        .matches_inline(look, input.haystack(), at)
+                    {
+                        return Ok(());
                     }
                     sid = next;
                 }
                 State::Union { ref alternates } => {
                     sid = match alternates.get(0) {
-                        None => return,
+                        None => return Ok(()),
                         Some(&sid) => sid,
                     };
                     instrument!(|c| {
@@ -1722,6 +1832,7 @@ impl PikeVM {
                             c.record_stack_push(alt);
                         }
                     });
+                    allocation.grow(stack, alternates.len() - 1)?;
                     stack.extend(
                         alternates[1..]
                             .iter()
@@ -1733,7 +1844,7 @@ impl PikeVM {
                 State::BinaryUnion { alt1, alt2 } => {
                     sid = alt1;
                     instrument!(|c| c.record_stack_push(sid));
-                    stack.push(FollowEpsilon::Explore(alt2));
+                    allocation.push(stack, FollowEpsilon::Explore(alt2))?;
                 }
                 State::Capture { next, slot, .. } => {
                     // There's no need to do anything with slots that
@@ -1742,10 +1853,13 @@ impl PikeVM {
                     // all.
                     if slot.as_usize() < curr_slots.len() {
                         instrument!(|c| c.record_stack_push(sid));
-                        stack.push(FollowEpsilon::RestoreCapture {
-                            slot,
-                            offset: curr_slots[slot],
-                        });
+                        allocation.push(
+                            stack,
+                            FollowEpsilon::RestoreCapture {
+                                slot,
+                                offset: curr_slots[slot],
+                            },
+                        )?;
                         // OK because length of a slice must fit into an isize.
                         curr_slots[slot] = Some(NonMaxUsize::new(at).unwrap());
                     }
@@ -1784,9 +1898,7 @@ impl PikeVM {
                 self.nfa.start_anchored(),
             )),
             Anchored::Yes => Some((true, self.nfa.start_anchored())),
-            Anchored::Pattern(pid) => {
-                Some((true, self.nfa.start_pattern(pid)?))
-            }
+            Anchored::Pattern(pid) => Some((true, self.nfa.start_pattern(pid)?)),
         }
     }
 }
@@ -1816,8 +1928,12 @@ impl<'r, 'c, 'h> Iterator for FindMatches<'r, 'c, 'h> {
     #[inline]
     fn next(&mut self) -> Option<Match> {
         // Splitting 'self' apart seems necessary to appease borrowck.
-        let FindMatches { re, ref mut cache, ref mut caps, ref mut it } =
-            *self;
+        let FindMatches {
+            re,
+            ref mut cache,
+            ref mut caps,
+            ref mut it,
+        } = *self;
         // 'advance' converts errors into panics, which is OK here because
         // the PikeVM can never return an error.
         it.advance(|input| {
@@ -1854,8 +1970,12 @@ impl<'r, 'c, 'h> Iterator for CapturesMatches<'r, 'c, 'h> {
     #[inline]
     fn next(&mut self) -> Option<Captures> {
         // Splitting 'self' apart seems necessary to appease borrowck.
-        let CapturesMatches { re, ref mut cache, ref mut caps, ref mut it } =
-            *self;
+        let CapturesMatches {
+            re,
+            ref mut cache,
+            ref mut caps,
+            ref mut it,
+        } = *self;
         // 'advance' converts errors into panics, which is OK here because
         // the PikeVM can never return an error.
         it.advance(|input| {
@@ -1905,10 +2025,25 @@ impl Cache {
     /// If you want to reuse the returned `Cache` with some other `PikeVM`,
     /// then you must call [`Cache::reset`] with the desired `PikeVM`.
     pub fn new(re: &PikeVM) -> Cache {
+        Self::new_with_allocations(re, &Unenforced).expect("ordinary Pike cache allocation")
+    }
+
+    /// Construct the original cache with admission before each destination.
+    pub fn new_with_allocations(
+        re: &PikeVM,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, AllocationError> {
+        Allocator::new(funding).reserve(core::mem::size_of::<Self>())?;
+        let mut cache = Self::empty();
+        cache.reset_with_allocations(re, funding)?;
+        Ok(cache)
+    }
+
+    fn empty() -> Cache {
         Cache {
-            stack: vec![],
-            curr: ActiveStates::new(re),
-            next: ActiveStates::new(re),
+            stack: Vec::new(),
+            curr: ActiveStates::empty(),
+            next: ActiveStates::empty(),
         }
     }
 
@@ -1950,8 +2085,20 @@ impl Cache {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset(&mut self, re: &PikeVM) {
-        self.curr.reset(re);
-        self.next.reset(re);
+        self.reset_with_allocations(re, &Unenforced)
+            .expect("ordinary Pike cache reset")
+    }
+
+    /// Reset through the same geometry worker; failures retain partial buffers.
+    pub fn reset_with_allocations(
+        &mut self,
+        re: &PikeVM,
+        funding: &dyn Allocation,
+    ) -> Result<(), AllocationError> {
+        self.stack.clear();
+        self.curr.reset(re, Allocator::new(funding))?;
+        self.next.reset(re, Allocator::new(funding))?;
+        Ok(())
     }
 
     /// Returns the heap memory usage, in bytes, of this cache.
@@ -1960,7 +2107,7 @@ impl Cache {
     /// compute that, use `std::mem::size_of::<Cache>()`.
     pub fn memory_usage(&self) -> usize {
         use core::mem::size_of;
-        (self.stack.len() * size_of::<FollowEpsilon>())
+        (self.stack.capacity() * size_of::<FollowEpsilon>())
             + self.curr.memory_usage()
             + self.next.memory_usage()
     }
@@ -2015,20 +2162,19 @@ impl ActiveStates {
     /// Create a new set of active states for the given PikeVM. The active
     /// states returned may only be used with the given PikeVM. (Use 'reset'
     /// to re-purpose the allocation for a different PikeVM.)
-    fn new(re: &PikeVM) -> ActiveStates {
-        let mut active = ActiveStates {
+    fn empty() -> ActiveStates {
+        ActiveStates {
             set: SparseSet::new(0),
             slot_table: SlotTable::new(),
-        };
-        active.reset(re);
-        active
+        }
     }
 
     /// Reset this set of active states such that it can be used with the given
     /// PikeVM (and only that PikeVM).
-    fn reset(&mut self, re: &PikeVM) {
-        self.set.resize(re.get_nfa().states().len());
-        self.slot_table.reset(re);
+    fn reset(&mut self, re: &PikeVM, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        self.set
+            .resize_with_allocations(re.get_nfa().states().len(), allocation.policy())?;
+        self.slot_table.reset(re, allocation)
     }
 
     /// Return the heap memory usage, in bytes, used by this set of active
@@ -2086,34 +2232,25 @@ impl SlotTable {
     ///
     /// One should call 'reset' with the corresponding PikeVM before use.
     fn new() -> SlotTable {
-        SlotTable { table: vec![], slots_for_captures: 0, slots_per_state: 0 }
+        SlotTable {
+            table: vec![],
+            slots_for_captures: 0,
+            slots_per_state: 0,
+        }
     }
 
     /// Reset this slot table such that it can be used with the given PikeVM
     /// (and only that PikeVM).
-    fn reset(&mut self, re: &PikeVM) {
+    fn reset(&mut self, re: &PikeVM, allocation: Allocator<'_>) -> Result<(), AllocationError> {
         let nfa = re.get_nfa();
-        self.slots_per_state = nfa.group_info().slot_len();
-        // This is always correct, but may be reduced for a particular search
-        // if a 'Captures' has fewer slots, e.g., none at all or only slots
-        // for tracking the overall match instead of all slots for every
-        // group.
-        self.slots_for_captures = core::cmp::max(
-            self.slots_per_state,
-            nfa.pattern_len().checked_mul(2).unwrap(),
-        );
-        let len = nfa
-            .states()
-            .len()
-            .checked_mul(self.slots_per_state)
-            // Add space to account for scratch space used during a search.
-            .and_then(|x| x.checked_add(self.slots_for_captures))
-            // It seems like this could actually panic on legitimate inputs on
-            // 32-bit targets, and very likely to panic on 16-bit. Should we
-            // somehow convert this to an error? What about something similar
-            // for the lazy DFA cache? If you're tripping this assert, please
-            // file a bug.
-            .expect("slot table length doesn't overflow");
+        let (slots_per_state, slots_for_captures, len) = Self::geometry(
+            nfa.states().len(),
+            nfa.group_info().slot_len(),
+            nfa.group_info().implicit_slot_len(),
+        )?;
+        allocation.resize_copy(&mut self.table, len, None)?;
+        self.slots_per_state = slots_per_state;
+        self.slots_for_captures = slots_for_captures;
         // This happens about as often as a regex is compiled, so it probably
         // should be at debug level, but I found it quite distracting and not
         // particularly useful.
@@ -2123,14 +2260,27 @@ impl SlotTable {
             len,
             self.slots_per_state,
         );
-        self.table.resize(len, None);
+        Ok(())
+    }
+
+    fn geometry(
+        states: usize,
+        slots: usize,
+        implicit: usize,
+    ) -> Result<(usize, usize, usize), AllocationError> {
+        let scratch = slots.max(implicit);
+        let len = states
+            .checked_mul(slots)
+            .and_then(|rows| rows.checked_add(scratch))
+            .ok_or(AllocationError::SizeOverflow)?;
+        Ok((slots, scratch, len))
     }
 
     /// Return the heap memory usage, in bytes, used by this slot table.
     ///
     /// This does not include the stack size of this value.
     fn memory_usage(&self) -> usize {
-        self.table.len() * core::mem::size_of::<Option<NonMaxUsize>>()
+        self.table.capacity() * core::mem::size_of::<Option<NonMaxUsize>>()
     }
 
     /// Perform any per-search setup for this slot table.
@@ -2207,7 +2357,10 @@ enum FollowEpsilon {
     /// Explore the epsilon transitions from a state ID.
     Explore(StateID),
     /// Reset the given `slot` to the given `offset` (which might be `None`).
-    RestoreCapture { slot: SmallIndex, offset: Option<NonMaxUsize> },
+    RestoreCapture {
+        slot: SmallIndex,
+        offset: Option<NonMaxUsize>,
+    },
 }
 
 /// A set of counters that "instruments" a PikeVM search. To enable this, you
@@ -2298,8 +2451,10 @@ impl Counters {
         // is likely to be overwhelming. And we probably only care about the
         // most frequently occurring ones anyway.
         const LIMIT: usize = 20;
-        let mut set_counts =
-            self.state_sets.iter().collect::<Vec<(&Vec<StateID>, &u64)>>();
+        let mut set_counts = self
+            .state_sets
+            .iter()
+            .collect::<Vec<(&Vec<StateID>, &u64)>>();
         set_counts.sort_by_key(|(_, &count)| core::cmp::Reverse(count));
         trace!("## PikeVM frequency of state sets (top {LIMIT})");
         for (set, count) in set_counts.iter().take(LIMIT) {
@@ -2362,5 +2517,18 @@ impl Counters {
 
     fn record_set_insert(&mut self, sid: StateID) {
         self.set_inserts[sid] += 1;
+    }
+}
+
+#[cfg(all(test, feature = "syntax"))]
+#[path = "pikevm/allocation_tests.rs"]
+mod allocation_tests;
+
+impl PikeVM {
+    /// Visit shared immutable NFA and prefilter ownership, excluding caches.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        self.nfa.visit_source_storage(visitor)?;
+        if let Some(pre) = self.config.get_prefilter() { pre.visit_source_storage(visitor)?; }
+        Ok(())
     }
 }

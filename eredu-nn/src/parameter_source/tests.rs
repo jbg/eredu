@@ -71,13 +71,17 @@ fn metadata_borrows_all_spec_fields_and_current_trainability() {
         assert!(rows.named[0].0.trainable());
     }
 }
-struct Legacy {
-    ordinary_calls: Cell<usize>,
+struct Incomplete {
+    source_calls: Cell<usize>,
 }
-impl Parameterized<i32> for Legacy {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, i32>>(&'a self, _: &mut V) {
-        self.ordinary_calls.set(self.ordinary_calls.get() + 1);
-    }
+impl Parameterized<i32> for Incomplete {
+    fn visit_parameter_sources<'a, V: crate::ParameterSourceVisitor<'a, i32>>(&'a self, _: &mut V) -> Result<(), crate::ParameterSourceError> {
+
+
+        self.source_calls.set(self.source_calls.get() + 1);
+
+ Err(ParameterSourceError::UnclassifiedRetainedField)
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, i32>>(&'a mut self, _: &mut V) {}
     fn set_trainable(&mut self, _: bool) {}
 }
@@ -95,7 +99,7 @@ struct Known {
 #[derive(crate::Parameterized)]
 #[parameterized(tensor = "i32")]
 struct Nested {
-    first: Legacy,
+    first: Incomplete,
     later: Known,
 }
 #[derive(crate::Parameterized)]
@@ -114,10 +118,10 @@ enum Choice {
     Empty,
 }
 #[test]
-fn derived_nested_failure_never_calls_legacy_or_becomes_partial_success() {
+fn derived_nested_failure_visits_all_known_children_without_partial_success() {
     let value = Some(vec![Nested {
-        first: Legacy {
-            ordinary_calls: Cell::new(0),
+        first: Incomplete {
+            source_calls: Cell::new(0),
         },
         later: Known {
             named: parameter("later", 7),
@@ -129,7 +133,7 @@ fn derived_nested_failure_never_calls_legacy_or_becomes_partial_success() {
     let mut rows = Rows::default();
     assert_eq!(
         value.visit_parameter_sources(&mut rows),
-        Err(ParameterSourceError::Unavailable)
+        Err(ParameterSourceError::UnclassifiedRetainedField)
     );
     assert_eq!(rows.named.len(), 1);
     assert_eq!(*rows.named[0].1, 7);
@@ -138,7 +142,7 @@ fn derived_nested_failure_never_calls_legacy_or_becomes_partial_success() {
         [11, 13]
     );
     let nested = &value.as_ref().unwrap()[0];
-    assert_eq!(nested.first.ordinary_calls.get(), 0);
+    assert_eq!(nested.first.source_calls.get(), 1);
     assert_eq!(nested.later.width, 2);
     assert!(std::ptr::eq(rows.named[0].1, nested.later.named.as_ref()));
     assert!(std::ptr::eq(rows.auxiliary[0], &nested.later.auxiliary));
@@ -166,10 +170,10 @@ fn derived_variants_distinguish_bare_skip_optional_auxiliary_and_empty() {
     }
     let empty = Choice::Empty;
     empty.visit_parameter_sources(&mut Rows::default()).unwrap();
-    Vec::<Legacy>::new()
+    Vec::<Incomplete>::new()
         .visit_parameter_sources(&mut Rows::default())
         .unwrap();
-    None::<Legacy>
+    None::<Incomplete>
         .visit_parameter_sources(&mut Rows::default())
         .unwrap();
 }

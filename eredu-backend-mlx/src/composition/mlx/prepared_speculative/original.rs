@@ -7,7 +7,7 @@ mod independent;
 use crate::composition::mlx::speculative::autoregressive::{
     AutoregressiveSourcePair, MlxAutoregressiveMechanisms,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     speculative::autoregressive::{AutoregressiveExecutor, AutoregressiveSchedulePlan},
     working_memory::WorkingMemoryError,
@@ -23,7 +23,7 @@ pub(super) struct OriginalIndependentRequest<'a> {
     pub options: eredu_core::SpeculativeSchedulerOptions,
     pub input_positions: NonZeroU64,
     pub context_positions: NonZeroU64,
-    pub preparation: &'a eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation,
+    pub preparation: &'a eredu_runtime::working_memory::PreparedSemanticSource,
 }
 
 /// Holds no model/source clone. The draft's actual selected realization and model
@@ -80,16 +80,16 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
         >(),
         size_of::<SpeculativeExecutionStreams<'_>>(),
         size_of::<Result<T, Error>>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
         crate::backend::OriginalCopyEnvironment::control_bytes().ok_or(
-            Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+            Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
         )?,
     ];
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     funding
         .reserve_metadata(bytes)
@@ -112,7 +112,7 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
             .map_err(|cause| super::super::model::retain_planning_error(cause, funding.clone()))?;
             funding
                 .reserve_metadata(schedule.control_bytes().ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?)
                 .map_err(Error::WorkspacePlanning)?;
             let sources = AutoregressiveSourcePair::prepare_funded(
@@ -149,7 +149,7 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
 /// Constructor policy stays shared; no ordinary domain lease is acquired here.
 fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
     mut lane: SpeculativeGenerationLane<'a, MlxBackend<'world>, C>,
-    preparation: &eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation,
+    preparation: &eredu_runtime::working_memory::PreparedSemanticSource,
     streams: SpeculativeExecutionStreams<'_>,
 ) -> Result<MlxSpeculativeLaneRuntime<'a, C>, Error> {
     let (sources, environment) = streams
@@ -166,8 +166,14 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
         size_of::<MlxTextSampler>(),
         size_of::<Option<MlxSpeculativeSeed>>(),
         size_of::<Result<MlxSpeculativeSeed, eredu_core::speculative::SpeculativeControlError>>(),
-        crate::backend::array_copy::OriginalPreparedArrayCopySource::control_bytes()
-            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?,
+        size_of::<(
+            &MlxModelInput,
+            &eredu_runtime::working_memory::WorkingMemoryPool,
+            &eredu_runtime::SharedPreparedInputCacheIdentity,
+            Option<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>>,
+            Result<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>, WorkingMemoryError>,
+            Result<&eredu_runtime::working_memory::MediaSessionBinding, eredu_core::PreparedRequestRejection>,
+        )>(),
     ];
     funding
         .reserve_metadata(
@@ -175,7 +181,7 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?,
         )
         .map_err(Error::WorkspacePlanning)?;
@@ -195,17 +201,21 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
     let state = semantic
         .prepared_source()
         .and_then(|source| {
-            source.downcast_ref::<eredu_runtime::working_memory::OriginalSpeculativePlainText>()
+            source.downcast_ref::<eredu_runtime::working_memory::PreparedSemanticState>()
         })
         .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
     if !state.preparation().same_preparation(preparation) {
         return Err(sources.retain_startup_error(WorkingMemoryError::IdentityMismatch));
     }
     let mut prompt = lane.take_prompt();
+    // Borrow the actual completed input owner for either text or media. The
+    // selected prefill worker prepares any numerical copy later; a text-only
+    // copy descriptor is not the source contract for a media packet.
     prompt
-        .original_text_copy_source()
-        .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?
-        .map_err(|cause| sources.retain_startup_error(cause))?;
+        .original_prediction_source(sources.pool())
+        .map_err(|cause| sources.retain_startup_error(
+            Error::PrefillControl(cause).at_speculative_stage("lane original prompt source"),
+        ))?;
     if let Some(chunk) = generation.inference_policy().prefill_chunk_positions {
         prompt = prompt.with_prefill_chunk_positions(chunk);
     }
@@ -249,7 +259,7 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
 pub(super) fn prepare_lane_buffers<'run, 'lane: 'run, 'world, 'streams: 'run, C, E>(
     executor: &'run mut E,
     lane: SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>,
-    preparation: &eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation,
+    preparation: &eredu_runtime::working_memory::PreparedSemanticSource,
     streams: SpeculativeExecutionStreams<'streams>,
     new_cache: impl FnOnce(&mut E, SpeculativeExecutionStreams<'streams>) -> Result<E::Cache, Error>,
 ) -> Result<
@@ -291,7 +301,7 @@ where
         size_of::<SpeculativeExecutionStreams<'streams>>(),
         size_of::<(
             &mut E,
-            &eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation,
+            &eredu_runtime::working_memory::PreparedSemanticSource,
         )>(),
         size_of::<
             Option<(
@@ -299,7 +309,7 @@ where
                 &crate::backend::OriginalCopyEnvironment<'_>,
             )>,
         >(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
     ];
     sources
         .metadata_funding()
@@ -308,7 +318,7 @@ where
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?,
         )
         .map_err(Error::WorkspacePlanning)?;
@@ -335,7 +345,7 @@ where
 pub(super) fn run_lane<'lane, 'world, C, V>(
     executor: &mut AutoregressiveExecutor<'_, MlxAutoregressiveMechanisms>,
     lane: SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>,
-    preparation: &eredu_runtime::working_memory::OriginalSpeculativeSemanticPreparation,
+    preparation: &eredu_runtime::working_memory::PreparedSemanticSource,
     streams: SpeculativeExecutionStreams<'_>,
     visitor: V,
 ) -> Result<SpeculativeGenerationBatchOutput, Error>

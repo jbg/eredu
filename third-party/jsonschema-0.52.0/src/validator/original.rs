@@ -17,11 +17,13 @@ use std::mem::{size_of, size_of_val};
 pub trait OriginalJson: Json {
     /// Exact fixed input-access control population for one validator dispatch.
     fn original_input_controls() -> Option<usize>;
-    /// Exact controls for allocation-free default string-buffer construction
-    /// and each borrowed string-node invocation, respectively. Returning None
-    /// leaves these operations unqualified before either is called. The body
-    /// separately pays the selected callback and child validator.
-    fn original_string_controls() -> Option<(usize, usize)> { None }
+    /// Exact controls for default string-buffer construction and each string-node
+    /// invocation. Returning None leaves these operations unqualified before
+    /// either is called. The canonical representation hook separately reserves
+    /// any string backing before the body invokes its child validator.
+    fn original_string_controls() -> Option<(usize, usize)> {
+        None
+    }
     /// Actual retained allocation of one cold prepared property key.
     fn original_key_bytes(key: &Self::PreparedKey) -> Option<usize>;
     /// Actual additional backing of a cold schema number. Return None when
@@ -55,12 +57,15 @@ impl<F: OriginalJson> std::fmt::Debug for OriginalValidationSource<F> {
 }
 impl<F: OriginalJson> OriginalValidationSource<F> {
     /// Retain an already compiled graph and initialize its cold hash source.
-    /// This performs ordinary source preparation, not an admitted invocation.
-    pub fn new(validator: Validator<F>) -> Self {
-        Self {
-            validator,
-            seed: ahash::RandomState::new(),
-        }
+    /// This uses the compiled graph's retained source policy, not an invocation loan.
+    ///
+    /// # Errors
+    /// Returns the original storage or host-entropy failure.
+    pub fn new(validator: Validator<F>) -> Result<Self, crate::CompilationError> {
+        let funding = &validator.funding;
+        funding.reserve(size_of::<(Self, Result<Self, crate::CompilationError>)>())?;
+        let seed = funding.random_state()?;
+        Ok(Self { validator, seed })
     }
     /// Inspect only the fixed entry frames. Source backing and the borrowed
     /// input owner remain separate obligations of the caller.
@@ -82,10 +87,28 @@ impl<F: OriginalJson> OriginalValidationSource<F> {
     }
     /// Inspect actual immutable backing requests of this compiled source.
     /// This is a cold, allocating graph traversal, never an invocation worker.
-    /// The caller must keep the graph immutable after storing this requirement.
-    pub fn retained_bytes(&self) -> Result<usize, Error> {
-        let mut source = super::source::Inspector::<F>::new(F::original_key_bytes, F::original_number_bytes);
-        self.validator.root.original_source(&mut source)?;
+    /// The graph's retained source funds actual inspection scratch. The caller
+    /// must keep the graph immutable after storing this requirement.
+    ///
+    /// # Errors
+    /// Returns the original scratch refusal or an unqualified retained source.
+    pub fn retained_bytes(&self) -> Result<usize, crate::CompilationError> {
+        let funding = &self.validator.funding;
+        funding.reserve(size_of::<(
+            super::source::Inspector<F>,
+            Result<usize, crate::CompilationError>,
+            &Self,
+        )>())?;
+        let mut source = super::source::Inspector::<F>::new(
+            F::original_key_bytes,
+            F::original_number_bytes,
+            funding.clone(),
+        );
+        let result = source.node(&self.validator.root);
+        if let Some(error) = source.take_failure() {
+            return Err(error);
+        }
+        result.map_err(|error| funding.workspace_error(error))?;
         Ok(source.bytes())
     }
     /// Use the ordinary body dispatch with fresh, fallible scratch funding.
@@ -100,11 +123,57 @@ impl<F: OriginalJson> OriginalValidationSource<F> {
         context
             .workspace
             .set_input_controls(F::original_input_controls().ok_or(Error::Overflow)?);
-        context.workspace.set_string_controls(F::original_string_controls());
+        context
+            .workspace
+            .set_string_controls(F::original_string_controls());
         let valid = self.validator.root.is_valid(&input, &mut context);
         match context.workspace_failure() {
             Some(cause) => Err(cause),
             None => Ok(valid),
         }
+    }
+}
+
+impl OriginalJson for crate::SerdeJson {
+    fn original_input_controls() -> Option<usize> {
+        use crate::{Json, Object};
+        use serde_json::{Map, Number, Value};
+        type Members<'a> = <&'a Map<String, Value> as Object<'a, crate::SerdeJson>>::MembersIter;
+        let parts = [
+            size_of::<<Self as Json>::Node<'_>>(),
+            size_of::<Members<'_>>(),
+            size_of::<std::slice::Iter<'_, Value>>(),
+            size_of::<&Map<String, Value>>(),
+            size_of::<&[Value]>(),
+            size_of::<&Number>(),
+            size_of::<Option<&Number>>(),
+            size_of::<Option<(&str, &Value)>>(),
+            size_of::<Option<&Value>>(),
+            size_of::<Option<std::borrow::Cow<'_, str>>>(),
+            size_of::<Option<crate::NodeIdentity>>(),
+            size_of::<(&Value, &str)>(),
+            size_of::<(&Map<String, Value>, &String)>(),
+            size_of::<(usize, usize, bool)>(),
+            size_of::<std::cmp::Ordering>(),
+            size_of::<Option<i64>>(),
+            size_of::<Option<u64>>(),
+            size_of::<Option<f64>>(),
+            size_of::<std::str::Chars<'_>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+    fn original_string_controls() -> Option<(usize, usize)> {
+        Some((
+            size_of::<serde_json::Value>(),
+            size_of::<(&mut serde_json::Value, &str, usize)>(),
+        ))
+    }
+    fn original_key_bytes(key: &String) -> Option<usize> {
+        Some(key.capacity())
+    }
+    fn original_number_bytes(number: &serde_json::Number) -> Option<usize> {
+        Some(number.allocation_size())
     }
 }

@@ -1,7 +1,7 @@
 //! Shared flattening and n-ary simplification; scratch owns allocation policy.
 use super::scalar::{self, Emission};
 use crate::ast::{Expr, ExprFlags, ExprRef, ExprSet, ExprTag, byteset_set, byteset_union};
-use std::convert::Infallible;
+use crate::{ParserAllocationFunding, raw::PreparedExprError};
 
 pub(crate) mod storage;
 type Lookahead = (ExprRef, ExprRef, u32);
@@ -18,16 +18,16 @@ trait Memory {
     fn finish_lookahead(&mut self);
     fn overflow(&mut self) -> Self::Error;
 }
-#[derive(Default)]
-struct OrdinaryMemory {
+struct GrowingMemory {
+    funding: ParserAllocationFunding,
     suffix: Vec<ExprRef>,
     bytes: Vec<u32>,
     lookahead: Vec<Lookahead>,
 }
-impl Memory for OrdinaryMemory {
-    type Error = Infallible;
-    fn copy_suffix(&mut self, input: &[ExprRef]) -> Result<(), Infallible> {
-        self.suffix = input.to_vec();
+impl Memory for GrowingMemory {
+    type Error = PreparedExprError;
+    fn copy_suffix(&mut self, input: &[ExprRef]) -> Result<(), PreparedExprError> {
+        self.funding.try_extend_copy(&mut self.suffix, input)?;
         Ok(())
     }
     fn suffix(&self) -> &[ExprRef] {
@@ -36,39 +36,38 @@ impl Memory for OrdinaryMemory {
     fn finish_suffix(&mut self) {
         self.suffix = Vec::new();
     }
-    fn ensure_args(&mut self, _: &mut Vec<ExprRef>, _: usize) -> Result<(), Infallible> {
+    fn ensure_args(&mut self, args: &mut Vec<ExprRef>, required: usize) -> Result<(), PreparedExprError> {
+        self.funding.try_grow_vec(args, required)?;
         Ok(())
     }
-    fn bytes(&mut self, words: usize) -> Result<&mut [u32], Infallible> {
-        self.bytes = vec![0; words];
+    fn bytes(&mut self, words: usize) -> Result<&mut [u32], PreparedExprError> {
+        self.funding.try_grow_vec(&mut self.bytes, words)?;
+        self.bytes.resize(words, 0);
         Ok(&mut self.bytes)
     }
     fn finish_bytes(&mut self) {
         self.bytes = Vec::new();
     }
-    fn lookahead(&mut self, _: usize) -> Result<&mut Vec<Lookahead>, Infallible> {
+    fn lookahead(&mut self, count: usize) -> Result<&mut Vec<Lookahead>, PreparedExprError> {
         self.lookahead = Vec::new();
+        self.funding.try_grow_vec(&mut self.lookahead, count)?;
         Ok(&mut self.lookahead)
     }
     fn finish_lookahead(&mut self) {
         self.lookahead = Vec::new();
     }
-    fn overflow(&mut self) -> Infallible {
-        panic!("n-ary argument count overflow")
+    fn overflow(&mut self) -> PreparedExprError {
+        self.funding.storage_overflow().into()
     }
 }
 
-pub(super) fn ordinary(source: &mut ExprSet, args: &mut Vec<ExprRef>, tag: ExprTag) -> ExprRef {
-    let mut memory = OrdinaryMemory::default();
-    let mut sink = scalar::Ordinary(source);
-    let result = match tag {
+pub(super) fn growing(source: &mut ExprSet, args: &mut Vec<ExprRef>, tag: ExprTag) -> Result<ExprRef, PreparedExprError> {
+    let mut memory = GrowingMemory { funding: source.construction_funding()?.clone(), suffix: Vec::new(), bytes: Vec::new(), lookahead: Vec::new() };
+    let mut sink = scalar::Prepared(source);
+    match tag {
         ExprTag::Or => or(&mut sink, &mut memory, args),
         ExprTag::And => and(&mut sink, &mut memory, args),
         _ => unreachable!("only And and Or have n-ary construction"),
-    };
-    match result {
-        Ok(value) => value,
-        Err(never) => match never {},
     }
 }
 

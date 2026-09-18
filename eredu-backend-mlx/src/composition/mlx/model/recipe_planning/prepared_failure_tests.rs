@@ -1,5 +1,5 @@
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataAccount;
+use eredu_nn::workspace::HostMetadataAccount;
 use eredu_runtime::working_memory::{WorkingMemoryError, SpeculativeRequestError};
 use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
 
@@ -7,20 +7,20 @@ use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
 struct State {remaining:AtomicUsize,calls:AtomicUsize,retired:AtomicBool}
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError>{
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError>{
         self.0.calls.fetch_add(1,Ordering::SeqCst);
         let remaining=self.0.remaining.load(Ordering::SeqCst);
-        let next=remaining.checked_sub(bytes).ok_or(WorkspaceMetadataFundingError::Capacity{
+        let next=remaining.checked_sub(bytes).ok_or(HostMetadataFundingError::Capacity{
             required:bytes as u64,available:remaining as u64})?;
         self.0.remaining.store(next,Ordering::SeqCst);
         Ok(())
     }
 }
 impl Drop for Account {fn drop(&mut self){self.0.retired.store(true,Ordering::SeqCst);}}
-fn funding()->(WorkspaceMetadataFunding,Arc<State>){
+fn funding()->(HostMetadataFunding,Arc<State>){
     let state=Arc::new(State{remaining:AtomicUsize::new(usize::MAX),calls:AtomicUsize::new(0),retired:AtomicBool::new(false)});
-    (WorkspaceMetadataFunding::new(Account(state.clone())).unwrap(),state)
+    (HostMetadataFunding::new(Account(state.clone())).unwrap(),state)
 }
 #[test]
 fn prepaid_phase_failure_preserves_budget_source_without_a_second_debit(){

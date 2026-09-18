@@ -1,7 +1,7 @@
 //! Public prediction equations, effective matrices and coordinated reversible edits.
 use super::*;
 use eredu_core::{
-    component::*, intervention::InterventionDtype, parameters::*, TensorObservationData,
+    TensorObservationData, component::*, intervention::InterventionDtype, parameters::*,
 };
 use std::collections::BTreeMap;
 

@@ -1,6 +1,6 @@
 //! Source-bound initialized inputs for the canonical realtime frame coordinator.
 use crate::{backend::{error::Error,initialized_input},MlxTensor};
-use eredu_nn::workspace::{WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding,HostMetadataFundingError};
 use eredu_runtime::{RealtimeIngressSource,RealtimeInputMatrix,RealtimeHostTokenMaterializer,
     RealtimePayloadKind,MaterializedRealtimeInput,working_memory::{HostSourceConstructionFacts,
     OriginalHostSourceBank,OriginalHostSourceCustody,WorkingMemoryError}};
@@ -14,7 +14,7 @@ const KINDS:[RealtimePayloadKind;3]=[RealtimePayloadKind::InputAudio,
 pub(crate) enum RealtimeInputSourceError {
     #[error(transparent)] Input(#[from] PreparedInputCause),
     #[error(transparent)] Memory(#[from] WorkingMemoryError),
-    #[error(transparent)] Metadata(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Metadata(#[from] HostMetadataFundingError),
     #[error(transparent)] Backend(#[from] Error),
 }
 fn overflow()->RealtimeInputSourceError {WorkingMemoryError::Overflow.into()}
@@ -49,7 +49,7 @@ impl<'a> RealtimeInputSource<'a> {
     /// The real adapter/policy frames, separate from each source constructor.
     pub(crate) fn control_bytes(&self)->Result<usize,RealtimeInputSourceError> {
         sum(&[size_of::<Self>(),size_of::<RealtimeInputMaterializer<'_>>(),
-            size_of::<(Self,OriginalHostSourceBank,OriginalHostSourceCustody,&WorkspaceMetadataFunding)>(),
+            size_of::<(Self,OriginalHostSourceBank,OriginalHostSourceCustody,&HostMetadataFunding)>(),
             size_of::<Result<RealtimeInputMaterializer<'_>,RealtimeInputSourceError>>(),
             size_of::<(&mut RealtimeInputMaterializer<'_>,&RealtimeIngressSource<'_>)>(),
             size_of::<Result<(),RealtimeInputSourceError>>(),
@@ -63,7 +63,7 @@ impl<'a> RealtimeInputSource<'a> {
     /// Consumes a direct partition of the enclosing admitted frame's bank.
     /// Equal facts alone are insufficient: the original account must also match.
     pub(crate) fn accept(self,bank:OriginalHostSourceBank,custody:OriginalHostSourceCustody,
-        funding:&'a WorkspaceMetadataFunding)->Result<RealtimeInputMaterializer<'a>,RealtimeInputSourceError> {
+        funding:&'a HostMetadataFunding)->Result<RealtimeInputMaterializer<'a>,RealtimeInputSourceError> {
         if !bank.belongs_to_source(&custody) || !bank.matches_facts(self.facts) {return Err(identity());}
         funding.reserve_metadata(self.control_bytes()?)?;
         Ok(RealtimeInputMaterializer{source:self,bank,custody,started:false,cursor:0,failed:false})

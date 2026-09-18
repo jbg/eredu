@@ -28,10 +28,13 @@ pub(crate) fn trace(shape:&[i32],prototype:WorkspaceLayoutView<'_>,context:&Work
     ->Result<WorkspaceTensor,Error> {
     WorkspaceTensor::zeros_from_prototype(shape,prototype,context)
 }
-/// Actual borrowed zeros_dtype Rust/C transports; the resident seed and native
-/// constructor sources own the eager typed zero, Shape and lazy Full/Broadcast.
+/// Actual borrowed zeros_dtype Rust/C transports, including its zeros_like
+/// prototype wrapper. The resident seed and native constructor sources own the
+/// eager typed zero, Shape and lazy Full/Broadcast.
 pub(super) fn control_bytes()->Option<usize>{
-    let frames=[size_of::<(&[i32],safemlx::Dtype,&safemlx::Stream)>(),size_of::<safemlx::Dtype>(),
+    let frames=[size_of::<(&safemlx::Array,&safemlx::Stream)>(),
+        size_of::<Result<safemlx::Array,safemlx::error::Exception>>(),
+        size_of::<(&[i32],safemlx::Dtype,&safemlx::Stream)>(),size_of::<safemlx::Dtype>(),
         size_of::<&[i32]>(),size_of::<&safemlx::Stream>(),size_of::<safemlx::Array>(),
         size_of::<Result<safemlx::Array,safemlx::error::Exception>>(),
         size_of::<*mut ()>()];

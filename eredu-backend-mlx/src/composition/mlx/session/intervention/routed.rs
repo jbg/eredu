@@ -58,11 +58,11 @@ pub(super) fn locations(
     let mut at = Vec::with_capacity(shape[0] as usize);
     for (token, selection) in tokens
         .try_iter::<u32>()
-        .map_err(eredu_nn::Error::backend_source)?
+        .map_err(eredu_nn::Error::backend_retained_source)?
         .zip(
             slots
                 .try_iter::<u32>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         )
     {
         if token as u64 >= coefficients[0] as u64
@@ -87,16 +87,16 @@ pub(super) fn locations(
     let mut rows = Vec::with_capacity(shape[0] as usize);
     for ((token, selection), group) in tokens
         .try_iter::<u32>()
-        .map_err(eredu_nn::Error::backend_source)?
+        .map_err(eredu_nn::Error::backend_retained_source)?
         .zip(
             slots
                 .try_iter::<u32>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         )
         .zip(
             groups
                 .try_iter::<u32>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         )
     {
         let expert = match source.global_groups {

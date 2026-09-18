@@ -4,7 +4,7 @@ use super::super::super::rollback as chart;
 use crate::{api::{ParserLimits, StopReason}, earley::PreparedLexer, tokenparser::{progress, rollback}};
 use std::mem::{size_of, size_of_val};
 use toktrie::{TokTrie, TokenId};
-impl<F: Fn(usize) -> Result<(), E>, E> rollback::Context for Context<'_, '_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> rollback::Context for Context<'_, '_, F> {
     type Error = Cause<E>;
     fn tokens(&self) -> &[TokenId] { &self.state.tokens }
     fn bytes_len(&self) -> usize { self.state.bytes.len() }
@@ -48,7 +48,7 @@ impl PreparedTokenParser {
     /// Rolls back committed tokens through the same ordinary history/chart
     /// workers. Normal terminal states reopen; failures retain the reached state.
     /// Token limits return by the ordinary rule; funding is never refunded.
-    pub fn rollback<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn rollback<F: crate::earley::PreparedFunding<Error = E>, E>(
         self, lexer: &mut PreparedLexer, trie: &TokTrie, limits: &ParserLimits,
         tokens: usize, funding: &F,
     ) -> Result<Self, PreparedTokenParserError<E>> {
@@ -63,13 +63,13 @@ impl PreparedTokenParser {
                 size_of::<(&mut Context<'_, '_, F>, usize)>(),
                 size_of::<(usize, usize)>(),
             ];
-            funding(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+            funding.reserve(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
                 .ok_or(Cause::Overflow)?).map_err(Cause::Funding)?;
             rollback::run(context, tokens)
         }).map(|(owner, ())| owner)
     }
     /// Resets all committed token history using the same rollback operation.
-    pub fn reset<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn reset<F: crate::earley::PreparedFunding<Error = E>, E>(
         self, lexer: &mut PreparedLexer, trie: &TokTrie, limits: &ParserLimits, funding: &F,
     ) -> Result<Self, PreparedTokenParserError<E>> {
         let tokens = self.state.tokens.len();

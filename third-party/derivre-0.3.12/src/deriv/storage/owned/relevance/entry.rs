@@ -219,32 +219,32 @@ mod tests {
     use std::cell::Cell;
     #[test]
     fn full_entry_preserves_concat_nested_repeat_probe_and_recoverable_fuel_order() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let d = source.mk_byte(b'd');
-        let ab = source.mk_byte_set_or(&[a, b]);
-        let bc = source.mk_byte_set_or(&[b, c]);
-        let cd = source.mk_byte_set_or(&[c, d]);
-        let left = source.mk_repeat(ab, 1, 2);
-        let right = source.mk_repeat(bc, 1, 3);
-        let disjoint = source.mk_repeat(cd, 1, 2);
-        let repeated = source.mk_and(&mut vec![left, right]);
-        let empty = source.mk_and(&mut vec![left, disjoint]);
-        let nested_left = source.mk_repeat(left, 1, 2);
-        let nested_right = source.mk_repeat(right, 1, 2);
-        let nested = source.mk_and(&mut vec![nested_left, nested_right]);
-        let prefix = source.mk_byte_literal(b"prefix");
-        let suffix = source.mk_byte_literal(b"suffix");
-        let prefixed = source.mk_concat(prefix, repeated);
-        let concatenated = source.mk_concat(prefixed, suffix);
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[nested; 128]));
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let d = source.mk_byte(b'd').unwrap();
+        let ab = source.mk_byte_set_or(&[a, b]).unwrap();
+        let bc = source.mk_byte_set_or(&[b, c]).unwrap();
+        let cd = source.mk_byte_set_or(&[c, d]).unwrap();
+        let left = source.mk_repeat(ab, 1, 2).unwrap();
+        let right = source.mk_repeat(bc, 1, 3).unwrap();
+        let disjoint = source.mk_repeat(cd, 1, 2).unwrap();
+        let repeated = source.mk_and(&mut vec![left, right]).unwrap();
+        let empty = source.mk_and(&mut vec![left, disjoint]).unwrap();
+        let nested_left = source.mk_repeat(left, 1, 2).unwrap();
+        let nested_right = source.mk_repeat(right, 1, 2).unwrap();
+        let nested = source.mk_and(&mut vec![nested_left, nested_right]).unwrap();
+        let prefix = source.mk_byte_literal(b"prefix").unwrap();
+        let suffix = source.mk_byte_literal(b"suffix").unwrap();
+        let prefixed = source.mk_concat(prefix, repeated).unwrap();
+        let concatenated = source.mk_concat(prefixed, suffix).unwrap();
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[nested; 128])).unwrap();
         let (_, mut source, _) = AlphabetInfo::from_exprset(
             source,
             &[repeated, empty, nested, concatenated, declaration],
-        );
-        source.reserve(128);
+        ).unwrap();
+        source.reserve(128).unwrap();
         let mut ordinary = source.clone();
         let mut reference = RelevanceCache::new();
         let prepared = source.prepared_source_plan().unwrap().compile().unwrap();

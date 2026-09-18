@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::error::Error;
 use std::mem::{size_of, size_of_val};
-type Funding = eredu_nn::workspace::WorkspaceMetadataFunding;
+type Funding = eredu_nn::workspace::HostMetadataFunding;
 type Roots = safemlx::PreparedNestedRoots<Funding>;
 #[derive(Debug)]
 struct NestedPreparationFailure {
@@ -32,7 +32,7 @@ pub(crate) fn control_bytes(roots: usize) -> Option<usize> {
         Roots::control_bytes(roots)?
             .checked_add(Roots::submission_control_bytes::<ArrayLoans<'_>>()?)?
             .checked_add(size_of::<Result<Roots, safemlx::PreparedNestedRootsFailure<Funding>>>())?
-            .checked_add(eredu_nn::Error::retained_source_control_bytes::<NestedPreparationFailure>()?)?
+            .checked_add(eredu_nn::Error::retained_source_construction_bytes::<NestedPreparationFailure>()?)?
     };
     let frames = [
         size_of::<(&MlxTensor, &Group, &Group, &Stream)>(),
@@ -93,6 +93,59 @@ pub(super) fn sum(
         complete_native(&[&output], stream, funding)?;
         Ok(Some(output))
     })?
+}
+#[derive(Debug, thiserror::Error)]
+enum WaveCause<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Native(Error),
+    #[error(transparent)]
+    Validation(E),
+}
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+struct WaveFailure<E: std::error::Error + 'static> {
+    #[source]
+    cause: WaveCause<E>,
+    funding: Funding,
+}
+pub(super) fn sum_wave<E,V>(
+    values: &[MlxTensor], group: &Group, context: &Group, stream: &Stream,
+    mut validate: V,
+) -> Result<Option<Vec<MlxTensor>>, eredu_core::BackendFailure>
+where E: std::error::Error + Send + Sync + 'static,
+      V: FnMut(&[MlxTensor],&Funding,bool)->Result<(),E>,
+{
+    MlxNeuralBackend::with_parallel_control_context(context, |prepared| {
+        let Some((_, funding)) = prepared else { return Ok(None); };
+        let controls = size_of::<(
+            &[MlxTensor], &Group, &Group, &Stream, &Funding, V, usize, Option<usize>,
+            Vec<MlxTensor>, Vec<&MlxTensor>, std::slice::Iter<'_, MlxTensor>,
+            Result<Vec<MlxTensor>, WaveCause<E>>, Result<Array, eredu_nn::Error>,
+            Result<(), E>, Result<(), Error>, WaveFailure<E>, eredu_core::BackendFailure,
+        )>().checked_add(values.len().checked_mul(size_of::<MlxTensor>() + size_of::<&MlxTensor>())
+            .ok_or_else(||eredu_core::HostMetadataFundingError::Overflow.into_backend_failure())?)
+            .and_then(|n| if values.is_empty() { Some(n) } else { n.checked_add(control_bytes(values.len())?) })
+            .and_then(|n| n.checked_add(eredu_core::BackendFailure::source_retention_peak_bytes::<WaveFailure<E>>()?))
+            .ok_or_else(||eredu_core::HostMetadataFundingError::Overflow.into_backend_failure())?;
+        funding.reserve_metadata(controls).map_err(eredu_core::HostMetadataFundingError::into_backend_failure)?;
+        let run = (|| -> Result<Vec<MlxTensor>, WaveCause<E>> {
+            context.validate_model_collective_group(group).map_err(|cause|WaveCause::Native(Error::Neural(cause)))?;
+            validate(values,funding,false).map_err(WaveCause::Validation)?;
+            let mut outputs = Vec::with_capacity(values.len());
+            for value in values {
+                outputs.push(MlxTensor::from_array(context.sum_model(value.as_array(), stream)
+                    .map_err(|cause|WaveCause::Native(Error::Neural(cause)))?));
+            }
+            // Every occurrence is constructed before the shared nested completion.
+            let roots: Vec<_> = outputs.iter().collect();
+            if !roots.is_empty() { complete_native(&roots, stream, funding).map_err(WaveCause::Native)?; }
+            validate(&outputs,funding,true).map_err(WaveCause::Validation)?;
+            Ok(outputs)
+        })();
+        run.map(Some).map_err(|cause|eredu_core::BackendFailure::from_error(WaveFailure {
+            cause, funding: funding.clone(),
+        }))
+    }).map_err(Error::into_backend_failure)?
 }
 pub(super) fn gather(
     value: &MlxTensor,

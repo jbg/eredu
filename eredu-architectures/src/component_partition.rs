@@ -1,21 +1,27 @@
 //! Architecture-owned observation coordinates for an exact partition selection.
 
+use eredu_collections::ordered_map::Map as SourceMap;
 use std::collections::BTreeMap;
 
 use eredu_core::{
+    ArchitectureDescriptor,
     capture::PartitionCaptureCombination,
     component::{ComponentCoordinateMap, ComponentGroup, ComponentWritePartition},
-    ArchitectureDescriptor,
 };
 use eredu_runtime::{
-    inspection::ObservationHookSite, ArchitectureParameterDescription, LocalModelLayout,
-    LocalTensorLayout, TensorPlacement,
+    ArchitectureParameterDescription, LocalModelLayout, LocalTensorLayout, TensorPlacement,
+    inspection::ObservationHookSite,
 };
 
+pub(crate) mod construction;
+use construction::Destination;
 mod intervention_source;
 pub use intervention_source::PartitionInterventionMemberLayout;
 mod contiguous_capture;
-pub use contiguous_capture::{ComponentPartitionCaptureSource, ComponentPartitionCaptureRank, ContiguousPartitionCaptureSource, ContiguousPartitionCaptureRank, PartitionCaptureSourceError};
+pub use contiguous_capture::{
+    ComponentPartitionCaptureRank, ComponentPartitionCaptureSource, ContiguousPartitionCaptureRank,
+    ContiguousPartitionCaptureSource, PartitionCaptureSourceError,
+};
 mod decoder_invocations;
 mod input_projection;
 mod output_gate;
@@ -23,11 +29,13 @@ mod output_projection;
 mod prediction;
 mod routed;
 mod routed_capture;
-pub use routed_capture::{RoutedPartitionCaptureSource, RoutedPartitionCaptureRank, RoutedPartitionCaptureSourceError};
+pub use routed_capture::{
+    RoutedPartitionCaptureRank, RoutedPartitionCaptureSource, RoutedPartitionCaptureSourceError,
+};
 mod streams;
 mod transforms;
+pub use routed::{PartitionedRoutedObservation, derive_routed_component_coordinates};
 pub(crate) use routed::{derive_bank_unit_coordinates, derive_coordinates_for_experts};
-pub use routed::{derive_routed_component_coordinates, PartitionedRoutedObservation};
 
 /// One invocation's local scalar coordinates. Absence of coordinates means that
 /// this partition does not execute the invocation, even if it stores shared weights.
@@ -97,10 +105,10 @@ impl PartitionedObservation {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ComponentPartitionLayout {
     topology: eredu_core::ParallelRankTopology,
-    groups: BTreeMap<String, PartitionedComponentGroup>,
-    paths: BTreeMap<String, String>,
-    observations: BTreeMap<String, PartitionedObservation>,
-    routed: BTreeMap<String, PartitionedRoutedObservation>,
+    groups: SourceMap<String, PartitionedComponentGroup>,
+    paths: SourceMap<String, String>,
+    observations: SourceMap<String, PartitionedObservation>,
+    routed: SourceMap<String, PartitionedRoutedObservation>,
 }
 
 impl ComponentPartitionLayout {
@@ -221,7 +229,7 @@ impl ComponentPartitionLayout {
         invocation: Option<eredu_core::capture::CaptureInvocationShape>,
         max_fragments: usize,
     ) -> Result<Option<eredu_core::capture::CaptureSlicePartition>, ComponentPartitionError> {
-        use eredu_core::capture::{resolve_slice, CaptureError, CaptureSlicePartition};
+        use eredu_core::capture::{CaptureError, CaptureSlicePartition, resolve_slice};
         let selection =
             plan.plan().selections.get(selection_index).ok_or_else(|| {
                 CaptureError::Invalid("unknown component capture selection".into())
@@ -295,11 +303,42 @@ impl ComponentPartitionLayout {
         components: &[ComponentGroup],
         layout: &LocalModelLayout,
         topology: eredu_core::ParallelRankTopology,
-        owns_parameter_invocation: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+        owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
     ) -> Result<Self, ComponentPartitionError> {
-        let mut groups = BTreeMap::new();
-        let mut paths = BTreeMap::new();
-        let mut observations = BTreeMap::new();
+        Self::from_components_worker(
+            descriptor,
+            components,
+            layout,
+            topology,
+            owns,
+            Destination(None),
+        )
+    }
+
+    fn from_components_worker(
+        descriptor: &ArchitectureDescriptor,
+        components: &[ComponentGroup],
+        layout: &LocalModelLayout,
+        topology: eredu_core::ParallelRankTopology,
+        owns_parameter_invocation: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+        allocation: Destination<'_>,
+    ) -> Result<Self, ComponentPartitionError> {
+        allocation.controls::<(
+            &ArchitectureDescriptor,
+            &[ComponentGroup],
+            &LocalModelLayout,
+            eredu_core::ParallelRankTopology,
+            SourceMap<String, PartitionedComponentGroup>,
+            SourceMap<String, String>,
+            SourceMap<String, PartitionedObservation>,
+            Option<ComponentCoordinateMap>,
+            &str,
+            bool,
+        )>()?;
+        allocation.controls_of(&owns_parameter_invocation)?;
+        let mut groups = SourceMap::new();
+        let mut paths = SourceMap::new();
+        let mut observations = SourceMap::new();
         for component in components {
             // Use the invocation's logical weight, never its shared source alias.
             // Reused checkpoint storage does not transfer execution ownership.
@@ -311,52 +350,62 @@ impl ComponentPartitionLayout {
             let coordinates = if local {
                 let tensor = layout
                     .tensor(weight)
-                    .ok_or_else(|| ComponentPartitionError::MissingWeight(weight.clone()))?;
-                Some(derive_component_coordinates(component, tensor)?)
+                    .ok_or_else(|| allocation.missing(weight))?;
+                Some(coordinates::component_worker(
+                    component, tensor, allocation,
+                )?)
             } else {
                 None
             };
-            if groups
+            if allocation
                 .insert(
-                    component.id.clone(),
+                    &mut groups,
+                    allocation.text(&component.id)?,
                     PartitionedComponentGroup {
-                        coordinates: coordinates.clone(),
+                        coordinates: allocation.optional_coordinates(coordinates.as_ref())?,
                     },
-                )
+                )?
                 .is_some()
             {
-                return Err(ComponentPartitionError::DuplicateIdentity(
-                    component.id.clone(),
-                ));
+                return Err(allocation.duplicate(&component.id));
             }
             for path in [&component.activation, &component.effective_activation]
                 .into_iter()
                 .chain(component.write_input.iter())
             {
-                if paths.insert(path.clone(), component.id.clone()).is_some() {
-                    return Err(ComponentPartitionError::DuplicateIdentity(path.clone()));
+                if allocation
+                    .insert(
+                        &mut paths,
+                        allocation.text(path)?,
+                        allocation.text(&component.id)?,
+                    )?
+                    .is_some()
+                {
+                    return Err(allocation.duplicate(path));
                 }
-                insert_observation(
+                observations::insert(
                     &mut observations,
                     path,
                     PartitionedObservation {
-                        axis: "component".into(),
-                        coordinates: coordinates.clone(),
+                        axis: allocation.text("component")?,
+                        coordinates: allocation.optional_coordinates(coordinates.as_ref())?,
                         exports: local,
                         site: ObservationHookSite::Unit,
                         combination: PartitionCaptureCombination::Disjoint,
                     },
+                    allocation,
                 )?;
             }
             // Shared decoder reads consume the complete normalized hidden axis
             // on each executing TP/EP rank, before scalar projection sharding.
-            replicated_observation(
+            observations::replicated(
                 &mut observations,
                 descriptor,
                 &component.input,
                 "hidden",
                 local,
                 ObservationHookSite::Unit,
+                allocation,
             )?;
             for read in component
                 .reads
@@ -364,18 +413,24 @@ impl ComponentPartitionLayout {
                 .filter(|read| read.projection_output.is_some())
             {
                 if owns_parameter_invocation(&read.weight)? != local {
-                    return Err(ComponentPartitionError::InvalidPlacement(
-                        read.weight.clone(),
-                    ));
+                    return Err(allocation.invalid(&read.weight));
                 }
                 let tensor = if local {
-                    Some(layout.tensor(&read.weight).ok_or_else(|| {
-                        ComponentPartitionError::MissingWeight(read.weight.clone())
-                    })?)
+                    Some(
+                        layout
+                            .tensor(&read.weight)
+                            .ok_or_else(|| allocation.missing(&read.weight))?,
+                    )
                 } else {
                     None
                 };
-                input_projection::insert_read_output(&mut observations, descriptor, read, tensor)?;
+                input_projection::read_worker(
+                    &mut observations,
+                    descriptor,
+                    read,
+                    tensor,
+                    allocation,
+                )?;
             }
             for stage in component
                 .reads
@@ -383,62 +438,65 @@ impl ComponentPartitionLayout {
                 .chain(component.output_gate.iter().map(|gate| &gate.read))
                 .flat_map(|read| &read.input_projections)
             {
-                input_projection::insert_observation(
+                input_projection::stage_worker(
                     &mut observations,
                     descriptor,
                     stage,
                     if local {
-                        Some(layout.tensor(&stage.weight).ok_or_else(|| {
-                            ComponentPartitionError::MissingWeight(stage.weight.clone())
-                        })?)
+                        Some(
+                            layout
+                                .tensor(&stage.weight)
+                                .ok_or_else(|| allocation.missing(&stage.weight))?,
+                        )
                     } else {
                         None
                     },
+                    allocation,
                 )?;
             }
             if component.output_gate.is_some() {
-                output_gate::insert_observations(
+                output_gate::worker(
                     &mut observations,
                     descriptor,
                     component,
                     layout,
                     local,
                     owns_parameter_invocation,
+                    allocation,
                 )?;
             }
             if let Some(stage) = &component.write_input_projection {
                 if owns_parameter_invocation(&component.write_weight)? != local {
-                    return Err(ComponentPartitionError::InvalidPlacement(
-                        component.write_weight.clone(),
-                    ));
+                    return Err(allocation.invalid(&component.write_weight));
                 }
-                output_projection::insert_observations(
+                output_projection::worker(
                     &mut observations,
                     descriptor,
                     component,
                     stage,
                     local.then_some(layout),
+                    allocation,
                 )?;
             }
             for path in component.write_output.iter().chain(component.output.iter()) {
-                replicated_observation(
+                observations::replicated(
                     &mut observations,
                     descriptor,
                     path,
                     "hidden",
                     local,
                     ObservationHookSite::Unit,
+                    allocation,
                 )?;
                 if component.write_partition == ComponentWritePartition::TensorParallelSum
                     && topology.tensor_parallel_size() > 1
                 {
                     if component.output_normalization.is_some() || component.write_bias.is_some() {
-                        return Err(eredu_core::capture::CaptureError::Unsupported(
-                            "additive component write requires an explicit bias-free, unnormalized TP equation".into(),
-                        ).into());
+                        return Err(allocation.capture_unsupported(format_args!("additive component write requires an explicit bias-free, unnormalized TP equation")));
                     }
-                    for name in [path.clone(), format!("{path}.effective")] {
-                        if let Some(placement) = observations.get_mut(&name) {
+                    let effective = allocation.format(format_args!("{path}.effective"))?;
+                    for name in [path.as_str(), effective.as_str()] {
+                        if let Some(placement) = observations.get_mut(name) {
                             placement.combination = PartitionCaptureCombination::SumF64ToF32;
                         }
                     }
@@ -450,7 +508,7 @@ impl ComponentPartitionLayout {
             groups,
             paths,
             observations,
-            routed: BTreeMap::new(),
+            routed: SourceMap::new(),
         })
     }
 
@@ -464,6 +522,40 @@ impl ComponentPartitionLayout {
         publication_owner: usize,
         selected_routed: Option<&crate::SelectedRoutedTextRealization>,
     ) -> Result<Self, ComponentPartitionError> {
+        Self::from_ownership_worker(
+            descriptor,
+            parameters,
+            layout,
+            topology,
+            ownership,
+            owned_groups,
+            publication_owner,
+            selected_routed,
+            Destination(None),
+        )
+    }
+    pub(crate) fn from_ownership_worker(
+        descriptor: &ArchitectureDescriptor,
+        parameters: &ArchitectureParameterDescription,
+        layout: &LocalModelLayout,
+        topology: eredu_core::ParallelRankTopology,
+        ownership: &eredu_runtime::PartitionOwnership,
+        owned_groups: &[crate::partitioned_execution::PartitionedGroupRequirements],
+        publication_owner: usize,
+        selected_routed: Option<&crate::SelectedRoutedTextRealization>,
+        allocation: Destination<'_>,
+    ) -> Result<Self, ComponentPartitionError> {
+        allocation.controls::<(
+            &ArchitectureDescriptor,
+            &ArchitectureParameterDescription,
+            &LocalModelLayout,
+            eredu_core::ParallelRankTopology,
+            &eredu_runtime::PartitionOwnership,
+            &[crate::partitioned_execution::PartitionedGroupRequirements],
+            usize,
+            Option<&crate::SelectedRoutedTextRealization>,
+            Self,
+        )>()?;
         let owns_parameter_invocation = |parameter: &str| {
             let owned = parameters
                 .groups()
@@ -474,61 +566,70 @@ impl ComponentPartitionLayout {
                         .iter()
                         .any(|member| member.target() == parameter)
                 })
-                .ok_or_else(|| ComponentPartitionError::MissingWeight(parameter.into()))?;
+                .ok_or_else(|| allocation.missing(parameter))?;
             Ok::<_, ComponentPartitionError>(owned.owner().is_owned_by(ownership, |group, unit| {
                 owned_groups
                     .iter()
                     .any(|owned| owned.group() == group && owned.units().contains(&unit))
             }))
         };
+        allocation.controls_of(&owns_parameter_invocation)?;
         let Self {
             groups,
             paths,
             mut observations,
             ..
-        } = Self::from_components(
+        } = Self::from_components_worker(
             descriptor,
             &descriptor.components,
             layout,
             topology,
             &owns_parameter_invocation,
+            allocation,
         )?;
-        decoder_invocations::register(&mut observations, descriptor, parameters, |owner| {
-            owner.is_owned_by(ownership, |group, unit| {
-                owned_groups
-                    .iter()
-                    .any(|owned| owned.group() == group && owned.units().contains(&unit))
-            })
-        })?;
-        register_routed_boundaries(
+        decoder_invocations::worker(
+            &mut observations,
+            descriptor,
+            parameters,
+            |owner| {
+                owner.is_owned_by(ownership, |group, unit| {
+                    owned_groups
+                        .iter()
+                        .any(|owned| owned.group() == group && owned.units().contains(&unit))
+                })
+            },
+            allocation,
+        )?;
+        invocations::routed(
             &mut observations,
             descriptor,
             &descriptor.routed_components,
             |node| {
-                let owner = node_invocation_owner(descriptor, parameters, node)?;
+                let owner = invocations::owner(descriptor, parameters, node, allocation)?;
                 Ok(owner.is_owned_by(ownership, |group, unit| {
                     owned_groups
                         .iter()
                         .any(|owned| owned.group() == group && owned.units().contains(&unit))
                 }))
             },
+            allocation,
         )?;
         if let Some(readout) = &descriptor.component_readout {
             if let Some(streams) = &readout.stream_residual {
-                streams::register(
+                streams::worker(
                     &mut observations,
                     descriptor,
                     streams,
                     &owns_parameter_invocation,
                     (ownership.owns_input(), ObservationHookSite::Input),
                     (ownership.owns_output(), ObservationHookSite::Readout),
+                    allocation,
                 )?;
             }
             if readout.logits != eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
-                return Err(eredu_core::capture::CaptureError::Invalid(
-                    "component readout does not name the public final-output seam".into(),
-                )
-                .into());
+                return Err(allocation.capture_invalid(format_args!(
+                    "component readout does not name the public final-output seam"
+                )));
             }
             for normalization in &readout.block_normalizations {
                 let parameter = normalization
@@ -537,27 +638,28 @@ impl ComponentPartitionLayout {
                     .as_ref()
                     .or(normalization.normalization.bias.as_ref())
                     .ok_or_else(|| {
-                        eredu_core::capture::CaptureError::Unsupported(
-                            "block normalization has no parameter-owned invocation".into(),
-                        )
+                        allocation.capture_unsupported(format_args!(
+                            "block normalization has no parameter-owned invocation"
+                        ))
                     })?;
                 // The declared logical parameter retains the invocation owner,
                 // even when its prepared source aliases a shared final gain.
                 let local = owns_parameter_invocation(parameter)?;
                 for path in [&normalization.input, &normalization.output] {
-                    replicated_observation(
+                    observations::replicated(
                         &mut observations,
                         descriptor,
                         path,
                         "hidden",
                         local,
                         ObservationHookSite::Unit,
+                        allocation,
                     )?;
                 }
             }
             for residual in &readout.block_transforms {
                 let invalid = || {
-                    eredu_core::capture::CaptureError::Invalid(format!(
+                    allocation.capture_invalid(format_args!(
                         "block transform has no matching residual invocation: {}",
                         residual.transform_id
                     ))
@@ -595,7 +697,7 @@ impl ComponentPartitionLayout {
                 {
                     return Err(invalid().into());
                 }
-                let owner = node_invocation_owner(descriptor, parameters, &node.id)?;
+                let owner = invocations::owner(descriptor, parameters, &node.id, allocation)?;
                 let local = owner.is_owned_by(ownership, |group, unit| {
                     owned_groups
                         .iter()
@@ -618,17 +720,18 @@ impl ComponentPartitionLayout {
                 } else {
                     &transform.input
                 };
-                replicated_observation(
+                observations::replicated(
                     &mut observations,
                     descriptor,
                     input,
                     "hidden",
                     local,
                     ObservationHookSite::Unit,
+                    allocation,
                 )?;
             }
             for write in &readout.other_writes {
-                let owner = node_invocation_owner(descriptor, parameters, &write.node_id)?;
+                let owner = invocations::owner(descriptor, parameters, &write.node_id, allocation)?;
                 let local = owner.is_owned_by(ownership, |group, unit| {
                     owned_groups
                         .iter()
@@ -638,13 +741,14 @@ impl ComponentPartitionLayout {
                     .into_iter()
                     .chain(write.input.iter())
                 {
-                    replicated_observation(
+                    observations::replicated(
                         &mut observations,
                         descriptor,
                         path,
                         "hidden",
                         local,
                         ObservationHookSite::Unit,
+                        allocation,
                     )?;
                 }
                 // A declared residual-add invocation also owns its incoming and
@@ -662,57 +766,62 @@ impl ComponentPartitionLayout {
                                 .as_ref()
                                 .is_some_and(|axes| axes.iter().any(|axis| axis.name == "hidden"))
                     }) {
-                        replicated_observation(
+                        observations::replicated(
                             &mut observations,
                             descriptor,
                             &point.path,
                             "hidden",
                             local,
                             ObservationHookSite::Unit,
+                            allocation,
                         )?;
                     }
                 }
             }
             // Invocation ownership is distinct from tied parameter storage:
             // the output stage may store embeddings without executing lookup.
-            replicated_observation(
+            observations::replicated(
                 &mut observations,
                 descriptor,
                 &readout.embedding,
                 "hidden",
                 ownership.owns_input(),
                 ObservationHookSite::Input,
+                allocation,
             )?;
             for path in [&readout.residual, &readout.normalized]
                 .into_iter()
                 .chain(readout.projection_input.iter())
             {
-                replicated_observation(
+                observations::replicated(
                     &mut observations,
                     descriptor,
                     path,
                     "hidden",
                     ownership.owns_output(),
                     ObservationHookSite::Readout,
+                    allocation,
                 )?;
             }
             // The shared vocabulary projection completes its global gather
             // before emitting this affine score, on each output-stage rank.
-            replicated_observation(
+            observations::replicated(
                 &mut observations,
                 descriptor,
                 &readout.linear_scores,
                 "vocabulary",
                 ownership.owns_output(),
                 ObservationHookSite::Readout,
+                allocation,
             )?;
         }
-        transforms::register(
+        transforms::worker(
             &mut observations,
             descriptor,
             layout,
             eredu_core::speculative::SpeculativeCaptureScope::Target,
             &owns_parameter_invocation,
+            allocation,
         )?;
         // Final publication belongs to the executor independently of whether
         // this family has declared component decomposition or readout equations.
@@ -722,36 +831,37 @@ impl ComponentPartitionLayout {
             .iter()
             .any(|point| point.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
         {
-            replicated_observation(
+            observations::replicated(
                 &mut observations,
                 descriptor,
                 eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
                 "vocabulary",
                 ownership.owns_output(),
                 ObservationHookSite::Publication,
+                allocation,
             )?;
             let logits = observations
                 .get_mut(eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
                 .expect("registered logits");
             logits.exports = topology.global_rank() == publication_owner;
             if logits.exports && logits.coordinates.is_none() {
-                return Err(eredu_core::capture::CaptureError::Invalid(
-                    "publication owner has no final-output invocation".into(),
-                )
-                .into());
+                return Err(allocation.capture_invalid(format_args!(
+                    "publication owner has no final-output invocation"
+                )));
             }
         }
         let routed = if let Some(selected) = selected_routed {
-            routed::placement::derive_observations(
+            routed::placement::worker(
                 descriptor,
                 parameters,
                 layout,
                 topology,
                 owned_groups,
                 selected,
+                allocation,
             )?
         } else {
-            BTreeMap::new()
+            SourceMap::new()
         };
         Ok(Self {
             topology,
@@ -955,141 +1065,53 @@ impl eredu_runtime::intervention::PartitionActivationLayout for ComponentPartiti
 /// Join a semantic operator to its logical parameter namespaces. The complete
 /// residual write executes at that unit, independently of shared source storage.
 fn register_routed_boundaries(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     components: &[eredu_core::component::RoutedComponentGroup],
-    owns_node: impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+    owns: impl Fn(&str) -> Result<bool, ComponentPartitionError>,
 ) -> Result<(), ComponentPartitionError> {
-    for component in components {
-        for (input, width) in component
-            .input
-            .iter()
-            .map(|path| (path, component.input_width))
-            .chain(
-                component
-                    .write_output
-                    .iter()
-                    .chain(component.output.iter())
-                    .map(|path| (path, component.output_width)),
-            )
-        {
-            let point = descriptor
-                .observations
-                .points
-                .iter()
-                .find(|point| point.path == *input)
-                .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(input.clone()))?;
-            if !point.axes.as_ref().is_some_and(|axes| {
-                axes.iter().any(|axis| {
-                    axis.name == "hidden"
-                        && axis.dimension == eredu_core::SymbolicDimension::Known(width)
-                })
-            }) {
-                return Err(ComponentPartitionError::InvalidPlacement(
-                    component.id.clone(),
-                ));
-            }
-            replicated_observation(
-                observations,
-                descriptor,
-                input,
-                "hidden",
-                owns_node(&point.node_id)?,
-                ObservationHookSite::Unit,
-            )?;
-        }
-    }
-    Ok(())
+    invocations::routed(
+        observations,
+        descriptor,
+        components,
+        owns,
+        Destination(None),
+    )
 }
-
 fn node_invocation_owner<'a>(
     descriptor: &ArchitectureDescriptor,
     parameters: &'a ArchitectureParameterDescription,
-    node_id: &str,
+    node: &str,
 ) -> Result<&'a eredu_runtime::ParameterGroupOwner, ComponentPartitionError> {
-    use eredu_core::capture::CaptureError;
-    let invalid = || {
-        CaptureError::Invalid(format!(
-            "residual write has no unique unit owner: {node_id}"
-        ))
-    };
-    let node = descriptor
-        .nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .ok_or_else(invalid)?;
-    let mut owner = None;
-    for group_id in &node.parameter_groups {
-        let group = descriptor
-            .parameter_groups
-            .iter()
-            .find(|group| &group.id == group_id)
-            .ok_or_else(invalid)?;
-        let mut matched = false;
-        for owned in parameters.groups().iter().filter(|owned| {
-            owned.members().iter().any(|member| {
-                member
-                    .target()
-                    .strip_prefix(&group.canonical_prefix)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-            })
-        }) {
-            matched = true;
-            if !matches!(
-                owned.owner(),
-                eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. }
-            ) || owner.is_some_and(|previous| previous != owned.owner())
-            {
-                return Err(invalid().into());
-            }
-            owner = Some(owned.owner());
-        }
-        if !matched {
-            return Err(invalid().into());
-        }
-    }
-    owner.ok_or_else(|| invalid().into())
+    invocations::owner(descriptor, parameters, node, Destination(None))
 }
+mod invocations;
 
 fn insert_observation(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     path: &str,
     placement: PartitionedObservation,
 ) -> Result<(), ComponentPartitionError> {
-    match observations.entry(path.into()) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(placement);
-            Ok(())
-        }
-        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &placement => Ok(()),
-        _ => Err(ComponentPartitionError::DuplicateIdentity(path.into())),
-    }
+    observations::insert(observations, path, placement, Destination(None))
 }
-
 fn replicated_observation(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     path: &str,
     axis: &str,
     local: bool,
     site: ObservationHookSite,
 ) -> Result<(), ComponentPartitionError> {
-    let placement = replicated_placement(descriptor, path, axis, local, site)?;
-    insert_observation(observations, path, placement.clone())?;
-    let effective = format!("{path}.effective");
-    if descriptor
-        .observations
-        .points
-        .iter()
-        .any(|point| point.path == effective)
-    {
-        insert_observation(observations, &effective, placement)?;
-    }
-    Ok(())
+    observations::replicated(
+        observations,
+        descriptor,
+        path,
+        axis,
+        local,
+        site,
+        Destination(None),
+    )
 }
-
-// Project exactly one declared point. Callers choose whether an explicit
-// original/effective convention or exact node bindings establish other points.
 fn replicated_placement(
     descriptor: &ArchitectureDescriptor,
     path: &str,
@@ -1097,41 +1119,9 @@ fn replicated_placement(
     local: bool,
     site: ObservationHookSite,
 ) -> Result<PartitionedObservation, ComponentPartitionError> {
-    use eredu_core::{capture::CaptureError, SymbolicDimension};
-    let point = descriptor
-        .observations
-        .points
-        .iter()
-        .find(|point| point.path == path)
-        .ok_or_else(|| CaptureError::MissingPath(path.into()))?;
-    let axes = point
-        .axes
-        .as_ref()
-        .ok_or_else(|| CaptureError::Unsupported("replicated observation has no axes".into()))?;
-    let mut matching = axes.iter().filter(|candidate| candidate.name == axis);
-    let Some(eredu_core::TensorAxis {
-        dimension: SymbolicDimension::Known(width),
-        ..
-    }) = matching.next()
-    else {
-        return Err(
-            CaptureError::Invalid("replicated observation width is unresolved".into()).into(),
-        );
-    };
-    if matching.next().is_some() {
-        return Err(CaptureError::Invalid("replicated observation axis is repeated".into()).into());
-    }
-    let coordinates = local
-        .then(|| ComponentCoordinateMap::range(*width, 0..*width))
-        .transpose()?;
-    Ok(PartitionedObservation {
-        axis: axis.into(),
-        coordinates,
-        exports: local,
-        site,
-        combination: PartitionCaptureCombination::Disjoint,
-    })
+    observations::placement(descriptor, path, axis, local, site, Destination(None))
 }
+mod observations;
 
 /// A complete replicated observation, with one authoritative existing producer.
 /// This describes architecture placement only; it grants no native transform,
@@ -1145,11 +1135,17 @@ pub struct CompletePartitionCaptureSource {
 }
 impl CompletePartitionCaptureSource {
     /// Lowest exporting world rank, following the ordinary replica rule.
-    pub const fn producer(self) -> usize { self.producer }
+    pub const fn producer(self) -> usize {
+        self.producer
+    }
     /// Whether every rank actually executes this complete observation hook.
-    pub const fn has_world_hooks(self) -> bool { self.hook_members == self.world_size }
+    pub const fn has_world_hooks(self) -> bool {
+        self.hook_members == self.world_size
+    }
     /// Declared ordinary hook category, including explicit output publication.
-    pub const fn site(self) -> ObservationHookSite { self.site }
+    pub const fn site(self) -> ObservationHookSite {
+        self.site
+    }
 }
 
 /// Reusable, architecture-derived scalar layouts for one complete topology.
@@ -1161,19 +1157,19 @@ pub struct ComponentPartitionLayouts {
 }
 
 impl ComponentPartitionLayouts {
-    pub(crate) fn new(
+    pub(crate) fn new(topology:eredu_core::ParallelTopology,layouts:Vec<ComponentPartitionLayout>)->Result<Self,ComponentPartitionError>{Self::new_worker(topology,layouts,Destination(None))}
+    pub(crate) fn new_worker(
         topology: eredu_core::ParallelTopology,
         layouts: Vec<ComponentPartitionLayout>,
+        allocation:Destination<'_>,
     ) -> Result<Self, ComponentPartitionError> {
+        allocation.controls::<(eredu_core::ParallelTopology,Vec<ComponentPartitionLayout>,Self)>()?;
         if layouts.len() != topology.world_size()
             || layouts.iter().enumerate().any(|(rank, layout)| {
                 layout.topology.global_rank() != rank || layout.topology.topology() != topology
             })
         {
-            return Err(eredu_core::capture::CaptureError::Invalid(
-                "component layouts do not match the complete rank topology".into(),
-            )
-            .into());
+            return Err(allocation.capture_invalid(format_args!("component layouts do not match the complete rank topology")));
         }
         Ok(Self { topology, layouts })
     }
@@ -1212,7 +1208,8 @@ impl ComponentPartitionLayouts {
         &self,
         path: &str,
     ) -> Result<PartitionCaptureCombination, eredu_core::capture::CaptureError> {
-        self.capture_combination_source(path).map_err(|error| error.legacy(path))
+        self.capture_combination_source(path)
+            .map_err(|error| error.legacy(path))
     }
 
     /// Combines semantic placement with hook coverage from the actual executor.
@@ -1222,17 +1219,29 @@ impl ComponentPartitionLayouts {
         path: &str,
         hooks: eredu_runtime::inspection::ObservationHookSupport,
     ) -> eredu_core::ObservationSupportStatus {
+        self.capture_hook_support_source(path, hooks,
+            eredu_core::capture::CaptureSourceConstruction::new(None))
+            .expect("ordinary capture hook support")
+    }
+
+    /// Same hook predicate with prospective diagnostic construction. The caller
+    /// retains the construction account around the enclosing source and errors.
+    pub fn capture_hook_support_source(
+        &self, path: &str, hooks: eredu_runtime::inspection::ObservationHookSupport,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
+        use eredu_core::ObservationSupportStatus as S;
+        construction.controls(std::mem::size_of::<(&Self, &str,
+            eredu_runtime::inspection::ObservationHookSupport, Option<ObservationHookSite>, S)>())?;
         let Some(site) = self.observation_site(path) else {
-            return eredu_core::ObservationSupportStatus::Unverified(
-                "global observation ownership is not yet implemented for this point".into(),
-            );
+            return Ok(S::Unverified(construction.text(
+                "global observation ownership is not yet implemented for this point")?));
         };
         if !hooks.supports(site) {
-            return eredu_core::ObservationSupportStatus::Unverified(
-                "selected architecture and executor do not declare the required internal observation hook".into(),
-            );
+            return Ok(S::Unverified(construction.text(
+                "selected architecture and executor do not declare the required internal observation hook")?));
         }
-        eredu_core::ObservationSupportStatus::Supported
+        Ok(S::Supported)
     }
 
     /// Selects the same producer as `capture_producers` when every executing
@@ -1248,21 +1257,36 @@ impl ComponentPartitionLayouts {
         for (rank, layout) in self.layouts.iter().enumerate() {
             let point = layout.observation(path)?;
             if point.combination() != PartitionCaptureCombination::Disjoint
-                || site.is_some_and(|prior| prior != point.site()) { return None; }
+                || site.is_some_and(|prior| prior != point.site())
+            {
+                return None;
+            }
             site = Some(point.site());
             let Some(map) = point.coordinates() else {
-                if point.exports() { return None; }
+                if point.exports() {
+                    return None;
+                }
                 continue;
             };
             if map.contiguous_range() != Some(0..map.global_count())
                 || width.is_some_and(|prior| prior != map.global_count())
-                || axis.is_some_and(|prior| prior != point.axis()) { return None; }
-            width = Some(map.global_count()); axis = Some(point.axis());
+                || axis.is_some_and(|prior| prior != point.axis())
+            {
+                return None;
+            }
+            width = Some(map.global_count());
+            axis = Some(point.axis());
             hook_members = hook_members.checked_add(1)?;
-            if point.exports() && producer.is_none() { producer = Some(rank); }
+            if point.exports() && producer.is_none() {
+                producer = Some(rank);
+            }
         }
-        Some(CompletePartitionCaptureSource { producer: producer?, hook_members,
-            world_size: self.topology.world_size(), site: site? })
+        Some(CompletePartitionCaptureSource {
+            producer: producer?,
+            hook_members,
+            world_size: self.topology.world_size(),
+            site: site?,
+        })
     }
 
     /// Fixed control values for one borrowed complete-source lookup. The
@@ -1272,38 +1296,65 @@ impl ComponentPartitionLayouts {
         use std::mem::{size_of, size_of_val};
         let parts = [
             size_of::<(&Self, &str)>(),
-            size_of::<(Option<ObservationHookSite>, Option<usize>, Option<usize>, Option<&str>, usize)>(),
+            size_of::<(
+                Option<ObservationHookSite>,
+                Option<usize>,
+                Option<usize>,
+                Option<&str>,
+                usize,
+            )>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, ComponentPartitionLayout>>>(),
             size_of::<Option<(usize, &ComponentPartitionLayout)>>(),
             size_of::<Option<&PartitionedObservation>>(),
             size_of::<Option<&ComponentCoordinateMap>>(),
-            size_of::<(Option<std::ops::Range<usize>>, Option<std::ops::Range<usize>>)>(),
-            size_of::<(Option<CompletePartitionCaptureSource>, CompletePartitionCaptureSource)>(),
-            size_of::<(&ComponentPartitionLayout, &PartitionedObservation, &ComponentCoordinateMap, &str)>(),
-            size_of::<(Option<usize>, bool, PartitionCaptureCombination, ObservationHookSite)>(),
+            size_of::<(
+                Option<std::ops::Range<usize>>,
+                Option<std::ops::Range<usize>>,
+            )>(),
+            size_of::<(
+                Option<CompletePartitionCaptureSource>,
+                CompletePartitionCaptureSource,
+            )>(),
+            size_of::<(
+                &ComponentPartitionLayout,
+                &PartitionedObservation,
+                &ComponentCoordinateMap,
+                &str,
+            )>(),
+            size_of::<(
+                Option<usize>,
+                bool,
+                PartitionCaptureCombination,
+                ObservationHookSite,
+            )>(),
         ];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// All ranks that execute a declared component observation, including
     /// replicas. Unknown observation axes have no component placement.
     pub fn capture_hook_members(&self, path: &str) -> Option<Vec<usize>> {
-        self.observation_site(path)?;
-        Some(
-            self.layouts
-                .iter()
-                .enumerate()
-                .filter_map(|(rank, layout)| {
-                    let local = layout
-                        .observation(path)
-                        .is_some_and(|point| point.coordinates().is_some())
-                        || layout
-                            .routed_observation(path)
-                            .is_some_and(|point| point.ownership().is_some());
-                    local.then_some(rank)
-                })
-                .collect(),
-        )
+        self.capture_hook_members_source(path, eredu_core::capture::CaptureSourceConstruction::new(None))
+            .expect("ordinary capture hook members")
+    }
+
+    /// Same retained membership selection with exact prospective destination.
+    pub fn capture_hook_members_source(&self, path: &str,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<Option<Vec<usize>>, eredu_core::capture::CaptureError> {
+        construction.controls(std::mem::size_of::<(&Self, &str, Option<ObservationHookSite>, Vec<usize>)>())?;
+        if self.observation_site(path).is_none() { return Ok(None); }
+        let local = |layout: &ComponentPartitionLayout| {
+            layout.observation(path).is_some_and(|point| point.coordinates().is_some())
+                || layout.routed_observation(path).is_some_and(|point| point.ownership().is_some())
+        };
+        let mut result = construction.vector(self.layouts.iter().filter(|layout| local(layout)).count())?;
+        for (rank, layout) in self.layouts.iter().enumerate() {
+            if local(layout) { result.push(rank); }
+        }
+        Ok(Some(result))
     }
 
     /// Compiles bounded expected producers for one global scalar selection.
@@ -1529,156 +1580,56 @@ impl eredu_runtime::capture::partition::PartitionCaptureLayout for ComponentPart
 }
 
 /// Derives the actual scalar input axis of an architecture-declared write matrix.
-/// Semantic units determine scalar offsets even when physical columns are packed.
 /// Pipeline invocation ownership must be established separately by the caller.
 pub fn derive_component_coordinates(
     component: &ComponentGroup,
     tensor: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    if let Some(stage) = &component.write_input_projection {
-        return output_projection::component_coordinates(component.count, stage, tensor);
-    }
-    derive_write_coordinates(&component.write_weight, component.count, tensor)
+    coordinates::component_worker(component, tensor, Destination(None))
 }
-
 fn derive_write_coordinates(
     name: &str,
     count: usize,
     tensor: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    derive_matrix_axis_coordinates(name, count, tensor, 1)
+    coordinates::write_worker(name, count, tensor, Destination(None))
 }
-
 fn derive_matrix_axis_coordinates(
     name: &str,
     count: usize,
     tensor: &LocalTensorLayout,
     axis: usize,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    if tensor.global_shape().len() != 2 || axis >= 2 {
-        return Err(ComponentPartitionError::InvalidPlacement(name.into()));
-    }
-    derive_tensor_axis_coordinates(name, count, tensor, axis)
+    coordinates::matrix_worker(name, count, tensor, axis, Destination(None))
 }
-
 fn derive_tensor_axis_coordinates(
     name: &str,
     count: usize,
     tensor: &LocalTensorLayout,
     axis: usize,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(name.into());
-    let global = tensor.global_shape();
-    let local = tensor.local_shape();
-    if axis >= global.len()
-        || global.len() != local.len()
-        || global.contains(&0)
-        || local.contains(&0)
-        || global
-            .iter()
-            .zip(local)
-            .enumerate()
-            .any(|(index, (global, local))| index != axis && global != local)
-        || !tensor.additional_placements().is_empty()
-    {
-        return Err(invalid());
-    }
-    let full = || ComponentCoordinateMap::range(count, 0..count).map_err(Into::into);
-    match tensor.placement() {
-        TensorPlacement::Replicated | TensorPlacement::Local if global == local => full(),
-        TensorPlacement::Range {
-            axis: selected_axis,
-            start,
-            end,
-        } if *selected_axis == axis
-            && start <= end
-            && *end <= global[axis]
-            && end - start == local[axis] =>
-        {
-            let units = tensor.logical_units().ok_or_else(invalid)?;
-            let range = tensor.logical_range().ok_or_else(invalid)?;
-            if let Some(chunk) = tensor.partition_chunk_size() {
-                if chunk == 0 || global[axis].div_ceil(chunk) != units {
-                    return Err(invalid());
-                }
-                let physical =
-                    eredu_runtime::partition_chunk_range(global[axis], chunk, range.clone())
-                        .map_err(|_| invalid())?;
-                if physical != (*start..*end) {
-                    return Err(invalid());
-                }
-                // FP8 retains one physical code per component. A short final
-                // chunk therefore maps directly, without uniform-unit rounding.
-                if global[axis] == count {
-                    return ComponentCoordinateMap::range(count, physical).map_err(Into::into);
-                }
-                // Packed columns can use uniform semantic units only when
-                // every physical chunk is complete. Partial packed encodings
-                // need a separately declared scalar layout.
-                if global[axis].is_multiple_of(chunk) {
-                    return ComponentCoordinateMap::partition_units(count, units, range.clone())
-                        .map_err(Into::into);
-                }
-                return Err(invalid());
-            }
-            // Verify the physical selection agrees with the retained semantic
-            // units before expanding them to scalar component coordinates.
-            if units == 0
-                || !global[axis].is_multiple_of(units)
-                || range.start > range.end
-                || range.end > units
-            {
-                return Err(invalid());
-            }
-            let physical_per_unit = global[axis] / units;
-            if *start != range.start * physical_per_unit || *end != range.end * physical_per_unit {
-                return Err(invalid());
-            }
-            ComponentCoordinateMap::partition_units(count, units, range.clone()).map_err(Into::into)
-        }
-        TensorPlacement::Shard {
-            axis: selected_axis,
-            index,
-            parts,
-        } if *selected_axis == axis
-            && *parts > 0
-            && index < parts
-            && global[axis].is_multiple_of(*parts)
-            && local[axis] == global[axis] / parts =>
-        {
-            let units = tensor.logical_units().ok_or_else(invalid)?;
-            let range = tensor.logical_range().ok_or_else(invalid)?;
-            if units == 0
-                || !units.is_multiple_of(*parts)
-                || !global[axis].is_multiple_of(units)
-                || range != &(index * (units / parts)..(index + 1) * (units / parts))
-            {
-                return Err(invalid());
-            }
-            ComponentCoordinateMap::partition_units(count, units, range.clone()).map_err(Into::into)
-        }
-        // An indexed physical axis is a scalar axis only when unpacked. Packed
-        // layouts need an explicit semantic index map, not multiplication guesses.
-        TensorPlacement::Indices {
-            axis: selected_axis,
-            indices,
-        } if *selected_axis == axis && global[axis] == count && local[axis] == indices.len() => {
-            ComponentCoordinateMap::indices(count, indices.clone()).map_err(Into::into)
-        }
-        _ => Err(invalid()),
-    }
+    coordinates::tensor_worker(name, count, tensor, axis, Destination(None))
 }
+mod coordinates;
 
 /// Component declarations and retained placement do not form an exact map.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ComponentPartitionError {
+    /// The actual source account refused a prospective destination.
+    #[error("{0}")]
+    MetadataFunding(#[from] eredu_core::HostMetadataFundingError),
+    /// The host allocator rejected an admitted destination.
+    #[error("component source allocation: {0}")]
+    MetadataAllocation(#[from] std::collections::TryReserveError),
+    /// An allocator returned a capacity outside its qualified request.
+    #[error("component source capacity differs from its request")]
+    MetadataCapacity,
+
     /// The global capture admission cannot project onto this component layout.
-    #[error(transparent)]
+    #[error("{0}")]
     Capture(#[from] eredu_core::capture::CaptureError),
     /// A logical invocation has no declared output projection.
-    #[error(
-        "component projection weight {0:?} is absent from the parameter description or layout"
-    )]
+    #[error("component projection weight {0:?} is absent from the parameter description or layout")]
     MissingWeight(String),
     /// A group or observation path is declared more than once.
     #[error("component identity {0:?} is repeated")]
@@ -1687,7 +1638,7 @@ pub enum ComponentPartitionError {
     #[error("projection weight {0:?} has no exact scalar component placement")]
     InvalidPlacement(String),
     /// The architecture's scalar axis or mask is malformed.
-    #[error(transparent)]
+    #[error("{0}")]
     Coordinates(#[from] eredu_core::component::ComponentCoordinateError),
     /// Parallel layout could not be derived from the supplied parameter description.
     #[error("component parameter layout: {0}")]
@@ -1723,7 +1674,7 @@ mod tests {
         let parameters = crate::deepseek::parallel::v4_parameter_description(&args).unwrap();
         assert_eq!(descriptor.routed_components.len(), 2);
         for stage in 0..2 {
-            let mut observations = BTreeMap::new();
+            let mut observations = SourceMap::new();
             register_routed_boundaries(
                 &mut observations,
                 &descriptor,
@@ -1758,7 +1709,7 @@ mod tests {
         let mut invalid = descriptor.routed_components.clone();
         invalid[0].input = Some("readout.embedding".into());
         assert!(
-            register_routed_boundaries(&mut BTreeMap::new(), &descriptor, &invalid, |node| {
+            register_routed_boundaries(&mut SourceMap::new(), &descriptor, &invalid, |node| {
                 node_invocation_owner(&descriptor, &parameters, node).map(|_| true)
             },)
             .is_err()
@@ -1938,7 +1889,7 @@ mod tests {
                 let start = rank.tensor_parallel_rank() * 128;
                 ComponentPartitionLayout {
                     topology: rank,
-                    groups: BTreeMap::from([(
+                    groups: SourceMap::from([(
                         "units".into(),
                         PartitionedComponentGroup {
                             coordinates: Some(
@@ -1946,9 +1897,9 @@ mod tests {
                             ),
                         },
                     )]),
-                    paths: BTreeMap::from([("units".into(), "units".into())]),
-                    routed: BTreeMap::new(),
-                    observations: BTreeMap::from([(
+                    paths: SourceMap::from([("units".into(), "units".into())]),
+                    routed: SourceMap::new(),
+                    observations: SourceMap::from([(
                         "units".into(),
                         PartitionedObservation {
                             axis: "component".into(),
@@ -2033,15 +1984,34 @@ mod tests {
                 point.site = ObservationHookSite::Publication;
                 point.exports = rank == 2;
             }
-            let members = publication.activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4).unwrap();
-            assert_eq!(members.iter().map(|member| member.rank).collect::<Vec<_>>(), [2]);
+            let members = publication
+                .activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4)
+                .unwrap();
+            assert_eq!(
+                members.iter().map(|member| member.rank).collect::<Vec<_>>(),
+                [2]
+            );
             assert_eq!(members[0].projection.local_shape(), [2, 256]);
-            assert_eq!(publication.activation_region_bound(&plan, 0, 4, 4).unwrap(), 1);
-            assert!(publication.complete_capture_source("units").unwrap().has_world_hooks());
+            assert_eq!(
+                publication.activation_region_bound(&plan, 0, 4, 4).unwrap(),
+                1
+            );
+            assert!(
+                publication
+                    .complete_capture_source("units")
+                    .unwrap()
+                    .has_world_hooks()
+            );
             for layout in &mut publication.layouts {
                 layout.observations.get_mut("units").unwrap().site = ObservationHookSite::Unit;
             }
-            assert_eq!(publication.activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4).unwrap().len(), 4);
+            assert_eq!(
+                publication
+                    .activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4)
+                    .unwrap()
+                    .len(),
+                4
+            );
             let scoped = plan
                 .plan()
                 .clone()
@@ -2071,13 +2041,17 @@ mod tests {
                     .activation_members_at(&scoped, 0, CapturePhase::Decode, 4, invocation, 4, 4)
                     .unwrap();
                 assert_eq!(members.len(), 4);
-                assert!(members
-                    .iter()
-                    .all(|member| member.projection.local_shape() == [rows, 128]));
+                assert!(
+                    members
+                        .iter()
+                        .all(|member| member.projection.local_shape() == [rows, 128])
+                );
             }
-            assert!(layouts
-                .activation_members(&scoped, 0, CapturePhase::Decode, 4, 4, 4)
-                .is_err());
+            assert!(
+                layouts
+                    .activation_members(&scoped, 0, CapturePhase::Decode, 4, 4, 4)
+                    .is_err()
+            );
             let mut additive = layouts.clone();
             for layout in &mut additive.layouts {
                 let point = layout.observations.get_mut("units").unwrap();
@@ -2132,9 +2106,11 @@ mod tests {
                 .get_mut("units")
                 .unwrap()
                 .coordinates = None;
-            assert!(additive
-                .activation_members(&add_plan, 0, CapturePhase::Prefill, 0, 4, 4)
-                .is_err());
+            assert!(
+                additive
+                    .activation_members(&add_plan, 0, CapturePhase::Prefill, 0, 4, 4)
+                    .is_err()
+            );
             for (phase, prediction, rows) in
                 [(CapturePhase::Prefill, 0, 2), (CapturePhase::Decode, 1, 1)]
             {
@@ -2149,12 +2125,16 @@ mod tests {
                     assert_eq!(member.projection.local_shape(), [rows, 128]);
                     assert_eq!(member.projection.region_count(), 1);
                 }
-                assert!(layouts
-                    .activation_members(&plan, 0, phase, prediction, 3, 4)
-                    .is_err());
-                assert!(layouts
-                    .activation_members(&plan, 0, phase, prediction, 4, 3)
-                    .is_err());
+                assert!(
+                    layouts
+                        .activation_members(&plan, 0, phase, prediction, 3, 4)
+                        .is_err()
+                );
+                assert!(
+                    layouts
+                        .activation_members(&plan, 0, phase, prediction, 4, 3)
+                        .is_err()
+                );
                 let mut replicas = layouts.clone();
                 for rank in &mut replicas.layouts {
                     rank.observations.get_mut("units").unwrap().exports = false;
@@ -2181,18 +2161,22 @@ mod tests {
                         .collect::<Vec<_>>(),
                     [0, 2, 3]
                 );
-                assert!(replicas
-                    .rank(1)
-                    .unwrap()
-                    .project_intervention(&plan, 0, phase, prediction, 4)
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    replicas
+                        .rank(1)
+                        .unwrap()
+                        .project_intervention(&plan, 0, phase, prediction, 4)
+                        .unwrap()
+                        .is_none()
+                );
                 for rank in &mut replicas.layouts {
                     rank.observations.get_mut("units").unwrap().coordinates = None;
                 }
-                assert!(replicas
-                    .activation_members(&plan, 0, phase, prediction, 4, 4)
-                    .is_err());
+                assert!(
+                    replicas
+                        .activation_members(&plan, 0, phase, prediction, 4, 4)
+                        .is_err()
+                );
             }
         }
         // Complete geometric ownership alone cannot enable a callback that the
@@ -2329,21 +2313,36 @@ mod tests {
                     .capture_placement_at(&scoped, 0, CapturePhase::Decode, 4, invocation, limits)
                     .unwrap();
                 assert_eq!(projected.hook_members, [0, 1, 2, 3]);
-                assert!(projected
-                    .source_shapes
-                    .iter()
-                    .all(|shape| shape == &[rows, 128]));
-                assert!(projected
-                    .producers
-                    .iter()
-                    .all(|producer| producer.projection.global_shape() == [rows, 256]));
-                assert!(layouts
-                    .capture_placement_at(&plan, 0, CapturePhase::Prefill, 0, invocation, limits)
-                    .is_err());
+                assert!(
+                    projected
+                        .source_shapes
+                        .iter()
+                        .all(|shape| shape == &[rows, 128])
+                );
+                assert!(
+                    projected
+                        .producers
+                        .iter()
+                        .all(|producer| producer.projection.global_shape() == [rows, 256])
+                );
+                assert!(
+                    layouts
+                        .capture_placement_at(
+                            &plan,
+                            0,
+                            CapturePhase::Prefill,
+                            0,
+                            invocation,
+                            limits
+                        )
+                        .is_err()
+                );
             }
-            assert!(layouts
-                .capture_placement(&scoped, 0, CapturePhase::Decode, 4, limits)
-                .is_err());
+            assert!(
+                layouts
+                    .capture_placement(&scoped, 0, CapturePhase::Decode, 4, limits)
+                    .is_err()
+            );
             let request = |max_producers, max_fragments| ComponentCaptureProjectionRequest {
                 invocation: None,
                 plan: &plan,
@@ -2360,12 +2359,25 @@ mod tests {
             assert_eq!(contiguous.axis(), "component");
             assert_eq!(contiguous.width(), 256);
             assert_eq!(contiguous.producer_count(), producers.len());
-            assert_eq!((0..contiguous.world_size()).filter_map(|rank| contiguous.rank(rank))
-                .filter(|row| row.produces).map(|row| row.rank).collect::<Vec<_>>(),
-                producers.iter().map(|row| row.rank).collect::<Vec<_>>());
+            assert_eq!(
+                (0..contiguous.world_size())
+                    .filter_map(|rank| contiguous.rank(rank))
+                    .filter(|row| row.produces)
+                    .map(|row| row.rank)
+                    .collect::<Vec<_>>(),
+                producers.iter().map(|row| row.rank).collect::<Vec<_>>()
+            );
             for rank in 0..contiguous.world_size() {
-                assert_eq!(contiguous.rank(rank).unwrap().coordinates,
-                    layouts.layouts[rank].observation("units").unwrap().coordinates().unwrap().contiguous_range().unwrap());
+                assert_eq!(
+                    contiguous.rank(rank).unwrap().coordinates,
+                    layouts.layouts[rank]
+                        .observation("units")
+                        .unwrap()
+                        .coordinates()
+                        .unwrap()
+                        .contiguous_range()
+                        .unwrap()
+                );
             }
             // Selection-empty sources remain explicit producers. Their actual
             // tensor source is not confused with an absent local invocation.
@@ -2390,13 +2402,24 @@ mod tests {
                 [0, 2],
                 "retain every TP term but eliminate EP replicas"
             );
-            assert!(terms
-                .iter()
-                .all(|term| term.projection.local_shape() == [2, 256]));
+            assert!(
+                terms
+                    .iter()
+                    .all(|term| term.projection.local_shape() == [2, 256])
+            );
             let source = additive.contiguous_capture_source("units").unwrap();
-            assert_eq!(source.combination(), PartitionCaptureCombination::SumF64ToF32);
-            assert_eq!((0..source.world_size()).filter_map(|rank| source.rank(rank))
-                .filter(|row| row.produces).map(|row| row.rank).collect::<Vec<_>>(), [0, 2]);
+            assert_eq!(
+                source.combination(),
+                PartitionCaptureCombination::SumF64ToF32
+            );
+            assert_eq!(
+                (0..source.world_size())
+                    .filter_map(|rank| source.rank(rank))
+                    .filter(|row| row.produces)
+                    .map(|row| row.rank)
+                    .collect::<Vec<_>>(),
+                [0, 2]
+            );
             assert!(additive.capture_producers(request(1, 2)).is_err());
             additive.layouts[1]
                 .observations
@@ -2404,8 +2427,10 @@ mod tests {
                 .unwrap()
                 .coordinates = None;
             assert!(additive.capture_producers(request(2, 2)).is_err());
-            assert_eq!(additive.contiguous_capture_source("units").unwrap_err(),
-                PartitionCaptureSourceError::AdditiveGroup);
+            assert_eq!(
+                additive.contiguous_capture_source("units").unwrap_err(),
+                PartitionCaptureSourceError::AdditiveGroup
+            );
             additive.layouts[1]
                 .observations
                 .get_mut("units")
@@ -2510,7 +2535,7 @@ mod tests {
                 forward_epoch: 1,
             };
             PartitionCaptureReceiptPlan::new(
-                plan,
+                eredu_core::capture::SharedCapturePlan::new(plan),
                 context,
                 producers,
                 topology.world_size(),

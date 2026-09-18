@@ -314,6 +314,7 @@ impl CompletedOriginalModelInput {
             controlled_attribution: None,
             prepared_capture: None,
             original_media: Some(input::OriginalMediaPacket::original(self.clone())),
+            placement_semantics: None,
             cache_identity: Some(self.body.cache().expect("complete B cache").clone()),
             prefill_chunk_positions: chunk,
             inference_request: request,

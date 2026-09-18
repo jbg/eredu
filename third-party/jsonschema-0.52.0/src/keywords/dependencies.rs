@@ -23,42 +23,55 @@ impl DependenciesValidator {
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
         if let Value::Object(map) = schema {
-            let kctx = ctx.new_at_location("dependencies");
-            let mut dependencies = Vec::with_capacity(map.len());
+            let kctx = ctx.new_at_location("dependencies")?;
+            let mut dependencies = Vec::new();
+            ctx.funding().grow(&mut dependencies, map.len())?;
             for (key, subschema) in map {
-                let ctx = kctx.new_at_location(key.as_str());
-                let s =
-                    match subschema {
-                        Value::Array(_) => {
-                            let validators = vec![required::compile_with_path(
-                                subschema,
-                                kctx.location().clone(),
-                            )
-                            .expect("The required validator compilation does not return None")?];
-                            SchemaNode::from_array(&kctx, validators)
-                        }
-                        _ => compiler::compile(&ctx, ctx.as_resource_ref(subschema))?,
-                    };
-                dependencies.push((F::prepare_key(key), s));
+                let ctx = kctx.new_at_location(key.as_str())?;
+                let s = match subschema {
+                    Value::Array(_) => {
+                        let mut validators = Vec::new();
+                        ctx.funding().grow(&mut validators, 1)?;
+                        validators.push(
+                            required::compile_with_path(&ctx, subschema, kctx.location().clone())
+                                .expect("The required validator compilation does not return None")?,
+                        );
+                        SchemaNode::from_array(&kctx, validators)?
+                    }
+                    _ => compiler::compile(&ctx, ctx.as_resource_ref(subschema))?,
+                };
+                dependencies.push((ctx.funding().key::<F>(key)?, s));
             }
-            Ok(Box::new(DependenciesValidator { dependencies }))
+            Ok(ctx
+                .funding()
+                .boxed(DependenciesValidator { dependencies })?)
         } else {
-            let location = ctx.location().join("dependencies");
-            Err(ValidationError::single_type_error(
+            let location = ctx
+                .location()
+                .join_with_funding("dependencies", ctx.funding())?;
+            Err(ValidationError::single_type_error_with_funding(
                 location.clone(),
                 location,
-                Location::new(),
+                Location::new_with_funding(ctx.funding())?,
                 Cow::Borrowed(schema),
                 JsonType::Object,
-            ))
+                ctx.funding(),
+            )?
+            .into())
         }
     }
 }
 
 impl<F: Json> Validate<F> for DependenciesValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.vector(&self.dependencies)?;
-        for (key, node) in &self.dependencies { source.key(key)?; source.node(node)?; }
+        for (key, node) in &self.dependencies {
+            source.key(key)?;
+            source.node(node)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -66,6 +79,9 @@ impl<F: Json> Validate<F> for DependenciesValidator<F> {
             std::mem::size_of::<std::slice::Iter<'_, (F::PreparedKey, SchemaNode<F>)>>(),
             std::mem::size_of::<(&F::PreparedKey, &SchemaNode<F>, bool)>(),
         ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
@@ -80,7 +96,7 @@ impl<F: Json> Validate<F> for DependenciesValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -97,7 +113,7 @@ impl<F: Json> Validate<F> for DependenciesValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -147,59 +163,75 @@ impl DependentRequiredValidator {
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
         if let Value::Object(map) = schema {
-            let kctx = ctx.new_at_location("dependentRequired");
-            let mut dependencies = Vec::with_capacity(map.len());
+            let kctx = ctx.new_at_location("dependentRequired")?;
+            let mut dependencies = Vec::new();
+            ctx.funding().grow(&mut dependencies, map.len())?;
             for (key, subschema) in map {
-                let ictx = kctx.new_at_location(key.as_str());
+                let ictx = kctx.new_at_location(key.as_str())?;
                 if let Value::Array(dependency_array) = subschema {
-                    if !crate::unique::is_unique(dependency_array) {
+                    if !ctx.funding().unique(dependency_array)? {
                         let location = ictx.location().clone();
-                        return Err(ValidationError::unique_items(
+                        return Err(ValidationError::unique_items_with_funding(
                             location.clone(),
                             location,
-                            Location::new(),
+                            Location::new_with_funding(ctx.funding())?,
                             Cow::Borrowed(subschema),
-                        ));
+                            ctx.funding(),
+                        )?
+                        .into());
                     }
-                    let validators =
-                        vec![
-                            required::compile_with_path(subschema, kctx.location().clone())
-                                .expect(
-                                    "The required validator compilation does not return None",
-                                )?,
-                        ];
+                    let mut validators = Vec::new();
+                    ctx.funding().grow(&mut validators, 1)?;
+                    validators.push(
+                        required::compile_with_path(&ctx, subschema, kctx.location().clone())
+                            .expect("The required validator compilation does not return None")?,
+                    );
                     dependencies.push((
-                        F::prepare_key(key),
-                        SchemaNode::from_array(&kctx, validators),
+                        ctx.funding().key::<F>(key)?,
+                        SchemaNode::from_array(&kctx, validators)?,
                     ));
                 } else {
                     let location = ictx.location().clone();
-                    return Err(ValidationError::single_type_error(
+                    return Err(ValidationError::single_type_error_with_funding(
                         location.clone(),
                         location,
-                        Location::new(),
+                        Location::new_with_funding(ctx.funding())?,
                         Cow::Borrowed(subschema),
                         JsonType::Array,
-                    ));
+                        ctx.funding(),
+                    )?
+                    .into());
                 }
             }
-            Ok(Box::new(DependentRequiredValidator { dependencies }))
+            Ok(ctx
+                .funding()
+                .boxed(DependentRequiredValidator { dependencies })?)
         } else {
-            let location = ctx.location().join("dependentRequired");
-            Err(ValidationError::single_type_error(
+            let location = ctx
+                .location()
+                .join_with_funding("dependentRequired", ctx.funding())?;
+            Err(ValidationError::single_type_error_with_funding(
                 location.clone(),
                 location,
-                Location::new(),
+                Location::new_with_funding(ctx.funding())?,
                 Cow::Borrowed(schema),
                 JsonType::Object,
-            ))
+                ctx.funding(),
+            )?
+            .into())
         }
     }
 }
 impl<F: Json> Validate<F> for DependentRequiredValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.vector(&self.dependencies)?;
-        for (key, node) in &self.dependencies { source.key(key)?; source.node(node)?; }
+        for (key, node) in &self.dependencies {
+            source.key(key)?;
+            source.node(node)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -207,6 +239,9 @@ impl<F: Json> Validate<F> for DependentRequiredValidator<F> {
             std::mem::size_of::<std::slice::Iter<'_, (F::PreparedKey, SchemaNode<F>)>>(),
             std::mem::size_of::<(&F::PreparedKey, &SchemaNode<F>, bool)>(),
         ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
@@ -221,7 +256,7 @@ impl<F: Json> Validate<F> for DependentRequiredValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -238,7 +273,7 @@ impl<F: Json> Validate<F> for DependentRequiredValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -287,30 +322,43 @@ impl DependentSchemasValidator {
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
         if let Value::Object(map) = schema {
-            let ctx = ctx.new_at_location("dependentSchemas");
-            let mut dependencies = Vec::with_capacity(map.len());
+            let ctx = ctx.new_at_location("dependentSchemas")?;
+            let mut dependencies = Vec::new();
+            ctx.funding().grow(&mut dependencies, map.len())?;
             for (key, subschema) in map {
-                let ctx = ctx.new_at_location(key.as_str());
+                let ctx = ctx.new_at_location(key.as_str())?;
                 let schema_nodes = compiler::compile(&ctx, ctx.as_resource_ref(subschema))?;
-                dependencies.push((F::prepare_key(key), schema_nodes));
+                dependencies.push((ctx.funding().key::<F>(key)?, schema_nodes));
             }
-            Ok(Box::new(DependentSchemasValidator { dependencies }))
+            Ok(ctx
+                .funding()
+                .boxed(DependentSchemasValidator { dependencies })?)
         } else {
-            let location = ctx.location().join("dependentSchemas");
-            Err(ValidationError::single_type_error(
+            let location = ctx
+                .location()
+                .join_with_funding("dependentSchemas", ctx.funding())?;
+            Err(ValidationError::single_type_error_with_funding(
                 location.clone(),
                 location,
-                Location::new(),
+                Location::new_with_funding(ctx.funding())?,
                 Cow::Borrowed(schema),
                 JsonType::Object,
-            ))
+                ctx.funding(),
+            )?
+            .into())
         }
     }
 }
 impl<F: Json> Validate<F> for DependentSchemasValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.vector(&self.dependencies)?;
-        for (key, node) in &self.dependencies { source.key(key)?; source.node(node)?; }
+        for (key, node) in &self.dependencies {
+            source.key(key)?;
+            source.node(node)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -318,6 +366,9 @@ impl<F: Json> Validate<F> for DependentSchemasValidator<F> {
             std::mem::size_of::<std::slice::Iter<'_, (F::PreparedKey, SchemaNode<F>)>>(),
             std::mem::size_of::<(&F::PreparedKey, &SchemaNode<F>, bool)>(),
         ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
@@ -332,7 +383,7 @@ impl<F: Json> Validate<F> for DependentSchemasValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -349,7 +400,7 @@ impl<F: Json> Validate<F> for DependentSchemasValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,

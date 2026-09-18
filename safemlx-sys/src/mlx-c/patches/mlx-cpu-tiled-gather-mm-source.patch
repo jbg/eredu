@@ -1,0 +1,378 @@
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -535,7 +535,9 @@
+       bool right_sorted = false)
+       : UnaryPrimitive(stream),
+         left_sorted_(left_sorted),
+-        right_sorted_(right_sorted) {}
++        right_sorted_(right_sorted), cpu_matmul_(stream.cpu_matmul()) {}
++
++  CpuMatmulKernel cpu_matmul() const noexcept { return cpu_matmul_; }
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -556,6 +558,7 @@
+  private:
+   bool left_sorted_;
+   bool right_sorted_;
++  const CpuMatmulKernel cpu_matmul_;
+ };
+ 
+ class SegmentedMM : public UnaryPrimitive {
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -6057,7 +6057,7 @@
+ bool GatherMM::is_equivalent(const Primitive& other) const {
+   const GatherMM& g_other = static_cast<const GatherMM&>(other);
+   return left_sorted_ == g_other.left_sorted_ &&
+-      right_sorted_ == g_other.right_sorted_;
++      right_sorted_ == g_other.right_sorted_ && cpu_matmul_ == g_other.cpu_matmul_;
+ }
+ 
+ std::vector<Shape> GatherMM::output_shapes(const ArrayVector& inputs) {
+diff --git a/mlx/backend/cpu/masked_mm.cpp b/mlx/backend/cpu/masked_mm.cpp
+--- a/mlx/backend/cpu/masked_mm.cpp
++++ b/mlx/backend/cpu/masked_mm.cpp
+@@ -7,6 +7,7 @@
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/gemm.h"
++#include "mlx/backend/cpu/gather_mm_storage.h"
+ #include "mlx/backend/cpu/lapack.h"
+ #include "mlx/primitives.h"
+ 
+@@ -366,6 +367,10 @@
+ }
+ 
+ void GatherMM::eval_cpu(const ArrayVector& inputs, array& out) {
++  if (cpu_matmul() != CpuMatmulKernel::PlatformDefault) {
++    cpu::eval_tiled_gather_mm(inputs, out, stream());
++    return;
++  }
+   if (out.dtype() != float32) {
+     throw std::runtime_error(
+         "[GatherMM::eval] Currently only supports float32.");
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -30,6 +30,7 @@
+ #include "mlx/backend/cpu/alias_storage.h"
+ #include "mlx/backend/cpu/random_storage.h"
+ #include "mlx/backend/cpu/matmul_storage.h"
++#include "mlx/backend/cpu/gather_mm_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -70,10 +71,11 @@
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
+   const bool fixed_alias = fixed && cpu::is_alias_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
++  const bool fixed_tiled_gather_mm = fixed && cpu::is_tiled_gather_mm_eval_primitive(arr);
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_tiled_gather_mm || fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -81,7 +83,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_flat_scatter
++    const auto failure = fixed_tiled_gather_mm
++        ? submission::GraphConstruction::create_cpu_tiled_gather_mm_eval(*extended_prologue, extended_bank.value)
++        : fixed_flat_scatter
+         ? submission::GraphConstruction::create_cpu_flat_scatter_eval(*extended_prologue, extended_bank.value)
+         : fixed_gather_axis
+         ? submission::GraphConstruction::create_cpu_gather_axis_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -80,7 +80,7 @@
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+-  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3 && !(raw_task && inputs == 0)) || (!copy && rank != 0)) return false;
++  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3 && !(raw_task && (inputs == 0 || inputs == 4))) || (!copy && rank != 0)) return false;
+   SingleOutputEvalStorage value;
+   value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -65,6 +65,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/matmul_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cblas.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/masked_mm.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/gather_mm_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/quantized.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -178,6 +178,8 @@
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_tiled_gather_mm_eval(const FixedEvalPrologueGuard&,
++      GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard&,
+       GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard&,
+diff --git a/mlx/backend/cpu/gather_mm_storage.h b/mlx/backend/cpu/gather_mm_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/gather_mm_storage.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++
++namespace mlx::core::cpu {
++// Selected F32 grouped matrix product through the existing SIMD tile worker.
++// These scalar facts grant no index, array, native bank or completion authority.
++MLX_API bool tiled_gather_mm_eval_layout(size_t lhs_rank, size_t rhs_rank,
++    size_t index_rank, size_t m, size_t n, size_t k, size_t batches,
++    bool tracer, CopyEvalStorage&) noexcept;
++MLX_API bool is_tiled_gather_mm_eval_primitive(const array&) noexcept;
++MLX_API bool tiled_gather_mm_eval_storage(const array&, CopyEvalStorage&) noexcept;
++void eval_tiled_gather_mm(const ArrayVector&, array&, Stream);
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/gather_mm_storage.cpp b/mlx/backend/cpu/gather_mm_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/gather_mm_storage.cpp
+@@ -0,0 +1,182 @@
++#include "mlx/backend/cpu/gather_mm_storage.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/gemms/simd_gemm.h"
++#include "mlx/backend/cpu/matmul_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
++
++namespace mlx::core::cpu {
++namespace {
++bool product(size_t a, size_t b, size_t& out) noexcept {
++  if (b && a > size_t(PTRDIFF_MAX) / b) return false;
++  out = a * b; return true;
++}
++bool add(size_t& out, size_t value) noexcept {
++  if (value > size_t(PTRDIFF_MAX) - out) return false;
++  out += value; return true;
++}
++bool selected(CpuMatmulKernel kernel) noexcept {
++  return kernel == CpuMatmulKernel::Float32Tiles ||
++      kernel == CpuMatmulKernel::Float32AndFloat16Tiles;
++}
++bool readable(const array& value) noexcept {
++  if (value.ndim() > 5 || value.strides().size() != value.ndim()) return false;
++  size_t span = 1, elements = 1, delta = 0, bytes = 0;
++  for (size_t i = 0; i != size_t(value.ndim()); ++i) {
++    if (value.shape(i) <= 0 || value.strides()[i] < 0 ||
++        !product(elements, size_t(value.shape(i)), elements) ||
++        !product(size_t(value.shape(i) - 1), size_t(value.strides()[i]), delta) ||
++        !add(span, delta)) return false;
++  }
++  return elements == value.size() && elements <= size_t(INT_MAX) &&
++      span <= value.data_size() && product(span, value.itemsize(), bytes);
++}
++bool matrix(const array& value, bool& transposed, size_t& batches) noexcept {
++  const size_t rank = value.ndim();
++  if (rank < 2 || rank > 5 || value.dtype() != float32 || !readable(value)) return false;
++  const auto row = value.strides()[rank - 2], col = value.strides()[rank - 1];
++  if (row == value.shape(-1) && col == 1) transposed = false;
++  else if (row == 1 && col == value.shape(-2)) transposed = true;
++  else return false;
++  batches = 1;
++  for (size_t i = 0; i + 2 < rank; ++i)
++    if (!product(batches, size_t(value.shape(i)), batches)) return false;
++  return true;
++}
++struct Geometry {
++  size_t m, n, k, batches, lhs_batches, rhs_batches;
++  bool lhs_transposed, rhs_transposed;
++};
++bool geometry(const array& output, Geometry& value) noexcept {
++  if (!is_tiled_gather_mm_eval_primitive(output) || output.inputs().size() != 4 ||
++      !output.siblings().empty()) return false;
++  const auto& inputs = output.inputs();
++  const auto& a = inputs[0]; const auto& b = inputs[1];
++  const auto& lhs = inputs[2]; const auto& rhs = inputs[3];
++  if (!matrix(a, value.lhs_transposed, value.lhs_batches) ||
++      !matrix(b, value.rhs_transposed, value.rhs_batches) ||
++      lhs.dtype() != uint32 || rhs.dtype() != uint32 ||
++      lhs.ndim() > 3 || lhs.shape() != rhs.shape() ||
++      !readable(lhs) || !readable(rhs) || output.ndim() != lhs.ndim() + 2 ||
++      a.shape(-1) != b.shape(-2) || output.shape(-2) != a.shape(-2) ||
++      output.shape(-1) != b.shape(-1)) return false;
++  value.m = a.shape(-2); value.n = b.shape(-1); value.k = a.shape(-1);
++  value.batches = lhs.size();
++  for (size_t i = 0; i < size_t(lhs.ndim()); ++i)
++    if (output.shape(i) != lhs.shape(i)) return false;
++  size_t elements = 0;
++  return product(value.m, value.n, elements) && product(elements, value.batches, elements) &&
++      elements == output.size();
++}
++// The actual Eval cleanup retains four input owners and the output through this task.
++// Shape/stride ranks remain inside their native inline capacity; no route IDs
++// are read on the submitting thread and no selected weight bank is expanded.
++struct GatherMmTask {
++  const float* lhs; const float* rhs; float* output;
++  const uint32_t* lhs_indices; const uint32_t* rhs_indices;
++  Geometry dimensions;
++  Shape lhs_shape, rhs_shape, lhs_index_shape, rhs_index_shape;
++  Strides lhs_strides, rhs_strides, lhs_index_strides, rhs_index_strides;
++  void operator()() {
++    for (size_t batch = 0; batch != dimensions.batches; ++batch) {
++      const auto a = lhs_indices[elem_to_loc(batch, lhs_index_shape, lhs_index_strides)];
++      const auto b = rhs_indices[elem_to_loc(batch, rhs_index_shape, rhs_index_strides)];
++      if (a >= dimensions.lhs_batches || b >= dimensions.rhs_batches)
++        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++      simd_gemm<float, float>(lhs + elem_to_loc(a, lhs_shape, lhs_strides),
++          rhs + elem_to_loc(b, rhs_shape, rhs_strides),
++          output + batch * dimensions.m * dimensions.n,
++          dimensions.lhs_transposed, dimensions.rhs_transposed,
++          int(dimensions.m), int(dimensions.n), int(dimensions.k), 1.0f, 0.0f);
++    }
++  }
++};
++bool dispatch_layout(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if (!CommandEncoder::dispatch_layout<GatherMmTask>(task)) return false;
++  // Same fixed simd_gemm/load_block arrays, SIMD values and scalar transports
++  // as selected Matmul; only the surrounding indexed task is distinct.
++  const size_t controls = sizeof(EvalDispatchStorage) + sizeof(task) + sizeof(out) +
++      sizeof(GatherMmTask) * 2 + sizeof(float[16 * 16]) * 3 +
++      sizeof(simd::Simd<float, simd::max_size<float>>) * 4 +
++      sizeof(int) * 25 + sizeof(float) * 6 + sizeof(bool) * 4 +
++      sizeof(float*) * 9 + sizeof(size_t) * 4 + sizeof(uint32_t) * 2 +
++      sizeof(ldiv_t) + sizeof(long) * 2 + sizeof(Shape*) * 4 + sizeof(Strides*) * 4 +
++      sizeof(submission::GraphQuotaError) + sizeof(submission::GraphFailure);
++  if (task.controls > SIZE_MAX - controls) return false;
++  out = {task.task_bytes, task.task_alignment, 0, task.controls + controls};
++  return true;
++}
++} // namespace
++
++bool is_tiled_gather_mm_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      typeid(output.primitive()) == typeid(GatherMM) && output.dtype() == float32 &&
++      selected(static_cast<const GatherMM&>(output.primitive()).cpu_matmul());
++}
++bool tiled_gather_mm_eval_layout(size_t lhs_rank, size_t rhs_rank, size_t index_rank,
++    size_t m, size_t n, size_t k, size_t batches, bool tracer, CopyEvalStorage& out) noexcept {
++  TiledMatmulFacts facts;
++  if (lhs_rank < 2 || lhs_rank > 5 || rhs_rank < 2 || rhs_rank > 5 || index_rank > 3 ||
++      (!index_rank && batches != 1) || !m || !n || !k || !batches ||
++      m > size_t(INT_MAX) - 15 || n > size_t(INT_MAX) - 15 ||
++      Shape::inline_capacity < 5 || Strides::inline_capacity < 5 ||
++      !tiled_matmul_facts(facts)) return false;
++  size_t left = 0, right = 0, result = 0, bytes = 0;
++  if (!product(m, k, left) || !product(k, n, right) || !product(m, n, result) ||
++      !product(result, batches, result) || left > size_t(INT_MAX) ||
++      right > size_t(INT_MAX) || result > size_t(INT_MAX) || batches > size_t(INT_MAX) ||
++      !product(result, sizeof(float), bytes)) return false;
++  EvalDispatchStorage task; SingleOutputEvalStorage common;
++  if (!dispatch_layout(task) || !single_output_raw_task_layout(index_rank + 2, 4, tracer, task, common)) return false;
++  CopyEvalStorage value; static_cast<SingleOutputEvalStorage&>(value) = common; value.copy = true;
++  const size_t controls = sizeof(value) + sizeof(common) + sizeof(task) + sizeof(facts) +
++      sizeof(lhs_rank) + sizeof(rhs_rank) + sizeof(index_rank) + sizeof(m) + sizeof(n) +
++      sizeof(k) + sizeof(batches) + sizeof(tracer) + sizeof(out) + sizeof(size_t) * 17 +
++      sizeof(Geometry) * 2 + sizeof(bool) * 3 + sizeof(int64_t) * 2 + sizeof(const array*) * 11 +
++      sizeof(const ArrayVector*) + sizeof(Shape) * 4 + sizeof(Strides) * 4 + sizeof(Stream) +
++      sizeof(CpuMatmulKernel) * 2 + sizeof(const GatherMM*) + sizeof(CommandEncoder*) +
++      sizeof(submission::FixedEvalPrologueGuard*) + sizeof(submission::Record*) +
++      sizeof(submission::GraphQuota*) + sizeof(submission::GraphConstructionContext) + sizeof(submission::GraphFailure);
++  if (!add(value.named_control_bytes, controls) || !submission::GraphConstruction::complete_layout(value)) return false;
++  out = value; return true;
++}
++bool tiled_gather_mm_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
++  Geometry value;
++  if (!geometry(output, value)) return false;
++  return tiled_gather_mm_eval_layout(output.inputs()[0].ndim(), output.inputs()[1].ndim(),
++      output.inputs()[2].ndim(), value.m, value.n, value.k, value.batches, output.is_tracer(), out);
++}
++void eval_tiled_gather_mm(const ArrayVector& inputs, array& output, Stream stream) {
++  Geometry value; TiledMatmulFacts facts;
++  if (!geometry(output, value) || !tiled_matmul_facts(facts) ||
++      value.m > size_t(INT_MAX) - 15 || value.n > size_t(INT_MAX) - 15 ||
++      value.k > size_t(INT_MAX) || output.size() > size_t(INT_MAX))
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++  output.allocate_data(output.nbytes());
++  const auto& a = inputs[0]; const auto& b = inputs[1];
++  const auto& lhs = inputs[2]; const auto& rhs = inputs[3];
++  auto& encoder = get_command_encoder(stream);
++  for (const auto& input : inputs) encoder.set_input_array(input);
++  encoder.set_output_array(output);
++  encoder.dispatch(GatherMmTask{a.data<float>(), b.data<float>(), output.data<float>(),
++      lhs.data<uint32_t>(), rhs.data<uint32_t>(), value,
++      Shape(a.shape().begin(), a.shape().end() - 2), Shape(b.shape().begin(), b.shape().end() - 2),
++      lhs.shape(), rhs.shape(), Strides(a.strides().begin(), a.strides().end() - 2),
++      Strides(b.strides().begin(), b.strides().end() - 2), lhs.strides(), rhs.strides()});
++}
++} // namespace mlx::core::cpu
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_tiled_gather_mm_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record = guard.record(); auto* graph = record.graph_quota(); auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph) return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if (!cpu::tiled_gather_mm_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/arange_storage.h b/mlx/backend/cpu/arange_storage.h
+--- a/mlx/backend/cpu/arange_storage.h
++++ b/mlx/backend/cpu/arange_storage.h
+@@ -4,6 +4,6 @@
+ bool is_arange_eval_primitive(const array&) noexcept;
+ bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ bool arange_float_eval_storage(const array&,CopyEvalStorage&) noexcept;
+-bool arange_int_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++bool arange_int_eval_layout(Dtype dtype,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ bool arange_int_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }
+diff --git a/mlx/backend/cpu/arange_storage.cpp b/mlx/backend/cpu/arange_storage.cpp
+--- a/mlx/backend/cpu/arange_storage.cpp
++++ b/mlx/backend/cpu/arange_storage.cpp
+@@ -29,8 +29,13 @@
+ bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+   return arange_eval_layout<float>(elements,tracer,out);
+ }
+-bool arange_int_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  return arange_eval_layout<int32_t>(elements,tracer,out);
++bool arange_int_eval_layout(Dtype dtype,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  CopyEvalStorage value;
++  if (!(dtype == int32 ? arange_eval_layout<int32_t>(elements,tracer,value) :
++        dtype == uint32 ? arange_eval_layout<uint32_t>(elements,tracer,value) : false)) return false;
++  const size_t controls = sizeof(dtype) + sizeof(elements) + sizeof(tracer) + sizeof(out) + sizeof(value);
++  if (controls > SIZE_MAX - value.named_control_bytes) return false;
++  value.named_control_bytes += controls; out = value; return true;
+ }
+ bool arange_float_eval_storage(const array& value,CopyEvalStorage& out) noexcept {
+   if(!is_arange_eval_primitive(value)||!value.siblings().empty()||!value.inputs().empty()||value.ndim()!=1||
+@@ -46,14 +51,14 @@
+ namespace mlx::core::cpu {
+ bool arange_int_eval_storage(const array& value,CopyEvalStorage& out) noexcept {
+   if(!is_arange_eval_primitive(value)||!value.siblings().empty()||!value.inputs().empty()||value.ndim()!=1||
+-      value.dtype()!=int32||value.itemsize()!=sizeof(int32_t)||value.shape(0)<=0||
++      (value.dtype()!=int32&&value.dtype()!=uint32)||value.itemsize()!=sizeof(int32_t)||value.shape(0)<=0||
+       size_t(value.shape(0))!=value.size())return false;
+   const auto [start,stop,step]=static_cast<const Arange&>(value.primitive()).state();
+   // This exact coordinate producer also keeps the final loop increment in I32.
+   // No float coordinate conversion or signed wraparound is used by the mask.
+   if(!std::isfinite(start)||!std::isfinite(stop)||step!=1.0||start<0.0||stop>double(INT_MAX)||
+       start!=std::floor(start)||stop!=std::floor(stop)||stop-start!=double(value.size()))return false;
+-  return arange_int_eval_layout(value.size(),value.is_tracer(),out);
++  return arange_int_eval_layout(value.dtype(),value.size(),value.is_tracer(),out);
+ }
+ }
+ namespace mlx::core::submission {

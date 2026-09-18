@@ -186,15 +186,10 @@ impl ModelArgs {
     pub fn routed_observation_points(
         &self,
         unit_path: &str,
-        _layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        self.is_moe().then(|| {
-            eredu_runtime::RoutedObservationPoints::new(
-                eredu_runtime::RoutedBankId::new(0),
-                format!("{unit_path}.mlp"),
-                self.num_experts,
-            )
-        })
+        _layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+if !(self.is_moe()){return Ok(None);}
+        eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0),format_args!("{unit_path}.mlp"),self.num_experts,metadata_context).map(Some)
     }
 
     /// Returns the model-wide physical encoding, if any.
@@ -315,9 +310,9 @@ impl Config for ModelArgs {
     fn routed_observation_points(
         &self,
         unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        ModelArgs::routed_observation_points(self, unit_path, layer)
+        layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+ModelArgs::routed_observation_points(self,unit_path,layer,metadata_context)
     }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
@@ -1608,7 +1603,7 @@ mod tests {
         value["norm_topk_prob"] = Value::Bool(true);
         let args = model_args_from_config_value(&value).unwrap();
         assert!(args.is_moe());
-        let point = args.routed_observation_points("model.layers.2", 2).unwrap();
+        let point = args.routed_observation_points("model.layers.2", 2, None).expect("ordinary routed point construction").unwrap();
         assert_eq!(
             point
                 .bank(eredu_runtime::RoutedBankId::new(0))
@@ -1625,7 +1620,7 @@ mod tests {
         );
         assert!(model_args_from_config_value(&base("qwen3"))
             .unwrap()
-            .routed_observation_points("model.layers.2", 2)
+            .routed_observation_points("model.layers.2", 2, None).expect("ordinary routed point construction")
             .is_none());
     }
 }

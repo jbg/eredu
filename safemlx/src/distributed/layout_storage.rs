@@ -91,7 +91,8 @@ impl<'a> GroupCpuLayoutStorage<'a> {
     /// Fixed validation/query/result frames before binding an actual partial.
     pub fn binding_control_bytes(&self)->Option<usize> {
         let parts=[size_of::<Self>(),size_of::<(&Self,&Array)>(),size_of::<GroupCpuOperationStorage<'_>>(),
-            size_of::<Result<GroupCpuOperationStorage<'_>,GroupStorageUnavailable>>(),
+            size_of::<Result<GroupCpuOperationStorage<'_>,GroupCpuBindingError>>(),
+            binding::control_bytes()?,
             size_of::<&safemlx_sys::mlx_distributed_constructor_storage>()*2,
             size_of::<&safemlx_sys::mlx_distributed_cpu_eval_storage>()*2,
             size_of::<bool>()];
@@ -101,43 +102,18 @@ impl<'a> GroupCpuLayoutStorage<'a> {
     /// Recompute from the actual partial and reject any source/layout/population
     /// difference before constructing a graph. A lazy partial remains lazy and
     /// is completed by its enclosing admitted model role, never by this query.
-    pub fn bind_actual<'input>(self,input:&'input Array)->Result<GroupCpuOperationStorage<'input>,GroupStorageUnavailable> where 'a:'input {
-        if input.shape()!=self.shape || input.dtype()!=self.dtype{return Err(GroupStorageUnavailable);}
-        let actual=self.group.cpu_operation_storage(input,self.operation)?;
-        if !constructor_population(&self.constructor,actual.constructor().native()) ||
-            !cpu_population(self.evaluation.native(),actual.evaluation().native()) {
-            return Err(GroupStorageUnavailable);
-        }
+    pub fn bind_actual<'input>(self,input:&'input Array)->Result<GroupCpuOperationStorage<'input>,GroupCpuBindingError> where 'a:'input {
+        binding::geometry(self.shape,self.dtype,input.shape(),input.dtype())?;
+        let actual=self.group.cpu_operation_storage(input,self.operation)
+            .map_err(GroupCpuBindingError::NativeSource)?;
+        binding::constructor(&self.constructor,actual.constructor().native())?;
+        binding::evaluation(self.evaluation.native(),actual.evaluation().native())?;
         Ok(actual)
     }
 }
-fn constructor_population(a:&safemlx_sys::mlx_distributed_constructor_storage,
-    b:&safemlx_sys::mlx_distributed_constructor_storage)->bool {
-    // Inspection transport differs between a metadata view and actual Array;
-    // every allocation class and constructor semantic population must agree.
-    a.output_rank==b.output_rank&&a.output_elements==b.output_elements&&a.primitives==b.primitives&&
-    a.input_edges==b.input_edges&&a.blocks==b.blocks&&a.header_bytes==b.header_bytes&&
-    a.header_alignment==b.header_alignment&&a.slots_bytes==b.slots_bytes&&a.slots_alignment==b.slots_alignment&&
-    a.reserved_alignment==b.reserved_alignment&&a.requested_bytes==b.requested_bytes&&
-    a.allocation_extents==b.allocation_extents&&a.request_bytes==b.request_bytes&&
-    a.request_alignments==b.request_alignments&&a.request_counts==b.request_counts
-}
-fn cpu_population(a:&safemlx_sys::mlx_distributed_cpu_eval_storage,b:&safemlx_sys::mlx_distributed_cpu_eval_storage)->bool {
-    a.operation==b.operation&&a.peer==b.peer&&a.input_rank==b.input_rank&&a.output_rank==b.output_rank&&
-    a.inputs==b.inputs&&a.tracer==b.tracer&&a.possible_copy==b.possible_copy&&a.backing_births==b.backing_births&&
-    a.data_captures==b.data_captures&&a.temporary_batches==b.temporary_batches&&
-    a.logical_backing_bytes==b.logical_backing_bytes&&a.copy_backing_bytes==b.copy_backing_bytes&&
-    a.output_backing_bytes==b.output_backing_bytes&&a.copy_worker_graph_extent==b.copy_worker_graph_extent&&
-    a.communication_worker_graph_extent==b.communication_worker_graph_extent&&a.blocks==b.blocks&&
-    a.header_bytes==b.header_bytes&&a.header_alignment==b.header_alignment&&a.slots_bytes==b.slots_bytes&&
-    a.slots_alignment==b.slots_alignment&&a.reserved_alignment==b.reserved_alignment&&
-    a.requested_bytes==b.requested_bytes&&a.allocation_extents==b.allocation_extents&&
-    a.request_bytes==b.request_bytes&&a.request_alignments==b.request_alignments&&a.request_counts==b.request_counts&&
-    a.communication.pool_jobs==b.communication.pool_jobs&&a.communication.socket_attempts==b.communication.socket_attempts&&
-    a.communication.destination_arrays==b.communication.destination_arrays&&
-    a.communication.task_graph_extent==b.communication.task_graph_extent&&
-    a.communication.destination_graph_extent==b.communication.destination_graph_extent
-}
+
+mod binding;
+pub use binding::{GroupCpuBindingError,GroupCpuBindingPopulation};
 
 mod owned;
 pub use owned::OwnedGroupCpuLayoutStorage;

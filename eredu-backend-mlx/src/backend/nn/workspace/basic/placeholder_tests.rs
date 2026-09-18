@@ -7,6 +7,12 @@ fn mechanisms() -> MlxMetalWorkspaceMechanisms {
         sdpa_blocks: None,
     }
 }
+fn cpu_mechanisms() -> MlxCpuWorkspaceMechanisms {
+    MlxCpuWorkspaceMechanisms::new(
+        mechanisms().allocation,
+        MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::PlatformDefault).unwrap(),
+    )
+}
 fn operation(dtype: WorkspaceDtype) -> WorkspaceOperation {
     WorkspaceOperation {
         kind: WorkspaceOperationKind::ParameterPlaceholder,
@@ -59,6 +65,72 @@ fn unloaded_seed_fact_is_dtype_sized_and_has_no_disjoint_host_staging() {
 }
 
 #[test]
+fn cpu_unloaded_scalars_complete_tensor_host_and_residual_reports_without_native_plans() {
+    let cpu = cpu_mechanisms();
+    for dtype in [
+        WorkspaceDtype::Float32,
+        WorkspaceDtype::Int32,
+        WorkspaceDtype::Uint32,
+        WorkspaceDtype::Uint8,
+        WorkspaceDtype::Bool,
+    ] {
+        let context = WorkspaceContext::new(cpu);
+        context.set_borrowed_storage(
+            eredu_nn::workspace::WorkspaceBorrowedStorage::new(&context, []).unwrap(),
+        ).unwrap();
+        context.begin_state_span([]).unwrap();
+        drop(context.execute(
+            WorkspaceOperationKind::ParameterPlaceholder,
+            &[],
+            vec![WorkspaceLayout::new(&[], dtype).unwrap()],
+        ).unwrap());
+        let report = context.report(&[]).unwrap();
+        let scalar = mechanisms().allocation.buffer_capacity(dtype.bytes()).unwrap();
+        assert_eq!(report.operations.len(), 1);
+        assert!(report.unpriced_operations.is_empty());
+        assert!(report.unpriced_host_operations.is_empty());
+        assert_eq!(report.tensor_buffers.total_bytes, Some(scalar));
+        assert_eq!(report.host_workspace_bytes, Some(0));
+        assert_eq!(report.total_bytes, Some(scalar));
+        assert_eq!(report.transient_bytes, Some(scalar));
+        assert_eq!(report.inference_transient_bytes(), Some(scalar));
+        let residual = report.residual.as_ref().unwrap();
+        assert_eq!(residual.total_bytes, Some(scalar));
+        assert_eq!(residual.transient_bytes, Some(scalar));
+        assert_eq!(residual.retained_bytes, Some(0));
+        assert!(cpu.plan(report.operations[0].as_view()).unwrap().is_none(),
+            "descriptive scalar facts do not certify the lazy native constructor");
+
+        let geometry = eredu_core::InferenceGeometry {
+            batch_size: 1,
+            cached_positions: 0,
+            input_positions: 1,
+            max_output_tokens: 1,
+            prefill_chunk_positions: 1,
+            output: eredu_core::OutputDemand::Sequence,
+        };
+        let quoted = eredu_runtime::working_memory::quote_inference_workspace_with_context(
+            geometry,
+            &context,
+            |_| -> Result<WorkspaceTraceReport, Error> {
+                context.begin_state_span([])?;
+                drop(context.execute(
+                    WorkspaceOperationKind::ParameterPlaceholder,
+                    &[],
+                    vec![WorkspaceLayout::new(&[], dtype)?],
+                )?);
+                context.report(&[])
+            },
+        ).unwrap();
+        assert_eq!(quoted.completed_spans(), 2);
+        assert!(quoted.first_gap().is_none());
+        assert_eq!(quoted.tensor_transient_peak_bytes(), Some(scalar));
+        assert_eq!(quoted.host_peak_bytes(), Some(0));
+        assert_eq!(quoted.residual_workspace().unwrap().peak_bytes(), Some(scalar));
+    }
+}
+
+#[test]
 fn invalid_placeholder_descriptors_cannot_price_logical_weight_materialization() {
     let mechanisms = mechanisms();
     let mut invalid = Vec::new();
@@ -77,6 +149,8 @@ fn invalid_placeholder_descriptors_cannot_price_logical_weight_materialization()
     for op in invalid {
         assert!(mechanisms.operation_bound(&op).is_err());
         assert!(mechanisms.host_workspace_bound(&op).is_err());
+        assert!(cpu_mechanisms().operation_bound(&op).is_err());
+        assert!(cpu_mechanisms().host_workspace_bound(&op).is_err());
     }
 }
 

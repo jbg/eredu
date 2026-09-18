@@ -21,6 +21,7 @@ use crate::{
     },
     nfa::thompson,
     util::{
+        allocation::{Allocation, Unenforced},
         iter,
         search::{Anchored, Input, Match, MatchError, MatchKind},
     },
@@ -143,9 +144,7 @@ impl Regex {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[cfg(feature = "syntax")]
-    pub fn new_many<P: AsRef<str>>(
-        patterns: &[P],
-    ) -> Result<Regex, BuildError> {
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Regex, BuildError> {
         Regex::builder().build_many(patterns)
     }
 
@@ -282,11 +281,7 @@ impl Regex {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn is_match<'h, I: Into<Input<'h>>>(
-        &self,
-        cache: &mut Cache,
-        input: I,
-    ) -> bool {
+    pub fn is_match<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> bool {
         // Not only can we do an "earliest" search, but we can avoid doing a
         // reverse scan too.
         self.forward()
@@ -341,11 +336,7 @@ impl Regex {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn find<'h, I: Into<Input<'h>>>(
-        &self,
-        cache: &mut Cache,
-        input: I,
-    ) -> Option<Match> {
+    pub fn find<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> Option<Match> {
         self.try_search(cache, &input.into()).unwrap()
     }
 
@@ -402,7 +393,11 @@ impl Regex {
         input: I,
     ) -> FindMatches<'r, 'c, 'h> {
         let it = iter::Searcher::new(input.into());
-        FindMatches { re: self, cache, it }
+        FindMatches {
+            re: self,
+            cache,
+            it,
+        }
     }
 }
 
@@ -444,8 +439,21 @@ impl Regex {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Result<Option<Match>, MatchError> {
+        self.try_search_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Search with the original two lazy DFAs and funded cache growth.
+    pub fn try_search_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
         let (fcache, rcache) = (&mut cache.forward, &mut cache.reverse);
-        let end = match self.forward().try_search_fwd(fcache, input)? {
+        let end = match self
+            .forward()
+            .try_search_fwd_with_allocations(fcache, input, funding)?
+        {
             None => return Ok(None),
             Some(end) => end,
         };
@@ -454,10 +462,7 @@ impl Regex {
         // the start, it must follow that our starting position is also our end
         // position. So short circuit and skip the reverse search.
         if input.start() == end.offset() {
-            return Ok(Some(Match::new(
-                end.pattern(),
-                end.offset()..end.offset(),
-            )));
+            return Ok(Some(Match::new(end.pattern(), end.offset()..end.offset())));
         }
         // We can also skip the reverse search if we know our search was
         // anchored. This occurs either when the input config is anchored or
@@ -465,10 +470,7 @@ impl Regex {
         // start of the match, if one is found, must be the start of the
         // search.
         if self.is_anchored(input) {
-            return Ok(Some(Match::new(
-                end.pattern(),
-                input.start()..end.offset(),
-            )));
+            return Ok(Some(Match::new(end.pattern(), input.start()..end.offset())));
         }
         // N.B. I have tentatively convinced myself that it isn't necessary
         // to specify the specific pattern for the reverse search since the
@@ -493,7 +495,7 @@ impl Regex {
             .earliest(false);
         let start = self
             .reverse()
-            .try_search_rev(rcache, &revsearch)?
+            .try_search_rev_with_allocations(rcache, &revsearch, funding)?
             .expect("reverse search must match if forward search does");
         debug_assert_eq!(
             start.pattern(),
@@ -501,16 +503,17 @@ impl Regex {
             "forward and reverse search must match same pattern",
         );
         debug_assert!(start.offset() <= end.offset());
-        Ok(Some(Match::new(end.pattern(), start.offset()..end.offset())))
+        Ok(Some(Match::new(
+            end.pattern(),
+            start.offset()..end.offset(),
+        )))
     }
 
     /// Returns true if either the given input specifies an anchored search
     /// or if the underlying NFA is always anchored.
     fn is_anchored(&self, input: &Input<'_>) -> bool {
         match input.get_anchored() {
-            Anchored::No => {
-                self.forward().get_nfa().is_always_start_anchored()
-            }
+            Anchored::No => self.forward().get_nfa().is_always_start_anchored(),
             Anchored::Yes | Anchored::Pattern(_) => true,
         }
     }
@@ -577,7 +580,11 @@ impl<'r, 'c, 'h> Iterator for FindMatches<'r, 'c, 'h> {
 
     #[inline]
     fn next(&mut self) -> Option<Match> {
-        let FindMatches { re, ref mut cache, ref mut it } = *self;
+        let FindMatches {
+            re,
+            ref mut cache,
+            ref mut it,
+        } = *self;
         it.advance(|input| re.try_search(cache, input))
     }
 }
@@ -610,9 +617,17 @@ impl Cache {
     /// `Regex`. If you want to reuse the cache for another `Regex`, then you
     /// must call [`Cache::reset`] with that `Regex`.
     pub fn new(re: &Regex) -> Cache {
-        let forward = dfa::Cache::new(re.forward());
-        let reverse = dfa::Cache::new(re.reverse());
-        Cache { forward, reverse }
+        Self::new_with_allocations(re, &Unenforced).expect("lazy regex cache allocation")
+    }
+
+    /// Create both original cache producers with allocation funding.
+    pub fn new_with_allocations(
+        re: &Regex,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, crate::hybrid::error::CacheError> {
+        let forward = dfa::Cache::new_with_allocations(re.forward(), funding)?;
+        let reverse = dfa::Cache::new_with_allocations(re.reverse(), funding)?;
+        Ok(Cache { forward, reverse })
     }
 
     /// Reset this cache such that it can be used for searching with the given
@@ -657,8 +672,19 @@ impl Cache {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset(&mut self, re: &Regex) {
-        self.forward.reset(re.forward());
-        self.reverse.reset(re.reverse());
+        self.reset_with_allocations(re, &Unenforced)
+            .expect("lazy regex cache allocation")
+    }
+
+    /// Reset both original caches with allocation funding.
+    pub fn reset_with_allocations(
+        &mut self,
+        re: &Regex,
+        funding: &dyn Allocation,
+    ) -> Result<(), crate::hybrid::error::CacheError> {
+        self.forward.reset_with_allocations(re.forward(), funding)?;
+        self.reverse.reset_with_allocations(re.reverse(), funding)?;
+        Ok(())
     }
 
     /// Return a reference to the forward cache.
@@ -771,7 +797,9 @@ pub struct Builder {
 impl Builder {
     /// Create a new regex builder with the default configuration.
     pub fn new() -> Builder {
-        Builder { dfa: DFA::builder() }
+        Builder {
+            dfa: DFA::builder(),
+        }
     }
 
     /// Build a regex from the given pattern.
@@ -785,11 +813,18 @@ impl Builder {
 
     /// Build a regex from the given patterns.
     #[cfg(feature = "syntax")]
-    pub fn build_many<P: AsRef<str>>(
+    pub fn build_many<P: AsRef<str>>(&self, patterns: &[P]) -> Result<Regex, BuildError> {
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Build the original forward/reverse NFA pair with source funding.
+    #[cfg(feature = "syntax")]
+    pub fn build_many_with_allocations<P: AsRef<str>>(
         &self,
         patterns: &[P],
+        funding: &dyn Allocation,
     ) -> Result<Regex, BuildError> {
-        let forward = self.dfa.build_many(patterns)?;
+        let forward = self.dfa.build_many_with_allocations(patterns, funding)?;
         let reverse = self
             .dfa
             .clone()
@@ -800,7 +835,7 @@ impl Builder {
                     .match_kind(MatchKind::All),
             )
             .thompson(thompson::Config::new().reverse(true))
-            .build_many(patterns)?;
+            .build_many_with_allocations(patterns, funding)?;
         Ok(self.build_from_dfas(forward, reverse))
     }
 
@@ -858,10 +893,7 @@ impl Builder {
     /// This permits setting things like case insensitivity, Unicode and multi
     /// line mode.
     #[cfg(feature = "syntax")]
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Builder {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Builder {
         self.dfa.syntax(config);
         self
     }
@@ -891,5 +923,13 @@ impl Builder {
 impl Default for Builder {
     fn default() -> Builder {
         Builder::new()
+    }
+}
+
+impl Regex {
+    /// Visit both immutable directions while preserving their shared owners.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        self.forward().visit_source_storage(visitor)?;
+        self.reverse().visit_source_storage(visitor)
     }
 }

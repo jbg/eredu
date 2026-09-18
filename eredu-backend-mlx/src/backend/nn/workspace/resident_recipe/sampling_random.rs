@@ -128,7 +128,7 @@ pub(super) fn eager_preparation(
     };
     let bytes = allocation
         .buffer_capacity(8)
-        .map_err(Error::backend_source)?;
+        .map_err(Error::backend_retained_source)?;
     Ok(Some((
         CertifiedSpanStorage {
             mutable_bytes: bytes,

@@ -3,7 +3,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use eredu_core::{
-    AttentionPolicy, LayerSchedule,
+    AttentionPolicy,
     cache::{
         LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
         StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
@@ -241,7 +241,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -458,12 +458,14 @@ pub struct TargetBoundarySchema {
 
 impl TargetBoundarySchema {
     /// Derives the schema for the configured DSpark target captures.
-    pub fn from_args(args: &V4Args) -> Result<Self, Error> {
-        args.validate().map_err(Error::backend)?;
+    pub fn from_args(args: &V4Args, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata);
+        metadata.controls::<(&V4Args, Self, Result<Self, Error>)>()?;
+        args.validate_with_diagnostic(|message| metadata.error(message))?;
         let activation_hidden_size = args
             .hidden_size
             .checked_mul(args.hc_mult)
-            .ok_or_else(|| Error::backend("V4 transport activation width overflowed"))?;
+            .ok_or_else(|| metadata.error(format_args!("V4 transport activation width overflowed")))?;
         Ok(Self {
             hidden_size: args.hidden_size,
             activation_hidden_size,
@@ -676,7 +678,7 @@ where
     fn prepare_construction_units(&self, banks: Option<&crate::routed_text::RetainedRoutedBanks>, context: &<B::Tensor as Tensor>::Context)
         -> Result<Option<crate::routed_text::RetainedRoutedUnits>, Error> {
         crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
-        let count = self.groups.unit_count(0)?;
+        let count = self.groups.unit_count(0, None)?;
         let selected = banks.map(|banks| banks.get(&eredu_runtime::RoutedBankId::new(0))
             .and_then(|bank| bank.plan().gated())
             .ok_or_else(|| Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)))
@@ -687,7 +689,7 @@ where
     }
     fn install_construction_units(&mut self, source: Option<crate::routed_text::RetainedRoutedUnits>) -> Result<(), Error> {
         if let Some(source) = &source {
-            if source.v4()?.len() != self.groups.unit_count(0)? {
+            if source.v4()?.len() != self.groups.unit_count(0, None)? {
                 return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
             }
         }
@@ -703,45 +705,37 @@ where
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
 
-    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+    fn state_layout(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
         -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
         match &self.parallel_geometry {
             Some(geometry) => geometry.state_layout().clone_workspace(context),
             None => state_layout_with_metadata(&self.args, context),
         }
-    }
-    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+    }, None => {
+        self.state_layout_impl()
+    } }
+}
+    fn state_identity(&self, state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
         state_identity_with_metadata(&self.args, state.layout(), state.global_layer_offset(), topology, context)
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+    }, None => {
         state_identity(
             &self.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
         )
-    }
+    } }
+}
 
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
-    }
 
-    fn parameter_description_with_metadata(&self,
+
+    fn parameter_description(&self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
         match &self.construction_parameters {
@@ -753,7 +747,9 @@ where
             None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
                 Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
             }
-            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+            None => (|| {
+        super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
+    })().map(std::borrow::Cow::Owned),
         }
     }
 
@@ -1119,7 +1115,7 @@ where
     }
 
     fn target_unit_source(&self, index: usize, selected_plan: Option<&crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>) -> Result<super::block::V4BlockSpec, Error> {
-        self.groups.unit_count(0)?;
+        self.groups.unit_count(0, None)?;
         let args = self.parallel_geometry.as_ref().map_or(&*self.args, |geometry| geometry.args());
         let realization = selected_plan.or(self.expert_realization.as_ref());
         let selected = realization.and_then(|source| source.unit_spec("target", index)).cloned();
@@ -1163,7 +1159,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
         crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         let args = self
             .parallel_geometry
             .as_ref()
@@ -2589,7 +2585,7 @@ where
         P: eredu_runtime::RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_with_provider(
@@ -2688,7 +2684,7 @@ where
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel_with_provider(
@@ -3044,8 +3040,10 @@ where
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         use eredu_runtime::layered::{
             PrefillObservationDeclaration as Declaration, PrefillReadoutStage,
         };
@@ -3055,11 +3053,10 @@ where
         // mix features/streams within each token, never across future rows.
         // Prediction and bidirectional DSpark invocations retain their separate
         // existing policy and receive no declarations from this target group.
-        let count = self.groups.unit_count(0)?;
+        let count = self.groups.unit_count(0, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..count).map(|index| self.groups.unit_path(0, index)),
-            true,
-        )?;
+            (0..count).map(|index| self.groups.unit_path(0, index, metadata_context)),
+            true, metadata_context)?;
         // These are actual hooks of finish_target_instrumented, after the
         // selected physical readout positions and before the final learned sum.
         for path in [
@@ -3067,17 +3064,17 @@ where
             "readout.streams.effective",
             "readout.stream_coefficients",
         ] {
-            declarations.push(Declaration::causal_ordinary_text(
-                path.into(),
+            { if let Some(context)=metadata.context(){context.reserve_metadata_vec(&mut declarations,1)?;} declarations.push(Declaration::causal_ordinary_text(
+                metadata.text(path)?,
                 1,
                 PrefillReadoutStage::ReadoutInput,
-            ));
+            )); };
         }
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..count {
-            let path = self.groups.unit_path(0, index)?;
+            let path = self.groups.unit_path(0, index, metadata_context)?;
             if self.args.n_routed_experts > 0 {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.feed_forward"));
+                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.feed_forward"))?, metadata_context)?;
             }
         }
         Ok(declarations)
@@ -3160,24 +3157,23 @@ where
         )
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.groups.execution_graph()
     }
-    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.groups.execution_graph_with_metadata(context)
-    }
-    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<usize, Self::Error> {
-        self.groups.unit_count_with_metadata(group, context)
+
+
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        self.groups.unit_count(group, metadata_context)
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.groups.unit_count(group)
-    }
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.groups.unit_path(group, index)
+        self.groups.unit_path(group, index, metadata_context)
     }
 
     fn observes_unit_boundaries(&self, group: usize, _index: usize) -> bool {
@@ -3285,7 +3281,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward(
@@ -3548,7 +3544,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -3636,7 +3632,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.groups.unit_count(group, None)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel(
@@ -3833,8 +3829,8 @@ where
 
     type Boundary = TargetBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        TargetBoundarySchema::from_args(self.args())
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        TargetBoundarySchema::from_args(self.args(), metadata)
     }
 
     fn begin_partition<'a>(

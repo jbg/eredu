@@ -1,35 +1,16 @@
 pub mod compiler;
 mod formats;
 mod numeric;
+mod source_text;
 mod schema;
 mod shared_context;
 
-#[cfg(feature = "referencing")]
 mod context_ref;
-#[cfg(not(feature = "referencing"))]
-mod context_simple;
-
-pub mod context {
-    #[cfg(feature = "referencing")]
-    pub use super::context_ref::*;
-    #[cfg(not(feature = "referencing"))]
-    pub use super::context_simple::*;
-}
+pub mod context { pub use super::context_ref::*; }
 
 use std::{any::type_name_of_val, sync::Arc};
 
 use serde_json::Value;
-pub fn json_merge(a: &mut Value, b: &Value) {
-    match (a, b) {
-        (Value::Object(a), Value::Object(b)) => {
-            for (k, v) in b.iter() {
-                json_merge(a.entry(k.clone()).or_insert(Value::Null), v);
-            }
-        }
-        (a, b) => *a = b.clone(),
-    }
-}
-
 pub trait Retrieve: Send + Sync {
     fn retrieve(&self, uri: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 }

@@ -3183,7 +3183,7 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV3(args) => crate::deepseek::v3::TargetBoundarySchema::from_args(args)
                 .wire_schema()
                 .map_err(|error| error.to_string()),
-            Self::DeepSeekV4(args) => crate::deepseek::v4::TargetBoundarySchema::from_args(args)
+            Self::DeepSeekV4(args) => crate::deepseek::v4::TargetBoundarySchema::from_args(args, None)
                 .map_err(|error| error.to_string())?
                 .wire_schema()
                 .map_err(|error| error.to_string()),

@@ -330,7 +330,7 @@ pub struct SessionPartitionCapture<'a, T: PartitionCaptureTransport> {
     epoch: DistributedCommitEpoch,
     pub(super) index: usize,
     key: PartitionCaptureKey,
-    plan: crate::capture::CapturePlanSource,
+    plan: SharedCapturePlan,
     rank: usize,
     exchange: PartitionCaptureExchange<'a, T>,
     quota: CaptureQuota,
@@ -348,8 +348,8 @@ pub struct SessionPartitionCapture<'a, T: PartitionCaptureTransport> {
 impl<T: PartitionCaptureTransport> SessionPartitionCapture<'_, T> {
     /// Existing immutable shared source retained by this exact partition work.
     /// No source payload copy or fresh source registration is manufactured.
-    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
-        self.plan.shared()
+    pub fn shared_plan_source(&self) -> &SharedCapturePlan {
+        &self.plan
     }
     /// Full nonrefundable global charge for preparation and working credits.
     pub const fn global_reserved(&self) -> CaptureUsage {
@@ -577,7 +577,7 @@ impl CaptureSession {
     fn prepare_partition_selection<'a, T: PartitionCaptureTransport>(
         &mut self,
         transport: &'a T,
-        plan: crate::capture::CapturePlanSource,
+        plan: SharedCapturePlan,
         key: PartitionCaptureKey,
         index: usize,
         producers: Vec<PartitionCaptureProducer>,
@@ -624,7 +624,7 @@ impl CaptureSession {
     fn prepare_partition_work<'a, T: PartitionCaptureTransport>(
         &mut self,
         transport: &'a T,
-        plan: crate::capture::CapturePlanSource,
+        plan: SharedCapturePlan,
         key: PartitionCaptureKey,
         index: usize,
         producers: routed::Producers,

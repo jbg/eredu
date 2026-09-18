@@ -13,10 +13,10 @@ type B = crate::composition::MlxNeuralBackend;
 
 struct Fill;
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for Fill {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, tensor: &'a mut MlxTensor) {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, tensor: &'a mut MlxTensor) {
         let shape = tensor.shape().to_vec();
         let count = shape.iter().product::<i32>() as usize;
-        let values = if metadata.id.as_str() == "model.layers.0.mlp.gate.weight" {
+        let values = if metadata.id().as_str() == "model.layers.0.mlp.gate.weight" {
             (0..count).map(|i| (i / 32 + 1) as f32 / 32.0).collect()
         } else {
             vec![0.01f32; count]
@@ -228,11 +228,7 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
         };
         let output = moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoints::new(
-                    eredu_runtime::RoutedBankId::new(0),
-                    "model.layers.0.mlp",
-                    4,
-                ),
+                eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0), format_args!("{}", "model.layers.0.mlp"), 4, None).unwrap(),
                 &input,
                 &stream,
                 &mut provider,
@@ -347,11 +343,7 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
         };
         assert!(moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoints::new(
-                    eredu_runtime::RoutedBankId::new(0),
-                    "model.layers.0.mlp",
-                    4
-                ),
+                eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0), format_args!("{}", "model.layers.0.mlp"), 4, None).unwrap(),
                 &input,
                 &stream,
                 &mut provider,
@@ -495,9 +487,9 @@ fn routing_intervention_loaded_discovery_admission_and_evidence_agree_for_qwen_f
         let mut count = 0;
         while let Some(token) = generator.next() {
             token.unwrap();
-            let step = generator.take_captured_step().unwrap().unwrap();
+            let step = generator.take_captured_delivery().unwrap().unwrap();
             assert_eq!(step.prediction_index, count);
-            for record in step.interventions {
+            for record in &step.interventions {
                 if record.outcome == InterventionOutcome::Inactive {
                     continue;
                 }

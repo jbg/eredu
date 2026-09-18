@@ -6,7 +6,7 @@ use eredu_core::{
 };
 use eredu_runtime::{
     execution_control::{
-        validate_sampling_override, SamplingOverride, TextSamplingControlBackend,
+        SamplingOverride, TextSamplingControlBackend,
         TextSnapshotBackend,
     },
     working_memory::{InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool},
@@ -591,16 +591,13 @@ fn reserved_domain_rejects_copy_capture_and_reseed_without_mutating_sources() {
         MlxBackend::copy_pending_input(&mut runtime, Some(PendingTextInput::Prefill(&prompt)))
             .err()
             .unwrap();
-    let action = validate_sampling_override::<Error>(
-        MlxBackend::sampling_control_facts(&sampler),
-        SamplingOverride {
+    let action = SamplingOverride {
             temperature: Some(0.3),
             reseed: Some(77),
-        },
-    )
-    .unwrap();
-    let reseed =
-        MlxBackend::install_sampling_override(&mut runtime, &mut sampler, action).unwrap_err();
+        };
+    let eredu_core::SamplingOverrideError::Backend(reseed) =
+        MlxBackend::apply_sampling_override(&mut runtime, &mut sampler, None, action).unwrap_err()
+        else { panic!("expected native reservation refusal") };
     for error in [capture, sampling_copy, input_copy, reseed] {
         assert_eq!(
             memory_error(&error),

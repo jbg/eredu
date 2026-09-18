@@ -81,7 +81,7 @@ impl WorkspaceMechanisms for Facts {
                 .map(|layout| {
                     if matches!(
                         op.kind,
-                        WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)
+                        WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. } | WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)
                     ) {
                         Ok(WorkspaceOutputStorage::AliasInput(0))
                     } else {

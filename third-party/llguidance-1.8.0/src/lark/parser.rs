@@ -9,7 +9,7 @@ use super::{
     ast::*,
     lexer::{lex_lark, Lexeme, LexemeValue, Location, Token},
 };
-use anyhow::{anyhow, bail, ensure, Result};
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
 
 const MAX_NESTING: usize = 30;
 
@@ -19,38 +19,35 @@ pub struct Parser {
     src: Rc<String>,
     pos: usize,
     nesting_level: usize,
+    funding: derivre::ParserAllocationFunding,
 }
 
 impl Parser {
     /// Creates a new parser instance.
-    pub fn new(src: Rc<String>, tokens: Vec<Lexeme>, nesting: usize) -> Self {
+    pub fn new(src: Rc<String>, tokens: Vec<Lexeme>, nesting: usize, funding: derivre::ParserAllocationFunding) -> Self {
         Parser {
             tokens,
             src,
             pos: 0,
             nesting_level: nesting,
+            funding,
         }
     }
 
     /// Parses the start symbol of the grammar.
     pub fn parse_start(&mut self) -> Result<ParsedLark> {
-        ensure!(
+        ensure!(&self.funding,
             self.nesting_level < MAX_NESTING,
             "lark grammar too deeply nested"
         );
         self.parse_start_inner().map_err(|e| {
+            if self.funding.failure().is_some() || crate::earley::is_grammar_storage_failure(&e) { return e; }
             if let Some(tok) = self.peek_token() {
-                anyhow!(
-                    "{}({}): {} (at {} ({}))\n{}",
-                    tok.line,
-                    tok.column,
-                    e,
-                    tok.value,
-                    tok.token,
-                    highlight_location(&self.src, tok.line, tok.column)
-                )
+                e.annotate(format_args!("{}({}): ", tok.line, tok.column),
+                    format_args!(" (at {} ({}))\n{}", tok.value, tok.token,
+                        highlight_location(&self.src, tok.line, tok.column)), &self.funding)
             } else {
-                anyhow!("at EOF: {}", e)
+                e.annotate("at EOF: ", "", &self.funding)
             }
         })
     }
@@ -63,7 +60,7 @@ impl Parser {
             if self.is_at_end() {
                 break;
             }
-            items.push(self.parse_item()?);
+            { let value = self.parse_item()?; self.funding.try_push(&mut items, value)?; }
             self.consume_newlines();
         }
         Ok(ParsedLark { items })
@@ -87,12 +84,14 @@ impl Parser {
                 line: t.line,
                 column: t.column,
                 src: self.src.clone(),
+                funding: self.funding.clone(),
             }
         } else {
             Location {
                 line: 0,
                 column: 0,
                 src: self.src.clone(),
+                funding: self.funding.clone(),
             }
         }
     }
@@ -119,12 +118,12 @@ impl Parser {
             None
         };
         let (name, pin_terminals) = if let Some(name) = name.strip_prefix("!") {
-            (name.to_string(), true)
+            (self.funding.try_copy_str(name)?, true)
         } else {
             (name, false)
         };
         let (name, cond_inline) = if let Some(name) = name.strip_prefix("?") {
-            (name.to_string(), true)
+            (self.funding.try_copy_str(name)?, true)
         } else {
             (name, false)
         };
@@ -198,12 +197,12 @@ impl Parser {
                         let string = self.parse_simple_string(&lexeme)?;
                         rule.capture_name = Some(string);
                     } else if rule.capture_name.is_none() {
-                        rule.capture_name = Some(rule.name.clone());
+                        rule.capture_name = Some(self.funding.try_copy_str(&rule.name)?);
                     }
                 }
                 "lazy" => {
                     if !rule.is_lazy() {
-                        rule.suffix = Some(Value::LiteralRegex("".to_string(), "".to_string()));
+                        rule.suffix = Some(Value::LiteralRegex(String::new(), String::new()));
                     }
                 }
                 _ => {
@@ -211,7 +210,7 @@ impl Parser {
                     match key.as_str() {
                         "stop" => {
                             let value = self.parse_value()?;
-                            ensure!(
+                            ensure!(&self.funding,
                                 rule.stop.is_none() && rule.suffix.is_none(),
                                 "Cannot have multiple stop/suffix conditions"
                             );
@@ -220,7 +219,7 @@ impl Parser {
                         "stop_capture" => {
                             let lexeme = self.expect_token_val(Token::String)?;
                             let string = self.parse_simple_string(&lexeme)?;
-                            ensure!(
+                            ensure!(&self.funding,
                                 rule.stop_capture_name.is_none(),
                                 "Cannot have multiple stop_capture names"
                             );
@@ -228,7 +227,7 @@ impl Parser {
                         }
                         "suffix" => {
                             let value = self.parse_value()?;
-                            ensure!(
+                            ensure!(&self.funding,
                                 rule.stop.is_none() && rule.suffix.is_none(),
                                 "Cannot have multiple stop/suffix conditions"
                             );
@@ -239,10 +238,10 @@ impl Parser {
                             rule.max_tokens = Some(value);
                         }
                         "temperature" => {
-                            let value = self.expect_token_val(Token::Number)?.parse::<f32>()?;
+                            let value = self.expect_token_val(Token::Number)?.parse::<f32>().map_err(|error| derivre::ParserError::cause(error, &self.funding))?;
                             rule.temperature = Some(value);
                         }
-                        _ => bail!("Unknown attribute: {}", key),
+                        _ => bail!(&self.funding, "Unknown attribute: {}", key),
                     }
                 }
             }
@@ -282,38 +281,38 @@ impl Parser {
             }
         } else if self.match_token(Token::KwOverride) {
             let rule = self.parse_rule()?;
-            Ok(Statement::OverrideRule(Box::new(rule)))
+            Ok(Statement::OverrideRule(self.funding.try_box(rule)?))
         } else if self.match_token(Token::KwDeclare) {
             let mut names = Vec::new();
             while let Ok(name) = self.parse_name() {
-                names.push(name);
+                { let value = name; self.funding.try_push(&mut names, value)?; }
             }
             if names.is_empty() {
-                bail!("Expected at least one name after %declare")
+                bail!(&self.funding, "Expected at least one name after %declare")
             }
             Ok(Statement::Declare(names))
         } else if self.has_token(Token::KwLLGuidance) {
             let value = match self.take_token_value() {
-                LexemeValue::Json(v) => v.clone(),
-                v => bail!("expected JSON value, got {}", v),
+                LexemeValue::Json(v) => v,
+                v => bail!(&self.funding, "expected JSON value, got {}", v),
             };
             Ok(Statement::LLGuidance(value))
         } else {
-            bail!("expecting rule, token or statement")
+            bail!(&self.funding, "expecting rule, token or statement")
         }
     }
 
     /// Parses rule parameters.
     fn parse_rule_params(&mut self) -> Result<RuleParams> {
         if !self.match_token(Token::LBrace) {
-            bail!("Expected '{{' in rule parameters")
+            bail!(&self.funding, "Expected '{{' in rule parameters")
         }
         let mut params = Vec::new();
         let name = self.expect_token_val(Token::Rule)?;
-        params.push(name);
+        { let value = name; self.funding.try_push(&mut params, value)?; }
         while self.match_token(Token::Comma) {
             let name = self.expect_token_val(Token::Rule)?;
-            params.push(name);
+            { let value = name; self.funding.try_push(&mut params, value)?; }
         }
         self.expect_token(Token::RBrace)?;
         Ok(RuleParams(params))
@@ -322,14 +321,14 @@ impl Parser {
     /// Parses token parameters.
     fn parse_token_params(&mut self) -> Result<TokenParams> {
         if !self.match_token(Token::LBrace) {
-            bail!("Expected '{{' in token parameters")
+            bail!(&self.funding, "Expected '{{' in token parameters")
         }
         let mut params = Vec::new();
         let name = self.expect_token_val(Token::Token)?;
-        params.push(name);
+        { let value = name; self.funding.try_push(&mut params, value)?; }
         while self.match_token(Token::Comma) {
             let name = self.expect_token_val(Token::Token)?;
-            params.push(name);
+            { let value = name; self.funding.try_push(&mut params, value)?; }
         }
         self.expect_token(Token::RBrace)?;
         Ok(TokenParams(params))
@@ -338,7 +337,7 @@ impl Parser {
     /// Parses priority.
     fn parse_priority(&mut self) -> Result<i32> {
         if !self.match_token(Token::Dot) {
-            bail!("Expected '.' in priority")
+            bail!(&self.funding, "Expected '.' in priority")
         }
         let number = self.parse_i32()?;
         Ok(number)
@@ -346,7 +345,7 @@ impl Parser {
 
     /// Parses expansions.
     fn parse_expansions(&mut self) -> Result<Expansions> {
-        ensure!(
+        ensure!(&self.funding,
             self.nesting_level + 1 < MAX_NESTING,
             "lark grammar too deeply nested"
         );
@@ -360,9 +359,9 @@ impl Parser {
     fn parse_expansions_inner(&mut self) -> Result<Expansions> {
         let loc = self.location();
         let mut aliases = Vec::new();
-        aliases.push(self.parse_alias()?);
+        { let value = self.parse_alias()?; self.funding.try_push(&mut aliases, value)?; }
         while self.match_vbar() {
-            aliases.push(self.parse_alias()?);
+            { let value = self.parse_alias()?; self.funding.try_push(&mut aliases, value)?; }
         }
         Ok(Expansions(loc, aliases))
     }
@@ -381,10 +380,10 @@ impl Parser {
 
     /// Parses an alias.
     fn parse_alias(&mut self) -> Result<Alias> {
-        let mut conjuncts = Vec::with_capacity(1);
+        let mut conjuncts = Vec::new();
         loop {
             let expansion = self.parse_expansion()?;
-            conjuncts.push(expansion);
+            { let value = expansion; self.funding.try_push(&mut conjuncts, value)?; }
             if !self.match_token(Token::And) {
                 break;
             }
@@ -422,7 +421,7 @@ impl Parser {
             ]) {
                 break;
             }
-            exprs.push(self.parse_expr()?);
+            { let value = self.parse_expr()?; self.funding.try_push(&mut exprs, value)?; }
         }
         Ok(Expansion(exprs))
     }
@@ -430,13 +429,13 @@ impl Parser {
     fn parse_i32(&mut self) -> Result<i32> {
         let val = self.expect_token_val(Token::Number)?;
         val.parse::<i32>()
-            .map_err(|e| anyhow!("error parsing signed integer: {e}"))
+            .map_err(|e| anyhow!(&self.funding, "error parsing signed integer: {e}"))
     }
 
     fn parse_usize(&mut self) -> Result<usize> {
         let val = self.expect_token_val(Token::Number)?;
         val.parse::<usize>()
-            .map_err(|e| anyhow!("error parsing unsigned integer: {e}"))
+            .map_err(|e| anyhow!(&self.funding, "error parsing unsigned integer: {e}"))
     }
 
     /// Parses an expression.
@@ -445,7 +444,7 @@ impl Parser {
         let mut op = None;
         let mut range = None;
         if let Some(op_token) = self.match_token_with_value(Token::Op) {
-            op = Some(Op(op_token.clone()));
+            op = Some(Op(op_token));
         } else if self.has_tokens(&[Token::Tilde, Token::Number]) {
             self.expect_token(Token::Tilde)?;
             let start_num = self.parse_i32()?;
@@ -473,7 +472,7 @@ impl Parser {
             };
             self.expect_token(Token::RBrace)?;
             if end_num == 0 {
-                bail!("End number in range cannot be 0")
+                bail!(&self.funding, "End number in range cannot be 0")
             }
             range = Some((start_num, end_num));
         }
@@ -500,7 +499,7 @@ impl Parser {
         };
 
         if negated {
-            Ok(Atom::Not(Box::new(res)))
+            Ok(Atom::Not(self.funding.try_box(res)?))
         } else {
             Ok(res)
         }
@@ -509,27 +508,33 @@ impl Parser {
     /// Rewrite `\xHH` escapes (allowed by the lark/Python string lexer above, but not by
     /// `serde_json`) into the equivalent `\u00HH`. All other escapes are already valid JSON and
     /// pass through unchanged. The lexer guarantees a `\x` is always followed by two hex digits.
-    fn rewrite_hex_escapes(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c != '\\' {
-                out.push(c);
+    fn rewrite_hex_escapes(&self, source: &str) -> Result<String> {
+        let mut out = Vec::new();
+        let mut chars = source.chars();
+        while let Some(character) = chars.next() {
+            if character != '\\' {
+                let mut bytes = [0; 4];
+                self.funding.try_extend_copy(&mut out, character.encode_utf8(&mut bytes).as_bytes())?;
                 continue;
             }
             match chars.next() {
                 Some('x') => {
-                    out.push_str("\\u00");
-                    out.extend(chars.by_ref().take(2));
+                    self.funding.try_extend_copy(&mut out, b"\\u00")?;
+                    for character in chars.by_ref().take(2) {
+                        let mut bytes = [0; 4];
+                        self.funding.try_extend_copy(&mut out, character.encode_utf8(&mut bytes).as_bytes())?;
+                    }
                 }
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
+                other => {
+                    self.funding.try_push(&mut out, b'\\')?;
+                    if let Some(character) = other {
+                        let mut bytes = [0; 4];
+                        self.funding.try_extend_copy(&mut out, character.encode_utf8(&mut bytes).as_bytes())?;
+                    }
                 }
-                None => out.push('\\'),
             }
         }
-        out
+        Ok(String::from_utf8(out).expect("copied Lark string UTF-8"))
     }
 
     fn parse_string(&self, s: &str) -> Result<(String, String)> {
@@ -540,15 +545,14 @@ impl Parser {
         };
         // serde_json does not support \xHH escapes that lark/python string literals allow,
         // so rewrite them to the equivalent \u00HH before JSON-decoding.
-        let inner_json = Self::rewrite_hex_escapes(inner);
-        let inner: String =
-            serde_json::from_str(&inner_json).map_err(|e| anyhow!("error parsing string: {e}"))?;
-        Ok((inner, flags.to_string()))
+        let inner_json = self.rewrite_hex_escapes(inner)?;
+        let inner = super::string_value::parse(&inner_json, &self.funding)?;
+        Ok((inner, self.funding.try_copy_str(flags)?))
     }
 
     fn parse_simple_string(&self, string1: &str) -> Result<String> {
         let (inner, flags) = self.parse_string(string1)?;
-        ensure!(flags.is_empty(), "flags not allowed in this context");
+        ensure!(&self.funding, flags.is_empty(), "flags not allowed in this context");
         Ok(inner)
     }
 
@@ -568,8 +572,8 @@ impl Parser {
         } else if let Some(regexp_token) = self.match_token_with_value(Token::Regexp) {
             let inner = regexp_token;
             let last_slash_idx = inner.rfind('/').unwrap();
-            let flags = inner[last_slash_idx + 1..].to_string();
-            let regex = inner[1..last_slash_idx].to_string();
+            let flags = self.funding.try_copy_str(&inner[last_slash_idx + 1..])?;
+            let regex = self.funding.try_copy_str(&inner[1..last_slash_idx])?;
             Ok(Value::LiteralRegex(regex, flags))
         } else if let Some(grammar_ref) = self.match_token_with_value(Token::GrammarRef) {
             Ok(Value::GrammarRef(grammar_ref))
@@ -578,16 +582,16 @@ impl Parser {
         } else if self.has_token(Token::KwJson) {
             match self.take_token_value() {
                 LexemeValue::Json(v) => Ok(Value::Json(v)),
-                v => bail!("expected JSON value, got {}", v),
+                v => bail!(&self.funding, "expected JSON value, got {}", v),
             }
         } else if self.has_token(Token::KwRegex) {
             match self.take_token_value() {
                 LexemeValue::Regex(v) => Ok(Value::RegexExt(v)),
-                v => bail!("expected regex JSON value, got {}", v),
+                v => bail!(&self.funding, "expected regex JSON value, got {}", v),
             }
         } else if self.match_token(Token::KwLark) {
             if !self.match_token(Token::LBrace) {
-                bail!("Expected '{{' after %lark")
+                bail!(&self.funding, "Expected '{{' after %lark")
             }
             let mut nesting_level = 1;
             let mut endp = self.pos;
@@ -604,16 +608,17 @@ impl Parser {
                 endp += 1;
             }
             if nesting_level > 0 {
-                bail!("Unmatched %lark {{ ... }}");
+                bail!(&self.funding, "Unmatched %lark {{ ... }}");
             }
-            let mut inner = Vec::with_capacity(endp - self.pos);
+            let mut inner = Vec::new();
+            self.funding.try_grow_vec(&mut inner, endp - self.pos)?;
             for t in self.tokens[self.pos..endp].iter_mut() {
                 inner.push(t.take());
             }
             self.pos = endp + 1;
 
             let inner =
-                Parser::new(self.src.clone(), inner, self.nesting_level + 1).parse_start()?;
+                Parser::new(self.src.clone(), inner, self.nesting_level + 1, self.funding.clone()).parse_start()?;
             Ok(Value::NestedLark(inner.items))
         } else if let Some(name_token) = self
             .match_token_with_value(Token::Rule)
@@ -627,9 +632,9 @@ impl Parser {
             } else if self.match_token(Token::LBrace) {
                 // Lark template usage (not supported outside of parser anyways)
                 let mut values = Vec::new();
-                values.push(self.parse_value()?);
+                { let value = self.parse_value()?; self.funding.try_push(&mut values, value)?; }
                 while self.match_token(Token::Comma) {
-                    values.push(self.parse_value()?);
+                    { let value = self.parse_value()?; self.funding.try_push(&mut values, value)?; }
                 }
                 self.expect_token(Token::RBrace)?;
                 Ok(Value::TemplateUsage {
@@ -643,7 +648,7 @@ impl Parser {
                 Ok(Value::Name(name_token))
             }
         } else {
-            bail!("Expected value")
+            bail!(&self.funding, "Expected value")
         }
     }
 
@@ -677,7 +682,7 @@ impl Parser {
                 ParamExpr::BitAnd(ParamValue(!(1u64 << n)))
             }
 
-            _ => bail!("Unexpected expression '{}'", n),
+            _ => bail!(&self.funding, "Unexpected expression '{}'", n),
         };
 
         Ok(r)
@@ -689,7 +694,7 @@ impl Parser {
             self.expect_colon()?;
             let end_bit = self.parse_bit_len()?;
             self.expect_token(Token::RBracket)?;
-            ensure!(
+            ensure!(&self.funding,
                 end_bit > start_bit,
                 "end bit index {} must be > start bit index {}",
                 end_bit,
@@ -699,12 +704,12 @@ impl Parser {
         } else if self.match_token(Token::Underscore) {
             return Ok(ParamRef::full());
         }
-        bail!("expected '_' or '[start_bit:stop_bit]'");
+        bail!(&self.funding, "expected '_' or '[start_bit:stop_bit]'");
     }
 
     fn parse_param_value(&mut self) -> Result<ParamValue> {
         if let Some(hex) = self.match_token_with_value(Token::HexNumber) {
-            let val = u64::from_str_radix(&hex[2..], 16)?;
+            let val = u64::from_str_radix(&hex[2..], 16).map_err(|error| derivre::ParserError::cause(error, &self.funding))?;
             Ok(ParamValue(val))
         } else {
             let val = self.parse_usize()? as u64;
@@ -714,7 +719,7 @@ impl Parser {
 
     fn parse_usize_max(&mut self, max_num: usize) -> Result<usize> {
         let val = self.parse_usize()?;
-        ensure!(
+        ensure!(&self.funding,
             val <= max_num,
             "number {} is too large; must be <= {}",
             val,
@@ -761,14 +766,14 @@ impl Parser {
         self.expect_token(Token::Comma)?;
         let right = self.parse_param_cond()?;
         self.expect_token(Token::RParen)?;
-        Ok(ctor(Box::new(left), Box::new(right)))
+        Ok(ctor(self.funding.try_box(left)?, self.funding.try_box(right)?))
     }
 
     fn parse_cond_1(&mut self, ctor: fn(Box<ParamCond>) -> ParamCond) -> Result<ParamCond> {
         self.expect_token(Token::LParen)?;
         let cond = self.parse_param_cond()?;
         self.expect_token(Token::RParen)?;
-        Ok(ctor(Box::new(cond)))
+        Ok(ctor(self.funding.try_box(cond)?))
     }
 
     fn parse_expr_1(&mut self, ctor: fn(ParamRef) -> ParamExpr) -> Result<ParamExpr> {
@@ -834,23 +839,23 @@ impl Parser {
                 ParamCond::EQ(pr, ParamValue(pr.mask() >> pr.start()))
             }
 
-            _ => bail!("Unexpected condition '{}'", n),
+            _ => bail!(&self.funding, "Unexpected condition '{}'", n),
         };
         Ok(r)
     }
 
     /// Parses an import path.
     fn parse_import_path(&mut self) -> Result<String> {
-        let mut names = String::new();
-        if self.match_token(Token::Dot) {
-            names.push('.');
-        }
-        names.push_str(&self.parse_name()?);
+        let mut names = Vec::new();
+        if self.match_token(Token::Dot) { self.funding.try_push(&mut names, b'.')?; }
+        let name = self.parse_name()?;
+        self.funding.try_extend_copy(&mut names, name.as_bytes())?;
         while self.match_token(Token::Dot) {
-            names.push('.');
-            names.push_str(&self.parse_name()?);
+            self.funding.try_push(&mut names, b'.')?;
+            let name = self.parse_name()?;
+            self.funding.try_extend_copy(&mut names, name.as_bytes())?;
         }
-        Ok(names)
+        Ok(String::from_utf8(names).expect("copied import identifiers"))
     }
 
     /// Parses a name (RULE or TOKEN).
@@ -860,19 +865,19 @@ impl Parser {
         } else if let Some(token) = self.match_token_with_value(Token::Token) {
             Ok(token)
         } else {
-            bail!("Expected name (RULE or TOKEN)")
+            bail!(&self.funding, "Expected name (RULE or TOKEN)")
         }
     }
 
     /// Parses a list of names.
     fn parse_name_list(&mut self) -> Result<Vec<String>> {
         if !self.match_token(Token::LParen) {
-            bail!("Expected '(' in name list")
+            bail!(&self.funding, "Expected '(' in name list")
         }
         let mut names = Vec::new();
-        names.push(self.parse_name()?);
+        { let value = self.parse_name()?; self.funding.try_push(&mut names, value)?; }
         while self.match_token(Token::Comma) {
-            names.push(self.parse_name()?);
+            { let value = self.parse_name()?; self.funding.try_push(&mut names, value)?; }
         }
         self.expect_token(Token::RParen)?;
         Ok(names)
@@ -923,24 +928,22 @@ impl Parser {
                 self.advance();
                 Ok(())
             } else {
-                bail!("Expected token {}, found {}", expected, token.token)
+                bail!(&self.funding, "Expected token {}, found {}", expected, token.token)
             }
         } else {
-            bail!("Expected token {}, found end of input", expected)
+            bail!(&self.funding, "Expected token {}, found end of input", expected)
         }
     }
 
     fn expect_token_val(&mut self, expected: Token) -> Result<String> {
         if let Some(token) = self.peek_token() {
             if token.token == expected {
-                let r = token.value.get_string().unwrap();
-                self.advance();
-                Ok(r)
+                match self.take_token_value() { LexemeValue::String(value) => Ok(value), _ => unreachable!("string-valued Lark token") }
             } else {
-                bail!("Expected token {}, found {}", expected, token.token)
+                bail!(&self.funding, "Expected token {}, found {}", expected, token.token)
             }
         } else {
-            bail!("Expected token {}, found end of input", expected)
+            bail!(&self.funding, "Expected token {}, found end of input", expected)
         }
     }
 
@@ -948,9 +951,7 @@ impl Parser {
     fn match_token_with_value(&mut self, expected: Token) -> Option<String> {
         if let Some(token) = self.peek_token() {
             if token.token == expected {
-                let r = token.value.get_string().unwrap();
-                self.advance();
-                Some(r)
+                match self.take_token_value() { LexemeValue::String(value) => Some(value), _ => unreachable!("string-valued Lark token") }
             } else {
                 None
             }
@@ -998,7 +999,9 @@ pub struct ParsedLark {
     pub items: Vec<Item>,
 }
 
-pub fn parse_lark(input: &str) -> Result<ParsedLark> {
-    let tokens = lex_lark(input)?;
-    Parser::new(Rc::new(input.to_string()), tokens, 0).parse_start()
+pub fn parse_lark(input: &str, funding: derivre::ParserAllocationFunding) -> Result<ParsedLark> {
+    let tokens = lex_lark(input, &funding)?;
+    let source = funding.try_copy_str(input)?;
+    let source = funding.try_rc(source)?;
+    Parser::new(source, tokens, 0, funding).parse_start()
 }

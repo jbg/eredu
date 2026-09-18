@@ -6,7 +6,7 @@ use super::*;
 struct DiskLocation {
     inner: Arc<DiskLocationData>,
     // Every alias drops its actual immutable fields/file before their H.
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 #[derive(Debug)]
 struct DiskLocationData {

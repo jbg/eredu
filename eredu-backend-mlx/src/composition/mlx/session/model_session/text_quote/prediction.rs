@@ -46,13 +46,9 @@ impl PredictionScopes {
         &self,
         step: &InferenceTextStep,
     ) -> Result<OriginalTextPredictionScopeSet, Error> {
-        self.controls
-            .validate_reservation(
-                step.request()
-                    .memory_reservation()
-                    .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
-            )
-            .map_err(memory)?;
+        // The neutral bank authenticates its actual reservation and either the
+        // original run or its sealed sampling-extension origin. Comparing the
+        // extension guard to the old model reservation would reject that origin.
         let result = {
             let mut bank = self
                 .bank
@@ -106,7 +102,7 @@ fn added(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     a.zip(b).and_then(|(a, b)| a.checked_add(b))
 }
 
-pub(super) fn facts() -> Result<TextPredictionScopeFacts, Error> {
+fn role_facts() -> Result<[Option<u64>; 5], Error> {
     crate::backend::submission_recovery::prediction::validate_layouts()?;
     use super::super::{ObservationRetention, ResourceOperation, ScopeRetention, SessionOperation};
     use crate::backend::MlxCompletion;
@@ -172,13 +168,16 @@ pub(super) fn facts() -> Result<TextPredictionScopeFacts, Error> {
         n.map(Some)
             .ok_or_else(|| memory(WorkingMemoryError::Overflow))
     };
-    Ok(TextPredictionScopeFacts::new(
-        known(model)?,
-        known(sampling)?,
-        known(event)?,
-        known(validation)?,
-        known(scalar)?,
-    ))
+    Ok([known(model)?, known(sampling)?, known(event)?, known(validation)?, known(scalar)?])
+}
+
+pub(super) fn facts() -> Result<TextPredictionScopeFacts, Error> {
+    let [model, sampling, event, validation, scalar] = role_facts()?;
+    Ok(TextPredictionScopeFacts::new(model, sampling, event, validation, scalar))
+}
+pub(super) fn sampling_facts() -> Result<(Option<u64>, Option<u64>), Error> {
+    let [_, sampling, event, _, _] = role_facts()?;
+    Ok((sampling, event))
 }
 
 #[cfg(all(

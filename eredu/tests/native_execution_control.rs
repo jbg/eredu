@@ -5,8 +5,8 @@ use eredu::{
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    capture::*, execution_control::*, ExecutionPlan, GenerationConfigOverrides, SemanticEvent,
-    SessionCapabilities,
+    ExecutionPlan, GenerationConfigOverrides, SemanticEvent, SessionCapabilities, capture::*,
+    execution_control::*,
 };
 use std::{
     io::Write,
@@ -14,9 +14,62 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokenizers::{
-    decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
-    pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
+    AddedToken, Tokenizer, decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
+    pre_tokenizers::whitespace::Whitespace,
 };
+
+const ORIGINAL_CAPACITY: u64 = 64 << 30;
+trait SourceChatFixture {
+    fn source_chat_with_capacity(
+        &self,
+        policy: ChatTemplateRequest,
+        capacity: u64,
+    ) -> anyhow::Result<eredu::runtime::chat::PreparedChat>;
+    fn source_chat(
+        &self,
+        policy: ChatTemplateRequest,
+    ) -> anyhow::Result<eredu::runtime::chat::PreparedChat> {
+        self.source_chat_with_capacity(policy, ORIGINAL_CAPACITY)
+    }
+}
+impl<B: eredu_runtime::working_memory::OriginalChatBackend> SourceChatFixture for LoadedModel<B> {
+    fn source_chat_with_capacity(
+        &self,
+        policy: ChatTemplateRequest,
+        capacity: u64,
+    ) -> anyhow::Result<eredu::runtime::chat::PreparedChat> {
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let tokenizer =
+            self.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+        let source = self
+            .compile_managed_chat_source(
+                &tokenizer,
+                ChatSourceInput::RetainedConfiguration,
+                !policy.tools.is_empty(),
+                &cancel,
+            )?
+            .expect("fixture preparation is not cancelled");
+        Ok(self
+            .prepare_chat(&source, &policy, capacity, &cancel)?
+            .expect("fixture preparation is not cancelled"))
+    }
+}
+fn original_settings(
+    mut settings: PreparedChatGenerationSettings,
+) -> PreparedChatGenerationSettings {
+    settings.inference.managed_memory_capacity_bytes = Some(ORIGINAL_CAPACITY);
+    settings
+}
+fn chat_settings(
+    chat: &eredu::runtime::chat::PreparedChat,
+    mut settings: PreparedChatGenerationSettings,
+) -> PreparedChatGenerationSettings {
+    settings.inference.managed_memory_capacity_bytes = Some(chat.capacity());
+    settings
+}
+fn copy_limits() -> eredu_runtime::working_memory::WorkspaceCopyLimits {
+    eredu_runtime::working_memory::WorkspaceCopyLimits::new(ORIGINAL_CAPACITY)
+}
 
 struct Fixture(PathBuf);
 impl Drop for Fixture {
@@ -56,7 +109,7 @@ fn fixture(fragments: bool) -> Fixture {
         .build()
         .unwrap();
     let mut tokenizer = Tokenizer::new(words);
-    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     tokenizer.with_decoder(Some(ByteLevel::default()));
     tokenizer
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
@@ -169,7 +222,8 @@ fn collect(
 fn semantics(records: &[ControlledGenerationRecord]) -> Vec<SemanticEvent> {
     records
         .iter()
-        .filter_map(|record| match &record.generation.event {
+        .filter_map(|record| record.event.progress())
+        .filter_map(|event| match event {
             ObservedGenerationEvent::Semantic { event, .. } => Some(event.clone()),
             _ => None,
         })
@@ -231,7 +285,7 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
             .unwrap()
             .into_parts();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
             tools: if text {
                 vec![]
@@ -261,29 +315,34 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
         per_record_bytes: 16384,
         total_bytes: 65536,
     };
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-        .unwrap();
+    let mut request = PreparedChatRequest::new(&chat, original_settings(settings));
+    if text {
+        request.output_mode = PreparedChatOutputMode::Text;
+    }
     // Every subsequent action must use the resident prepared model and tokenizer.
     std::fs::remove_file(root.0.join("model.safetensors")).unwrap();
     std::fs::remove_file(root.0.join("tokenizer.json")).unwrap();
     let mut records = vec![];
-    let mut run = if text {
+    if text {
         assert!(matches!(
             chat.semantic_support(),
             eredu::runtime::chat::SemanticSupport::Unsupported { .. }
         ));
-        model.start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
-    } else {
-        model.start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
     }
-    .unwrap();
-    run.enable_snapshots(SnapshotLimits {
-        max_snapshots: 2,
-        max_branches: 1,
-        retained_bytes: 64 << 20,
-        cumulative_copy_bytes: 256 << 20,
-    })
+    let mut run = model
+        .start_controlled_chat(request, trace, Default::default(), collect(&mut records))
+        .unwrap()
+        .unwrap();
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_snapshots: 2,
+            max_branches: 1,
+            retained_bytes: 64 << 20,
+            cumulative_copy_bytes: 256 << 20,
+        },
+        ORIGINAL_CAPACITY,
+        copy_limits(),
+    )
     .unwrap();
     run.force_next_token(1).unwrap();
     run.step(collect(&mut records)).unwrap();
@@ -440,7 +499,7 @@ fn text_matches_ordinary_sampling_with_policy(
             .into_parts();
     for temperature in [0.0, 1.7] {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user", "content":"word4 right"})],
                 add_generation_prompt: true,
                 ..Default::default()
@@ -458,12 +517,8 @@ fn text_matches_ordinary_sampling_with_policy(
             per_record_bytes: 16384,
             total_bytes: 65536,
         };
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-            .unwrap();
-        let prompt = prepared.prompt_token_ids().to_vec();
-        assert_eq!(prompt, [4, 2, 3, 7]);
-        let resolved = prepared.generation_config();
+        let prompt = vec![4, 2, 3, 7];
+        let resolved = model.resolve_generation_config(settings.overrides).unwrap();
         assert_eq!(resolved.temperature, temperature);
         assert_eq!(resolved.top_k, 12);
         assert_eq!(resolved.top_p, 0.9);
@@ -481,9 +536,13 @@ fn text_matches_ordinary_sampling_with_policy(
         assert!(baseline.iter().all(|id| *id < 32));
         model.reset().unwrap();
         let mut records = vec![];
+        let mut request = PreparedChatRequest::new(&chat, original_settings(settings));
+        request.output_mode = PreparedChatOutputMode::Text;
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+            .start_controlled_chat(request, trace, Default::default(), collect(&mut records))
+            .unwrap()
             .unwrap();
+        assert_eq!(run.prompt_attribution().canonical_token_ids, prompt);
         assert!(run.force_next_token(32).is_err());
         assert!(run.force_next_token(63).is_err());
         run.run(collect(&mut records)).unwrap();

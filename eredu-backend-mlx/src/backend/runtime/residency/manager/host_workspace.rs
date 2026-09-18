@@ -1,4 +1,4 @@
-//! Cold facts for the exact per-name host-to-Metal copy dispatch.
+//! Cold facts for the exact per-name Host copy on its selected native stream.
 //!
 //! The snapshot retains source buffers without residency leases. Post-admission
 //! custody explicitly pins the revalidated stores to prevent eviction/fallback.
@@ -163,6 +163,7 @@ pub(crate) struct HostCopyWorkspaceData {
     // handle must also remain the one whose device was checked cold.
     manager: super::ManagerWeak,
     stream_handle: usize,
+    destination: safemlx::StreamCopyPlan<()>,
     allocation: MetalAllocationFacts,
     units: Vec<HostCopyUnit>,
     copies: Vec<HostCopyBinding>,
@@ -221,6 +222,9 @@ impl std::fmt::Debug for HostCopySourcePins {
 }
 
 impl HostCopyWorkspace {
+    pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
+        self.destination.device_type()
+    }
     pub(crate) fn cloned_definition_payload_bytes(definition: &OffloadUnit) -> Option<usize> {
         super::operation_source::unit_clone_payload_bytes(definition)
     }
@@ -277,57 +281,25 @@ impl HostCopyWorkspace {
     pub(crate) fn unique_source_bytes(&self) -> u64 {
         self.unique_source_bytes
     }
-    /// Proved MetalShared/Transfer input is copied directly by the Metal kernel.
+    /// Transfer input is copied directly by the selected native worker; there
+    /// is no separate numerical Host staging allocation.
     pub(crate) fn host_staging_bytes(&self) -> u64 {
         0
     }
 
     /// Rechecks definitions and physical sources without acquiring a lease or
-    /// repairing a missing store. Success still requires the executor to retain
+    /// repairing a missing store. Both source modes compare the same immutable
+    /// owners and exact selected stream under one manager loan; they never
+    /// reconstruct a snapshot during validation. Success still requires the executor to retain
     /// its own residency authority across validation and subsequent dispatch.
     pub(crate) fn validate_sources(
         &self,
         manager: &ResidencyManager,
     ) -> Result<(), HostCopyWorkspaceError> {
-        if self.custody.is_some() {
-            let state =
-                manager.inner.state.lock().map_err(|_| {
-                    HostCopyWorkspaceError::Residency(ResidencyError::StatePoisoned)
-                })?;
-            return self.validate_retained_locked(manager, &state);
-        }
-        let ids = self
-            .units
-            .iter()
-            .map(|unit| unit.id().clone())
-            .collect::<Vec<_>>();
-        let current = manager.host_copy_workspace(&ids, self.allocation)?;
-        self.validate_snapshot(&current)
-    }
-
-    fn validate_snapshot(&self, current: &Self) -> Result<(), HostCopyWorkspaceError> {
-        if self.units.len() != current.units.len() {
-            return Err(HostCopyWorkspaceError::mismatch(
-                "host-copy unit set changed",
-            ));
-        }
-        for (expected, actual) in self.units.iter().zip(&current.units) {
-            if expected.definition != actual.definition
-                || expected.copies.len() != actual.copies.len()
-                || self
-                    .copies(expected)
-                    .iter()
-                    .zip(current.copies(actual))
-                    .any(|(left, right)| {
-                        left.binding != right.binding || left.metadata != right.metadata
-                    })
-            {
-                return Err(HostCopyWorkspaceError::mismatch(
-                    "host-copy source set changed",
-                ));
-            }
-        }
-        Ok(())
+        let state = manager.inner.state.lock().map_err(|_| {
+            HostCopyWorkspaceError::Residency(ResidencyError::StatePoisoned)
+        })?;
+        self.validate_sources_locked(manager, &state)
     }
 
     /// Atomically revalidates and pins only already-ready host copies. This
@@ -338,7 +310,7 @@ impl HostCopyWorkspace {
         &self,
         manager: &ResidencyManager,
     ) -> Result<HostCopySourcePins, HostCopyWorkspaceError> {
-        self.pin_sources_impl(manager, false, None)
+        self.pin_sources_impl(manager, None)
     }
 
     /// Original installation consumes the retained immutable-owner decision.
@@ -368,7 +340,7 @@ impl HostCopyWorkspace {
             .ok_or(HostCopyWorkspaceError::Storage(
                 WorkingMemoryError::UnknownBound,
             ))?;
-        self.pin_sources_impl(manager, true, Some(custody))
+        self.pin_sources_impl(manager, Some(custody))
     }
 
     /// One initial-quote pin through the accepted quote controls. Mapping a
@@ -441,25 +413,29 @@ impl HostCopyWorkspace {
             size_of::<std::sync::MutexGuard<'static, ManagerState>>(),
         ]
         .into_iter()
-        .try_fold(vectors.checked_add(names)?, usize::checked_add)?;
+        .try_fold(
+            vectors.checked_add(names)?.checked_add(self.source_validation_control_bytes()?)?,
+            usize::checked_add,
+        )?;
         u64::try_from(controls)
             .ok()?
             .checked_add(OrdinaryRetirement::<HostPinLeases>::control_bytes()?)
     }
 
-    fn validate_retained_locked(
+    fn validate_sources_locked(
         &self,
         manager: &ResidencyManager,
         state: &ManagerState,
     ) -> Result<(), HostCopyWorkspaceError> {
         if !self.manager.ptr_eq(&manager.inner.downgrade())
             || self.stream_handle != state.device_stream.as_ptr().ctx as usize
+            || !self.destination.matches_source(&state.device_stream)
         {
             return Err(HostCopyWorkspaceError::mismatch(
                 "retained copy stream changed",
             ));
         }
-        manager.validate_host_copy_state(&state, false)?;
+        manager.validate_host_copy_state(&state)?;
         for unit in &self.units {
             let definition = state.control.unit(unit.id()).ok_or_else(|| {
                 HostCopyWorkspaceError::mismatch("retained host unit disappeared")
@@ -497,13 +473,6 @@ impl HostCopyWorkspace {
         manager: &ResidencyManager,
         windows: &super::OperationWindows,
     ) -> bool {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            eprintln!("HOST_PARALLEL_STORAGE_READY custody={} geometry={} checkpoint={} owns_windows_snapshot={}",
-                self.custody.is_some(), self.geometry.is_some(),
-                manager.original_checkpoint_source().is_some(),
-                manager.owns_original_host_workspace(self, windows));
-        }
         self.custody.is_some()
             && self.geometry.is_some()
             && manager.original_checkpoint_source().is_some()
@@ -515,6 +484,7 @@ impl HostCopyWorkspace {
     ) -> Option<usize> {
         use std::mem::{size_of, size_of_val};
         let controls = [
+            size_of::<(&Self, &ResidencyManager, &ManagerState, Result<(), HostCopyWorkspaceError>)>(),
             size_of::<(&ResidencyManager, &ManagerState, &OffloadUnitId)>(),
             size_of::<Option<&ResidentHostOwner>>(),
             size_of::<(&Self, &ResidencyManager)>(),
@@ -531,7 +501,8 @@ impl HostCopyWorkspace {
         ];
         controls
             .into_iter()
-            .try_fold(size_of_val(&controls), usize::checked_add)
+            .try_fold(size_of_val(&controls), usize::checked_add)?
+            .checked_add(self.destination.source_comparison_control_bytes()?)
     }
     pub(in crate::backend::runtime::residency::manager) fn same_snapshot(
         &self,
@@ -547,13 +518,12 @@ impl HostCopyWorkspace {
             manager.inner.state.try_lock().map_err(|_| {
                 HostCopyWorkspaceError::unknown("host source manager is not available")
             })?;
-        self.validate_retained_locked(manager, &state)
+        self.validate_sources_locked(manager, &state)
     }
 
     fn pin_sources_impl(
         &self,
         manager: &ResidencyManager,
-        retained: bool,
         custody: Option<eredu_runtime::working_memory::OriginalOperationMetadataCustody>,
     ) -> Result<HostCopySourcePins, HostCopyWorkspaceError> {
         // Put custody behind the deferred owner before any fallible prefix.
@@ -583,12 +553,7 @@ impl HostCopyWorkspace {
             .state
             .lock()
             .map_err(|_| HostCopyWorkspaceError::Residency(ResidencyError::StatePoisoned))?;
-        if retained || self.custody.is_some() {
-            self.validate_retained_locked(manager, &state)?;
-        } else {
-            let current = manager.host_copy_workspace_locked(&state, &ids, self.allocation)?;
-            self.validate_snapshot(&current)?;
-        }
+        self.validate_sources_locked(manager, &state)?;
         state
             .control
             .ledger()
@@ -702,7 +667,7 @@ impl ResidencyManager {
                     "prepared host snapshot selection changed",
                 ));
             }
-            cached.validate_retained_locked(self, &state)?;
+            cached.validate_sources_locked(self, &state)?;
             return Ok(cached.clone());
         }
         if prepared_only || self.original_source_custody().is_some() {
@@ -716,24 +681,10 @@ impl ResidencyManager {
     fn validate_host_copy_state(
         &self,
         state: &ManagerState,
-        inspect_device: bool,
     ) -> Result<(), HostCopyWorkspaceError> {
         if self.inner.failed_transfer.load(Ordering::Acquire) {
             return Err(HostCopyWorkspaceError::unknown(
                 "manager has failed transfer ownership",
-            ));
-        }
-        // The existing scalar copy snapshot reads the immutable value without
-        // constructing a Device shell. Original validation uses the retained
-        // same-manager/same-stream proof and does not repeat this cold query.
-        if inspect_device
-            && safemlx::StreamCopyPlan::<()>::capture(&state.device_stream)
-                .map_err(HostCopyWorkspaceError::StreamCopy)?
-                .device_type()
-                != safemlx::DeviceType::Gpu
-        {
-            return Err(HostCopyWorkspaceError::unknown(
-                "copy destination is not the selected Metal device",
             ));
         }
         for unit in state.control.units() {
@@ -773,7 +724,9 @@ impl ResidencyManager {
         allocation: MetalAllocationFacts,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         let original = self.original_source_custody().is_some();
-        self.validate_host_copy_state(state, !original)?;
+        self.validate_host_copy_state(state)?;
+        let destination = safemlx::StreamCopyPlan::<()>::capture(&state.device_stream)
+            .map_err(HostCopyWorkspaceError::StreamCopy)?;
         // Both vectors are final snapshot storage. Their exact populations
         // come from the locked selected stores; no tree nodes or separate
         // duplicate/source index are allocated during construction.
@@ -857,6 +810,11 @@ impl ResidencyManager {
                 {
                     return Err(HostCopyWorkspaceError::unknown(
                         "host source is not MetalShared transfer storage",
+                    ));
+                }
+                if !copy_shape_is_supported(destination.device_type(), metadata.shape()) {
+                    return Err(HostCopyWorkspaceError::unknown(
+                        "Host copy shape is outside the selected native worker",
                     ));
                 }
                 let (owner_id, owner) = if binding.is_alias() {
@@ -972,6 +930,7 @@ impl ResidencyManager {
             value: Arc::new(HostCopyWorkspaceData {
                 manager: self.inner.downgrade(),
                 stream_handle: state.device_stream.as_ptr().ctx as usize,
+                destination,
                 allocation,
                 units,
                 copies,
@@ -982,6 +941,16 @@ impl ResidencyManager {
             custody: None,
         })
     }
+}
+
+/// The CPU General-copy worker uses positive signed-index geometry. Snapshot
+/// shapes are canonical dense Host arrays; rank/dtype dispatch is separately
+/// authenticated by the selected native copy-layout query.
+pub(super) fn copy_shape_is_supported(device: safemlx::DeviceType, shape: &[i32]) -> bool {
+    device != safemlx::DeviceType::Cpu
+        || shape.iter().try_fold(1_i32, |n, &d| {
+            (d > 0).then(|| n.checked_mul(d)).flatten()
+        }).is_some()
 }
 
 #[cfg(all(

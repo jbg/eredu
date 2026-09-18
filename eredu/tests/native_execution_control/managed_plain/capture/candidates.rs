@@ -65,9 +65,9 @@ fn run(mode: &str) -> serde_json::Value {
     );
     let mut frames = Vec::new();
     let mut tokens = Vec::new();
-    let mut observer = |token: Option<u32>, frame: Option<CapturedStepDelivery>, _: f64| {
+    let mut observer = |token: Option<u32>, frame: Option<SharedCapturedStep>, _: f64| {
         tokens.push(token.expect("committed token"));
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+        let Some(frame) = frame else {
             panic!("original shared frame")
         };
         assert_eq!(frame.prediction_index() as usize, frames.len());

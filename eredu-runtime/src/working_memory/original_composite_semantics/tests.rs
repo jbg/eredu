@@ -37,6 +37,25 @@ fn binding() -> MediaSessionBinding {
     }
 }
 #[test]
+fn independent_media_binding_requires_the_actual_initialized_cache_revision() {
+    let execution = InferenceExecutionIdentity::default();
+    let retention = super::super::InferenceRetention::new();
+    let foreign = super::super::InferenceRetention::new();
+    let binding = MediaSessionBinding {
+        execution: execution.clone(),
+        revision: retention.revision().clone(),
+        control: Arc::new(()),
+        frontier: 0,
+    };
+    assert!(binding.matches_retained_state(&execution, &retention, 0));
+    assert!(!binding.matches_retained_state(&execution, &foreign, 0));
+    assert!(foreign.initialized_revision().is_none(), "comparison cannot mint an identity");
+    let _ = foreign.revision();
+    assert!(!binding.matches_retained_state(&execution, &foreign, 0));
+    assert!(!binding.matches_retained_state(&execution, &retention, 1));
+    assert!(!binding.matches_retained_state(&InferenceExecutionIdentity::default(), &retention, 0));
+}
+#[test]
 fn exact_semantic_capacity_and_short_rejection_preserve_original_host_residence() {
     let (host, bytes) = sizes();
     for short in [true, false] {

@@ -18,7 +18,7 @@ pub(crate) struct ReadCacheHostSource {
     generation: u64,
     custody: OriginalHostSourceCustody,
     context: WorkspaceContext,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     selection: ReadSelection,
 }
 // Only the completed-read handoff below can select this private origin. The
@@ -241,7 +241,7 @@ impl DiskReadOperation {
                     TryLockError<MutexGuard<'_, Option<CompletedDiskRead>>>,
                 >,
             >(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             size_of::<CacheBlockSelection>(),
             size_of::<(&CacheBlockSourceLoan<'_>, Option<CacheDiskSource<'_>>, bool)>(),
             size_of::<
@@ -265,3 +265,5 @@ impl DiskReadOperation {
             .try_fold(size_of_val(&frames), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

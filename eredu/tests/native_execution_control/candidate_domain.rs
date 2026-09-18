@@ -70,7 +70,7 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
             .into_parts();
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    let chat = model.source_chat(ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
         tools: vec![serde_json::json!({"type":"function", "function": {
             "name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}
@@ -115,30 +115,27 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
         per_record_bytes: 64 << 10,
         total_bytes: 1 << 20,
     };
-    let ordinary_prepared = model
-        .prepare_observed_chat(&chat, settings, capture.clone(), trace)
-        .unwrap();
-    let controlled_prepared = model
-        .prepare_observed_chat(&chat, settings, capture.clone(), trace)
-        .unwrap();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, capture, trace)
-        .unwrap();
-    let uncaptured = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-        .unwrap();
+    let request = || PreparedChatRequest::new(&chat, original_settings(settings));
+    let cancellation = eredu_core::GenerationCancellationToken::new();
     let expected = model
-        .generate_observed_chat(uncaptured, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_prepared_chat(request(), &cancellation)
+        .unwrap()
+        .unwrap()
+        .run(&cancellation, &mut |_| {})
         .unwrap();
     model.reset().unwrap();
     let mut ordinary = Vec::new();
+    let mut collect_ordinary = |token: Option<u32>, step: Option<SharedCapturedStep>, _| {
+        ordinary.push((token.unwrap(), step.unwrap()));
+    };
+    let mut ordinary_request = request();
+    ordinary_request.capture = Some(&capture);
     let observed = model
-        .generate_observed_chat(ordinary_prepared, &[], Default::default(), |record| {
-            ordinary.push(record);
-            ControlFlow::Continue(())
-        })
+        .start_prepared_chat(ordinary_request, &cancellation)
+        .unwrap()
+        .unwrap()
+        .with_capture_observer(&mut collect_ordinary)
+        .run(&cancellation, &mut |_| {})
         .unwrap();
     assert_eq!(
         observed.token_ids(),
@@ -148,31 +145,38 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     model.reset().unwrap();
     let mut records = Vec::new();
     {
+        let mut request = request();
+        request.capture = Some(&capture);
         let mut run = model
-            .start_controlled_chat(
-                controlled_prepared,
-                &[],
-                Default::default(),
-                collect(&mut records),
-            )
+            .start_controlled_chat(request, trace, Default::default(), collect(&mut records))
+            .unwrap()
             .unwrap();
         run.run(collect(&mut records)).unwrap();
     }
     let ordinary = ordinary
         .iter()
-        .filter_map(|record| candidates(&record.event))
+        .map(|(token, frame)| {
+            assert_eq!(frame.records.len(), 1);
+            assert_eq!(frame.records[0].outcome, CaptureOutcome::Captured);
+            let Some(CapturePayload::Candidates(candidates)) = &frame.records[0].payload else {
+                panic!()
+            };
+            (*token, frame.prediction_index, false, candidates)
+        })
         .collect::<Vec<_>>();
     let controlled = records
         .iter()
-        .filter_map(|record| candidates(&record.generation.event))
+        .filter_map(|record| record.event.progress().and_then(candidates))
         .collect::<Vec<_>>();
     assert_eq!(
         ordinary, controlled,
         "capture must preserve sampling and match controlled execution"
     );
-    assert!(controlled
-        .iter()
-        .any(|(_, prediction, _, _)| *prediction > 0));
+    assert!(
+        controlled
+            .iter()
+            .any(|(_, prediction, _, _)| *prediction > 0)
+    );
     for (token, _, forced, capture) in controlled {
         assert!(!forced);
         assert_eq!(capture.source, CandidateLogitsSource::Original);
@@ -188,8 +192,11 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     }
     records.clear();
     model.reset().unwrap();
+    let mut request = request();
+    request.capture = Some(&capture);
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled_chat(request, trace, Default::default(), collect(&mut records))
+        .unwrap()
         .unwrap();
     for token in [1, 2] {
         run.force_next_token(token).unwrap();
@@ -198,12 +205,12 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     assert_eq!(
         records
             .iter()
-            .filter_map(|record| candidates(&record.generation.event))
+            .filter_map(|record| record.event.progress().and_then(candidates))
             .count(),
         2
     );
     for record in &records {
-        if let Some((token, _, forced, capture)) = candidates(&record.generation.event) {
+        if let Some((token, _, forced, capture)) = record.event.progress().and_then(candidates) {
             assert!(forced);
             assert_domain(capture);
             assert!(

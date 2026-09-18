@@ -33,7 +33,7 @@ impl ResidencyManager {
         }
         // With no selected target IDs, SupplementarySourcePlan retains all
         // actual members through its existing singleton source-acquire graph.
-        // The same initializer authenticates CPU source / GPU execution streams,
+        // The same initializer authenticates CPU source and the selected CPU/Metal execution streams,
         // captures foreground descriptors and catalogs, pays manager storage,
         // installs ordinary materialization resources, and initializes the
         // supplementary source. Only target-specific setup is absent.

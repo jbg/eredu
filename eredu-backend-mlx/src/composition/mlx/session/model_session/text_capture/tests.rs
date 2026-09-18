@@ -256,7 +256,7 @@ fn actual_funded_sampler_copy_rejects_capture_before_work_and_collector_slots_ar
         WorkingMemoryError::PreparationAlreadyStarted
     ));
     drop(state.funded_capture.take());
-    state.capture = Some(eredu_runtime::capture::CaptureSession::from_shared_plan(
+    state.capture = Some(eredu_runtime::capture::CaptureSession::new(
         source.clone(),
     ));
     assert!(matches!(

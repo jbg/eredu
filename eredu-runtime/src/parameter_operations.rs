@@ -168,7 +168,7 @@ where
     match static_modules.visit_parameter_sources(visitor) {
         Ok(()) => {}
         Err(
-            ParameterSourceError::Unavailable | ParameterSourceError::UnclassifiedRetainedField,
+            ParameterSourceError::UnclassifiedRetainedField,
         ) => return Ok(false),
         Err(cause) => return Err(context.metadata_source(cause)),
     }
@@ -257,8 +257,8 @@ where
     }
     struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
     impl<T: Clone> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
-        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadata, value: &mut T) {
-            if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut T) {
+            if let Some(replacement) = self.0.get(metadata.id().as_str()) {
                 *value = replacement.clone();
             }
         }
@@ -278,7 +278,7 @@ struct LoadedSlotAdapter<'a, B: NeuralBackend>(
 impl<'a, B: NeuralBackend> eredu_nn::ParameterVisitorMut<'a, B::Tensor>
     for LoadedSlotAdapter<'_, B>
 {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut B::Tensor) {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut B::Tensor) {
         self.0.visit_slot(metadata, value);
     }
 }

@@ -61,7 +61,7 @@ impl StopController {
             let fin = RegexAst::LookAhead(Box::new(rx_ast));
             let pref = RegexAst::Regex("(?s:.*)".to_string());
             let rx = RegexAst::Concat(vec![pref, fin]);
-            let mut builder = RegexBuilder::new();
+            let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
             let rx = builder.mk(&rx)?;
             let mut all_regex = LexemeSet::new(1);
             all_regex.add(LexemeIdx::new(0));

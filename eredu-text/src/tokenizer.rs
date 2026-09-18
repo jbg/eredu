@@ -99,38 +99,43 @@ impl SelectedChatTemplate<'_> {
     }
 }
 
+/// One allocation-free selection rule for borrowed metadata and config sources.
+pub(crate) fn selected_chat_template_name(has_tools: bool, has_tool_template: bool) -> &'static str {
+    if has_tools && has_tool_template {
+        TOOL_USE_CHAT_TEMPLATE_NAME
+    } else {
+        DEFAULT_CHAT_TEMPLATE_NAME
+    }
+}
+
 impl ModelChatTemplate {
+    /// Borrows the selected source/name before any owned public metadata is
+    /// produced. Both ordinary rendering and admitted compilation use this
+    /// exact selection policy.
+    pub fn selected_source(&self, has_tools: bool) -> Option<(&str, Option<&'static str>)> {
+        match self {
+            Self::Single(template) => Some((template, None)),
+            Self::Named(templates) => {
+                let name = selected_chat_template_name(
+                    has_tools, templates.contains_key(TOOL_USE_CHAT_TEMPLATE_NAME),
+                );
+                templates.get(name).map(|source| (source.as_str(), Some(name)))
+            }
+        }
+    }
     /// Selects `tool_use` for a non-empty tool list when present, and `default`
     /// otherwise. Single templates are always selected unchanged.
     pub fn select(
         &self,
         tools: Option<&[serde_json::Value]>,
     ) -> Result<SelectedChatTemplate<'_>, Error> {
-        match self {
-            Self::Single(template) => Ok(SelectedChatTemplate {
-                template,
-                identity: ChatTemplateIdentity::Single,
-            }),
-            Self::Named(templates) => {
-                let selected_name = if tools.is_some_and(|tools| !tools.is_empty())
-                    && templates.contains_key(TOOL_USE_CHAT_TEMPLATE_NAME)
-                {
-                    TOOL_USE_CHAT_TEMPLATE_NAME
-                } else {
-                    DEFAULT_CHAT_TEMPLATE_NAME
-                };
-                let template =
-                    templates
-                        .get(selected_name)
-                        .ok_or_else(|| Error::AmbiguousChatTemplate {
-                            available: templates.keys().cloned().collect(),
-                        })?;
-                Ok(SelectedChatTemplate {
-                    template,
-                    identity: ChatTemplateIdentity::Named(selected_name.to_owned()),
-                })
-            }
-        }
+        let (template, name) = self.selected_source(tools.is_some_and(|tools| !tools.is_empty()))
+            .ok_or_else(|| Error::AmbiguousChatTemplate {
+                available: match self { Self::Named(templates) => templates.keys().cloned().collect(),
+                    Self::Single(_) => Vec::new() },
+            })?;
+        Ok(SelectedChatTemplate { template,
+            identity: name.map_or(ChatTemplateIdentity::Single, |name| ChatTemplateIdentity::Named(name.to_owned())) })
     }
 }
 

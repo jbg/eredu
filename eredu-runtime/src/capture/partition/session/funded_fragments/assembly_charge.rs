@@ -40,12 +40,12 @@ impl PreparedPartitionFragmentAllowance {
         -> Result<PreparedPartitionAssemblyCharge<'_>, PartitionCaptureFragmentAllowanceError>
     {
         let source=self.source.clone(); let metadata=self.metadata.clone();
-        let error=|cause|PartitionCaptureFragmentAllowanceError{cause,_source:Some(source.clone()),_metadata:metadata.clone()};
+        let error=|cause|PartitionCaptureFragmentAllowanceError{cause,_source:source.clone(),_metadata:metadata.clone()};
         let parts=[size_of::<PreparedPartitionAssemblyCharge<'_>>()*2,
             size_of::<Result<PreparedPartitionAssemblyCharge<'_>,PartitionCaptureFragmentAllowanceError>>(),
             size_of::<PartitionCaptureFragmentAllowanceError>(),size_of::<Cause>(),size_of::<CaptureUsage>()*3,
             size_of::<Result<CaptureUsage,CaptureError>>(),size_of::<(&mut Self,&PartitionCaptureReceiptPlan)>(),
-            size_of::<std::slice::Iter<'_,Row>>(),size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>()];
+            size_of::<std::slice::Iter<'_,Row>>(),size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>()];
         self.metadata.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
             .ok_or_else(||error(Cause::Source("assembly charge controls overflow")))?)
             .map_err(|cause|error(cause.into()))?;

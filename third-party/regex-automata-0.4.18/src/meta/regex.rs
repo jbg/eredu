@@ -18,13 +18,16 @@ use crate::{
     },
     nfa::thompson::{self, WhichCaptures},
     util::{
+        allocation::{Allocation, AllocationError, Allocator, Unenforced},
         captures::{Captures, GroupInfo},
         iter,
         look::LookMatcher,
         pool::{Pool, PoolGuard},
         prefilter::Prefilter,
         primitives::{NonMaxUsize, PatternID},
-        search::{HalfMatch, Input, Match, MatchKind, PatternSet, Span},
+        search::{
+            HalfMatch, Input, Match, MatchError, MatchKind, PatternSet, Span,
+        },
     },
 };
 
@@ -534,7 +537,11 @@ impl Regex {
             return false;
         }
         let mut guard = self.pool.get();
-        let result = self.imp.strat.is_match(&mut guard, &input);
+        let result = self
+            .imp
+            .strat
+            .is_match(&mut guard, &input, &Unenforced)
+            .expect("ordinary meta search allocation");
         // See 'Regex::search' for why we put the guard back explicitly.
         PoolGuard::put(guard);
         result
@@ -614,7 +621,11 @@ impl Regex {
     ) -> FindMatches<'r, 'h> {
         let cache = self.pool.get();
         let it = iter::Searcher::new(input.into());
-        FindMatches { re: self, cache, it }
+        FindMatches {
+            re: self,
+            cache,
+            it,
+        }
     }
 
     /// Returns an iterator over all non-overlapping `Captures` values. If no
@@ -656,7 +667,12 @@ impl Regex {
         let cache = self.pool.get();
         let caps = self.create_captures();
         let it = iter::Searcher::new(input.into());
-        CapturesMatches { re: self, cache, caps, it }
+        CapturesMatches {
+            re: self,
+            cache,
+            caps,
+            it,
+        }
     }
 
     /// Returns an iterator of spans of the haystack given, delimited by a
@@ -817,7 +833,10 @@ impl Regex {
         &'r self,
         input: I,
     ) -> Split<'r, 'h> {
-        Split { finder: self.find_iter(input), last: 0 }
+        Split {
+            finder: self.find_iter(input),
+            last: 0,
+        }
     }
 
     /// Returns an iterator of at most `limit` spans of the haystack given,
@@ -891,7 +910,10 @@ impl Regex {
         input: I,
         limit: usize,
     ) -> SplitN<'r, 'h> {
-        SplitN { splits: self.split(input), limit }
+        SplitN {
+            splits: self.split(input),
+            limit,
+        }
     }
 }
 
@@ -924,7 +946,11 @@ impl Regex {
             return None;
         }
         let mut guard = self.pool.get();
-        let result = self.imp.strat.search(&mut guard, input);
+        let result = self
+            .imp
+            .strat
+            .search(&mut guard, input, &Unenforced)
+            .expect("ordinary meta search allocation");
         // We do this dance with the guard and explicitly put it back in the
         // pool because it seems to result in better codegen. If we let the
         // guard's Drop impl put it back in the pool, then functions like
@@ -982,7 +1008,11 @@ impl Regex {
             return None;
         }
         let mut guard = self.pool.get();
-        let result = self.imp.strat.search_half(&mut guard, input);
+        let result = self
+            .imp
+            .strat
+            .search_half(&mut guard, input, &Unenforced)
+            .expect("ordinary meta search allocation");
         // See 'Regex::search' for why we put the guard back explicitly.
         PoolGuard::put(guard);
         result
@@ -1139,7 +1169,11 @@ impl Regex {
             return None;
         }
         let mut guard = self.pool.get();
-        let result = self.imp.strat.search_slots(&mut guard, input, slots);
+        let result = self
+            .imp
+            .strat
+            .search_slots(&mut guard, input, slots, &Unenforced)
+            .expect("ordinary meta search allocation");
         // See 'Regex::search' for why we put the guard back explicitly.
         PoolGuard::put(guard);
         result
@@ -1203,7 +1237,8 @@ impl Regex {
         let result = self
             .imp
             .strat
-            .which_overlapping_matches(&mut guard, input, patset);
+            .which_overlapping_matches(&mut guard, input, patset, &Unenforced)
+            .expect("ordinary meta search allocation");
         // See 'Regex::search' for why we put the guard back explicitly.
         PoolGuard::put(guard);
         result
@@ -1249,12 +1284,23 @@ impl Regex {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Option<Match> {
+        self.search_with_allocations(cache, input, &Unenforced)
+            .expect("ordinary meta search allocation")
+    }
+
+    /// Search the same selected strategy using caller-owned funded scratch.
+    pub fn search_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
         if self.imp.info.captures_disabled()
             || self.imp.info.is_impossible(input)
         {
-            return None;
+            return Ok(None);
         }
-        self.imp.strat.search(cache, input)
+        self.imp.strat.search(cache, input, funding)
     }
 
     /// This is like [`Regex::search_half`], but requires the caller to
@@ -1293,12 +1339,23 @@ impl Regex {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Option<HalfMatch> {
+        self.search_half_with_allocations(cache, input, &Unenforced)
+            .expect("ordinary meta search allocation")
+    }
+
+    /// Search the same selected strategy using caller-owned funded scratch.
+    pub fn search_half_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
         if self.imp.info.captures_disabled()
             || self.imp.info.is_impossible(input)
         {
-            return None;
+            return Ok(None);
         }
-        self.imp.strat.search_half(cache, input)
+        self.imp.strat.search_half(cache, input, funding)
     }
 
     /// This is like [`Regex::search_captures`], but requires the caller to
@@ -1389,9 +1446,28 @@ impl Regex {
         input: &Input<'_>,
         caps: &mut Captures,
     ) {
+        self.search_captures_with_allocations(cache, input, caps, &Unenforced)
+            .expect("ordinary meta search allocation")
+    }
+
+    /// Populate captures through the same funded strategy worker.
+    pub fn search_captures_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        caps: &mut Captures,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         caps.set_pattern(None);
-        let pid = self.search_slots_with(cache, input, caps.slots_mut());
+        let pid = self.search_slots_with_allocations(
+            cache,
+            input,
+            caps.slots_mut(),
+            funding,
+        )?;
         caps.set_pattern(pid);
+
+        Ok(())
     }
 
     /// This is like [`Regex::search_slots`], but requires the caller to
@@ -1448,12 +1524,24 @@ impl Regex {
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
     ) -> Option<PatternID> {
+        self.search_slots_with_allocations(cache, input, slots, &Unenforced)
+            .expect("ordinary meta search allocation")
+    }
+
+    /// Search the same selected strategy using caller-owned funded scratch.
+    pub fn search_slots_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        slots: &mut [Option<NonMaxUsize>],
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
         if self.imp.info.captures_disabled()
             || self.imp.info.is_impossible(input)
         {
-            return None;
+            return Ok(None);
         }
-        self.imp.strat.search_slots(cache, input, slots)
+        self.imp.strat.search_slots(cache, input, slots, funding)
     }
 
     /// This is like [`Regex::which_overlapping_matches`], but requires the
@@ -1499,10 +1587,29 @@ impl Regex {
         input: &Input<'_>,
         patset: &mut PatternSet,
     ) {
+        self.which_overlapping_matches_with_allocations(
+            cache,
+            input,
+            patset,
+            &Unenforced,
+        )
+        .expect("ordinary meta search allocation")
+    }
+
+    /// Search the same selected strategy using caller-owned funded scratch.
+    pub fn which_overlapping_matches_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        patset: &mut PatternSet,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         if self.imp.info.is_impossible(input) {
-            return;
+            return Ok(());
         }
-        self.imp.strat.which_overlapping_matches(cache, input, patset)
+        self.imp
+            .strat
+            .which_overlapping_matches(cache, input, patset, funding)
     }
 }
 
@@ -1597,7 +1704,16 @@ impl Regex {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn create_cache(&self) -> Cache {
-        self.imp.strat.create_cache()
+        self.create_cache_with_allocations(&Unenforced)
+            .expect("ordinary meta cache allocation")
+    }
+
+    /// Construct explicit scratch under the invocation's allocation policy.
+    pub fn create_cache_with_allocations(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        self.imp.strat.create_cache(funding)
     }
 
     /// Returns the total number of patterns in this regex.
@@ -1915,16 +2031,45 @@ impl Regex {
 
 impl Clone for Regex {
     fn clone(&self) -> Regex {
+        self.clone_with_allocations(&Unenforced)
+            .expect("ordinary regex clone allocation")
+    }
+}
+
+impl Regex {
+    /// Alias compiled engines and fund the new original scratch-pool owner.
+    pub fn clone_with_allocations(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Regex, AllocationError> {
+        let allocation = Allocator::new(funding);
         let imp = Arc::clone(&self.imp);
-        let pool = {
-            let strat = Arc::clone(&imp.strat);
-            let create: CachePoolFn = Box::new(move || strat.create_cache());
-            Pool::with_capacity(
-                self.imp.info.config().get_pool_capacity(),
-                create,
-            )
-        };
-        Regex { imp, pool }
+        let strat = Arc::clone(&imp.strat);
+        let create: CachePoolFn = allocation.boxed(move || {
+            strat
+                .create_cache(&Unenforced)
+                .expect("ordinary meta cache allocation")
+        })?;
+        let pool = Pool::with_capacity_and_allocations(
+            self.imp.info.config().get_pool_capacity(),
+            create,
+            funding,
+        )?;
+        Ok(Regex { imp, pool })
+    }
+
+    /// Test the same selected strategy with explicit funded scratch.
+    pub fn is_match_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        let input = input.clone().earliest(true);
+        if self.imp.info.is_impossible(&input) {
+            return Ok(false);
+        }
+        self.imp.strat.is_match(cache, &input, funding)
     }
 }
 
@@ -1943,17 +2088,25 @@ impl RegexInfo {
     /// a meta regex.
     ///
     /// This is exported for use in some tests.
-    pub(super) fn new(config: Config, hirs: &[&Hir]) -> RegexInfo {
-        // Collect all of the properties from each of the HIRs, and also
-        // union them into one big set of properties representing all HIRs
-        // as if they were in one big alternation.
-        let mut props = vec![];
-        for hir in hirs.iter() {
-            props.push(hir.properties().clone());
+    pub(super) fn new_with_allocations(
+        config: Config,
+        hirs: &[&Hir],
+        funding: &dyn Allocation,
+    ) -> Result<RegexInfo, AllocationError> {
+        let allocation = Allocator::new(funding);
+        let syntax = regex_syntax::allocation::Allocator::new(&allocation);
+        let mut props = Vec::new();
+        allocation.grow(&mut props, hirs.len())?;
+        for hir in hirs {
+            props.push(hir.properties().clone_with_allocations(syntax)?);
         }
-        let props_union = hir::Properties::union(&props);
-
-        RegexInfo(Arc::new(RegexInfoI { config, props, props_union }))
+        let props_union =
+            hir::Properties::union_with_allocations(&props, syntax)?;
+        Ok(RegexInfo(allocation.arc(RegexInfoI {
+            config,
+            props,
+            props_union,
+        })?))
     }
 
     pub(crate) fn config(&self) -> &Config {
@@ -2112,7 +2265,11 @@ impl<'r, 'h> Iterator for FindMatches<'r, 'h> {
 
     #[inline]
     fn next(&mut self) -> Option<Match> {
-        let FindMatches { re, ref mut cache, ref mut it } = *self;
+        let FindMatches {
+            re,
+            ref mut cache,
+            ref mut it,
+        } = *self;
         it.advance(|input| Ok(re.search_with(cache, input)))
     }
 
@@ -2177,8 +2334,12 @@ impl<'r, 'h> Iterator for CapturesMatches<'r, 'h> {
     #[inline]
     fn next(&mut self) -> Option<Captures> {
         // Splitting 'self' apart seems necessary to appease borrowck.
-        let CapturesMatches { re, ref mut cache, ref mut caps, ref mut it } =
-            *self;
+        let CapturesMatches {
+            re,
+            ref mut cache,
+            ref mut caps,
+            ref mut it,
+        } = *self;
         let _ = it.advance(|input| {
             re.search_captures_with(cache, input, caps);
             Ok(caps.get_match())
@@ -2192,7 +2353,9 @@ impl<'r, 'h> Iterator for CapturesMatches<'r, 'h> {
 
     #[inline]
     fn count(self) -> usize {
-        let CapturesMatches { re, mut cache, it, .. } = self;
+        let CapturesMatches {
+            re, mut cache, it, ..
+        } = self;
         // This does the deref for PoolGuard once instead of every iter.
         let cache = &mut *cache;
         it.into_half_matches_iter(
@@ -2381,6 +2544,14 @@ impl Cache {
         re.create_cache()
     }
 
+    /// Construct the same invocation-owned scratch with prospective funding.
+    pub fn new_with_allocations(
+        re: &Regex,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        re.create_cache_with_allocations(funding)
+    }
+
     /// Reset this cache such that it can be used for searching with the given
     /// `Regex` (and only that `Regex`).
     ///
@@ -2419,7 +2590,10 @@ impl Cache {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset(&mut self, re: &Regex) {
-        re.imp.strat.reset_cache(self)
+        re.imp
+            .strat
+            .reset_cache(self, &Unenforced)
+            .expect("ordinary meta search allocation")
     }
 
     /// Returns the heap memory usage, in bytes, of this cache.
@@ -2526,7 +2700,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn match_kind(self, kind: MatchKind) -> Config {
-        Config { match_kind: Some(kind), ..self }
+        Config {
+            match_kind: Some(kind),
+            ..self
+        }
     }
 
     /// Toggles whether empty matches are permitted to occur between the code
@@ -2567,7 +2744,10 @@ impl Config {
     /// Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn utf8_empty(self, yes: bool) -> Config {
-        Config { utf8_empty: Some(yes), ..self }
+        Config {
+            utf8_empty: Some(yes),
+            ..self
+        }
     }
 
     /// Toggles whether automatic prefilter support is enabled.
@@ -2594,7 +2774,10 @@ impl Config {
     /// Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn auto_prefilter(self, yes: bool) -> Config {
-        Config { autopre: Some(yes), ..self }
+        Config {
+            autopre: Some(yes),
+            ..self
+        }
     }
 
     /// Overrides and sets the prefilter to use inside a `Regex`.
@@ -2663,7 +2846,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn prefilter(self, pre: Option<Prefilter>) -> Config {
-        Config { pre: Some(pre), ..self }
+        Config {
+            pre: Some(pre),
+            ..self
+        }
     }
 
     /// Configures what kinds of groups are compiled as "capturing" in the
@@ -2820,7 +3006,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn nfa_size_limit(self, limit: Option<usize>) -> Config {
-        Config { nfa_size_limit: Some(limit), ..self }
+        Config {
+            nfa_size_limit: Some(limit),
+            ..self
+        }
     }
 
     /// Sets the size limit, in bytes, for the one-pass DFA.
@@ -2852,7 +3041,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn onepass_size_limit(self, limit: Option<usize>) -> Config {
-        Config { onepass_size_limit: Some(limit), ..self }
+        Config {
+            onepass_size_limit: Some(limit),
+            ..self
+        }
     }
 
     /// Set the cache capacity, in bytes, for the lazy DFA.
@@ -2894,7 +3086,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn hybrid_cache_capacity(self, limit: usize) -> Config {
-        Config { hybrid_cache_capacity: Some(limit), ..self }
+        Config {
+            hybrid_cache_capacity: Some(limit),
+            ..self
+        }
     }
 
     /// Sets the size limit, in bytes, for heap memory used for a fully
@@ -2943,7 +3138,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn dfa_size_limit(self, limit: Option<usize>) -> Config {
-        Config { dfa_size_limit: Some(limit), ..self }
+        Config {
+            dfa_size_limit: Some(limit),
+            ..self
+        }
     }
 
     /// Sets a limit on the total number of NFA states, beyond which, a full
@@ -2975,7 +3173,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn dfa_state_limit(self, limit: Option<usize>) -> Config {
-        Config { dfa_state_limit: Some(limit), ..self }
+        Config {
+            dfa_state_limit: Some(limit),
+            ..self
+        }
     }
 
     /// Whether to attempt to shrink the size of the alphabet for the regex
@@ -3006,7 +3207,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn byte_classes(self, yes: bool) -> Config {
-        Config { byte_classes: Some(yes), ..self }
+        Config {
+            byte_classes: Some(yes),
+            ..self
+        }
     }
 
     /// Set the line terminator to be used by the `^` and `$` anchors in
@@ -3040,7 +3244,10 @@ impl Config {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn line_terminator(self, byte: u8) -> Config {
-        Config { line_terminator: Some(byte), ..self }
+        Config {
+            line_terminator: Some(byte),
+            ..self
+        }
     }
 
     /// Sets the capacity used to manage a pool of [`Cache`] values in the
@@ -3051,7 +3258,10 @@ impl Config {
     /// makes sense as a value. A smaller number could result in slowdowns if
     /// many regex queries are run under contention.
     pub fn pool_capacity(self, capacity: usize) -> Config {
-        Config { pool_capacity: Some(capacity), ..self }
+        Config {
+            pool_capacity: Some(capacity),
+            ..self
+        }
     }
 
     /// Toggle whether the hybrid NFA/DFA (also known as the "lazy DFA") should
@@ -3065,7 +3275,10 @@ impl Config {
     /// default. Otherwise, if the crate feature is disabled, then this is
     /// always disabled, regardless of its setting by the caller.
     pub fn hybrid(self, yes: bool) -> Config {
-        Config { hybrid: Some(yes), ..self }
+        Config {
+            hybrid: Some(yes),
+            ..self
+        }
     }
 
     /// Toggle whether a fully compiled DFA should be available for use by the
@@ -3079,7 +3292,10 @@ impl Config {
     /// default. Otherwise, if the crate feature is disabled, then this is
     /// always disabled, regardless of its setting by the caller.
     pub fn dfa(self, yes: bool) -> Config {
-        Config { dfa: Some(yes), ..self }
+        Config {
+            dfa: Some(yes),
+            ..self
+        }
     }
 
     /// Toggle whether a one-pass DFA should be available for use by the meta
@@ -3095,7 +3311,10 @@ impl Config {
     /// by default. Otherwise, if the crate feature is disabled, then this is
     /// always disabled, regardless of its setting by the caller.
     pub fn onepass(self, yes: bool) -> Config {
-        Config { onepass: Some(yes), ..self }
+        Config {
+            onepass: Some(yes),
+            ..self
+        }
     }
 
     /// Toggle whether a bounded backtracking regex engine should be available
@@ -3109,7 +3328,10 @@ impl Config {
     /// by default. Otherwise, if the crate feature is disabled, then this is
     /// always disabled, regardless of its setting by the caller.
     pub fn backtrack(self, yes: bool) -> Config {
-        Config { backtrack: Some(yes), ..self }
+        Config {
+            backtrack: Some(yes),
+            ..self
+        }
     }
 
     /// Returns the match kind on this configuration, as set by
@@ -3492,6 +3714,15 @@ impl Builder {
         self.build_many(&[pattern])
     }
 
+    /// Compile one pattern through the same prospectively funded source worker.
+    pub fn build_with_allocations(
+        &self,
+        pattern: &str,
+        funding: &dyn Allocation,
+    ) -> Result<Regex, BuildError> {
+        self.build_many_with_allocations(&[pattern], funding)
+    }
+
     /// Builds a `Regex` from many pattern strings.
     ///
     /// If there was a problem parsing any of the patterns or a problem turning
@@ -3531,6 +3762,17 @@ impl Builder {
         &self,
         patterns: &[P],
     ) -> Result<Regex, BuildError> {
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Compile with prospective source allocation funding.
+    pub fn build_many_with_allocations<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+        funding: &dyn Allocation,
+    ) -> Result<Regex, BuildError> {
+        let allocation = Allocator::new(funding);
+
         use crate::util::primitives::IteratorIndexExt;
         log! {
             debug!("building meta regex with {} patterns:", patterns.len());
@@ -3556,9 +3798,9 @@ impl Builder {
             let ast = self
                 .ast
                 .build()
-                .parse(p.as_ref())
+                .parse_with_allocations(p.as_ref(), &allocation)
                 .map_err(|err| BuildError::ast(pid, err))?;
-            asts.push(ast);
+            allocation.push(&mut asts, ast)?;
         }
         for ((pid, p), ast) in
             patterns.iter().with_pattern_ids().zip(asts.iter())
@@ -3566,11 +3808,11 @@ impl Builder {
             let hir = self
                 .hir
                 .build()
-                .translate(p.as_ref(), ast)
+                .translate_with_allocations(p.as_ref(), ast, &allocation)
                 .map_err(|err| BuildError::hir(pid, err))?;
-            hirs.push(hir);
+            allocation.push(&mut hirs, hir)?;
         }
-        self.build_many_from_hir(&hirs)
+        self.build_many_from_hir_with_allocations(&hirs, funding)
     }
 
     /// Builds a `Regex` directly from an `Hir` expression.
@@ -3613,6 +3855,15 @@ impl Builder {
     /// ```
     pub fn build_from_hir(&self, hir: &Hir) -> Result<Regex, BuildError> {
         self.build_many_from_hir(&[hir])
+    }
+
+    /// Compile one borrowed HIR through the same funded source worker.
+    pub fn build_from_hir_with_allocations(
+        &self,
+        hir: &Hir,
+        funding: &dyn Allocation,
+    ) -> Result<Regex, BuildError> {
+        self.build_many_from_hir_with_allocations(&[hir], funding)
     }
 
     /// Builds a `Regex` directly from many `Hir` expressions.
@@ -3676,19 +3927,43 @@ impl Builder {
         &self,
         hirs: &[H],
     ) -> Result<Regex, BuildError> {
+        self.build_many_from_hir_with_allocations(hirs, &Unenforced)
+    }
+
+    /// Compile borrowed HIRs with the same funded engine selection worker.
+    pub fn build_many_from_hir_with_allocations<H: Borrow<Hir>>(
+        &self,
+        hirs: &[H],
+        funding: &dyn Allocation,
+    ) -> Result<Regex, BuildError> {
         let config = self.config.clone();
         // We collect the HIRs into a vec so we can write internal routines
         // with '&[&Hir]'. i.e., Don't use generics everywhere to keep code
         // bloat down..
-        let hirs: Vec<&Hir> = hirs.iter().map(|hir| hir.borrow()).collect();
-        let info = RegexInfo::new(config, &hirs);
-        let strat = strategy::new(&info, &hirs)?;
+        let allocation = Allocator::new(funding);
+        let mut borrowed = Vec::new();
+        allocation.grow(&mut borrowed, hirs.len())?;
+        borrowed.extend(hirs.iter().map(|hir| hir.borrow()));
+        let hirs = borrowed;
+        let info = RegexInfo::new_with_allocations(config, &hirs, funding)?;
+        let strat = strategy::new_with_allocations(&info, &hirs, funding)?;
         let pool = {
             let strat = Arc::clone(&strat);
-            let create: CachePoolFn = Box::new(move || strat.create_cache());
-            Pool::with_capacity(self.config.get_pool_capacity(), create)
+            let create: CachePoolFn = allocation.boxed(move || {
+                strat
+                    .create_cache(&Unenforced)
+                    .expect("ordinary meta search allocation")
+            })?;
+            Pool::with_capacity_and_allocations(
+                self.config.get_pool_capacity(),
+                create,
+                funding,
+            )?
         };
-        Ok(Regex { imp: Arc::new(RegexI { strat, info }), pool })
+        Ok(Regex {
+            imp: allocation.arc(RegexI { strat, info })?,
+            pool,
+        })
     }
 
     /// Configure the behavior of a `Regex`.
@@ -3777,5 +4052,53 @@ mod tests {
 
         let re = Regex::new(r"[a-zA-Z]+ing").unwrap();
         assert_eq!(1, re.find_iter("tingling").count());
+    }
+}
+
+impl RegexInfo {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        use crate::util::source_storage as storage;
+        let mut own =
+            self.0.props.capacity() * core::mem::size_of::<hir::Properties>();
+        own = own
+            .checked_add(self.0.props_union.memory_usage())
+            .ok_or(storage::Error::SizeOverflow)?;
+        for props in &self.0.props {
+            own = own
+                .checked_add(props.memory_usage())
+                .ok_or(storage::Error::SizeOverflow)?;
+        }
+        if storage::arc(&self.0, own, visitor)? {
+            if let Some(pre) = self.0.config.get_prefilter() {
+                pre.visit_source_storage(visitor)?;
+            }
+        }
+        Ok(())
+    }
+}
+impl Regex {
+    /// Visit actual immutable source owners and backing without allocating.
+    /// Used persistent search pools reject; caller-owned scoped caches remain
+    /// independent and leave this source census valid.
+    pub fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        use crate::util::source_storage as storage;
+        self.pool.visit_source_storage(visitor, |create, visitor| {
+            storage::boxed(create, visitor);
+            Ok(())
+        })?;
+        if !storage::arc(&self.imp, 0, visitor)? {
+            return Ok(());
+        }
+        self.imp.info.visit_source_storage(visitor)?;
+        if storage::arc(&self.imp.strat, 0, visitor)? {
+            self.imp.strat.visit_source_storage(visitor)?;
+        }
+        Ok(())
     }
 }

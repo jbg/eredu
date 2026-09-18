@@ -29,36 +29,57 @@ impl Tokenizer {
             size_of::<([&[Q]; 2], std::iter::Zip<std::slice::Iter<'_, Q>, std::slice::Iter<'_, Q>>)>(),
             size_of::<[&D; 2]>(), size_of::<[&[D]; 2]>(),
             crate::models::bpe::BPE::configuration_comparison_control_bytes()?,
-            crate::processors::template::compiled::CompiledTemplate::configuration_comparison_control_bytes()?,
+            crate::models::wordlevel::WordLevel::configuration_comparison_control_bytes()?,
+            crate::models::unigram::Unigram::configuration_comparison_control_bytes()?,
+            crate::decoders::fixed_profile::Profile::control_bytes()?,
+            size_of::<std::iter::Zip<std::slice::Iter<'_,D>,std::slice::Iter<'_,D>>>(),
+            super::normalization_source::comparison_control_bytes()?,
+            std::mem::size_of::<[PreLeaves<'_>; 2]>(),
+            std::mem::size_of::<[Option<Result<&P, ()>>; 2]>(),
+            crate::processors::template::compiled::TemplateProcessing::configuration_comparison_control_bytes()?,
         ];
-        controls.iter().copied().try_fold(0usize, usize::checked_add)
+        controls
+            .iter()
+            .copied()
+            .try_fold(0usize, usize::checked_add)
     }
 
     /// Tests the complete supported compiled configuration against a selected tokenizer.
     /// This borrows both sources, ignores execution caches, and allocates nothing.
     /// Unsupported source components return false; vocabulary equality alone is insufficient.
     pub fn matches_compiled_configuration(&self, selected: &Self) -> bool {
-        if !matches!((self.get_model(), selected.get_model()),
-            (M::BPE(a), M::BPE(b)) if a.same_configuration(b))
-            || self.get_truncation().is_some()
+        super::TokenizerInput::from(self).matches_compiled_configuration(selected)
+    }
+}
+impl super::TokenizerInput<'_> {
+    /// Authenticate the complete projected input configuration by borrow.
+    pub fn matches_compiled_configuration(self, selected: &Tokenizer) -> bool {
+        let source = self.root;
+        if !match (source.get_model(), selected.get_model()) {
+            (M::BPE(a), M::BPE(b)) => a.same_configuration(b),
+            (M::WordLevel(a), M::WordLevel(b)) => a.same_configuration(b),
+            (M::Unigram(a), M::Unigram(b)) => a.same_configuration(b),
+            _ => false,
+        } || source.get_truncation().is_some()
             || selected.get_truncation().is_some()
-            || self.get_padding().is_some()
+            || source.get_padding().is_some()
             || selected.get_padding().is_some()
-            || !matches!(
-                (self.get_normalizer(), selected.get_normalizer()),
-                (None, None) | (Some(N::NFC(_)), Some(N::NFC(_)))
+            || !super::normalization_source::same_input(self, selected.get_normalizer())
+            || !pre(
+                source.get_pre_tokenizer(),
+                selected.get_pre_tokenizer(),
+                self.remove_input_prefixes,
             )
-            || !optional(self.get_pre_tokenizer(), selected.get_pre_tokenizer(), pre)
             || !optional(
-                self.get_post_processor(),
+                source.get_post_processor(),
                 selected.get_post_processor(),
                 post,
             )
-            || !optional(self.get_decoder(), selected.get_decoder(), decoder)
+            || !optional(source.get_decoder(), selected.get_decoder(), decoder)
         {
             return false;
         }
-        let a = self.get_added_vocabulary();
+        let a = self.added;
         let b = selected.get_added_vocabulary();
         a.get_encode_special_tokens() == b.get_encode_special_tokens()
             && a.len() == b.len()
@@ -86,32 +107,78 @@ fn optional<T>(a: Option<&T>, b: Option<&T>, same: fn(&T, &T) -> bool) -> bool {
         _ => false,
     }
 }
-fn pre(a: &P, b: &P) -> bool {
-    match (a, b) {
-        (P::Sequence(a), P::Sequence(b)) => {
-            let (a, b) = (a.as_ref(), b.as_ref());
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| pre_leaf(a, b))
-        }
-        _ => pre_leaf(a, b),
+struct PreLeaves<'a> {
+    stack: [std::slice::Iter<'a, P>; crate::utils::borrowed_json::DEPTH],
+    depth: usize,
+}
+impl<'a> PreLeaves<'a> {
+    fn new(value: Option<&'a P>) -> Self {
+        let mut stack = std::array::from_fn(|_| [].iter());
+        stack[0] = value.map_or(&[][..], std::slice::from_ref).iter();
+        Self { stack, depth: 1 }
     }
 }
-fn pre_leaf(a: &P, b: &P) -> bool {
-    match (a, b) {
-        (P::ByteLevel(a), P::ByteLevel(b)) => a == b,
-        (P::Digits(a), P::Digits(b)) => a == b,
-        #[cfg(all(feature = "fancy-regex", not(feature = "onig")))]
-        (P::CompiledByteLevel(a), P::ByteLevel(b)) => a.settings() == *b,
-        #[cfg(feature = "fancy-regex")]
-        (P::CompiledByteLevel(a), P::CompiledByteLevel(b)) => a == b,
-        #[cfg(all(feature = "fancy-regex", not(feature = "onig")))]
-        (P::CompiledRegexSplit(a), P::Split(b)) => {
-            matches!(&b.pattern, crate::pre_tokenizers::split::SplitPattern::Regex(pattern)
-                if a.pattern() == pattern && b.regex.matches_pattern(pattern))
-                && b.behavior == crate::SplitDelimiterBehavior::Isolated
-                && !b.invert
+impl<'a> Iterator for PreLeaves<'a> {
+    type Item = Result<&'a P, ()>;
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.depth != 0 {
+            match self.stack[self.depth - 1].next() {
+                None => self.depth -= 1,
+                Some(P::Sequence(value)) => {
+                    if self.depth == self.stack.len() {
+                        self.depth = 0;
+                        return Some(Err(()));
+                    }
+                    self.stack[self.depth] = value.as_ref().iter();
+                    self.depth += 1;
+                }
+                Some(value) => return Some(Ok(value)),
+            }
         }
+        None
+    }
+}
+fn pre(a: Option<&P>, b: Option<&P>, remove_prefixes: bool) -> bool {
+    let (mut a, mut b) = (PreLeaves::new(a), PreLeaves::new(b));
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(Ok(a)), Some(Ok(b))) if pre_leaf(a, b, remove_prefixes) => {}
+            _ => return false,
+        }
+    }
+}
+fn pre_leaf(a: &P, b: &P, remove_prefixes: bool) -> bool {
+    match (a, b) {
+        (P::Metaspace(a), P::Metaspace(b)) => {
+            a.get_replacement() == b.get_replacement()
+                && a.get_split() == b.get_split()
+                && b.get_prepend_scheme()
+                    == if remove_prefixes {
+                        crate::pre_tokenizers::metaspace::PrependScheme::Never
+                    } else {
+                        a.get_prepend_scheme()
+                    }
+        }
+        (P::ByteLevel(a), P::ByteLevel(b)) => {
+            a == b
+                && (!a.use_regex || {
+                    #[cfg(feature = "fancy-regex")]
+                    {
+                        true
+                    }
+                    #[cfg(not(feature = "fancy-regex"))]
+                    {
+                        false
+                    }
+                })
+        }
+        (P::Digits(a), P::Digits(b)) => a == b,
+        (P::Whitespace(a), P::Whitespace(b)) => a == b,
         #[cfg(feature = "fancy-regex")]
-        (P::CompiledRegexSplit(a), P::CompiledRegexSplit(b)) => a == b,
+        (P::Split(a), P::Split(b)) => {
+            a == b && a.workspace_plan().is_some() && b.workspace_plan().is_some()
+        }
         _ => false,
     }
 }
@@ -127,21 +194,27 @@ fn post(a: &Q, b: &Q) -> bool {
 fn post_leaf(a: &Q, b: &Q) -> bool {
     match (a, b) {
         (Q::ByteLevel(a), Q::ByteLevel(b)) => a == b,
-        (Q::CompiledTemplate(a), Q::Template(b)) => a.matches_template(b),
-        (Q::CompiledTemplate(a), Q::CompiledTemplate(b)) => a == b,
+        (Q::Template(a), Q::Template(b)) => a == b,
         _ => false,
     }
 }
 fn decoder(a: &D, b: &D) -> bool {
     match (a, b) {
-        (D::ByteLevel(a), D::ByteLevel(b)) => a == b,
         (D::Sequence(a), D::Sequence(b)) => {
             let (a, b) = (a.get_decoders(), b.get_decoders());
-            a.len() == 1
-                && b.len() == 1
-                && matches!((&a[0], &b[0]),
-                (D::ByteLevel(a), D::ByteLevel(b)) if a == b)
+            a.len() == b.len() && a.len() <= 5 && a.iter().zip(b).all(|(a, b)| decoder_leaf(a, b))
         }
-        _ => false,
+        _ => decoder_leaf(a, b),
+    }
+}
+fn decoder_leaf(a: &D, b: &D) -> bool {
+    use crate::decoders::fixed_profile::Component;
+    match (a, b) {
+        (D::ByteLevel(a), D::ByteLevel(b)) => a == b,
+        (D::Metaspace(a), D::Metaspace(b)) => a == b,
+        _ => {
+            let (a, b) = (Component::from_decoder(a), Component::from_decoder(b));
+            a != Component::Other && a == b
+        }
     }
 }

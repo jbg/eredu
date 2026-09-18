@@ -144,7 +144,7 @@ fn phase(kind: PartitionCaptureFrameKind) -> DistributedExecutionPhase {
 impl OriginalCaptureTransport {
     /// Reserve one producer's fixed failure destinations before lending the
     /// same retained request metadata account. This is no native grant.
-    pub(crate) fn prepare_capture_metadata(&self) -> Result<&WorkspaceMetadataFunding, Error> {
+    pub(crate) fn prepare_capture_metadata(&self) -> Result<&HostMetadataFunding, Error> {
         let custody = &self.owner.owner().custody;
         controls(custody)?;
         Ok(&custody.funding)

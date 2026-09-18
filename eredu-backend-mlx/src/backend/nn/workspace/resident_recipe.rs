@@ -11,6 +11,12 @@ use eredu_runtime::working_memory::{InferenceSpanWorkspacePlan, InferenceWorkspa
 mod activation;
 mod attention_direct;
 mod attention_tiled;
+// These are the fixed frames of the same Rust accumulator, independent of its
+// selected numerical backend. CPU primitives retain their own query census.
+pub(in crate::backend::nn::workspace) fn blockwise_control_bytes(operation: WorkspaceOperationView<'_>) -> Option<usize> {
+    matches!(operation.kind,WorkspaceOperationKindView::BlockwiseAttention{..})
+        .then(||attention_tiled::control_bytes(operation)).flatten()
+}
 mod capture;
 mod clip;
 mod copy_rank;
@@ -53,6 +59,8 @@ mod numerical;
 ))]
 pub(super) mod original_component_tests;
 mod parameter_construction;
+#[cfg(test)]
+mod stream_tests;
 mod pooled_attention;
 mod pooled_positions;
 mod pooling_mask;
@@ -65,6 +73,8 @@ mod sampling_filters;
 mod sampling_mirostat;
 mod sampling_penalties;
 mod sampling_random;
+mod sampling_program;
+pub(crate) use sampling_program::ResidentSamplingProgram;
 #[cfg(all(test, target_vendor="apple", feature="metal", not(feature="cuda")))]
 mod sampling_validation_tests;
 mod selective_scan;
@@ -107,6 +117,32 @@ pub(crate) struct ResidentDispatchPopulation {
     // Additive actual reshape/concat metadata, retained across DAG re-queries.
     copy_rank_extents: usize,
     kernel_attempts: usize,
+}
+impl ResidentDispatchPopulation {
+    /// Count the native sources, not device kinds. A model, the CPU router,
+    /// and CPU collectives use independently retained streams. The homogeneous
+    /// CPU model has no crossed router; its collective stream is still distinct.
+    fn completion_streams(&self) -> Option<usize> {
+        if let Some(source) = self.cpu_model.as_ref() {
+            if self.gpu_entries != 0 || self.gpu_input_edges != 0
+                || self.gpu_siblings != 0 || self.gpu_births != 0
+                || self.worker_graph_extents != 0 || self.copy_rank_extents != 0
+                || self.kernel_attempts != 0 || self.additional_sort_kernels != 0
+                || self.cpu_entries != source.primitives.checked_add(self.parallel_entries)?.checked_add(1)?
+            {
+                return None;
+            }
+            Some(1 + usize::from(self.parallel_entries != 0))
+        } else {
+            if self.gpu_entries == 0 { return None; }
+            let routers = self.cpu_entries.checked_sub(self.parallel_entries)?;
+            Some(1 + usize::from(routers != 0) + usize::from(self.parallel_entries != 0))
+        }
+    }
+    fn completion_stream_control_bytes() -> usize {
+        std::mem::size_of::<(&Self, Option<&super::cpu::CpuPopulation>,
+            usize, usize, Option<usize>, bool)>()
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResidentCompletionRecipe {
@@ -299,36 +335,92 @@ impl ResidentSamplingRecipe {
 }
 #[derive(Debug)]
 pub(crate) struct ResidentNativeRecipe {
+    pub(crate) quote_components: crate::backend::error::WorkspaceQuoteComponents,
     plan: InferenceSpanWorkspacePlan,
     records: Vec<ResidentSpanRecipe>,
-    sampling: Vec<ResidentSamplingRecipe>,
+    sampling: ResidentSamplingProgram,
     neural: Option<neural_boundaries::NeuralBoundaries>,
-    layerwise_constructors: Option<parameter_construction::Constructors>,
+    layerwise_constructors: Option<parameter_construction::ParameterConstructors>,
     host_copies: Option<host_copies::HostCopies>,
     host_transfers: Option<host_copies::HostTransfers>,
     foreground_copies: Option<host_copies::ForegroundCopies>,
     resume_copy: Option<crate::backend::array_copy::OriginalResumeCopyPopulation>,
+    parallel_source: Option<parallel::OriginalParallelSource>,
     // Cold recorder destinations have already reserved this independent host
     // account. Keep it after every recipe payload; Q funds later native work.
     addressable_program: addressable_program::RetainedProgram,
-    planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl ResidentNativeRecipe {
+    pub(crate) fn planning_metadata(&self) -> Option<&HostMetadataFunding> {
+        self.planning_metadata.as_ref()
+    }
+    pub(crate) fn record_quote_components(&mut self,
+        mut value: crate::backend::error::WorkspaceQuoteComponents) -> Result<(), crate::backend::error::Error> {
+        let metadata = self.planning_metadata.as_ref();
+        if let Some(funding) = metadata {
+            funding.reserve_metadata(std::mem::size_of::<(
+                &mut Self, crate::backend::error::WorkspaceQuoteComponents,
+                std::slice::Iter<'_, ResidentSpanRecipe>,
+                std::slice::Iter<'_, ResidentSamplingRecipe>,
+                Option<ResidentDispatchPopulation>, Option<ResidentCompletionRecipe>,
+                NestedCompletionRoots<'_>, Option<usize>, usize,
+                Result<(), crate::backend::error::Error>,
+            )>()).map_err(crate::backend::error::Error::WorkspacePlanning)?;
+        }
+        value.kernel_attempts = self.kernel_attempts();
+        value.equation_rows = self.records.len();
+        value.gpu_entries = Some(0);
+        value.cpu_entries = Some(0);
+        value.nested_frontiers = Some(0);
+        for row in &self.records {
+            value.mixed_rows += usize::from(row.dispatch.is_some_and(|dispatch| dispatch.cpu_entries != 0));
+            value.gpu_entries = value.gpu_entries.and_then(|total| total.checked_add(row.dispatch?.gpu_entries));
+            value.cpu_entries = value.cpu_entries.and_then(|total| total.checked_add(row.dispatch?.cpu_entries));
+            value.nested_frontiers = value.nested_frontiers.and_then(|total|
+                total.checked_add(NestedCompletionRoots::for_row(row).count()?));
+        }
+        value.sampling_gpu_entries = Some(0);
+        value.sampling_cpu_entries = Some(0);
+        value.sampling_nested_frontiers = Some(0);
+        for row in self.sampling.rows() {
+            if let Some(completion) = row.completion() {
+                value.sampling_gpu_entries = value.sampling_gpu_entries.and_then(|total| total.checked_add(completion.dispatch?.gpu_entries));
+                value.sampling_cpu_entries = value.sampling_cpu_entries.and_then(|total| total.checked_add(completion.dispatch?.cpu_entries));
+                value.sampling_nested_frontiers = value.sampling_nested_frontiers.and_then(|total| total.checked_add(completion.nested_completions));
+            }
+        }
+        self.quote_components = value;
+        Ok(())
+    }
     pub(crate) fn bind_resume_copy(
         &mut self,
         population: crate::backend::array_copy::OriginalResumeCopyPopulation,
     ) -> Result<(), Error> {
         if self.resume_copy.is_some()
             || self.plan.geometry().input_positions != population.pending_positions()
-            || self.plan.geometry().prefill_chunk_positions == 0
+            || (self.plan.geometry().prefill_chunk_positions == 0
+                && !(self.plan.geometry().input_positions == 0
+                    && self.plan.geometry().max_output_tokens == 0
+                    && self.plan.geometry().output == eredu_core::OutputDemand::StateOnly))
             || self.plan.geometry().prefill_chunk_positions > population.pending_positions()
         {
-            return Err(Error::backend_source(
+            return Err(Error::backend_retained_source(
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
         self.resume_copy = Some(population);
         Ok(())
+    }
+    // A completed copy-only restore has a fully known empty equation list.
+    // It still owns its actual copy and sampler-preparation programs; absence
+    // of model rows does not make those independently counted programs unknown.
+    fn is_terminal_resume(&self) -> bool {
+        let geometry = self.plan.geometry();
+        self.resume_copy.is_some() && self.records.is_empty()
+            && geometry.input_positions == 0 && geometry.max_output_tokens == 0
+            && geometry.prefill_chunk_positions == 0
+            && geometry.output == eredu_core::OutputDemand::StateOnly
     }
     pub(crate) fn resume_copy(
         &self,
@@ -338,11 +430,40 @@ impl ResidentNativeRecipe {
     pub(crate) fn plan(&self) -> &InferenceSpanWorkspacePlan {
         &self.plan
     }
-    pub(crate) fn sampling_records(&self) -> &[ResidentSamplingRecipe] {
+    pub(crate) fn sampling_program(&self) -> &ResidentSamplingProgram {
         &self.sampling
+    }
+    pub(crate) fn sampling_records(&self) -> &[ResidentSamplingRecipe] {
+        &self.sampling.rows
     }
     pub(crate) fn records(&self) -> &[ResidentSpanRecipe] {
         &self.records
+    }
+    /// A failed enclosing quote may move the already funded equation detail
+    /// into its retained diagnostic. This never supplies a missing source.
+    pub(crate) fn take_first_missing_equation(
+        &mut self,
+    ) -> Result<Option<(usize, usize, Option<String>)>, crate::backend::error::Error> {
+        let frames = [
+            size_of::<&mut Self>(),
+            size_of::<std::iter::Enumerate<std::slice::IterMut<'_, ResidentSpanRecipe>>>(),
+            size_of::<(usize, &mut ResidentSpanRecipe)>(),
+            size_of::<Option<(usize, &mut ResidentSpanRecipe)>>(),
+            size_of::<usize>(),
+            size_of::<Option<(usize, usize, Option<String>)>>(),
+            size_of::<Result<Option<(usize, usize, Option<String>)>, crate::backend::error::Error>>(),
+        ];
+        if let Some(funding) = &self.planning_metadata {
+            let bytes = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+                .ok_or(crate::backend::error::Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?;
+            funding.reserve_metadata(bytes).map_err(crate::backend::error::Error::WorkspacePlanning)?;
+        }
+        for (record, row) in self.records.iter_mut().enumerate() {
+            if let Some(operation) = row.first_missing_operation {
+                return Ok(Some((record, operation, row.missing_operation_detail.take())));
+            }
+        }
+        Ok(None)
     }
     /// Count every single-GPU equation/sampling DAG once. Nested completions
     /// visit subsets of those descriptors: the fixed native Eval skips any
@@ -390,35 +511,16 @@ impl ResidentNativeRecipe {
             self.resume_copy
                 .map_or(0, |copy| copy.layout().kernel_attempts),
         )?;
-        self.sampling.iter().try_fold(total, |n, row| {
-            if row.phase == eredu_runtime::working_memory::SamplingWorkspacePhase::Preparation
-                && row.preparation.is_some()
-                && row.completion.is_none()
-            {
-                Some(n)
-            } else {
-                let completion = row.completion?;
-                let dispatch = completion.dispatch?;
-                let frontiers = if dispatch.cpu_entries == 0 {
-                    1
-                } else {
-                    completion.nested_completions.checked_add(1)?
-                };
-                n.checked_add(dispatch.kernel_attempts.checked_mul(frontiers)?)
-            }
-        })
+        total.checked_add(self.sampling.kernel_attempts()?)
     }
     /// The actual eager key constructor has no Eval, Record or shader lookup.
     pub(crate) fn sampling_preparation_graph(
         &self,
     ) -> Result<Option<safemlx::ResidentGraphLayout>, crate::backend::error::Error> {
-        match self.sampling.first().and_then(|row| row.preparation) {
-            Some(ResidentSamplingPreparation::Empty) => Ok(None),
-            Some(ResidentSamplingPreparation::EagerKey(graph)) => Ok(Some(graph)),
-            None => Err(crate::backend::error::Error::PrefillControl(
+        self.sampling.preparation_graph().ok_or(
+            crate::backend::error::Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-            )),
-        }
+            ))
     }
     pub(crate) fn maximum_roots(&self) -> Result<u64, crate::backend::error::Error> {
         self.records
@@ -453,7 +555,7 @@ impl ResidentNativeRecipe {
                 .and_then(|n| n.checked_add(size_of::<Self>()))
                 .and_then(|n| {
                     n.checked_add(
-                        self.sampling
+                        self.sampling.rows
                             .capacity()
                             .checked_mul(size_of::<ResidentSamplingRecipe>())?,
                     )
@@ -466,7 +568,7 @@ impl ResidentNativeRecipe {
             .try_fold(retained, |n, row| n.checked_add(row.query_controls?))
             .ok_or_else(|| Error::backend("resident recipe query controls are unqualified"))?;
         let controls = self
-            .sampling
+            .sampling.rows
             .iter()
             .try_fold(controls, |n, row| n.checked_add(row.query_controls?))
             .ok_or_else(|| Error::backend("resident sampling query controls are unqualified"))?;
@@ -510,17 +612,15 @@ impl ResidentNativeRecipe {
         .into_iter()
         .try_fold(controls, usize::checked_add)
         .ok_or_else(|| Error::backend("resident recipe control overflow"))?;
-        u64::try_from(fixed).map_err(Error::backend_source)
+        u64::try_from(fixed).map_err(Error::backend_retained_source)
     }
     /// The same immutable model quote source for every collective span. No
     /// occurrence or control request is created by this borrowed projection.
     pub(crate) fn parallel_control_source(
         &self,
     ) -> Result<Option<&parallel::OriginalParallelSource>, crate::backend::error::Error> {
-        let mut sources = self
-            .records
-            .iter()
-            .filter_map(|row| row.parallel().map(|value| value.source()));
+        let mut sources = self.parallel_source.iter().chain(self.records.iter()
+            .filter_map(|row| row.parallel().map(|value| value.source())));
         let Some(source) = sources.next() else {
             return Ok(None);
         };
@@ -538,7 +638,7 @@ impl ResidentNativeRecipe {
                         >())
                     })
                     .ok_or(crate::backend::error::Error::WorkspacePlanning(
-                        eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow,
+                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
                     ))?,
             )
             .map_err(crate::backend::error::Error::WorkspacePlanning)?;
@@ -615,15 +715,8 @@ impl ResidentNativeRecipe {
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
-        self.sampling
-            .iter()
-            .find(|row| {
-                row.phase
-                    == eredu_runtime::working_memory::SamplingWorkspacePhase::Step {
-                        index: step.attempt(),
-                    }
-            })
-            .and_then(ResidentSamplingRecipe::completion)
+        usize::try_from(step.attempt()).ok()
+            .and_then(|index| self.sampling.completion(index))
             .ok_or(crate::backend::error::Error::PrefillScopeUnavailable)
     }
     pub(crate) fn completion_for_step(
@@ -689,10 +782,11 @@ pub(crate) struct ResidentRecipeRecorder {
     geometry: InferenceGeometry,
     mechanism: MlxMetalWorkspaceMechanisms,
     cpu: Option<MlxCpuWorkspaceMechanisms>,
-    layerwise_constructors: Option<parameter_construction::Constructors>,
+    layerwise_constructors: Option<parameter_construction::ParameterConstructors>,
     addressable_sources: Option<AddressableSources>,
     records: Vec<ResidentSpanRecipe>,
     sampling: Vec<ResidentSamplingRecipe>,
+    sampling_input: Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan>,
     prefill_validation_roots: usize,
     context: Option<eredu_nn::workspace::WorkspaceContext>,
 }
@@ -706,6 +800,7 @@ impl ResidentRecipeRecorder {
             addressable_sources: None,
             records: Vec::new(),
             sampling: Vec::new(),
+            sampling_input: None,
             prefill_validation_roots: 0,
             context: None,
         }
@@ -761,7 +856,7 @@ impl ResidentRecipeRecorder {
     fn metadata_source<E: std::error::Error + Send + Sync + 'static>(&self, cause: E) -> Error {
         match &self.context {
             Some(context) => context.metadata_source(cause),
-            None => Error::backend_source(cause),
+            None => Error::backend_retained_source(cause),
         }
     }
     fn add(&self, a: usize, b: usize) -> Result<usize, Error> {
@@ -779,7 +874,7 @@ impl ResidentRecipeRecorder {
     }
 
     fn finish_with_sampling(
-        self,
+        mut self,
         plan: &InferenceSpanWorkspacePlan,
         expected_sampling: Option<usize>,
     ) -> Result<ResidentNativeRecipe, Error> {
@@ -794,18 +889,18 @@ impl ResidentRecipeRecorder {
             return Err(self
                 .metadata_error("resident native recipe differs from its actual equation source"));
         }
-        if expected_sampling != Some(self.sampling.len()) {
-            return Err(self.metadata_error("resident recipe is missing actual sampling phases"));
-        }
+        let sampling = self.take_sampling_program(expected_sampling)?;
         Ok(ResidentNativeRecipe {
+            quote_components: Default::default(),
             plan: plan.clone(),
             records: self.records,
-            sampling: self.sampling,
+            sampling,
             neural: None,
             layerwise_constructors: self.layerwise_constructors,
             host_copies: None,
             foreground_copies: None,
             resume_copy: None,
+            parallel_source: None,
             host_transfers: None,
             addressable_program: addressable_program::RetainedProgram::default(),
             planning_metadata: self
@@ -914,7 +1009,7 @@ fn normalization_lowering(operation: WorkspaceOperationView<'_>) -> Option<Lower
         }
         K::Normalization("rms", _) => reduction_lowering(10, 13, 1, 3),
         K::Normalization("l2", _) => reduction_lowering(15, 17, 1, 2),
-        K::Normalization("layer_norm", _) => reduction_lowering(4, 6, 2, 0),
+        K::LayerNorm { .. } => reduction_lowering(4, 6, 2, 0),
         K::Normalization("gated_group_rms_norm" | "silu_gated_group_rms_norm", _) => {
             let mut value = reduction_lowering(42, 48, 2, 2);
             value.intermediate_rank = 3;
@@ -1379,7 +1474,7 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
             // its temporary descriptor/Data and shared general-copy branch.
             Some(Lowering::plain(1,1,0))
         }
-        K::View("broadcast" | "transpose" | "squeeze" | "expand_dims" | "reshape")
+        K::View("broadcast" | "squeeze" | "expand_dims" | "reshape")
         | K::Transpose(_)
         | K::Contiguous
         | K::DeepCopy => Some(Lowering::plain(1, 1, 0)),
@@ -1455,6 +1550,19 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         }
         K::Elementwise("clip") => clip::lowering(operation),
         K::Elementwise("where") => Some(Lowering::plain(7, 9, 0)),
+        K::Elementwise("masked_scatter") => {
+            super::masked_scatter::geometry(operation).ok()??;
+            // One source cast, mask reshape/broadcast, source reshape/broadcast,
+            // three leading-axis expansions, MaskedScatter and final squeeze.
+            // The ternary primitive has three edges; the other nine are unary.
+            let mut value = Lowering::plain(10, 12, 0);
+            // Eval-only flatten/contiguous-mask and offsets descriptors are
+            // outside the lazy graph. Scan writes the existing offsets buffer.
+            value.maximum_births += 3;
+            value.intermediate_rank = operation.inputs.iter()
+                .map(|input| input.shape().len()).max()?.checked_add(1)?;
+            Some(value)
+        }
         // The shared activation adapters try one custom F32 kernel, then the
         // ordinary scalar equation. Include widening/final cast and that exact
         // fallback rather than assuming the kernel cache is already populated.
@@ -1551,7 +1659,7 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         | K::Elementwise("cast_u32" | "capture_cast_f32" | "cast_f32" | "bool_to_u32") => {
             Some(Lowering::plain(1, 1, 0))
         }
-        K::Normalization(..) | K::ConstructedNormalization(_) => normalization_lowering(operation),
+        K::Normalization(..) | K::LayerNorm { .. } | K::ConstructedNormalization(_) => normalization_lowering(operation),
         K::Reduction("sum" | "sum_all" | "min" | "max", _, _) => {
             Some(reduction_lowering(2, 2, 0, 2))
         }
@@ -1757,7 +1865,7 @@ impl ResidentRecipeRecorder {
         if let Some(context) = &self.context {
             context.reserve_metadata_vec(&mut self.records, 1)?;
         } else {
-            self.records.try_reserve(1).map_err(Error::backend_source)?;
+            self.records.try_reserve(1).map_err(Error::backend_retained_source)?;
         }
         self.records.push(ResidentSpanRecipe {
             span: span.clone(),
@@ -1901,7 +2009,7 @@ impl ResidentRecipeRecorder {
         } else {
             self.sampling
                 .try_reserve(1)
-                .map_err(Error::backend_source)?;
+                .map_err(Error::backend_retained_source)?;
         }
         self.sampling.push(ResidentSamplingRecipe {
             closing_roots,
@@ -1972,6 +2080,9 @@ impl InferenceEquationTraceObserver for ResidentRecipeRecorder {
             output,
             true,
         )
+    }
+    fn observe_sampling_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+        self.record_sampling_input(input)
     }
     fn observe_sampling(
         &mut self,
@@ -2161,7 +2272,7 @@ impl ResidentRecipeRecorder {
                     nested_completions,
                     program
                         .population()
-                        .map_err(Error::backend_source)?
+                        .map_err(Error::backend_retained_source)?
                         .scalar_completions,
                 )?;
             }
@@ -2257,6 +2368,12 @@ impl ResidentRecipeRecorder {
                 bytes=bytes.checked_add(region.child_bytes).ok_or_else(||self.metadata_error("expert region backing overflow"))?;
                 boundary_births=add(boundary_births,region.child_births)?;
                 nested_completions=add(nested_completions,region.parent_completions)?;
+                if region.indexed_parent {
+                    nested_root_capacity=nested_root_capacity.max(4);
+                    arrays=add(arrays,4)?;
+                    operation_controls=add(operation_controls,crate::backend::runtime::cache::value_completion_control_bytes(4)
+                        .ok_or_else(||self.metadata_error("indexed expert parent completion has no source"))?)?;
+                }
                 arrays=add(arrays,op.outputs.len())?;
                 for (slice,n) in std::iter::once((&region.empty_slice,region.empty_slices))
                     .chain(region.extra_parents.iter().map(|operation|(operation,1))){
@@ -2752,6 +2869,18 @@ impl ResidentRecipeRecorder {
                 })
                 .ok_or_else(|| Error::backend("grouped output storage overflow"))?;
             seeds = add(seeds, lowering.seeds)?;
+        }
+        if missing_operation_detail.is_none() {
+            if let Some(operation) = missing.and_then(|index| report.operations.get(index)) {
+                let arguments = format_args!(
+                    "{:?}; inputs: {:?}; outputs: {:?}",
+                    operation.kind, operation.inputs, operation.outputs
+                );
+                missing_operation_detail = Some(match &self.context {
+                    Some(context) => context.metadata_string(arguments)?,
+                    None => arguments.to_string(),
+                });
+            }
         }
         if grouped_outputs.unit_observers != 0 {
             grouped_outputs.observer_shape_rank = maximum_rank;
@@ -3473,3 +3602,5 @@ mod stored_host_effect_tests {
 
 #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 mod muse_tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

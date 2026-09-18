@@ -113,7 +113,7 @@ struct Facts {
 impl WorkspaceMechanisms for Facts {
     fn operation_bound(&self, op: &WorkspaceOperation) -> Result<Option<WorkspaceOperationBound>> {
         let storage = match &op.kind {
-            WorkspaceOperationKind::Index { selected_axes: 0 } => {
+            WorkspaceOperationKind::StaticSlice { .. } => {
                 WorkspaceOutputStorage::AliasInput(0)
             }
             WorkspaceOperationKind::View("reshape") => {
@@ -164,7 +164,7 @@ impl WorkspaceFactMechanisms for Facts {
         op: WorkspaceOperationView<'_>,
     ) -> std::result::Result<Option<WorkspaceOperationFacts>, Self::Error> {
         let aliases = match op.kind {
-            WorkspaceOperationKindView::Index { selected_axes: 0 } => 0,
+            WorkspaceOperationKindView::StaticSlice { .. } => 0,
             WorkspaceOperationKindView::View("reshape") => 1,
             WorkspaceOperationKindView::Elementwise("capture_cast_f32") if !self.missing_tensor => {
                 0
@@ -191,7 +191,7 @@ impl WorkspaceFactMechanisms for Facts {
         destination.validate(facts.layout).unwrap();
         destination.assumptions.copy_from_slice(FACT_ASSUMPTIONS);
         destination.outputs[0] = match op.kind {
-            WorkspaceOperationKindView::Index { selected_axes: 0 } => {
+            WorkspaceOperationKindView::StaticSlice { .. } => {
                 WorkspaceOutputEffect::AliasInput(0)
             }
             WorkspaceOperationKindView::View("reshape") => {

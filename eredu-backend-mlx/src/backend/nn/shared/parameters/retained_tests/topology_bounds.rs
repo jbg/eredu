@@ -4,7 +4,7 @@ use std::convert::Infallible;
 
 struct Populate;
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for Populate {
-    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
+    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
         let shape = value.as_array().shape().to_vec();
         let count = shape.iter().map(|&n| n as usize).product::<usize>();
         assert!(count > 0);

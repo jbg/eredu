@@ -1,0 +1,55 @@
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -24,6 +24,7 @@
+ struct MLX_API HostTransferAllocationInfo {
+   uint64_t identity;
+   size_t capacity;
++  bool prepared_source;
+ };
+ 
+ /** Cold inspection of certified host-transfer backing; never evaluates/polls. */
+@@ -105,6 +106,8 @@
+   size_t capacity() const;
+   /** Non-reused runtime-local generation; zero means identity supply exhausted. */
+   uint64_t allocation_identity() const;
++  /** Positive constructor provenance for this exact retained Host allocation. */
++  std::optional<HostTransferAllocationInfo> allocation_info() const noexcept;
+   /** Retain directly on shared host storage without constructing an array. */
+   bool retain_allocation_owner(std::shared_ptr<void> owner) const;
+   bool retain_prepared_allocation_owner(AllocationOwners::Node* node,
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -101,6 +101,8 @@
+     else allocator::allocator().free_host_transfer(buffer_, policy_);
+     record_host_transfer_free(storage_kind_, capacity_);
+   }
++
++  bool prepared_source() const noexcept { return prepared_ != nullptr; }
+ 
+   uint64_t allocation_generation() const {
+     return generation_;
+@@ -329,7 +331,8 @@
+     return std::nullopt;
+   }
+   return HostTransferAllocationInfo{
+-      retained->owner->allocation_generation(), retained->owner->capacity()};
++      retained->owner->allocation_generation(), retained->owner->capacity(),
++      retained->owner->prepared_source()};
+ }
+ 
+ bool retain_host_transfer_allocation_owner(
+@@ -368,6 +371,12 @@
+   }
+   retained->owner->retain_allocation_owner(std::move(owner));
+   return true;
++}
++
++std::optional<HostTransferAllocationInfo> HostTransferBuffer::allocation_info() const noexcept {
++  if (!storage_ || !storage_->allocation_generation()) return std::nullopt;
++  return HostTransferAllocationInfo{storage_->allocation_generation(),
++      storage_->capacity(), storage_->prepared_source()};
+ }
+ 
+ uint64_t HostTransferBuffer::allocation_identity() const {

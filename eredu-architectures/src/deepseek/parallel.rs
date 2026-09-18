@@ -1034,7 +1034,7 @@ impl V4PartitionLocalFoundation {
             crate::decoder::TARGET_EXECUTION_GROUP,
             geometry.target_units(),
         )];
-        let boundary = v4::TargetBoundarySchema::from_args(args)
+        let boundary = v4::TargetBoundarySchema::from_args(args, None)
             .map_err(|error| invalid(error.to_string()))?;
         validate_partition_common(
             partition,
@@ -2353,12 +2353,12 @@ mod tests {
     #[test]
     fn v4_boundary_plan_owns_flattened_transport_width() {
         let mut args = v4_args();
-        let boundary = v4::TargetBoundarySchema::from_args(&args).unwrap();
+        let boundary = v4::TargetBoundarySchema::from_args(&args, None).unwrap();
         assert_eq!(boundary.activation_hidden_size(), 16);
 
         args.hidden_size = i32::MAX;
         args.hc_mult = 2;
-        assert!(v4::TargetBoundarySchema::from_args(&args).is_err());
+        assert!(v4::TargetBoundarySchema::from_args(&args, None).is_err());
     }
 
     #[test]

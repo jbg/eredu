@@ -65,11 +65,11 @@ impl<'a, V: ParameterVisitorMut<'a, MlxTensor>> NativeParameterSourceVisitorMut<
     for MutableEmit<'_, '_, V>
 {
     fn parameter(&mut self, local: &'static str, value: &'a mut Array, trainable: bool) {
-        let Some(spec) = self.topology.get(local) else {
-            self.visitor.borrowed_metadata_unavailable();
-            return;
-        };
-        self.visitor.visit_mut_borrowed(
+        let spec = self
+            .topology
+            .get(local)
+            .expect("validated native mutable topology preserves all parameter identities");
+        self.visitor.visit_mut(
             ParameterMetadataView::from_spec(spec, trainable),
             MlxTensor::ref_cast_mut(value),
         );
@@ -85,15 +85,27 @@ pub(in crate::backend::nn::shared) fn visit_module_parameter_sources<
     topology: &'a dyn NativeParameterTopology,
     visitor: &mut V,
 ) -> Result<(), ParameterSourceError> {
+    validate_module_parameter_fields(module, topology)?;
+    module.visit_native_parameter_sources(&mut SourceEmit { topology, visitor })
+}
+
+/// Checks named fields independently of auxiliary-inventory completeness.
+pub(super) fn validate_module_parameter_fields<M: NativeRetainedValues>(
+    module: &M,
+    topology: &dyn NativeParameterTopology,
+) -> Result<(), ParameterSourceError> {
     let expected = module
         .native_parameter_source_count()
-        .ok_or(ParameterSourceError::Unavailable)?;
+        .ok_or(ParameterSourceError::UnclassifiedRetainedField)?;
     let mut check = Check {
         topology,
         count: 0,
         failure: None,
     };
-    module.visit_native_parameter_sources(&mut check)?;
+    match module.visit_native_parameter_sources(&mut check) {
+        Ok(()) | Err(ParameterSourceError::UnclassifiedRetainedField) => {}
+        Err(error) => return Err(error),
+    }
     if let Some(error) = check.failure {
         return Err(error);
     }
@@ -102,23 +114,28 @@ pub(in crate::backend::nn::shared) fn visit_module_parameter_sources<
     }
     // Validate every retained key exactly once before exposing any row. This
     // also rejects a repeated physical key hiding a missing topology member.
-    for (slot, key) in topology.keys().enumerate() {
+    for slot in 0..topology.len() {
+        let key = topology.key(slot).expect("index within immutable topology");
         let mut occurrences = Occurrences { key, count: 0 };
-        module.visit_native_parameter_sources(&mut occurrences)?;
+        match module.visit_native_parameter_sources(&mut occurrences) {
+            Ok(()) | Err(ParameterSourceError::UnclassifiedRetainedField) => {}
+            Err(error) => return Err(error),
+        }
         if occurrences.count != 1 {
             return Err(ParameterSourceError::TopologyMismatch { slot });
         }
     }
-    module.visit_native_parameter_sources(&mut SourceEmit { topology, visitor })
+    Ok(())
 }
 
 // Mutable fields are supplied by the same audited leaf declarations as the
 // immutable source. Validate topology first; no maps or names are reconstructed.
-pub(super) fn visit_module_parameters_mut_borrowed<'a, M, V>(
+pub(super) fn visit_module_parameters_mut<'a, M, V>(
     module: &'a mut M,
     topology: &dyn NativeParameterTopology,
     visitor: &mut V,
-) where
+) -> Result<(), ParameterSourceError>
+where
     M: NativeRetainedValues,
     V: ParameterVisitorMut<'a, MlxTensor>,
 {
@@ -127,17 +144,9 @@ pub(super) fn visit_module_parameters_mut_borrowed<'a, M, V>(
         fn parameter(&mut self, _: ParameterMetadataView<'a>, _: &'a MlxTensor) {}
         fn retained(&mut self, _: &'a MlxTensor) {}
     }
-    if visit_module_parameter_sources(&*module, topology, &mut Check).is_err() {
-        visitor.borrowed_metadata_unavailable();
-        return;
-    }
+    visit_module_parameter_sources(&*module, topology, &mut Check)?;
     let mut emit = MutableEmit { topology, visitor };
-    if module
-        .visit_native_parameter_sources_mut(&mut emit)
-        .is_err()
-    {
-        emit.visitor.borrowed_metadata_unavailable();
-    }
+    module.visit_native_parameter_sources_mut(&mut emit)
 }
 
 // Layout-only visitor; real generic adapters have the identical borrowed
@@ -148,13 +157,15 @@ impl<'a> ParameterSourceVisitor<'a, MlxTensor> for VisitLayout {
     fn retained(&mut self, _: &'a MlxTensor) {}
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for VisitLayout {
-    fn visit_mut(&mut self, _: ParameterMetadata, _: &'a mut MlxTensor) {}
+    fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &'a mut MlxTensor) {}
 }
 pub(super) fn binding_visit_control_bytes() -> Option<usize> {
     use std::mem::size_of;
     [
         size_of::<Check<'static>>(),
-        size_of::<super::topology::TopologyKeys<'static>>(),
+        size_of::<std::ops::Range<usize>>(),
+        size_of::<(usize, &str)>(),
+        size_of::<Option<&str>>(),
         size_of::<Occurrences<'static>>(),
         size_of::<SourceEmit<'static, 'static, VisitLayout>>(),
         size_of::<MutableEmit<'static, 'static, VisitLayout>>(),

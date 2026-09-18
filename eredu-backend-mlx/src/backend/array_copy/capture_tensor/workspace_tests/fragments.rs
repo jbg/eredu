@@ -63,7 +63,7 @@ fn fragment_program_keeps_global_preview_order_and_complete_enclosing_span() {
             let ops = &report.operations[before..];
             assert!(matches!(
                 ops[0].kind,
-                WorkspaceOperationKind::Index { selected_axes: 0 }
+                WorkspaceOperationKind::StaticSlice { .. }
             ));
             if preview {
                 assert!(matches!(
@@ -76,7 +76,7 @@ fn fragment_program_keeps_global_preview_order_and_complete_enclosing_span() {
                 );
                 assert!(matches!(
                     ops[2].kind,
-                    WorkspaceOperationKind::Index { selected_axes: 0 }
+                    WorkspaceOperationKind::StaticSlice { .. }
                 ));
                 assert_eq!(
                     ops[2].outputs[0].shape(),

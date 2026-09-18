@@ -165,7 +165,7 @@ where
                 self.session.parameter_declarations(),
                 members,
             )
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         self.prepared_parameters
             .extend(self.prepared_bank_parameters.iter().map(|p| p.slot.clone()));
         self.prepared_parameters
@@ -251,7 +251,7 @@ where
             .map(|completion| completion.metadata_funding());
         fn retain<E: std::error::Error + Send + Sync + 'static>(
             cause: E,
-            funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+            funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
         ) -> Error {
             match funding {
                 Some(funding) => Error::Neural(funding.metadata_source(cause)),
@@ -526,8 +526,9 @@ where
     fn inspection_adapters_for_test(
         &self,
         geometry: eredu_core::InferenceGeometry,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
     ) -> Result<(), Error> {
-        MlxReplicatedTextMechanisms::inspection_adapters_for_test(&self.session, geometry)
+        MlxReplicatedTextMechanisms::inspection_adapters_for_test(&self.session, geometry, pool)
     }
     #[cfg(test)]
     fn prefill_status_for_test(&self) -> Result<(bool, bool), Error> {
@@ -538,7 +539,7 @@ where
         &self,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<(), Error> {
         MlxReplicatedTextMechanisms::bind_session_neural_recipe(&self.session, pool, recipe, funding)
     }
@@ -547,7 +548,7 @@ where
         &self,
         source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         recipe: &mut crate::backend::nn::workspace::AutoregressiveEquationRecipe,
     ) -> Result<
         (
@@ -610,7 +611,7 @@ where
         native_root_capacity: Option<u64>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Option<eredu_runtime::working_memory::TextPrefillScopeFacts>, Error> {
         MlxReplicatedTextMechanisms::session_prefill_control_facts(
             &self.session,
@@ -633,7 +634,7 @@ where
         host_destinations: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         Option<crate::backend::runtime::execution::generic::OriginalOperationBankOwner>,
         Error,
@@ -688,7 +689,7 @@ where
 
     fn retire_expired_opening_rows(&self) -> Result<(), Error> {
         MlxReplicatedTextMechanisms::retire_session_opening_rows(&self.session)?;
-        MlxReplicatedTextMechanisms::retire_session_prefill_controls(&self.session)
+        MlxReplicatedTextMechanisms::retire_session_controls(&self.session)
     }
 
     #[cfg(test)]
@@ -708,10 +709,14 @@ where
     fn validate_prepared_observation_paths(
         &self,
         expected: &eredu_runtime::SharedLayeredObservationPaths,
+        metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<(), Error> {
         self.session
             .validate_prepared_observation_paths(expected)
-            .map_err(|error| Error::Other(Box::new(error)))
+            .map_err(|cause| match metadata.funding() {
+                Some(funding) => crate::composition::mlx::model::retain_planning_error(cause, funding),
+                None => Error::Other(Box::new(cause)),
+            })
     }
 
     fn collect_retained_idle_auxiliary_storage(
@@ -1161,7 +1166,7 @@ where
     }
 
     fn resident_reset_profile(&self) -> Option<ResidentResetProfile> {
-        if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT || P::present() {
+        if P::present() {
             None
         } else {
             S::resident_reset_profile()
@@ -1174,7 +1179,7 @@ where
         eredu_runtime::working_memory::ResidentResetSource<'_, MlxKeyValueState>,
         eredu_runtime::working_memory::WorkingMemoryError,
     > {
-        if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT || P::present() {
+        if P::present() {
             return Err(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound);
         }
         self.session
@@ -1191,7 +1196,7 @@ where
             eredu_runtime::working_memory::ResidentResetInstallation<MlxKeyValueState>,
         ),
     > {
-        if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT || P::present() {
+        if P::present() {
             return Err((
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
                 installation,
@@ -1206,7 +1211,7 @@ where
         eredu_runtime::working_memory::ResidentResetSource<'_, MlxHybridState>,
         eredu_runtime::working_memory::WorkingMemoryError,
     > {
-        if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT || P::present() {
+        if P::present() {
             return Err(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound);
         }
         self.session
@@ -1223,7 +1228,7 @@ where
             eredu_runtime::working_memory::ResidentResetInstallation<MlxHybridState>,
         ),
     > {
-        if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT || P::present() {
+        if P::present() {
             return Err((
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
                 installation,
@@ -1422,7 +1427,7 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
-    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
+    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport<&'static str> {
         use eredu_core::execution_control::ControlSupport;
         let policy = super::native_control_policy_support(
             D::PARTITIONED_SESSION,
@@ -1432,10 +1437,9 @@ where
         if matches!(policy, ControlSupport::Unsupported { .. }) {
             return policy;
         }
-        if self.session.estimate_control_state().is_none() {
+        if self.session.estimate_original_control_state().is_none() {
             return ControlSupport::Unsupported {
-                reason: "native state isolation or a complete storage estimate is unavailable"
-                    .into(),
+                reason: "native state isolation or a complete storage estimate is unavailable",
             };
         }
         ControlSupport::Supported
@@ -1482,7 +1486,7 @@ where
         if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
             self.native_control_support()
         {
-            return Err(Error::ArchitectureModel(reason));
+            return Err(Error::ArchitectureModel(reason.into()));
         }
         self.session
             .capture_control_state(&self.stream)
@@ -1522,7 +1526,7 @@ where
         if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
             self.native_control_support()
         {
-            return Err(Error::ArchitectureModel(reason));
+            return Err(Error::ArchitectureModel(reason.into()));
         }
         let saved = saved
             .downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
@@ -1532,12 +1536,22 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
+    fn original_control_branch_sources(&self, slot: &dyn std::any::Any)
+        -> Result<[eredu_runtime::replicated_session::ControlBranchSource; 2], Error> {
+        use crate::composition::mlx::session::{PreparedControlSlotError, prepared_control_slot_error};
+        let slot = slot.downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| prepared_control_slot_error(PreparedControlSlotError::Type))?;
+        self.session.original_control_branch_sources(slot).map_err(prepared_control_slot_error)
+    }
+
     fn exchange_original_control_state(
         &mut self,
         slot: &mut dyn std::any::Any,
-        metadata: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        metadata: &eredu_nn::workspace::HostMetadataFunding,
         media: Option<&eredu_runtime::working_memory::MediaSessionBinding>,
-    ) -> Result<Option<eredu_runtime::working_memory::CopiedMediaStateBinding>, Error> {
+        branch: Option<(&eredu_runtime::working_memory::PendingTextBranchExchange,
+            &[eredu_runtime::replicated_session::ControlBranchSource; 2])>,
+    ) -> Result<eredu_runtime::replicated_session::ControlExchangeResult, Error> {
         use crate::composition::mlx::session::{
             PreparedControlSlotError, prepared_control_slot_error,
         };
@@ -1554,7 +1568,7 @@ where
             .downcast_mut::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
             .ok_or_else(|| prepared_control_slot_error(PreparedControlSlotError::Type))?;
         self.session
-            .exchange_control_state_prepared_fixed(slot, &self.stream, Some(metadata), media)
+            .exchange_control_state_prepared_fixed(slot, &self.stream, Some(metadata), media, branch)
             .map_err(prepared_control_slot_error)
     }
 
@@ -1975,7 +1989,7 @@ where
                         u64::try_from(*sequence).map_err(|error| Error::Other(Box::new(error)))?;
                     request
                         .validate_prefill(batch, sequence)
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                 }
                 Ok(tokens)
             })
@@ -2033,7 +2047,7 @@ where
         }
         let input = match tokens {
             Ok(ref tokens) => Ok(A::text_input(tokens, mask.as_ref())),
-            Err(error) => Err(eredu_nn::Error::backend_source(error)),
+            Err(error) => Err(eredu_nn::Error::backend_retained_source(error)),
         };
         let output = self
             .session
@@ -2057,7 +2071,7 @@ where
     ) -> Result<Array, Error> {
         let input = match tokens {
             Ok(tokens) => Ok(A::text_input(MlxTensor::ref_cast(tokens), None)),
-            Err(error) => Err(eredu_nn::Error::backend_source(error)),
+            Err(error) => Err(eredu_nn::Error::backend_retained_source(error)),
         };
         #[cfg(test)]
         if input.is_ok() {
@@ -2082,3 +2096,5 @@ where
         Ok(self.published(output))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

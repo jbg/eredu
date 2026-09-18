@@ -166,7 +166,7 @@ fn neural_factories_price_each_packed_companion_in_its_native_placeholder_dtype(
         // Ordinary mutable parameter replacement does not construct a new seed.
         struct Replace<'a>(&'a WorkspaceContext);
         impl<'a> crate::ParameterVisitorMut<'a, WorkspaceTensor> for Replace<'_> {
-            fn visit_mut(&mut self, _: crate::ParameterMetadata, value: &'a mut WorkspaceTensor) {
+            fn visit_mut(&mut self, _: crate::ParameterMetadataView<'_>, value: &'a mut WorkspaceTensor) {
                 *value = WorkspaceTensor::existing(value.layout().clone(), self.0).unwrap();
             }
         }
@@ -237,7 +237,7 @@ fn placeholder_mechanism_failure_preserves_the_original_source() {
             &self,
             _: &WorkspaceOperation,
         ) -> Result<Option<WorkspaceOperationBound>, Error> {
-            Err(Error::backend_source(std::io::Error::other(
+            Err(Error::backend_retained_source(std::io::Error::other(
                 "scalar allocator fact failed",
             )))
         }

@@ -67,7 +67,7 @@ fn controls(context: &WorkspaceContext, parts: &[usize]) -> Result<(), Error> {
 struct SourceFailure {
     #[source]
     cause: Error,
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 fn with_failure<T, F: FnOnce() -> Result<T, Error>>(
     context: &WorkspaceContext,
@@ -346,3 +346,5 @@ where
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

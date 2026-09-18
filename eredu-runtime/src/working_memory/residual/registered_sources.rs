@@ -202,13 +202,11 @@ impl IncrementalInferenceQuote {
             .capture
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !capture.same_source(source.storage_identity())
-            || witness
-                .sources
-                .as_ref()
-                .and_then(|sources| sources.inherited_capture.as_ref())
-                .is_some_and(|prior| !prior.same_source(source.storage_identity()))
-        {
+        // A changed declaration is accepted only through the closed compiler's
+        // exact retained parent. This transfers the parent's existing custody;
+        // the new source still needs its own separately funded publication.
+        let inherited = source.limit_revision_source().unwrap_or(source);
+        if !capture.same_source(inherited.storage_identity()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         witness.validate(&self.pool)?;

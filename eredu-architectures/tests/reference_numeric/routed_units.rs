@@ -109,7 +109,7 @@ where
     let observed = eredu_runtime::ObservedExpertProvider::<_, _, Error>::new(
         provider,
         capture,
-        eredu_runtime::RoutedObservationPoints::new(id, "fixture.experts", bank.spec.group_count()),
+        eredu_runtime::RoutedObservationPoints::new(id,format_args!("fixture.experts"), bank.spec.group_count(), None).unwrap(),
     );
     let mut boxed = eredu_runtime::RoutedBankProviders::new([(id, Box::new(observed))]).unwrap();
     let request = RoutedExpertRequest {
@@ -159,7 +159,7 @@ where
     let observed = eredu_runtime::ObservedExpertProvider::<_, _, Error>::new(
         provider,
         capture,
-        eredu_runtime::RoutedObservationPoints::new(id, "fixture.experts", bank.spec.group_count()),
+        eredu_runtime::RoutedObservationPoints::new(id,format_args!("fixture.experts"), bank.spec.group_count(), None).unwrap(),
     );
     let mut boxed = eredu_runtime::RoutedBankProviders::new([(id, Box::new(observed))]).unwrap();
     let request = RoutedExpertRequest {
@@ -391,7 +391,7 @@ fn partition_unit_coordinates_survive_provider_chunks_exchange_and_actual_replac
                     keep_selected: true,
                 },
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
             assert!(matches!(
                 recipe.action,
                 Some(InterventionAction::Zero { .. })
@@ -633,7 +633,7 @@ fn assert_unit_source(error: &(dyn std::error::Error + 'static)) {
 struct Failing;
 impl RoutedUnitObserver<NumericTensor> for Failing {
     fn observe(&mut self, _: &RoutedUnitBatch<'_, NumericTensor>) -> Result<(), Error> {
-        Err(Error::backend_source(UnitSentinel))
+        Err(Error::backend_retained_source(UnitSentinel))
     }
 }
 impl eredu_runtime::ActivationObserver<NumericTensor, Error> for Failing {
@@ -662,7 +662,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
     let mut observed = eredu_runtime::ObservedExpertProvider::new(
         provider,
         &mut observer,
-        eredu_runtime::RoutedObservationPoints::new(id, "bank", bank.spec.group_count()),
+        eredu_runtime::RoutedObservationPoints::new(id,format_args!("bank"), bank.spec.group_count(), None).unwrap(),
     );
     let error = RoutedExpertProvider::<NumericBackend>::forward_grouped(
         &mut observed,
@@ -695,7 +695,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
     let error = eredu_runtime::ObservedExpertProvider::new(
         provider,
         &mut Failing,
-        eredu_runtime::RoutedObservationPoints::new(id, "bank", bank.spec.group_count()),
+        eredu_runtime::RoutedObservationPoints::new(id,format_args!("bank"), bank.spec.group_count(), None).unwrap(),
     )
     .execute_neural(|observed| {
         RoutedExpertProvider::<NumericBackend>::forward_grouped(

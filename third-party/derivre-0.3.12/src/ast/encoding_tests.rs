@@ -1,12 +1,6 @@
 use super::*;
 use std::error::Error;
 
-fn legacy_insert(expression: &Expr<'_>, table: &mut VecHashCons) -> u32 {
-    table.start_insert();
-    expression.serialize(table);
-    table.finish_insert()
-}
-
 fn tag(flags: ExprFlags, tag: ExprTag) -> u32 {
     flags.0 | tag as u32
 }
@@ -21,20 +15,20 @@ fn check_sequence(cases: &[(Expr<'_>, Vec<u32>)]) {
     let mut prepared =
         PreparedVecHashCons::try_new_with_scratch(words, cases.len(), scratch).unwrap();
     let capacity = prepared.retained_capacity_bytes().unwrap();
-    let mut legacy = VecHashCons::new();
+    let mut growing = PreparedVecHashCons::empty_with_funding(crate::ParserAllocationFunding::unenforced()).unwrap();
     for (expression, expected) in cases {
         assert_eq!(expression.encoded_word_len().unwrap(), expected.len());
-        let legacy_id = legacy_insert(expression, &mut legacy);
+        let growing_id = expression.try_intern_encoded(&mut growing).unwrap();
         let prepared_id = expression.try_intern_encoded(&mut prepared).unwrap();
-        assert_eq!(prepared_id, legacy_id);
-        assert_eq!(legacy.get(legacy_id), expected);
+        assert_eq!(prepared_id, growing_id);
+        assert_eq!(growing.get(growing_id), expected);
         assert_eq!(prepared.get(prepared_id), expected);
         assert_eq!(prepared.retained_capacity_bytes().unwrap(), capacity);
     }
     let count = prepared.len();
     for (expression, expected) in cases.iter().rev() {
         let prepared_id = expression.try_intern_encoded(&mut prepared).unwrap();
-        assert_eq!(prepared_id, legacy_insert(expression, &mut legacy));
+        assert_eq!(prepared_id, expression.try_intern_encoded(&mut growing).unwrap());
         assert_eq!(prepared.get(prepared_id), expected);
         assert_eq!(prepared.len(), count);
         assert_eq!(prepared.retained_capacity_bytes().unwrap(), capacity);
@@ -42,7 +36,7 @@ fn check_sequence(cases: &[(Expr<'_>, Vec<u32>)]) {
 }
 
 #[test]
-fn every_expression_variant_preserves_legacy_words_ids_and_flags() {
+fn every_expression_variant_preserves_words_ids_and_flags() {
     let args = [ExprRef::new(17), ExprRef::new(23), ExprRef::new(41)];
     let byte_set = [0x1, 0x8000_0000, 0x1234_5678, 0xffff_ffff, 0, 3, 5, 9];
     let positive = ExprFlags::POSITIVE;
@@ -292,9 +286,9 @@ fn encoded_word_geometry_checks_overflow_without_allocating_a_large_slice() {
 }
 
 #[test]
-fn borrowed_legacy_expressions_encode_without_rebasing_children_or_faking_expr_ids() {
-    let mut source = ExprSet::new(256);
-    let literal = source.mk_literal("marigold");
+fn borrowed_original_expressions_encode_without_rebasing_children_or_faking_expr_ids() {
+    let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+    let literal = source.mk_literal("marigold").unwrap();
     let expression = source.get(literal);
     let words = expression.encoded_word_len().unwrap();
     let before = source.exprs.retained_capacity_bytes().unwrap();
@@ -310,5 +304,5 @@ fn borrowed_legacy_expressions_encode_without_rebasing_children_or_faking_expr_i
     let raw_id = expression.try_intern_encoded(&mut raw).unwrap();
     assert_eq!(raw.get(raw_id), source.exprs.get(literal.as_u32()));
     assert_eq!(source.exprs.retained_capacity_bytes().unwrap(), before);
-    assert_eq!(source.mk_literal("marigold"), literal);
+    assert_eq!(source.mk_literal("marigold").unwrap(), literal);
 }

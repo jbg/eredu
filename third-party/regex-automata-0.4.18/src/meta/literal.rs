@@ -12,16 +12,18 @@ use crate::{meta::regex::RegexInfo, util::search::MatchKind};
 /// are "too few" alternates, in which case, the regex engine is likely faster.
 ///
 /// And currently, this only returns something when 'hirs.len() == 1'.
-pub(crate) fn alternation_literals(
+pub(crate) fn alternation_literals_with_allocations(
     info: &RegexInfo,
     hirs: &[&Hir],
-) -> Option<Vec<Vec<u8>>> {
+    funding: &dyn crate::util::allocation::Allocation,
+) -> Result<Option<Vec<Vec<u8>>>, crate::util::allocation::AllocationError> {
+    let allocation = crate::util::allocation::Allocator::new(funding);
     use regex_syntax::hir::{HirKind, Literal};
 
     // Might as well skip the work below if we know we can't build an
     // Aho-Corasick searcher.
     if !cfg!(feature = "perf-literal-multisubstring") {
-        return None;
+        return Ok(None);
     }
     // This is pretty hacky, but basically, if `is_alternation_literal` is
     // true, then we can make several assumptions about the structure of our
@@ -32,26 +34,24 @@ pub(crate) fn alternation_literals(
         || !info.props()[0].is_alternation_literal()
         || info.config().get_match_kind() != MatchKind::LeftmostFirst
     {
-        return None;
+        return Ok(None);
     }
     let hir = &hirs[0];
     let alts = match *hir.kind() {
         HirKind::Alternation(ref alts) => alts,
-        _ => return None, // one literal isn't worth it
+        _ => return Ok(None), // one literal isn't worth it
     };
 
     let mut lits = vec![];
     for alt in alts {
         let mut lit = vec![];
         match *alt.kind() {
-            HirKind::Literal(Literal(ref bytes)) => {
-                lit.extend_from_slice(bytes)
-            }
+            HirKind::Literal(Literal(ref bytes)) => allocation.extend_copy(&mut lit, bytes)?,
             HirKind::Concat(ref exprs) => {
                 for e in exprs {
                     match *e.kind() {
                         HirKind::Literal(Literal(ref bytes)) => {
-                            lit.extend_from_slice(bytes);
+                            allocation.extend_copy(&mut lit, bytes)?;
                         }
                         _ => unreachable!("expected literal, got {e:?}"),
                     }
@@ -59,7 +59,7 @@ pub(crate) fn alternation_literals(
             }
             _ => unreachable!("expected literal or concat, got {alt:?}"),
         }
-        lits.push(lit);
+        allocation.push(&mut lits, lit)?;
     }
     // Why do this? Well, when the number of literals is small, it's likely
     // that we'll use the lazy DFA which is in turn likely to be faster than
@@ -75,7 +75,7 @@ pub(crate) fn alternation_literals(
     // Aho-Corasick, where even the contiguous NFA is likely to do much better.
     if lits.len() < 3000 {
         debug!("skipping Aho-Corasick because there are too few literals");
-        return None;
+        return Ok(None);
     }
-    Some(lits)
+    Ok(Some(lits))
 }

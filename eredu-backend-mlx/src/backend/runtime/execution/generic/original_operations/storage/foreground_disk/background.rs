@@ -4,7 +4,7 @@ use crate::backend::runtime::residency::{
     dense_stream::{BackgroundHostCoordinator, BackgroundHostReadService, PreparedBackgroundForward},
     manager::{OriginalResidencySource, PreparedBackgroundHostReads, PreparedBackgroundHostWindow},
 };
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{DenseDiskStreamLoadOptions, residency::ResidencyClosureSlot,
     working_memory::{HostSourcePeakSelection, OriginalHostSourceCustody, WorkingMemoryReservation}};
 
@@ -29,18 +29,18 @@ pub(crate) struct BackgroundRequestPlan {
     reads: ForegroundDiskWindowPlan,
     forwards: usize,
     selected: Option<Vec<usize>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl BackgroundRequestPlan {
     pub(super) fn new(
         selection: &BackgroundSelection, manager: &ResidencyManager, pool: &WorkingMemoryPool,
         ids: &[OffloadUnitId], device: &[ForegroundDiskWindowPlan],
         device_sources: &[crate::backend::runtime::residency::manager::WindowPopulation], forwards: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let controls = [
             size_of::<Self>(), size_of::<Result<Self, Error>>(), size_of::<BackgroundSelection>(),
-            size_of::<(&BackgroundSelection, &ResidencyManager, &WorkingMemoryPool, &[OffloadUnitId], &[ForegroundDiskWindowPlan], &[crate::backend::runtime::residency::manager::WindowPopulation], usize, &WorkspaceMetadataFunding)>(),
+            size_of::<(&BackgroundSelection, &ResidencyManager, &WorkingMemoryPool, &[OffloadUnitId], &[ForegroundDiskWindowPlan], &[crate::backend::runtime::residency::manager::WindowPopulation], usize, &HostMetadataFunding)>(),
             size_of::<crate::backend::runtime::residency::manager::WindowPopulation>(),
             size_of::<(usize, &ForegroundDiskWindowPlan)>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, ForegroundDiskWindowPlan>>>(),
@@ -178,3 +178,5 @@ impl BackgroundRequestPlan {
         BackgroundHostCoordinator::from_prepared(forwards, custody, funding.clone())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

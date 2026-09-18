@@ -117,7 +117,7 @@ pub(super) fn decoder<C: crate::decoder::Config>(
 ) {
     for layer in 0..config.num_hidden_layers() as usize {
         let path = format!("{}.layers.{layer}", config.parameter_root());
-        let Some(points) = config.routed_observation_points(&path, layer) else {
+        let Some(points) = config.routed_observation_points(&path, layer, None).expect("ordinary routed point construction") else {
             continue;
         };
         let Some(point) = points.bank(eredu_runtime::RoutedBankId::new(0)) else {

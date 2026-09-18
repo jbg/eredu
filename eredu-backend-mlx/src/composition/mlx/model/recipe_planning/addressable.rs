@@ -6,7 +6,7 @@ impl Executable {
         &self,
         mechanism: ResidentExecutionMechanisms,
         pool: &WorkingMemoryPool,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Option<AddressableSources>, Error> {
         let Some(banks) = self
             .erased()

@@ -62,7 +62,7 @@ impl CacheResidencyManager {
     /// The canonical collector retains this same Host account until replacement
     /// or manager retirement, including when the attempted frame is discarded.
     pub(crate) fn prepare_realtime_reporting<I>(&self,expected:RealtimeReportingSource,future:I,
-        funding:&WorkspaceMetadataFunding)->Result<(),Exception>
+        funding:&HostMetadataFunding)->Result<(),Exception>
     where I:Iterator<Item=usize>+Clone {
         let result=(||->Result<(),Cause> {
             funding.reserve_metadata(expected.controls)?;

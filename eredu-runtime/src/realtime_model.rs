@@ -843,10 +843,10 @@ where
             ));
         }
     }
-    if architecture
+    if !architecture
         .execution_graph()
         .map_err(RealtimeModelConstructionError::Architecture)?
-        != *selected.execution_graph()
+        .matches(selected.execution_graph())
     {
         return Err(RealtimeModelConstructionError::Contract(
             "constructed realtime execution graph differs from selection".into(),
@@ -854,7 +854,7 @@ where
     }
     for group in 0..selected.execution_graph().groups().len() {
         let actual = architecture
-            .group_unit_count(group)
+            .group_unit_count(group, None)
             .map_err(RealtimeModelConstructionError::Architecture)?;
         let expected = selected
             .execution_units()
@@ -875,14 +875,14 @@ where
     } else {
         selected.execution_parameters()
     };
-    if &actual != expected {
+    if actual.as_ref() != expected {
         return Err(RealtimeModelConstructionError::Contract(
             "constructed realtime parameter topology differs from selection".into(),
         ));
     }
     if !source
         && architecture
-            .state_layout()
+            .state_layout(None)
             .map_err(RealtimeModelConstructionError::Architecture)?
             != *selected.state().layout()
     {

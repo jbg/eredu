@@ -36,6 +36,8 @@ See the 'opt/reverse-inner' and 'opt/reverse-suffix' benchmarks in rebar for a
 real demonstration of how quadratic behavior is mitigated.
 */
 
+use crate::util::allocation::{Allocation};
+
 use crate::{
     meta::error::{RetryError, RetryQuadraticError},
     HalfMatch, Input, MatchError,
@@ -122,23 +124,31 @@ pub(crate) fn dfa_try_search_half_rev(
 }
 
 #[cfg(feature = "hybrid")]
-pub(crate) fn hybrid_try_search_half_rev(
+#[cfg(feature = "hybrid")]
+pub(crate) fn hybrid_try_search_half_rev_with_allocations(
     dfa: &crate::hybrid::dfa::DFA,
     cache: &mut crate::hybrid::dfa::Cache,
     input: &Input<'_>,
     min_start: usize,
+    funding: &dyn Allocation,
 ) -> Result<Option<HalfMatch>, RetryError> {
     let mut mat = None;
-    let mut sid = dfa.start_state_reverse(cache, input)?;
+    let mut sid =
+        dfa.start_state_reverse_with_allocations(cache, input, funding)?;
     if input.start() == input.end() {
-        hybrid_eoi_rev(dfa, cache, input, &mut sid, &mut mat)?;
+        hybrid_eoi_rev(dfa, cache, input, &mut sid, &mut mat, funding)?;
         return Ok(mat);
     }
     let mut at = input.end() - 1;
     loop {
         sid = dfa
-            .next_state(cache, sid, input.haystack()[at])
-            .map_err(|_| MatchError::gave_up(at))?;
+            .next_state_with_allocations(
+                cache,
+                sid,
+                input.haystack()[at],
+                funding,
+            )
+            .map_err(|error| cache_error(error, at))?;
         if sid.is_tagged() {
             if sid.is_match() {
                 let pattern = dfa.match_pattern(cache, sid, 0);
@@ -166,7 +176,7 @@ pub(crate) fn hybrid_try_search_half_rev(
         }
     }
     let was_dead = sid.is_dead();
-    hybrid_eoi_rev(dfa, cache, input, &mut sid, &mut mat)?;
+    hybrid_eoi_rev(dfa, cache, input, &mut sid, &mut mat, funding)?;
     // See the comments in the full DFA routine above for why we need this.
     if at == input.start()
         && mat.map_or(false, |m| m.offset() > input.start())
@@ -222,13 +232,14 @@ fn hybrid_eoi_rev(
     input: &Input<'_>,
     sid: &mut crate::hybrid::LazyStateID,
     mat: &mut Option<HalfMatch>,
+    funding: &dyn Allocation,
 ) -> Result<(), MatchError> {
     let sp = input.get_span();
     if sp.start > 0 {
         let byte = input.haystack()[sp.start - 1];
         *sid = dfa
-            .next_state(cache, *sid, byte)
-            .map_err(|_| MatchError::gave_up(sp.start))?;
+            .next_state_with_allocations(cache, *sid, byte, funding)
+            .map_err(|error| cache_error(error, sp.start))?;
         if sid.is_match() {
             let pattern = dfa.match_pattern(cache, *sid, 0);
             *mat = Some(HalfMatch::new(pattern, sp.start));
@@ -237,8 +248,8 @@ fn hybrid_eoi_rev(
         }
     } else {
         *sid = dfa
-            .next_eoi_state(cache, *sid)
-            .map_err(|_| MatchError::gave_up(sp.start))?;
+            .next_eoi_state_with_allocations(cache, *sid, funding)
+            .map_err(|error| cache_error(error, sp.start))?;
         if sid.is_match() {
             let pattern = dfa.match_pattern(cache, *sid, 0);
             *mat = Some(HalfMatch::new(pattern, 0));
@@ -248,4 +259,12 @@ fn hybrid_eoi_rev(
         debug_assert!(!sid.is_quit());
     }
     Ok(())
+}
+
+#[cfg(feature = "hybrid")]
+fn cache_error(error: crate::hybrid::CacheError, offset: usize) -> MatchError {
+    error
+        .allocation_error()
+        .map(MatchError::from)
+        .unwrap_or_else(|| MatchError::gave_up(offset))
 }

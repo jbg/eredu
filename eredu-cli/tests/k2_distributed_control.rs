@@ -2,8 +2,8 @@
 #![cfg(feature = "mlx")]
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
-use eredu_core::{capture::*, execution_control::*, GenerationConfigOverrides};
-use safemlx::{distributed, Device, DeviceType, Stream};
+use eredu_core::{GenerationConfigOverrides, capture::*, execution_control::*};
+use safemlx::{DeviceType, distributed};
 use std::{
     io::Write,
     ops::ControlFlow,
@@ -72,94 +72,162 @@ fn fixture(root: &Path, family: &str) {
     .unwrap();
 }
 
-#[test]
-#[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
-fn k2_distributed_facade_control_matrix() {
-    for family in ["dense", "mova"] {
-        for residency in ["resident", "host", "disk"] {
-            let root = tempfile::tempdir().unwrap();
-            fixture(root.path(), family);
-            let world = if family == "dense" { 4 } else { 8 };
-            let sockets = (0..world)
-                .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-                .collect::<Vec<_>>();
-            let hosts = sockets
-                .iter()
-                .map(|socket| vec![format!("127.0.0.1:{}", socket.local_addr().unwrap().port())])
-                .collect::<Vec<_>>();
-            let hostfile = root.path().join("hosts.json");
-            std::fs::write(&hostfile, serde_json::to_vec(&hosts).unwrap()).unwrap();
-            drop(sockets);
-            let mut children = vec![];
-            for rank in 0..world {
-                let log =
-                    std::fs::File::create(root.path().join(format!("rank-{rank}.log"))).unwrap();
-                children.push(
-                    Command::new(std::env::current_exe().unwrap())
-                        .args(["--exact", "k2_distributed_facade_worker", "--nocapture"])
-                        .env("K2_CONTROL_ARTIFACT", root.path())
-                        .env("K2_CONTROL_FAMILY", family)
-                        .env("K2_CONTROL_RESIDENCY", residency)
-                        .env("MLX_RANK", rank.to_string())
-                        .env("MLX_HOSTFILE", &hostfile)
-                        .stdout(Stdio::from(log.try_clone().unwrap()))
-                        .stderr(Stdio::from(log))
-                        .spawn()
-                        .unwrap(),
-                );
+fn run_control_case(family: &str, residency: &str) {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), family);
+    let world = if family == "dense" { 4 } else { 8 };
+    let sockets = (0..world)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+    let hosts = sockets
+        .iter()
+        .map(|socket| vec![format!("127.0.0.1:{}", socket.local_addr().unwrap().port())])
+        .collect::<Vec<_>>();
+    let hostfile = root.path().join("hosts.json");
+    std::fs::write(&hostfile, serde_json::to_vec(&hosts).unwrap()).unwrap();
+    drop(sockets);
+    let mut children = vec![];
+    for rank in 0..world {
+        let log =
+            std::fs::File::create(root.path().join(format!("rank-{rank}.log"))).unwrap();
+        children.push(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "k2_distributed_facade_worker", "--nocapture"])
+                .env("K2_CONTROL_ARTIFACT", root.path())
+                .env("K2_CONTROL_FAMILY", family)
+                .env("K2_CONTROL_RESIDENCY", residency)
+                .env("MLX_RANK", rank.to_string())
+                .env("MLX_HOSTFILE", &hostfile)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while children
+        .iter_mut()
+        .any(|child| child.try_wait().unwrap().is_none())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut failures = vec![];
+    for (rank, mut child) in children.into_iter().enumerate() {
+        let status = match child.try_wait().unwrap() {
+            Some(status) => status,
+            None => {
+                child.kill().unwrap();
+                child.wait().unwrap()
             }
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while children
-                .iter_mut()
-                .any(|child| child.try_wait().unwrap().is_none())
-                && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            let mut failures = vec![];
-            for (rank, mut child) in children.into_iter().enumerate() {
-                let status = match child.try_wait().unwrap() {
-                    Some(status) => status,
-                    None => {
-                        child.kill().unwrap();
-                        child.wait().unwrap()
-                    }
-                };
-                if !status.success() {
-                    failures.push(format!(
-                        "rank {rank}: {}",
-                        std::fs::read_to_string(root.path().join(format!("rank-{rank}.log")))
-                            .unwrap()
-                    ));
-                }
-            }
-            assert!(
-                failures.is_empty(),
-                "{family}/{residency}: {}",
-                failures.join("\n")
-            );
+        };
+        if !status.success() {
+            failures.push(format!(
+                "rank {rank}: {}",
+                std::fs::read_to_string(root.path().join(format!("rank-{rank}.log")))
+                    .unwrap()
+            ));
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{family}/{residency}: {}",
+        failures.join("\n")
+    );
 }
 
-#[test]
-fn k2_distributed_facade_worker() {
-    let Some(root) = std::env::var_os("K2_CONTROL_ARTIFACT") else {
-        return;
+mod k2_distributed_facade_control_matrix {
+    macro_rules! case {
+        ($name:ident, $family:literal, $residency:literal) => {
+            #[test]
+            #[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
+            fn $name() {
+                super::run_control_case($family, $residency);
+            }
+        };
+    }
+
+    case!(dense_resident, "dense", "resident");
+    case!(dense_host, "dense", "host");
+    case!(dense_disk, "dense", "disk");
+    case!(mova_resident, "mova", "resident");
+    case!(mova_host, "mova", "host");
+    case!(mova_disk, "mova", "disk");
+}
+
+// A callback refusal also retains the canonical failed session. Both facade
+// variants preserve the same typed local capture cause and its original owner.
+fn is_cumulative_encoded_limit(error: &ControlledGenerationError) -> bool {
+    let capture = match error {
+        ControlledGenerationError::Capture(capture)
+        | ControlledGenerationError::CaptureFailure { capture, .. } => capture,
+        _ => return false,
     };
-    let root = std::path::PathBuf::from(root);
-    let family = std::env::var("K2_CONTROL_FAMILY").unwrap();
-    let residency = std::env::var("K2_CONTROL_RESIDENCY").unwrap();
-    let rank = std::env::var("MLX_RANK").unwrap().parse().unwrap();
-    let world = distributed::init(true, distributed::Backend::Ring).unwrap();
-    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let backend = eredu_backend_mlx::native::distributed_backend(&stream, &stream, &world);
+    matches!(capture.cause(), CaptureError::Limit {
+        budget: CaptureBudget::Encoded, cumulative: true,
+    })
+}
+
+fn reset_admitted(
+    model: &mut LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    capacity: u64,
+) {
+    let before = model.text_preparation_usage().unwrap();
+    assert!(before.attempts > 0);
+    // Every participant refuses the same zero operation budget before any
+    // readiness producer or vote; no retry can recover spent preparation work.
+    let refused =
+        model
+            .prepare_reset_ordinary()
+            .unwrap()
+            .reset_admitted(eredu_core::SessionResetLimits {
+                application_memory_budget_bytes: Some(0),
+                ..eredu_core::SessionResetLimits::new(capacity)
+            });
+    assert!(refused.is_err());
+    drop(refused);
+    assert_eq!(model.text_preparation_usage().unwrap(), before);
+    // All stages use this retained coordinator's same two-exchange protocol.
+    // Successful reset adds construction and publication votes, preserving all
+    // previous spending rather than resetting the coordinator's history.
+    assert_eq!(before.retained_bytes % before.attempts, 0);
+    assert_eq!(before.host_bytes % before.attempts, 0);
+    let retained_per_attempt = before.retained_bytes / before.attempts;
+    let host_per_attempt = before.host_bytes / before.attempts;
+    assert!(retained_per_attempt > 0 && host_per_attempt > 0);
+    model
+        .prepare_reset_ordinary()
+        .unwrap()
+        .reset_admitted(eredu_core::SessionResetLimits::new(capacity))
+        .unwrap();
+    model.synchronize().unwrap();
+    let after = model.text_preparation_usage().unwrap();
+    assert_eq!(after.attempts, before.attempts + 2);
+    assert_eq!(
+        after.retained_bytes,
+        before.retained_bytes + 2 * retained_per_attempt
+    );
+    assert_eq!(after.host_bytes, before.host_bytes + 2 * host_per_attempt);
+}
+
+fn load_fixture<'a>(
+    root: &Path,
+    family: &str,
+    residency: &str,
+    world: &'a distributed::Group,
+    rank: usize,
+) -> LoadedModel<eredu_backend_mlx::backend::MlxBackend<'a>> {
+    // Each model retains its actual admitted stream and communicator sources.
+    let backend =
+        eredu_backend_mlx::native::prepared_distributed_backend_on(world, DeviceType::Cpu)
+            .expect("prepared distributed execution/source stream construction")
+            .expect("the selected CPU has a qualified stream constructor");
     let topology = eredu_core::ParallelRankTopology::new(
         eredu_core::ParallelTopology::new(2, 2, if family == "mova" { 2 } else { 1 }, 1).unwrap(),
         rank,
     )
     .unwrap();
-    let ordinary = match residency.as_str() {
+    let ordinary = match residency {
         "resident" => eredu_runtime::OrdinaryWeightResidency::FullyResident,
         "host" => eredu_runtime::OrdinaryWeightResidency::LayerwiseHost(
             eredu_runtime::LayerwiseLoadOptions::new(
@@ -205,11 +273,11 @@ fn k2_distributed_facade_worker() {
         .unwrap(),
     )
     .unwrap();
-    let prepared = eredu_core::load_model(&backend, &root, options).unwrap();
+    let prepared = eredu_core::load_model(&backend, root, options).unwrap();
     let runtime = eredu_core::ModelRuntime::from_prepared(backend, prepared).unwrap();
     let tokenizer =
         eredu_text::tokenizer::Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
-    let mut model = LoadedModel::from_runtime(
+    LoadedModel::from_runtime(
         runtime,
         tokenizer,
         LoadedTextModelConfig {
@@ -221,14 +289,26 @@ fn k2_distributed_facade_worker() {
             checkpoint_generation_config: None,
         },
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn k2_distributed_facade_worker() {
+    let Some(root) = std::env::var_os("K2_CONTROL_ARTIFACT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let family = std::env::var("K2_CONTROL_FAMILY").unwrap();
+    let residency = std::env::var("K2_CONTROL_RESIDENCY").unwrap();
+    let rank = std::env::var("MLX_RANK").unwrap().parse().unwrap();
+    let world = distributed::init(true, distributed::Backend::Ring).unwrap();
+    let mut model = load_fixture(&root, &family, &residency, &world, rank);
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    // Finish ordinary numerical references before constructing retained paid
+    // sources. An ordinary allocation cannot coexist with active reservations.
+    let mut references = Vec::new();
     for temperature in [0.0, 0.8] {
-        let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user","content":"word1 word2"})],
-                ..Default::default()
-            })
-            .unwrap();
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(temperature),
@@ -236,36 +316,88 @@ fn k2_distributed_facade_worker() {
                 ..Default::default()
             },
             seed: 827,
+            inference: TextInferencePolicy {
+                managed_memory_capacity_bytes: Some(CAPACITY),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let trace = TraceLimits {
-            per_record_bytes: 16384,
-            total_bytes: 1 << 20,
-        };
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-            .unwrap();
         let baseline = model
             .generate_tokens(
-                prepared.prompt_token_ids().to_vec(),
-                eredu_core::TextGenerationConfig::new(prepared.generation_config())
-                    .with_seed(settings.seed),
+                vec![1, 2],
+                eredu_core::TextGenerationConfig::new(
+                    model.resolve_generation_config(settings.overrides).unwrap(),
+                )
+                .with_seed(settings.seed),
             )
             .unwrap()
             .map(|token| token.unwrap().token_id().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(baseline.len(), 8);
         model.reset().unwrap();
+        references.push((settings, baseline));
+    }
+    // The raw reference owns unquoted operation resources for its full model
+    // lifetime. Retire it before constructing the canonical model; all control
+    // trials below keep that one model and its cumulative agreement history.
+    model.synchronize().unwrap();
+    drop(model);
+    eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+    let mut model = load_fixture(&root, &family, &residency, &world, rank);
+    let tokenizer = model
+        .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+        .unwrap();
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+    for (settings, baseline) in references {
+        let chat = model
+            .prepare_chat(
+                &source,
+                &ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user","content":"word1 word2"})],
+                    ..Default::default()
+                },
+                CAPACITY,
+                &cancellation,
+            )
+            .unwrap()
+            .unwrap();
+        let request = |settings| {
+            let mut request = PreparedChatRequest::new(&chat, settings);
+            request.output_mode = PreparedChatOutputMode::Text;
+            request
+        };
+        let trace = TraceLimits {
+            per_record_bytes: 16384,
+            total_bytes: 1 << 20,
+        };
+        let prepared = request(settings);
+        let prepared_trace = trace;
         let emit = |_: ControlledGenerationRecord| ControlFlow::Continue(());
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), emit)
-            .unwrap();
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 2,
-            max_branches: 1,
-            retained_bytes: 64 << 20,
-            cumulative_copy_bytes: 256 << 20,
-        })
+            .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
+            .unwrap_or_else(|error| panic!(
+                "{family}/{residency} rank {rank} snapshot trial at temperature {}: {error:?}",
+                settings.overrides.temperature.unwrap(),
+            ))
+            .expect("live control");
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 2,
+                max_branches: 1,
+                retained_bytes: 64 << 20,
+                cumulative_copy_bytes: 256 << 20,
+            },
+            CAPACITY,
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
+        )
         .unwrap();
         run.step(emit).unwrap();
         run.step(emit).unwrap();
@@ -289,6 +421,23 @@ fn k2_distributed_facade_worker() {
                 emit,
             )
             .unwrap();
+        // Keep both branches unfinished while exchanging their actual request
+        // banks. A live dormant branch retains sources and spent slots, but may
+        // not prevent the other branch from activating its next prediction.
+        let before = run.snapshot_usage().unwrap().cumulative_copy_bytes;
+        run.restore(&saved, emit).unwrap();
+        assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > before);
+        run.step(emit).unwrap();
+        assert_eq!(run.token_ids(), &baseline[..3]);
+        run.exchange(&mut child, emit).unwrap();
+        run.step(emit).unwrap();
+        assert_eq!(run.token_ids(), &baseline[..3]);
+        run.exchange(&mut child, emit).unwrap();
+        run.step(emit).unwrap();
+        assert_eq!(run.token_ids(), &baseline[..4]);
+        run.exchange(&mut child, emit).unwrap();
+        run.run(emit).unwrap();
+        assert_eq!(run.token_ids(), baseline);
         run.exchange(&mut child, emit).unwrap();
         run.run(emit).unwrap();
         assert_eq!(run.token_ids(), baseline);
@@ -299,21 +448,21 @@ fn k2_distributed_facade_worker() {
             consumed
         );
         drop(run);
-        model.reset().unwrap();
+        reset_admitted(&mut model, CAPACITY);
         for controlled in [false, true] {
-            let prepared = model
-                .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-                .unwrap();
+            let prepared = request(settings);
+            let prepared_trace = trace;
             let before = model.text_preparation_usage().unwrap();
             let cancelled = if controlled {
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), emit)
-                    .unwrap();
+                    .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
+                    .unwrap()
+                    .expect("live control");
                 run.run(|record| {
                     if rank == 0
                         && matches!(
-                            record.generation.event,
-                            ObservedGenerationEvent::Token { .. }
+                            record.event.progress(),
+                            Some(ObservedGenerationEvent::Token { .. })
                         )
                     {
                         ControlFlow::Break(())
@@ -325,18 +474,31 @@ fn k2_distributed_facade_worker() {
                 assert_eq!(run.status(), GenerationStatus::Cancelled);
                 run.token_ids().to_vec()
             } else {
-                model
-                    .generate_observed_text(prepared, &[], Default::default(), |record| {
+                (|| -> Result<Vec<u32>, ControlledGenerationError> {
+                    let mut emit = |record: ControlledGenerationRecord| {
                         if rank == 0
-                            && matches!(record.event, ObservedGenerationEvent::Token { .. })
+                            && matches!(
+                                record.event.progress(),
+                                Some(ObservedGenerationEvent::Token { .. })
+                            )
                         {
                             ControlFlow::Break(())
                         } else {
                             ControlFlow::Continue(())
                         }
-                    })
-                    .unwrap()
-                    .token_ids
+                    };
+                    let mut run = model
+                        .start_controlled_chat(
+                            prepared,
+                            prepared_trace,
+                            GenerationControlHandle::new(Default::default()),
+                            &mut emit,
+                        )?
+                        .expect("live control");
+                    run.run(&mut emit)?;
+                    Ok(run.token_ids().to_vec())
+                })()
+                .unwrap()
             };
             assert_eq!(
                 cancelled,
@@ -345,24 +507,23 @@ fn k2_distributed_facade_worker() {
             );
             let after = model.text_preparation_usage().unwrap();
             assert!(after.attempts > before.attempts);
-            model.reset().unwrap();
-            assert_eq!(model.text_preparation_usage().unwrap(), after);
+            reset_admitted(&mut model, CAPACITY);
 
             if controlled {
-                let prepared = model
-                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-                    .unwrap();
+                let prepared = request(settings);
+                let prepared_trace = trace;
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), emit)
-                    .unwrap();
+                    .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
+                    .unwrap()
+                    .expect("live control");
                 run.run(|record| {
                     if rank == 0
                         && matches!(
-                            record.generation.event,
-                            ObservedGenerationEvent::Lifecycle {
+                            record.event.progress(),
+                            Some(ObservedGenerationEvent::Lifecycle {
                                 next_prediction: 1,
                                 ..
-                            }
+                            })
                         )
                     {
                         ControlFlow::Break(())
@@ -374,7 +535,7 @@ fn k2_distributed_facade_worker() {
                 assert_eq!(run.status(), GenerationStatus::Cancelled);
                 assert_eq!(run.token_ids(), &baseline[..1]);
                 drop(run);
-                model.reset().unwrap();
+                reset_admitted(&mut model, CAPACITY);
             }
 
             for boundary_record in [false, true] {
@@ -387,22 +548,27 @@ fn k2_distributed_facade_worker() {
                 } else {
                     settings
                 };
-                let prepared = model
-                    .prepare_observed_chat(&chat, trial_settings, CapturePlan::none(), trace)
-                    .unwrap();
+                let prepared = request(trial_settings);
+                let prepared_trace = trace;
                 let mut initial_bytes = 0;
                 if controlled {
                     let mut run = model
-                        .start_controlled_text(prepared, &[], Default::default(), |record| {
-                            initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                            ControlFlow::Continue(())
-                        })
-                        .unwrap();
+                        .start_controlled_chat(
+                            prepared,
+                            prepared_trace,
+                            Default::default(),
+                            |record| {
+                                initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                                ControlFlow::Continue(())
+                            },
+                        )
+                        .unwrap()
+                        .expect("live control");
                     if boundary_record {
                         run.step(|record| {
                             if !matches!(
-                                record.generation.event,
-                                ObservedGenerationEvent::Lifecycle { .. }
+                                record.event.progress(),
+                                Some(ObservedGenerationEvent::Lifecycle { .. })
                             ) {
                                 initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
                             }
@@ -412,26 +578,37 @@ fn k2_distributed_facade_worker() {
                     }
                     drop(run);
                 } else {
-                    model
-                        .generate_observed_text(prepared, &[], Default::default(), |record| {
+                    (|| -> Result<Vec<u32>, ControlledGenerationError> {
+                        let mut emit = |record: ControlledGenerationRecord| {
                             if (boundary_record
                                 && !matches!(
-                                    record.event,
-                                    ObservedGenerationEvent::Completed { .. }
+                                    record.event.progress(),
+                                    Some(ObservedGenerationEvent::Completed { .. })
                                 ))
                                 || (!boundary_record
                                     && matches!(
-                                        record.event,
-                                        ObservedGenerationEvent::Started { .. }
+                                        record.event.progress(),
+                                        Some(ObservedGenerationEvent::Started { .. })
                                     ))
                             {
                                 initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
                             }
                             ControlFlow::Continue(())
-                        })
-                        .unwrap();
+                        };
+                        let mut run = model
+                            .start_controlled_chat(
+                                prepared,
+                                prepared_trace,
+                                GenerationControlHandle::new(Default::default()),
+                                &mut emit,
+                            )?
+                            .expect("live control");
+                        run.run(&mut emit)?;
+                        Ok(run.token_ids().to_vec())
+                    })()
+                    .unwrap();
                 }
-                model.reset().unwrap();
+                reset_admitted(&mut model, CAPACITY);
                 let limits = if rank == 0 {
                     TraceLimits {
                         total_bytes: initial_bytes + 64,
@@ -440,36 +617,33 @@ fn k2_distributed_facade_worker() {
                 } else {
                     trace
                 };
-                let prepared = model
-                    .prepare_observed_chat(&chat, trial_settings, CapturePlan::none(), limits)
-                    .unwrap();
+                let prepared = request(trial_settings);
+                let prepared_trace = limits;
                 let before = model.text_preparation_usage().unwrap();
                 let (local_limit, error): (bool, Box<dyn std::error::Error>) = if controlled {
                     let mut run = model
-                        .start_controlled_text(prepared, &[], Default::default(), emit)
-                        .unwrap();
+                        .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
+                        .unwrap()
+                        .expect("live control");
                     let error = run.run(emit).unwrap_err();
-                    let local = matches!(
-                        error,
-                        ControlledGenerationError::Capture(CaptureError::Limit {
-                            budget: CaptureBudget::Encoded,
-                            cumulative: true
-                        })
-                    );
+                    let local = is_cumulative_encoded_limit(&error);
                     (local, Box::new(error))
                 } else {
-                    let error = model
-                        .generate_observed_text(prepared, &[], Default::default(), |_| {
-                            ControlFlow::Continue(())
-                        })
-                        .unwrap_err();
-                    let local = matches!(
-                        error,
-                        PreparedChatError::Capture(CaptureError::Limit {
-                            budget: CaptureBudget::Encoded,
-                            cumulative: true
-                        })
-                    );
+                    let error = (|| -> Result<Vec<u32>, ControlledGenerationError> {
+                        let mut emit = |_| ControlFlow::Continue(());
+                        let mut run = model
+                            .start_controlled_chat(
+                                prepared,
+                                prepared_trace,
+                                GenerationControlHandle::new(Default::default()),
+                                &mut emit,
+                            )?
+                            .expect("live control");
+                        run.run(&mut emit)?;
+                        Ok(run.token_ids().to_vec())
+                    })()
+                    .unwrap_err();
+                    let local = is_cumulative_encoded_limit(&error);
                     (local, Box::new(error))
                 };
                 if rank == 0 {
@@ -495,21 +669,28 @@ fn k2_distributed_facade_worker() {
                 }
                 let after = model.text_preparation_usage().unwrap();
                 assert!(after.attempts > before.attempts);
-                model.reset().unwrap();
-                assert_eq!(model.text_preparation_usage().unwrap(), after);
-                let prepared = model
-                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-                    .unwrap();
-                let retry = model
-                    .generate_observed_text(prepared, &[], Default::default(), |_| {
-                        ControlFlow::Continue(())
-                    })
-                    .unwrap();
+                reset_admitted(&mut model, CAPACITY);
+                let prepared = request(settings);
+                let prepared_trace = trace;
+                let retry = (|| -> Result<Vec<u32>, ControlledGenerationError> {
+                    let mut emit = |_| ControlFlow::Continue(());
+                    let mut run = model
+                        .start_controlled_chat(
+                            prepared,
+                            prepared_trace,
+                            GenerationControlHandle::new(Default::default()),
+                            &mut emit,
+                        )?
+                        .expect("live control");
+                    run.run(&mut emit)?;
+                    Ok(run.token_ids().to_vec())
+                })()
+                .unwrap();
                 assert_eq!(
-                    retry.token_ids, baseline,
+                    retry, baseline,
                     "corrected delivery must reproduce the baseline after reset"
                 );
-                model.reset().unwrap();
+                reset_admitted(&mut model, CAPACITY);
             }
         }
     }

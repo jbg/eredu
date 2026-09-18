@@ -313,6 +313,7 @@ fn dense_and_affine_hybrid_spans_have_independent_tensor_and_host_bounds() {
                     };
                     let request = quote_inference_workspace(geometry, |span| {
                         let report = match span {
+                            InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
                             InferenceWorkspaceSpan::Prefill(chunk) => inspect(
                                 chunk.position as usize,
                                 (chunk.input.end - chunk.input.start) as usize,

@@ -1,0 +1,227 @@
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -1,5 +1,7 @@
+ #include "mlx/backend/cpu/alias_storage.h"
+ #include "mlx/primitives.h"
++#include "mlx/prepared_input.h"
++#include "mlx/original_buffer.h"
+ #include "mlx/submission.h"
+ #include <typeinfo>
+ namespace mlx::core::cpu {
+@@ -7,11 +9,11 @@
+ bool product(size_t a,size_t b,size_t& out) noexcept {
+   if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
+ }
+-bool shape_elements(const array& value,size_t& elements) noexcept {
++bool shape_elements(const array& value,size_t& elements,bool empty=false) noexcept {
+   if(value.ndim()>5)return false;
+   elements=1;
+   for(int extent:value.shape())
+-    if(extent<=0||!product(elements,size_t(extent),elements))return false;
++    if(extent<0||(!empty&&extent==0)||!product(elements,size_t(extent),elements))return false;
+   return elements==value.size();
+ }
+ bool canonical_dtype(const array& value) noexcept {
+@@ -46,6 +48,7 @@
+   switch(operation) {
+     case AliasOperation::Transpose:if(rank!=output_rank)return false;break;
+     case AliasOperation::Broadcast:if(rank>output_rank)return false;break;
++    case AliasOperation::EmptyBroadcast:if(rank>output_rank||!output_rank)return false;break;
+     case AliasOperation::ExpandDims:if(rank>=output_rank)return false;break;
+     default:return false;
+   }
+@@ -54,7 +57,7 @@
+   // delegates copy_shared_buffer. No Data, backing, task, or weak copy exists.
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+-  const size_t controls=sizeof(value)+sizeof(operation)+sizeof(rank)+sizeof(output_rank)+
++  const size_t controls=sizeof(bool)+sizeof(value)+sizeof(operation)+sizeof(rank)+sizeof(output_rank)+
+       sizeof(tracer)+sizeof(out)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*6+sizeof(const Primitive*)+
+       sizeof(size_t)*15+sizeof(int)*6+sizeof(int64_t)*2+sizeof(bool)*7+sizeof(bool[5])+
+@@ -62,14 +65,46 @@
+       sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+-  value.named_control_bytes+=controls;out=value;return true;
++  value.named_control_bytes+=controls;
++  if(operation==AliasOperation::EmptyBroadcast) {
++    // broadcast's zero-element branch calls allocate_data(0): one Data owner,
++    // no task, no copied descriptor and no physical backing birth.
++    WeakCopyStorage descriptor;
++    size_t allocation_controls=0;
++    if(!PreparedInputLeaf::weak_copy_storage(0,descriptor)||descriptor.count!=3||
++        !allocator::original_buffer_allocation_control_bytes(allocation_controls))return false;
++    value.request_counts[3]=1;
++    value.request_bytes[3]=descriptor.requests[2].bytes;
++    value.request_alignments[3]=descriptor.requests[2].alignment;
++    const auto adoption=array::buffer_adoption_layout();
++    const size_t empty_controls[]={sizeof(descriptor),sizeof(allocation_controls),sizeof(adoption),
++        sizeof(allocator::Buffer),sizeof(Deleter),sizeof(std::shared_ptr<array::Data>),
++        sizeof(submission::GraphAllocator<array::Data>),sizeof(submission::CaptureSlot),adoption.incoming_bytes,
++        adoption.scratch_owner_bytes,adoption.deleter_bytes,adoption.allocator_callable_bytes,
++        adoption.prepared_strides_bytes,allocation_controls};
++    if(sizeof(empty_controls)>SIZE_MAX-value.named_control_bytes)return false;
++    value.named_control_bytes+=sizeof(empty_controls);
++    for(size_t bytes:empty_controls) {
++      if(bytes>SIZE_MAX-value.named_control_bytes)return false;
++      value.named_control_bytes+=bytes;
++    }
++    if(sizeof(size_t)>SIZE_MAX-value.named_control_bytes)return false;
++    value.named_control_bytes+=sizeof(size_t);
++    if(!submission::GraphConstruction::complete_layout(value))return false;
++  }
++  out=value;return true;
+ }
+ bool alias_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+   size_t input_elements=0,output_elements=0,bytes=0;
+-  if(!alias_input_geometry(input,input_elements)||!shape_elements(output,output_elements)||
++  const bool empty_broadcast=typeid(output.primitive())==typeid(Broadcast)&&output.size()==0;
++  // Empty broadcast does not read or alias the input's backing. Its declared
++  // shape, scalar type and exact Broadcast target still have to agree.
++  if(!(empty_broadcast ? (canonical_dtype(input)&&input.strides().size()==rank&&
++          shape_elements(input,input_elements,true)) : alias_input_geometry(input,input_elements))||
++      !shape_elements(output,output_elements,empty_broadcast)||
+       input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !product(output_elements,size_t(output.itemsize()),bytes))return false;
+   AliasOperation operation;
+@@ -99,7 +134,7 @@
+     }
+     if(selected!=axes.size()||source!=rank)return false;
+   } else {
+-    operation=AliasOperation::Broadcast;
++    operation=empty_broadcast?AliasOperation::EmptyBroadcast:AliasOperation::Broadcast;
+     const auto& shape=static_cast<const Broadcast&>(output.primitive()).shape_ref();
+     if(rank>output_rank||shape!=output.shape())return false;
+     const size_t offset=output_rank-rank;
+diff --git a/mlx/backend/cpu/alias_storage.h b/mlx/backend/cpu/alias_storage.h
+--- a/mlx/backend/cpu/alias_storage.h
++++ b/mlx/backend/cpu/alias_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1, ExpandDims = 2 };
++enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1, ExpandDims = 2, EmptyBroadcast = 3 };
+ // Common alias workers inspect only fixed inline shape/stride state. These
+ // queries grant neither source storage nor permission to evaluate a primitive.
+ MLX_API bool alias_input_geometry(const array&, size_t& elements) noexcept;
+diff --git a/mlx/backend/cpu/concatenate_storage.cpp b/mlx/backend/cpu/concatenate_storage.cpp
+--- a/mlx/backend/cpu/concatenate_storage.cpp
++++ b/mlx/backend/cpu/concatenate_storage.cpp
+@@ -20,8 +20,8 @@
+ }
+ bool concatenate_many_eval_layout(Dtype dtype,size_t rank,size_t inputs,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+   if(!((dtype==float32&&dtype.size()==4)||(dtype==float16&&dtype.size()==2)||
+-      (dtype==bfloat16&&dtype.size()==2)||(dtype==uint8&&dtype.size()==1))||rank<1||rank>4||
+-      inputs<2||inputs>elements||elements>size_t(INT_MAX)||inputs>SIZE_MAX/2)return false;
++      (dtype==bfloat16&&dtype.size()==2)||(dtype==uint8&&dtype.size()==1)||(dtype==int32&&dtype.size()==4))||rank<1||rank>4||
++      inputs<2||inputs>size_t(INT_MAX)||elements>size_t(INT_MAX)||inputs>(SIZE_MAX-1)/2)return false;
+   const size_t weak_copies=inputs*2;
+   CopyEvalStorage value;
+   // One real Eval/cleanup over the actual inputs. Its inplace jobs below have no
+@@ -43,8 +43,8 @@
+       !append(value,5,weak.requests[1],weak_copies)||!append(value,5,shells[1],inputs))return false;
+   const submission::GraphQuota::Request task{dispatch.task_bytes,dispatch.task_alignment};
+   const submission::GraphQuota::Request birth{routing.birth_bytes,routing.birth_alignment};
+-  if(!append(value,6,task,inputs)||!append(value,7,birth,1))return false;
+-  value.rank=rank;value.copy=true;value.backing_births=1;
++  if(!append(value,6,task,inputs)||(elements&&!append(value,7,birth,1)))return false;
++  value.rank=rank;value.copy=true;value.backing_births=elements?1:0;
+   if(dispatch.worker_graph_extent_bound>SIZE_MAX/inputs)return false;
+   value.worker_graph_extents=dispatch.worker_graph_extent_bound*inputs;
+   const auto adoption=array::buffer_adoption_layout();
+@@ -71,7 +71,7 @@
+   out=value;return true;
+ }
+ bool concatenate_eval_layout(Dtype dtype,size_t rank,size_t left,size_t right,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(!left||!right||left>size_t(INT_MAX)||right>size_t(INT_MAX)-left)return false;
++  if(left>size_t(INT_MAX)||right>size_t(INT_MAX)-left)return false;
+   return concatenate_many_eval_layout(dtype,rank,2,left+right,tracer,out);
+ }
+ 
+@@ -85,18 +85,31 @@
+   if(rank<1||rank>4||axis<0||size_t(axis)>=rank)return false;
+   for(const auto& input:output.inputs()) {
+     size_t count=0;
+-    if(input.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+-        !alias_input_geometry(input,count)||count>size_t(INT_MAX)-elements)return false;
++    if(input.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize())return false;
++    if(input.size()==0) {
++      // An empty job retains its descriptor and task but reads no elements.
++      // Keep the actual zero Data geometry; nonempty operands retain the
++      // existing readable physical-span proof below.
++      count=1;
++      if(input.strides().size()!=rank||input.data_size()!=0)return false;
++      for(size_t i=0;i<rank;++i) {
++        if(input.shape(i)<0||input.strides()[i]<0)return false;
++        if(input.shape(i)&&count>size_t(INT_MAX)/size_t(input.shape(i)))return false;
++        count*=size_t(input.shape(i));
++      }
++      if(count!=0)return false;
++    } else if(!alias_input_geometry(input,count))return false;
++    if(count>size_t(INT_MAX)-elements)return false;
+     elements+=count;
+     for(size_t i=0;i<rank;++i) {
+-      if(input.shape(i)<=0||(i!=size_t(axis)&&input.shape(i)!=output.shape(i)))return false;
++      if(input.shape(i)<0||(i!=size_t(axis)&&input.shape(i)!=output.shape(i)))return false;
+     }
+     if(size_t(input.shape(axis))>size_t(INT_MAX)-joined)return false;
+     joined+=size_t(input.shape(axis));
+   }
+   if(joined!=size_t(output.shape(axis)))return false;
+   for(auto extent:output.shape()) {
+-    if(extent<=0||total>size_t(INT_MAX)/size_t(extent))return false;
++    if(extent<0||(extent&&total>size_t(INT_MAX)/size_t(extent)))return false;
+     total*=size_t(extent);
+   }
+   if(total!=output.size()||total!=elements)return false;
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -73,11 +73,18 @@
+   out=value;return true;
+ }
+ bool scalar_full_eval_layout(Dtype dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(!common(dtype,rank,elements,true))return false;
++  if(!common(dtype,rank,elements,true)&&!(full_dtype(dtype)&&rank>0&&rank<=4&&elements==0))return false;
+   CopyEvalStorage value;
+   if(!copy_eval_layout(rank,1,true,tracer,value))return false;
++  if(elements==0) {
++    // Full still executes the existing copy worker (unless donated). Its
++    // zero-byte allocation publishes Data but creates no physical owner.
++    value.backing_births=0;
++    value.request_counts[7]=value.request_bytes[7]=value.request_alignments[7]=0;
++    if(!submission::GraphConstruction::complete_layout(value))return false;
++  }
+   const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+
+-      sizeof(value)+sizeof(const array*)*3+sizeof(size_t)*12+sizeof(int)*2+sizeof(bool)*4+
++      sizeof(value)+sizeof(const array*)*4+sizeof(size_t)*13+sizeof(int)*2+sizeof(bool)*5+sizeof(Strides::const_iterator)+sizeof(int64_t)+sizeof(Shape::const_iterator)+sizeof(int)+
+       sizeof(CopyType)+sizeof(Stream)+sizeof(submission::FixedEvalPrologueGuard*)+
+       sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+@@ -105,8 +112,19 @@
+   if(!is_selection_eval_primitive(output)||!output.siblings().empty())return false;
+   const bool full=typeid(output.primitive())==typeid(Full);
+   if(!(full?full_dtype(output.dtype()):canonical(output.dtype())))return false;
++  if(output.inputs().size()!=(full?1:3))return false;
++  if(full&&output.size()==0) {
++    const auto& input=output.inputs()[0];size_t actual=0;
++    if(input.shape()!=output.shape()||input.dtype()!=output.dtype()||
++        input.strides().size()!=input.ndim()||input.ndim()<1||input.ndim()>4||
++        input.data_size()!=0||!input.flags().row_contiguous)return false;
++    actual=1;
++    for(auto extent:input.shape())if(extent<0||!product(actual,size_t(extent),actual))return false;
++    if(actual!=0)return false;
++    for(auto stride:input.strides())if(stride<0)return false;
++    return scalar_full_eval_layout(output.dtype(),output.ndim(),0,output.is_tracer(),out);
++  }
+   size_t elements=0;if(!shape(output,elements))return false;
+-  if(output.inputs().size()!=(full?1:3))return false;
+   for(size_t i=0;i!=output.inputs().size();++i) {
+     const auto& input=output.inputs()[i];size_t actual=0;
+     if(input.shape()!=output.shape()||!shape(input,actual)||actual!=elements||

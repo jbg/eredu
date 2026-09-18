@@ -89,8 +89,7 @@ impl Blueprint {
             buffers: Buffers::default(),
         };
         let (_, _, encoded) = source
-            .prepared_extents()
-            .map_err(|e| fail(Cause::Source(e)))?;
+            .storage_extents();
         let input = encoded
             .checked_sub(1)
             .filter(|&n| n != 0)
@@ -374,28 +373,28 @@ mod tests {
     }
     #[test]
     fn actual_lexer_source_nary_scope_preserves_normalization_cost_and_failed_prefix() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let high = source.mk_lookahead(a, 3);
-        let low = source.mk_lookahead(a, 1);
-        let other = source.mk_lookahead(b, 2);
-        let nested_or = source.mk(Expr::Or(ExprFlags::POSITIVE, &[a, high, low]));
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let high = source.mk_lookahead(a, 3).unwrap();
+        let low = source.mk_lookahead(a, 1).unwrap();
+        let other = source.mk_lookahead(b, 2).unwrap();
+        let nested_or = source.mk(Expr::Or(ExprFlags::POSITIVE, &[a, high, low])).unwrap();
         let nested_and = source.mk(Expr::And(
             ExprFlags::from_nullable_positive(false, false),
             &[a, c],
-        ));
+        )).unwrap();
         let outer = source.mk(Expr::Or(
             ExprFlags::POSITIVE,
             &[nested_or, other, b, high, ExprRef::NO_MATCH],
-        ));
+        )).unwrap();
         let (_, mut source, roots) = AlphabetInfo::from_exprset(
             source,
             &[a, b, c, high, low, other, nested_or, nested_and, outer],
-        );
+        ).unwrap();
         assert!(!source.optimize);
-        source.reserve(64);
+        source.reserve(64).unwrap();
         let mut ordinary = source.clone();
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
         drop(source);
@@ -410,7 +409,7 @@ mod tests {
 
         let input = [roots[6], roots[5], roots[1], roots[3], ExprRef::NO_MATCH];
         let mut expected_args = input.to_vec();
-        let expected = ordinary.mk_or(&mut expected_args);
+        let expected = ordinary.mk_or(&mut expected_args).unwrap();
         let result = scope.or(&input).unwrap();
         assert_eq!(result, expected);
         assert_eq!(scope.normalized_args(), expected_args.as_slice());
@@ -425,7 +424,7 @@ mod tests {
 
         let input = [roots[7], roots[0], ExprRef::ANY_BYTE_STRING];
         let mut expected_args = input.to_vec();
-        let expected = ordinary.mk_and(&mut expected_args);
+        let expected = ordinary.mk_and(&mut expected_args).unwrap();
         assert_eq!(scope.and(&input).unwrap(), expected);
         assert_eq!(scope.normalized_args(), expected_args.as_slice());
         assert_eq!(scope.source.cost(), ordinary.cost());

@@ -11,17 +11,22 @@ use llguidance::{
 use std::{sync::Arc, time::Duration};
 
 fn captured_grammar(no_forcing: bool, open_word: bool) -> GrammarInit {
-    let mut lexer = LexerSpec::new().unwrap();
+    let mut lexer = LexerSpec::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     lexer.setup_lexeme_class(RegexAst::NoMatch).unwrap();
     lexer.no_forcing = no_forcing;
-    let mut grammar = Grammar::new(Some("captured clone fixture".to_owned()));
-    let start = grammar.fresh_symbol_ext(
-        "start",
-        SymbolProps {
-            is_start: true,
-            ..SymbolProps::default()
-        },
+    let mut grammar = Grammar::new(
+        Some("captured clone fixture".to_owned()),
+        derivre::ParserAllocationFunding::unenforced(),
     );
+    let start = grammar
+        .fresh_symbol_ext(
+            "start",
+            SymbolProps {
+                is_start: true,
+                ..SymbolProps::default()
+            },
+        )
+        .unwrap();
     let mut sequence = Vec::new();
     let parts = if open_word {
         vec![("word", RegexAst::Regex("[a-z]+".to_owned()), true)]
@@ -38,13 +43,15 @@ fn captured_grammar(no_forcing: bool, open_word: bool) -> GrammarInit {
         let lexeme = lexer
             .add_greedy_lexeme(name.to_owned(), expression, false, None, usize::MAX)
             .unwrap();
-        let symbol = grammar.fresh_symbol_ext(
-            name,
-            SymbolProps {
-                capture_name: capture.then(|| name.to_owned()),
-                ..SymbolProps::default()
-            },
-        );
+        let symbol = grammar
+            .fresh_symbol_ext(
+                name,
+                SymbolProps {
+                    capture_name: capture.then(|| name.to_owned()),
+                    ..SymbolProps::default()
+                },
+            )
+            .unwrap();
         grammar.make_terminal(symbol, lexeme, &lexer).unwrap();
         sequence.push(symbol);
     }

@@ -1,7 +1,7 @@
 //! Completed scan requests; source pins keep exact backing until their release.
 use super::*;
 use crate::backend::nn::workspace::OriginalPagedDiscard;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use safemlx::error::Exception;
 use std::{mem::size_of, sync::TryLockError};
 
@@ -11,7 +11,7 @@ use std::{mem::size_of, sync::TryLockError};
 pub(in super::super) struct PendingOriginalDiscard {
     visible_start: i64,
     prefix_tokens: i64,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl CacheResidencyManager {
     pub(crate) fn discard_original(

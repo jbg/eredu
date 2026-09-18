@@ -3,7 +3,7 @@ use super::*;
 use eredu_core::{BackendFailure, BackendFailureKind, SharedBackendFailure,
     Completion, BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
     consensus::{ConsensusTransport, BoundedConsensusTransport}};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{RetainedCommunicationSource,
     working_memory::{WorkingMemoryPool, InferenceExecutionIdentity}};
 use crate::backend::runtime::distributed::{
@@ -16,13 +16,13 @@ use std::{cell::RefCell, mem::{size_of, size_of_val}, rc::Rc};
 struct Failure {
     #[source] cause:Error,
     _source:RetainedCommunicationSource,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 #[derive(Debug)]
 struct FailureState {
     first:RefCell<Option<SharedBackendFailure>>,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// One prepaid first-cause cell shared with exact outstanding completions.
 #[derive(Clone,Debug)]
@@ -58,14 +58,14 @@ pub(crate) struct PreparedRealtimeConsensusTransport {
     execution:InferenceExecutionIdentity,
     capacity:u64,
     failures:Failures,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Output stays on its actual paid Host destination through neutral validation.
 pub(crate) struct RealtimeConsensusOutput {
     words:OriginalCommunicationU32Words,
     expected:usize,
     failures:Failures,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 #[derive(Debug)]
 pub(crate) struct RealtimeConsensusCompletion {
@@ -103,7 +103,7 @@ impl PreparedRealtimeConsensusTransport {
         inspected.map_err(|cause|failures.record(cause))?;
         Ok(Self{owner,pool:pool.clone(),execution:execution.clone(),capacity,failures,funding})
     }
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding {&self.funding}
+    pub(crate) fn funding(&self)->&HostMetadataFunding {&self.funding}
     /// Returns an allocation-free alias; the cell stays retained while any
     /// completion can report, so cleanup cannot replace the first native cause.
     pub(crate) fn take_failure(&self)->Option<BackendFailure> {self.failures.take()}
@@ -118,10 +118,10 @@ impl PreparedRealtimeConsensusTransport {
         ])?;
         let expected=local.len().checked_mul(self.participant_count()).ok_or_else(overflow)?;
         let source=self.owner.borrow_funded(&funding)?;
-        let frame=source.prepare_preparation_frame(local,&self.pool)?;
+        let frame=source.prepare_preparation_frame(local,&self.pool,None)?;
         let operation=frame.prepare(&source)?;
         let stream=source.world().retained_transport_stream().ok_or_else(identity)?;
-        let Submission{output,completion}=operation.start(&source,local,stream,&self.pool)?;
+        let Submission{output,completion}=operation.start(&source,local,stream,&self.pool,None)?;
         Ok(Submission{output:RealtimeConsensusOutput{words:output,expected,
             failures:self.failures.clone(),funding},
             completion:RealtimeConsensusCompletion{inner:completion,failures:self.failures.clone()}})
@@ -177,9 +177,9 @@ impl BoundedCompletion for RealtimeConsensusCompletion {
         inner.wait_bounded(policy).map_err(|cause|failures.record(cause))
     }
 }
-fn overflow()->Error {Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
+fn overflow()->Error {Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
 fn identity()->Error {Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)}
-fn reserve(funding:&WorkspaceMetadataFunding,parts:&[usize])->Result<(),Error> {
+fn reserve(funding:&HostMetadataFunding,parts:&[usize])->Result<(),Error> {
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }

@@ -621,7 +621,7 @@ impl BpeTrainer {
             .map(|(i, (pair, new_token_id))| (pair, (i as u32, new_token_id)))
             .collect();
 
-        model.replace_legacy_storage(vocab, vocab_r, merges);
+        model.install_tables(vocab, vocab_r, merges);
 
         model.continuing_subword_prefix = self.continuing_subword_prefix.clone();
         model.end_of_word_suffix = self.end_of_word_suffix.clone();
@@ -738,7 +738,7 @@ mod tests {
         .iter()
         .cloned()
         .collect();
-        assert_eq!(*model.storage.legacy_vocab(), expected_vocab);
+        assert_eq!(model.storage.owned_vocab(), expected_vocab);
 
         // The keys in `merges` are pairs of symbols, the values are tuples of (rank, id),
         // where 'rank' determines the order in which this merge will be applied during
@@ -752,7 +752,7 @@ mod tests {
         .iter()
         .cloned()
         .collect();
-        assert_eq!(*model.storage.legacy_merges(), expected_merges);
+        assert_eq!(model.storage.owned_merges(), expected_merges);
     }
     #[test]
     fn bpe_test_max_token_length_16() {

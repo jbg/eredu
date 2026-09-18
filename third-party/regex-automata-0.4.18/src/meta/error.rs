@@ -1,6 +1,6 @@
 use regex_syntax::{ast, hir};
 
-use crate::{nfa, util::search::MatchError, PatternID};
+use crate::{nfa, util::{allocation::AllocationError, search::MatchError}, PatternID};
 
 /// An error that occurs when construction of a `Regex` fails.
 ///
@@ -30,11 +30,25 @@ pub struct BuildError {
 
 #[derive(Clone, Debug)]
 enum BuildErrorKind {
+    Allocation(AllocationError),
     Syntax { pid: PatternID, err: regex_syntax::Error },
     NFA(nfa::thompson::BuildError),
 }
 
+impl From<AllocationError> for BuildError {
+    fn from(error: AllocationError) -> Self { Self { kind: BuildErrorKind::Allocation(error) } }
+}
+
 impl BuildError {
+    /// Return the fixed prospective allocation failure, if present.
+    pub fn allocation_error(&self) -> Option<AllocationError> {
+        match &self.kind {
+            BuildErrorKind::Allocation(error) => Some(*error),
+            BuildErrorKind::NFA(error) => error.allocation_error(),
+            _ => None,
+        }
+    }
+
     /// If it is known which pattern ID caused this build error to occur, then
     /// this method returns it.
     ///
@@ -79,11 +93,13 @@ impl BuildError {
     }
 
     pub(crate) fn ast(pid: PatternID, err: ast::Error) -> BuildError {
+        if let ast::ErrorKind::Allocation(error) = err.kind() { return AllocationError::from(*error).into(); }
         let err = regex_syntax::Error::from(err);
         BuildError { kind: BuildErrorKind::Syntax { pid, err } }
     }
 
     pub(crate) fn hir(pid: PatternID, err: hir::Error) -> BuildError {
+        if let hir::ErrorKind::Allocation(error) = err.kind() { return AllocationError::from(*error).into(); }
         let err = regex_syntax::Error::from(err);
         BuildError { kind: BuildErrorKind::Syntax { pid, err } }
     }
@@ -99,6 +115,7 @@ impl std::error::Error for BuildError {
         match self.kind {
             BuildErrorKind::Syntax { ref err, .. } => Some(err),
             BuildErrorKind::NFA(ref err) => Some(err),
+            BuildErrorKind::Allocation(ref error) => Some(error),
         }
     }
 }
@@ -110,6 +127,7 @@ impl core::fmt::Display for BuildError {
                 write!(f, "error parsing pattern {}", pid.as_usize())
             }
             BuildErrorKind::NFA(_) => write!(f, "error building NFA"),
+            BuildErrorKind::Allocation(ref error) => error.fmt(f),
         }
     }
 }
@@ -199,11 +217,16 @@ impl From<RetryQuadraticError> for RetryError {
 #[derive(Debug)]
 pub(crate) struct RetryFailError {
     offset: usize,
+    allocation: Option<crate::util::allocation::AllocationError>,
 }
 
 impl RetryFailError {
+    pub(crate) fn allocation_error(&self) -> Option<crate::util::allocation::AllocationError> {
+        self.allocation
+    }
+
     pub(crate) fn from_offset(offset: usize) -> RetryFailError {
-        RetryFailError { offset }
+        RetryFailError { offset, allocation: None }
     }
 }
 
@@ -227,6 +250,7 @@ impl From<MatchError> for RetryFailError {
         use crate::util::search::MatchErrorKind::*;
 
         match *merr.kind() {
+            Allocation(error) => RetryFailError { offset: 0, allocation: Some(error) },
             Quit { offset, .. } => RetryFailError::from_offset(offset),
             GaveUp { offset } => RetryFailError::from_offset(offset),
             // These can never occur because we avoid them by construction

@@ -404,7 +404,7 @@ impl WorkspaceMechanisms for FailingFacts {
         _: &WorkspaceOperation,
     ) -> Result<Option<WorkspaceOperationBound>, Error> {
         self.0.set(self.0.get() + 1);
-        Err(Error::backend_source(SelectedFailure))
+        Err(Error::backend_retained_source(SelectedFailure))
     }
 }
 

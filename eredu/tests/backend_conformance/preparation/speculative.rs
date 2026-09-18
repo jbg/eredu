@@ -7,51 +7,23 @@ fn schedule_fault(fault: ScheduleFault) {
 }
 
 #[test]
-fn speculative_inference_policy_rejects_before_prompt_or_target_and_draft_work() {
+fn speculative_capacity_requires_matching_source_before_prompt_or_model_work() {
     for controlled in [false, true] {
-        for policy in [
-            eredu_core::TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(16 << 20),
-                ..Default::default()
-            },
-            eredu_core::TextInferencePolicy {
-                prefill_chunk_positions: std::num::NonZeroU64::new(3),
-                ..Default::default()
-            },
-            eredu_core::TextInferencePolicy {
-                submission_tracking_capacity_bytes: std::num::NonZeroU64::new(1024),
-                ..Default::default()
-            },
-            eredu_core::TextInferencePolicy {
-                graph_metadata_capacity_bytes: std::num::NonZeroU64::new(1024),
-                ..Default::default()
-            },
+        for (capacity, expected) in [
+            (None, eredu_core::TokenInputRejection::Unsupported),
+            (
+                Some(16 << 20),
+                eredu_core::TokenInputRejection::IdentityMismatch,
+            ),
         ] {
             let (mut model, chat, mut settings) = setup();
-            settings.inference = policy;
+            settings.inference.managed_memory_capacity_bytes = capacity;
             let _guard = probe(Fault::None);
             let error = run_speculative(&mut model, &chat, settings, controlled).unwrap_err();
-            let policy_error = if controlled {
-                match error.downcast_ref::<eredu::api::ControlledSpeculativeGenerationError>() {
-                    Some(eredu::api::ControlledSpeculativeGenerationError::Prepared(error)) => {
-                        error
-                    }
-                    _ => panic!("unexpected controlled error: {error}"),
-                }
-            } else {
-                error
-                    .downcast_ref::<eredu::api::PreparedChatSpeculativeError>()
-                    .expect("typed preparation error")
-            };
-            assert!(
-                matches!(policy_error, eredu::api::PreparedChatSpeculativeError::InferencePolicyUnavailable(policy) if *policy == settings.inference)
-            );
-            assert!(
-                error.to_string().contains(
-                    "does not yet implement the requested prefill or managed-memory policy"
-                ),
-                "{error}"
-            );
+            let error = error
+                .downcast_ref::<eredu::api::PreparedChatSpeculativeError>()
+                .expect("one preparation error family for both drivers");
+            assert_eq!(error.input_rejection(), Some(expected));
             let seen = snapshot();
             assert_eq!(seen.votes.last(), Some(&(Stage::Request, Status::Failed)));
             assert!(seen.native.is_empty());
@@ -62,18 +34,21 @@ fn speculative_inference_policy_rejects_before_prompt_or_target_and_draft_work()
 }
 
 #[test]
-fn speculative_later_lane_inference_policy_rejects_whole_batch_before_prompt() {
+fn speculative_later_lane_foreign_capacity_rejects_whole_batch_before_prompt() {
     let (mut model, chat, settings) = setup();
     let mut bounded = settings;
     bounded.inference.managed_memory_capacity_bytes = Some(16 << 20);
     let _guard = probe(Fault::None);
     let error = model
-        .generate_prepared_text_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
             drafting: SpeculativeDraft::Embedded,
             lanes: [settings, bounded]
                 .into_iter()
                 .map(|settings| PreparedChatSpeculativeBatchLane {
-                    input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     settings,
                     max_draft_tokens: NonZeroUsize::new(1).unwrap(),
                     caller_stop_sequences: &[],
@@ -85,8 +60,9 @@ fn speculative_later_lane_inference_policy_rejects_whole_batch_before_prompt() {
         })
         .err()
         .expect("bounded second lane must reject the batch");
-    assert!(
-        matches!(error, eredu::api::PreparedChatSpeculativeError::InferencePolicyUnavailable(policy) if policy == bounded.inference)
+    assert_eq!(
+        error.input_rejection(),
+        Some(eredu_core::TokenInputRejection::IdentityMismatch)
     );
     let seen = snapshot();
     assert_eq!(seen.votes, [(Stage::Request, Status::Failed)]);
@@ -103,11 +79,12 @@ fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
             settings.seed = 0;
             settings.overrides.max_new_tokens = Some(6);
             let _guard = probe(Fault::DraftSampling { peer });
-            let request = PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(
-                    &chat,
-                    vec![CONTROL_REJECTION_PROMPT_TOKEN],
-                ),
+            SPECULATIVE_RESULT_FAULT.set(Some(CONTROL_REJECTION_PROMPT_TOKEN));
+            let request = PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: PreparedChatSpeculativeGenerationOptions {
@@ -120,15 +97,19 @@ fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
             };
             let error: Box<dyn std::error::Error> = if controlled {
                 model
-                    .with_controlled_text_speculative(request, Default::default(), |session| {
-                        while session.step()?.is_some() {}
-                        Ok(())
-                    })
+                    .with_controlled_prepared_chat_speculative(
+                        request,
+                        Default::default(),
+                        |session| {
+                            while session.step()?.is_some() {}
+                            Ok(())
+                        },
+                    )
                     .unwrap_err()
                     .into()
             } else {
                 model
-                    .generate_prepared_text_speculative(request)
+                    .generate_prepared_chat_speculative(request)
                     .unwrap_err()
                     .into()
             };
@@ -248,11 +229,14 @@ fn peer_cancellation_is_per_lane_and_other_batch_lanes_finish() {
         pending: true,
     });
     let batch = model
-        .generate_prepared_text_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
             drafting: SpeculativeDraft::Embedded,
             lanes: (0..2)
                 .map(|_| PreparedChatSpeculativeBatchLane {
-                    input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     settings,
                     max_draft_tokens: NonZeroUsize::new(1).unwrap(),
                     caller_stop_sequences: &[],
@@ -274,8 +258,11 @@ fn peer_publication_cancellation_matches_local_callback_cancellation() {
         settings.seed = 0;
         let _guard = probe(Fault::None);
         let mut armed = false;
-        let request = PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+        let request = PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+            output_mode: eredu::api::PreparedChatOutputMode::Text,
+            skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
             settings,
             options: Default::default(),
@@ -293,13 +280,13 @@ fn peer_publication_cancellation_matches_local_callback_cancellation() {
         };
         let output = if controlled {
             model
-                .with_controlled_text_speculative(request, Default::default(), |session| {
+                .with_controlled_prepared_chat_speculative(request, Default::default(), |session| {
                     while session.step()?.is_some() {}
                     Ok(())
                 })
                 .unwrap()
         } else {
-            model.generate_prepared_text_speculative(request).unwrap()
+            model.generate_prepared_chat_speculative(request).unwrap()
         };
         assert!(armed);
         assert_eq!(output.token_ids(), [7]);
@@ -321,9 +308,12 @@ fn controlled_record_budget_and_caller_error_agree_before_more_model_work() {
             };
         }
         let error = model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
                     settings,
                     options: Default::default(),

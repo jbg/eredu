@@ -149,11 +149,11 @@ fn populate<A>(
 {
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>, usize);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, m: ParameterMetadata, v: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, m: eredu_nn::ParameterMetadataView<'_>, v: &'a mut NumericTensor) {
             let source = self
                 .0
-                .get(m.id.as_str())
-                .unwrap_or_else(|| panic!("missing actual parameter {}", m.id.as_str()));
+                .get(m.id().as_str())
+                .unwrap_or_else(|| panic!("missing actual parameter {}", m.id().as_str()));
             assert_eq!(v.shape, source.shape);
             v.data.clone_from(&source.data);
             nonzero(v);
@@ -174,11 +174,11 @@ where
     A: LayeredArchitecture<NumericBackend, State, Error = Error>,
 {
     let a = model.architecture();
-    let d = A::prefill_observation_declarations(a).unwrap();
+    let d = A::prefill_observation_declarations(a, None).unwrap();
     assert_eq!(d.len(), 18);
-    assert_eq!(A::group_unit_count(a, 1).unwrap(), 2);
+    assert_eq!(A::group_unit_count(a, 1, None).unwrap(), 2);
     for i in 0..2 {
-        let p = A::unit_path(a, 1, i).unwrap();
+        let p = A::unit_path(a, 1, i, None).unwrap();
         for suffix in ["input", "input.effective", "output", "output.effective"] {
             assert!(d.iter().any(|d| d.path() == format!("{p}.{suffix}")));
         }

@@ -3,18 +3,18 @@ use super::*;
 
 pub(super) fn matches_completed_input(value:&OriginalNumericalValue,inputs:Option<InputPlacement<'_>>,
     sources:&OriginalSpeculativeNumericalSources,destination:&OriginalCopyEnvironment<'_>,
-    funding:&WorkspaceMetadataFunding,
+    funding:&HostMetadataFunding,
 )->Result<bool,Error>{
     use eredu_core::speculative::{SamplingPlacement,SpeculativeExecutionTopology};
     let parts=[size_of::<(&OriginalNumericalValue,Option<InputPlacement<'_>>,
-            &OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>,&WorkspaceMetadataFunding)>(),
+            &OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>,&HostMetadataFunding)>(),
         size_of::<Option<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>)>>(),
         size_of::<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>)>(),
         size_of::<SamplingPlacement>(),size_of::<Result<bool,Error>>(),
         size_of::<safemlx::StreamCopyPlan<()>>(),
         size_of::<Result<safemlx::StreamCopyPlan<()>,safemlx::StreamCopyCause>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     let Some((context,placement))=inputs else{return Ok(false)};
     if context.original_external().is_none()
@@ -31,7 +31,7 @@ pub(super) fn matches_completed_input(value:&OriginalNumericalValue,inputs:Optio
     let marker=safemlx::StreamCopyPlan::<()>::capture(origin.stream())
         .map_err(|cause|retain_planning_error(Cause::StreamCopy(cause),funding.clone()))?;
     funding.reserve_metadata(marker.source_comparison_control_bytes()
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     // OriginalNumericalValue has only completed native/model/copy constructors.
     // Its own source stream, backing account and native pins remain in Retained;
@@ -54,13 +54,13 @@ pub(super) fn validate_completed_input(value:&OriginalNumericalValue,
         size_of::<safemlx::StreamCopyPlan<()>>(),
         size_of::<Result<safemlx::StreamCopyPlan<()>,safemlx::StreamCopyCause>>()];
     funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     sources.validate_environment(environment)?;
     let destination=safemlx::StreamCopyPlan::<()>::capture(environment.stream())
         .map_err(|cause|retain_planning_error(Cause::StreamCopy(cause),funding.clone()))?;
     funding.reserve_metadata(destination.source_comparison_control_bytes()
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     if destination.matches_source(&value.value().stream)
         || matches_completed_input(value,Some((context,placement)),sources,environment,funding)? {return Ok(());}

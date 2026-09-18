@@ -3,6 +3,8 @@
 use super::*;
 use eredu_core::execution_control::SnapshotEstimate;
 use std::sync::Arc;
+mod branch;
+pub use branch::{ControlBranchSource, ControlBranchPlacement, ControlExchangeResult};
 
 /// Native mechanisms for complete, independently writable ordinary state copies.
 /// Unlike rollback checkpoints, these copies must remain stable as any descendant
@@ -130,7 +132,7 @@ pub enum PreparedControlExchangeError<A: std::fmt::Display, P: std::fmt::Display
     Media(#[from] crate::working_memory::WorkingMemoryError),
     /// The actual metadata account refused before the new revision was allocated.
     #[error(transparent)]
-    Metadata(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    Metadata(#[from] eredu_nn::workspace::HostMetadataFundingError),
     /// This selected strategy has no bounded control agreement.
     #[error("partitioned cache control requires the selected bounded failure agreement")]
     MissingAgreement,
@@ -594,7 +596,7 @@ where
         slot: &mut ReplicatedTextControlState<M::State>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), PreparedControlExchangeError<A::Error, M::PolicyError>> {
-        self.exchange_control_state_prepared_fixed(slot, context, None, None)
+        self.exchange_control_state_prepared_fixed(slot, context, None, None, None)
             .map(drop)
     }
 
@@ -605,10 +607,11 @@ where
         &mut self,
         slot: &mut ReplicatedTextControlState<M::State>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-        metadata: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        metadata: Option<&eredu_nn::workspace::HostMetadataFunding>,
         media: Option<&crate::working_memory::MediaSessionBinding>,
+        branch: Option<(&crate::working_memory::PendingTextBranchExchange, &[ControlBranchSource; 2])>,
     ) -> Result<
-        Option<crate::working_memory::CopiedMediaStateBinding>,
+        ControlExchangeResult,
         PreparedControlExchangeError<A::Error, M::PolicyError>,
     > {
         let validation = self
@@ -618,15 +621,23 @@ where
                 if let Some(metadata) = metadata {
                     metadata
                         .reserve_metadata(std::mem::size_of::<(
-                            Option<crate::working_memory::InferenceStateRevision>,
+                            [Option<crate::working_memory::InferenceStateRevision>; 2],
+                            Option<ControlBranchSource>,
+                            Option<ControlBranchPlacement>,
+                            Option<[ControlBranchPlacement; 2]>,
+                            ControlExchangeResult,
                             Option<crate::working_memory::CopiedMediaStateBinding>,
                             Result<
-                                Option<crate::working_memory::CopiedMediaStateBinding>,
+                                ControlExchangeResult,
                                 PreparedControlExchangeError<A::Error, M::PolicyError>,
                             >,
                             Option<&crate::working_memory::MediaSessionBinding>,
                         )>())
                         .map_err(PreparedControlExchangeError::Metadata)?;
+                }
+                if let Some((pending, sources)) = branch {
+                    if metadata.is_none() || media.is_some() { return Err(crate::working_memory::WorkingMemoryError::IdentityMismatch.into()); }
+                    self.validate_branch_sources(slot, pending, sources)?;
                 }
                 if let Some(source) = media {
                     if metadata.is_none()
@@ -652,30 +663,40 @@ where
                         );
                     }
                 }
-                metadata
-                    .map(crate::working_memory::InferenceStateRevision::prepare_metadata)
-                    .transpose()
-                    .map_err(PreparedControlExchangeError::Metadata)
+                let installed = metadata.map(crate::working_memory::InferenceStateRevision::prepare_metadata)
+                    .transpose().map_err(PreparedControlExchangeError::Metadata)?;
+                let displaced = if metadata.is_some() {
+                    Some(crate::working_memory::InferenceStateRevision::prepare_metadata(metadata.expect("validated original funding"))
+                        .map_err(PreparedControlExchangeError::Metadata)?)
+                } else { None };
+                let source = if metadata.is_some() && branch.is_none() { Some(self.control_branch_source(&self.state)?) } else { None };
+                Ok((installed, displaced, source))
             });
         RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)
             .map_err(PreparedControlBindingError::from)?;
         if D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT {
             return Err(PreparedControlExchangeError::MissingAgreement);
         }
-        let revision = self.agree_control_result(
+        let (revision, displaced, displaced_source) = self.agree_control_result(
             validation,
             crate::DistributedExecutionPhase::ControlExchangePreparation,
             context,
             PreparedControlExchangeError::Agreement,
             |phase| PreparedControlExchangeError::Remote { phase },
         )?;
+        let placements = branch.map(|(_, sources)| branch::placements(sources,
+            displaced.as_ref().expect("branch displaced revision").clone(),
+            revision.as_ref().expect("branch installed revision").clone()));
+        let displaced_placement = displaced_source.map(|source| branch::displaced(source,
+            displaced.as_ref().expect("funded displaced revision").clone()));
         self.exchange_control_payload(slot);
+        if let Some(revision) = displaced { slot.state.inference_retention_mut().install_exchanged_revision(revision); }
         if let Some(revision) = revision {
             self.state
                 .inference_retention_mut()
                 .install_exchanged_revision(revision);
         }
-        Ok(media.map(|source| {
+        Ok(ControlExchangeResult { placements, displaced: displaced_placement, media: media.map(|source| {
             crate::working_memory::CopiedMediaStateBinding::new(
                 source,
                 crate::working_memory::MediaSessionBinding {
@@ -686,7 +707,7 @@ where
                     frontier: source.frontier,
                 },
             )
-        }))
+        }) })
     }
 
     /// Atomically exchanges complete state at an already completed boundary.

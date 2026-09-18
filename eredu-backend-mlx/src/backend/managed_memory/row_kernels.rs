@@ -6,18 +6,20 @@ mod metal {
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
         WorkingMemoryPool,
     };
+    use safemlx::Dtype;
     use safemlx::fast::{
         KernelDefinitionError, KernelFamilyLayout, KernelInputClass, KernelInputSignature,
         KernelSpecialization, MetalKernelDefinitionPlan, MetalKernelFamilyPlan,
         PreparedMetalKernelFamily,
     };
-    use safemlx::Dtype;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         OnceLock,
+        atomic::{AtomicBool, Ordering},
     };
 
     pub(crate) type Family = PreparedMetalKernelFamily<SharedNativeInitializationCustody>;
+    use crate::backend::managed_memory::kernel_family::UnenforcedFamilyCache;
+    static UNENFORCED: [UnenforcedFamilyCache; 3] = [const { UnenforcedFamilyCache::new() }; 3];
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum RowKernel {
         Rms,
@@ -58,18 +60,23 @@ mod metal {
         ensure_row_contiguous: true,
         atomic_outputs: false,
     };
-    pub(crate) static SOFTMAX: MetalKernelDefinitionPlan<'static, 1, 1> = MetalKernelDefinitionPlan {
-        name: "f32_softmax_last", inputs: ["input"], outputs: ["output"],
-        source: concat!(
-            "uint row=thread_position_in_grid.x; if(row>=threads_per_grid.x) return;",
-            "uint width=input_shape[input_ndim-1]; size_t base=size_t(row)*width;",
-            "float maximum=-INFINITY; for(uint i=0;i<width;++i) { float v=input[base+i]; maximum=(isnan(v)||isnan(maximum)) ? NAN : max(maximum,v); }",
-            "float sums[4]={}; for(uint i=0;i<width;++i) { float v=stable_exp_f32(input[base+i]-maximum); output[base+i]=v; sums[i%4]+=v; }",
-            "float inverse=1.0f/((sums[0]+sums[2])+(sums[1]+sums[3]));",
-            "for(uint i=0;i<width;++i) output[base+i]*=inverse;"),
-        header: include_str!("../nn/exp_f32.metal"),
-        ensure_row_contiguous: true, atomic_outputs: false,
-    };
+    pub(crate) static SOFTMAX: MetalKernelDefinitionPlan<'static, 1, 1> =
+        MetalKernelDefinitionPlan {
+            name: "f32_softmax_last",
+            inputs: ["input"],
+            outputs: ["output"],
+            source: concat!(
+                "uint row=thread_position_in_grid.x; if(row>=threads_per_grid.x) return;",
+                "uint width=input_shape[input_ndim-1]; size_t base=size_t(row)*width;",
+                "float maximum=-INFINITY; for(uint i=0;i<width;++i) { float v=input[base+i]; maximum=(isnan(v)||isnan(maximum)) ? NAN : max(maximum,v); }",
+                "float sums[4]={}; for(uint i=0;i<width;++i) { float v=stable_exp_f32(input[base+i]-maximum); output[base+i]=v; sums[i%4]+=v; }",
+                "float inverse=1.0f/((sums[0]+sums[2])+(sums[1]+sums[3]));",
+                "for(uint i=0;i<width;++i) output[base+i]*=inverse;"
+            ),
+            header: include_str!("../nn/exp_f32.metal"),
+            ensure_row_contiguous: true,
+            atomic_outputs: false,
+        };
     const fn input(class: KernelInputClass) -> KernelInputSignature {
         KernelInputSignature {
             dtype: Dtype::Float32,
@@ -161,6 +168,8 @@ mod metal {
             std::mem::size_of::<Option<safemlx::OriginalScopeObserver>>(),
             std::mem::size_of::<safemlx::Array>() * 3,
             std::mem::size_of::<Result<Option<safemlx::Array>, safemlx::error::Exception>>(),
+            std::mem::size_of::<[i32; 2]>(),
+            std::mem::size_of::<bool>(),
             std::mem::size_of::<f32>() * 2,
             std::mem::size_of::<usize>() * 3,
         ]
@@ -188,64 +197,38 @@ mod metal {
         rows: i32,
         stream: &safemlx::Stream,
     ) -> Result<safemlx::Array, safemlx::error::Exception> {
-        use safemlx::fast::{BorrowedKernelOutput, CustomKernelConfig, MetalKernel};
-        use std::cell::RefCell;
-        thread_local! {
-            static ORDINARY: [RefCell<Option<MetalKernel>>; 3] = [const { RefCell::new(None) }; 3];
-        }
+        use safemlx::fast::BorrowedKernelOutput;
+        validate_call(kind, shape.len())?;
+        // High-rank ordinary tensors retain their logical shape at this output
+        // boundary. The kernel always uses the same fixed invocation transport;
+        // the admitted rank predicate rejects an unquoted rank before construction.
+        let flat = [rows, *shape.last().unwrap_or(&1)];
+        let reduced = shape.len() > OUTPUT_DIMENSIONS;
         let output = [BorrowedKernelOutput {
-            shape,
+            shape: if reduced { &flat } else { shape },
             dtype: Dtype::Float32,
         }];
-        if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
-            let family = family(kind).ok_or_else(|| observer.capacity_error())?;
-            let [output] =
-                family.apply_fixed_device(inputs, output, &[], [rows, 1, 1], [32, 1, 1], stream)?;
-            return Ok(output);
+        let [output] = if let Some(family) = family(kind) {
+            family.apply_fixed_device(inputs, output, &[], [rows, 1, 1], [32, 1, 1], stream)?
+        } else {
+            let family = UNENFORCED[kind.index()].get_or_try_init(|owner| realize(kind, owner))?;
+            family.apply_fixed_device(inputs, output, &[], [rows, 1, 1], [32, 1, 1], stream)?
+        };
+        if reduced {
+            output.reshape(shape, stream)
+        } else {
+            Ok(output)
         }
-        ORDINARY.with(|kernels| {
-            let cell = &kernels[kind.index()];
-            if cell.borrow().is_none() {
-                fn build<const N: usize>(
-                    p: &MetalKernelDefinitionPlan<'_, N, 1>,
-                ) -> Result<MetalKernel, safemlx::error::Exception> {
-                    MetalKernel::new(
-                        p.name,
-                        p.inputs,
-                        p.outputs,
-                        p.source,
-                        p.header,
-                        p.ensure_row_contiguous,
-                        p.atomic_outputs,
-                    )
-                }
-                *cell.borrow_mut() = Some(match kind {
-                    RowKernel::Rms => build(&RMS),
-                    RowKernel::Sum => build(&SUM),
-                    RowKernel::Softmax => build(&SOFTMAX),
-                }?);
-            }
-            let loan = cell.borrow();
-            let kernel = loan.as_ref().expect("row kernel initialized");
-            if MetalKernel::fixed_control_bytes::<I, 1>(0, shape.len()).is_some() {
-                let [output] = kernel.apply_fixed_device(
-                    inputs,
-                    output,
-                    &[],
-                    [rows, 1, 1],
-                    [32, 1, 1],
-                    stream,
-                )?;
-                Ok(output)
-            } else {
-                let config = CustomKernelConfig::new()
-                    .with_grid([rows, 1, 1])
-                    .with_thread_group([32, 1, 1])
-                    .with_output_arg(shape, Dtype::Float32);
-                let mut outputs = kernel.apply_device(inputs, &config, stream)?;
-                Ok(outputs.pop().expect("row kernel has one declared output"))
-            }
-        })
+    }
+    fn realize<T: Send + 'static>(
+        kind: RowKernel,
+        custody: T,
+    ) -> Result<PreparedMetalKernelFamily<T>, KernelDefinitionError<T>> {
+        match kind {
+            RowKernel::Rms => RMS_FAMILY.realize(custody),
+            RowKernel::Sum => SUM_FAMILY.realize(custody),
+            RowKernel::Softmax => SOFTMAX_FAMILY.realize(custody),
+        }
     }
     fn definition_bytes<const I: usize>(definition: &MetalKernelDefinitionPlan<'_, I, 1>) -> usize {
         std::mem::size_of_val(definition)
@@ -259,6 +242,7 @@ mod metal {
         // The shared Metal preamble/retirement machinery is already counted by
         // the pointwise family in this same process baseline.
         std::mem::size_of_val(&INITIALIZED)
+            + std::mem::size_of_val(&UNENFORCED)
             + std::mem::size_of_val(&SOURCE_QUALIFIED)
             + std::mem::size_of_val(&INITIALIZING)
             + std::mem::size_of_val(&RMS_FAMILY)
@@ -294,11 +278,7 @@ mod metal {
             self,
             custody: SharedNativeInitializationCustody,
         ) -> Result<Family, Self::Error> {
-            match self.0 {
-                RowKernel::Rms => RMS_FAMILY.realize(custody),
-                RowKernel::Sum => SUM_FAMILY.realize(custody),
-                RowKernel::Softmax => SOFTMAX_FAMILY.realize(custody),
-            }
+            realize(self.0, custody)
         }
     }
     #[derive(Debug, thiserror::Error)]
@@ -351,14 +331,16 @@ mod metal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use safemlx::{fast::BorrowedKernelOutput, Array, Device, DeviceType, Stream};
+        use safemlx::{Array, Device, DeviceType, Stream, fast::BorrowedKernelOutput};
 
         #[test]
         fn row_families_use_actual_dimensions_and_match_scalar_equations() {
             if std::env::var_os("EREDU_REQUIRE_QUALIFIED_ROW_FAMILY").is_some() {
-                assert!([RowKernel::Rms, RowKernel::Sum, RowKernel::Softmax]
-                    .into_iter()
-                    .all(source_qualified));
+                assert!(
+                    [RowKernel::Rms, RowKernel::Sum, RowKernel::Softmax]
+                        .into_iter()
+                        .all(source_qualified)
+                );
             }
             if !source_qualified(RowKernel::Rms) {
                 return;
@@ -482,6 +464,10 @@ pub(crate) fn softmax_control_bytes(_: usize) -> Option<usize> {
 }
 
 #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-pub(crate) fn sum_source_qualified() -> bool { false }
+pub(crate) fn sum_source_qualified() -> bool {
+    false
+}
 #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-pub(crate) fn sum_control_bytes(_: usize) -> Option<usize> { None }
+pub(crate) fn sum_control_bytes(_: usize) -> Option<usize> {
+    None
+}

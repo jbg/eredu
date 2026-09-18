@@ -94,6 +94,11 @@ impl TextOperation<'_> {
         quoted.quote.claim_prediction_scopes(&quoted.step)
     }
 
+    pub(super) fn sampling_work(&self) -> Result<Option<super::text_funding::FundedWorkOwner>, Error> {
+        let quoted = self.permit.quoted.as_ref().expect("quoted operation");
+        quoted.quote.sampling_work(&quoted.step)
+    }
+
     pub(super) fn prefill_scopes(
         &self,
         session: &MlxModelSession,
@@ -116,6 +121,11 @@ impl TextOperation<'_> {
             crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection)>,Error>{
         let quoted=self.permit.quoted.as_ref().expect("quoted operation");
         quoted.quote.install_parallel_control(&quoted.step)
+    }
+
+    pub(super) fn activate_operation_bank(&self) -> Result<Option<crate::backend::runtime::execution::generic::OriginalOperationActivation>, Error> {
+        let quoted = self.permit.quoted.as_ref().expect("quoted operation");
+        quoted.quote.activate_operation_bank(&quoted.step)
     }
 
     pub(super) fn partition_capture_frame(&self, session: &MlxModelSession)
@@ -588,7 +598,7 @@ fn validate_quote(
     {
         return Err(mismatch());
     }
-    if state.sampling.temperature != quote.config().sampling().temperature {
+    if state.sampling.temperature != quote.sampling_temperature()? {
         return Err(mismatch());
     }
     capture::validate_capture_binding(runtime, state, quote)?;
@@ -640,8 +650,8 @@ pub(super) fn validate_prompt_binding_fixed(
         .quote
         .as_ref()
         .is_some_and(|actual| actual.same_owner(quote))
-        || prompt.prefill_chunk_positions.map(|chunk| chunk.get())
-            != Some(quote.request().geometry().prefill_chunk_positions)
+        || prompt.prefill_chunk_positions.map_or(0, |chunk| chunk.get())
+            != quote.request().geometry().prefill_chunk_positions
     {
         return Err(WorkingMemoryError::IdentityMismatch);
     }

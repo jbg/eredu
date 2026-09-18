@@ -11,6 +11,8 @@ use eredu_core::{
 use std::error::Error as _;
 
 type Runtime = ModelRuntime<MlxBackend<'static>>;
+mod prepared_residency;
+pub(in crate::composition::mlx::session::model_session::text_quote) use prepared_residency::PreparedResidencyFixture;
 pub(in crate::composition::mlx::session::model_session::text_quote) fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))
 }
@@ -99,17 +101,28 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn finish(
     drop(runtime);
     stream.synchronize().unwrap();
 }
+#[track_caller]
 pub(in crate::composition::mlx::session::model_session::text_quote) fn settle(
     pool: &WorkingMemoryPool,
     bytes: u64,
 ) {
+    let caller = std::panic::Location::caller();
+    let started = std::time::Instant::now();
+    let mut reported = false;
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::transforms::async_eval_with_event(std::iter::empty::<&Array>())
             .unwrap()
             .synchronize()
             .unwrap();
         disk::reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        let used = pool.used_bytes().unwrap();
+        let unquoted = pool.unquoted_owner_count().unwrap();
+        let complete = used == bytes && unquoted == 0;
+        if !complete && !reported && started.elapsed().as_secs() >= 9 {
+            eprintln!("native fixture retirement at {caller}: expected={bytes}, used={used}, unquoted={unquoted}");
+            reported = true;
+        }
+        complete
     });
 }
 fn cause<'a, T: std::error::Error + 'static>(
@@ -561,9 +574,7 @@ fn run_real_prediction(with_decoder: bool) {
                 drop(token);
                 let delivery = driver.take_completed_delivery(&mut run).unwrap();
                 if capture {
-                    let CapturedStepDelivery::Shared(frame) = delivery.unwrap() else {
-                        panic!("same original shared capture bank");
-                    };
+                    let frame = delivery.unwrap();
                     let Some(CapturePayload::SharedTensor(tensor)) = &frame.records()[0].payload
                     else {
                         panic!("actual full capture value");

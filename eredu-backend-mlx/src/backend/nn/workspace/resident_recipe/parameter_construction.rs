@@ -7,13 +7,7 @@ use eredu_runtime::working_memory::{
 };
 use std::mem::{size_of, size_of_val};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Constructors {
-    pub(super) slots: usize,
-    pub(super) scalar_bytes: u64,
-    rank: usize,
-    dtypes: [usize; 5],
-}
+pub(super) use crate::backend::runtime::execution::generic::ParameterConstructors;
 
 fn source_error(cause: WorkspaceParameterSourceError) -> crate::backend::error::Error {
     crate::backend::error::Error::PrefillControl(match cause {
@@ -22,7 +16,7 @@ fn source_error(cause: WorkspaceParameterSourceError) -> crate::backend::error::
     })
 }
 
-impl Constructors {
+impl ParameterConstructors {
     pub(super) fn native_source(self,query:usize)
         ->Result<(safemlx::ResidentGraphLayout,usize),crate::backend::error::Error> {
         use crate::backend::error::Error as NativeError;
@@ -207,21 +201,14 @@ impl ResidentNativeRecipe {
 
 #[derive(Debug, thiserror::Error)]
 #[error("layerwise constructor trace differs from retained parameter source: actual {actual:?}, expected {expected:?}")]
-struct TraceMismatch { actual: Constructors, expected: Constructors }
+struct TraceMismatch { actual: ParameterConstructors, expected: ParameterConstructors }
 
-fn dtype_index(dtype: WorkspaceDtype) -> usize {
-    match dtype {
-        WorkspaceDtype::Float32 => 0, WorkspaceDtype::Int32 => 1,
-        WorkspaceDtype::Bool => 2, WorkspaceDtype::Uint8 => 3,
-        WorkspaceDtype::Uint32 => 4,
-    }
-}
 
 // One borrowed census for cold trace qualification and the later native graph
 // producer. It observes the selected logical unit list, preserving repeat slots.
 pub(super) fn constructor_source(source: &LayerwiseWorkspace,
-    funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
-    -> Result<(Constructors, usize), crate::backend::error::Error>
+    funding: Option<&eredu_nn::workspace::HostMetadataFunding>)
+    -> Result<(ParameterConstructors, usize), crate::backend::error::Error>
 {
     use crate::backend::error::Error as NativeError;
     let overflow = || NativeError::PrefillControl(WorkingMemoryError::Overflow);
@@ -229,7 +216,15 @@ pub(super) fn constructor_source(source: &LayerwiseWorkspace,
         // These are cold borrowed reads and fixed frames, not a second source
         // snapshot. Pay the actual participating planning account before query.
         let frames = [
-            size_of::<Constructors>(),
+            size_of::<ParameterConstructors>(),
+            size_of::<Option<ParameterConstructors>>(),
+            size_of::<(&crate::backend::runtime::residency::manager::ResidencyManager,
+                usize, Option<&Vec<ParameterConstructors>>, &[ParameterConstructors],
+                Option<&ParameterConstructors>, &LayerwiseWorkspace, bool)>(),
+            size_of::<(ParameterConstructors, ParameterConstructors, Option<ParameterConstructors>)>(),
+            size_of::<(WorkspaceDtype, usize, usize, Option<()>, [usize; 5])>(),
+            size_of::<std::iter::Zip<std::slice::IterMut<'_, usize>, std::array::IntoIter<usize, 5>>>(),
+            size_of::<Option<(&mut usize, usize)>>(),
             size_of::<&LayerwiseWorkspace>(),
             size_of::<WorkspaceParameterRow<'_>>(),
             size_of::<WorkspaceParameterUnit<'_>>(),
@@ -243,8 +238,8 @@ pub(super) fn constructor_source(source: &LayerwiseWorkspace,
                     WorkspaceParameterSourceError,
                 >,
             >(),
-            size_of::<Result<(Constructors, usize), NativeError>>(),
-            size_of::<Option<&eredu_nn::workspace::WorkspaceMetadataFunding>>(),
+            size_of::<Result<(ParameterConstructors, usize), NativeError>>(),
+            size_of::<Option<&eredu_nn::workspace::HostMetadataFunding>>(),
         ];
         let query = frames
             .into_iter()
@@ -259,32 +254,34 @@ pub(super) fn constructor_source(source: &LayerwiseWorkspace,
         // source values or a temporary provider. Then visit selected ordinals,
         // not the larger lookahead/canonical closure or copy retry population.
         // Repeated logical ordinals remain repeated even when requested_unit
-        // resolves them to one shared physical owner. The source constructor
-        // already refuses excluded/overridden parameter sets.
+        // resolves them to one shared physical owner. The complete constructor
+        // declaration includes independently populated slots absent from leases.
         let counted = source.parameter_source().count().map_err(source_error)?;
         if counted.counts().requested != source.layout().len() {
             return Err(identity());
         }
-        let mut constructors = Constructors::default();
+        let mut constructors = ParameterConstructors::default();
         source.with_execution_ordinals(|selected| {
         let count=selected.map_or(source.layout().len(),<[usize]>::len);
         for index in 0..count {
             let ordinal=selected.map_or(index,|ordinals|ordinals[index]);
+            if let Some(complete) = source.parameter_constructors(ordinal) {
+                constructors = constructors.checked_merge(complete).ok_or_else(overflow)?;
+                continue;
+            }
+            // A complete lease inventory remains sufficient when no parameter
+            // has another owner. Absence alone never supplies missing slots.
+            if source.has_parameter_exclusions() {
+                return Err(NativeError::PrefillControl(WorkingMemoryError::UnknownBound));
+            }
             let unit = source.requested_unit(ordinal).map_err(source_error)?;
             let rows = source.unit(unit).map_err(source_error)?.rows;
             for index in 0..rows {
                 let row = source.row(unit, index).map_err(source_error)?;
-                constructors.slots = constructors.slots.checked_add(1).ok_or_else(overflow)?;
                 // The source projector uses the constructor's neutral dtype:
                 // floating slots start F32 even when later bound to FP16/BF16;
                 // packed/integer/bool slots retain their exact declared dtype.
-                constructors.scalar_bytes = constructors
-                    .scalar_bytes
-                    .checked_add(row.dtype.bytes())
-                    .ok_or_else(overflow)?;
-                constructors.rank = constructors.rank.max(row.shape.len());
-                let dtype = dtype_index(row.dtype);
-                constructors.dtypes[dtype] = constructors.dtypes[dtype].checked_add(1).ok_or_else(overflow)?;
+                constructors.include(row.dtype, row.shape.len()).ok_or_else(overflow)?;
             }
         }
 
@@ -298,7 +295,17 @@ impl ResidentRecipeRecorder {
     pub(crate) fn bind_layerwise_constructor_source(&mut self, source: &LayerwiseWorkspace)
         -> Result<(), Error>
     {
-        if self.layerwise_constructors.is_some() || !self.records.is_empty() || self.cpu.is_some() {
+        if let Some(context) = &self.context {
+            context.charge_metadata(size_of::<(
+                &Self, &LayerwiseWorkspace, safemlx::DeviceType, bool, Result<(), Error>,
+            )>())?;
+        }
+        // Scalar seeds and lazy Full/Broadcast constructors are shared by both
+        // native devices. Strict binding replaces them before evaluation; the
+        // retained source must still name the recorder's selected destination.
+        if self.layerwise_constructors.is_some() || !self.records.is_empty()
+            || (source.destination_device_type() == safemlx::DeviceType::Cpu) != self.cpu.is_some()
+        {
             return Err(self.metadata_error("layerwise constructor source already bound or differs"));
         }
         let funding = self.context.as_ref().and_then(|context| context.metadata_funding());
@@ -313,17 +320,17 @@ impl ResidentRecipeRecorder {
     {
         let Some(expected) = self.layerwise_constructors else { return Ok(()); };
         if let Some(context) = &self.context {
-            context.charge_metadata(size_of::<(Constructors, &WorkspaceTraceReport,
+            context.charge_metadata(size_of::<(ParameterConstructors, &WorkspaceTraceReport,
                 &Self, Result<(), Error>, &WorkspaceOperation)>())?;
         }
-        let mut actual = Constructors::default();
+        let mut actual = ParameterConstructors::default();
         for operation in &report.operations {
             if !matches!(operation.kind, WorkspaceOperationKind::ParameterPlaceholder) { continue; }
             if !operation.inputs.is_empty() || operation.outputs.len() != 1
                 || !operation.outputs[0].shape().is_empty()
             { return Err(self.metadata_error("layerwise constructor trace changed its scalar seed")); }
             let dtype = operation.outputs[0].dtype();
-            let index = dtype_index(dtype);
+            let index = ParameterConstructors::dtype_index(dtype);
             actual.slots = self.add(actual.slots, 1)?;
             actual.dtypes[index] = self.add(actual.dtypes[index], 1)?;
             actual.scalar_bytes = actual.scalar_bytes.checked_add(dtype.bytes())
@@ -335,3 +342,8 @@ impl ResidentRecipeRecorder {
         Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
+
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod tests;

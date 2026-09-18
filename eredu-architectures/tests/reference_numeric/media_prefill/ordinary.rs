@@ -416,7 +416,7 @@ where
         drop((request, run));
     }
     {
-        let request = source.request().clone();
+        let request = source.request().expect("ordinary source retains its inference request").clone();
         let execution = session.inference_execution_identity().clone();
         let cancellation = eredu_core::GenerationCancellationToken::new();
         cancellation.cancel();
@@ -438,6 +438,7 @@ where
     assert!(
         source
             .request()
+            .expect("ordinary source retains its inference request")
             .validate(
                 &eredu_runtime::working_memory::InferenceExecutionIdentity::default(),
                 geometry
@@ -467,7 +468,7 @@ where
     let mut source = session
         .prepare_media_prefill_unbudgeted(make_plan()?)
         .map_err(|e| Error::backend(e.to_string()))?;
-    let request = source.request().clone();
+    let request = source.request().expect("ordinary source retains its inference request").clone();
     let execution = session.inference_execution_identity().clone();
     let mut observer = Observer(Rc::new(RefCell::new(Trace::default())));
     let mut executor = SessionPrefill::new_media(session, &mut source, context, &mut observer)

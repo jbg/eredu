@@ -11,8 +11,8 @@ fn layouts(empty:bool)->ComponentPartitionLayouts {
             }else if topology.tensor_parallel_rank()==0 {vec![2,0]}else{vec![3,1]}).unwrap())
         };
         let exports=coordinates.is_some();
-        ComponentPartitionLayout {topology,groups:BTreeMap::new(),paths:BTreeMap::new(),routed:BTreeMap::new(),
-            observations:BTreeMap::from([("x".into(),PartitionedObservation {
+        ComponentPartitionLayout {topology,groups:SourceMap::new(),paths:SourceMap::new(),routed:SourceMap::new(),
+            observations:SourceMap::from([("x".into(),PartitionedObservation {
                 axis:"component".into(),coordinates,exports,site:ObservationHookSite::Unit,
                 combination:PartitionCaptureCombination::Disjoint,
             })])}

@@ -126,6 +126,19 @@ impl Drop for PreparedResume {
 impl TextResumeBackend for Backend {
     type ResumeSource = Saved;
     type ResumePreparation = PreparedResume;
+    type DisplacedState = ();
+    fn text_resume_facts(_: &Self::TextGenerationState) -> TextResumeFacts<'_> {
+        TextResumeFacts {
+            sampling_after: crate::SamplingStateFacts {
+                temperature: 0.0,
+                requires_positive_temperature: false,
+                has_rng: false,
+            },
+            capture_plan_id: None,
+            intervention_plan_id: None,
+            has_interventions: false,
+        }
+    }
     fn admit_text_resume<C: TokenFilterController>(
         runtime: &ModelRuntime<Self>,
         saved: &Saved,
@@ -197,7 +210,7 @@ impl TextResumeBackend for Backend {
         prepared.facts.borrow_mut().resume.installed = true;
         hook(&prepared.facts, Hook::Install)
     }
-    fn finish_text_resume(prepared: &mut PreparedResume) -> Preparation {
+    fn finish_text_resume(prepared: &mut PreparedResume) -> (Preparation, ()) {
         hook(&prepared.facts, Hook::Finish).unwrap();
         let mut facts = prepared.facts.borrow_mut();
         assert_eq!(
@@ -206,7 +219,7 @@ impl TextResumeBackend for Backend {
         );
         prepared.armed = false;
         facts.resume.finished = true;
-        prepared.authority.take().expect("one-time finish")
+        (prepared.authority.take().expect("one-time finish"), ())
     }
 }
 
@@ -235,6 +248,24 @@ fn limited(n: usize) -> TextGenerationConfig {
     let mut sampling = config().sampling();
     sampling.max_new_tokens = Some(n);
     TextGenerationConfig::new(sampling)
+}
+
+#[test]
+fn terminal_resume_cannot_authorize_future_predictions() {
+    let (mut runtime, facts, cancellation) = resume_fixture();
+    let saved = source();
+    let options = OriginalTextResumeOptions { terminal: true,
+        ..OriginalTextResumeOptions::new(OriginalTextResumeKind::Restore) };
+    let error = ControlledTextGeneration::resume_saved_original_with_options(
+        &mut runtime, &saved, limited(1), controller(&facts, ControllerFailure::None),
+        &cancellation, &HostPreparationAuthority::unmanaged(), &options,
+    ).err().expect("terminal continuation must have no future prediction");
+    let ControlledTextGenerationError::Preparation(error) = error else { panic!("preparation refusal") };
+    use std::error::Error;
+    assert_eq!(error.source().unwrap().downcast_ref::<crate::PreparedRequestRejection>(),
+        Some(&crate::PreparedRequestRejection::RequestMismatch));
+    assert!(!facts.borrow().resume.installed);
+    assert!(!facts.borrow().resume.events.contains(&"admit"));
 }
 
 fn local_cause(error: &ControlledTextGenerationError<io::Error, io::Error>) -> &Cause {
@@ -310,7 +341,7 @@ fn final_owned_controller_new_context_and_fresh_preparation_reach_the_existing_m
     assert!(facts.borrow().events.is_empty());
     for attempt in 0..2 {
         assert_eq!(driver.advance(&mut run).unwrap().unwrap().token_id, 7);
-        driver.take_completed_step(&mut run).unwrap();
+        driver.take_completed_delivery(&mut run).unwrap();
         assert_eq!(facts.borrow().contexts.last().unwrap().attempt(), attempt);
     }
     assert!(driver.advance(&mut run).unwrap().is_none());

@@ -1,19 +1,18 @@
 //! Actual paid active parser plus separate complete canonical controller history.
 mod automatic;
-use automatic::Automatic;
 use super::{
     OriginalGrammarSlicer, OriginalGrammarState, OriginalGrammarStateCopyError,
     OriginalGrammarStateError,
 };
+use automatic::Automatic;
 use eredu_core::{
+    HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority,
+    OriginalSourceWitness, PackedTokenFilter, PackedTokenFilterError, SharedTokenFilter,
     speculative::{
         PlainControllerError, PlainControllerHistory, PreparedGrammarController,
         PreparedGrammarSource,
     },
-    HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority,
-    OriginalTokenDomainWitness, PackedTokenFilter, PackedTokenFilterError, SharedTokenFilter,
 };
-use eredu_nn::workspace::WorkspaceMetadataFunding;
 use std::{
     mem::{size_of, size_of_val},
     sync::Arc,
@@ -42,7 +41,7 @@ pub struct OriginalPreparedGrammarController {
     automatic: Option<Automatic>,
     history: PlainControllerHistory,
     validity: SharedTokenFilter,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Failed semantic operation retaining the complete paid controller prefix.
 #[derive(Debug, thiserror::Error)]
@@ -53,26 +52,33 @@ pub struct OriginalPreparedGrammarControllerError {
     prefix: OriginalPreparedGrammarController,
 }
 impl OriginalPreparedGrammarController {
+    #[cfg(test)]
+    pub(in crate::runtime::chat::constraints) fn is_active(&self) -> bool {
+        self.automatic.is_none()
+    }
+
     fn copy_controls() -> Option<usize> {
-            let parts = [
-                size_of::<Self>(),
-                size_of::<CopyCause>(),
-                size_of::<OriginalPreparedGrammarControllerCopyError>(),
-                size_of::<Option<OriginalGrammarState>>(),
-                size_of::<Option<Automatic>>(),
-                size_of::<Result<Automatic, automatic::Error>>(),
-                size_of::<Result<Option<Automatic>, automatic::Error>>(),
-                size_of::<Option<PlainControllerHistory>>(),
-                size_of::<WorkspaceMetadataFunding>(),
-                size_of::<SharedTokenFilter>(),
-                size_of::<Arc<OriginalGrammarSlicer>>(),
-                size_of::<(&Self, usize, &HostMetadataFunding)>(),
-                size_of::<Result<Self, OriginalPreparedGrammarControllerCopyError>>(),
-                size_of::<Result<(), CopyCause>>(),
-                size_of::<Result<OriginalGrammarState, OriginalGrammarStateCopyError>>(),
-                HostMetadataFunding::reservation_control_bytes(),
-            ];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        let parts = [
+            size_of::<Self>(),
+            size_of::<CopyCause>(),
+            size_of::<OriginalPreparedGrammarControllerCopyError>(),
+            size_of::<Option<OriginalGrammarState>>(),
+            size_of::<Option<Automatic>>(),
+            size_of::<Result<Automatic, automatic::Error>>(),
+            size_of::<Result<Option<Automatic>, automatic::Error>>(),
+            size_of::<Option<PlainControllerHistory>>(),
+            size_of::<HostMetadataFunding>(),
+            size_of::<SharedTokenFilter>(),
+            size_of::<Arc<OriginalGrammarSlicer>>(),
+            size_of::<(&Self, usize, &HostMetadataFunding)>(),
+            size_of::<Result<Self, OriginalPreparedGrammarControllerCopyError>>(),
+            size_of::<Result<(), CopyCause>>(),
+            size_of::<Result<OriginalGrammarState, OriginalGrammarStateCopyError>>(),
+            HostMetadataFunding::reservation_control_bytes(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
     fn reserve<T, F>(&self) -> Result<(), Cause> {
         let parts = [
@@ -149,26 +155,33 @@ impl OriginalPreparedGrammarController {
             .map(|(owner, ())| owner)
     }
     pub(super) fn new_auto(
-        state: OriginalGrammarState, capacity: usize, validity: SharedTokenFilter,
+        state: OriginalGrammarState,
+        capacity: usize,
+        validity: SharedTokenFilter,
     ) -> Result<Self, OriginalPreparedGrammarControllerError> {
-        Self::new(state, capacity, validity)?.operation(|owner| {
-            owner.automatic = Some(Automatic::prepare(owner.state.as_ref().ok_or(Cause::Source)?, &owner.funding)?);
-            Ok(())
-        }).map(|(owner, ())| owner)
+        Self::new(state, capacity, validity)?
+            .operation(|owner| {
+                owner.automatic = Some(Automatic::prepare(
+                    owner.state.as_ref().ok_or(Cause::Source)?,
+                    &owner.funding,
+                )?);
+                Ok(())
+            })
+            .map(|(owner, ())| owner)
     }
-
 }
 fn history_copy_bytes(capacity: usize) -> Option<usize> {
     let parts = [
         PlainControllerHistory::copy_metadata_bytes(capacity)?,
-        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
-            ?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()?,
         size_of::<(&PlainControllerHistory, usize, &HostMetadataFunding)>(),
         size_of::<Result<PlainControllerHistory, Cause>>(),
         size_of::<HostPreparationAuthority>(),
         HostMetadataFunding::reservation_control_bytes(),
     ];
-    parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+    parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)
 }
 fn copy_history(
     history: &PlainControllerHistory,
@@ -202,7 +215,7 @@ pub struct OriginalPreparedGrammarControllerCopyError {
     history: Option<PlainControllerHistory>,
     validity: SharedTokenFilter,
     source: Arc<OriginalGrammarSlicer>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedGrammarController for OriginalPreparedGrammarController {
     type Error = OriginalPreparedGrammarControllerError;
@@ -219,16 +232,22 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
             &self.validity,
             vocabulary.recipe.source(),
             vocabulary.declaration.historical_source(),
-            OriginalTokenDomainWitness::new(vocabulary.trie_source()),
+            OriginalSourceWitness::new(vocabulary.trie_source()),
+            OriginalSourceWitness::new(&vocabulary.compilation),
             &self.funding,
         )
     }
     fn prepared_grammar_copy_bytes(&self, capacity: usize) -> Option<usize> {
-        if capacity < self.history.len() { return None; }
+        if capacity < self.history.len() {
+            return None;
+        }
         Self::copy_controls()?
             .checked_add(self.state.as_ref()?.copy_required_bytes()?)?
             .checked_add(history_copy_bytes(capacity)?)?
-            .checked_add(match self.automatic.as_ref() { Some(source) => source.copy_required_bytes()?, None => 0 })
+            .checked_add(match self.automatic.as_ref() {
+                Some(source) => source.copy_required_bytes()?,
+                None => 0,
+            })
     }
     #[inline(never)]
     fn copy_prepared_grammar(
@@ -236,7 +255,7 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
         capacity: usize,
         funding: &HostMetadataFunding,
     ) -> Result<Self, Self::CopyError> {
-        let funding = WorkspaceMetadataFunding::from(funding.clone());
+        let funding = funding.clone();
         let original = self
             .state
             .as_ref()
@@ -248,7 +267,11 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
             funding.reserve_metadata(Self::copy_controls().ok_or(CopyCause::Overflow)?)?;
             state = Some(original.try_copy(&funding)?);
             history = Some(copy_history(&self.history, capacity, &funding)?);
-            automatic = self.automatic.as_ref().map(|source| source.try_copy(&funding)).transpose()?;
+            automatic = self
+                .automatic
+                .as_ref()
+                .map(|source| source.try_copy(&funding))
+                .transpose()?;
             Ok(())
         })();
         match result {
@@ -279,7 +302,11 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
                 return Err(PlainControllerError::Destination.into());
             }
             if let Some(automatic) = owner.automatic.as_mut() {
-                if let Some(state) = automatic.commit(owner.state.as_ref().ok_or(Cause::Source)?, token, &owner.funding)? {
+                if let Some(state) = automatic.commit(
+                    owner.state.as_ref().ok_or(Cause::Source)?,
+                    token,
+                    &owner.funding,
+                )? {
                     owner.state = Some(state);
                     owner.automatic = None;
                 }
@@ -295,7 +322,8 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
     fn compute_prepared_grammar_mask(self) -> Result<Self, Self::Error> {
         self.operation(|owner| {
             if let Some(automatic) = owner.automatic.as_mut() {
-                automatic.compute_mask(owner.state.as_ref().ok_or(Cause::Source)?, &owner.funding)?;
+                automatic
+                    .compute_mask(owner.state.as_ref().ok_or(Cause::Source)?, &owner.funding)?;
             } else {
                 let state = owner.state.take().ok_or(Cause::Source)?;
                 owner.state = Some(state.compute_mask()?);
@@ -306,7 +334,9 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
     }
     fn prepared_grammar_terminal(self) -> Result<(Self, bool), Self::Error> {
         self.operation(|owner| {
-            if owner.automatic.is_some() { return Ok(false); }
+            if owner.automatic.is_some() {
+                return Ok(false);
+            }
             let state = owner.state.take().ok_or(Cause::Source)?;
             let (state, terminal) = state.is_terminal()?;
             owner.state = Some(state);
@@ -314,7 +344,9 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
         })
     }
     fn prepared_grammar_mask(&self) -> Result<PackedTokenFilter<'_>, PackedTokenFilterError> {
-        if let Some(automatic) = self.automatic.as_ref() { return automatic.mask(&self.validity); }
+        if let Some(automatic) = self.automatic.as_ref() {
+            return automatic.mask(&self.validity);
+        }
         self.state
             .as_ref()
             .ok_or(PackedTokenFilterError::Geometry)?
@@ -323,5 +355,7 @@ impl PreparedGrammarController for OriginalPreparedGrammarController {
 }
 
 impl eredu_core::SharedStorageRetirement for OriginalPreparedGrammarController {
-    fn retire(self: Arc<Self>) { drop(Arc::into_inner(self)); }
+    fn retire(self: Arc<Self>) {
+        drop(Arc::into_inner(self));
+    }
 }

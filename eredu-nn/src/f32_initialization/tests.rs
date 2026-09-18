@@ -91,7 +91,7 @@ fn realization_failure_preserves_original_typed_cause() {
         |values| {
             assert_eq!(values.len(), 17);
             assert_eq!(ALLOCATION.get(), Some((17, values.as_ptr() as usize)));
-            Err(Error::backend_source(RealizationFailure))
+            Err(Error::backend_retained_source(RealizationFailure))
         },
     )
     .unwrap_err();

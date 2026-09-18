@@ -15,7 +15,7 @@ use eredu_nn::{
     LinearOperator, NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout,
     ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
     ParallelPlanError, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
@@ -137,21 +137,15 @@ where
 
     type Boundary = TextBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        let geometry = self
-            .parallel_geometry()
-            .ok_or_else(|| Error::backend("Gemma pipeline boundary requires parallel geometry"))?;
-        Ok(TextBoundarySchema::from_args(&self.args().text, geometry))
-    }
-
-    fn boundary_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<Self::Boundary,Error> {
-        let metadata=forward::Metadata::new(Some(context));
-        self.checked_graph(metadata)?;
-        let geometry=self.parallel_geometry().ok_or_else(||metadata.error(format_args!(
-            "Gemma pipeline boundary requires retained local geometry")))?;
-        TextBoundarySchema::from_state_layout_in(&self.args.text,geometry.per_layer_width(),
-            geometry.state_layout(),crate::composite_execution::graph::Destination(Some(context)))
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        let destination = forward::Metadata::new(metadata);
+        if metadata.is_some() {
+            self.checked_graph(destination)?;
+        }
+        let geometry = self.parallel_geometry().ok_or_else(|| destination.error(format_args!(
+            "Gemma pipeline boundary requires parallel geometry")))?;
+        TextBoundarySchema::from_state_layout_in(&self.args.text, geometry.per_layer_width(),
+            geometry.state_layout(), crate::composite_execution::graph::Destination(metadata))
     }
 
     fn begin_partition<'a>(
@@ -468,6 +462,25 @@ impl<T> PreparedCompositeIngress<T> {
     }
 }
 
+fn prediction_token_part<'a, T: Tensor>(
+    part: &'a eredu_runtime::PreparedInputPart<T>, plan: &Gemma4InputPartPlan,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<crate::composite_execution::PredictionTokenPart<'a, T>, Error> {
+    use crate::composite_execution::PredictionTokenPart;
+    match plan {
+        Gemma4InputPartPlan::TextTokens { .. } => match part.payload() {
+            eredu_runtime::PreparedInputPayload::TokenIds(value) => Ok(PredictionTokenPart::Tokens(value)),
+            _ => Err(metadata.error(format_args!("Gemma 4 admitted text part lost its token payload"))),
+        },
+        Gemma4InputPartPlan::Projected { placeholder_token_id, positions, .. } =>
+            Ok(PredictionTokenPart::Repeated { token: *placeholder_token_id, positions: *positions }),
+        Gemma4InputPartPlan::Vision { placeholder_token_id, ingress, .. } =>
+            Ok(PredictionTokenPart::Repeated { token: *placeholder_token_id, positions: ingress.decoder_positions as u64 }),
+        Gemma4InputPartPlan::Audio { placeholder_token_id, ingress, .. } =>
+            Ok(PredictionTokenPart::Repeated { token: *placeholder_token_id, positions: ingress.decoder_positions as u64 }),
+    }
+}
+
 /// Interprets one admitted Gemma 4 input using neutral tensor operations.
 pub fn prepare_composite_ingress<B>(
     input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
@@ -525,33 +538,28 @@ where
     let mut vision_parts = metadata.vector(vision_count)?;
     let mut audio_parts = metadata.vector(audio_count)?;
     for (part, plan) in prepared.parts().iter().zip(plans) {
+        let token_metadata = crate::decoder::identity::Metadata::new(input.metadata().or_else(|| B::construction_metadata(context)));
+        tokens.push(crate::composite_execution::prediction_tokens::materialize(
+            prediction_token_part(part, &plan, token_metadata)?, context, token_metadata)?);
         match plan {
             Gemma4InputPartPlan::TextTokens { .. } => {
                 let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
                     return Err(metadata.error(format_args!("Gemma 4 admitted text part lost its token payload")));
                 };
-                tokens.push(value.clone());
                 modalities.push(eredu_core::InputModality::Text);
                 projected.push(None);
             }
             Gemma4InputPartPlan::Projected {
                 modality,
-                placeholder_token_id,
-                positions,
+                ..
             } => {
                 let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(metadata.error(format_args!("Gemma 4 admitted projected part lost its embedding payload")));
                 };
-                let count = i32::try_from(positions)
-                    .map_err(|_| metadata.error(format_args!("Gemma 4 projected span exceeds I32")))?;
-                let token = i32::try_from(placeholder_token_id)
-                    .map_err(|_| metadata.error(format_args!("Gemma 4 placeholder ID exceeds I32")))?;
-                tokens.push(B::Tensor::full_i32(token, &[1, count], context)?);
                 modalities.push(modality);
                 projected.push(Some(value.clone()));
             }
             Gemma4InputPartPlan::Vision {
-                placeholder_token_id,
                 ingress,
                 ..
             } => {
@@ -561,13 +569,6 @@ where
                 let positions = part
                     .metadata_value(eredu_core::InputMetadataKey::PatchPositions)
                     .ok_or_else(|| metadata.error(format_args!("Gemma 4 vision positions disappeared")))?;
-                let token = i32::try_from(placeholder_token_id)
-                    .map_err(|_| metadata.error(format_args!("Gemma 4 placeholder ID exceeds I32")))?;
-                tokens.push(B::Tensor::full_i32(
-                    token,
-                    &[1, ingress.decoder_positions],
-                    context,
-                )?);
                 modalities.push(part.modality());
                 projected.push(None);
                 vision_parts.push(VisionPart {
@@ -577,20 +578,12 @@ where
                 });
             }
             Gemma4InputPartPlan::Audio {
-                placeholder_token_id,
                 ingress,
                 ..
             } => {
                 let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(metadata.error(format_args!("Gemma 4 admitted audio part lost its tensor payload")));
                 };
-                let token = i32::try_from(placeholder_token_id)
-                    .map_err(|_| metadata.error(format_args!("Gemma 4 placeholder ID exceeds I32")))?;
-                tokens.push(B::Tensor::full_i32(
-                    token,
-                    &[1, ingress.decoder_positions],
-                    context,
-                )?);
                 modalities.push(eredu_core::InputModality::Audio);
                 projected.push(None);
                 audio_parts.push(AudioPart {
@@ -728,6 +721,18 @@ where
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>, Error> {
         crate::media_plan::admission::gemma::admit(config, input, inspector, context)
+    }
+
+    fn visit_prepared_prediction_tokens(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(input.metadata());
+        metadata.controls::<(Gemma4InputPartPlan, crate::composite_execution::PredictionTokenPart<'_, B::Tensor>)>()?;
+        for (part, plan) in input.prepared().parts().iter().zip(input.admitted().gemma_parts()) {
+            visitor(prediction_token_part(part, &plan, metadata)?)?;
+        }
+        Ok(())
     }
 
     fn should_execute_prepared_group(
@@ -872,35 +877,23 @@ where
     fn prepared_group_collective_waves(
         &self, group:usize, input:PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
         tensor_partitions:usize, pipeline_stages:usize,
-    )->Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,String> {
-        let first_active=(0..2).find(|group|
-            <Self as CompositeArchitecture<B,S>>::should_execute_prepared_group(self,*group,input));
-        prepared_group_waves(input,self.args.text.hidden_size,group,first_active,
-            tensor_partitions,pipeline_stages,crate::composite_execution::graph::Destination(None))
-            .map_err(|cause|cause.to_string())
-    }
-    fn prepared_group_collective_waves_with_metadata(
-        &self, group:usize, input:PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
-        tensor_partitions:usize, pipeline_stages:usize,
-        context:&eredu_nn::workspace::WorkspaceContext,
+        context:Option<&eredu_nn::workspace::WorkspaceContext>,
     )->Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,Error> {
+        let destination=crate::composite_execution::graph::Destination(context);
+        destination.controls::<(&Self,usize,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
+            usize,usize,Option<usize>)>()?;
         let first_active=(0..2).find(|group|
             <Self as CompositeArchitecture<B,S>>::should_execute_prepared_group(self,*group,input));
         prepared_group_waves(input,self.args.text.hidden_size,group,first_active,
-            tensor_partitions,pipeline_stages,crate::composite_execution::graph::Destination(Some(context)))
+            tensor_partitions,pipeline_stages,destination)
     }
     fn prepared_primary_ingress_collectives(
         &self,input:PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,tensor_partitions:usize,
-    )->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,String> {
-        prepared_ingress_waves(input,self.args.text.hidden_size,tensor_partitions,
-            crate::composite_execution::graph::Destination(None)).map_err(|cause|cause.to_string())
-    }
-    fn prepared_primary_ingress_collectives_with_metadata(
-        &self,input:PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,tensor_partitions:usize,
-        context:&eredu_nn::workspace::WorkspaceContext,
+        context:Option<&eredu_nn::workspace::WorkspaceContext>,
     )->Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>,Error> {
-        prepared_ingress_waves(input,self.args.text.hidden_size,tensor_partitions,
-            crate::composite_execution::graph::Destination(Some(context)))
+        let destination=crate::composite_execution::graph::Destination(context);
+        destination.controls::<(&Self,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,usize)>()?;
+        prepared_ingress_waves(input,self.args.text.hidden_size,tensor_partitions,destination)
     }
 
     fn routed_tensor_reductions(
@@ -922,21 +915,6 @@ where
         })
     }
 
-    fn partition_boundary_schema_with_metadata(&self,_source_group:usize,_destination_group:usize,
-        _selected:&eredu_runtime::ResolvedBoundaryWireSchema,_batch:i32,_source_sequence:i32,
-        _group_sequences:&[i32],_continuation:Option<(i32,i32)>,
-        context:&eredu_nn::workspace::WorkspaceContext,
-    )->Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>,Error>{
-        context.charge_metadata(std::mem::size_of::<Option<eredu_runtime::ResolvedBoundaryWireSchema>>())?;
-        Ok(None)
-    }
-    fn partition_boundary_values_with_metadata(&self,_source_group:usize,_destination_group:usize,
-        _schema:&eredu_runtime::ResolvedBoundaryWireSchema,_hidden:&B::Tensor,_forward:&Self::ForwardContext,
-        context:&eredu_nn::workspace::WorkspaceContext,
-    )->Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>,Error>{
-        context.charge_metadata(std::mem::size_of::<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>>())?;
-        Ok(None)
-    }
     fn accept_partition_boundary(
         &mut self,
         source_group: usize,
@@ -1059,10 +1037,10 @@ where
         B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         let metadata = forward::Metadata::new(input.metadata().or_else(|| B::construction_metadata(context)));
+        forward::with_metadata(metadata, || {
         let prepared = prepare_composite_ingress::<B>(input, context)?;
         let decoder_parts = prepared.decoder_parts_with_metadata(metadata)?;
-        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-            self,
+        self.begin_forward_with_metadata(
             ModelInput {
                 parts: &decoder_parts,
                 vision: prepared.vision_input(),
@@ -1070,10 +1048,12 @@ where
                 per_layer_tokens: None,
                 mask: None,
             },
+            Some(parallel),
             state,
-            parallel,
             context,
+            metadata,
         )
+        })
     }
 }
 
@@ -1539,6 +1519,7 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     partition_state: Option<crate::replicated_text::SharedCompositeConfig<StateLayout>>,
     partition_media_inputs: [bool; 2],
     expert_realization: Option<crate::replicated_text::SharedCompositeConfig<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>>,
+    execution_graph: ExecutionGraph,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
@@ -1546,30 +1527,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
 
-    fn state_layout_with_metadata(
-        &self, context: &eredu_nn::workspace::WorkspaceContext,
+    fn state_layout(
+        &self, context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
         self.checked_graph(crate::decoder::identity::Metadata::new(Some(context)))?
             .state.clone_workspace(context)
-    }
-
-    fn state_identity_with_metadata(
-        &self, state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        self.source_state_identity(state, topology, context)
-    }
+    }, None => {
+        self.state_layout_impl()
+    } }
+}
 
     fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
+        &self, state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
+        self.source_state_identity(state, topology, context)
+    }, None => {
         super::state_identity(
             &self.args,
             state.layout(),
@@ -1577,17 +1554,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             topology,
         )
         .map_err(|error| Error::backend(error.to_string()))
-    }
+    } }
+}
+
+
 
     fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
-        self.parameter_description_impl(context)
-    }
-
-    fn parameter_description_with_metadata(
         &self, context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
         let metadata=crate::decoder::identity::Metadata::new(B::construction_metadata(context));
@@ -1595,7 +1567,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         if self.source.is_some() {
             return Ok(std::borrow::Cow::Borrowed(&self.checked_graph(metadata)?.description));
         }
-        self.parameter_description(context).map(std::borrow::Cow::Owned)
+        (|| {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        self.parameter_description_impl(context)
+    })().map(std::borrow::Cow::Owned)
     }
 
     fn retained_static_value_slot_bound(&self) -> Option<usize> {
@@ -1676,6 +1651,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+    fn build_execution_graph(
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<ExecutionGraph, Error> {
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<ExecutionGraph>()?;
+        let mut groups = destination.vector(3)?;
+        groups.push(destination.group(VISION_EXECUTION_GROUP, &[])?);
+        groups.push(destination.group(AUDIO_EXECUTION_GROUP, &[])?);
+        groups.push(destination.group(
+            TEXT_EXECUTION_GROUP,
+            &[VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+        )?);
+        destination.finish(groups, TEXT_EXECUTION_GROUP)
+    }
+
     /// Executes one media unit for a continuation request whose primary
     /// layered forward context lives on another pipeline owner.
     pub fn forward_partition_media_continuation(
@@ -1902,6 +1892,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         Ok(Self {
             args,
             source: None,
+            execution_graph: Self::build_execution_graph(B::construction_metadata(context))?,
             static_modules: StaticModules {
                 text,
                 vision,
@@ -2262,18 +2253,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
+        let graph = match B::construction_metadata(context) { Some(context) => self.execution_graph.clone_with_metadata(context)?, None => self.execution_graph.clone() };
         let counts = [
             self.args
                 .vision
@@ -2951,41 +2931,47 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     fn media_prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // The validated image/audio ingress retains exact placements and masks; shared-KV decoder rows keep their original offsets.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2)?;
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::media_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)),
-        )?;
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)), metadata_context)?;
         // The retained-media ingress changes decoder inputs and positions, but
         // executes the same row-local routed banks as the ordinary target.
         // Reuse those exact architecture declarations; encoder hooks remain
         // outside this decoder contract.
-        declarations.extend(
-            <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(self)?
-                .into_iter()
-                .filter(|declaration| declaration.flattens_batch_tokens()),
-        );
+        let ordinary=<Self as LayeredArchitecture<B,S>>::prefill_observation_declarations(self,metadata_context)?;
+        metadata.controls::<(Vec<eredu_runtime::layered::PrefillObservationDeclaration>,usize)>()?;
+        let selected = ordinary.iter().filter(|declaration| declaration.flattens_batch_tokens());
+        metadata.borrowed_controls(&selected)?;
+        let count = selected.count();
+        if let Some(context) = metadata.context() { context.reserve_metadata_vec(&mut declarations, count)?; }
+        let selected = ordinary.into_iter().filter(|declaration| declaration.flattens_batch_tokens());
+        metadata.borrowed_controls(&selected)?;
+        declarations.extend(selected);
         Ok(declarations)
     }
 
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // The ordinary target is group two; optional media groups do not share
         // this row contract. Shared consumers read the earlier publisher's
         // causal history at the captured submission-start query offset.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2)?;
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)),
-            true,
-        )?;
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)),
+            true, metadata_context)?;
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
-            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)?;
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)?;
             if self.args.text.layer_schedule.get(index).is_some_and(|policy| policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe) {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.routing"));
+                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.routing"))?, metadata_context)?;
             }
         }
         Ok(declarations)
@@ -3073,17 +3059,7 @@ where
         }
     }
 
-    fn execution_graph_with_metadata(&self, context:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<eredu_runtime::ArchitectureExecutionGraph<'_>,Self::Error> {
-        let graph=self.checked_graph(crate::decoder::identity::Metadata::new(Some(context)))?;
-        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(graph.description.graph()))
-    }
 
-    fn group_unit_count_with_metadata(&self,group:usize,context:&eredu_nn::workspace::WorkspaceContext)->Result<usize,Self::Error>{
-        let graph=self.checked_graph(crate::decoder::identity::Metadata::new(Some(context)))?;
-        graph.description.unit_layout().group_range(group).map(|r|r.len())
-            .ok_or_else(||context.metadata_error(format_args!("Gemma 4 has three execution groups")))
-    }
 
     fn primary_execution_group(&self) -> &str {
         TEXT_EXECUTION_GROUP
@@ -3096,22 +3072,21 @@ where
         crate::transport::pipeline_state(2, layout)
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            &self.execution_graph,
+        ))
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        if let Some(context) = metadata_context {
+            let graph = self.checked_graph(crate::decoder::identity::Metadata::new(Some(context)))?;
+            return graph.description.unit_layout().group_range(group).map(|range| range.len())
+                .ok_or_else(|| metadata.error(format_args!("Gemma 4 has three execution groups")));
+        }
         match group {
             0 => Ok(self
                 .args
@@ -3124,51 +3099,40 @@ where
                 .as_ref()
                 .map_or(0, |config| config.num_hidden_layers as usize)),
             2 => Ok(self.args.text.num_hidden_layers()),
-            _ => Err(Error::backend("Gemma 4 has three execution groups")),
+            _ => Err(metadata.error(format_args!("{}", "Gemma 4 has three execution groups"))),
         }
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.validate_unit_index(group,index,crate::decoder::ModuleMetadata::ordinary())?;
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        self.validate_unit_index(group,index,metadata)?;
         match group {
-            0 => Ok(format!("model.vision_tower.encoder.layers.{index}")),
-            1 => Ok(format!("model.audio_tower.layers.{index}")),
-            2 => Ok(format!("model.language_model.layers.{index}")),
+            0 => metadata.text(format_args!("model.vision_tower.encoder.layers.{index}")),
+            1 => metadata.text(format_args!("model.audio_tower.layers.{index}")),
+            2 => metadata.text(format_args!("model.language_model.layers.{index}")),
             _ => unreachable!(),
         }
     }
 
-    fn unit_path_with_metadata(&self,group:usize,index:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error> {
-        self.validate_unit_index(group,index,crate::decoder::ModuleMetadata::funded(context))?;
-        match group {
-            0=>context.metadata_string(format_args!("model.vision_tower.encoder.layers.{index}")),
-            1=>context.metadata_string(format_args!("model.audio_tower.layers.{index}")),
-            2=>context.metadata_string(format_args!("model.language_model.layers.{index}")),
-            _=>Err(context.metadata_error(format_args!("Gemma 4 has three execution groups"))),
-        }
-    }
-    fn group_input_observation_path_with_metadata(&self,group:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        context.charge_metadata(std::mem::size_of::<(Option<String>,usize)>())?;
-        (group==2).then(||context.metadata_string(format_args!("{}",
-            eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH))).transpose()
-    }
-    fn group_output_observation_path_with_metadata(&self,group:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        context.charge_metadata(std::mem::size_of::<(Option<String>,usize)>())?;
-        let path=match group {0=>Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH),
-            1=>Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH),_=>None};
-        path.map(|path|context.metadata_string(format_args!("{path}"))).transpose()
-    }
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+
+
+
+    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        metadata.optional_path((group == 2).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH))
     }
 
-    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok(match group {
-            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
-            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        metadata.optional_path(match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH),
             _ => None,
         })
     }
@@ -3431,9 +3395,9 @@ where
     }
 
     fn forward_metadata(&self, forward: &Self::ForwardContext)
-        -> Option<eredu_runtime::layered::LayeredForwardMetadata<Error>> {
+        -> Option<eredu_runtime::layered::LayeredMetadata<Error>> {
         forward.metadata.as_ref().map(|context|
-            eredu_runtime::layered::LayeredForwardMetadata::new(context, |error| error))
+            eredu_runtime::layered::LayeredMetadata::new(context, |error| error))
     }
 
     fn visit_retained_context_values<'a>(&'a self, forward: &'a Self::ForwardContext,
@@ -3517,8 +3481,6 @@ where
         parallel: &B::ParallelContext, context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let metadata = forward::Metadata::new(B::construction_metadata(context));
-        self.parallel_geometry.as_ref().ok_or_else(|| metadata.error(format_args!(
-            "Gemma 4 model was not built with local geometry")))?;
         self.begin_forward_with_metadata(input, Some(parallel), state, context, metadata)
     }
 

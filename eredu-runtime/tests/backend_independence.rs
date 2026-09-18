@@ -1,3 +1,6 @@
+#[path = "backend_independence/architecture_metadata.rs"]
+mod architecture_metadata;
+
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -224,40 +227,33 @@ enum FakeParameterError {
 }
 
 struct FakeModule {
+    metadata: eredu_nn::ParameterSpec,
     weight: FakeTensor,
 }
 
-fn fake_parameter_metadata(id: &str) -> eredu_nn::ParameterMetadata {
-    eredu_nn::ParameterMetadata {
-        id: eredu_nn::ParameterId::new(id).unwrap(),
-        trainable: true,
-        alias_of: None,
-        group: None,
-        linear_companion: None,
-        linear_companion_of: None,
-        linear_row_layout: eredu_nn::LinearRowLayout::Contiguous,
-    }
-}
-
 impl Parameterized<FakeTensor> for FakeModule {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, FakeTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, FakeTensor>,
     {
-        visitor.visit(fake_parameter_metadata("weight"), &self.weight);
-    }
+
+        visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(&self.metadata, true), &self.weight);
+
+ Ok(())
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, FakeTensor>,
     {
-        visitor.visit_mut(fake_parameter_metadata("weight"), &mut self.weight);
+        visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(&self.metadata, true), &mut self.weight);
     }
 
     fn set_trainable(&mut self, _trainable: bool) {}
 }
 
 struct AtomicFakeModule {
+    identities: [eredu_nn::ParameterSpec; 3],
     first: FakeTensor,
     second: FakeTensor,
     duplicate_identity: bool,
@@ -266,35 +262,28 @@ struct AtomicFakeModule {
 }
 
 impl Parameterized<FakeTensor> for AtomicFakeModule {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, FakeTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, FakeTensor>,
     {
-        visitor.visit(fake_parameter_metadata("first"), &self.first);
-        visitor.visit(
-            fake_parameter_metadata(if self.duplicate_identity {
-                "first"
-            } else {
-                "second"
-            }),
+
+        visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(&self.identities[0], true), &self.first);
+        visitor.parameter(
+            eredu_nn::ParameterMetadataView::from_spec(&self.identities[usize::from(!self.duplicate_identity)], true),
             &self.second,
         );
-    }
+
+ Ok(())
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, FakeTensor>,
     {
         self.mutable_visits += 2;
-        visitor.visit_mut(fake_parameter_metadata("first"), &mut self.first);
+        visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(&self.identities[0], true), &mut self.first);
         visitor.visit_mut(
-            fake_parameter_metadata(if self.mutable_mismatch {
-                "third"
-            } else if self.duplicate_identity {
-                "first"
-            } else {
-                "second"
-            }),
+            eredu_nn::ParameterMetadataView::from_spec(&self.identities[if self.mutable_mismatch { 2 } else { usize::from(!self.duplicate_identity) }], true),
             &mut self.second,
         );
     }
@@ -303,11 +292,14 @@ impl Parameterized<FakeTensor> for AtomicFakeModule {
 }
 
 impl Parameterized<FakeTensor> for FakeOperator {
-    fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, _visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, FakeTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, FakeTensor>,
     {
-    }
+
+
+ Ok(())
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, FakeTensor>,
@@ -1465,6 +1457,11 @@ impl CommunicationBackend for PartitionCollectiveBackend {
 }
 
 impl SumReductionBackend for PartitionCollectiveBackend {
+    fn complete_model_sum_wave<E,V>(values: &[FakeTensor], group: &PartitionCollectiveGroup,
+        _: &(), _: &(), validate:V) -> Result<Option<Vec<FakeTensor>>, eredu_core::BackendFailure>
+    where E: std::error::Error + Send + Sync + 'static, V:FnMut(&[FakeTensor],&eredu_nn::workspace::HostMetadataFunding,bool)->Result<(),E> {
+        prepared_sum_wave::complete(values, group, validate)
+    }
     fn all_reduce_sum(
         value: Self::Tensor,
         group: &Self::CommunicationGroup,
@@ -1594,7 +1591,7 @@ fn minimal_text_backend_compiles_without_optional_execution_extensions() {
         inconsistent_transport: false,
         inconsistent_identity: false,
     };
-    let layout = architecture.state_layout().unwrap();
+    let layout = architecture.state_layout(None).unwrap();
     let mut state =
         DeviceState::create(layout, |_, _| Ok::<_, Infallible>(FakeLayerState::new(0))).unwrap();
     let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
@@ -1636,6 +1633,7 @@ fn neutral_loader_materializes_and_binds_the_fake_backend() {
     assert!(unit.contains(&id));
 
     let mut module = FakeModule {
+        metadata: eredu_nn::ParameterSpec::trainable("weight").unwrap(),
         weight: FakeTensor(vec![2, 2]),
     };
     bind_materialized_unit::<FakeBackend, _>(&mut module, unit).unwrap();
@@ -1660,6 +1658,7 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
     )])
     .unwrap();
     let module = FakeModule {
+        metadata: eredu_nn::ParameterSpec::trainable("weight").unwrap(),
         weight: FakeTensor(vec![2, 2]),
     };
     let plan = build_module_binding_plan(
@@ -1976,6 +1975,7 @@ fn atomic_binding_fixture(
 fn duplicate_module_parameter_identity_fails_before_mutable_traversal() {
     let unit = atomic_binding_fixture(&[("first", "first")]);
     let mut module = AtomicFakeModule {
+        identities: ["first", "second", "third"].map(|name| eredu_nn::ParameterSpec::trainable(name).unwrap()),
         first: FakeTensor(vec![2, 2]),
         second: FakeTensor(vec![2, 2]),
         duplicate_identity: true,
@@ -1991,6 +1991,7 @@ fn duplicate_module_parameter_identity_fails_before_mutable_traversal() {
 fn bind_validation_failure_is_atomic() {
     let unit = atomic_binding_fixture(&[("first", "first"), ("second", "second")]);
     let mut module = AtomicFakeModule {
+        identities: ["first", "second", "third"].map(|name| eredu_nn::ParameterSpec::trainable(name).unwrap()),
         first: FakeTensor(vec![2, 2]),
         second: FakeTensor(vec![1]),
         duplicate_identity: false,
@@ -2008,6 +2009,7 @@ fn bind_validation_failure_is_atomic() {
 fn immutable_and_mutable_traversal_disagreement_fails_before_binding() {
     let unit = atomic_binding_fixture(&[("first", "first"), ("second", "second")]);
     let mut module = AtomicFakeModule {
+        identities: ["first", "second", "third"].map(|name| eredu_nn::ParameterSpec::trainable(name).unwrap()),
         first: FakeTensor(vec![2, 2]),
         second: FakeTensor(vec![2, 2]),
         duplicate_identity: false,
@@ -2074,7 +2076,7 @@ fn device_state_retention_uses_local_ordinal_with_nonzero_partition_offset() {
         },
     )
     .unwrap();
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder").unwrap().into_owned();
     let units = ExecutionUnitLayout::new(&graph, [7]).unwrap();
     let global_address = units.address(6).unwrap();
 
@@ -2127,43 +2129,27 @@ struct OrdinaryTextFixture {
 impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        StateLayout::new(
-            LayerSchedule::new(
-                1,
-                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap()],
-            )
-            .unwrap(),
-        )
-        .map_err(Error::backend)
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Self::DefinitionError> {
+        architecture_metadata::layout(architecture_metadata::vector(
+            [LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap()], metadata,
+        )?, metadata)
     }
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        eredu_runtime::ModelStateIdentity::new(
-            "ordinary-text-fixture",
-            "ordinary-text-fixture",
-            if self.inconsistent_identity {
-                "different-architecture"
-            } else {
-                "ordinary-text-fixture"
-            },
-            1,
-            state.global_layer_offset(),
-            0,
-            topology,
-        )
-        .map_err(Error::backend)
+        architecture_metadata::identity("ordinary-text-fixture", if self.inconsistent_identity { "different-architecture" } else { "ordinary-text-fixture" },
+            1, state, topology, metadata)
     }
 
     fn parameter_description(
         &self,
         _: &(),
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        let graph = self.execution_graph()?;
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        let graph = self.execution_graph()?.into_owned();
         let layout = ExecutionUnitLayout::new(&graph, [1]).map_err(Error::backend)?;
         let group = eredu_runtime::ParameterGroupSpec::new(
             "decoder.weight",
@@ -2185,6 +2171,7 @@ impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
             [group.clone()],
             [eredu_runtime::OwnedParameterGroupSpec::new(owner, group)],
         )
+        .map(std::borrow::Cow::Owned)
         .map_err(Error::backend)
     }
 
@@ -2209,17 +2196,16 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
     type Input<'a> = &'a FakeTensor;
 
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
         // The fixture's unit adds its marker independently to every input row.
         // This declaration changes no equations or ordinary observation hooks.
-        Ok(vec![
+        architecture_metadata::vector([
             eredu_runtime::layered::PrefillObservationDeclaration::causal_ordinary_text(
-                "decoder.unit.0.output".into(),
+                architecture_metadata::text(format_args!("decoder.unit.0.output"), metadata)?,
                 0,
                 eredu_runtime::layered::PrefillReadoutStage::BeforeReadout,
             ),
-        ])
+        ], metadata)
     }
 
     fn inference_input_shape(_: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
@@ -2258,19 +2244,19 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
         ])
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder")
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        eredu_runtime::ArchitectureExecutionGraph::single("decoder")
             .map_err(Error::backend)
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
         (group == 0)
             .then_some(1)
-            .ok_or_else(|| Error::backend("unknown ordinary text group"))
+            .ok_or_else(|| architecture_metadata::diagnostic(format_args!("{}", "unknown ordinary text group"), metadata_context))
     }
 
-    fn unit_path(&self, _: usize, _: usize) -> Result<String, Self::Error> {
-        Ok("decoder.unit.0".into())
+    fn unit_path(&self, _: usize, _: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        architecture_metadata::text(format_args!("{}", "decoder.unit.0"), metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -2409,22 +2395,23 @@ impl
 impl ArchitectureParameters<FakeBackend> for PredictionCaptureFixture {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.0.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Self::DefinitionError> {
+        self.0.state_layout(metadata)
     }
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        self.0.state_identity(state, topology)
+        self.0.state_identity(state, topology, metadata)
     }
 
     fn parameter_description(
         &self,
         context: &(),
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
         self.0.parameter_description(context)
     }
 
@@ -2474,16 +2461,16 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
         self.0.state_partition_plan(layout)
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.0.execution_graph()
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.0.group_unit_count(group)
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        self.0.group_unit_count(group, metadata_context)
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.0.unit_path(group, index)
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        self.0.unit_path(group, index, metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -2634,7 +2621,14 @@ impl PartitionedLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLa
 {
     type Boundary = NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(NoAuxiliaryBoundarySchema::new(1))
     }
 
@@ -2781,34 +2775,22 @@ impl RuntimeStateComponents<FakeBackend> for HybridLayerState {
 }
 
 fn hybrid_policy() -> LayerCachePolicy {
+    hybrid_policy_in(None).unwrap()
+}
+
+fn hybrid_policy_in(metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<LayerCachePolicy, Error> {
     let fixed = |role, residency| {
-        StateTensorPolicy::new(
-            role,
-            vec![
-                StateTensorDimension::Batch,
-                StateTensorDimension::fixed(4).unwrap(),
-            ],
-            StateTensorDtype::Floating,
-            residency,
-        )
-        .unwrap()
+        let dimensions = architecture_metadata::vector([
+            StateTensorDimension::Batch,
+            StateTensorDimension::fixed(4).unwrap(),
+        ], metadata)?;
+        Ok::<_, Error>(StateTensorPolicy::new(role, dimensions, StateTensorDtype::Floating, residency).unwrap())
     };
-    LayerCachePolicy::key_value_with_fixed_state(
-        AttentionPolicy::Full,
-        1,
-        4,
-        vec![
-            fixed(
-                StateTensorRole::Recurrent,
-                MutableStateResidency::LayerScopedOffloadable,
-            ),
-            fixed(
-                StateTensorRole::Convolution { slot: 0 },
-                MutableStateResidency::AlwaysDeviceMutable,
-            ),
-        ],
-    )
-    .unwrap()
+    let states = architecture_metadata::vector([
+        fixed(StateTensorRole::Recurrent, MutableStateResidency::LayerScopedOffloadable)?,
+        fixed(StateTensorRole::Convolution { slot: 0 }, MutableStateResidency::AlwaysDeviceMutable)?,
+    ], metadata)?;
+    Ok(LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 1, 4, states).unwrap())
 }
 
 struct HybridFixture {
@@ -2843,35 +2825,29 @@ impl ArchitectureStateFactory<FakeBackend> for HybridStateFactory {
 impl ArchitectureParameters<FakeBackend> for HybridFixture {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        StateLayout::new(LayerSchedule::new(1, vec![hybrid_policy()]).unwrap())
-            .map_err(Error::backend)
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Self::DefinitionError> {
+        let policy = hybrid_policy_in(metadata)?;
+        architecture_metadata::layout(architecture_metadata::vector([policy], metadata)?, metadata)
     }
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        eredu_runtime::ModelStateIdentity::new(
-            "hybrid-fixture",
-            "hybrid-fixture",
-            "hybrid-fixture",
-            1,
-            state.global_layer_offset(),
-            0,
-            topology,
-        )
-        .map_err(Error::backend)
+        architecture_metadata::identity("hybrid-fixture", "hybrid-fixture",
+            1, state, topology, metadata)
     }
 
     fn parameter_description(
         &self,
         _: &(),
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        let graph = self.execution_graph()?;
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        let graph = self.execution_graph()?.into_owned();
         let layout = ExecutionUnitLayout::new(&graph, [1]).map_err(Error::backend)?;
-        ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
+        ArchitectureParameterDescription::new(&graph, &layout, [], []).map(std::borrow::Cow::Owned)
+        .map_err(Error::backend)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -2930,19 +2906,19 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, HybridLayerState>
         ])
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(vec![ExecutionGroupSpec::root("hybrid")], "hybrid")
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        eredu_runtime::ArchitectureExecutionGraph::single("hybrid")
             .map_err(Error::backend)
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
         (group == 0)
             .then_some(1)
-            .ok_or_else(|| Error::backend("unknown hybrid fixture group"))
+            .ok_or_else(|| architecture_metadata::diagnostic(format_args!("{}", "unknown hybrid fixture group"), metadata_context))
     }
 
-    fn unit_path(&self, _: usize, _: usize) -> Result<String, Self::Error> {
-        Ok("hybrid.unit.0".into())
+    fn unit_path(&self, _: usize, _: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        architecture_metadata::text(format_args!("{}", "hybrid.unit.0"), metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -3389,7 +3365,7 @@ where
         &self, event: eredu_runtime::replicated_session::ParallelControlEvent,
         _: &(), run: F,
     ) -> Result<Result<T, E>, eredu_core::BackendFailure>
-    where F: FnOnce(Option<(&(), &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    where F: FnOnce(Option<(&(), &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         parallel_control::with_loan(event, run)
     }
@@ -3883,9 +3859,9 @@ fn try_select_reference_text_with_completion(
     eredu_runtime::SelectedReplicatedTextRealization,
     eredu_runtime::ReplicatedTextSelectionError,
 > {
-    let graph = architecture.execution_graph().unwrap();
+    let graph = architecture.execution_graph().unwrap().into_owned();
     let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
-    let state_layout = architecture.state_layout().unwrap();
+    let state_layout = architecture.state_layout(None).unwrap();
     let source =
         eredu_checkpoint::SourceTensorEncoding::Safetensors(eredu_checkpoint::StoredDtype::F32);
     let parameter = ReplicatedTextParameterRequirement::new(
@@ -4045,7 +4021,8 @@ struct ReferencePartitionPass {
 
 struct ReferencePartitionExecutor {
     architecture: OrdinaryTextFixture,
-    unit: FakeUnit,
+    policy: RecordingPolicy,
+    expose_policy: bool,
     fail_after_state: Rc<Cell<bool>>,
 }
 
@@ -4058,10 +4035,10 @@ impl
     type Architecture = OrdinaryTextFixture;
     type Policy = RecordingPolicy;
     fn parameter_parts(&mut self) -> Option<(&mut Self::Architecture, &mut Self::Policy)> {
-        None
+        self.expose_policy.then_some((&mut self.architecture, &mut self.policy))
     }
     fn parameter_parts_ref(&self) -> Option<(&Self::Architecture, &Self::Policy)> {
-        None
+        self.expose_policy.then_some((&self.architecture, &self.policy))
     }
 }
 
@@ -4075,6 +4052,10 @@ impl
         FakeTensorMetadata,
     > for ReferencePartitionExecutor
 {
+    fn group_submission_mechanism(&self) -> eredu_runtime::GroupSubmissionMechanism {
+        eredu_runtime::GroupSubmissionMechanism::PolicyOnly
+    }
+
     type Pass<'a, 'control> = ReferencePartitionPass;
 
     fn apply_prediction_target_operation<O>(
@@ -4143,7 +4124,7 @@ impl
         forward.hidden = self.architecture.forward_unit(
             driver.group_index(),
             driver.range().start,
-            &mut self.unit,
+            self.policy.units[0].as_mut().expect("retained resident unit"),
             &forward.hidden,
             state,
             &mut forward.context,
@@ -4251,6 +4232,10 @@ impl
         PipelineTensorMetadata,
     > for PipelineDestinationExecutor
 {
+    fn group_submission_mechanism(&self) -> eredu_runtime::GroupSubmissionMechanism {
+        eredu_runtime::GroupSubmissionMechanism::PolicyOnly
+    }
+
     type Pass<'a, 'control> = ReferencePartitionPass;
 
     fn begin<'a, 'control>(
@@ -5009,7 +4994,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         inconsistent_identity: false,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
-    let parameters = architecture.parameter_description(&()).unwrap();
+    let parameters = architecture.parameter_description(&()).unwrap().into_owned();
     let partition = ArchitecturePartition::from_architecture::<
         FakeBackend,
         DeviceState<FakeBackend, FakeLayerState>,
@@ -5087,7 +5072,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
                 .expect("neutral driver constructed the selected local unit");
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![Some(driver)],
                 Vec::new(),
@@ -5107,7 +5092,8 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
                 plan,
                 ReferencePartitionExecutor {
                     architecture,
-                    unit,
+                    policy: RecordingPolicy::new(vec![unit]),
+                    expose_policy: false,
                     fail_after_state: Rc::clone(&fail_after_state),
                 },
                 communication,
@@ -5288,7 +5274,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
             let (architecture, _partition, manifest, tasks) = input.into_parts();
             assert!(tasks.is_empty());
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![None],
                 Vec::new(),
@@ -5308,7 +5294,8 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
                 plan,
                 ReferencePartitionExecutor {
                     architecture,
-                    unit: FakeUnit { marker: 5 },
+                    policy: RecordingPolicy::new(vec![FakeUnit { marker: 5 }]),
+                    expose_policy: false,
                     fail_after_state: Rc::new(Cell::new(false)),
                 },
                 communication,
@@ -5784,7 +5771,7 @@ fn partitioned_agreement_session(
             let (architecture, partition, manifest, _) = input.into_parts();
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![Some(driver)],
                 Vec::new(),
@@ -5811,7 +5798,8 @@ fn partitioned_agreement_session(
                 plan,
                 ReferencePartitionExecutor {
                     architecture,
-                    unit: FakeUnit { marker: 5 },
+                    policy: RecordingPolicy::new(vec![FakeUnit { marker: 5 }]),
+                    expose_policy: false,
                     fail_after_state: Rc::new(Cell::new(matches!(
                         local_failure,
                         LocalPartitionFailure::Execution
@@ -5953,7 +5941,7 @@ fn partitioned_cache_control_session(
             let (architecture, partition, manifest, _) = input.into_parts();
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![Some(driver)],
                 Vec::new(),
@@ -5980,7 +5968,8 @@ fn partitioned_cache_control_session(
                 plan,
                 ReferencePartitionExecutor {
                     architecture,
-                    unit: FakeUnit { marker: 5 },
+                    policy: RecordingPolicy::new(vec![FakeUnit { marker: 5 }]),
+                    expose_policy: false,
                     fail_after_state: Rc::new(Cell::new(false)),
                 },
                 communication,
@@ -6902,7 +6891,7 @@ fn partitioned_runtime_rejects_publication_and_agreement_manifest_perturbations_
             inconsistent_transport: false,
             inconsistent_identity: false,
         };
-        let graph = architecture.execution_graph().unwrap();
+        let graph = architecture.execution_graph().unwrap().into_owned();
         let plan = PartitionedExecutionPlan::new(
             graph,
             vec![(ArchitectureGroupKind::Decoder, false)],
@@ -6940,7 +6929,8 @@ fn partitioned_runtime_rejects_publication_and_agreement_manifest_perturbations_
             plan,
             ReferencePartitionExecutor {
                 architecture,
-                unit: FakeUnit { marker: 5 },
+                policy: RecordingPolicy::new(vec![FakeUnit { marker: 5 }]),
+                expose_policy: false,
                 fail_after_state: Rc::new(Cell::new(false)),
             },
             communication,
@@ -7039,7 +7029,7 @@ fn production_partitioned_middle_stage_completes_source_before_send_and_fences_d
             assert_eq!(tasks.len(), 1);
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![Some(driver)],
                 vec![
@@ -7282,7 +7272,7 @@ fn assert_destination_preparation_failure_is_agreed_before_transfer(
             let (architecture, partition, manifest, _) = input.into_parts();
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
-                architecture.execution_graph().unwrap(),
+                architecture.execution_graph().unwrap().into_owned(),
                 vec![(ArchitectureGroupKind::Decoder, false)],
                 vec![Some(driver)],
                 vec![PartitionBoundaryRoute {
@@ -7566,11 +7556,15 @@ impl Parameterized<FakeTensor> for FakeUnit {
         true
     }
 
-    fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, _visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, FakeTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, FakeTensor>,
     {
-    }
+ let mut __source_result = Ok(());
+
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
     where
@@ -7582,8 +7576,13 @@ impl Parameterized<FakeTensor> for FakeUnit {
 }
 
 struct GroupedFixture {
+    graph: ExecutionGraph,
     static_modules: FakeOperator,
     trace: Vec<(usize, usize)>,
+}
+
+fn grouped_graph() -> ExecutionGraph {
+    ExecutionGraph::new(vec![ExecutionGroupSpec::root("vision"), ExecutionGroupSpec::root("audio"), ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"])], "text").unwrap()
 }
 
 thread_local! {
@@ -7635,34 +7634,26 @@ impl Drop for GroupedForwardContext {
 impl ArchitectureParameters<FakeBackend> for GroupedFixture {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        let policies = (0..4)
-            .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
-            .collect();
-        StateLayout::new(LayerSchedule::new(4, policies).unwrap()).map_err(Error::backend)
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Self::DefinitionError> {
+        let policies = std::array::from_fn::<_, 4, _>(|_|
+            LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap());
+        architecture_metadata::layout(architecture_metadata::vector(policies, metadata)?, metadata)
     }
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        eredu_runtime::ModelStateIdentity::new(
-            "fixture",
-            "fixture",
-            "fixture",
-            4,
-            state.global_layer_offset(),
-            0,
-            topology,
-        )
-        .map_err(Error::backend)
+        architecture_metadata::identity("fixture", "fixture",
+            4, state, topology, metadata)
     }
 
     fn parameter_description(
         &self,
         _: &(),
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
         let graph = ExecutionGraph::new(
             vec![
                 ExecutionGroupSpec::root("vision"),
@@ -7673,7 +7664,8 @@ impl ArchitectureParameters<FakeBackend> for GroupedFixture {
         )
         .map_err(Error::backend)?;
         let layout = ExecutionUnitLayout::new(&graph, [1, 1, 2]).map_err(Error::backend)?;
-        ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
+        ArchitectureParameterDescription::new(&graph, &layout, [], []).map(std::borrow::Cow::Owned)
+        .map_err(Error::backend)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -7751,39 +7743,31 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         ])
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
-            ],
-            "text",
-        )
-        .map_err(Error::backend)
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.graph))
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
         [1, 1, 2]
             .get(group)
             .copied()
-            .ok_or_else(|| Error::backend(format!("unknown fixture group {group}")))
+            .ok_or_else(|| architecture_metadata::diagnostic(format_args!("unknown fixture group {group}"), metadata_context))
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        Ok(format!("group.{group}.unit.{index}"))
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        architecture_metadata::text(format_args!("group.{group}.unit.{index}"), metadata_context)
     }
 
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        (group == 2).then(|| architecture_metadata::text(format_args!("{}", eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH), metadata_context)).transpose()
     }
 
-    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok(match group {
-            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
-            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH),
             _ => None,
-        })
+        }.map(|path| architecture_metadata::text(format_args!("{path}"), metadata_context)).transpose()
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -7970,7 +7954,14 @@ impl PartitionedLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLa
 {
     type Boundary = NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(NoAuxiliaryBoundarySchema::new(8))
     }
 
@@ -8048,6 +8039,7 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
 
     let mut architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8230,11 +8222,12 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
 #[test]
 fn complete_state_partition_derives_identity_through_architecture_contract() {
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
     let state = eredu_runtime::PartitionState::new(
-        architecture.state_layout().expect("fixture state layout"),
+        architecture.state_layout(None).expect("fixture state layout"),
         0,
     )
     .expect("complete replicated state partition");
@@ -8264,6 +8257,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8353,9 +8347,9 @@ fn selected_reference_composite(
     architecture: &GroupedFixture,
     residency: LayerWeightResidency,
 ) -> eredu_runtime::SelectedReplicatedTextRealization {
-    let graph = architecture.execution_graph().unwrap();
+    let graph = architecture.execution_graph().unwrap().into_owned();
     let units = ExecutionUnitLayout::new(&graph, [1, 1, 2]).unwrap();
-    let state_layout = architecture.state_layout().unwrap();
+    let state_layout = architecture.state_layout(None).unwrap();
     let requirements = ReplicatedTextRequirements::new(
         "composite-fixture",
         NeuralOperatorCapabilities::NONE,
@@ -8452,6 +8446,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
         LayerWeightResidency::LayerwiseHost(Default::default()),
     ] {
         let architecture = GroupedFixture {
+            graph: grouped_graph(),
             static_modules: FakeOperator,
             trace: Vec::new(),
         };
@@ -8650,6 +8645,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
 #[test]
 fn composite_prepared_parts_drive_dependency_group_output() {
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8686,6 +8682,7 @@ fn composite_prepared_parts_drive_dependency_group_output() {
 fn layerwise_runtime_aborts_active_lease_and_forward_after_observer_error() {
     let mut state = fixture_state();
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8723,6 +8720,7 @@ fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8870,6 +8868,7 @@ fn fixture_state() -> DeviceState<FakeBackend, FakeLayerState> {
 #[test]
 fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     let resident_architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8906,6 +8905,7 @@ fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     );
 
     let layerwise_architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -9177,7 +9177,7 @@ fn independent_materialization_task(
 
 #[test]
 fn independent_backend_uses_retained_materialization_plans_and_transform_outputs() {
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder").unwrap().into_owned();
     let layout = ExecutionUnitLayout::new(&graph, [2]).unwrap();
     let static_task = independent_materialization_task(
         "embedding.weight",
@@ -9256,7 +9256,7 @@ fn independent_backend_uses_retained_materialization_plans_and_transform_outputs
 
 #[test]
 fn independent_materialization_helpers_fail_closed_and_merge_numeric_counters() {
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder").unwrap().into_owned();
     let layout = ExecutionUnitLayout::new(&graph, [1]).unwrap();
     let unknown = independent_materialization_task(
         "layers.4.weight",
@@ -9559,10 +9559,11 @@ fn distributed_prompt_cache_and_manual_rollback_never_reuse_a_commit_epoch() {
 #[test]
 fn parameter_unit_loans_preserve_semantic_addresses_and_forward_order() {
     let architecture = GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
-    let graph = architecture.execution_graph().unwrap();
+    let graph = architecture.execution_graph().unwrap().into_owned();
     let addresses = ExecutionUnitLayout::new(&graph, vec![1, 1, 2]).unwrap();
     let mut runtime =
         LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, RecordingPolicy::bounded(4));
@@ -9595,7 +9596,7 @@ fn parameter_unit_loans_preserve_semantic_addresses_and_forward_order() {
     ));
     assert!(!runtime.policy().forward_active);
     assert!(runtime.policy().units.iter().all(Option::is_none));
-    let layout = runtime.architecture().state_layout().unwrap();
+    let layout = runtime.architecture().state_layout(None).unwrap();
     let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
         Ok::<_, Infallible>(FakeLayerState::new(0))
     })
@@ -9927,7 +9928,7 @@ fn asymmetric_input_rejection_precedes_capture_and_preserves_state_for_retry() {
                             };
                             let tokens = FakeTensor(vec![9]);
                             let input = if rank == 0 {
-                                Err(Error::backend_source(std::io::Error::other(
+                                Err(Error::backend_retained_source(std::io::Error::other(
                                     "local input failure",
                                 )))
                             } else {
@@ -10473,3 +10474,9 @@ mod retained_materialization;
 
 #[path = "backend_independence/parallel_control.rs"]
 mod parallel_control;
+
+#[path = "backend_independence/prepared_sum_wave.rs"]
+mod prepared_sum_wave;
+
+#[path = "backend_independence/partitioned_policy.rs"]
+mod partitioned_policy;

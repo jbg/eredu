@@ -4,7 +4,7 @@ use super::{advance::Context, Cause, PreparedEarleySeed, PreparedEarleySeedError
 use crate::{api::ParserLimits, earley::PreparedLexer};
 use std::mem::{size_of, size_of_val};
 use toktrie::{SimpleVob, TokTrie, TokenId};
-impl<F: Fn(usize) -> Result<(), E>, E> shared::Context for Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> shared::Context for Context<'_, F> {
     type Error = Cause<E>;
     fn marker(&self) -> TokenId {
         shared::marker_token(self.trie)
@@ -40,7 +40,7 @@ impl PreparedEarleySeed {
     /// Computes the complete ordinary grammar mask, including numeric ranges
     /// and EOS, under the selected step fuel/state/item policy. Cached results
     /// remain borrowed from this owner; no independent output copy is implied.
-    pub fn compute_token_mask<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn compute_token_mask<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -83,7 +83,7 @@ impl PreparedEarleySeed {
                 size_of::<Result<shared::Key, ()>>(),
                 size_of::<TokenId>() * 2,
             ];
-            funding(
+            funding.reserve(
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
@@ -128,12 +128,13 @@ impl PreparedEarleySeed {
                 });
             }
             let mut mask = self.token_mask.take().ok_or(Cause::Source)?;
+            let scope = derivre::prepared_funding::Scope::new(funding).map_err(Cause::frame)?;
             let result = shared::finish(
                 &mut Context {
                     owner: &mut self,
                     lexer,
                     trie,
-                    funding,
+                    funding: &scope,
                 },
                 &mut mask,
                 start,

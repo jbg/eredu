@@ -8,7 +8,7 @@ use eredu_core::speculative::{
     SpeculativeActivationOrigin, SpeculativeActivationPhase, SpeculativePrefillSpan,
 };
 use eredu_core::SpeculativeRequestId;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     speculative::embedded_occurrence::{
         EmbeddedOccurrenceClaim, EmbeddedOccurrenceCursor, EmbeddedSchedulePlan,
@@ -38,7 +38,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
         schedule: EmbeddedSchedulePlan<'a>,
         pool: &WorkingMemoryPool,
         capacity: u64,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         let source = OriginalSpeculativeNumericalPreparation::prepare(target, pool, funding)?;
         Self::prepare_from_source(source, schedule, capacity)
@@ -64,7 +64,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         source.metadata_funding()
             .reserve_metadata(controls)
@@ -112,7 +112,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
             size_of::<super::SpeculativeExecutionStreams<'_>>(),
             size_of::<Result<(),eredu_core::speculative::SpeculativeControlError>>()];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let mut cursor=self.cursor.try_borrow_mut().map_err(|_|self.numerical.retain_startup_error(
             WorkingMemoryError::AccountConstructionBusy))?;
@@ -151,7 +151,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
                     .ok_or(Error::WorkspacePlanning(
-                        WorkspaceMetadataFundingError::Overflow,
+                        HostMetadataFundingError::Overflow,
                     ))?,
             )
             .map_err(Error::WorkspacePlanning)?;

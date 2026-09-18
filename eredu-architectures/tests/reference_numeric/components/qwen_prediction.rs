@@ -105,9 +105,8 @@ fn qwen_prediction_fusion_hooks_preserve_cached_execution_and_effective_hidden()
                     }
                     let points = eredu_runtime::RoutedObservationPoints::new(
                         eredu_runtime::RoutedBankId::new(0),
-                        "mtp.layers.0.mlp".to_owned(),
-                        args.num_experts,
-                    );
+                        format_args!("mtp.layers.0.mlp"),
+                        args.num_experts, None).unwrap();
                     let actual_lane = actual_state.layer(args.num_hidden_layers as usize).unwrap();
                     let output = if tensor_parallel {
                         candidate.forward_parallel_observed_with_provider(
@@ -411,8 +410,8 @@ fn qwen_target_trial(
     .unwrap();
     struct RecurrentMagnitude<'c>(&'c NumericContext);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for RecurrentMagnitude<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let name = metadata.id().as_str();
             if name.contains(".linear_attn.") {
                 if name.ends_with(".norm.weight") {
                     // Raw architecture parameters start unloaded, unlike this
@@ -645,11 +644,11 @@ fn qwen_target_components_preserve_sharded_masks_shared_gate_and_collective_orde
 fn prepared_qwen_hybrid_components_and_scalar_gates_cross_tp_ep_pp_and_residency() {
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             let source = self
                 .0
-                .get(metadata.id.as_str())
-                .unwrap_or_else(|| panic!("missing reference parameter {}", metadata.id.as_str()));
+                .get(metadata.id().as_str())
+                .unwrap_or_else(|| panic!("missing reference parameter {}", metadata.id().as_str()));
             // Official depthwise convolution storage includes a singleton input
             // channel; the neutral operator stores the same coefficients as C×K.
             assert!(
@@ -657,7 +656,7 @@ fn prepared_qwen_hybrid_components_and_scalar_gates_cross_tp_ep_pp_and_residency
                     || (value.shape.len() == 2
                         && source.shape == [value.shape[0], 1, value.shape[1]]),
                 "{}",
-                metadata.id.as_str()
+                metadata.id().as_str()
             );
             value.data.clone_from(&source.data);
         }
@@ -701,7 +700,7 @@ fn prepared_qwen_hybrid_components_and_scalar_gates_cross_tp_ep_pp_and_residency
             let model = || {
                 qwen::hybrid::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap()
             };
-            let parameters = model().parameter_description(&context).unwrap();
+            let parameters = model().parameter_description(&context).unwrap().into_owned();
             let inputs = [
                 NumericTensor::token_ids(&[1, 2, 3]),
                 NumericTensor::token_ids(&[4]),

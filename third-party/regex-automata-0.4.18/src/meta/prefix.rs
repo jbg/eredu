@@ -9,6 +9,10 @@ the match the regex engine would report, then the corresponding reverse
 strategy is not used.
 */
 
+use crate::util::allocation::{
+    Allocation, AllocationError, Allocator,
+};
+use alloc::vec::Vec;
 use regex_syntax::hir::{literal::Literal, Class, Hir, HirKind};
 
 /// Return true when `hir` can match some string containing every byte in
@@ -18,8 +22,52 @@ use regex_syntax::hir::{literal::Literal, Class, Hir, HirKind};
 /// consumed somewhere in the HIR, this gives up and reports that the
 /// literal might occur internally. That is, this returning true does not
 /// necessarily mean that the `Hir` provided definitively matches `lit`.
+#[cfg(test)]
 pub(super) fn hir_can_contain_literal(hir: &Hir, lit: &[u8]) -> bool {
-    lit.is_empty() || lit.iter().all(|&byte| hir_can_consume_byte(hir, byte))
+    hir_can_contain_literal_with_allocations(hir, lit, &crate::util::allocation::Unenforced)
+        .expect("ordinary HIR proof allocation")
+}
+
+pub(super) fn hir_can_contain_literal_with_allocations(
+    hir: &Hir,
+    lit: &[u8],
+    funding: &dyn Allocation,
+) -> Result<bool, AllocationError> {
+    let allocation = Allocator::new(funding);
+    let mut stack = Vec::new();
+    for &byte in lit {
+        stack.clear();
+        allocation.push(&mut stack, hir)?;
+        let mut consumes = false;
+        while let Some(node) = stack.pop() {
+            let yes = match node.kind() {
+                HirKind::Empty | HirKind::Look(_) => false,
+                HirKind::Literal(lit) => lit.0.contains(&byte),
+                HirKind::Class(Class::Bytes(cls)) => {
+                    byte_class_contains(cls, byte)
+                }
+                // Preserve the original conservative non-ASCII-byte proof.
+                HirKind::Class(Class::Unicode(cls)) => {
+                    byte > 0x7F
+                        || unicode_class_contains(cls, char::from(byte))
+                }
+                _ => {
+                    for sub in node.kind().subs().iter().rev() {
+                        allocation.push(&mut stack, sub)?;
+                    }
+                    false
+                }
+            };
+            if yes {
+                consumes = true;
+                break;
+            }
+        }
+        if !consumes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Returns true when the given `Hir` has a fixed length.
@@ -76,37 +124,75 @@ pub(super) fn hir_has_fixed_length(hir: &Hir) -> bool {
 /// another prefix component or can match a character in any literal. For
 /// example, neither `\s*` in `[A-Za-z]*\s*` nor `\w+` in `\w+\w+` provides
 /// the required separator.
-pub(super) fn has_disjoint_class_separator(
+pub(super) fn has_disjoint_class_separator_with_allocations(
     prefix: &Hir,
     literals: &[Literal],
-) -> bool {
+    funding: &dyn Allocation,
+) -> Result<bool, AllocationError> {
     let hirs = match uncapture(prefix).kind() {
         HirKind::Concat(hirs) if hirs.len() >= 2 => hirs,
-        _ => return false,
+        _ => return Ok(false),
     };
     let Some(first) = hirs.iter().position(|hir| !hir_matches_empty_only(hir))
     else {
-        return false;
+        return Ok(false);
     };
-    let last =
-        hirs.iter().rposition(|hir| !hir_matches_empty_only(hir)).unwrap();
-    has_disjoint_class_separator_at(hirs, last, literals)
-        || (first != last
-            && has_disjoint_class_separator_at(hirs, first, literals))
+    let last = hirs
+        .iter()
+        .rposition(|hir| !hir_matches_empty_only(hir))
+        .unwrap();
+    if has_disjoint_class_separator_at(hirs, last, literals, funding)? {
+        return Ok(true);
+    }
+    if first != last {
+        return has_disjoint_class_separator_at(
+            hirs, first, literals, funding,
+        );
+    }
+    Ok(false)
 }
 
 fn has_disjoint_class_separator_at(
     hirs: &[Hir],
     separator: usize,
     literals: &[Literal],
-) -> bool {
+    funding: &dyn Allocation,
+) -> Result<bool, AllocationError> {
     let Some(separator_class) = required_class(&hirs[separator]) else {
-        return false;
+        return Ok(false);
     };
-    class_is_disjoint_from_literals(separator_class, literals)
-        && hirs.iter().enumerate().all(|(i, hir)| {
-            i == separator || hir_is_disjoint_from_class(hir, separator_class)
-        })
+    if !class_is_disjoint_from_literals(separator_class, literals) {
+        return Ok(false);
+    }
+    let allocation = Allocator::new(funding);
+    let mut stack = Vec::new();
+    for (i, hir) in hirs.iter().enumerate() {
+        if i == separator {
+            continue;
+        }
+        allocation.push(&mut stack, hir)?;
+        while let Some(node) = stack.pop() {
+            let disjoint = match node.kind() {
+                HirKind::Empty | HirKind::Look(_) => true,
+                HirKind::Literal(lit) => {
+                    class_is_disjoint_from_literal(separator_class, &lit.0)
+                }
+                HirKind::Class(cls) => {
+                    classes_are_disjoint(cls, separator_class)
+                }
+                _ => {
+                    for sub in node.kind().subs().iter().rev() {
+                        allocation.push(&mut stack, sub)?;
+                    }
+                    true
+                }
+            };
+            if !disjoint {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn hir_matches_empty_only(hir: &Hir) -> bool {
@@ -127,25 +213,6 @@ fn required_class(hir: &Hir) -> Option<&Class> {
     }
 }
 
-fn hir_is_disjoint_from_class(hir: &Hir, separator: &Class) -> bool {
-    match hir.kind() {
-        HirKind::Empty | HirKind::Look(_) => true,
-        HirKind::Literal(lit) => {
-            class_is_disjoint_from_literal(separator, &lit.0)
-        }
-        HirKind::Class(cls) => classes_are_disjoint(cls, separator),
-        HirKind::Repetition(rep) => {
-            hir_is_disjoint_from_class(&rep.sub, separator)
-        }
-        HirKind::Capture(capture) => {
-            hir_is_disjoint_from_class(&capture.sub, separator)
-        }
-        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
-            hirs.iter().all(|hir| hir_is_disjoint_from_class(hir, separator))
-        }
-    }
-}
-
 fn uncapture(mut hir: &Hir) -> &Hir {
     while let HirKind::Capture(capture) = hir.kind() {
         hir = &capture.sub;
@@ -154,27 +221,33 @@ fn uncapture(mut hir: &Hir) -> &Hir {
 }
 
 fn classes_are_disjoint(left: &Class, right: &Class) -> bool {
+    // Both canonical classes contain sorted, disjoint ranges. A merge walk
+    // answers the same intersection-emptiness proof without copying a class.
+    fn disjoint<T: Ord + Copy>(
+        mut left: impl Iterator<Item = (T, T)>,
+        mut right: impl Iterator<Item = (T, T)>,
+    ) -> bool {
+        let (mut l, mut r) = (left.next(), right.next());
+        while let (Some((ls, le)), Some((rs, re))) = (l, r) {
+            if le < rs {
+                l = left.next();
+            } else if re < ls {
+                r = right.next();
+            } else {
+                return false;
+            }
+        }
+        true
+    }
     match (left, right) {
-        (Class::Bytes(left), Class::Bytes(right)) => {
-            let (mut intersection, other) =
-                if left.ranges().len() <= right.ranges().len() {
-                    (left.clone(), right)
-                } else {
-                    (right.clone(), left)
-                };
-            intersection.intersect(other);
-            intersection.ranges().is_empty()
-        }
-        (Class::Unicode(left), Class::Unicode(right)) => {
-            let (mut intersection, other) =
-                if left.ranges().len() <= right.ranges().len() {
-                    (left.clone(), right)
-                } else {
-                    (right.clone(), left)
-                };
-            intersection.intersect(other);
-            intersection.ranges().is_empty()
-        }
+        (Class::Bytes(l), Class::Bytes(r)) => disjoint(
+            l.ranges().iter().map(|x| (x.start(), x.end())),
+            r.ranges().iter().map(|x| (x.start(), x.end())),
+        ),
+        (Class::Unicode(l), Class::Unicode(r)) => disjoint(
+            l.ranges().iter().map(|x| (x.start(), x.end())),
+            r.ranges().iter().map(|x| (x.start(), x.end())),
+        ),
         _ => false,
     }
 }
@@ -197,31 +270,6 @@ fn class_is_disjoint_from_literal(cls: &Class, lit: &[u8]) -> bool {
     }
 }
 
-fn hir_can_consume_byte(hir: &Hir, byte: u8) -> bool {
-    match hir.kind() {
-        HirKind::Empty | HirKind::Look(_) => false,
-        HirKind::Literal(lit) => lit.0.contains(&byte),
-        HirKind::Class(Class::Bytes(cls)) => byte_class_contains(cls, byte),
-        HirKind::Class(Class::Unicode(cls)) => {
-            // We don't check literals based on codepoints, so if
-            // we have a non-ASCII byte, we assume here that any
-            // Unicode class will match it. In practice, given
-            // the prevalence of `\w`, this is not a terrible
-            // approximation.
-            if byte > 0x7F {
-                return true;
-            }
-            let ch = char::from(byte);
-            unicode_class_contains(cls, ch)
-        }
-        HirKind::Repetition(rep) => hir_can_consume_byte(&rep.sub, byte),
-        HirKind::Capture(capture) => hir_can_consume_byte(&capture.sub, byte),
-        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
-            hirs.iter().any(|hir| hir_can_consume_byte(hir, byte))
-        }
-    }
-}
-
 fn byte_class_contains(cls: &regex_syntax::hir::ClassBytes, byte: u8) -> bool {
     cls.ranges()
         .iter()
@@ -232,5 +280,7 @@ fn unicode_class_contains(
     cls: &regex_syntax::hir::ClassUnicode,
     ch: char,
 ) -> bool {
-    cls.ranges().iter().any(|range| range.start() <= ch && ch <= range.end())
+    cls.ranges()
+        .iter()
+        .any(|range| range.start() <= ch && ch <= range.end())
 }

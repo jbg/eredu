@@ -41,10 +41,12 @@ type PairBank = OriginalNativeStorageBank<PairMechanism>;
 struct PairMechanism {
     runtime: Rc<PreparedInputRuntime>,
     selection: NativeStorageSelection,
+    initial_publication: Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>,
 }
 enum PairObservation<'a> {
     Origin(OriginalBufferWitness<'a>),
     Existing(OriginalBufferAliasWitness<'a>),
+    Ordinary(OrdinaryBufferWitness<'a>),
 }
 enum PairCause {
     Fixed(OriginalBufferCause),
@@ -75,7 +77,7 @@ impl std::error::Error for PairCause {
 impl OriginalNativeStorageMechanism for PairMechanism {
     type Key = AllocationIdentity;
     type Budget = OriginalBufferBudget;
-    type Root = Array;
+    type Root<'a> = &'a Array;
     type Attachment = PairAttachment;
     type Error = PairCause;
     type Observation<'a> = PairObservation<'a>;
@@ -102,10 +104,10 @@ impl OriginalNativeStorageMechanism for PairMechanism {
             PairCause::Budget(cause, owner.into_owner())
         })
     }
-    fn observe<'a>(
+    fn observe<'a, 'root: 'a>(
         &'a self,
         budget: &'a OriginalBufferBudget,
-        root: &'a Array,
+        root: &'root Array,
     ) -> Result<Self::Observation<'a>, PairCause> {
         match budget.inspect_array(root) {
             Ok(Some(value)) => Ok(PairObservation::Origin(value)),
@@ -115,7 +117,10 @@ impl OriginalNativeStorageMechanism for PairMechanism {
                 .map(PairObservation::Existing)
                 .ok_or(PairCause::Fixed(OriginalBufferCause::UncertifiedBacking)),
             Err(cause) => Err(PairCause::Fixed(cause)),
-            Ok(None) => Err(PairCause::Fixed(OriginalBufferCause::UncertifiedBacking)),
+            Ok(None) => match root.inspect_ordinary_buffer().map_err(PairCause::Fixed)? {
+                OrdinaryBufferInspection::Allocation(witness) => Ok(PairObservation::Ordinary(witness)),
+                _ => Err(PairCause::Fixed(OriginalBufferCause::UncertifiedBacking)),
+            },
         }
     }
     fn describe(
@@ -130,7 +135,23 @@ impl OriginalNativeStorageMechanism for PairMechanism {
                 let facts = witness.allocation();
                 NativeStorageObservation::Existing(facts.identity(), facts.bytes() as u64)
             }
+            PairObservation::Ordinary(witness) => {
+                let facts = witness.allocation();
+                NativeStorageObservation::Ordinary(facts.identity(), facts.bytes() as u64)
+            }
         }
+    }
+    fn has_retained_attachment(&self, previous: &Self::Observation<'_>, observation: &Self::Observation<'_>, pool: &WorkingMemoryPool) -> bool {
+        let facts = |observation: &Self::Observation<'_>| match observation {
+            PairObservation::Origin(witness) => witness.allocation(),
+            PairObservation::Existing(witness) => witness.allocation(),
+            PairObservation::Ordinary(witness) => witness.allocation(),
+        };
+        let current = facts(observation);
+        if std::mem::discriminant(previous) != std::mem::discriminant(observation)
+            || facts(previous) != current { return false; }
+        self.initial_publication.as_ref().is_some_and(|publication|
+            publication.has_native_attachment(pool.shared_storage_domain(), current))
     }
     fn prepare_attachment(&self, owner: PairRegistration) -> Result<PairAttachment, PairCause> {
         PreparedAllocationOwner::try_new(owner).map_err(|error| {
@@ -148,6 +169,7 @@ impl OriginalNativeStorageMechanism for PairMechanism {
         let result = match observation {
             PairObservation::Origin(witness) => witness.try_attach(owner),
             PairObservation::Existing(witness) => witness.try_attach(owner),
+            PairObservation::Ordinary(witness) => witness.try_attach(owner),
         };
         result.map_err(|error| {
             let (cause, owner) = error.into_parts();
@@ -161,6 +183,7 @@ impl PairMechanism {
         Self {
             runtime: runtime.clone(),
             selection: NativeStorageSelection::default(),
+            initial_publication: None,
         }
     }
     fn provider_controls(&self, capacity: usize, attempts: usize, rows: usize) -> Option<u64> {
@@ -178,9 +201,13 @@ impl PairMechanism {
             sidecar.attachment_failure_bytes(),
             sidecar.original_attachment_control_bytes(),
             OriginalBufferAliasWitness::inspection_control_bytes()?,
+            OrdinaryBufferWitness::inspection_control_bytes()?,
+            crate::backend::runtime::residency::storage::RetainedStoragePublication::attachment_lookup_control_bytes()?,
             // Borrowed native observations own no key or backing. The neutral
             // qualified registry separately prices all scalar key copies.
             size_of::<PairObservation<'static>>(),
+            size_of::<(&PairObservation<'static>, &PairObservation<'static>)>(),
+            size_of::<[safemlx::AllocationInfo; 2]>(),
             size_of::<NativeStorageObservation<AllocationIdentity>>(),
             size_of::<Result<PairObservation<'static>, PairCause>>(),
             size_of::<Result<(), (PairCause, PairAttachment)>>(),
@@ -404,7 +431,7 @@ fn accept(
         ))
     ));
     assert_eq!(pool.used_bytes().unwrap(), before);
-    let (_, exact_reservation, _) = plan_prefill_incremental_with_capacity(
+    let (exact_reservation, _) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
@@ -423,7 +450,7 @@ fn accept(
         capacity >= exact,
         "both quoted components fit the shared ceiling"
     );
-    let (_, reservation, accepted) = plan_prefill_incremental_with_capacity(
+    let (reservation, accepted) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
@@ -603,4 +630,62 @@ fn mutable_component_foreign_unpublished_birth_refuses_and_retains_actual_prepar
     drop(refused);
     safemlx::reclaim_allocation_owners();
     assert_eq!(pool.used_bytes().unwrap(), initial);
+}
+
+#[test]
+fn completed_source_receipt_retires_repeated_request_controls_but_preserves_new_output_custody() {
+    let Some(runtime) = component_runtime() else { return };
+    let initial = baseline(&runtime);
+    let pool = WorkingMemoryPool::new(u64::MAX, initial).unwrap();
+    let owner = crate::backend::managed_memory::NativeMemoryOwner::acquire(&pool).unwrap();
+    let source = Array::from_slice(&[37u32, 41], &[2]);
+    let source_bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
+    let mut source_inventory = crate::backend::runtime::residency::storage::RetainedStorage::default();
+    source_inventory.include_array(&source).unwrap();
+    let receipt = source_inventory.publish_unquoted(&owner).unwrap();
+    drop(owner);
+    let baseline = initial + source_bytes;
+    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    let mechanism = || {
+        let mut value = PairMechanism::new(&runtime);
+        value.initial_publication = Some(receipt.clone());
+        value
+    };
+    let Some(capacity) = shared_capacity(&pool, &mechanism(), [1, 1]) else { return };
+    for _ in 0..3 {
+        let mechanism = mechanism();
+        let mut accepted = accept(&pool, &mechanism, 1, capacity).unwrap();
+        let mut scope = accepted.run.scope().unwrap();
+        let mut publication = accepted.bank.claim_publication(&mut scope).unwrap();
+        publication.publish(&scope, [&source], &[]).unwrap();
+        scope.certify().unwrap();
+        drop((publication, accepted, mechanism));
+        safemlx::reclaim_allocation_owners();
+        crate::backend::ordinary_retirement::reclaim_all();
+        assert_eq!(pool.used_bytes().unwrap(), baseline,
+            "completed source already owns its attachment; no new request Q may remain on it");
+    }
+    // A newly born output has no initial receipt. Its actual original P and Q
+    // remain with an escaped alias after its publishing request is dropped.
+    let mechanism = mechanism();
+    let mut accepted = accept(&pool, &mechanism, 1, capacity).unwrap();
+    let output = construct(&accepted, &mechanism, [43, 47]);
+    let alias = output.clone();
+    let mut scope = accepted.run.scope().unwrap();
+    let mut publication = accepted.bank.claim_publication(&mut scope).unwrap();
+    publication.publish(&scope, [&output], &[]).unwrap();
+    scope.certify().unwrap();
+    let output_host = accepted.span.protected_host_bytes();
+    let output_bytes = output.allocation_info().unwrap().unwrap().bytes() as u64;
+    drop((publication, accepted, output, mechanism));
+    safemlx::reclaim_allocation_owners();
+    assert_eq!(pool.used_bytes().unwrap(), baseline + output_host + output_bytes);
+    assert_eq!(alias.evaluated().unwrap().as_slice::<u32>(), &[43, 47]);
+    drop(alias);
+    safemlx::reclaim_allocation_owners();
+    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    drop(source);
+    safemlx::reclaim_allocation_owners();
+    assert_eq!(pool.used_bytes().unwrap(), initial,
+        "retained initial receipt must not pin the original physical source");
 }

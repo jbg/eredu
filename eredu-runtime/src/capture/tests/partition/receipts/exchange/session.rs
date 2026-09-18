@@ -21,7 +21,7 @@ fn discovery(plan: &AdmittedCapturePlan) -> CaptureDiscovery {
 }
 
 fn configured(plan: AdmittedCapturePlan, ranks: usize) -> CaptureSession {
-    let mut session = CaptureSession::new(plan);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
     session
         .configure_partition_capture(
             PartitionCaptureIdentity::new(
@@ -332,7 +332,7 @@ fn live_global_capture_charges_all_ranks_and_publishes_only_after_commit() {
                 .unwrap();
             assert!(local_total.exceeded(results[0].1).is_none());
             if committed {
-                let mut ordinary = CaptureSession::new((*plan).clone());
+                let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new((*plan).clone()));
                 ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
                 ordinary
                     .observe(&mut Backend::default(), "block.output", &global())
@@ -526,7 +526,7 @@ fn common_coordination_rejects_different_runs_quotas_or_selection_sets_before_so
                     let plan = Arc::clone(&plan);
                     scope.spawn(move || {
                         let transport = transport(world, rank, Fault::None);
-                        let mut session = CaptureSession::new((*plan).clone());
+                        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new((*plan).clone()));
                         session
                             .configure_partition_capture(
                                 PartitionCaptureIdentity::new(
@@ -817,7 +817,7 @@ fn empty_generated_shard_acknowledges_precision_without_losing_global_values() {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>()
     });
-    let mut ordinary = CaptureSession::new(plan_for(CaptureTransform::Slice, false));
+    let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan_for(CaptureTransform::Slice, false)));
     ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
     ordinary
         .observe(&mut Backend::default(), "block.output", &global())

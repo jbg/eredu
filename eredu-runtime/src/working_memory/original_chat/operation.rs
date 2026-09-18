@@ -6,14 +6,14 @@ use super::{
 use crate::working_memory::{OriginalTokenizer, OriginalTokenizerBackend};
 use eredu_core::{ModelRuntime, TokenInputRejection};
 use eredu_text::chat_storage::{
-    ChatMessages, ChatRenderContext, ChatSourceError, ChatTemplatePlan,
+    ChatRenderContext, ChatSourceError, ChatTemplatePlan,
 };
 use std::mem::size_of;
 
-/// Actual source/render/file operation error with no pre-admission error erasure.
+/// Actual source/file operation error with no pre-admission error erasure.
 /// Every admitted variant contains the real closed partial owner by value.
 #[derive(Debug, thiserror::Error)]
-pub enum OriginalChatOperationError {
+pub enum OriginalChatSourceError {
     /// Fixed unsupported/foreign-source rejection before any operation.
     #[error(transparent)]
     Domain(#[from] TokenInputRejection),
@@ -23,9 +23,6 @@ pub enum OriginalChatOperationError {
     /// Actual J constructor/admission error and retained compiler prefix.
     #[error(transparent)]
     Compile(#[from] OriginalChatTemplateError),
-    /// Actual H render/admission error and J/C/partial-render custody.
-    #[error(transparent)]
-    Render(#[from] OriginalChatRenderError),
     /// Consuming config-file I/read/fresh-J error with both original lifetimes.
     #[error(transparent)]
     File(#[from] OriginalChatFileError),
@@ -34,7 +31,7 @@ pub enum OriginalChatOperationError {
     #[error(transparent)]
     FilePreparation(#[from] eredu_checkpoint::artifact::ArtifactFileReadError),
 }
-impl OriginalChatOperationError {
+impl OriginalChatSourceError {
     fn fixed_controls() -> Option<usize> {
         size_of::<Self>()
             .checked_add(size_of::<TokenInputRejection>())?
@@ -46,8 +43,22 @@ impl OriginalChatOperationError {
             .checked_add(size_of::<Option<OriginalChatTemplate>>())?
             .checked_add(size_of::<Result<Option<OriginalChatTemplate>, Self>>())
     }
+}
+
+/// Actual render failure, independent of source compiler storage.
+#[derive(Debug, thiserror::Error)]
+pub enum OriginalChatRenderOperationError {
+    /// Fixed unsupported or foreign-source refusal before rendering.
+    #[error(transparent)]
+    Domain(#[from] TokenInputRejection),
+    /// Actual render/admission failure retaining all partial render storage.
+    #[error(transparent)]
+    Render(#[from] OriginalChatRenderError),
+}
+impl OriginalChatRenderOperationError {
     pub(super) fn render_controls() -> Option<usize> {
-        Self::fixed_controls()?
+        size_of::<Self>().checked_add(size_of::<TokenInputRejection>())?
+            .checked_add(size_of::<Result<(), Self>>())?
             .checked_add(size_of::<Result<OriginalRenderedChat, Self>>())?
             .checked_add(size_of::<Option<OriginalRenderedChat>>())?
             .checked_add(size_of::<Result<Option<OriginalRenderedChat>, Self>>())
@@ -57,6 +68,28 @@ impl OriginalChatOperationError {
 /// text/facade; the concrete backend supplies its existing neutral original pool.
 /// Defaults return a fixed by-value rejection before reading or constructing.
 pub trait OriginalChatBackend: OriginalTokenizerBackend {
+    /// Compile a borrowed capture declaration against retained selected facts.
+    /// Geometry comes from the actual paid prompt; the returned original source
+    /// owns fresh declaration storage and does not grant execution authority.
+    fn compile_original_capture_declaration(
+        _runtime: &ModelRuntime<Self>, _plan: &eredu_core::capture::CapturePlan,
+        _request: eredu_core::capture::CaptureRequestShape,
+        _funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<crate::working_memory::OriginalCaptureSource, crate::working_memory::OriginalCaptureSourceError> {
+        Err(crate::working_memory::OriginalCaptureSourceError::rejected(crate::working_memory::WorkingMemoryError::UnknownBound))
+    }
+
+    /// Compile the same original intervention source used by restored children,
+    /// using this logical session and exact capture geometry. No ordinary source
+    /// may be relabeled; failure preserves the concrete preparation cause.
+    fn compile_original_intervention_declaration(
+        _runtime: &ModelRuntime<Self>, _plan: &eredu_core::intervention::InterventionPlan,
+        _capture: &eredu_core::capture::SharedCapturePlan, _session_id: &str,
+        _funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<crate::working_memory::OriginalInterventionSource, eredu_core::BackendFailure> {
+        Err(TokenInputRejection::Unsupported.into_backend_failure())
+    }
+
     /// Runs the existing neutral original compiler for exact forbidden inputs.
     /// Policy/trigger selection stays in the facade; no native tensor is built.
     fn compile_original_forbidden_source(
@@ -120,39 +153,28 @@ pub trait OriginalChatBackend: OriginalTokenizerBackend {
     fn compile_original_chat_template(
         _runtime: &ModelRuntime<Self>,
         _plan: ChatTemplatePlan<'_>,
-    ) -> Result<OriginalChatTemplate, OriginalChatOperationError> {
+    ) -> Result<OriginalChatTemplate, OriginalChatSourceError> {
         Err(TokenInputRejection::Unsupported.into())
     }
     /// Consuming exact config-file I followed by fresh J in the same account.
+    /// The facade supplies whether the request has tools; the portable text
+    /// compiler owns named-template selection and full metadata validation.
     fn compile_original_chat_template_file(
         _runtime: &ModelRuntime<Self>,
         _read: eredu_checkpoint::artifact::PreparedArtifactFileRead,
         _model_id: &str,
-    ) -> Result<OriginalChatTemplate, OriginalChatOperationError> {
+        _has_tools: bool,
+    ) -> Result<OriginalChatTemplate, OriginalChatSourceError> {
         Err(TokenInputRejection::Unsupported.into())
     }
-    /// Both exact borrowed-message renderings under one original H comparison.
+    /// Exact borrowed defaults, caller values and message controls under the
+    /// same original source and render ownership. No caller borrow escapes.
     fn render_original_chat(
         _runtime: &ModelRuntime<Self>,
         _template: &OriginalChatTemplate,
         _tokenizer: &OriginalTokenizer,
-        _messages: ChatMessages<'_>,
-        _consumer: eredu_core::GenerationSequenceConsumerLayout,
-    ) -> Result<OriginalRenderedChat, OriginalChatOperationError> {
+        _context: ChatRenderContext<'_>,
+    ) -> Result<OriginalRenderedChat, OriginalChatRenderOperationError> {
         Err(TokenInputRejection::Unsupported.into())
-    }
-    /// Exact borrowed defaults/caller values, with the same original source and
-    /// render ownership. Older backends may serve only an actually empty context.
-    fn render_original_chat_with_context(
-        runtime: &ModelRuntime<Self>,
-        template: &OriginalChatTemplate,
-        tokenizer: &OriginalTokenizer,
-        context: ChatRenderContext<'_>,
-        consumer: eredu_core::GenerationSequenceConsumerLayout,
-    ) -> Result<OriginalRenderedChat, OriginalChatOperationError> {
-        if !context.is_plain() {
-            return Err(TokenInputRejection::Unsupported.into());
-        }
-        Self::render_original_chat(runtime, template, tokenizer, context.messages(), consumer)
     }
 }

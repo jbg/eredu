@@ -2,7 +2,7 @@
 
 use super::{
     shared_storage::SharedStorageCustody, SharedStorageAttachmentError, SharedStorageDomain,
-    SharedTokenFilterIdentity, TokenFilter,
+    SharedStorageIdentity, TokenFilter,
 };
 use std::{fmt, ops::Deref, sync::Arc};
 
@@ -44,7 +44,7 @@ impl SharedTokenFilter {
     }
 
     /// Exact owner identity, independent of its filter contents.
-    pub fn identity(&self) -> &SharedTokenFilterIdentity {
+    pub fn identity(&self) -> &SharedStorageIdentity {
         self.0.custody.identity()
     }
 

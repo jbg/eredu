@@ -93,10 +93,10 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
             let parameter = parameter.as_array();
             self.arrays.push((
-                metadata.id.to_string(),
+                metadata.id().to_string(),
                 safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
                     .unwrap(),
             ));
@@ -115,7 +115,7 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
             State,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
@@ -256,12 +256,12 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
             let parameter = parameter.as_array();
             self.arrays.push((
-                metadata.id.to_string(),
+                metadata.id().to_string(),
                 if self.components {
-                    let name = metadata.id.as_str();
+                    let name = metadata.id().as_str();
                     let seed = name
                         .bytes()
                         .fold(0u32, |s, b| s.wrapping_mul(31).wrapping_add(u32::from(b)));
@@ -299,7 +299,7 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
             State,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
@@ -343,8 +343,8 @@ fn initialized_inkling_parameters(
     }
 
     impl<'tensor> ParameterVisitorMut<'tensor, MlxTensor> for Initializer<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'tensor mut MlxTensor) {
-            let name = metadata.id.to_string();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor mut MlxTensor) {
+            let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let dtype = parameter.as_array().dtype();
             let value = if name.ends_with("norm.weight")
@@ -390,11 +390,11 @@ fn initialized_inkling_parameters(
         State,
     >>::execution_graph(&architecture)
     .unwrap();
-    for group in 0..graph.groups().len() {
+    for group in 0..graph.group_count() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
             State,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             let mut unit = <Architecture as eredu_runtime::LayeredArchitecture<
@@ -611,7 +611,34 @@ fn gguf_tensor_from_array(name: impl Into<String>, array: &Array) -> GgufFixture
     if dimensions.is_empty() {
         dimensions.push(1);
     }
-    f32_gguf_tensor(name, dimensions, evaluated.as_slice::<f32>().to_vec())
+    // Expert slices and scalar broadcasts retain their physical strides.
+    // Serialize logical row order without requiring a native compact copy.
+    f32_gguf_tensor(name, dimensions, evaluated.try_to_vec::<f32>().unwrap())
+}
+
+#[test]
+fn gguf_fixture_serializer_preserves_strided_and_broadcast_values() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let values = (1..=24).map(|value| value as f32).collect::<Vec<_>>();
+    let source = Array::from_slice(&values, &[2, 3, 4]);
+    let selected = source.try_index_device((.., 1..2, ..), &stream).unwrap();
+    assert!(matches!(
+        selected.evaluated().unwrap().try_as_slice::<f32>(),
+        Err(safemlx::error::AsSliceError::NonContiguous)
+    ));
+    let broadcast = Array::full::<f32>(
+        &[2, 3], Array::from_f32(-1.25), &stream,
+    ).unwrap();
+    for (array, dimensions, expected) in [
+        (&selected, vec![4, 1, 2], vec![5.0, 6.0, 7.0, 8.0, 17.0, 18.0, 19.0, 20.0]),
+        (&broadcast, vec![3, 2], vec![-1.25; 6]),
+    ] {
+        let tensor = gguf_tensor_from_array("fixture.weight", array);
+        assert_eq!(tensor.dimensions, dimensions);
+        assert_eq!(tensor.name, "fixture.weight");
+        assert_eq!(tensor.data, expected.into_iter()
+            .flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+    }
 }
 
 fn write_inkling_gguf_fixture(path: &Path, components: bool) {

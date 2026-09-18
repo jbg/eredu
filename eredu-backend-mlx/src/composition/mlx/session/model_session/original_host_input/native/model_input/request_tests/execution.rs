@@ -242,7 +242,8 @@ fn snapshot_resumes(
     for branch in [false, true] {
         let previous_copies = budget.usage().cumulative_copy_bytes;
         let bytes = saved
-            .original_resume_preparation_bytes(runtime, resumed_config)
+            .original_resume_preparation_bytes(runtime, resumed_config, &eredu_core::OriginalTextResumeOptions::new(
+                if branch { eredu_core::OriginalTextResumeKind::Branch } else { eredu_core::OriginalTextResumeKind::Restore }))
             .unwrap();
         let host = pool.prepare_generation_resume_host_copy::<
             RetainedGenerationSequence, TextSnapshotError<Error>, MlxBackend<'_>, AllowAll,
@@ -320,7 +321,6 @@ fn run_original(
     vocabulary: u32,
     source: impl FnOnce(&WorkingMemoryPool) -> OriginalPreparedHostInput,
 ) -> ResultRow {
-    eprintln!("media case: positions={input_positions}, residency={mode}, route={route}");
     // The process registry retains admitted stream/source-worker birth accounts
     // after the backend drops. Establish those owners before the request baseline.
     let backend = original_request_backend(pool);

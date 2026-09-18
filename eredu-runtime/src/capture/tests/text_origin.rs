@@ -139,14 +139,14 @@ fn existing_session_and_preflight_keep_cached_context_and_decode_one_origin() {
     })
     .unwrap();
     assert_eq!(estimates, vec![vec![3, 10], vec![1, 12]]);
-    let mut bad = CaptureSession::new(plan.clone());
+    let mut bad = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
     bad.begin_step(CapturePhase::Prefill, 0).unwrap();
     let mut backend = Backend::default();
     assert!(bad
         .observe(&mut backend, "attention.scores", &vec![3, 3])
         .is_err());
     assert_eq!(backend.copies.get(), 0);
-    let mut session = CaptureSession::new(plan);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
     for (phase, prediction, shape) in [
         (CapturePhase::Prefill, 0, vec![3, 10]),
         (CapturePhase::Decode, 1, vec![1, 11]),
@@ -174,7 +174,7 @@ fn existing_session_and_preflight_keep_cached_context_and_decode_one_origin() {
 #[test]
 fn checkpoint_fork_readmits_origin_without_rebasing_prompt_or_local_schedule() {
     let (plan, discovery) = setup(3);
-    let mut session = CaptureSession::new(plan);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
     let mut backend = Backend::default();
     session.begin_step(CapturePhase::Prefill, 0).unwrap();
     session

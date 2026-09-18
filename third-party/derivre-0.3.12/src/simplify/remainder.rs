@@ -99,7 +99,6 @@ impl ExprSet {
         scale: u32,
         fractional: bool,
     ) -> Result<ExprRef, PreparedExprError> {
-        self.require_prepared()?;
         if divisor == 0 || remainder > divisor {
             return Err(PreparedExprError::Source);
         }
@@ -133,8 +132,8 @@ mod tests {
                 );
             }
         }
-        let mut source = ExprSet::new(256);
-        source.reserve(24);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        source.reserve(24).unwrap();
         source.digits = mapping;
         let mut ordinary = source.clone();
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
@@ -148,7 +147,7 @@ mod tests {
             (13, 3, 1, false),
         ];
         for (divisor, remainder, scale, fractional) in cases {
-            let expected = ordinary.mk_remainder_is(divisor, remainder, scale, fractional);
+            let expected = ordinary.mk_remainder_is(divisor, remainder, scale, fractional).unwrap();
             let actual = prepared
                 .source_mut()
                 .try_mk_remainder_is(divisor, remainder, scale, fractional)

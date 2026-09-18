@@ -11,7 +11,7 @@ fn residual_prompt_additional_sources_survive_either_native_scope_quarantining_f
         let g = geometry();
         let quote = replacement_quote(&pool, g, 0);
         let execution = InferenceExecutionIdentity::default();
-        let (_, reservation, accepted) = plan(&pool, &execution, &quote, request(g), 1000).unwrap();
+        let (reservation, accepted) = plan(&pool, &execution, &quote, request(g), 1000).unwrap();
         assert_eq!(reservation.bytes(), 96);
         let (metadata, run) = reservation.into_funding().unwrap();
         let config = TextGenerationConfig::new(ResolvedGenerationConfig {

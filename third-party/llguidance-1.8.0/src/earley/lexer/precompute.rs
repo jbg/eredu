@@ -420,7 +420,7 @@ mod tests {
             Vec::new(),
         ];
         let trie = TokTrie::from(&TokRxInfo::new(tokens.len() as u32, 3), &tokens);
-        let mut spec = LexerSpec::new().unwrap();
+        let mut spec = LexerSpec::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         spec.setup_lexeme_class(RegexAst::NoMatch).unwrap();
         spec.add_simple_literal("long".into(), &word, false)
             .unwrap();

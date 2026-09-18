@@ -24,6 +24,7 @@ enum PreparationCause {
 /// No native array, state or work authority is created by this source binding.
 pub(crate) struct AutoregressiveSourcePair {
     draft: ReplicatedTextControlOrigin,
+    target_media: Option<eredu_runtime::working_memory::MediaSessionBinding>,
     schedule: AutoregressiveScheduleIdentity,
     active: std::cell::RefCell<Option<ActiveSpeculativeInvocation>>,
     prefill: std::cell::RefCell<Option<ActiveSpeculativePrefill>>,
@@ -53,12 +54,13 @@ impl AutoregressiveSourcePair {
         schedule: &AutoregressiveSchedulePlan<'_>,
         pool: &WorkingMemoryPool,
         metadata_capacity: u64,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         let controls = [
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
             size_of::<ReplicatedTextControlOrigin>(),
+            size_of::<Result<eredu_runtime::working_memory::MediaSessionBinding, WorkingMemoryError>>(),
             size_of::<
                 Option<
                     Result<
@@ -79,7 +81,7 @@ impl AutoregressiveSourcePair {
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)
@@ -102,11 +104,21 @@ impl AutoregressiveSourcePair {
             )?;
         Ok(Self {
             draft: draft_origin,
+            target_media: target.erased().original_request_media_binding().ok(),
             schedule: schedule.identity(),
             active: std::cell::RefCell::new(None),
             prefill: std::cell::RefCell::new(None),
             numerical,
         })
+    }
+    pub(crate) fn validate_media_input(
+        &self, semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics,
+    ) -> Result<(), Error> {
+        if self.target_media.as_ref().is_some_and(|binding| semantics.binding().matches(binding)) {
+            Ok(())
+        } else {
+            Err(self.retain_startup_error(PreparationCause::Source))
+        }
     }
     pub(crate) fn numerical_sources(
         &self,
@@ -143,7 +155,7 @@ impl AutoregressiveSourcePair {
     ) {
         self.numerical.numerical_prerequisites()
     }
-    pub(crate) fn metadata_funding(&self) -> &WorkspaceMetadataFunding {
+    pub(crate) fn metadata_funding(&self) -> &HostMetadataFunding {
         self.numerical.metadata_funding()
     }
     pub(crate) fn schedule_identity(&self) -> AutoregressiveScheduleIdentity {
@@ -200,13 +212,14 @@ pub(crate) struct PreparedAutoregressiveInvocation<'source> {
     source_origin: ReplicatedTextControlOrigin,
     group_control_bytes: u64,
     group_source_facts: Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+    media_source: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
     projected: ProjectedResidentState,
     layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     report: InferenceWorkspaceReport,
     recipe: AutoregressiveEquationRecipe,
     context: WorkspaceContext,
     // All actual payload buffers, inspection handles and error prefixes first.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl<'source> PreparedAutoregressiveInvocation<'source> {
     /// Consumes the already-spent claim before any preparation. Refusal or drop
@@ -256,7 +269,7 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         quote
             .funding
@@ -281,6 +294,7 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             .bind_speculative_neural_recipe(quote.layerwise.as_ref(), sources.numerical_sources().pool(), &quote.funding, &mut quote.recipe)
             .map_err(|cause| retain_planning_error(cause, quote.funding.clone()))?;
         let AutoregressiveWorkspaceRecipe {
+            media_source,
             projected,
             layerwise,
             report,
@@ -305,6 +319,7 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             source_origin,
             group_control_bytes,
             group_source_facts,
+            media_source,
             projected,
             layerwise,
             report,

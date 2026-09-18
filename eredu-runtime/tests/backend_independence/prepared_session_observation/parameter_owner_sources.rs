@@ -13,6 +13,9 @@ impl
         RecordingPolicy,
     > for CustomStrategy
 {
+    fn group_submission_mechanism(_: &()) -> eredu_runtime::GroupSubmissionMechanism {
+        eredu_runtime::GroupSubmissionMechanism::PolicyOnly
+    }
     type Runtime = ();
     fn mark_terminal_failure(_: &(), _: DistributedExecutionPhase) {}
     fn visit_retained_values(_: &(), _: &mut dyn FnMut(&FakeTensor)) -> bool {

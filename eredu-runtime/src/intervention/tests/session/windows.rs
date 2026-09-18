@@ -197,7 +197,7 @@ fn run(action: InterventionAction, stride: u64) -> CaptureSession {
     // Existing routing admission requires bounded ID/coefficient previews.
     // The actual I32/F32 source fields retain the same bounded ordered prefix.
     plan.operations[0].evidence = InterventionEvidence::Preview { max_elements: 3 };
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(
             plan.admit_invocations(&discovery, bounds, "session")

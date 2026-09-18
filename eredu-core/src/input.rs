@@ -140,6 +140,22 @@ pub enum InputExtent {
     },
     /// Number of valid (unpadded) input audio frames.
     AudioValidFrames(usize),
+    /// Origin of one processor-emitted frame or temporal group in a video input.
+    /// This is descriptive source metadata, never execution or source authority.
+    VideoFrame {
+        /// Ordered source request segment containing the original video.
+        group: usize,
+        /// Position among this video's emitted temporal groups.
+        index: usize,
+        /// Complete number of groups emitted for this video.
+        count: usize,
+        /// First selected original frame folded into this group.
+        first_source_frame: usize,
+        /// Last selected original frame, including final temporal padding.
+        last_source_frame: usize,
+        /// Exact finite positive IEEE-754 source frame rate used by the processor.
+        source_fps_bits: u64,
+    },
 }
 
 impl InputExtent {
@@ -150,6 +166,7 @@ impl InputExtent {
                 matches!(modality, InputModality::Image | InputModality::Video)
             }
             Self::AudioValidFrames(_) => matches!(modality, InputModality::Audio),
+            Self::VideoFrame { .. } => matches!(modality, InputModality::Video),
         }
     }
 
@@ -157,6 +174,7 @@ impl InputExtent {
         match self {
             Self::PatchGrid { .. } => 0,
             Self::AudioValidFrames(_) => 1,
+            Self::VideoFrame { .. } => 2,
         }
     }
 
@@ -178,6 +196,14 @@ impl InputExtent {
                 width: cursor.usize("patch grid width")?,
             }),
             1 => Ok(Self::AudioValidFrames(cursor.usize("valid audio frames")?)),
+            2 => Ok(Self::VideoFrame {
+                group: cursor.usize("video group")?, index: cursor.usize("video index")?,
+                count: cursor.usize("video count")?,
+                first_source_frame: cursor.usize("video first source frame")?,
+                last_source_frame: cursor.usize("video last source frame")?,
+                source_fps_bits: u64::from(cursor.next("video frame rate low")?)
+                    | (u64::from(cursor.next("video frame rate high")?) << 32),
+            }),
             value => Err(PreparedInputError::InvalidWireValue {
                 field: "input extent",
                 value,
@@ -826,6 +852,26 @@ mod tests {
                 width: 2,
             }]
         );
+    }
+
+    #[test]
+    fn video_frame_origin_survives_wire_and_changes_identity() {
+        let origin = InputExtent::VideoFrame {
+            group: 3, index: 1, count: 2, first_source_frame: 7, last_source_frame: 9,
+            source_fps_bits: (30000.0f64 / 1001.0).to_bits(),
+        };
+        let identity = |origin| PreparedInputIdentity::new(vec![InputPartDescriptor::new_with_extents(
+            InputModality::Video, InputPayloadKind::Tensor,
+            tensor(TensorDtype::F32, &[4, 12]), [],
+            [InputExtent::PatchGrid { time: 2, height: 1, width: 2 }, origin],
+        ).unwrap()]).unwrap();
+        let expected = identity(origin);
+        let words = expected.encode_words().unwrap();
+        assert_eq!(PreparedInputIdentity::decode_words(&words).unwrap(), expected);
+        let InputExtent::VideoFrame { group, index, count, first_source_frame, last_source_frame, .. } = origin else { unreachable!() };
+        assert_ne!(expected, identity(InputExtent::VideoFrame {
+            group, index, count, first_source_frame, last_source_frame, source_fps_bits: 30.0f64.to_bits(),
+        }));
     }
 
     #[test]

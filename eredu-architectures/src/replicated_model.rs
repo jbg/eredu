@@ -662,9 +662,9 @@ fn parameter_description<B: NeuralBackend, U: Parameterized<B::Tensor>>(
         metadata.charge_metadata(std::mem::size_of_val(&build))?;
     }
     let graph = match metadata {
-        Some(metadata) => decoder.execution_graph_with_metadata(metadata)?
+        Some(metadata) => decoder.execution_graph()?
             .into_owned_with_metadata(metadata)?,
-        None => decoder.execution_graph()?,
+        None => decoder.execution_graph()?.into_owned(),
     };
     let layout = match metadata {
         Some(metadata) => ExecutionUnitLayout::new_with_metadata(&graph, &[layers], metadata)?,
@@ -790,36 +790,26 @@ macro_rules! architecture_parameters {
         {
             type DefinitionError = Error;
 
-            fn state_layout(&self) -> Result<StateLayout, Error> {
-                F::state_layout(&self.config)
-            }
 
-            fn state_layout_with_metadata(
+            fn state_layout(
                 &self,
-                context: &eredu_nn::workspace::WorkspaceContext,
+                context: Option<&eredu_nn::workspace::WorkspaceContext>,
             ) -> Result<StateLayout, Error> {
+match context { Some(context) => {
                 F::state_layout_with_metadata(&self.config, context)
-            }
+            }, None => {
+                F::state_layout(&self.config)
+            } }
+}
+
 
             fn state_identity(
                 &self,
                 state: &eredu_runtime::PartitionState,
                 topology: PromptCacheTopology,
+                metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
             ) -> Result<ModelStateIdentity, Error> {
-                F::state_identity(
-                    &self.config,
-                    state.layout(),
-                    state.global_layer_offset(),
-                    topology,
-                )
-            }
-
-            fn state_identity_with_metadata(
-                &self,
-                state: &eredu_runtime::PartitionState,
-                topology: PromptCacheTopology,
-                metadata: &eredu_nn::workspace::WorkspaceContext,
-            ) -> Result<ModelStateIdentity, Error> {
+match metadata { Some(metadata) => {
                 F::state_identity_with_metadata(
                     &self.config,
                     state.layout(),
@@ -827,12 +817,22 @@ macro_rules! architecture_parameters {
                     topology,
                     metadata,
                 )
-            }
+            }, None => {
+                F::state_identity(
+                    &self.config,
+                    state.layout(),
+                    state.global_layer_offset(),
+                    topology,
+                )
+            } }
+}
 
-            fn parameter_description(
-                &self,
-                context: &<B::Tensor as Tensor>::Context,
-            ) -> Result<ArchitectureParameterDescription, Error> {
+            fn parameter_description(&self, context: &<B::Tensor as Tensor>::Context)
+                -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+                crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
+                    &Self, &<B::Tensor as Tensor>::Context, std::borrow::Cow<'_, ArchitectureParameterDescription>,
+                )>()?;
+                (|| {
                 parameter_description(
                     &self.decoder,
                     F::layer_count(
@@ -843,7 +843,9 @@ macro_rules! architecture_parameters {
                     context,
                     |index| F::build_unit(&self.config, index, context),
                 )
+            })().map(std::borrow::Cow::Owned)
             }
+
 
             fn retained_static_value_slot_bound(&self) -> Option<usize> {
                 eredu_nn::Parameterized::retained_value_slot_bound(self.decoder.static_modules())
@@ -926,19 +928,20 @@ macro_rules! common_layered_methods {
             F::OBSERVATION_HOOKS
         }
         fn prefill_observation_declarations(
-            &self,
-        ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error> {
+            &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
             if !F::CAUSAL_PREFILL_ROWS {
                 return Ok(Vec::new());
             }
             // These paths belong to this selected shell, including its actual
             // state profile and checkpoint transformation. No direct family
             // model is reconstructed to supply a different path owner.
-            let count = self.decoder.group_unit_count(0)?;
+            let count = self.decoder.group_unit_count(0, metadata_context)?;
             crate::decoder::ordinary_prefill_observation_declarations(
-                (0..count).map(|index| self.decoder.unit_path(0, index)),
-                true,
-            )
+                (0..count).map(|index| self.decoder.unit_path(0, index, metadata_context)),
+                true, metadata_context)
         }
         fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
             crate::transport::decoder()
@@ -959,27 +962,21 @@ macro_rules! common_layered_methods {
         ) -> eredu_runtime::ArchitectureStatePartitionPlan {
             crate::transport::pipeline_state(0, layout)
         }
-        fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
             self.decoder.execution_graph()
         }
-        fn execution_graph_with_metadata(
-            &self,
-            context: &eredu_nn::workspace::WorkspaceContext,
-        ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
-            self.decoder.execution_graph_with_metadata(context)
+
+        fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+            self.decoder.group_unit_count(group, metadata_context)
         }
-        fn group_unit_count_with_metadata(
-            &self,
-            group: usize,
-            context: &eredu_nn::workspace::WorkspaceContext,
-        ) -> Result<usize, Error> {
-            self.decoder.group_unit_count_with_metadata(group, context)
-        }
-        fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-            self.decoder.group_unit_count(group)
-        }
-        fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-            self.decoder.unit_path(group, index)
+        fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+            self.decoder.unit_path(group, index, metadata_context)
         }
         fn static_modules(&self) -> &Self::StaticModules {
             self.decoder.static_modules()
@@ -1099,7 +1096,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
 
@@ -1148,7 +1145,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::forward_unit(
             unit,
             hidden,
@@ -1172,7 +1169,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         F::forward_unit_observed(
             unit,
             &path,
@@ -1232,7 +1229,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
 
@@ -1281,7 +1278,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         let mut layer = AttentionLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1303,7 +1300,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         let mut layer = AttentionLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1359,7 +1356,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
 
@@ -1400,7 +1397,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         let mut layer = FixedLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1422,7 +1419,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         let mut layer = FixedLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1477,7 +1474,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
 
@@ -1522,7 +1519,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         let mut layer = StatelessLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1544,7 +1541,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         let mut layer = StatelessLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1598,7 +1595,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
 
@@ -1647,7 +1644,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::forward_unit(
             unit,
             hidden,
@@ -1671,7 +1668,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         F::forward_unit_observed(
             unit,
             &path,
@@ -1731,7 +1728,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         F::build_unit(&self.config, index, context)
     }
     fn begin_forward<'a>(
@@ -1778,7 +1775,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.decoder.unit_path(group, index, None)?;
         let mut layer = CompressedLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,
@@ -1800,7 +1797,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.decoder.unit_path(group, index, None)?;
         let mut layer = CompressedLayer::<B, _> {
             inner: state.layer(index).map_err(Error::backend)?,
             backend: PhantomData,

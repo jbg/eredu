@@ -75,8 +75,8 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
             size_of::<Result<(),PartitionCaptureProgramError>>()*2,
             size_of::<(&mut Self,&mut ScheduledCaptureStep<'_>,DistributedCommitEpoch,&mut CaptureLedger)>(),
             size_of::<(&mut Self,&mut ScheduledCaptureStep<'_>,crate::layered::BoundCaptureSelection<'_>,&crate::prefill::PrefillChunk,PrefillEvidenceProgress)>(),
-            size_of::<(SharedCapturePlan,WorkspaceMetadataFunding)>(),
-            size_of::<(&SharedCapturePlan,&WorkspaceMetadataFunding)>(),
+            size_of::<(SharedCapturePlan,HostMetadataFunding)>(),
+            size_of::<(&SharedCapturePlan,&HostMetadataFunding)>(),
             size_of::<Option<&mut dyn ScheduledPartitionCapture>>(),
             eredu_core::BackendFailure::source_retention_peak_bytes::<crate::layered::PreparedCaptureSelectionError>()
                 .ok_or_else(||self.error(Cause::Source("evidence declaration controls overflow")))?,

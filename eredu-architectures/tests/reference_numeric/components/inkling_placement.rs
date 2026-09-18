@@ -614,7 +614,7 @@ fn inkling_partition_bank_trials(
                             assert!(routers.iter().all(|parameter| !matches!(parameter.lowering(), eredu_runtime::WeightLoweringKind::Transform | eredu_runtime::WeightLoweringKind::DerivedTransform)));
                             let target_args = eredu_architectures::inkling::with_checkpoint_formats(args, selected.parameters().iter().filter_map(|parameter| parameter.executable().weight_quantization().map(|format| (parameter.name().to_owned(), format))).collect()).unwrap();
                             let target = eredu_architectures::inkling::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
-                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
+                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap().into_owned();
                             let topology_rank = ParallelRankTopology::new(topology, rank).unwrap();
                             let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, topology_rank).unwrap();
                             let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, topology_rank).unwrap();

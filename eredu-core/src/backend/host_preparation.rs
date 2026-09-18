@@ -55,6 +55,14 @@ impl HostPreparationAuthority {
         self.owner.is_none()
     }
 
+    /// Checks the actual retained metadata payer without exposing its authority.
+    /// This establishes account identity only, never an allocation permission.
+    pub(crate) fn is_funded_by(&self, funding: &super::HostMetadataFunding) -> bool {
+        self.owner.as_ref().and_then(|retention| retention.owner.as_ref())
+            .and_then(|owner| owner.downcast_ref::<super::HostMetadataFunding>())
+            .is_some_and(|actual| actual.same_account(funding))
+    }
+
     /// Exact requested shared-shell layout and named constructor/retirement
     /// controls for the same closed authority producer. This reports storage;
     /// it grants neither bytes nor permission to retain an unqualified payload.

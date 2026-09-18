@@ -59,6 +59,14 @@ impl ResidentNativeRecipe {
         let waits = per_forward
             .checked_mul(consumers)
             .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
+        let source_controls = if completion == BoundaryCompletion::RetainedEvent {
+            ResidentDispatchPopulation::completion_stream_control_bytes()
+        } else { 0 };
+        if source_controls != 0 {
+            if let Some(funding) = &self.planning_metadata {
+                funding.reserve_metadata(source_controls).map_err(Error::WorkspacePlanning)?;
+            }
+        }
         // Both workers use run_nested_graph_event. Mixed CPU/GPU callbacks
         // settle before its suspended resident bank is restored; GPU-only
         // retained events keep the ordinary asynchronous completion ownership.
@@ -80,14 +88,11 @@ impl ResidentNativeRecipe {
             } else {
                 let traversal = row.traversal.expect("checked traversal");
                 let dispatch = row.dispatch.expect("checked dispatch");
-                // A CPU equation has one actual CPU stream and the same
-                // retained Event owner. Its exact CPU producer must be present;
-                // callback work settles before the suspended graph is restored.
+                // The same native device may own more than one source stream.
+                // Keep the exact model/router/collective classification shared
+                // with source-copy expansion and native Graph construction.
                 (completion == BoundaryCompletion::RetainedEvent
-                    && (traversal.limits().streams
-                        != usize::from(dispatch.gpu_entries != 0)
-                            + usize::from(dispatch.cpu_entries != 0)
-                        || (dispatch.gpu_entries == 0 && dispatch.cpu_model.is_none())))
+                    && dispatch.completion_streams() != Some(traversal.limits().streams))
                     .then_some("completion stream population")
             };
             if let Some(requirement) = requirement {
@@ -106,6 +111,12 @@ impl ResidentNativeRecipe {
             row.nested_completions
                 .checked_add(per_forward)
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
+            if source_controls != 0 && self.planning_metadata.is_none() {
+                row.query_controls = Some(row.query_controls
+                    .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?
+                    .checked_add(source_controls)
+                    .ok_or_else(|| error(WorkingMemoryError::Overflow))?);
+            }
         }
         safemlx::OperationEvent::wait_record_layout(waits).ok_or_else(|| {
             Error::PrefillControl(WorkingMemoryError::UnknownBound)

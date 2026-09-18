@@ -1,9 +1,12 @@
-//! Compact media ingress consumed by the ordinary selected prefill transaction.
+//! Compact media ingress consumed by the shared selected prefill transaction.
 //!
-//! Construction in this first integration is explicitly ordinary. These types
-//! do not supply original media-input, graph, or native completion funding.
+//! Sources retain one inference request or one accepted speculative occurrence.
+//! Workspace-only sources retain neither; every native graph, storage and
+//! completion authority remains with the calling transaction.
 
 pub(crate) mod construction;
+mod origin;
+pub(crate) use origin::MediaPrefillOrigin;
 
 use crate::layered::invocation::LayeredInvocation;
 use crate::prefill::PrefillChunk;
@@ -11,7 +14,7 @@ use crate::working_memory::{
     InferenceExecutionIdentity, InferenceRequest, InferenceStateRevision, WorkingMemoryError,
 };
 use crate::{
-    ExecutionGraph, LayeredForwardState, LayeredTraversalHook, ParallelLayeredArchitecture,
+    ExecutionGraph, LayeredForwardState, LayeredTraversalHook,
     RuntimeState, SharedPreparedInputCacheIdentity,
 };
 use eredu_core::InferenceGeometry;
@@ -71,59 +74,19 @@ where
     /// plan input. Default rejects this optional capability before publication.
     fn validate_ingress_cache_identity(
         _plan: &Self::IngressPlan,
-        _identity: &SharedPreparedInputCacheIdentity,
-    ) -> Result<(), Self::Error> {
-        Err(Self::ingress_error(MediaIngressError::ForeignIdentity))
+        _identity: &SharedPreparedInputCacheIdentity, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Self::Error> {
+        Err(Self::ingress_error(MediaIngressError::ForeignIdentity, metadata_context))
     }
-    /// Counted validation of the same cache/source relationship. Implementors
-    /// must preserve that relationship before supporting the original route.
-    fn validate_ingress_cache_identity_with_metadata(
-        _plan: &Self::IngressPlan,
-        _identity: &SharedPreparedInputCacheIdentity,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<(), Self::Error> {
-        Err(Self::ingress_error_with_metadata(
-            MediaIngressError::ForeignIdentity,
-            context,
-        ))
-    }
-    /// Borrows this architecture's retained validated graph when available.
-    /// The compatibility default preserves its existing declaration producer;
-    /// a prepared adapter must reject invalidated evidence without rebuilding it.
-    fn ingress_execution_graph(
-        &self,
-    ) -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.execution_graph()
-            .map(crate::ArchitectureExecutionGraph::owned)
-    }
-    /// Checked companion for the same graph loan and its error destination.
-    /// The default alone does not qualify an ordinary declaration producer.
-    fn ingress_execution_graph_with_metadata(
-        &self,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.ingress_execution_graph()
-    }
+/// Loans the actual graph after adapter admission checks. The destination
+    /// funds diagnostic errors; it never selects a second graph producer.
+    fn ingress_execution_graph(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error>;
     /// Validates the plan against this actual selected architecture before work.
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan) -> Result<(), Self::Error>;
+    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Self::Error>;
     /// Preserves a typed ingress contract cause within the architecture error.
-    fn ingress_error(error: MediaIngressError) -> Self::Error;
-    /// Uses the same source checks with a participating diagnostic destination.
-    /// The compatibility default is not a complete metadata qualification.
-    fn validate_ingress_plan_with_metadata(
-        &self,
-        plan: &Self::IngressPlan,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<(), Self::Error> {
-        self.validate_ingress_plan(plan)
-    }
-    /// Retains the same typed cause through a participating error constructor.
-    fn ingress_error_with_metadata(
-        error: MediaIngressError,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Self::Error {
-        Self::ingress_error(error)
-    }
+    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Self::Error;
+/// Retains the same typed cause through a participating error constructor.
+
     /// Starts only ingress work; full-prompt decoder embeddings/masks are deferred.
     fn begin_ingress(
         &mut self,
@@ -184,6 +147,12 @@ impl CompositePrefillCut {
             |count| Ok(Vec::with_capacity(count)),
             |cause| cause,
         )
+    }
+
+    pub(crate) fn new_with_metadata(graph: ExecutionGraph, primary: &str,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        construction::Destination(Some(context)).cut(graph, primary)
     }
 
     fn new_with_storage<E>(
@@ -273,7 +242,7 @@ where
 {
     pub(crate) plan: A::IngressPlan,
     pub(crate) cut: CompositePrefillCut,
-    request: InferenceRequest,
+    origin: MediaPrefillOrigin,
     prompt_identity: Option<crate::SharedPreparedInputCacheIdentity>,
     geometry: InferenceGeometry,
     revision: InferenceStateRevision,
@@ -330,12 +299,21 @@ where
     ) -> Result<Self, E> {
         let geometry = A::ingress_geometry(&plan);
         request.validate(execution, geometry).map_err(error)?;
+        Self::from_storage(plan, cut, MediaPrefillOrigin::Inference(request), revision, allocate)
+    }
+
+    fn from_storage<E>(
+        plan: A::IngressPlan, cut: CompositePrefillCut, origin: MediaPrefillOrigin,
+        revision: InferenceStateRevision,
+        allocate: impl FnOnce(usize) -> Result<Vec<CutValue<B::Tensor>>, E>,
+    ) -> Result<Self, E> {
+        let geometry = A::ingress_geometry(&plan);
         let mut cut_values = allocate(cut.graph.groups().len())?;
         cut_values.resize_with(cut.graph.groups().len(), || CutValue::Unseen);
         Ok(Self {
             plan,
             cut,
-            request,
+            origin,
             prompt_identity: None,
             geometry,
             revision,
@@ -350,16 +328,43 @@ where
         })
     }
 
+    pub(crate) fn new_speculative(
+        plan: A::IngressPlan, cut: CompositePrefillCut,
+        role: crate::working_memory::OriginalSpeculativeRole,
+        revision: InferenceStateRevision,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        role.validate_prefill_geometry(A::ingress_geometry(&plan))
+            .map_err(|cause| context.metadata_source(cause))?;
+        context.charge_metadata(std::mem::size_of::<(
+            Self, Result<Self, eredu_nn::Error>, A::IngressPlan, CompositePrefillCut,
+            crate::working_memory::OriginalSpeculativeRole, InferenceStateRevision,
+            Vec<CutValue<B::Tensor>>, CutValue<B::Tensor>,
+        )>())?;
+        let origin=MediaPrefillOrigin::speculative(role,A::ingress_geometry(&plan))
+            .map_err(|cause|context.metadata_source(cause))?;
+        let mut source = Self::from_storage(plan, cut, origin, revision,
+            |count| context.metadata_vec(count))?;
+        source.metadata = Some(context.clone());
+        Ok(source)
+    }
+
+    pub(crate) fn validate_speculative_span(
+        &self, span: &crate::working_memory::OriginalSpeculativePrefillSpan,
+    ) -> Result<(), WorkingMemoryError> {
+        self.origin.validate_span(span)?;
+        self.validate_span(span.chunk()).map_err(|_| WorkingMemoryError::IdentityMismatch)
+    }
+
     pub(crate) fn with_prompt_identity(
         mut self,
         identity: Option<crate::SharedPreparedInputCacheIdentity>,
     ) -> Result<Self, A::Error> {
         if let Some(identity) = &identity {
             match &self.metadata {
-                Some(metadata) => A::validate_ingress_cache_identity_with_metadata(
-                    &self.plan, identity, metadata,
-                )?,
-                None => A::validate_ingress_cache_identity(&self.plan, identity)?,
+                Some(metadata) => A::validate_ingress_cache_identity(
+                    &self.plan, identity, Some(metadata))?,
+                None => A::validate_ingress_cache_identity(&self.plan, identity, None)?,
             }
         }
         self.prompt_identity = identity;
@@ -372,9 +377,11 @@ where
             .or_else(|| A::ingress_cache_identity(&self.plan))
     }
 
-    /// Existing ordinary request bound to this source; cloning grants no new work.
-    pub fn request(&self) -> &InferenceRequest {
-        &self.request
+    /// Actual inference request, when this source was prepared for that driver.
+    /// Speculative ingress carries its accepted role instead and cannot be
+    /// converted into an inference request or replayed by the ordinary driver.
+    pub fn request(&self) -> Result<&InferenceRequest, WorkingMemoryError> {
+        self.origin.request()
     }
 
     /// Exact original decoder and chunk geometry.
@@ -396,7 +403,7 @@ where
         &self,
         request: &InferenceRequest,
     ) -> Result<(), WorkingMemoryError> {
-        self.request.validate_same_request(request)
+        self.request()?.validate_same_request(request)
     }
 
     pub(crate) fn validate_span(&self, chunk: &PrefillChunk) -> Result<(), MediaIngressError> {
@@ -481,6 +488,7 @@ where
             self.phase = Phase::Failed;
             return Err(error);
         }
+        self.origin.committed().map_err(|_|MediaIngressError::InvalidSpan)?;
         self.next = self.current_end;
         self.revision = revision.clone();
         self.phase = if self.next == self.geometry.input_positions {
@@ -527,8 +535,8 @@ where
             .as_ref()
             .or_else(|| B::construction_metadata(context))
         {
-            Some(metadata) => A::ingress_error_with_metadata(error, metadata),
-            None => A::ingress_error(error),
+            Some(metadata) => A::ingress_error(error, Some(metadata)),
+            None => A::ingress_error(error, None),
         }
     }
     fn matches_graph(
@@ -536,15 +544,7 @@ where
         architecture: &A,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<bool, A::Error> {
-        let graph = match self
-            .source
-            .metadata
-            .as_ref()
-            .or_else(|| B::construction_metadata(context))
-        {
-            Some(metadata) => architecture.ingress_execution_graph_with_metadata(metadata)?,
-            None => architecture.ingress_execution_graph()?,
-        };
+        let graph = architecture.ingress_execution_graph(self.source.metadata.as_ref().or_else(|| B::construction_metadata(context)))?;
         Ok(graph.matches(&self.source.cut.graph))
     }
     fn validate_plan(
@@ -559,9 +559,9 @@ where
             .or_else(|| B::construction_metadata(context))
         {
             Some(metadata) => {
-                architecture.validate_ingress_plan_with_metadata(&self.source.plan, metadata)
+                architecture.validate_ingress_plan(&self.source.plan, Some(metadata))
             }
-            None => architecture.validate_ingress_plan(&self.source.plan),
+            None => architecture.validate_ingress_plan(&self.source.plan, None),
         }
     }
 
@@ -651,6 +651,17 @@ where
             context,
         )
     }
+    /// Uses the same ingress transition while observing its exact retained cut.
+    pub fn enter_group_with_cut(
+        &mut self, architecture: &mut A, group: usize, initial: &mut B::Tensor,
+        forward: &mut A::ForwardContext, state: &mut S, parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        cut: &mut dyn FnMut(&mut dyn FnMut(&mut dyn FnMut(&B::Tensor))) -> Result<(), A::Error>,
+    ) -> Result<bool, A::Error> {
+        self.before_group_using(architecture, group, initial, forward, state, parallel, context,
+            |ingress| cut(&mut |visitor| A::visit_ingress_roots(ingress, visitor)))
+    }
+
     /// Creates only family semantic context for the actual received boundary.
     pub fn begin_received(
         &mut self,

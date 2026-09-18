@@ -153,7 +153,7 @@ pub(crate) fn execute(
         run(input, geometry, &mut Native(stream))
     })();
     let (state, output) = result.map_err(|cause| match OriginalScopeObserver::try_current() {
-        Ok(None) => Error::backend_source(cause),
+        Ok(None) => Error::backend_retained_source(cause),
         _ => Error::backend_retained_source(cause),
     })?;
     Ok(SelectiveStateSpaceScanOutput {
@@ -191,7 +191,7 @@ pub(crate) fn control_bytes(sequence: usize, handles: usize, indices: usize) -> 
         size_of::<
             Result<SelectiveScanGeometry, eredu_nn::operation_geometry::SelectiveScanGeometryError>,
         >(),
-        Error::retained_source_control_bytes::<Exception>()?,
+        Error::retained_source_construction_bytes::<Exception>()?,
         Exception::retained_source_control_bytes::<
             Refusal<eredu_nn::operation_geometry::SelectiveScanGeometryError>,
         >()?,

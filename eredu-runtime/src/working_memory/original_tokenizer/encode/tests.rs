@@ -336,3 +336,61 @@ mod template;
 mod lfm;
 
 mod nfc;
+mod composition;
+
+#[test]
+fn wordlevel_whitespace_source_and_encoding_have_exact_original_custody() {
+    const SOURCE: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"added_tokens":[],"model":{"type":"WordLevel","unk_token":"[UNK]","vocab":{"[UNK]":0,"alpha":2,"é":5,"中文":9}}}"#;
+    let c=WorkingMemoryPool::tokenizer_required_bytes(&TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap();
+    let short=WorkingMemoryPool::new(c-1,0).unwrap();
+    let refusal=short.compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap_err();
+    assert!(matches!(refusal.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{..})));
+    assert_eq!(short.used_bytes().unwrap(),0);
+    let pool=WorkingMemoryPool::new(64*1024*1024,0).unwrap();
+    let tokenizer=source(&pool,SOURCE);
+    assert_eq!(tokenizer.original_bytes(),c);
+    let input="alpha\u{a0}é 中文 missing";
+    let e=WorkingMemoryPool::tokenizer_encode_required_bytes(&tokenizer,input,false).unwrap();
+    let ids=pool.encode_tokenizer_ids(&tokenizer,input,false).unwrap();
+    assert_eq!(ids.ids(),[2,5,9,0]);
+    assert!(ids.matches_source(&tokenizer));
+    assert_eq!(pool.used_bytes().unwrap(),c+e);
+    drop(tokenizer);
+    assert_eq!(pool.used_bytes().unwrap(),c+e);
+    drop(ids);
+    assert_eq!(pool.used_bytes().unwrap(),0);
+    let limited=WorkingMemoryPool::new(c+e-1,0).unwrap();
+    let tokenizer=source(&limited,SOURCE);
+    let error=limited.encode_tokenizer_ids(&tokenizer,input,false).unwrap_err();
+    assert!(matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{..})));
+    assert_eq!(limited.used_bytes().unwrap(),c);
+}
+
+#[test]
+fn unigram_source_and_path_storage_retain_one_original_allowance() {
+    const SOURCE: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"added_tokens":[],"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",-9.0],["a",-1.0],["ab",-1.0],["é",-1.0],[" ",-1.0]]}}"#;
+    let c = WorkingMemoryPool::tokenizer_required_bytes(&TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap();
+    let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
+    let refusal = short.compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap_err();
+    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    assert_eq!(short.used_bytes().unwrap(), 0);
+    let pool = WorkingMemoryPool::new(64 * 1024 * 1024, 0).unwrap();
+    let tokenizer = source(&pool, SOURCE);
+    let input = "ab aé🙂";
+    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&tokenizer, input, false).unwrap();
+    let ids = pool.encode_tokenizer_ids(&tokenizer, input, false).unwrap();
+    assert_eq!(ids.ids(), [2, 4, 1, 3, 0]);
+    assert!(ids.matches_source(&tokenizer));
+    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    drop(tokenizer);
+    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    drop(ids);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let limited = WorkingMemoryPool::new(c + e - 1, 0).unwrap();
+    let tokenizer = source(&limited, SOURCE);
+    let refusal = limited.encode_tokenizer_ids(&tokenizer, input, false).unwrap_err();
+    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    assert_eq!(limited.used_bytes().unwrap(), c);
+}
+
+mod pretokenizer;

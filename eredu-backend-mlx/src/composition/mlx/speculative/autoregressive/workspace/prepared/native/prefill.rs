@@ -16,6 +16,7 @@ struct Program {
     addressable:Option<SpeculativeAddressableSources>,
     input: PreparedPrefillInput,
     recipe: AutoregressiveEquationRecipe,
+    media_source: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
     projected: ProjectedResidentState,
     layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     report: InferenceWorkspaceReport,
@@ -24,7 +25,7 @@ struct Program {
     roots_runtime: PrefillRootsRuntime,
     finished: Cell<bool>,
     role: OriginalSpeculativeRole,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Private callback installation, never a reusable source or admission proof.
 /// Its last Rc shell retires before the program and the program's funding.
@@ -93,15 +94,18 @@ impl PreparedAutoregressiveInvocation<'_> {
         }
         // The exact copied U32 source is complete before tracing. Only its
         // actual static index is added to each original equation row.
+        if input.media_packet().is_none() {
         self.recipe
             .bind_prefill_inputs(mechanism, &self.context, |chunk| {
                 input.trace_span(chunk, &self.context)
             })
             .map_err(|cause| cold(Cause::Backend(cause)))?;
+        }
         let row_count = self.recipe.records().len();
         let mut addressable=SpeculativeAddressableSources::prepare(self.recipe.records(),self.group_source_facts,&self.funding)?;
-        let view_controls =
-            PreparedPrefillInput::view_control_bytes().ok_or_else(|| cold(Cause::Unknown))?;
+        let view_controls = if input.media_packet().is_some() { 0 } else {
+            PreparedPrefillInput::view_control_bytes().ok_or_else(|| cold(Cause::Unknown))?
+        };
         let mut plans = self
             .context
             .metadata_vec::<Plan>(row_count)
@@ -193,15 +197,14 @@ impl PreparedAutoregressiveInvocation<'_> {
                 .map_err(|cause|retain_planning_error(cause,self.funding.clone()))?,
             None=>requirements,
         }};
-        let role = self
-            .sources.request()
-            .reserve_role(self.claim, requirements)
-            .map_err(|cause| retain_planning_error(cause, self.funding.clone()))?;
+        let role = reserve_role(self.sources, self.claim, requirements, row_count, &self.funding)?;
+        input.prepare_media_source(self.model,self.state,self.report.geometry(),&role,&self.context)?;
         let active = ActiveSpeculativePrefill(Some(Rc::new(Program {
             plans,
             addressable,
             input,
             recipe: self.recipe,
+            media_source: self.media_source,
             projected: self.projected,
             layerwise: self.layerwise,
             report: self.report,
@@ -238,9 +241,15 @@ impl PreparedAutoregressiveInvocation<'_> {
 }
 
 impl ActiveSpeculativePrefill {
+    pub(super) fn visit_retained_media_roots(
+        &self, visitor: &mut dyn FnMut(&Array), funding: &HostMetadataFunding,
+    ) -> Result<(), Error> {
+        self.inner().input.visit_retained_media_roots(visitor, funding)
+    }
     pub(super) fn layerwise(&self) -> Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace> {
         self.inner().layerwise.as_ref()
     }
+    pub(super) fn metadata_context(&self) -> &WorkspaceContext { &self.inner().context }
     fn inner(&self) -> &Rc<Program> {
         self.0.as_ref().expect("live prefill view")
     }
@@ -305,7 +314,7 @@ impl ActiveSpeculativePrefill {
             Array,
             &StateStream,
             &OriginalSpeculativeRole,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         ) -> Result<T, Error>,
     ) -> Result<SpeculativePrefillOutcome<AutoregressivePrefill<T>>, Error> {
         let program = self.inner();
@@ -463,6 +472,9 @@ impl SpanCall<'_> {
         active: &ActiveSpeculativeInvocation,
     ) -> Result<Option<Array>, Error> {
         active.begin_equation_construction()?;
+        if self.input.media_packet().is_some() {
+            return self.input.media_span(model,state,self.span,&mut Sequence(active));
+        }
         let tokens = self
             .input
             .view_span(self.span.chunk(), active.observer(), &state.stream)?;
@@ -479,10 +491,12 @@ impl SpanCall<'_> {
 }
 struct Sequence<'a>(&'a ActiveSpeculativeInvocation);
 impl AutoregressiveSequenceCompletion for Sequence<'_> {
+    fn metadata_context(&self) -> WorkspaceContext { self.0.metadata_context() }
+
     fn role(&self) -> &OriginalSpeculativeRole {
         self.0.role()
     }
-    fn metadata_funding(&self) -> WorkspaceMetadataFunding {
+    fn metadata_funding(&self) -> HostMetadataFunding {
         self.0.metadata_funding()
     }
     fn take_checkpoint(&mut self) -> Result<MlxPredictionTargetState, Error> {
@@ -497,3 +511,5 @@ impl AutoregressiveSequenceCompletion for Sequence<'_> {
         self.0.complete_sequence_roots(output, state, stream)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

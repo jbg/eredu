@@ -33,7 +33,7 @@ where
 {
     let Some(control) = provider
         .routing_control(bank, token_rows(input)?)
-        .map_err(Error::backend_source)?
+        .map_err(Error::backend_retained_source)?
     else {
         if provider.routing_unmodified_interest(bank) == crate::RoutingUnmodifiedInterest::None {
             return selector.select(input, context);
@@ -42,7 +42,7 @@ where
             let selection = selector.select(input, context)?;
             provider
                 .routing_unmodified(bank, (&selection).into())
-                .map_err(Error::backend_source)?;
+                .map_err(Error::backend_retained_source)?;
             Ok(selection)
         })();
         if let Err(error) = &result {
@@ -58,7 +58,7 @@ where
                 selection.original.as_ref().map(Into::into),
                 (&selection.effective).into(),
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         Ok(selection.effective)
     })();
     if let Err(error) = &result {
@@ -131,7 +131,11 @@ mod tests {
         fail: bool,
     }
     impl Parameterized<WorkspaceTensor> for Selector {
-        fn visit_parameters<'a, V: ParameterVisitor<'a, WorkspaceTensor>>(&'a self, _: &mut V) {}
+        fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, WorkspaceTensor>>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+ __source_result
+}
         fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, WorkspaceTensor>>(
             &'a mut self,
             _: &mut V,

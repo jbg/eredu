@@ -35,7 +35,7 @@ impl ResidentRecipeRecorder {
                 Some(context) => {
                     context.metadata_error(format_args!("capture population overflow"))
                 }
-                None => Error::backend_source(crate::backend::error::Error::PrefillControl(
+                None => Error::backend_retained_source(crate::backend::error::Error::PrefillControl(
                     eredu_runtime::working_memory::WorkingMemoryError::Overflow,
                 )),
             })?;
@@ -58,7 +58,7 @@ impl ResidentRecipeRecorder {
             Some(context) => context.metadata_error(format_args!(
                 "capture native completion population is incomplete"
             )),
-            None => Error::backend_source(crate::backend::error::Error::PrefillControl(
+            None => Error::backend_retained_source(crate::backend::error::Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             )),
         };
@@ -474,7 +474,7 @@ impl ResidentNativeRecipe {
     /// even when capture quota skips its transform; absent hooks remain absent.
     pub(crate) fn capture_scalars_for_step(
         &self, step: &eredu_runtime::working_memory::InferenceTextStep, count: usize,
-        metadata: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        metadata: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>, crate::backend::error::Error> {
         use crate::backend::error::Error as NativeError;
         use eredu_runtime::working_memory::WorkingMemoryError;
@@ -493,6 +493,7 @@ impl ResidentNativeRecipe {
         scalars.resize(count, None);
         for row in &self.records {
             let selected = match &row.span {
+                InferenceWorkspaceSpan::Sampling(_) => return Err(NativeError::PrefillControl(WorkingMemoryError::IdentityMismatch)),
                 InferenceWorkspaceSpan::Prefill(_) => step.attempt() == 0,
                 InferenceWorkspaceSpan::Decode { index, .. } => index.checked_add(1) == Some(step.attempt()),
             };
@@ -514,3 +515,5 @@ impl ResidentNativeRecipe {
         Ok(scalars)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

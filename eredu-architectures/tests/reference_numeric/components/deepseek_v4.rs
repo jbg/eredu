@@ -10,8 +10,8 @@ mod prediction;
 #[derive(Default)]
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-        self.0.insert(metadata.id.as_str().into(), value.clone());
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+        self.0.insert(metadata.id().as_str().into(), value.clone());
     }
 }
 

@@ -39,7 +39,7 @@ fn original_scope_pair_is_sealed_once_and_excluded_from_native_headroom() {
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     drop(quote);
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();

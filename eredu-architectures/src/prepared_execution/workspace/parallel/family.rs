@@ -87,7 +87,7 @@ where A: crate::partitioned_execution::TextPartitionArchitecture<WorkspaceBacken
     context.charge_metadata(std::mem::size_of::<(A, eredu_runtime::StateLayout,
         Vec<eredu_runtime::ExecutionUnitAddress>, eredu_nn::workspace::WorkspaceParallelContext,
         Result<EquationQuote, Error>)>())?;
-    let layout = architecture.state_layout_with_metadata(context)?;
+    let layout = architecture.state_layout(Some(context))?;
     let end = source.state_offset.checked_add(visitor.state.layout().len())
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
     let local = layout.slice_with_metadata(source.state_offset..end, context)
@@ -123,13 +123,13 @@ where A: crate::partitioned_execution::TextPartitionArchitecture<WorkspaceBacken
             Some(parameters) => {
                 let runtime = LayerwiseRuntime::new_workspace_with_policy(architecture,
                     |layout| WorkspaceLayerwisePolicy::for_layout(parameters, layout, context), context)?;
-                routed::spans(&source.selected, source.rank, &source.execution, &source.providers,
+                routed::spans(&source.selected, source.rank, &source.execution, source.providers.borrowed(),
                     runtime, &parallel, &bindings, visitor)
             }
             None => {
                 let runtime = ResidentRuntime::<_,WorkspaceBackend,ResidentState>::new_workspace(architecture,context)?
                     .into_layerwise_workspace(context)?;
-                routed::spans(&source.selected, source.rank, &source.execution, &source.providers,
+                routed::spans(&source.selected, source.rank, &source.execution, source.providers.borrowed(),
                     runtime, &parallel, &bindings, visitor)
             }
         }

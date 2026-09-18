@@ -18,7 +18,7 @@ use crate::{
     MlxTensor,
 };
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceMetadataFunding, WorkspaceMetadataFundingError},
+    workspace::{WorkspaceContext, HostMetadataFunding, HostMetadataFundingError},
     TensorParallelGroupedOutput,
 };
 use eredu_runtime::{
@@ -40,12 +40,12 @@ fn source_failure(stage: &'static str, cause: Error) -> Error {
     }
 }
 fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
 fn sum(parts: &[usize]) -> Option<usize> {
     parts.iter().copied().try_fold(size_of_val(parts), usize::checked_add)
 }
-fn reserve(funding: &WorkspaceMetadataFunding, bytes: Option<usize>) -> Result<(), Error> {
+fn reserve(funding: &HostMetadataFunding, bytes: Option<usize>) -> Result<(), Error> {
     funding.reserve_metadata(bytes.ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
 fn shared_bytes<T>() -> Option<usize> {
@@ -90,7 +90,7 @@ struct Request {
     failed: Cell<bool>,
     running: Cell<bool>,
     timeout: Option<std::time::Duration>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(crate) struct AddressableRequestOwner(Option<Rc<Request>>);
 impl Clone for AddressableRequestOwner {
@@ -153,7 +153,14 @@ impl AddressableRequestOwner {
                 .checked_add(AddressableExecutionRow::activation_control_bytes()?)?
                 .checked_add(WorkspaceContext::metadata_vec_bytes::<IndexedRequestInstallation>(count)?)?
                 .checked_add(IndexedRequestInstallation::control_bytes()?.checked_mul(channels)?)?
-                .checked_add(Active::dispatch_control_bytes()?.checked_mul(count)?)?;
+                .checked_add(Active::dispatch_control_bytes()?.checked_mul(count)?)?
+                .checked_add(Active::local_control_bytes()?.checked_mul(row.occurrences().iter().filter(|(_,quote)|quote.is_local()).count())?)?;
+            let mut one = one;
+            for (_, quote) in row.occurrences().iter().filter(|(_, quote)| quote.is_local()) {
+                one = one.checked_add(quote.specialization_control_bytes()?)?
+                    .checked_add(IndexedBankSource::local_request_control_bytes()?)?
+                    .checked_add(crate::backend::runtime::residency::parameter_bank::IndexedConstructorPartitions::select_count_control_bytes()?)?;
+            }
             bytes = bytes.checked_add(one.checked_mul(*repeats)?)?;
         }
         if any {
@@ -172,7 +179,7 @@ impl AddressableRequestOwner {
         controls: OriginalTextControlGuard,
         registration: OriginalOperationRegistration,
         timeout: Option<std::time::Duration>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         reserve(funding, Self::construction_control_bytes())?;
         controls
@@ -195,7 +202,7 @@ impl AddressableRequestOwner {
     /// operation. Its ordinary bank remains alive around during().
     pub(crate) fn new_prepared(sources:AddressableRequestSources,
         access:OriginalSelectedResidencyAccess,budget:OriginalBufferBudget,
-        observer:&OriginalScopeObserver,timeout:Option<std::time::Duration>,funding:&WorkspaceMetadataFunding,
+        observer:&OriginalScopeObserver,timeout:Option<std::time::Duration>,funding:&HostMetadataFunding,
     )->Result<Self,Error> {
         reserve(funding,Self::construction_control_bytes().and_then(|n|n.checked_add(Self::prepared_extra_control_bytes()?)))?;
         access.validate_observer(observer)?;
@@ -250,6 +257,7 @@ pub(crate) struct AddressableExecutionRow {
     started: Cell<bool>,
 }
 struct Active {
+    local: Cell<Option<(usize, usize)>>,
     request: AddressableRequestOwner,
     first: usize,
     end: usize,
@@ -304,6 +312,7 @@ impl AddressableExecutionRow {
             finished: false,
         };
         let owner = ActiveOwner(Some(Rc::new(Active {
+            local: Cell::new(None),
             request: self.request.clone(),
             source: self.invocation.source().clone(),
             first: self.start,
@@ -347,10 +356,20 @@ fn first_channel(invocation: &AddressableInvocation, index: usize) -> bool {
         .any(|(_, old)| old.identity().source().same_binding(source))
 }
 impl Active {
+    fn local_control_bytes() -> Option<usize> {
+        sum(&[size_of::<(&Self, &IndexedBankSource, usize)>(),
+            size_of::<(&Self, bool, Result<(), Error>)>(), size_of::<&Self>(),
+            size_of::<eredu_nn::workspace::WorkspaceAddressableRegionView<'_>>(),
+            size_of::<OriginalSelectedResidencyAccess>(), size_of::<Option<(usize,usize)>>(),
+            size_of::<Result<(), Error>>(), size_of::<(crate::backend::runtime::residency::parameter_bank::IndexedConstructorPartitions,
+                Option<crate::backend::runtime::residency::manager::ForegroundDiskSourceCapacity>)>()])
+    }
     fn dispatch_control_bytes() -> Option<usize> {
         sum(&[
             size_of::<(&Self, &IndexedBankSource, &Stream)>(),
             size_of::<IndexedInvocationRequest<'_, MlxTensor>>(), size_of::<usize>(),
+            size_of::<crate::backend::nn::workspace::AddressableQuoteRef>(),
+            size_of::<Result<crate::backend::nn::workspace::AddressableQuoteRef, eredu_nn::Error>>(),
             size_of::<Result<TensorParallelGroupedOutput<MlxTensor>, Error>>(),
             size_of::<crate::backend::runtime::execution::generic::OriginalSelectedResidencyAccess>(),
             size_of::<(OriginalBufferBudget,OriginalOperationMetadataCustody)>(),
@@ -360,8 +379,53 @@ impl Active {
     }
 }
 impl IndexedRequestSource for Active {
-    fn funding(&self) -> &WorkspaceMetadataFunding {
+    fn funding(&self) -> &HostMetadataFunding {
         &self.request.inner().funding
+    }
+    fn enter_local(&self, bank: &IndexedBankSource,
+        declaration: eredu_nn::workspace::WorkspaceAddressableRegionView<'_>, rows: usize) -> Result<(), Error> {
+        let owner = self.request.inner();
+        if let Err(cause) = reserve(&owner.funding, Self::local_control_bytes()) {
+            owner.failed.set(true);
+            return Err(cause);
+        }
+        let index = self.next.get();
+        if owner.failed.get() || !owner.running.get() || self.local.get().is_some()
+            || index < self.first || index >= self.end { owner.failed.set(true); return Err(identity()); }
+        let result = (|| {
+            let occurrence = owner.sources.occurrences().get(index).ok_or_else(identity)?;
+            if !occurrence.quote.is_local() || !occurrence.quote.identity().source().same_binding(bank)
+                || occurrence.quote.declaration.as_view() != declaration || rows > declaration.chunks.rows {
+                return Err(identity());
+            }
+            // Authentication precedes the callback and is still the original
+            // registered parent. The addressable worker supplies its one child.
+            let access = owner.authority.access()?;
+            if rows == 0 {
+                self.next.set(index + 1);
+                let unused = owner.sources.take(index, &access)?;
+                drop(unused);
+            }
+            self.local.set(Some((index, rows)));
+            Ok(())
+        })();
+        if result.is_err() { self.local.set(None); owner.failed.set(true); }
+        result
+    }
+    fn complete_local(&self, completed: bool) -> Result<(), Error> {
+        let owner = self.request.inner();
+        let local = self.local.take();
+        if !completed { owner.failed.set(true); return Ok(()); }
+        if owner.failed.get() || !owner.running.get()
+            || local.is_none_or(|(index, _)| self.next.get() != index + 1) {
+            owner.failed.set(true);
+            return Err(identity());
+        }
+        Ok(())
+    }
+    fn abort_local(&self) {
+        self.local.set(None);
+        self.request.inner().failed.set(true);
     }
     fn with_region(
         &self,
@@ -396,16 +460,26 @@ impl IndexedRequestSource for Active {
             if !occurrence.quote.identity().source().same_binding(bank) {
                 return Err(super::mismatch("addressable request bank binding"));
             }
-            if occurrence.quote.declaration.as_view() != request.declaration {
+            let selected = if occurrence.quote.is_local() {
+                let (selected_index, rows) = self.local.get().ok_or_else(identity)?;
+                if selected_index != index || rows == 0 || rows != request.declaration.chunks.rows { return Err(identity()); }
+                occurrence.quote.select_rows(rows, &owner.funding).map_err(Error::Neural)?
+            } else {
+                if self.local.get().is_some() { return Err(identity()); }
+                occurrence.quote.clone()
+            };
+            if selected.declaration.as_view() != request.declaration {
                 return Err(super::mismatch("addressable request declaration"));
             }
             let access = owner.authority.access()
                 .map_err(|cause| source_failure("addressable request selected residency", cause))?;
             let (constructors, reads) = owner.sources.take(index, &access)
                 .map_err(|cause| source_failure("addressable request source extraction", cause))?;
-            let source = &occurrence.quote;
+            let constructors = if occurrence.quote.is_local() {
+                constructors.select_count(selected.residency.census().plan().len(), &owner.funding)?
+            } else { constructors };
             run_region(
-                source.clone(),
+                selected,
                 bank,
                 request,
                 &access,
@@ -426,3 +500,5 @@ impl IndexedRequestSource for Active {
         result
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

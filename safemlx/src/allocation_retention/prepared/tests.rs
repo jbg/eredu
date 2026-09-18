@@ -1,13 +1,14 @@
 use super::*;
 use crate::{
-    ops::indexing::TryIndexOp, reclaim_allocation_owners, Device, DeviceType, Dtype,
-    HostTransferBuffer, HostTransferPolicy, Stream,
+    Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy, Stream,
+    ops::indexing::TryIndexOp, reclaim_allocation_owners,
 };
 use std::{
     cell::Cell,
     sync::{
+        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -214,9 +215,11 @@ fn lazy_and_empty_backing_preserve_owner_and_actual_native_cause() {
         })
         .unwrap_err();
     match error.cause() {
-        PreparedAllocationOwnerCause::Native(error) => assert!(error
-            .to_string()
-            .contains("Invalid prepared allocation owner")),
+        PreparedAllocationOwnerCause::Native(error) => assert!(
+            error
+                .to_string()
+                .contains("Invalid prepared allocation owner")
+        ),
         other => panic!("unexpected cause {other:?}"),
     }
     assert_eq!(error.into_parts().1.into_owner(), 17);
@@ -428,9 +431,11 @@ fn cold_preparation_initializes_once_before_bounded_handoff() {
         })
         .unwrap_err();
     match error.cause() {
-        PreparedAllocationOwnerCause::Native(error) => assert!(error
-            .to_string()
-            .contains("Invalid prepared allocation owner")),
+        PreparedAllocationOwnerCause::Native(error) => assert!(
+            error
+                .to_string()
+                .contains("Invalid prepared allocation owner")
+        ),
         other => panic!("unexpected cause {other:?}"),
     }
     assert_eq!(crate::error::mlx_error_handler_state_for_test(), (true, 1));

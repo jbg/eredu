@@ -1,24 +1,31 @@
 //! Exact borrowed root planning and fresh aggregate HF construction. No account.
 mod decode;
+mod model;
+mod normalizer;
+mod pre;
 mod regex;
 use self::regex::{RegexSelection, RegexState};
 use super::{
-    AddedVocabulary, AddedVocabularyCompileError, AddedVocabularyCompileFailure, Tokenizer,
-    TokenizerImpl, added_vocabulary::AddedVocabularyRecipe,
+    added_vocabulary::AddedVocabularyRecipe, AddedVocabulary, AddedVocabularyCompileError,
+    AddedVocabularyCompileFailure, Tokenizer, TokenizerImpl,
 };
-use crate::processors::template::compiled::{TemplateCompileFailure, compiler as template};
+use crate::processors::template::compiled::{compiler as template, TemplateCompileFailure};
 use crate::{
-    decoders::{DecoderWrapper, sequence::Sequence as DecodeSequence},
+    decoders::{sequence::Sequence as DecodeSequence, DecoderWrapper},
     models::{
+        bpe::{BpeCompileError, BpeCompileFailure, BpeCompilePlan},
+        unigram::{UnigramCompileError, UnigramCompileFailure},
+        wordlevel::{WordLevelCompileError, WordLevelCompileFailure},
         ModelWrapper,
-        bpe::{BPE, BpeCompileError, BpeCompileFailure, BpeCompilePlan},
     },
-    normalizers::{NFC, NormalizerWrapper},
+    normalizers::NormalizerWrapper,
     pre_tokenizers::{
-        PreTokenizerWrapper, byte_level::ByteLevel, digits::Digits,
+        byte_level::{ByteLevel, ByteLevelSettings},
+        digits::Digits,
         sequence::Sequence as PreSequence,
+        PreTokenizerWrapper,
     },
-    processors::{PostProcessorWrapper, sequence::Sequence as PostSequence},
+    processors::{sequence::Sequence as PostSequence, PostProcessorWrapper},
     utils::borrowed_json::{self as json, Reader, Span},
 };
 use std::{alloc::Layout, collections::TryReserveError, convert::TryFrom, fmt, mem::size_of};
@@ -61,6 +68,10 @@ pub enum TokenizerCompileError {
     },
     /// Model planning diagnostic; its offset is relative to the model object.
     Model(BpeCompileError),
+    /// WordLevel model planning diagnostic.
+    WordLevel(WordLevelCompileError),
+    /// Scored Unigram model planning diagnostic.
+    Unigram(UnigramCompileError),
     /// Added-array planning diagnostic; its offset is relative to that array.
     Added(AddedVocabularyCompileError),
 }
@@ -82,6 +93,8 @@ impl std::error::Error for TokenizerCompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Model(e) => Some(e),
+            Self::WordLevel(e) => Some(e),
+            Self::Unigram(e) => Some(e),
             Self::Added(e) => Some(e),
             _ => None,
         }
@@ -101,6 +114,11 @@ impl From<json::Error> for TokenizerCompileError {
 impl From<BpeCompileError> for TokenizerCompileError {
     fn from(e: BpeCompileError) -> Self {
         Self::Model(e)
+    }
+}
+impl From<WordLevelCompileError> for TokenizerCompileError {
+    fn from(e: WordLevelCompileError) -> Self {
+        Self::WordLevel(e)
     }
 }
 impl From<AddedVocabularyCompileError> for TokenizerCompileError {
@@ -164,8 +182,9 @@ enum Role {
 }
 #[derive(Debug, Clone, Copy)]
 enum Inline {
-    Byte(ByteLevel),
+    Byte(ByteLevelSettings),
     Digits(bool),
+    Metaspace(pre::Meta),
     Decode(decode::Inline),
     Regex(RegexSelection),
     Template {
@@ -185,6 +204,13 @@ fn inline(input: &str, span: Span, role: Role) -> Result<Inline, Error> {
         }
     }
     let typ = required(typ, span.start)?;
+    if matches!(role, Role::Pre) && text_is(input, typ, "Metaspace")? {
+        return pre::select(input, span).map(Inline::Metaspace);
+    }
+    if matches!(role, Role::Pre) && text_is(input, typ, "Whitespace")? {
+        fields(input, span, ["type"])?;
+        return regex::whitespace(span).map(Inline::Regex);
+    }
     if text_is(input, typ, "Split")? {
         return regex::selection(input, span, role).map(Inline::Regex);
     }
@@ -194,11 +220,11 @@ fn inline(input: &str, span: Span, role: Role) -> Result<Inline, Error> {
             span,
             ["type", "add_prefix_space", "trim_offsets", "use_regex"],
         )?;
-        let value = ByteLevel::new(
-            boolean(input, f[1], true)?,
-            boolean(input, f[2], true)?,
-            boolean(input, f[3], true)?,
-        );
+        let value = ByteLevelSettings {
+            add_prefix_space: boolean(input, f[1], true)?,
+            trim_offsets: boolean(input, f[2], true)?,
+            use_regex: boolean(input, f[3], true)?,
+        };
         if matches!(role, Role::Pre) && value.use_regex {
             return regex::implicit_byte_level(span, value).map(Inline::Regex);
         }
@@ -262,9 +288,7 @@ impl Component {
             };
             let f = fields(input, span, ["type", member])?;
             let array = required(f[1], span.start)?;
-            let mut a = Reader::new(input, array).array()?;
-            let mut following_byte = false;
-            let mut first_digits = false;
+            let mut a = pre::Items::new(input, array, role)?;
             let mut decoder_components = [crate::decoders::fixed_profile::Component::Other; 5];
             while let Some(item) = a.next()? {
                 let value = inline(input, item, role)?;
@@ -279,37 +303,7 @@ impl Component {
                         _ => return Err(err(K::ComponentProfile, item.start)),
                     };
                 }
-                match value {
-                    Inline::Digits(value) if result.count == 0 => {
-                        first_digits = value;
-                    }
-                    Inline::Regex(selected) => {
-                        let ordered = if selected.is_implicit() {
-                            result.count == 1 && first_digits
-                        } else {
-                            result.count == 0
-                        };
-                        if !ordered || result.regex.replace(selected).is_some() {
-                            return Err(err(K::RegexProfile, item.start));
-                        }
-                    }
-                    Inline::Byte(byte) if result.count == 1 => {
-                        following_byte = !byte.add_prefix_space && !byte.use_regex;
-                    }
-                    _ => {}
-                }
                 result.count = add(result.count, 1)?;
-            }
-            if let Some(selected) = result.regex {
-                if result.count != 2
-                    || if selected.is_implicit() {
-                        !first_digits
-                    } else {
-                        !following_byte
-                    }
-                {
-                    return Err(err(K::RegexProfile, array.start));
-                }
             }
             if matches!(role, Role::Decode)
                 && crate::decoders::fixed_profile::Profile::sequence(
@@ -323,16 +317,22 @@ impl Component {
         } else {
             let value = inline(input, span, role)?;
             result.add_template(value)?;
-            if matches!(value, Inline::Decode(_)) {
-                return Err(err(K::ComponentProfile, span.start));
+            if let Inline::Decode(value) = value {
+                if crate::decoders::fixed_profile::Profile::sequence(&[value.component()]).is_none()
+                {
+                    return Err(err(K::ComponentProfile, span.start));
+                }
             }
-            if matches!(value, Inline::Regex(_)) {
-                return Err(err(K::RegexProfile, span.start));
+            if let Inline::Regex(selected) = value {
+                result.regex = Some(selected);
             }
         }
         Ok(result)
     }
     fn add_template(&mut self, value: Inline) -> Result<(), Error> {
+        if let Inline::Metaspace(value) = value {
+            self.template_buffers = add(self.template_buffers, value.bytes())?;
+        }
         if let Inline::Decode(value) = value {
             self.template_buffers = add(self.template_buffers, value.bytes())?;
         }
@@ -403,13 +403,13 @@ impl TokenizerCompileRequirements {
 #[derive(Debug)]
 pub struct TokenizerCompilePlan<'a> {
     input: &'a str,
-    model: BpeCompilePlan<'a>,
+    model: model::Plan<'a>,
     added: AddedVocabularyRecipe<'a>,
-    normalizer: Option<NormalizerWrapper>,
+    normalizer: normalizer::Plan<'a>,
     pre: Component,
     post: Component,
     decoder: Component,
-    regex: RegexState,
+    regex: RegexState<'a>,
     requirements: TokenizerCompileRequirements,
     encode_special_tokens: bool,
     #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
@@ -452,7 +452,7 @@ impl<'a> TokenizerCompilePlan<'a> {
                 return Err(err(K::Version, version.start));
             }
         }
-        for span in [f[1], f[2]].into_iter().flatten() {
+        for span in [f[1], f[2]].iter().flatten() {
             if &input[span.start..span.end] != "null" {
                 return Err(err(K::ComponentProfile, span.start));
             }
@@ -461,24 +461,26 @@ impl<'a> TokenizerCompilePlan<'a> {
         let pre = Component::plan(input, f[5], Role::Pre)?;
         let post = Component::plan(input, f[6], Role::Post)?;
         let decoder = Component::plan(input, f[7], Role::Decode)?;
-        let regex = RegexState::plan(pre.regex)?;
-        let normalizer = if let Some(span) = absent(input, f[4]) {
-            let n = fields(input, span, ["type"])?;
-            if !text_is(input, required(n[0], span.start)?, "NFC")? {
-                return Err(err(K::ComponentProfile, span.start));
-            }
-            Some(NormalizerWrapper::NFC(NFC))
-        } else {
-            None
-        };
+        let regex = RegexState::plan(input, pre)?;
+        let normalizer = normalizer::Plan::inspect(input, f[4])?;
         let span = required(f[8], root.start)?;
-        let model = BpeCompilePlan::prepare_model_json(&bytes[span.start..span.end])?;
+        let model = model::Plan::prepare(&bytes[span.start..span.end])?;
         let added_bytes = f[3].map_or(b"[]".as_slice(), |s| &bytes[s.start..s.end]);
-        let added = AddedVocabularyRecipe::prepare_json(added_bytes, normalizer.as_ref())?;
+        let added = AddedVocabularyRecipe::prepare_json(added_bytes, |text| {
+            normalizer.pattern_bounds(text).map_err(|_| {
+                super::added_vocabulary::AddedVocabularyCompileError {
+                    kind: super::added_vocabulary::AddedVocabularyCompileErrorKind::Overflow,
+                    offset: text.offset,
+                }
+            })
+        })?;
         let m = model.requirements();
         let a = added.requirements();
         let buffers = add(
-            add(m.buffer_bytes(), a.buffer_bytes())?,
+            add(
+                add(m.buffer_bytes(), a.buffer_bytes())?,
+                normalizer.buffer_bytes()?,
+            )?,
             add(
                 add(add(pre.bytes()?, post.bytes()?)?, decoder.bytes()?)?,
                 regex.buffer_bytes(),
@@ -486,6 +488,8 @@ impl<'a> TokenizerCompilePlan<'a> {
         )?;
         let control_parts = [
             decode::control_bytes()?,
+            normalizer.control_bytes()?,
+            pre::controls()?,
             pre.template_controls,
             post.template_controls,
             decoder.template_controls,
@@ -584,11 +588,12 @@ impl<'a> TokenizerCompilePlan<'a> {
         self.requirements
     }
     /// Development-only capacity overflow on actual destination reserves.
-    /// Slots 0/1/2 are pre/post/decoder sequences; 3/4 are literal pattern/content.
+    /// Slots 0/1/2 are pre/post/decoder sequences; 3/4 are literal pattern/content;
+    /// slot 5 is the Metaspace replacement spelling.
     #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
     #[doc(hidden)]
     pub fn fail_reservation(mut self, stage: usize) -> Self {
-        assert!(stage < 5);
+        assert!(stage < 6);
         self.fail_at = Some(stage);
         self
     }
@@ -599,11 +604,18 @@ impl<'a> TokenizerCompilePlan<'a> {
         self.model = self.model.fail_reservation(stage);
         self
     }
+    /// Development-only overflow of one original normalizer destination reserve.
+    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+    #[doc(hidden)]
+    pub fn fail_normalizer_reservation(mut self, stage: usize) -> Self {
+        self.normalizer = self.normalizer.fail_reservation(stage);
+        self
+    }
     /// Development-only capacity overflow on the actual selected added reserve.
     #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
     #[doc(hidden)]
     pub fn fail_added_reservation(mut self, stage: usize) -> Self {
-        assert!(stage < 4);
+        assert!(stage < 5);
         self.added_failure = Some(stage);
         self
     }
@@ -623,6 +635,17 @@ impl<'a> TokenizerCompilePlan<'a> {
         target: fancy_regex::workspace::construction::ConstructionFailure,
     ) -> Self {
         self.regex.fail(target);
+        self
+    }
+    /// Development-only fixed constructor target in the actual ordered regex inventory.
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+    #[doc(hidden)]
+    pub fn fail_regex_construction_at(
+        mut self,
+        ordinal: usize,
+        target: fancy_regex::workspace::construction::ConstructionFailure,
+    ) -> Self {
+        self.regex.fail_at(ordinal, target);
         self
     }
     /// Consumes the root once and constructs every component fresh.
@@ -650,8 +673,8 @@ impl<'a> TokenizerCompilePlan<'a> {
         };
         let result = (|| -> Result<(), Cause> {
             let mut regex = self.regex;
-            partial.model = Some(self.model.compile().map_err(Cause::Model)?);
-            partial.normalizer = self.normalizer;
+            partial.model = Some(self.model.compile()?);
+            partial.normalizer = self.normalizer.fill(&mut partial.normalizer_state)?;
             fill_components(
                 self.input,
                 self.pre,
@@ -684,7 +707,7 @@ impl<'a> TokenizerCompilePlan<'a> {
             return Err(TokenizerCompileFailure { cause, partial });
         }
         Ok(Tokenizer(TokenizerImpl {
-            model: ModelWrapper::BPE(partial.model.take().expect("model")),
+            model: partial.model.take().expect("model"),
             normalizer: partial.normalizer.take(),
             pre_tokenizer: partial.pre.take(),
             post_processor: partial.post.take(),
@@ -697,9 +720,10 @@ impl<'a> TokenizerCompilePlan<'a> {
 }
 #[derive(Debug, Default)]
 struct Partial {
-    model: Option<BPE>,
+    model: Option<ModelWrapper>,
     added: Option<AddedVocabulary>,
     normalizer: Option<NormalizerWrapper>,
+    normalizer_state: normalizer::State,
     pre: Option<PreTokenizerWrapper>,
     post: Option<PostProcessorWrapper>,
     decoder: Option<DecoderWrapper>,
@@ -707,16 +731,21 @@ struct Partial {
     post_items: Vec<PostProcessorWrapper>,
     decode_items: Vec<DecoderWrapper>,
     decode_strings: [Vec<u8>; 2],
+    pre_literal: Vec<u8>,
 }
 fn requested(stage: usize, n: usize, fail: Option<usize>) -> usize {
-    if fail == Some(stage) { usize::MAX } else { n }
+    if fail == Some(stage) {
+        usize::MAX
+    } else {
+        n
+    }
 }
 fn fill_components(
     input: &str,
     pre: Component,
     post: Component,
     decoder: Component,
-    regex: &mut RegexState,
+    regex: &mut RegexState<'_>,
     fail: Option<usize>,
     template_failure: Option<usize>,
     p: &mut Partial,
@@ -747,20 +776,24 @@ fn fill_components(
             if actual > component.count {
                 return Err(err(K::CapacityExceeded, array.start).into());
             }
-            let mut a = Reader::new(input, array).array().map_err(Error::from)?;
+            let mut a = pre::Items::new(input, array, component.role)?;
             while let Some(item) = a.next().map_err(Error::from)? {
                 let item = inline(input, item, component.role)?;
                 match (component.role, item) {
-                    (Role::Pre, Inline::Byte(b)) => p.pre_items.push(b.into()),
+                    (Role::Pre, Inline::Byte(b)) => p.pre_items.push(b.build().into()),
                     (Role::Pre, Inline::Digits(d)) => p.pre_items.push(Digits::new(d).into()),
+                    (Role::Pre, Inline::Metaspace(value)) => {
+                        let value = value.compile(p, fail)?;
+                        p.pre_items.push(value);
+                    }
                     (Role::Pre, Inline::Regex(selected)) => {
                         p.pre_items.push(regex.compile(selected)?)
                     }
-                    (Role::Post, Inline::Byte(b)) => p.post_items.push(b.into()),
+                    (Role::Post, Inline::Byte(b)) => p.post_items.push(b.build().into()),
                     (Role::Post, Inline::Template { span, .. }) => p
                         .post_items
                         .push(compile_template(input, span, template_failure)?),
-                    (Role::Decode, Inline::Byte(b)) => p.decode_items.push(b.into()),
+                    (Role::Decode, Inline::Byte(b)) => p.decode_items.push(b.build().into()),
                     (Role::Decode, Inline::Decode(value)) => {
                         let value = value.compile(input, fail, p)?;
                         p.decode_items.push(value);
@@ -782,13 +815,18 @@ fn fill_components(
             }
         } else {
             match (component.role, inline(input, span, component.role)?) {
-                (Role::Pre, Inline::Byte(b)) => p.pre = Some(b.into()),
+                (Role::Pre, Inline::Byte(b)) => p.pre = Some(b.build().into()),
                 (Role::Pre, Inline::Digits(d)) => p.pre = Some(Digits::new(d).into()),
-                (Role::Post, Inline::Byte(b)) => p.post = Some(b.into()),
+                (Role::Pre, Inline::Regex(selected)) => p.pre = Some(regex.compile(selected)?),
+                (Role::Pre, Inline::Metaspace(value)) => p.pre = Some(value.compile(p, fail)?),
+                (Role::Post, Inline::Byte(b)) => p.post = Some(b.build().into()),
                 (Role::Post, Inline::Template { span, .. }) => {
                     p.post = Some(compile_template(input, span, template_failure)?)
                 }
-                (Role::Decode, Inline::Byte(b)) => p.decoder = Some(b.into()),
+                (Role::Decode, Inline::Byte(b)) => p.decoder = Some(b.build().into()),
+                (Role::Decode, Inline::Decode(value)) => {
+                    p.decoder = Some(value.compile(input, fail, p)?)
+                }
                 _ => return Err(err(K::ComponentProfile, span.start).into()),
             }
         }
@@ -802,12 +840,14 @@ fn compile_template(
 ) -> Result<PostProcessorWrapper, Cause> {
     let plan = template::Plan::prepare(input, span)?;
     let value = plan.compile(failure).map_err(Cause::Template)?;
-    Ok(PostProcessorWrapper::CompiledTemplate(value))
+    Ok(PostProcessorWrapper::Template(value))
 }
 #[derive(Debug)]
 enum Cause {
     Source(Error),
     Model(BpeCompileFailure),
+    WordLevel(WordLevelCompileFailure),
+    Unigram(UnigramCompileFailure),
     Added(AddedVocabularyCompileFailure),
     Template(TemplateCompileFailure),
     Reserve(TryReserveError),
@@ -840,6 +880,10 @@ impl TokenizerCompileFailure {
     pub fn completed_model(&self) -> bool {
         self.partial.model.is_some()
     }
+    /// Literal normalizer destinations retained after a partial construction.
+    pub fn literal_normalizer_capacities(&self) -> [usize; 2] {
+        self.partial.normalizer_state.literal_capacities()
+    }
     /// Actual template constructor failure and all partial destination capacities.
     pub fn template_failure(&self) -> Option<&TemplateCompileFailure> {
         match &self.cause {
@@ -867,6 +911,8 @@ impl fmt::Display for TokenizerCompileFailure {
         match &self.cause {
             Cause::Source(e) => fmt::Display::fmt(e, f),
             Cause::Model(e) => fmt::Display::fmt(e, f),
+            Cause::WordLevel(e) => fmt::Display::fmt(e, f),
+            Cause::Unigram(e) => fmt::Display::fmt(e, f),
             Cause::Added(e) => fmt::Display::fmt(e, f),
             Cause::Template(e) => fmt::Display::fmt(e, f),
             Cause::Reserve(e) => fmt::Display::fmt(e, f),
@@ -880,6 +926,8 @@ impl std::error::Error for TokenizerCompileFailure {
         match &self.cause {
             Cause::Source(e) => Some(e),
             Cause::Model(e) => Some(e),
+            Cause::WordLevel(e) => Some(e),
+            Cause::Unigram(e) => Some(e),
             Cause::Added(e) => Some(e),
             Cause::Template(e) => Some(e),
             Cause::Reserve(e) => Some(e),
@@ -893,3 +941,12 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) mod template_tests;
+
+impl From<UnigramCompileError> for TokenizerCompileError {
+    fn from(e: UnigramCompileError) -> Self {
+        Self::Unigram(e)
+    }
+}
+
+#[cfg(test)]
+mod literal_tests;

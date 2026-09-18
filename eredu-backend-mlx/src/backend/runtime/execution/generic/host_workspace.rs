@@ -24,6 +24,8 @@ pub(crate) struct LayerwiseWorkspaceIdentity {
     policy: Arc<()>,
     geometry: LayerwiseGeometry,
     parameter_locations: Option<Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>>,
+    excluded: Option<MlxParameterExclusions>,
+    manager_unit_constructors: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,7 +93,13 @@ type ParameterRoots = BTreeMap<(OffloadUnitId, String), WorkspaceExistingStorage
 impl PartialEq for LayerwiseWorkspaceIdentity {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.policy, &other.policy) && self.geometry == other.geometry
+            && self.manager_unit_constructors == other.manager_unit_constructors
             && self.parameter_locations == other.parameter_locations
+            && match (&self.excluded, &other.excluded) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 impl Eq for LayerwiseWorkspaceIdentity {}
@@ -146,6 +154,33 @@ pub(crate) enum OriginalLayerwiseSourceCustody {
 }
 
 impl LayerwiseWorkspace {
+    /// The original manager retains the full unloaded-module population,
+    /// independently of the smaller set of rows populated by its leases.
+    pub(crate) fn parameter_constructors(&self, ordinal: usize) -> Option<super::ParameterConstructors> {
+        if self.identity.manager_unit_constructors {
+            self.manager.parameter_constructors(ordinal)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_parameter_exclusions(&self) -> bool {
+        self.identity.excluded.as_ref().is_some_and(|names| !names.names().is_empty())
+    }
+
+    pub(crate) fn excludes_parameter(&self, name: &str) -> bool {
+        self.identity.excluded.as_ref().is_some_and(|names| names.contains(name))
+    }
+
+    pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
+        match &self.copies {
+            LayerwiseCopies::Host(source) => source.destination_device_type(),
+            LayerwiseCopies::Foreground(source) => source.destination_device_type(),
+            // This existing legacy source is constructed only after its
+            // device snapshot has positively selected the GPU worker.
+            LayerwiseCopies::Disk { .. } => safemlx::DeviceType::Gpu,
+        }
+    }
     /// Enables one exact shared-driver unit visit. The source retains each
     /// logical ordinal separately even when its checkpoint owner is shared.
     pub(crate) fn begin_execution_trace(&self,context:&WorkspaceContext)->Result<(),eredu_nn::Error> {
@@ -203,6 +238,11 @@ impl LayerwiseWorkspace {
             .plan())
     }
 
+    #[cfg(test)]
+    pub(crate) fn detached_physical_read_bytes(&self, source: usize) -> Option<u64> {
+        self.manager.detached_physical_read_bytes(source)
+    }
+
     pub(crate) fn visit_native_copy_layouts<E>(&self,
         mut visit:impl FnMut(usize,safemlx::Dtype)->Result<(),E>)
         ->Result<bool,E> {
@@ -225,7 +265,7 @@ impl LayerwiseWorkspace {
         match &self.copies {
             LayerwiseCopies::Host(copies) => recipe.bind_host_copies(copies),
             LayerwiseCopies::Foreground(identity) => {
-                if recipe.matches_foreground_disk_source(identity.source()) {
+                if recipe.matches_foreground_disk_source(identity.source(), identity.destination_device_type()) {
                     Ok(())
                 } else {
                     Err(Error::PrefillControl(
@@ -246,7 +286,8 @@ impl LayerwiseWorkspace {
     pub(crate) fn known_retained_control_bytes(&self, retain_sources: bool) -> Option<u64> {
         use std::alloc::Layout;
         crate::backend::runtime::residency::storage::native_storage::Bank::shared_borrowed_owner_bytes()?;
-        let mut bytes = 0usize;
+        let mut bytes = self.identity.excluded.as_ref()
+            .map_or(Some(0), MlxParameterExclusions::unfunded_retained_bytes)?;
         match (&self.identity.geometry, &self.copies) {
             (LayerwiseGeometry::PreparedHost(_), LayerwiseCopies::Host(_)) => {
                 // Immutable snapshot and identity backing were constructed once
@@ -260,7 +301,7 @@ impl LayerwiseWorkspace {
                 if identity != copies {
                     return None;
                 }
-                bytes = ForegroundDiskIdentity::qualifier_control_bytes()?;
+                bytes = bytes.checked_add(ForegroundDiskIdentity::qualifier_control_bytes()?)?;
             }
             (
                 LayerwiseGeometry::Owned {
@@ -268,7 +309,7 @@ impl LayerwiseWorkspace {
                 },
                 copies,
             ) => {
-                bytes = layout.cloned_payload_bytes()?;
+                bytes = bytes.checked_add(layout.cloned_payload_bytes()?)?;
                 if retain_sources {
                     bytes = bytes.checked_add(match self.materialization() {
                         WorkspaceBound::Bounded { assumptions, .. } => assumptions.capacity(),
@@ -375,17 +416,6 @@ impl LayerwiseWorkspace {
         manager: &ResidencyManager,
         windows: &crate::backend::runtime::residency::manager::OperationWindows,
     ) -> bool {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            eprintln!("HOST_PARALLEL_STORAGE_SNAPSHOT same_manager={} prepared_host={} host_copies={} same_identity={}",
-                manager.same_source_manager(&self.manager),
-                matches!(&self.identity.geometry, LayerwiseGeometry::PreparedHost(_)),
-                matches!(&self.copies, LayerwiseCopies::Host(_)),
-                match (&self.identity.geometry, &self.copies) {
-                    (LayerwiseGeometry::PreparedHost(identity), LayerwiseCopies::Host(copies)) => copies.prepared_identity() == Some(identity),
-                    _ => false,
-                });
-        }
         if !manager.same_source_manager(&self.manager) {
             return false;
         }
@@ -559,22 +589,22 @@ impl LayerwiseWorkspace {
         }
         let unit = self
             .requested_unit(ordinal)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         let rows = self
             .unit(unit)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
             .rows;
         match &self.copies {
             LayerwiseCopies::Host(_) => (0..rows)
                 .map(|index| {
                     let row = self
                         .row(unit, index)
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                     let layout = WorkspaceLayout::new(row.shape, row.dtype)?;
                     let root = WorkspaceExistingStorage::new(Some(row.capacity_bytes), context);
                     Ok((
                         eredu_nn::ParameterId::new(row.binding.name())
-                            .map_err(eredu_nn::Error::backend_source)?,
+                            .map_err(eredu_nn::Error::backend_retained_source)?,
                         WorkspaceTensor::existing_with_storage(layout, &root, context)?,
                     ))
                 })
@@ -593,13 +623,13 @@ impl LayerwiseWorkspace {
                     .map(|index| {
                         let row = self
                             .row(unit, index)
-                            .map_err(eredu_nn::Error::backend_source)?;
+                            .map_err(eredu_nn::Error::backend_retained_source)?;
                         let owner_unit = self
                             .unit(row.owner.unit)
-                            .map_err(eredu_nn::Error::backend_source)?;
+                            .map_err(eredu_nn::Error::backend_retained_source)?;
                         let owner_row = self
                             .row(row.owner.unit, row.owner.row)
-                            .map_err(eredu_nn::Error::backend_source)?;
+                            .map_err(eredu_nn::Error::backend_retained_source)?;
                         let map = if row.owner.lifetime == WorkspaceParameterLifetime::Trace {
                             &mut *roots
                         } else {
@@ -617,7 +647,7 @@ impl LayerwiseWorkspace {
                         let layout = WorkspaceLayout::new(row.shape, row.dtype)?;
                         Ok((
                             eredu_nn::ParameterId::new(row.binding.name())
-                                .map_err(eredu_nn::Error::backend_source)?,
+                                .map_err(eredu_nn::Error::backend_retained_source)?,
                             WorkspaceTensor::existing_with_storage(layout, root, context)?,
                         ))
                     })
@@ -643,6 +673,9 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             std::mem::size_of::<LayerwiseWorkspace>(),
             std::mem::size_of::<Result<LayerwiseWorkspace, Error>>(),
             std::mem::size_of::<Option<&WorkspaceContext>>(),
+            std::mem::size_of::<(
+                &P, Option<&MlxParameterExclusions>, Option<MlxParameterExclusions>,
+            )>(),
             std::mem::size_of::<HostCopyWorkspace>(),
             std::mem::size_of::<
                 Result<
@@ -684,6 +717,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
         };
         if !self.pending.is_empty()
             || !self.populator.preserves_prepared_parameter_source()
+            || (context.is_some() && self.populator.prepared_parameter_exclusions()
+                .is_some_and(|names| !names.is_source_funded()))
         {
             return Err(unknown());
         }
@@ -712,6 +747,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
                     identity: LayerwiseWorkspaceIdentity {
                         policy: Arc::clone(&self.workspace_identity),
                     parameter_locations: None,
+                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                    manager_unit_constructors: true,
                         geometry: LayerwiseGeometry::PreparedForeground(identity.clone()),
                     },
                     copies: LayerwiseCopies::Foreground(identity.clone()),
@@ -747,6 +784,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
                 identity: LayerwiseWorkspaceIdentity {
                     policy: Arc::clone(&self.workspace_identity),
                     parameter_locations: None,
+                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                    manager_unit_constructors: true,
                     geometry: LayerwiseGeometry::PreparedHost(identity.clone()),
                 },
                 materialization: LayerwiseMaterialization::PreparedHost(identity.clone()),
@@ -794,6 +833,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             identity: LayerwiseWorkspaceIdentity {
                 policy: Arc::clone(&self.workspace_identity),
                     parameter_locations: None,
+                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                    manager_unit_constructors: true,
                 geometry: LayerwiseGeometry::Owned {
                     layout: self.layout.clone(),
                     depth: self.window_depth,
@@ -879,6 +920,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             identity: LayerwiseWorkspaceIdentity {
                 policy: Arc::clone(&self.workspace_identity),
                     parameter_locations: None,
+                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                    manager_unit_constructors: true,
                 geometry: LayerwiseGeometry::Owned {
                     layout: self.layout.clone(),
                     depth: self.window_depth,
@@ -898,6 +941,10 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
 // The source itself implements the portable loan. Composition wrappers need
 // not reopen private model modules or copy their parameter/source directory.
 impl eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters for LayerwiseWorkspace {
+    fn excludes_parameter(&self, name: &str) -> bool {
+        LayerwiseWorkspace::excludes_parameter(self, name)
+    }
+
     fn observe_acquire(&self,ordinal:usize,address:ExecutionUnitAddress,context:&WorkspaceContext)
         ->Result<(),eredu_nn::Error> {self.observe_execution_acquire(ordinal,address,context)}
 

@@ -38,7 +38,7 @@ impl<M: ExternalAssistantExecutionMechanisms<Architecture>>
             return Err(M::error("DFlash capture spans are not contiguous".into()));
         }
         if !self.whole_prompt && !M::supports_prefill_observation(self.assistant, false) {
-            return Err(M::neural_error(eredu_nn::Error::backend_source(
+            return Err(M::neural_error(eredu_nn::Error::backend_retained_source(
                 eredu_core::speculative::SpeculativeControlError::Unsupported(
                     "observer requires explicit prompt-span support",
                 ),
@@ -132,7 +132,7 @@ impl<M: ExternalAssistantExecutionMechanisms<Architecture>>
         let mut proofs=M::state_buffer(2,self.context)?;
         if let Some(proof)=&evidence{proofs.try_push(proof).map_err(|_|M::state_refusal(self.context))?;}
         if let Some(proof)=&pending.evidence{proofs.try_push(proof).map_err(|_|M::state_refusal(self.context))?;}
-        let mut completion=M::submit_completion_with_sources(target_states.iter().chain(scores.iter()).chain([&pending.output]),&proofs,self.context)?;
+        let completion=M::submit_completion_with_sources(target_states.iter().chain(scores.iter()).chain([&pending.output]),&proofs,self.context)?;
         completion.wait()?;
         drop(proofs);
         self.pending=Some(pending.output);

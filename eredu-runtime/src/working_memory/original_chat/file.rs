@@ -98,8 +98,8 @@ impl WorkingMemoryPool {
     ) -> Result<u64, WorkingMemoryError> {
         let controls = [
             original_file::control_bytes().ok_or(WorkingMemoryError::Overflow)?,
-            OriginalChatOperationError::source_controls().ok_or(WorkingMemoryError::Overflow)?,
-            size_of::<&str>(), // actual borrowed model/name
+            OriginalChatSourceError::source_controls().ok_or(WorkingMemoryError::Overflow)?,
+            size_of::<(&str, bool)>(), // actual borrowed model/name and request selection
             size_of::<ChatTemplatePlan<'_>>(),
             size_of::<Result<ChatTemplatePlan<'_>, ChatSourceError>>(),
             size_of::<Result<OriginalChatTemplate, OriginalChatTemplateError>>(),
@@ -121,10 +121,12 @@ impl WorkingMemoryPool {
         &self,
         read: PreparedArtifactFileRead,
         model_id: &str,
+        has_tools: bool,
     ) -> Result<OriginalChatTemplate, OriginalChatFileError> {
         self.compile_chat_template_file_with(
             read,
             model_id,
+            has_tools,
             |_| {},
             || {},
             |pool, plan| pool.compile_chat_template(plan),
@@ -134,6 +136,7 @@ impl WorkingMemoryPool {
         &self,
         read: PreparedArtifactFileRead,
         model_id: &str,
+        has_tools: bool,
         after_admission: impl FnOnce(&mut usize),
         after_read: impl FnOnce(),
         compile: impl FnOnce(
@@ -149,7 +152,7 @@ impl WorkingMemoryPool {
         )
         .map_err(OriginalChatFileError::from_read)?;
         after_read();
-        let plan = match ChatTemplatePlan::prepare_config(&input.bytes, model_id) {
+        let plan = match ChatTemplatePlan::prepare_config(&input.bytes, model_id, has_tools) {
             Ok(plan) => plan,
             Err(error) => {
                 return Err(OriginalChatFileError {

@@ -7,14 +7,18 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let Some((native,floating,seed_bytes))=source::dtype(operation) else{return Ok(None)};
     let output=operation.outputs.get(0).expect("one declared zero output");
     let rank=output.shape().len();let count=usize::try_from(output.elements()?)?;
-    if rank>4||count==0||count>i32::MAX as usize{return Ok(None);}
+    if rank>4||count>i32::MAX as usize{return Ok(None);}
     let mut population=CpuPopulation::default();
+    // Empty Broadcast constructs Data instead of aliasing. Full still owns
+    // its copy Eval, but neither zero-byte output has a physical backing birth.
     if rank!=0 {
-        let Some(broadcast)=OperationEvent::cpu_broadcast_alias_layout(0,rank,false) else{return Ok(None)};
+        let broadcast=if count==0 {OperationEvent::cpu_empty_broadcast_layout(0,rank,false)}
+            else {OperationEvent::cpu_broadcast_alias_layout(0,rank,false)};
+        let Some(broadcast)=broadcast else{return Ok(None)};
         if broadcast.backing_births()!=0||population.copy(broadcast,1).is_none(){return Ok(None);}
     }
     let Some(full)=OperationEvent::cpu_scalar_full_layout(native,rank,count,false) else{return Ok(None)};
-    if full.backing_births()!=1||population.copy(full,1).is_none(){return Ok(None);}
+    if full.backing_births()!=usize::from(count!=0)||population.copy(full,1).is_none(){return Ok(None);}
     let frames=[source::control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
         size_of::<WorkspaceOperationView<'_>>(),size_of::<WorkspaceLayoutView<'_>>(),
         size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<CpuPopulation>(),size_of::<OperationPlan>(),

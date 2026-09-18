@@ -9,7 +9,7 @@ use eredu_core::{
 };
 use eredu_runtime::working_memory::{
     HostSlotStorageKey, InferenceStateRetention, PreparedResidentKvReset, ResidentKvResetLayer,
-    ResidentKvResetState, ResidentResetSession, ResidentResetSource, WorkingMemoryError,
+    ResidentTableResetState, ResidentResetSession, ResidentResetSource, WorkingMemoryError,
     WorkingMemoryPool, WorkingMemoryStorage,
 };
 type ActualSession =

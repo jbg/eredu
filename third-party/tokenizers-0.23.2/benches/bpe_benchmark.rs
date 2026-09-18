@@ -80,7 +80,7 @@ fn bench_train_small(c: &mut Criterion) {
     let mut group = c.benchmark_group("bpe-train-small");
     let data = std::fs::read_to_string("data/small.txt").unwrap();
     group.throughput(Throughput::Bytes(data.len() as u64));
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     group.bench_function("BPE Train vocabulary (small)", |b| {
         b.iter_custom(|iters| {
             iter_bench_train(
@@ -99,7 +99,7 @@ fn bench_train_big(c: &mut Criterion) {
         .build()
         .into();
     let mut tokenizer = Tokenizer::new(BPE::default()).into_inner();
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     let mut group = c.benchmark_group("bpe-train-large");
     let data = std::fs::read_to_string("data/big.txt").unwrap();
     group.throughput(Throughput::Bytes(data.len() as u64));

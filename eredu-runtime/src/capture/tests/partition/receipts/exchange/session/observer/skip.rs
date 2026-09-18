@@ -158,7 +158,7 @@ fn coordinated_skip_keeps_other_values_and_rejects_rank_disagreement() {
                             );
                             if mixed {
                                 let mut ordinary =
-                                    CaptureSession::new(plan_for(CaptureTransform::Slice, false));
+                                    CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan_for(CaptureTransform::Slice, false)));
                                 ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
                                 ordinary
                                     .observe(&mut Backend::default(), "block.output", &global())

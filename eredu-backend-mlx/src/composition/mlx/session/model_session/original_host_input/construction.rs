@@ -1,7 +1,7 @@
 //! Actual I/A/B compiler selected from the loaded blueprint, with no native readback.
 use super::*;
 use eredu_core::{BackendFailureKind, TokenInputRejection};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{input::{host::PreparedHostInputPlan, OriginalModelInput, OriginalModelInputPublicationError}, working_memory::OriginalPreparedHostInputError};
 use eredu_architectures::media_plan::{MediaSemanticError, OriginalPreparedMediaSemantics, PreparedMediaSemanticCompile};
 use std::mem::{size_of, size_of_val};
@@ -14,9 +14,9 @@ type BindingError = eredu_runtime::replicated_session::OriginalMediaBindingError
 struct Failure<E: std::error::Error> {
     #[source]
     cause: E,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
-fn failure<E: std::error::Error + Send + Sync + 'static>(cause: E, funding: &WorkspaceMetadataFunding) -> BackendFailure {
+fn failure<E: std::error::Error + Send + Sync + 'static>(cause: E, funding: &HostMetadataFunding) -> BackendFailure {
     BackendFailure::new(BackendFailureKind::Other, Failure { cause, funding: funding.clone() })
         .with_operation("prepare original model input")
 }
@@ -30,7 +30,7 @@ fn controls() -> Option<usize> {
         error_controls::<SemanticError>()?, error_controls::<BindingError>()?,
         error_controls::<RetiredMlxPreparedModelInputError>()?,
         error_controls::<RetiredMlxPreparedModelInputBindError>()?,
-        error_controls::<WorkspaceMetadataFundingError>()?,
+        error_controls::<HostMetadataFundingError>()?,
         MlxPreparedModelInputError::retirement_control_bytes()?,
         MlxPreparedModelInputBindError::retirement_control_bytes()?,
         size_of::<MlxPreparedInputMaterializer>(), size_of::<Result<MlxPreparedInputMaterializer, InitializerError>>(),
@@ -62,9 +62,9 @@ pub(in crate::composition::mlx::session::model_session) fn prepare_model_input(
         .ok_or_else(|| TokenInputRejection::Unsupported.into_backend_failure())?;
     let pool = runtime.backend().memory_pool();
     let funding = pool.prepare_workspace_metadata(model.erased().inference_execution_identity(), capacity)
-        .map_err(WorkspaceMetadataFundingError::into_backend_failure)?;
-    funding.reserve_metadata(controls().ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?)
-        .map_err(WorkspaceMetadataFundingError::into_backend_failure)?;
+        .map_err(HostMetadataFundingError::into_backend_failure)?;
+    funding.reserve_metadata(controls().ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?)
+        .map_err(HostMetadataFundingError::into_backend_failure)?;
     model.erased().prepare_original_media_semantic_binding(&funding)
         .map_err(|cause| failure(cause, &funding))?;
     let materializer = MlxPreparedInputMaterializer::prepare_admitted(pool)

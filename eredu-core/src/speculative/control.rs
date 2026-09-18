@@ -3,11 +3,11 @@
 use super::*;
 use crate::{BackendFailure, execution_control::SnapshotEstimate};
 
+#[cfg(test)]
 mod capture_delivery;
 mod reductions_delivery;
 pub use reductions_delivery::{
     PreparedSpeculativePrefillReductions, SharedSpeculativePrefillReductions,
-    SpeculativePrefillReductionsDelivery,
 };
 mod snapshot_metadata;
 
@@ -512,17 +512,16 @@ where
 /// Raw prediction capture from sampling input, before filtering or random draws.
 /// Target rows can belong to an uncommitted verification; use the step's
 /// verification dispositions to determine which predictions became canonical.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeculativePredictionCapture {
     /// Target verifier or draft model.
     pub role: SpeculativeCaptureRole,
     /// Absolute generated-token prediction position (zero is target prefill).
     pub position: u64,
-    /// Existing capture records with their actual legacy or shared ownership.
+    /// Capture records with their original retained ownership.
     /// Shared frames retain their source account through escaped records and
     /// snapshot aliases; this carrier establishes no new completion or budget.
-    #[serde(with = "capture_delivery")]
-    pub capture: crate::capture::CapturedStepDelivery,
+    pub capture: crate::capture::SharedCapturedStep,
 }
 
 /// Model responsible for one raw prediction observation.
@@ -641,7 +640,7 @@ impl SpeculativePrefillSpan {
 
 /// Bounded internal evidence from an actual speculative forward. A successful
 /// forward is still tentative until the generation driver commits its tokens.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeculativeActivationCapture {
     /// Exact loaded activation-plan identity when installed through immutable
     /// public admission. Low-level observer fixtures may have no such authority.
@@ -664,13 +663,12 @@ pub struct SpeculativeActivationCapture {
     /// cumulative resource usage. Its transaction outcome describes the forward
     /// only; even `Committed` does not imply speculative token acceptance.
     /// Shared frames preserve their original source and host custody. Access the
-    /// immutable record with CapturedStepDelivery::as_step.
-    #[serde(with = "capture_delivery")]
-    pub captures: crate::capture::CapturedStepDelivery,
+    /// immutable record with SharedCapturedStep::as_step.
+    pub captures: crate::capture::SharedCapturedStep,
     /// Logical aggregates (statistics or Preview) across a split prefill, carried by its
     /// last real physical envelope. Physical invocation attribution is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefill_reductions: Option<SpeculativePrefillReductionsDelivery>,
+    pub prefill_reductions: Option<SharedSpeculativePrefillReductions>,
 }
 
 /// Selected architecture geometry, not completion or allocation authority.

@@ -590,7 +590,7 @@ fn ordinary_observation_precedes_ordered_interventions_and_downstream_consumes_r
     ];
     let (capture, intervention) = plans(ops, true);
     preflight(&capture, &intervention, &Estimates).unwrap();
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -645,7 +645,7 @@ fn prefill_row_patching_leaves_other_rows_unchanged_and_decode_is_inactive() {
         stride: 1,
     }];
     let (capture, intervention) = plans(vec![op], false);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -686,7 +686,7 @@ fn prefill_row_patching_leaves_other_rows_unchanged_and_decode_is_inactive() {
 #[test]
 fn none_and_inactive_plans_do_not_touch_native_values() {
     let (capture, intervention) = plans(vec![], false);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -728,7 +728,7 @@ fn conditional_intervention_requires_actual_application_before_commitment() {
             .clone()
             .admit(&discovery, original.request(), original.session_id())
             .unwrap();
-        let mut session = CaptureSession::new(capture.clone());
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
         session
             .enable_interventions(intervention, std::sync::Arc::new(Estimates))
             .unwrap();
@@ -794,7 +794,7 @@ fn missing_duplicate_and_failed_operations_remain_distinct() {
         ),
     ];
     let (capture, intervention) = plans(ops, false);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -866,7 +866,7 @@ fn joint_preflight_and_runtime_charge_evidence_to_capture_limits() {
             cumulative: false
         })
     ));
-    let mut session = CaptureSession::new(limited);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(limited));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
@@ -905,7 +905,7 @@ fn immutable_run_rejects_hot_replacement_and_undrained_steps() {
         )],
         false,
     );
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(intervention.clone(), std::sync::Arc::new(Estimates))
         .unwrap();
@@ -1003,7 +1003,7 @@ fn activation_storage_exhaustion_fails_before_native_edit_or_evidence_copy() {
             ..
         })
     ));
-    let mut session = CaptureSession::new(limited);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(limited));
     session
         .enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();

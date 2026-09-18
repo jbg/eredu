@@ -44,10 +44,8 @@ fn candidate_source(runtime: &Runtime, prompt: u64) -> SharedCapturePlan {
         .unwrap(),
     )
 }
-fn candidate_frame(delivery: CapturedStepDelivery, prediction: u64) -> SharedCapturedStep {
-    let CapturedStepDelivery::Shared(frame) = delivery else {
-        panic!("original shared frame")
-    };
+fn candidate_frame(delivery: SharedCapturedStep, prediction: u64) -> SharedCapturedStep {
+    let frame = delivery;
     assert_eq!(frame.prediction_index(), prediction);
     assert_eq!(frame.outcome(), CaptureStepOutcome::Committed);
     assert_eq!(frame.step_usage().captures, 1);
@@ -375,10 +373,7 @@ fn original_candidates_share_sequence_spans_with_full_tensor_without_extra_extra
     for prediction in 0..4 {
         let token = run.next().unwrap().unwrap();
         drop(token);
-        let CapturedStepDelivery::Shared(frame) = run.take_captured_delivery().unwrap().unwrap()
-        else {
-            panic!("original frame")
-        };
+        let frame = run.take_captured_delivery().unwrap().unwrap();
         assert_eq!(frame.outcome(), CaptureStepOutcome::Committed);
         assert_eq!(frame.step_usage().captures, 2);
         assert_eq!(

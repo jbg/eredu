@@ -408,11 +408,16 @@ fn checked_prompt_provenance(
         &preparation,
     )
     .unwrap();
+    let mut installed_epoch = None;
+    runtime.session().validate_parameter_epoch(&mut installed_epoch).unwrap();
+    assert!(installed_epoch.is_some());
+    assert_eq!(sampling.sampling.parameter_epoch, installed_epoch,
+        "pending admitted sampling must retain its quoted parameter version before prefill");
     let before_override = ColdState::capture(runtime, pool);
     let original_temperature = sampling.sampling.temperature;
     let had_rng = sampling.sampling.prng.is_some();
     use eredu_runtime::execution_control::{
-        validate_sampling_override, SamplingOverride, TextSamplingControlBackend,
+        SamplingOverride, TextSamplingControlBackend,
     };
     for change in [
         SamplingOverride {
@@ -424,16 +429,11 @@ fn checked_prompt_provenance(
             reseed: Some(99),
         },
     ] {
-        let change = validate_sampling_override::<Error>(
-            MlxBackend::sampling_control_facts(&sampling),
-            change,
-        )
-        .unwrap();
         let error =
-            MlxBackend::install_sampling_override(runtime, &mut sampling, change).unwrap_err();
+            MlxBackend::apply_sampling_override(runtime, &mut sampling, None, change).unwrap_err();
         assert_eq!(
             cause::<WorkingMemoryError>(&error),
-            Some(&WorkingMemoryError::UnknownBound)
+            Some(&WorkingMemoryError::IdentityMismatch)
         );
         assert_eq!(sampling.sampling.temperature, original_temperature);
         assert_eq!(sampling.sampling.prng.is_some(), had_rng);

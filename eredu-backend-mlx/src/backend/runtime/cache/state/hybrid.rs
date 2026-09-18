@@ -3,11 +3,6 @@
 use super::*;
 
 mod fixed_slots;
-mod resident_kv_copy;
-pub(crate) use resident_kv_copy::{
-    PreparedDenseHybridKvState, PreparedHybridKvCopy, PublishedDenseHybridKvState,
-    SavedHybridKvCopy,
-};
 mod resident_grouped_copy;
 pub(crate) use resident_grouped_copy::{
     InitializedHybridDenseGroup, InitializedHybridGroupCopy, PreparedDenseHybridGroupedState,

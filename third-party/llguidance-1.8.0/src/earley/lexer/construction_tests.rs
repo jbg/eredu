@@ -3,7 +3,7 @@ use crate::api::InvalidLexerStateLimit;
 use derivre::RegexAst;
 
 fn literal_spec() -> LexerSpec {
-    let mut spec = LexerSpec::new().unwrap();
+    let mut spec = LexerSpec::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     spec.setup_lexeme_class(RegexAst::NoMatch).unwrap();
     spec.add_simple_literal("word".to_string(), "abc", false)
         .unwrap();
@@ -109,7 +109,13 @@ fn prepared_warmup_and_advance_use_the_same_lexical_decisions_and_retain_failure
             .unwrap()
             .ordinary(spec.regex_builder.exprset().clone())
             .unwrap();
-        PreparedRegexVector::prepare(input, &mut ParserLimits::default(), &reserve).unwrap()
+        PreparedRegexVector::prepare_with_backing(
+            input,
+            &mut ParserLimits::default(),
+            Some(derivre::ParserAllocationFunding::unenforced()),
+            &reserve,
+        )
+        .unwrap()
     };
     let calls = Cell::new(0usize);
     let spending = Cell::new(0usize);
@@ -194,4 +200,81 @@ fn prepared_warmup_and_advance_use_the_same_lexical_decisions_and_retain_failure
         })
         .is_err());
     assert_eq!(untouched.get(), 0);
+}
+
+#[test]
+fn cached_mutation_uses_borrowed_controls_and_stops_at_each_refusal() {
+    use super::prepared::PreparedLexer;
+    use crate::earley::regexvec::prepared::PreparedRegexVector;
+    use std::cell::Cell;
+
+    let spec = literal_spec();
+    let reserve = |_| Ok::<(), &'static str>(());
+    let prepared = || {
+        let input = spec
+            .root_source_plan()
+            .unwrap()
+            .compile()
+            .unwrap()
+            .ordinary(spec.regex_builder.exprset().clone())
+            .unwrap();
+        let vector = PreparedRegexVector::prepare_with_backing(
+            input,
+            &mut ParserLimits::default(),
+            Some(derivre::ParserAllocationFunding::unenforced()),
+            &reserve,
+        )
+        .unwrap();
+        let mut lexer = PreparedLexer::prepare(vector, &reserve).unwrap();
+        let state = lexer.start_state(&spec.all_lexemes(), &reserve).unwrap();
+        (lexer, state)
+    };
+    let mut ordinary = Lexer::from(&spec, &mut ParserLimits::default(), false).unwrap();
+    let ordinary_state = ordinary.start_state(&spec.all_lexemes());
+    let expected = format!("{:?}", ordinary.advance(ordinary_state, b'a', false));
+    let (mut lexer, state) = prepared();
+    let transitions = lexer.vector().transitions_attempted();
+    let calls = Cell::new(0);
+    for _ in 0..64 {
+        // A warmed transition has an 8 KiB operation allowance. Its existing
+        // lexer/DFA owners remain in place; constructing either again would
+        // exceed this allowance even though this traversal allocates no owner.
+        let remaining = Cell::new(8 * 1024usize);
+        calls.set(0);
+        let result = lexer
+            .advance(state, b'a', &|bytes| {
+                calls.set(calls.get() + 1);
+                remaining.set(
+                    remaining
+                        .get()
+                        .checked_sub(bytes)
+                        .ok_or("operation allowance")?,
+                );
+                Ok::<(), &'static str>(())
+            })
+            .unwrap();
+        assert_eq!(format!("{result:?}"), expected);
+    }
+    assert_eq!(lexer.vector().transitions_attempted(), transitions);
+    for cut in 1..=calls.get() {
+        let (mut lexer, state) = prepared();
+        let reached = Cell::new(0);
+        let error = lexer
+            .advance(state, b'a', &|_| {
+                reached.set(reached.get() + 1);
+                if reached.get() == cut {
+                    Err("exact mutation refusal")
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "exact mutation refusal");
+        assert_eq!(reached.get(), cut);
+        assert!(lexer
+            .advance(state, b'a', &|_| -> Result<(), &'static str> {
+                panic!("failed mutable owner must not request later funding")
+            })
+            .is_err());
+    }
 }

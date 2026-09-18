@@ -14,7 +14,7 @@ struct Charge {
     used: Arc<AtomicUsize>,
     bytes: usize,
     // Real registry keys retain identity metadata, not the filter owner.
-    _identity: SharedTokenFilterIdentity,
+    _identity: SharedStorageIdentity,
     _domain: SharedStorageDomain,
 }
 impl Charge {
@@ -245,7 +245,7 @@ fn acquisition_unwind_poison_preserves_existing_custody_until_last_alias() {
 fn simultaneous_alias_attachments_acquire_one_shared_domain_charge() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<SharedTokenFilter>();
-    send_sync::<SharedTokenFilterIdentity>();
+    send_sync::<SharedStorageIdentity>();
     send_sync::<SharedStorageDomain>();
     let filter = filter();
     let domain = SharedStorageDomain::default();

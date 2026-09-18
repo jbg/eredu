@@ -22,20 +22,28 @@ pub enum CaptureSliceDestinationError {
 }
 impl CaptureSliceDestinationError {
     pub(crate) fn legacy(self, slices: &[CaptureSlice]) -> CaptureError {
+        self.legacy_with(slices,super::admission::allocation::Allocation(None))
+    }
+    pub(crate) fn legacy_with(self, slices: &[CaptureSlice],
+        allocation: super::admission::allocation::Allocation<'_>) -> CaptureError {
+        let result = (|| -> Result<CaptureError,CaptureError> { Ok(
         match self {
-            Self::Rank => CaptureError::Invalid("runtime tensor rank differs from catalog".into()),
+            Self::Rank => CaptureError::Invalid(allocation.text("runtime tensor rank differs from catalog")?),
             Self::Axis { index } => {
-                CaptureError::Invalid(format!("unknown axis {}", slices[index].axis))
+                CaptureError::Invalid(allocation.format(format_args!("unknown axis {}", slices[index].axis))?)
             }
-            Self::Range { index } => CaptureError::Invalid(format!(
+            Self::Range { index } => CaptureError::Invalid(allocation.format(format_args!(
                 "slice {} exceeds runtime extent",
                 slices[index].axis
-            )),
+            ))?),
             Self::Destination => {
-                CaptureError::Invalid("slice destination rank differs from source".into())
+                CaptureError::Invalid(allocation.text("slice destination rank differs from source")?)
             }
             Self::Overflow => CaptureError::Overflow,
         }
+        ) })();
+        result.unwrap_or_else(|cause|cause)
+
     }
 }
 /// Resolves into four existing rank-sized slices. It constructs no payload or

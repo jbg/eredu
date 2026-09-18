@@ -71,7 +71,7 @@ fn combined_and_intervention_only_checkpoints_rebind_children_and_retain_outcome
         );
         let source = captures(&capture);
         let targets = discovery(&intervention);
-        let mut parent = CaptureSession::new(capture.clone());
+        let mut parent = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
         parent
             .enable_interventions(intervention.clone(), Arc::new(Facts::new(0)))
             .unwrap();
@@ -128,7 +128,7 @@ fn fork_rejects_copied_identity_absent_revalidation_and_unavailable_native_estim
     let (capture, plan) = routed(true);
     let source = captures(&capture);
     let targets = discovery(&plan);
-    let mut parent = CaptureSession::new(capture.clone());
+    let mut parent = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
     parent
         .enable_interventions(plan.clone(), Arc::new(Facts::new(1)))
         .unwrap();
@@ -186,7 +186,7 @@ fn prospective_removal_keeps_inherited_accounting_and_original_provenance() {
     );
     let source = captures(&capture);
     let targets = discovery(&plan);
-    let mut parent = CaptureSession::new(capture.clone());
+    let mut parent = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
     parent
         .enable_interventions(plan.clone(), Arc::new(Facts::new(0)))
         .unwrap();

@@ -70,12 +70,38 @@ impl<'a> From<&'a WorkspaceLayout> for WorkspaceSamplingSource<'a> {
     }
 }
 
+/// Exact score descriptor supplied to the shared sampling worker. Its checked
+/// one-row rank is at most three, so retention needs no allocated shape buffer.
+/// These descriptive facts supply neither source custody nor execution rights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplingWorkspaceInputPlan {
+    shape: [i32; 3],
+    rank: usize,
+    backing_capacity_bytes: Option<u64>,
+    maximum_allocations: Option<usize>,
+}
+impl SamplingWorkspaceInputPlan {
+    /// Actual source dimensions, without normalizing or guessing its rank.
+    pub fn shape(&self) -> &[i32] { &self.shape[..self.rank] }
+    /// Reconstructs the same source descriptor over a separately paid layout.
+    pub fn source<'a>(&self, layout: &'a WorkspaceLayout) -> Result<WorkspaceSamplingSource<'a>, Error> {
+        if layout.shape() != self.shape() || layout.dtype() != WorkspaceDtype::Float32 {
+            return Err(WorkspaceMetadataError::Unqualified.into());
+        }
+        Ok(WorkspaceSamplingSource {
+            input: WorkspaceSamplingInput { layout, backing_capacity_bytes: self.backing_capacity_bytes },
+            maximum_allocations: self.maximum_allocations,
+        })
+    }
+}
+
 /// Sampling contribution across an entire output allowance. This includes
 /// retained random keys, every emitted token buffer, history replacement overlap
 /// and the supplied filter payload. Input logits, constraint-controller state,
 /// speculative proposals and retained observations belong to enclosing quotes.
 #[derive(Debug, Clone)]
 pub struct SamplingWorkspaceReport {
+    input: SamplingWorkspaceInputPlan,
     /// Exact selected score-row width used to validate and price the filter.
     pub output_width: usize,
     /// Number of ordinary committed-token sampling invocations inspected.
@@ -109,6 +135,9 @@ pub enum SamplingWorkspacePhase {
 /// Mechanisms may reduce this trace to native recipes; observation grants no
 /// allocation authority or completeness beyond the operations actually seen.
 pub trait SamplingWorkspaceObserver {
+    /// Observes the actual score source before preparation/step traces. The
+    /// default is appropriate for consumers that do not later reprice sampling.
+    fn observe_input(&mut self, _input: SamplingWorkspaceInputPlan) -> Result<(), Error> { Ok(()) }
     /// The report includes existing roots, retained prior outputs and the
     /// operations for this phase. Distinguish new producers from those roots
     /// when computing cumulative generations or replacement contributions.
@@ -205,22 +234,33 @@ fn quote_with_sampler(
     let logits = source.input;
     let vocabulary = logits_layout_width(logits.layout)?;
     if logits.layout.elements()? != vocabulary as u64 || logits.layout.shape().len() > 3 {
-        return Err(Error::backend(
+        return Err(context.metadata_error(format_args!(
             "configured sampling requires one score row of rank 1, 2 or 3",
-        ));
+        )));
     }
+    context.charge_metadata(std::mem::size_of::<SamplingWorkspaceInputPlan>()
+        + std::mem::size_of::<[i32; 3]>())?;
+    let mut shape = [0; 3];
+    shape[..logits.layout.shape().len()].copy_from_slice(logits.layout.shape());
+    let input_plan = SamplingWorkspaceInputPlan {
+        shape,
+        rank: logits.layout.shape().len(),
+        backing_capacity_bytes: logits.backing_capacity_bytes,
+        maximum_allocations: source.maximum_allocations,
+    };
+    if let Some(observer) = observer.as_deref_mut() { observer.observe_input(input_plan)?; }
     if !temperature.is_finite() || temperature < 0.0 {
-        return Err(Error::backend(
+        return Err(context.metadata_error(format_args!(
             "sampling temperature must be finite and nonnegative",
-        ));
+        )));
     }
     filter
         .validate_output_width(vocabulary)
-        .map_err(Error::backend)?;
+        .map_err(|cause| context.metadata_source(cause))?;
     context.validate_values(random.into_iter().map(|state| state.key()))?;
-    sampler.validate_steps(steps)?;
-    let filter_bytes = filter.mask_capacity_bytes().map_err(Error::backend)?;
-    let fixed = bytes_add(
+    sampler.validate_steps(steps, context)?;
+    let filter_bytes = filter.mask_capacity_bytes().map_err(|cause| context.metadata_source(cause))?;
+    let fixed = bytes_add(context,
         std::mem::size_of::<ConfiguredTextSampler>() as u64,
         filter_bytes,
     )?;
@@ -272,22 +312,23 @@ fn quote_with_sampler(
                 .as_ref()
                 .and_then(|state| state.displaced_bytes),
         )
-        .map(|(new, old)| bytes_add(new, old))
+        .map(|(new, old)| bytes_add(context, new, old))
         .transpose()?;
     let initial_host = initial
         .host_workspace_bytes
         .map(|bytes| {
-            bytes_add(
+            bytes_add(context,
                 bytes,
-                bytes_add(initial_fixed, history_bytes(sampler.history_capacity())?)?,
+                bytes_add(context, initial_fixed, history_bytes(context, sampler.history_capacity())?)?,
             )
         })
         .transpose()?;
     let initial_peak = initial_tensor
         .zip(initial_host)
-        .map(|(tensor, host)| bytes_add(tensor, host))
+        .map(|(tensor, host)| bytes_add(context, tensor, host))
         .transpose()?;
     let mut report = SamplingWorkspaceReport {
+        input: input_plan,
         output_width: vocabulary,
         steps,
         peak: match initial_peak {
@@ -306,12 +347,12 @@ fn quote_with_sampler(
         tensor_peak_bytes: initial_tensor,
         host_peak_bytes: initial_host,
         first_gap: initial_peak.is_none().then_some(0),
-        final_history_bytes: history_bytes(sampler.history_capacity())?,
+        final_history_bytes: history_bytes(context, sampler.history_capacity())?,
     };
     let mut known_peak = initial_peak.unwrap_or(0);
     let mut emitted = Vec::new();
     for index in 0..steps {
-        let old_history = history_bytes(sampler.history_capacity())?;
+        let old_history = history_bytes(context, sampler.history_capacity())?;
         context.begin_state_span(random.iter().map(|state| state.key()).chain(emitted.iter()))?;
         let storage = match source.maximum_allocations {
             Some(maximum_allocations) => WorkspaceExistingStorage::try_new_population(
@@ -355,27 +396,27 @@ fn quote_with_sampler(
                 closing.expect("observed closing roots"),
             )?;
         }
-        let new_history = history_bytes(sampler.history_capacity())?;
+        let new_history = history_bytes(context, sampler.history_capacity())?;
         let history = if old_history == new_history {
             new_history
         } else {
-            bytes_add(old_history, new_history)?
+            bytes_add(context, old_history, new_history)?
         };
         let host = trace
             .host_workspace_bytes
-            .map(|bytes| bytes_add(bytes, bytes_add(fixed, history)?))
+            .map(|bytes| bytes_add(context, bytes, bytes_add(context, fixed, history)?))
             .transpose()?;
         let tensor = trace
             .tensor_buffers
             .total_bytes
             .zip(trace.state.as_ref().and_then(|state| state.displaced_bytes))
-            .map(|(new, old)| bytes_add(new, old))
+            .map(|(new, old)| bytes_add(context, new, old))
             .transpose()?;
         report.tensor_peak_bytes = maximum(report.tensor_peak_bytes, tensor);
         report.host_peak_bytes = maximum(report.host_peak_bytes, host);
         match tensor
             .zip(host)
-            .map(|(tensor, host)| bytes_add(tensor, host))
+            .map(|(tensor, host)| bytes_add(context, tensor, host))
             .transpose()?
         {
             Some(bytes) if report.first_gap.is_none() && bytes >= known_peak => {
@@ -406,7 +447,7 @@ fn quote_with_sampler(
         report.host_peak_bytes,
     ) {
         let combined = tensor.checked_add(host).ok_or_else(|| {
-            Error::backend_source(crate::working_memory::WorkingMemoryError::Overflow)
+            context.metadata_source(crate::working_memory::WorkingMemoryError::Overflow)
         })?;
         if let WorkspaceBound::Bounded { bytes, assumptions } = &mut report.peak {
             *bytes = combined;
@@ -421,21 +462,21 @@ fn quote_with_sampler(
 fn maximum(old: Option<u64>, next: Option<u64>) -> Option<u64> {
     old.zip(next).map(|(old, next)| old.max(next))
 }
-fn history_bytes(capacity: usize) -> Result<u64, Error> {
+fn history_bytes(context: &WorkspaceContext, capacity: usize) -> Result<u64, Error> {
     (capacity as u64)
         .checked_mul(4)
-        .ok_or_else(|| Error::backend("sampling history byte overflow"))
+        .ok_or_else(|| context.metadata_error(format_args!("sampling history byte overflow")))
 }
-fn bytes_add(left: u64, right: u64) -> Result<u64, Error> {
+fn bytes_add(context: &WorkspaceContext, left: u64, right: u64) -> Result<u64, Error> {
     left.checked_add(right)
-        .ok_or_else(|| Error::backend("sampling workspace byte overflow"))
+        .ok_or_else(|| context.metadata_error(format_args!("sampling workspace byte overflow")))
 }
 
 // The production cursor holds no numerical history. A test-only real sampler
 // cursor exercises the established mechanism as an independent parity oracle.
 trait QuoteSampler {
     fn history_capacity(&self) -> usize;
-    fn validate_steps(&self, steps: u64) -> Result<(), Error>;
+    fn validate_steps(&self, steps: u64, context: &WorkspaceContext) -> Result<(), Error>;
     fn sample(
         &mut self,
         logits: &WorkspaceTensor,
@@ -449,8 +490,8 @@ impl QuoteSampler for SamplerWorkspaceProjection<'_> {
     fn history_capacity(&self) -> usize {
         SamplerWorkspaceProjection::history_capacity(self)
     }
-    fn validate_steps(&self, steps: u64) -> Result<(), Error> {
-        SamplerWorkspaceProjection::validate_steps(self, steps).map_err(Error::backend_source)
+    fn validate_steps(&self, steps: u64, context: &WorkspaceContext) -> Result<(), Error> {
+        SamplerWorkspaceProjection::validate_steps(self, steps).map_err(|cause| context.metadata_source(cause))
     }
     fn sample(
         &mut self,
@@ -502,7 +543,7 @@ impl QuoteSampler for SamplerWorkspaceProjection<'_> {
                 (token, Some(probability))
             }
         };
-        self.advance(probability).map_err(Error::backend_source)?;
+        self.advance(probability).map_err(|cause| context.metadata_source(cause))?;
         Ok(token)
     }
 }
@@ -512,10 +553,10 @@ impl QuoteSampler for ConfiguredTextSampler {
     fn history_capacity(&self) -> usize {
         ConfiguredTextSampler::history_capacity(self)
     }
-    fn validate_steps(&self, steps: u64) -> Result<(), Error> {
+    fn validate_steps(&self, steps: u64, context: &WorkspaceContext) -> Result<(), Error> {
         self.workspace_projection()
             .validate_steps(steps)
-            .map_err(Error::backend_source)
+            .map_err(|cause| context.metadata_source(cause))
     }
     fn sample(
         &mut self,
@@ -571,6 +612,8 @@ impl std::fmt::Display for Assumptions<'_> {
 }
 
 impl SamplingWorkspaceReport {
+    /// Exact original score geometry/backing facts retained by this report.
+    pub fn input_plan(&self) -> SamplingWorkspaceInputPlan { self.input }
     /// Adds this actual sampling report to the enclosing vocabulary contribution.
     /// Equations, prompt preparation and controller storage remain separate.
     /// This is the same composition used by text and prepared-media consumers.

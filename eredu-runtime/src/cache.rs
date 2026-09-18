@@ -430,7 +430,7 @@ impl CacheResidencyPool {
 pub struct CachePoolReservation {
     reservation: u64,
     pool: CacheResidencyPool,
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl Drop for CachePoolReservation {
@@ -456,7 +456,7 @@ pub struct CachePoolMembership {
     manager: u64,
     pool: CacheResidencyPool,
     // The canonical table separately retains its own paying owner.
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl CachePoolMembership {

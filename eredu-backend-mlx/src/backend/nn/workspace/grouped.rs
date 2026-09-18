@@ -547,3 +547,24 @@ pub(super) fn expert_row_candidates(
                 maximum.checked_sub(distance).filter(|rows| *rows > threshold)
             }))
 }
+
+/// Both native devices execute the same packed-bank chunk/callback schedule.
+pub(super) fn observation_schedule(bank: &WorkspaceGroupedBank, tokens: u32)
+    -> Result<Option<WorkspaceGroupedObservationSchedule>, Error> {
+        use super::super::grouped::{GROUPED_PROJECTION_CHUNK_THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS};
+        if let WorkspaceGroupedBank::GatedProduct(spec) = bank {
+            if !matches!(
+                spec.layout(),
+                eredu_nn::GatedProductGroupLayout::Packed { .. }
+            ) {
+                return Ok(None);
+            }
+            if tokens > GROUPED_PROJECTION_CHUNK_THRESHOLD as u32 {
+                return Ok(Some(WorkspaceGroupedObservationSchedule::TokenChunks(
+                    std::num::NonZeroU32::new(GROUPED_PROJECTION_CHUNK_TOKENS as u32)
+                        .expect("native grouped chunk size is positive"),
+                )));
+            }
+        }
+        Ok(Some(WorkspaceGroupedObservationSchedule::WholeBatch))
+}

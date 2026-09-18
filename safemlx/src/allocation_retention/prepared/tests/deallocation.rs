@@ -2,7 +2,7 @@
 use super::*;
 use std::{
     alloc::{GlobalAlloc, System},
-    sync::{atomic::AtomicBool, Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, atomic::AtomicBool},
 };
 
 #[derive(Debug)]

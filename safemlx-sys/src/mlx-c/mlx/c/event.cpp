@@ -654,6 +654,44 @@ extern "C" unsigned mlx_operation_event_validate_nested_graph(
       *scope->graph_quota(), scope->identity(), roots));
 }
 namespace {
+// The Event becoming readable is distinct from the last CPU signal task
+// releasing its Record-owned controls. Keep the resident bank suspended until
+// both have completed. Refusals preserve the Scope's accepted Records; they do
+// not certify completion or release their independently retained allocations.
+unsigned settle_nested_event(
+    mlx_operation_event& value, mlx::core::submission::Scope& scope,
+    bool release_event) noexcept {
+  using namespace mlx::core;
+  using namespace mlx::core::submission;
+  try {
+    if (auto status = mlx_operation_event_wait(value)) return status;
+    for (;;) {
+      const auto progress = scope.progress_scoped();
+      if (progress != ScopedProgress::observed)
+        return static_cast<unsigned>(evaluation_progress(progress));
+      const auto records = scope.query_records();
+      if (records.failed || records.blocked) return 7;
+      if (!records.pending) break;
+      std::this_thread::yield();
+    }
+    if (release_event) {
+      mlx_operation_event_free(value);
+      value.ctx = nullptr;
+    }
+    if (auto retirement = scope.retire_scoped_records();
+        retirement != ScopedProgress::observed)
+      return static_cast<unsigned>(evaluation_progress(retirement));
+    return 0;
+  } catch (...) {
+    scope.failure_owner().get()->capture_current_exception();
+    return 7;
+  }
+}
+size_t nested_settlement_control_bytes() noexcept {
+  using namespace mlx::core::submission;
+  return sizeof(mlx_operation_event*) + sizeof(Scope*) + sizeof(bool) +
+      sizeof(unsigned) + 2 * sizeof(ScopedProgress) + sizeof(RecordStatus);
+}
 // Both public entries use this same exact nested attempt, Event constructor,
 // prepared Eval and terminal-record worker. Mixed-stream Eval can queue CPU
 // callbacks which borrow its graph banks: keep the resident bank suspended until
@@ -694,22 +732,9 @@ unsigned run_nested_graph_event(
     status = mlx_operation_event_submit_on_stream_prepared(event.raw, stream, &limits);
     if (status) return status;
     if (settle_records) {
-      if ((status = mlx_operation_event_wait(event.raw))) return status;
-      for (;;) {
-        const auto progress = scope->progress_scoped();
-        if (progress != ScopedProgress::observed)
-          return static_cast<unsigned>(evaluation_progress(progress));
-        const auto records = scope->query_records();
-        if (records.failed || records.blocked) return 7;
-        if (!records.pending) break;
-        std::this_thread::yield();
-      }
       // Complete-only retains the former Event-before-record destruction order.
       // A published completed Event retains its roots and quota as usual.
-      if (complete) event.reset();
-      if (auto retirement = scope->retire_scoped_records();
-          retirement != ScopedProgress::observed)
-        return static_cast<unsigned>(evaluation_progress(retirement));
+      if ((status = settle_nested_event(event.raw, *scope, complete))) return status;
     }
     if (!complete) {
       *out = event.raw;
@@ -747,7 +772,7 @@ extern "C" size_t mlx_operation_event_nested_graph_control_bytes(void) {
       sizeof(mlx_submission_observer) + sizeof(mlx_stream) + sizeof(Stream) +
       sizeof(Scope*) + sizeof(GraphConstruction*) + sizeof(const mlx_array*) +
       4 * sizeof(size_t) + 3 * sizeof(unsigned) + sizeof(ScopedEvaluation) +
-      sizeof(ScopedProgress) + sizeof(RecordStatus) + 2 * sizeof(bool) +
+      2 * sizeof(bool) + nested_settlement_control_bytes() +
       sizeof(mlx_operation_event) + sizeof(mlx_operation_event*) +
       scoped_observer_control_bytes();
 }
@@ -919,7 +944,7 @@ extern "C" unsigned mlx_operation_event_new_nested_scheduled(
   if (auto status = mlx_operation_event_validate_nested_graph(observer, std::max<size_t>(1, roots))) return status;
   auto* scope = static_cast<Scope*>(observer.ctx);
   const auto selected = mlx_stream_get_(stream);
-  if (selected.device.type != Device::gpu) return 4;
+  if (selected.device.type != Device::gpu && selected.device.type != Device::cpu) return 4;
   const auto ready = preflight_original_submission_stream(*scope, selected);
   if (ready != ScopedEvaluation::complete) return static_cast<unsigned>(ready);
   if (auto status = mlx_operation_event_new(out, observer)) return status;
@@ -932,7 +957,7 @@ extern "C" unsigned mlx_operation_event_new_nested_scheduled(
   const auto& bound = event->nested->limits();
   CompletionEvalRecordLayout record;
   // Suspended limits describe the enclosing bank's capacity. This producer
-  // authenticates one selected GPU stream above and submits only that stream's
+  // authenticates one selected stream above and submits only that stream's
   // new Synchronizer below; already-scheduled roots add no lazy traversal.
   if (bound.streams < 1 || bound.arrays < roots + 1 || bound.input_edges < roots ||
       !bound.tape_entries || !bound.output_slots ||
@@ -972,8 +997,14 @@ extern "C" unsigned mlx_operation_event_submit_nested_scheduled(
   const auto roots = event->expected_roots;
   const mlx_operation_eval_traversal_limits limits{roots, roots + 1, 1, roots, 1, 1, record.capture_slots};
   const auto status = mlx_operation_event_submit_on_stream_prepared(value, stream, &limits);
-  if (status == 0) event->nested.reset(); // GPU prologues are fully constructed
-  return status;
+  if (status) return status;
+  if (mlx_stream_get_(stream).device.type == Device::cpu) {
+    if (auto settled = settle_nested_event(value, *event->scope, false)) return settled;
+  }
+  // GPU prologues are fully constructed; CPU signal tasks and their actual
+  // Records have settled. Neither path refunds this nested attempt.
+  event->nested.reset();
+  return 0;
 }
 
 extern "C" bool mlx_operation_event_cpu_copy_eval_layout(
@@ -993,6 +1024,20 @@ extern "C" bool mlx_operation_event_cpu_copy_eval_layout(
       copy ? 0 : dispatch.cpu_signal_extent};
   *out = value;
   return true;
+}
+
+extern "C" bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_eval_layout* out,
+    mlx_dtype dtype,size_t rank,bool store,bool tracer) {
+  using namespace mlx::core;
+  if(!out||dtype<MLX_BOOL||dtype>MLX_COMPLEX64)return false;
+  cpu::CopyEvalStorage native;
+  if(!cpu::host_transfer_eval_layout(mlx_dtype_to_cpp(dtype),rank,store,tracer,native))return false;
+  const size_t controls=sizeof(out)+sizeof(*out)+sizeof(dtype)+sizeof(rank)+sizeof(store)+sizeof(tracer)+
+      sizeof(native)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
+      native.backing_births,native.named_control_bytes+controls,0};
+  *out=value;return true;
 }
 
 #include "mlx/backend/cpu/unary_storage.h"
@@ -1016,7 +1061,7 @@ extern "C" bool mlx_operation_event_cpu_unary_eval_layout(mlx_cpu_unary_eval_lay
 extern "C" bool mlx_operation_event_cpu_binary_eval_layout(mlx_cpu_binary_eval_layout* out,
     uint32_t operation, mlx_dtype dtype, size_t rank, size_t elements, bool tracer) {
   using namespace mlx::core;
-  if (!out || operation > uint32_t(cpu::BinaryEvalKind::less_equal) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
+  if (!out || operation > uint32_t(cpu::BinaryEvalKind::log_add_exp) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
   cpu::BinaryEvalStorage native;
   if (!cpu::binary_eval_layout(static_cast<cpu::BinaryEvalKind>(operation), mlx_dtype_to_cpp(dtype),
       rank, elements, tracer, native)) return false;
@@ -1061,11 +1106,11 @@ extern "C" bool mlx_operation_event_cpu_byte_view_eval_layout(mlx_cpu_copy_eval_
 
 #include "mlx/backend/cpu/slice_storage.h"
 extern "C" bool mlx_operation_event_cpu_slice_eval_layout(mlx_cpu_copy_eval_layout* out,
-    size_t rank,bool tracer) {
+    size_t rank,bool empty,bool tracer) {
   if(!out)return false;
   mlx::core::cpu::CopyEvalStorage native;
-  if(!mlx::core::cpu::slice_eval_layout(rank,tracer,native))return false;
-  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(rank)+sizeof(tracer)+sizeof(size_t);
+  if(!mlx::core::cpu::slice_eval_layout(rank,empty,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(rank)+sizeof(empty)+sizeof(tracer)+sizeof(size_t);
   if(native.named_control_bytes>SIZE_MAX-controls)return false;
   const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
       native.backing_births,native.named_control_bytes+controls,0};
@@ -1098,11 +1143,12 @@ extern "C" bool mlx_operation_event_cpu_static_update_eval_layout(mlx_cpu_copy_e
 
 #include "mlx/backend/cpu/argsort_f32.h"
 extern "C" bool mlx_operation_event_cpu_argsort_eval_layout(mlx_cpu_copy_eval_layout* out,
-    size_t elements,bool tracer) {
-  if(!out)return false;
+    mlx_dtype source,size_t rank,size_t columns,size_t rows,bool tracer) {
+  if(!out||(source!=MLX_FLOAT32&&source!=MLX_INT32))return false;
   mlx::core::cpu::CopyEvalStorage native;
-  if(!mlx::core::cpu::argsort_eval_layout(elements,tracer,native))return false;
-  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(elements)+sizeof(tracer)+sizeof(size_t);
+  if(!mlx::core::cpu::argsort_eval_layout(mlx_dtype_to_cpp(source),rank,columns,rows,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(source)+sizeof(rank)+
+      sizeof(columns)+sizeof(rows)+sizeof(tracer)+sizeof(size_t)+sizeof(mlx::core::Dtype);
   if(native.named_control_bytes>SIZE_MAX-controls)return false;
   const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
       native.backing_births,native.named_control_bytes+controls,0};
@@ -1395,7 +1441,8 @@ extern "C" bool mlx_operation_event_cpu_rms_fallback_control_bytes(
 #include "mlx/backend/cpu/concatenate_storage.h"
 extern "C" bool mlx_operation_event_cpu_concatenate_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype dtype,size_t rank,size_t left,size_t right,bool tracer) {
-  if(!out||(dtype!=MLX_FLOAT32&&dtype!=MLX_FLOAT16&&dtype!=MLX_BFLOAT16&&dtype!=MLX_UINT8))return false;
+  // Validate the conversion-table index; the native source owns supported types.
+  if(!out||dtype<MLX_BOOL||dtype>MLX_COMPLEX64)return false;
   mlx::core::cpu::CopyEvalStorage native;
   if(!mlx::core::cpu::concatenate_eval_layout(mlx_dtype_to_cpp(dtype),rank,left,right,tracer,native))return false;
   const size_t frames=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(dtype)+sizeof(rank)+sizeof(left)+sizeof(right)+sizeof(tracer);
@@ -1406,7 +1453,7 @@ extern "C" bool mlx_operation_event_cpu_concatenate_eval_layout(mlx_cpu_copy_eva
 
 extern "C" bool mlx_operation_event_cpu_concatenate_many_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype dtype,size_t rank,size_t inputs,size_t elements,bool tracer) {
-  if(!out||(dtype!=MLX_FLOAT32&&dtype!=MLX_FLOAT16&&dtype!=MLX_BFLOAT16&&dtype!=MLX_UINT8))return false;
+  if(!out||dtype<MLX_BOOL||dtype>MLX_COMPLEX64)return false;
   mlx::core::cpu::CopyEvalStorage native;
   if(!mlx::core::cpu::concatenate_many_eval_layout(mlx_dtype_to_cpp(dtype),rank,inputs,elements,tracer,native))return false;
   const size_t frames=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(dtype)+sizeof(rank)+sizeof(inputs)+sizeof(elements)+sizeof(tracer);
@@ -1427,14 +1474,28 @@ extern "C" bool mlx_operation_event_cpu_arange_float_eval_layout(mlx_cpu_copy_ev
   return true;
 }
 extern "C" bool mlx_operation_event_cpu_arange_int_eval_layout(mlx_cpu_copy_eval_layout* out,
-    size_t elements,bool tracer) {
-  if(!out)return false;
+    mlx_dtype dtype,size_t elements,bool tracer) {
+  if(!out || (dtype != MLX_INT32 && dtype != MLX_UINT32))return false;
   mlx::core::cpu::CopyEvalStorage native;
-  if(!mlx::core::cpu::arange_int_eval_layout(elements,tracer,native))return false;
-  const size_t frames=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(elements)+sizeof(tracer);
+  if(!mlx::core::cpu::arange_int_eval_layout(mlx_dtype_to_cpp(dtype),elements,tracer,native))return false;
+  const size_t frames=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(dtype)+sizeof(elements)+sizeof(tracer);
   if(native.named_control_bytes>SIZE_MAX-frames)return false;
   *out={native.allocation_extents,native.worker_graph_extents,native.backing_births,native.named_control_bytes+frames,0};
   return true;
+}
+#include "mlx/backend/cpu/gather_mm_storage.h"
+extern "C" bool mlx_operation_event_cpu_tiled_gather_mm_eval_layout(mlx_cpu_copy_eval_layout* out,
+    size_t lhs_rank,size_t rhs_rank,size_t index_rank,size_t m,size_t n,size_t k,
+    size_t batches,bool tracer) {
+  if(!out)return false;
+  mlx::core::cpu::CopyEvalStorage native;
+  if(!mlx::core::cpu::tiled_gather_mm_eval_layout(lhs_rank,rhs_rank,index_rank,m,n,k,batches,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(lhs_rank)+sizeof(rhs_rank)+
+      sizeof(index_rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
+      native.backing_births,native.named_control_bytes+controls,0};
+  *out=value;return true;
 }
 extern "C" bool mlx_operation_event_cpu_rope_fallback_control_bytes(size_t* out,
     size_t rank,size_t dimensions,size_t elements) {
@@ -1478,19 +1539,22 @@ extern "C" bool mlx_operation_event_cpu_scatter_axis_eval_layout(mlx_cpu_copy_ev
   *out=value;return true;
 }
 
-#include "mlx/backend/cpu/reduction_storage.h"
-
-extern "C" bool mlx_operation_event_cpu_argsort_row_eval_layout(mlx_cpu_copy_eval_layout* out,
-    size_t rank,size_t elements,bool tracer) {
-  if(!out)return false;
-  mlx::core::cpu::CopyEvalStorage native;
-  if(!mlx::core::cpu::argsort_row_eval_layout(rank,elements,tracer,native))return false;
-  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(size_t);
+extern "C" bool mlx_operation_event_cpu_scatter_add_rows_eval_layout(mlx_cpu_copy_eval_layout* out,
+    mlx_dtype index,size_t output_elements,size_t update_elements,bool tracer) {
+  using namespace mlx::core;
+  if(!out||(index!=MLX_INT32&&index!=MLX_UINT32))return false;
+  cpu::CopyEvalStorage native;
+  if(!cpu::scatter_add_rows_eval_layout(mlx_dtype_to_cpp(index),output_elements,update_elements,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(index)+
+      sizeof(output_elements)+sizeof(update_elements)+sizeof(tracer)+sizeof(size_t)+sizeof(Dtype);
   if(native.named_control_bytes>SIZE_MAX-controls)return false;
   const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
       native.backing_births,native.named_control_bytes+controls,0};
   *out=value;return true;
 }
+
+#include "mlx/backend/cpu/reduction_storage.h"
+
 
 extern "C" bool mlx_operation_event_cpu_partition_row_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank,size_t elements,bool tracer) {
@@ -1540,14 +1604,15 @@ extern "C" bool mlx_operation_event_cpu_gather_axis_row_eval_layout(mlx_cpu_copy
   *out=value;return true;
 }
 
-extern "C" bool mlx_operation_event_cpu_flat_scatter_eval_layout(mlx_cpu_copy_eval_layout* out,
-    mlx_dtype index, size_t output_elements, size_t update_elements, bool tracer) {
+extern "C" bool mlx_operation_event_cpu_scatter_eval_layout(mlx_cpu_copy_eval_layout* out,
+    mlx_dtype source,mlx_dtype index,size_t rank,size_t output_elements,size_t update_elements,bool tracer) {
   using namespace mlx::core;
-  if (!out || index != MLX_INT32) return false;
+  if (!out || index != MLX_INT32 || (source!=MLX_FLOAT32&&source!=MLX_INT32)) return false;
   cpu::CopyEvalStorage native;
-  if (!cpu::flat_scatter_eval_layout(mlx_dtype_to_cpp(index), output_elements, update_elements, tracer, native)) return false;
-  const size_t controls = sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(index)+
-      sizeof(output_elements)+sizeof(update_elements)+sizeof(tracer)+sizeof(size_t)+sizeof(Dtype);
+  if (!cpu::scatter_eval_layout(mlx_dtype_to_cpp(source),mlx_dtype_to_cpp(index),rank,
+      output_elements,update_elements,tracer,native)) return false;
+  const size_t controls = sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(source)+sizeof(index)+sizeof(rank)+
+      sizeof(output_elements)+sizeof(update_elements)+sizeof(tracer)+sizeof(size_t)+sizeof(Dtype)*2;
   if (native.named_control_bytes > SIZE_MAX-controls) return false;
   *out = {native.allocation_extents,native.worker_graph_extents,native.backing_births,native.named_control_bytes+controls,0};
   return true;

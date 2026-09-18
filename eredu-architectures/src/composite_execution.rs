@@ -3,6 +3,8 @@
 mod media_prefill;
 pub(crate) mod graph;
 mod description;
+pub(crate) mod prediction_tokens;
+pub use prediction_tokens::PredictionTokenPart;
 pub use media_prefill::CompositeMediaIngressArchitecture;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
@@ -356,34 +358,13 @@ pub(crate) fn prepared_token_parts<T: Tensor, P>(
     context: &T::Context,
     placeholder: impl Fn(&P) -> Option<(u32, u64)>,
 ) -> Result<Vec<T>, eredu_nn::Error> {
-    let admitted = input.admitted().legacy().ok_or_else(|| {
-        eredu_nn::Error::backend(
-            "generic placeholder conversion requires ordinary family admission",
-        )
+    let metadata = crate::decoder::identity::Metadata::new(input.metadata());
+    let mut parts = metadata.vector(input.prepared().len())?;
+    prediction_tokens::visit(input, placeholder, &mut |part| {
+        parts.push(prediction_tokens::materialize(part, context, metadata)?);
+        Ok(())
     })?;
-    input
-        .prepared()
-        .parts()
-        .iter()
-        .zip(admitted.parts())
-        .map(|(part, plan)| {
-            if let Some((token, positions)) = placeholder(plan) {
-                let token = i32::try_from(token).map_err(eredu_nn::Error::backend)?;
-                let positions = i32::try_from(positions).map_err(eredu_nn::Error::backend)?;
-                T::full_i32(token, &[1, positions], context)
-            } else {
-                match (part.modality(), part.payload()) {
-                    (
-                        eredu_core::InputModality::Text,
-                        eredu_runtime::PreparedInputPayload::TokenIds(tokens),
-                    ) => Ok(tokens.clone()),
-                    _ => Err(eredu_nn::Error::backend(
-                        "composite prediction input has no declared token identity",
-                    )),
-                }
-            }
-        })
-        .collect()
+    Ok(parts)
 }
 
 /// Architecture-owned interpretation of admitted prepared input.
@@ -444,15 +425,29 @@ where
         Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
     }
 
-    /// Reconstructs the target's exact semantic token sequence for a prediction
-    /// lane, including architecture-declared media placeholders. The default
-    /// accepts ordinary text token parts; media-aware families share their
-    /// ingress token construction with this operation.
+    /// Visits the exact semantic sequence in admitted decoder order. Tensor
+    /// parts are borrowed from this input; repeated values are family-declared
+    /// placeholders. The same visit drives ordinary and funded construction.
+    fn visit_prepared_prediction_tokens(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        visitor: &mut dyn FnMut(PredictionTokenPart<'_, B::Tensor>) -> Result<(), eredu_nn::Error>,
+    ) -> Result<(), eredu_nn::Error> {
+        prediction_tokens::visit(input, |_| None, visitor)
+    }
+
+    /// Constructs the architecture's exact semantic token sequence, including
+    /// its admitted media placeholders, through the shared visit above.
     fn prepared_prediction_token_ids(
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        B::Tensor::concatenate(&prepared_token_parts(input, context, |_| None)?, 1, context)
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        let mut parts = metadata.vector(input.prepared().len())?;
+        Self::visit_prepared_prediction_tokens(input, &mut |part| {
+            parts.push(prediction_tokens::materialize(part, context, metadata)?);
+            Ok(())
+        })?;
+        B::Tensor::concatenate(&parts, 1, context)
     }
 
     /// Returns whether one request-optional execution group is active for the
@@ -581,39 +576,27 @@ where
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         _tensor_partitions: usize,
         _pipeline_stages: usize,
-    ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, eredu_nn::Error> {
+        graph::Destination(metadata).controls::<(&Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>, usize, usize, usize,
+            Option<Vec<Vec<CompositeTensorCollective>>>)>()?;
         Ok(None)
     }
 
-    /// The same reached wave producer with admitted metadata destinations.
-    fn prepared_group_collective_waves_with_metadata(
-        &self, _group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        _tensor_partitions: usize, _pipeline_stages: usize,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, eredu_nn::Error> {
-        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
-    }
-
     /// Exact TP collectives emitted while the primary decoder ingress is assembled.
-    ///
-    /// `None` preserves the ordinary single decoder-extent embedding sum. Composite
-    /// architectures which look up independently segmented token parts override this
-    /// with their request-bounded operation shapes and order.
+    /// `None` preserves the ordinary single decoder-extent embedding sum. The
+    /// supplied destination pays the actual segmented producer when overridden.
     fn prepared_primary_ingress_collectives(
         &self,
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         _tensor_partitions: usize,
-    ) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
-        Ok(None)
-    }
-
-    /// The same reached ingress producer with admitted metadata destinations.
-    fn prepared_primary_ingress_collectives_with_metadata(
-        &self, _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        _tensor_partitions: usize, _context: &eredu_nn::workspace::WorkspaceContext,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<CompositeTensorCollective>>, eredu_nn::Error> {
-        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+        graph::Destination(metadata).controls::<(&Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>, usize,
+            Option<Vec<CompositeTensorCollective>>)>()?;
+        Ok(None)
     }
 
     /// Whether a retained context still has decoder-ingress collectives to run.
@@ -662,6 +645,7 @@ where
         _source_sequence: i32,
         _group_sequences: &[i32],
         _continuation: Option<(i32, i32)>,
+        _metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Self::Error> {
         Ok(None)
     }
@@ -674,26 +658,11 @@ where
         _schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         _hidden: &B::Tensor,
         _forward: &Self::ForwardContext,
+        _metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>, Self::Error> {
         Ok(None)
     }
 
-    /// Emits the same family boundary refinement using admitted metadata.
-    fn partition_boundary_schema_with_metadata(
-        &self,_source_group:usize,_destination_group:usize,
-        _selected:&eredu_runtime::ResolvedBoundaryWireSchema,_batch:i32,_source_sequence:i32,
-        _group_sequences:&[i32],_continuation:Option<(i32,i32)>,
-        context:&eredu_nn::workspace::WorkspaceContext,
-    )->Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>,eredu_nn::Error>{
-        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
-    }
-    /// Emits the same family auxiliary values using admitted metadata.
-    fn partition_boundary_values_with_metadata(
-        &self,_source_group:usize,_destination_group:usize,_schema:&eredu_runtime::ResolvedBoundaryWireSchema,
-        _hidden:&B::Tensor,_forward:&Self::ForwardContext,context:&eredu_nn::workspace::WorkspaceContext,
-    )->Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>,eredu_nn::Error>{
-        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
-    }
 
     /// Installs a typed continuation or dependency before its destination begins.
     fn accept_partition_boundary(
@@ -853,47 +822,39 @@ where
 {
     type DefinitionError = A::DefinitionError;
 
-    fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Self::DefinitionError> {
-        self.inner.state_layout()
-    }
 
-    fn state_layout_with_metadata(
+    fn state_layout(
         &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::StateLayout, Self::DefinitionError> {
-        self.inner.state_layout_with_metadata(context)
-    }
+match context { Some(context) => {
+        self.inner.state_layout(Some(context))
+    }, None => {
+        self.inner.state_layout(None)
+    } }
+}
+
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        self.inner.state_identity(state, topology)
-    }
+match context { Some(context) => {
+        self.inner.state_identity(state, topology, Some(context))
+    }, None => {
+        self.inner.state_identity(state, topology, None)
+    } }
+}
 
-    fn state_identity_with_metadata(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        self.inner.state_identity_with_metadata(state, topology, context)
-    }
 
     fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        self.inner.parameter_description(context)
-    }
-
-    fn parameter_description_with_metadata(
         &self, context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
         match &self.construction_parameters {
             Some(source) => Ok(std::borrow::Cow::Borrowed(&**source)),
-            None => self.inner.parameter_description_with_metadata(context),
+            None => self.inner.parameter_description(context),
         }
     }
 
@@ -953,15 +914,13 @@ where
     type Error = A::Error;
 
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        self.inner.prefill_observation_declarations()
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner.prefill_observation_declarations(metadata_context)
     }
 
     fn media_prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        self.inner.media_prefill_observation_declarations()
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner.media_prefill_observation_declarations(metadata_context)
     }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -1009,55 +968,37 @@ where
         self.inner.state_partition_plan(layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.inner.execution_graph()
     }
 
-    fn execution_graph_with_metadata(
-        &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.inner.execution_graph_with_metadata(context)
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+
+        self.inner.group_unit_count(group, metadata_context)
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.inner.group_unit_count(group)
+
+
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+
+        self.inner.unit_path(group, index, metadata_context)
     }
 
-    fn group_unit_count_with_metadata(
-        &self,
-        group: usize,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<usize, Self::Error> {
-        self.inner.group_unit_count_with_metadata(group, context)
-    }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.inner.unit_path(group, index)
-    }
 
-    fn unit_path_with_metadata(&self,group:usize,index:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error>{
-        self.inner.unit_path_with_metadata(group,index,context)
-    }
-    fn group_input_observation_path_with_metadata(&self,group:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        self.inner.group_input_observation_path_with_metadata(group,context)
-    }
-    fn group_output_observation_path_with_metadata(&self,group:usize,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        self.inner.group_output_observation_path_with_metadata(group,context)
-    }
+
     fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
         self.inner.observes_unit_boundaries(group, index)
     }
 
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        self.inner.group_input_observation_path(group)
+    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+
+        self.inner.group_input_observation_path(group, metadata_context)
     }
 
-    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        self.inner.group_output_observation_path(group)
+    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+
+        self.inner.group_output_observation_path(group, metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -1185,7 +1126,7 @@ where
     fn forward_metadata(
         &self,
         forward: &Self::ForwardContext,
-    ) -> Option<eredu_runtime::layered::LayeredForwardMetadata<Self::Error>> {
+    ) -> Option<eredu_runtime::layered::LayeredMetadata<Self::Error>> {
         <A as LayeredArchitecture<B, S>>::forward_metadata(&self.inner, forward)
     }
 
@@ -1431,13 +1372,8 @@ where
         self.inner.partition_observation_hooks(tensor_parallel)
     }
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        self.inner.boundary_schema()
-    }
-
-    fn boundary_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<Self::Boundary,eredu_nn::Error> {
-        self.inner.boundary_schema_with_metadata(context)
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        self.inner.boundary_schema(metadata)
     }
 
     fn begin_partition<'a>(

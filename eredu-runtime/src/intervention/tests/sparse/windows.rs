@@ -57,7 +57,7 @@ fn run() -> CaptureSession {
             values: InterventionValues::Float32((10..22).map(|v| v as f32).collect()),
         },
     };
-    let mut run = CaptureSession::new(capture);
+    let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     run.enable_interventions(
         plan.admit_invocations(&discovery, bounds, "session")
             .unwrap(),

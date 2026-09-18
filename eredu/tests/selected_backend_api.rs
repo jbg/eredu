@@ -8,20 +8,27 @@ use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
 fn operate_selected_text_control(
     model: &mut eredu::api::LoadedModel<MlxBackend<'static>>,
-    request: eredu::api::PreparedObservedGeneration,
+    request: eredu::api::PreparedChatRequest<
+        '_,
+        <MlxBackend<'static> as eredu_core::TextGenerationBackend>::Prompt,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use eredu_core::execution_control::{GenerationControlHandle, SnapshotLimits};
     use std::ops::ControlFlow;
-    let mut run =
-        model.start_controlled_chat(request, &[], GenerationControlHandle::default(), |_| {
+    let capacity = request.chat.capacity();
+    let Some(mut run) =
+        model.start_controlled_chat(request, eredu::api::TraceLimits {
+            per_record_bytes: 16384,
+            total_bytes: 65536,
+        }, GenerationControlHandle::default(), |_| {
             ControlFlow::Continue(())
-        })?;
+        })? else { return Ok(()); };
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,
         max_branches: 1,
         retained_bytes: 128 << 20,
         cumulative_copy_bytes: 256 << 20,
-    })?;
+    }, capacity, eredu_runtime::working_memory::WorkspaceCopyLimits::new(capacity))?;
     let snapshot: eredu::api::ControlledGenerationSnapshot<MlxBackend<'static>> =
         run.snapshot(|_| ControlFlow::Continue(()))?;
     run.step(|_| ControlFlow::Continue(()))?;
@@ -52,7 +59,10 @@ fn operate_selected_text_control(
 fn mlx_text_control_uses_generic_model_and_snapshot_types() {
     let _: fn(
         &mut eredu::api::LoadedModel<MlxBackend<'static>>,
-        eredu::api::PreparedObservedGeneration,
+        eredu::api::PreparedChatRequest<
+            '_,
+            <MlxBackend<'static> as eredu_core::TextGenerationBackend>::Prompt,
+        >,
     ) -> Result<(), Box<dyn std::error::Error>> = operate_selected_text_control;
 }
 

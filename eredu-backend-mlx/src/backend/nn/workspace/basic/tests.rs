@@ -550,3 +550,73 @@ fn metal_empty_broadcast_activations_keep_scalar_storage_within_bounds() {
         }
     }
 }
+
+#[test]
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+fn unsigned_token_equality_funds_i64_promotion_and_matches_signed_values() {
+    use crate::MlxTensor;
+    use safemlx::{Array, Device, DeviceType, Stream};
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let selected = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let values = [0u32, 1, i32::MAX as u32, 1u32 << 31, u32::MAX, 7];
+    let source = MlxTensor::from_array(Array::from_slice(&values, &[2, 3]));
+    for scalar in [-1, 0, 1, i32::MAX] {
+        let context = WorkspaceContext::new(selected);
+        let input = WorkspaceTensor::existing(
+            WorkspaceLayout::new(&[2, 3], WorkspaceDtype::Uint32).unwrap(),
+            &context,
+        ).unwrap();
+        let output = input.equal_i32(scalar, &context).unwrap();
+        let report = context.report(&[output]).unwrap();
+        let bound = report.tensor_buffers.total_bytes.unwrap();
+        stream.synchronize().unwrap();
+        let before = safemlx::memory::active_memory().unwrap();
+        safemlx::memory::reset_peak_memory().unwrap();
+        let actual = source.equal_i32(scalar, &stream).unwrap();
+        safemlx::transforms::eval([actual.as_array()]).unwrap();
+        stream.synchronize().unwrap();
+        let observed = safemlx::memory::peak_memory().unwrap().saturating_sub(before) as u64;
+        assert!(observed <= bound, "{scalar}: observed {observed}, bound {bound}");
+        let expected: Vec<f32> = values.iter().map(|&value| {
+            if i64::from(value) == i64::from(scalar) { 1.0 } else { 0.0 }
+        }).collect();
+        assert_eq!(actual.to_f32_vec(&stream).unwrap(), expected);
+    }
+}
+
+#[test]
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+fn unsigned_media_placeholders_preserve_full_token_range_and_concatenation_bound() {
+    use crate::MlxTensor;
+    use safemlx::{Array, Device, DeviceType, Dtype, Stream};
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let selected = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let tail = [7u32, u32::MAX];
+    let native_tail = MlxTensor::from_array(Array::from_slice(&tail, &[1, 2]));
+    for scalar in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+        for count in [0, 1, 9] {
+            let context = WorkspaceContext::new(selected);
+            let input = WorkspaceTensor::existing(
+                WorkspaceLayout::new(&[1, 2], WorkspaceDtype::Uint32).unwrap(), &context,
+            ).unwrap();
+            let placeholder = WorkspaceTensor::full_u32(scalar, &[1, count], &context).unwrap();
+            let output = WorkspaceTensor::concatenate(&[placeholder, input], 1, &context).unwrap();
+            assert_eq!(output.layout().dtype(), WorkspaceDtype::Uint32);
+            let bound = context.report(&[output]).unwrap().tensor_buffers.total_bytes.unwrap();
+            stream.synchronize().unwrap();
+            let before = safemlx::memory::active_memory().unwrap();
+            safemlx::memory::reset_peak_memory().unwrap();
+            let placeholder = MlxTensor::full_u32(scalar, &[1, count], &stream).unwrap();
+            let output = MlxTensor::concatenate(&[placeholder, native_tail.clone()], 1, &stream).unwrap();
+            safemlx::transforms::eval([output.as_array()]).unwrap();
+            stream.synchronize().unwrap();
+            let observed = safemlx::memory::peak_memory().unwrap().saturating_sub(before) as u64;
+            assert!(observed <= bound, "scalar={scalar}, count={count}: {observed} > {bound}");
+            assert_eq!(output.as_array().dtype(), Dtype::Uint32);
+            let actual = output.as_array().evaluated().unwrap().try_to_vec::<u32>().unwrap();
+            let mut expected = vec![scalar; count as usize];
+            expected.extend_from_slice(&tail);
+            assert_eq!(actual, expected);
+        }
+    }
+}

@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    grammar::{CGrammar, CSymIdx, CSymbol, RhsPtr},
+    grammar::{CGrammar, CSymIdx, CSymbol, RhsPtr, SharedGrammar},
     lexer::{LexerResult, PreLexeme},
     lexerspec::{Lexeme, LexemeIdx, LexemeSpec, LexerSpec},
     perf::ParserPerfCounters,
@@ -270,7 +270,7 @@ impl Debug for Item {
 // used when processing a row.
 #[derive(Clone)]
 struct Scratch {
-    grammar: Arc<CGrammar>,
+    grammar: SharedGrammar,
 
     // The current "working row"
     row_start: usize,
@@ -387,7 +387,7 @@ impl Captures {
 
 #[derive(Clone)]
 struct ParserState {
-    grammar: Arc<CGrammar>,
+    grammar: SharedGrammar,
     tok_env: TokEnv,
     scratch: Scratch,
     trie_lexer_stack: usize,
@@ -470,12 +470,12 @@ pub struct Parser {
 }
 
 impl Scratch {
-    fn new(grammar: Arc<CGrammar>) -> Self {
+    fn new(grammar: SharedGrammar) -> Self {
         let lexemes = grammar.lexer_spec().alloc_lexeme_set();
         let grammars = grammar.lexer_spec().alloc_grammar_set();
         Self::from_masks(grammar, lexemes, grammars)
     }
-    fn from_masks(grammar: Arc<CGrammar>, lexemes: LexemeSet, grammars: SimpleVob) -> Self {
+    fn from_masks(grammar: SharedGrammar, lexemes: LexemeSet, grammars: SimpleVob) -> Self {
         Scratch {
             push_allowed_lexemes: lexemes,
             push_allowed_grammar_ids: grammars,
@@ -645,7 +645,7 @@ impl ParserState {
     // The parser starts in definitive mode.
     fn new(
         tok_env: TokEnv,
-        grammar: Arc<CGrammar>,
+        grammar: SharedGrammar,
         mut limits: ParserLimits,
         perf_counters: Arc<ParserPerfCounters>,
     ) -> Result<(Self, Lexer)> {
@@ -655,7 +655,7 @@ impl ParserState {
             lexer.prepare_large_lexemes(tok_env.tok_trie(), &limits)?;
             perf_counters.precompute.record(t0.elapsed());
         }
-        let scratch = Scratch::new(Arc::clone(&grammar));
+        let scratch = Scratch::new(grammar.clone());
         let lexer_state = lexer.a_dead_state(); // placeholder
         let special_marker_token = bias::marker_token(tok_env.tok_trie());
         let mut r = ParserState {
@@ -1333,7 +1333,7 @@ impl ParserState {
     }
 
     fn process_captures(&mut self, item: Item, curr_idx: usize, lexeme: &Lexeme, for_lexeme: bool) {
-        let grammar = Arc::clone(&self.grammar);
+        let grammar = self.grammar.clone();
         agenda::capture_targets(
             &grammar,
             item,
@@ -1722,7 +1722,7 @@ impl ParserError {
 impl Parser {
     pub fn new(
         tok_env: TokEnv,
-        grammar: Arc<CGrammar>,
+        grammar: SharedGrammar,
         limits: ParserLimits,
         perf_counters: Arc<ParserPerfCounters>,
     ) -> Result<Self> {

@@ -118,11 +118,11 @@ struct TestSemanticState {
     events: Vec<SemanticEvent>,
 }
 
-impl SpeculativeSemanticState for TestSemanticState {
-    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
+impl SemanticState for TestSemanticState {
+    fn fork_owned(&self) -> Result<eredu_core::SemanticStateOwner, SpeculativeOutputError> {
         let mut fork = self.clone();
         fork.events.clear();
-        Ok(Box::new(fork))
+        Ok(Box::new(fork).into())
     }
 
     fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {

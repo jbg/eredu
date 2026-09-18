@@ -22,34 +22,37 @@ impl WorkspaceMechanisms for NoOperations {
 
 struct Slots {
     values: Vec<WorkspaceTensor>,
-    immutable: Vec<ParameterId>,
-    mutable: Vec<Option<ParameterId>>,
+    immutable: Vec<ParameterSpec>,
+    mutable: Vec<Option<ParameterSpec>>,
 }
 impl Slots {
     fn new(context: &WorkspaceContext) -> Self {
         Self {
             values: vec![value(context, Some(7)), value(context, Some(11))],
-            immutable: vec![id("a"), id("b")],
-            mutable: vec![Some(id("a")), Some(id("b"))],
+            immutable: vec![spec("a"), spec("b")],
+            mutable: vec![Some(spec("a")), Some(spec("b"))],
         }
     }
 }
-fn metadata(id: &ParameterId) -> ParameterMetadata {
-    ParameterMetadata::from_spec(&ParameterSpec::trainable(id.as_str()).unwrap(), true)
-}
+fn spec(name: &str) -> ParameterSpec { ParameterSpec::trainable(name).unwrap() }
+
 impl Parameterized<WorkspaceTensor> for Slots {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, WorkspaceTensor>>(&'a self, visitor: &mut V) {
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, WorkspaceTensor>>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
         for (id, value) in self.immutable.iter().zip(&self.values) {
-            visitor.visit(metadata(id), value);
+            visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(id,true), value);
         }
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, WorkspaceTensor>>(
         &'a mut self,
         visitor: &mut V,
     ) {
         for (id, value) in self.mutable.iter().zip(&mut self.values) {
             if let Some(id) = id {
-                visitor.visit_mut(metadata(id), value);
+                visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(id,true), value);
             }
         }
     }
@@ -121,6 +124,7 @@ fn binding_preserves_supplied_aliases_without_allocating_or_reading_payloads() {
     bind_workspace_parameters(
         &mut module,
         [(id("a"), first.clone()), (id("b"), second)].into(),
+        |_| false,
     )
     .unwrap();
     // The provider's original handle and both bound slots share one capacity.
@@ -144,7 +148,7 @@ fn missing_and_unexpected_bindings_reject_before_replacing_a_valid_first_slot() 
         } else {
             provided.insert(id("extra"), value(&context, Some(107)));
         }
-        let error = bind_workspace_parameters(&mut module, provided).unwrap_err();
+        let error = bind_workspace_parameters(&mut module, provided, |_| false).unwrap_err();
         if missing {
             assert!(
                 matches!(cause(&error), ParameterOrchestrationError::MissingBinding { parameter } if parameter == &id("b"))
@@ -165,13 +169,13 @@ fn duplicate_immutable_or_mutable_destinations_reject_without_partial_binding() 
         let mut module = Slots::new(&context);
         let mut provided = weights(&context);
         if mutable {
-            module.mutable[1] = Some(id("a"));
+            module.mutable[1] = Some(spec("a"));
         } else {
-            module.immutable[1] = id("a");
+            module.immutable[1] = spec("a");
             provided.remove(&id("b"));
         }
         context.begin_state_span([]).unwrap();
-        let error = bind_workspace_parameters(&mut module, provided).unwrap_err();
+        let error = bind_workspace_parameters(&mut module, provided, |_| false).unwrap_err();
         assert!(
             matches!(cause(&error), ParameterOrchestrationError::DuplicateParameter { parameter } if parameter == &id("a"))
         );
@@ -184,9 +188,9 @@ fn changed_mutable_topology_rejects_before_publication() {
     for missing in [false, true] {
         let context = WorkspaceContext::new(NoOperations);
         let mut module = Slots::new(&context);
-        module.mutable[1] = (!missing).then(|| id("unexpected"));
+        module.mutable[1] = (!missing).then(|| spec("unexpected"));
         context.begin_state_span([]).unwrap();
-        let error = bind_workspace_parameters(&mut module, weights(&context)).unwrap_err();
+        let error = bind_workspace_parameters(&mut module, weights(&context), |_| false).unwrap_err();
         let ParameterOrchestrationError::ParameterTraversalMismatch { parameters } = cause(&error)
         else {
             panic!("wrong failure: {error}");
@@ -227,7 +231,7 @@ fn shape_context_and_dtype_are_validated_before_any_slot_changes() {
         let mut provided = weights(&context);
         provided.insert(id("b"), replacement);
         context.begin_state_span([]).unwrap();
-        let error = bind_workspace_parameters(&mut module, provided).unwrap_err();
+        let error = bind_workspace_parameters(&mut module, provided, |_| false).unwrap_err();
         assert!(matches!(
             cause(&error),
             ParameterOrchestrationError::Backend(_)
@@ -250,6 +254,7 @@ fn unknown_and_sublogical_backing_remain_provider_facts_after_binding() {
             (id("b"), value(&context, None)),
         ]
         .into(),
+        |_| false,
     )
     .unwrap();
     assert_eq!(retained(&context, &module.values[..1]), Some(4));
@@ -296,9 +301,9 @@ fn empty_modules_accept_only_empty_bindings() {
         immutable: vec![],
         mutable: vec![],
     };
-    bind_workspace_parameters(&mut module, BTreeMap::new()).unwrap();
+    bind_workspace_parameters(&mut module, BTreeMap::new(), |_| false).unwrap();
     let context = WorkspaceContext::new(NoOperations);
-    let error = bind_workspace_parameters(&mut module, weights(&context)).unwrap_err();
+    let error = bind_workspace_parameters(&mut module, weights(&context), |_| false).unwrap_err();
     assert!(
         matches!(cause(&error), ParameterOrchestrationError::UnexpectedBindings { parameters } if parameters == &[id("a"), id("b")])
     );
@@ -308,14 +313,18 @@ fn empty_modules_accept_only_empty_bindings() {
 fn finite_workspace_rows_reject_late_mismatch_then_publish_shared_aliases_atomically() {
     struct PreparedSlots { specs: [ParameterSpec;2], values: [WorkspaceTensor;2] }
     impl Parameterized<WorkspaceTensor> for PreparedSlots {
-        fn visit_parameters<'a,V:ParameterVisitor<'a,WorkspaceTensor>>(&'a self, visitor:&mut V) {
+        fn visit_parameter_sources<'a,V:eredu_nn::ParameterSourceVisitor<'a,WorkspaceTensor>>(&'a self, visitor:&mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
             for (spec,value) in self.specs.iter().zip(&self.values) {
-                visitor.visit_borrowed(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
+                visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
             }
-        }
+
+ __source_result
+}
         fn visit_parameters_mut<'a,V:ParameterVisitorMut<'a,WorkspaceTensor>>(&'a mut self,visitor:&mut V) {
             for (spec,value) in self.specs.iter().zip(&mut self.values) {
-                visitor.visit_mut_borrowed(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
+                visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
             }
         }
         fn set_trainable(&mut self,_:bool) {}
@@ -329,14 +338,14 @@ fn finite_workspace_rows_reject_late_mismatch_then_publish_shared_aliases_atomic
     let mut rows=[crate::PreparedParameterBinding::new("a",first.clone()),
         crate::PreparedParameterBinding::new("b",wrong)];
     context.begin_state_span([]).unwrap();
-    let error=bind_prepared_workspace_parameters(&mut module,&mut rows,&context).unwrap_err();
+    let error=bind_prepared_workspace_parameters(&mut module,&mut rows,&context, |_| false).unwrap_err();
     assert!(matches!(error.source().unwrap().downcast_ref::<crate::PreparedParameterBindingError<PreparedWorkspaceBindingCause>>(),
         Some(crate::PreparedParameterBindingError::Backend(PreparedWorkspaceBindingCause::Dtype))));
     assert_eq!(retained(&context,&module.values),Some(18));
     // The first valid row was not consumed by a later failed companion; the
     // same fixed destination can be corrected and validated before publication.
     rows[1]=crate::PreparedParameterBinding::new("b",view(&context,&root,&[2],WorkspaceDtype::Float32));
-    bind_prepared_workspace_parameters(&mut module,&mut rows,&context).unwrap();
+    bind_prepared_workspace_parameters(&mut module,&mut rows,&context, |_| false).unwrap();
     assert_eq!(retained(&context,&module.values),Some(64));
     let report=context.report(&[first,module.values[0].clone(),module.values[1].clone()]).unwrap();
     assert!(report.operations.is_empty());

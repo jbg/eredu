@@ -11,7 +11,6 @@ fn reserve(
     handoffs: &[WorkingMemoryCapacityHandoff],
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -62,8 +61,8 @@ fn additional_sources_keep_full_quote_and_exact_capacity_without_duplicate_credi
         ))
     ));
     assert_eq!(used(&pool), (96, 96));
-    let (admission, reservation, accepted) = reserve(&pool, &joined, 192, &execution, &[]).unwrap();
-    assert_eq!(admission.state, *ordinary.state());
+    let (reservation, accepted) = reserve(&pool, &joined, 192, &execution, &[]).unwrap();
+    assert_eq!(reservation.admission().state, *ordinary.state());
     assert_eq!(reservation.bytes(), 96);
     drop((
         ordinary,
@@ -102,7 +101,7 @@ fn foreign_zero_and_empty_registrations_reject_without_mutation() {
     }
     let empty = pool.register_storage::<u32>([]).unwrap();
     let joined = ordinary.with_registered_sources(empty).unwrap();
-    let (_, reservation, _) = reserve(
+    let (reservation, _) = reserve(
         &pool,
         &joined,
         160,
@@ -204,7 +203,7 @@ fn additional_source_pins_flow_through_cloned_reservation_and_all_original_scope
         .into_incremental()
         .with_registered_sources(source.clone())
         .unwrap();
-    let (_, reservation, accepted) = reserve(
+    let (reservation, accepted) = reserve(
         &pool,
         &quote,
         184,
@@ -248,7 +247,7 @@ fn abandoned_scope_preserves_all_additional_sources_and_original_envelope() {
             .into_incremental()
             .with_registered_sources(source.clone())
             .unwrap();
-        let (_, reservation, accepted) = reserve(
+        let (reservation, accepted) = reserve(
             &pool,
             &quote,
             184,

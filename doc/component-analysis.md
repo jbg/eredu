@@ -175,10 +175,11 @@ The last row of a fixed token-ID prefix scores the next token. Prepare captures
 when creating the run. Start a trial from a snapshot before the tested forward,
 use intervention re-admission for future changes, and let the ordinary sampler
 choose the result. For historical predictions without captures, replay the exact
-prefix IDs; summaries cannot recover old tensors. Use `prepare_observed_token_ids` or `prepare_intervened_token_ids` with the
-original `PreparedChat` output/termination contract and the exact prefix IDs.
-These methods validate the tokenizer vocabulary and share ordinary admission and
-generation; they never decode/re-encode the prefix or force a tested prediction.
+prefix IDs; summaries cannot recover old tensors. Set the canonical request's
+`input` to `PreparedChatPrompt::TokenIds(&prefix_ids)` and attach borrowed capture
+or intervention declarations. The original `PreparedChat` retains output and
+termination policy. Startup validates the canonical vocabulary through ordinary
+admission; it never decodes/re-encodes the prefix or forces a tested prediction.
 The runnable seven-step example below uses this exact replay path.
 
 Embedded prediction components use `prepare_speculative_activations` and

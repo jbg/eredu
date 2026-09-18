@@ -12,7 +12,7 @@ use crate::backend::{
     nn::workspace::MlxMetalWorkspaceMechanisms,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use safemlx::{Array, PrefillRootsRuntime, PreparedArrayClone};
 use std::mem::{size_of, size_of_val};
@@ -33,7 +33,7 @@ struct CopyCustody {
     _copies: Vec<RegisteredArrayCopyCustody>,
     // The vector backing, its account controls and prepared clone handles
     // retire before the H which paid for their construction.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 #[derive(thiserror::Error)]
 #[error("{cause}")]
@@ -43,7 +43,7 @@ struct Failure {
     // A counted host-slot error may own a completed native prefix. Its arrays
     // retire with the cause before their actual registered numerical receipts.
     _copies: Vec<RegisteredArrayCopyCustody>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,13 +54,13 @@ impl std::fmt::Debug for Failure {
 fn memory(cause: WorkingMemoryError) -> Error {
     Error::PrefillControl(cause)
 }
-fn reserve(funding: &WorkspaceMetadataFunding, bytes: Option<usize>) -> Result<(), Error> {
+fn reserve(funding: &HostMetadataFunding, bytes: Option<usize>) -> Result<(), Error> {
     funding
         .reserve_metadata(bytes.ok_or_else(|| memory(WorkingMemoryError::Overflow))?)
         .map_err(Error::WorkspacePlanning)
 }
 fn paid<E: std::error::Error + Send + Sync + 'static>(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     cause: E,
 ) -> Error {
     Error::Neural(funding.metadata_source(cause))
@@ -69,7 +69,7 @@ pub(super) struct Worker<'a, 'environment> {
     environment: &'a OriginalCopyEnvironment<'environment>,
     initialized: &'a PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &'a WorkspaceMetadataFunding,
+    funding: &'a HostMetadataFunding,
     capacity: u64,
     completed: Option<&'a CompletedResidentSource>,
     copies: Vec<RegisteredArrayCopyCustody>,
@@ -101,7 +101,7 @@ impl Worker<'_, '_> {
         Ok(array)
     }
 }
-fn alias(funding: &WorkspaceMetadataFunding, source: &Array) -> Result<Array, Error> {
+fn alias(funding: &HostMetadataFunding, source: &Array) -> Result<Array, Error> {
     // Native numerical copy is complete. Retain its descriptor with the exact
     // separately-paid handle slot, without ordinary hooks or another Scope.
     reserve(
@@ -119,7 +119,7 @@ pub(super) fn construct<C, F>(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     capacity: u64,
     preparation_controls: Option<usize>,
     operation: F,
@@ -135,9 +135,9 @@ where
         size_of::<IsolatedArrayCopy<'_>>(),
         size_of::<RegisteredArrayCopy>(),
         size_of::<Result<RegisteredArrayCopy, Error>>(),
-        size_of::<&WorkspaceMetadataFunding>(),
+        size_of::<&HostMetadataFunding>(),
         size_of::<Option<usize>>(),
-        size_of::<Result<(), eredu_nn::workspace::WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), eredu_nn::workspace::HostMetadataFundingError>>(),
         size_of::<F>(),
         size_of::<C>(),
         size_of::<Result<C, Error>>(),
@@ -187,7 +187,7 @@ where
         }))),
     }
 }
-fn operand_count<'a, F>(funding: &WorkspaceMetadataFunding, visit: F) -> Result<usize, Error>
+fn operand_count<'a, F>(funding: &HostMetadataFunding, visit: F) -> Result<usize, Error>
 where
     F: FnOnce(&mut dyn FnMut(&'a Array)),
 {
@@ -214,7 +214,7 @@ pub(crate) fn copy_original_compressed(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     capacity: u64,
 ) -> Result<PreparedPredictionCacheCopy<CompressedLatentCache>, Error> {
     copy_completed_compressed(source, None, environment, initialized, mechanisms, funding, capacity)
@@ -226,7 +226,7 @@ pub(crate) fn copy_completed_compressed(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     capacity: u64,
 ) -> Result<PreparedPredictionCacheCopy<CompressedLatentCache>, Error> {
     construct(
@@ -255,7 +255,7 @@ pub(crate) fn copy_original_pooling(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     capacity: u64,
 ) -> Result<PreparedPredictionCacheCopy<MlxPoolingAttentionCache>, Error> {
     copy_completed_pooling(source, None, environment, initialized, mechanisms, funding, capacity)
@@ -267,7 +267,7 @@ pub(crate) fn copy_completed_pooling(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     capacity: u64,
 ) -> Result<PreparedPredictionCacheCopy<MlxPoolingAttentionCache>, Error> {
     construct(
@@ -289,3 +289,5 @@ pub(crate) fn copy_completed_pooling(
         },
     )
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

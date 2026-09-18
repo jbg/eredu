@@ -85,13 +85,21 @@ impl SpeculativeActivationExecution {
         &self,
         scope: SpeculativeCaptureScope,
     ) -> Result<(), CaptureError> {
-        let valid = self.supports_scope(scope);
-        if valid {
+        self.validate_scope_by(scope, || {
+            CaptureError::Invalid(
+                "invocation scope differs from selected prediction strategy or depth".into(),
+            )
+        })
+    }
+    pub(crate) fn validate_scope_by<E>(
+        &self,
+        scope: SpeculativeCaptureScope,
+        error: impl FnOnce() -> E,
+    ) -> Result<(), E> {
+        if self.supports_scope(scope) {
             Ok(())
         } else {
-            Err(CaptureError::Invalid(
-                "invocation scope differs from selected prediction strategy or depth".into(),
-            ))
+            Err(error())
         }
     }
 }
@@ -102,33 +110,41 @@ pub fn speculative_capture_scope(
     descriptor: &ArchitectureDescriptor,
     node_id: &str,
 ) -> Result<SpeculativeCaptureScope, CaptureError> {
-    resolve_scope(descriptor, node_id).map_err(|error| match error {
-        ScopeError::Duplicate => {
-            CaptureError::Invalid("duplicate or unknown speculative invocation root".into())
-        }
-        ScopeError::Conflict => CaptureError::Invalid(
-            "component score scope conflicts with its invocation declaration".into(),
-        ),
-        ScopeError::Missing(id) => CaptureError::Invalid(format!(
-            "speculative capture node absent from architecture: {id}"
-        )),
-        ScopeError::Undeclared => CaptureError::Unsupported(
-            "prediction observation has no declared invocation scope".into(),
-        ),
-        ScopeError::Cycle => {
-            CaptureError::Invalid("cycle in speculative capture node ancestry".into())
+    resolve_scope(descriptor, node_id).map_err(|error| {
+        let text = error.to_string();
+        if matches!(error, ScopeError::Undeclared) {
+            CaptureError::Unsupported(text)
+        } else {
+            CaptureError::Invalid(text)
         }
     })
 }
 #[derive(Clone, Copy)]
-enum ScopeError<'a> {
+pub(crate) enum ScopeError<'a> {
     Duplicate,
     Conflict,
     Missing(&'a str),
     Undeclared,
     Cycle,
 }
-fn resolve_scope<'a>(
+impl std::fmt::Display for ScopeError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate => f.write_str("duplicate or unknown speculative invocation root"),
+            Self::Conflict => {
+                f.write_str("component score scope conflicts with its invocation declaration")
+            }
+            Self::Missing(id) => {
+                write!(f, "speculative capture node absent from architecture: {id}")
+            }
+            Self::Undeclared => {
+                f.write_str("prediction observation has no declared invocation scope")
+            }
+            Self::Cycle => f.write_str("cycle in speculative capture node ancestry"),
+        }
+    }
+}
+pub(crate) fn resolve_scope<'a>(
     descriptor: &'a ArchitectureDescriptor,
     node_id: &'a str,
 ) -> Result<SpeculativeCaptureScope, ScopeError<'a>> {

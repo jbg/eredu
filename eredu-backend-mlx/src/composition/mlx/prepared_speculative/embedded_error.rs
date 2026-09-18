@@ -1,7 +1,7 @@
 //! Typed source-funded error handoff for the shared Embedded executor.
 use super::*;
 use eredu_nn::workspace::{
-    WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceMetadataError, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -12,7 +12,7 @@ struct NeuralCause<E: std::error::Error + Send + Sync + 'static> {
     cause: E,
     // The closed NN source deallocates its shell before this payload. Its
     // concrete cause is destroyed before the last planning account alias.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -22,8 +22,8 @@ struct Diagnostic(String);
 struct ObservationMarker;
 
 fn transport_controls<E>(
-    funding: &WorkspaceMetadataFunding,
-) -> Result<(), WorkspaceMetadataFundingError> {
+    funding: &HostMetadataFunding,
+) -> Result<(), HostMetadataFundingError> {
     let controls = [
         size_of::<E>(),
         size_of::<Option<E>>(),
@@ -31,26 +31,26 @@ fn transport_controls<E>(
         size_of::<SpeculativeExecutionStreams<'_>>(),
         size_of::<Error>(),
         size_of::<Result<eredu_core::BackendFailure, Error>>(),
-        size_of::<WorkspaceMetadataFunding>(),
-        size_of::<WorkspaceMetadataFundingError>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<HostMetadataFunding>(),
+        size_of::<HostMetadataFundingError>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
         size_of::<Option<usize>>(),
     ];
     let bytes = controls
         .into_iter()
         .try_fold(size_of_val(&controls), usize::checked_add)
-        .ok_or(WorkspaceMetadataFundingError::Overflow)?;
+        .ok_or(HostMetadataFundingError::Overflow)?;
     funding.reserve_metadata(bytes)
 }
 
 // Retains the same concrete E through the existing shared diagnostic producer.
 // No E or operation result is stored in this small pre-operation receipt.
 fn prepare_session_funding<E: std::error::Error + Send + Sync + 'static>(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     additional_controls: Option<usize>,
-) -> Result<crate::composition::mlx::model::PreparedPlanningError<E>, WorkspaceMetadataFundingError> {
+) -> Result<crate::composition::mlx::model::PreparedPlanningError<E>, HostMetadataFundingError> {
     use crate::composition::mlx::model::PreparedPlanningError;
-    let additional_controls = additional_controls.ok_or(WorkspaceMetadataFundingError::Overflow)?;
+    let additional_controls = additional_controls.ok_or(HostMetadataFundingError::Overflow)?;
     if additional_controls != 0 {
         funding.reserve_metadata(additional_controls)?;
     }
@@ -58,7 +58,7 @@ fn prepare_session_funding<E: std::error::Error + Send + Sync + 'static>(
     funding.reserve_metadata(size_of::<(
         Option<PreparedPlanningError<E>>,
         Result<Option<PreparedPlanningError<E>>, Error>,
-        &WorkspaceMetadataFunding,
+        &HostMetadataFunding,
     )>())?;
     PreparedPlanningError::prepare(funding)
 }
@@ -82,7 +82,7 @@ pub(super) fn prepare_session_cause<E: std::error::Error + Send + Sync + 'static
     if let Some((sources, _)) = context.original_numerical() {
         sources.metadata_funding().reserve_metadata(
             conversion_control_bytes(&convert)
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         ).map_err(Error::WorkspacePlanning)?;
     }
     Ok(convert)
@@ -147,7 +147,7 @@ pub(super) fn session_arguments(
 
 fn neural_cause_funded<E: std::error::Error + Send + Sync + 'static>(
     cause: E,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> eredu_nn::Error {
     if let Err(refusal) = transport_controls::<NeuralCause<E>>(funding) {
         drop(cause);
@@ -164,7 +164,7 @@ pub(super) fn neural_cause<E: std::error::Error + Send + Sync + 'static>(
 ) -> eredu_nn::Error {
     match context.original_numerical() {
         Some((sources, _)) => neural_cause_funded(cause, sources.metadata_funding()),
-        None => eredu_nn::Error::backend_source(cause),
+        None => eredu_nn::Error::backend_retained_source(cause),
     }
 }
 pub(super) fn neural_observer(
@@ -181,3 +181,5 @@ pub(super) fn neural_observer(
 
 #[cfg(test)]
 mod tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

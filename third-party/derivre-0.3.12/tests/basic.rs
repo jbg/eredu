@@ -1,7 +1,7 @@
 use derivre::{JsonQuoteOptions, NextByte, Regex, RegexAst, RegexBuilder};
 
 fn check_is_match(rx: &mut Regex, s: &str, exp: bool) {
-    if rx.is_match(s) == exp {
+    if rx.is_match(s).unwrap() == exp {
     } else {
         panic!(
             "error for: {:?}; expected {}",
@@ -32,7 +32,7 @@ fn no_match_many(rx: &mut Regex, ss: &[&str]) {
 }
 
 fn look(rx: &mut Regex, s: &str, exp: Option<usize>) {
-    let res = rx.lookahead_len(s);
+    let res = rx.lookahead_len(s).unwrap();
     if res == exp {
     } else {
         panic!(
@@ -44,7 +44,7 @@ fn look(rx: &mut Regex, s: &str, exp: Option<usize>) {
 
 #[test]
 fn test_basic() {
-    let mut rx = Regex::new("a[bc](de|fg)").unwrap();
+    let mut rx = Regex::new("a[bc](de|fg)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     println!("{:?}", rx);
     no_match(&mut rx, "abd");
     match_(&mut rx, "abde");
@@ -52,19 +52,19 @@ fn test_basic() {
     no_match(&mut rx, "abdea");
     println!("{:?}", rx);
 
-    let mut rx = Regex::new("a[bc]*(de|fg)*x").unwrap();
+    let mut rx = Regex::new("a[bc]*(de|fg)*x", derivre::ParserAllocationFunding::unenforced()).unwrap();
 
     no_match_many(&mut rx, &["", "a", "b", "axb"]);
     match_many(&mut rx, &["ax", "abdex", "abcbcbcbcdex", "adefgdefgx"]);
     println!("{:?}", rx);
 
-    let mut rx = Regex::new("(A|foo)*").unwrap();
+    let mut rx = Regex::new("(A|foo)*", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(
         &mut rx,
         &["", "A", "foo", "Afoo", "fooA", "foofoo", "AfooA", "Afoofoo"],
     );
 
-    let mut rx = Regex::new("[abcquv][abdquv]").unwrap();
+    let mut rx = Regex::new("[abcquv][abdquv]", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(
         &mut rx,
         &["aa", "ab", "ba", "ca", "cd", "ad", "aq", "qa", "qd"],
@@ -73,41 +73,41 @@ fn test_basic() {
 
     println!("{:?}", rx);
 
-    let mut rx = Regex::new("ab{3,5}c").unwrap();
+    let mut rx = Regex::new("ab{3,5}c", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["abbbc", "abbbbc", "abbbbbc"]);
     no_match_many(
         &mut rx,
         &["", "ab", "abc", "abbc", "abbb", "abbbx", "abbbbbbc"],
     );
 
-    let mut rx = Regex::new("x*A[0-9]{5}").unwrap();
+    let mut rx = Regex::new("x*A[0-9]{5}", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["A12345", "xxxxxA12345", "xA12345"]);
     no_match_many(&mut rx, &["A1234", "xxxxxA123456", "xA123457"]);
 }
 
 #[test]
 fn test_unicode() {
-    let mut rx = Regex::new("źółw").unwrap();
+    let mut rx = Regex::new("źółw", derivre::ParserAllocationFunding::unenforced()).unwrap();
     println!("{:?}", rx);
     no_match(&mut rx, "zolw");
     match_(&mut rx, "źółw");
     no_match(&mut rx, "źół");
     println!("{:?}", rx);
 
-    let mut rx = Regex::new("[źó]łw").unwrap();
+    let mut rx = Regex::new("[źó]łw", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_(&mut rx, "ółw");
     match_(&mut rx, "źłw");
     no_match(&mut rx, "źzłw");
 
-    let mut rx = Regex::new("x[©ª«]y").unwrap();
+    let mut rx = Regex::new("x[©ª«]y", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["x©y", "xªy", "x«y"]);
     no_match_many(&mut rx, &["x®y", "x¶y", "x°y", "x¥y"]);
 
-    let mut rx = Regex::new("x[ab«\u{07ff}\u{0800}]y").unwrap();
+    let mut rx = Regex::new("x[ab«\u{07ff}\u{0800}]y", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["xay", "xby", "x«y", "x\u{07ff}y", "x\u{0800}y"]);
     no_match_many(&mut rx, &["xcy", "xªy", "x\u{07fe}y", "x\u{0801}y"]);
 
-    let mut rx = Regex::new("x[ab«\u{07ff}-\u{0801}]y").unwrap();
+    let mut rx = Regex::new("x[ab«\u{07ff}-\u{0801}]y", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(
         &mut rx,
         &[
@@ -121,23 +121,23 @@ fn test_unicode() {
     );
     no_match_many(&mut rx, &["xcy", "xªy", "x\u{07fe}y", "x\u{0802}y"]);
 
-    let mut rx = Regex::new(".").unwrap();
+    let mut rx = Regex::new(".", derivre::ParserAllocationFunding::unenforced()).unwrap();
     no_match(&mut rx, "\n");
     match_many(&mut rx, &["a", "1", " ", "\r"]);
 
-    let mut rx = Regex::new("a.*b").unwrap();
+    let mut rx = Regex::new("a.*b", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["ab", "a123b", "a \r\t123b"]);
     no_match_many(&mut rx, &["a", "a\nb", "a1\n2b"]);
 }
 
 #[test]
 fn test_lookaround() {
-    let mut rx = Regex::new("[ab]*(?P<stop>xx)").unwrap();
+    let mut rx = Regex::new("[ab]*(?P<stop>xx)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_(&mut rx, "axx");
     look(&mut rx, "axx", Some(2));
     look(&mut rx, "ax", None);
 
-    let mut rx = Regex::new("[ab]*(?P<stop>x*y)").unwrap();
+    let mut rx = Regex::new("[ab]*(?P<stop>x*y)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     look(&mut rx, "axy", Some(2));
     look(&mut rx, "ay", Some(1));
     look(&mut rx, "axxy", Some(3));
@@ -145,12 +145,12 @@ fn test_lookaround() {
     look(&mut rx, "abaxxy", Some(3));
     no_match_many(&mut rx, &["ax", "bx", "aaayy", "axb", "axyxx"]);
 
-    let mut rx = Regex::new("[abx]*(?P<stop>[xq]*y)").unwrap();
+    let mut rx = Regex::new("[abx]*(?P<stop>[xq]*y)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     look(&mut rx, "axxxxxxxy", Some(1));
     look(&mut rx, "axxxxxxxqy", Some(2));
     look(&mut rx, "axxxxxxxqqqy", Some(4));
 
-    let mut rx = Regex::new("(f|foob)(?P<stop>o*y)").unwrap();
+    let mut rx = Regex::new("(f|foob)(?P<stop>o*y)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     look(&mut rx, "fooby", Some(1));
     look(&mut rx, "fooy", Some(3));
     look(&mut rx, "fy", Some(1));
@@ -176,11 +176,11 @@ fn utf8_dfa() {
    )*
    "#;
 
-    let mut rx = Regex::new_with_parser(parser, utf8_rx).unwrap();
+    let mut rx = Regex::new_with_parser(parser, utf8_rx, derivre::ParserAllocationFunding::unenforced()).unwrap();
     println!("UTF8 {:?}", rx);
     //match_many(&mut rx, &["a", "ą", "ę", "ó", "≈ø¬", "\u{1f600}"]);
     println!("UTF8 {:?}", rx);
-    let compiled = rx.dfa();
+    let compiled = rx.dfa().unwrap();
     println!("UTF8 {:?}", rx);
     println!("mapping ({}) {:?}", rx.alpha().len(), &compiled[0..256]);
     println!("states {:?}", &compiled[256..]);
@@ -189,38 +189,38 @@ fn utf8_dfa() {
 
 #[test]
 fn utf8_restrictions() {
-    let mut rx = Regex::new("(.|\n)*").unwrap();
+    let mut rx = Regex::new("(.|\n)*", derivre::ParserAllocationFunding::unenforced()).unwrap();
     println!("{:?}", rx);
     match_many(&mut rx, &["", "a", "\n", "\n\n", "\x00", "\x7f"]);
     let s0 = rx.initial_state();
-    assert!(rx.transition(s0, 0x80).is_dead());
-    assert!(rx.transition(s0, 0xC0).is_dead());
-    assert!(rx.transition(s0, 0xC1).is_dead());
+    assert!(rx.transition(s0, 0x80).unwrap().is_dead());
+    assert!(rx.transition(s0, 0xC0).unwrap().is_dead());
+    assert!(rx.transition(s0, 0xC1).unwrap().is_dead());
     // more overlong:
-    assert!(rx.transition_bytes(s0, &[0xE0, 0x80]).is_dead());
-    assert!(rx.transition_bytes(s0, &[0xE0, 0x9F]).is_dead());
-    assert!(rx.transition_bytes(s0, &[0xF0, 0x80]).is_dead());
-    assert!(rx.transition_bytes(s0, &[0xF0, 0x8F]).is_dead());
+    assert!(rx.transition_bytes(s0, &[0xE0, 0x80]).unwrap().is_dead());
+    assert!(rx.transition_bytes(s0, &[0xE0, 0x9F]).unwrap().is_dead());
+    assert!(rx.transition_bytes(s0, &[0xF0, 0x80]).unwrap().is_dead());
+    assert!(rx.transition_bytes(s0, &[0xF0, 0x8F]).unwrap().is_dead());
     // surrogates:
-    assert!(rx.transition_bytes(s0, &[0xED, 0xA0]).is_dead());
-    assert!(rx.transition_bytes(s0, &[0xED, 0xAF]).is_dead());
-    assert!(rx.transition_bytes(s0, &[0xED, 0xBF]).is_dead());
+    assert!(rx.transition_bytes(s0, &[0xED, 0xA0]).unwrap().is_dead());
+    assert!(rx.transition_bytes(s0, &[0xED, 0xAF]).unwrap().is_dead());
+    assert!(rx.transition_bytes(s0, &[0xED, 0xBF]).unwrap().is_dead());
 }
 
 #[test]
 fn trie() {
-    let mut rx = Regex::new("(foo|far|bar|baz)").unwrap();
+    let mut rx = Regex::new("(foo|far|bar|baz)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["foo", "far", "bar", "baz"]);
     no_match_many(&mut rx, &["fo", "fa", "b", "ba", "baa", "f", "faz"]);
 
-    let mut rx = Regex::new("(foobarbazqux123|foobarbazqux124)").unwrap();
+    let mut rx = Regex::new("(foobarbazqux123|foobarbazqux124)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["foobarbazqux123", "foobarbazqux124"]);
     no_match_many(
         &mut rx,
         &["foobarbazqux12", "foobarbazqux125", "foobarbazqux12x"],
     );
 
-    let mut rx = Regex::new("(1a|12a|123a|1234a|12345a|123456a)").unwrap();
+    let mut rx = Regex::new("(1a|12a|123a|1234a|12345a|123456a)", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(
         &mut rx,
         &["1a", "12a", "123a", "1234a", "12345a", "123456a"],
@@ -233,11 +233,11 @@ fn trie() {
 
 #[test]
 fn unicode_case() {
-    let mut rx = Regex::new("(?i)Żółw").unwrap();
+    let mut rx = Regex::new("(?i)Żółw", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_many(&mut rx, &["Żółw", "żółw", "ŻÓŁW", "żóŁw"]);
     no_match_many(&mut rx, &["zółw"]);
 
-    let mut rx = Regex::new("Żółw").unwrap();
+    let mut rx = Regex::new("Żółw", derivre::ParserAllocationFunding::unenforced()).unwrap();
     match_(&mut rx, "Żółw");
     no_match_many(&mut rx, &["żółw", "ŻÓŁW", "żóŁw"]);
 }
@@ -255,7 +255,7 @@ fn validate_next_byte(rx: &mut Regex, data: Vec<(NextByte, u8)>) {
         } else if nb == NextByte::Dead {
             assert!(s.is_dead());
         }
-        s = rx.transition(s, b);
+        s = rx.transition(s, b).unwrap();
         if nb == NextByte::ForcedEOI {
             assert!(s.is_dead());
             assert!(rx.next_byte(s) == NextByte::Dead);
@@ -265,7 +265,7 @@ fn validate_next_byte(rx: &mut Regex, data: Vec<(NextByte, u8)>) {
 
 #[test]
 fn next_byte() {
-    let mut rx = Regex::new("a[bc]*dx").unwrap();
+    let mut rx = Regex::new("a[bc]*dx", derivre::ParserAllocationFunding::unenforced()).unwrap();
     validate_next_byte(
         &mut rx,
         vec![
@@ -277,7 +277,7 @@ fn next_byte() {
         ],
     );
 
-    rx = Regex::new("abdx|aBDy").unwrap();
+    rx = Regex::new("abdx|aBDy", derivre::ParserAllocationFunding::unenforced()).unwrap();
     validate_next_byte(
         &mut rx,
         vec![
@@ -287,7 +287,7 @@ fn next_byte() {
         ],
     );
 
-    rx = Regex::new("foo|bar").unwrap();
+    rx = Regex::new("foo|bar", derivre::ParserAllocationFunding::unenforced()).unwrap();
     validate_next_byte(
         &mut rx,
         vec![
@@ -311,13 +311,13 @@ fn check_one_quote(rx: &str, options: &JsonQuoteOptions, allow_nl: bool) -> Rege
         &["\\n", "\\n", "\\n"]
     };
 
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
 
     let e = b.mk_regex(rx).unwrap();
     let e = b.json_quote(e, options).unwrap();
     println!("*** {:?} {}", rx, b.exprset().expr_to_string(e));
 
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     match_many(&mut rx, valid_any_string);
     no_match_many(&mut rx, invalid_any_string);
     if options.is_allowed(b'u') {
@@ -340,21 +340,21 @@ fn check_json_quote(
     should_match: &[&str],
     should_not_match: &[&str],
 ) {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let e = b
         .mk(&RegexAst::JsonQuote(
             Box::new(RegexAst::Regex(rx.to_string())),
             options.clone(),
         ))
         .unwrap();
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     match_many(&mut rx, should_match);
     no_match_many(&mut rx, should_not_match);
 }
 
 #[test]
 fn test_json_quote() {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
 
     for options in [
         JsonQuoteOptions::no_unicode_raw(),
@@ -363,7 +363,7 @@ fn test_json_quote() {
         let e = b.mk_regex(r#"[abc"]"#).unwrap();
         let e = b.json_quote(e, &options).unwrap();
 
-        let mut rx = b.to_regex(e);
+        let mut rx = b.to_regex(e).unwrap();
         match_many(&mut rx, &["a", "b", "c", "\\\""]);
         no_match_many(&mut rx, &["A", "\"", "\\"]);
 
@@ -383,7 +383,7 @@ fn test_json_quote() {
 
 #[test]
 fn test_json_qbig() {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let options = JsonQuoteOptions::with_unicode_raw();
     let rx = "\\w+[\\\\](\\w+\\.)*\\w+\\.dll";
     // let rx = "a[\\\\]b";
@@ -400,11 +400,11 @@ fn test_json_qbig() {
 
 #[test]
 fn test_json_uxxxx() {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let options = JsonQuoteOptions::with_unicode_raw();
     let e0 = b.mk_regex(".").unwrap();
     let e = b.json_quote(e0, &options).unwrap();
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     for x in 0..=0xffff {
         for s in &[format!("\\u{:04X}", x), format!("\\u{:04x}", x)] {
             if x == 0x007f || ((0x0000..=0x001f).contains(&x) && x != 0x000a) {
@@ -418,25 +418,25 @@ fn test_json_uxxxx() {
 
 #[test]
 fn test_json_and() {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let options = JsonQuoteOptions::with_unicode_raw();
 
     let e0 = b.mk_regex_and(&["[a-z]+", "(foo|bar|Baz)"]).unwrap();
     let e = b.json_quote(e0, &options).unwrap();
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     match_many(&mut rx, &["foo", "bar"]);
     no_match_many(&mut rx, &["xoo", "Baz"]);
 
     let e0 = b.mk_regex_and(&["[a-z\n]+", "(foo\n|bar|Baz)"]).unwrap();
     let e = b.json_quote(e0, &options).unwrap();
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     match_many(&mut rx, &["foo\\n", "bar"]);
     no_match_many(&mut rx, &["foo\n", "xoo", "Baz"]);
 
     // contained_in(a,b) == a & ~b
     let e0 = b.mk_contained_in("[a-z\n]+", "(foo\n|bar|Baz)").unwrap();
     let e = b.json_quote(e0, &options).unwrap();
-    let mut rx = b.to_regex(e);
+    let mut rx = b.to_regex(e).unwrap();
     no_match_many(
         &mut rx,
         &["foo\\n", "q\n", "foo\\u000a", "bar", "Baz", "QUX"],
@@ -445,13 +445,13 @@ fn test_json_and() {
 }
 
 fn mk_search_regex(rx: &str) -> Regex {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let e0 = b.mk_regex_for_serach(rx).unwrap();
-    b.to_regex(e0)
+    b.to_regex(e0).unwrap()
 }
 
 fn assert_search(search_rx: &str, match_rx: &str) {
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let e0 = b.mk_regex_for_serach(search_rx).unwrap();
     let e1 = b.mk_regex(&format!("(?s:{})", match_rx)).unwrap();
     if e0 != e1 {
@@ -513,10 +513,10 @@ fn test_json_quote_long_literal_with_newline() {
     // The \n at byte offset 43 lands in the middle chunk.
     let long_str =
         "Welcome, dear Rosencrantz and Guildenstern!\nMoreover that we much did long to ";
-    let mut b = RegexBuilder::new();
+    let mut b = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let lit = b.mk(&RegexAst::Literal(long_str.to_string())).unwrap();
     let quoted = b.json_quote(lit, &options).unwrap();
-    let mut rx = b.to_regex(quoted);
+    let mut rx = b.to_regex(quoted).unwrap();
 
     let expected =
         "\"Welcome, dear Rosencrantz and Guildenstern!\\nMoreover that we much did long to \"";

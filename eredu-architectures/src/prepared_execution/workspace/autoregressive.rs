@@ -27,6 +27,7 @@ impl PreparedInferenceBlueprint {
         invocation: AutoregressiveInvocation,
         prefill_chunk_positions: NonZeroU64,
         input_dtype: WorkspaceDtype,
+        media: Option<(OriginalMediaWorkspaceInput, &eredu_runtime::working_memory::MediaSessionBinding)>,
         state: &ResidentState,
         context: &WorkspaceContext,
         observer: &mut dyn InferenceEquationTraceObserver,
@@ -37,6 +38,7 @@ impl PreparedInferenceBlueprint {
             invocation,
             prefill_chunk_positions,
             input_dtype,
+            media,
             state,
             context,
             None,
@@ -54,6 +56,7 @@ impl PreparedInferenceBlueprint {
         invocation: AutoregressiveInvocation,
         prefill_chunk_positions: NonZeroU64,
         input_dtype: WorkspaceDtype,
+        media: Option<(OriginalMediaWorkspaceInput, &eredu_runtime::working_memory::MediaSessionBinding)>,
         state: &ResidentState,
         context: &WorkspaceContext,
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
@@ -90,6 +93,15 @@ impl PreparedInferenceBlueprint {
             .workspace_geometry(frontier, invocation, prefill_chunk_positions)
             .map_err(|cause| PreparedExecutionError::Metadata(context.metadata_source(cause)))?;
         let observer = std::cell::RefCell::new(observer);
+        if let Some((input, binding)) = media {
+            if invocation.execution_pass() != eredu_runtime::ExpertPass::Prefill {
+                return Err(preparation_message(context, format_args!("media ingress requires an actual prefill invocation")));
+            }
+            return self.quote_original_media_with_trace(input, binding, geometry, state, context,
+                parameters, None, Some(EquationTraceRef(&observer)), None, None)
+                .map(|report| report.into_equations())
+                .map_err(|cause| PreparedExecutionError::Metadata(context.metadata_source(cause.into_failure())));
+        }
         let (equations, _) = self.quote_text_with_input_dtype(
             geometry,
             state,

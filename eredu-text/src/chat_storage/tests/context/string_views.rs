@@ -81,9 +81,8 @@ fn nanbeige_reasoning_content_chains_retain_output_after_input_and_source_retire
 }
 
 #[test]
-fn split_view_refuses_unqualified_storage_and_other_nanbeige_statements() {
+fn split_view_refuses_invalid_arity_types_and_unowned_separator_storage() {
     for template in [
-        "{{ text.split(',', 1)[0] }}",
         "{{ text.split(sep=',')[0] }}",
         "{{ text.strip('x', 'y') }}",
     ] {
@@ -94,14 +93,10 @@ fn split_view_refuses_unqualified_storage_and_other_nanbeige_statements() {
         assert!(refused);
     }
     for (template, caller) in [
+        ("{{ text.split(',') }}", json!({"text":"a,b"})),
         (
             "{{ text.split(separator)[0] }}",
             json!({"text":"a,b","separator":","}),
-        ),
-        ("{{ text.split(',') }}", json!({"text":"a,b"})),
-        (
-            "{{ (left + right).strip() }}",
-            json!({"left":" a","right":"b "}),
         ),
         ("{{ text.split(',')[0] }}", json!({"text":4})),
         (
@@ -128,12 +123,17 @@ fn split_view_refuses_unqualified_storage_and_other_nanbeige_statements() {
         json!({"text":"a,b","separator":","}).as_object().unwrap(),
     );
     assert_eq!(skipped.prompt(false), "skipped");
+    for (template, caller) in [
+        ("{{ text.split(',', 1)[0] }}", json!({"text":"é,b,c"})),
+        ("{{ (left + right).strip() }}", json!({"left":" a","right":"b "})),
+    ] {
+        compare(template, &[], &serde_json::Map::new(), caller.as_object().unwrap());
+    }
+}
+
+#[test]
+fn released_nanbeige_template_uses_supported_macro_state_and_slice_operations() {
     let full = include_str!("../../../../tests/fixtures/nanbeige/chat_template.jinja");
-    // Macro/state/slice support is still absent. Method parity must not turn a
-    // released-template support claim into an assertion about a reduced source.
-    let refused = match ChatTemplatePlan::prepare_utf8(full, "nanbeige-full") {
-        Ok(plan) => plan.compile().is_err(),
-        Err(_) => true,
-    };
-    assert!(refused);
+    let messages = [json!({"role":"user","content":"Preserve É and 世界."})];
+    compare(full, &messages, &serde_json::Map::new(), &serde_json::Map::new());
 }

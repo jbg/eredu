@@ -165,7 +165,7 @@ fn parity(family: Family) {
                     ids.len() as u64
                 );
                 ids.push(output.token_id());
-                assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+                assert!(driver.take_completed_delivery(&mut state).unwrap().is_none());
             }
             ids
         };

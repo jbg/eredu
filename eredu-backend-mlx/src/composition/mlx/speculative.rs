@@ -54,7 +54,7 @@ pub(in crate::composition::mlx) use sampling::numerical::{
     PendingModelLogits, completed_logits as completed_prediction_logits,
     logits_row as completed_prediction_logits_row,
     token_ids as prepared_prediction_token_ids,
-    registered_copy_input, OriginalNumericalValue,
+    registered_copy_input, OriginalNumericalValue, repeated_token_input, concatenate_token_inputs,
     tensor_range as prepared_prediction_tensor_range, tensor_axis_range as prepared_prediction_tensor_axis_range, tensor_concatenate as prepared_prediction_tensor_concatenate,
     RegisteredTensorSource, CompletedTensorSource, registered_range as prepared_registered_token_range,
 };

@@ -95,7 +95,7 @@ impl<M: WorkspaceFactMechanisms> WorkspaceFactMechanisms for MlxAddressableWorks
     fn with_prepared_facts<T>(
         &self,
         op: WorkspaceOperationView<'_>,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
         visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
     ) -> Result<T, Self::Error> {
         if is_region(op) {

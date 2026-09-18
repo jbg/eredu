@@ -1,6 +1,6 @@
 //! Cold row ceilings and exact completed-count binding share the retained owner map.
 use super::{ExpertRouteCountPlan, ExpertRoutePackingCause, ExpertRoutePackingGeometry};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Finite semantic row population; none of these counts grants native bytes.
@@ -38,7 +38,7 @@ pub enum ExpertRouteRegionCause {
     #[error("expert region differs from its retained owner/count geometry")] Geometry,
     #[error("expert region has no unspent completed count source")] Source,
     #[error("expert region row population overflowed")] Overflow,
-    #[error("expert region metadata was refused: {0}")] Funding(#[source] WorkspaceMetadataFundingError),
+    #[error("expert region metadata was refused: {0}")] Funding(#[source] HostMetadataFundingError),
 }
 pub(super) fn source<'a>(owners: &'a [usize], local: &'a [usize],
     packing: ExpertRoutePackingGeometry, rank: usize) -> Result<ExpertRouteRegionSource<'a>, ExpertRouteRegionCause> {
@@ -68,7 +68,7 @@ impl ExpertRouteRegionSource<'_> {
             routes_per_row: self.population.routes_per_row(), owners: self.owners,
             owner_local: self.local, kernel, tensor_partitions, movement,
             transfers: transfer_itinerary(kernel.separate_bias(tensor_partitions)),
-            provider_tensor_group:None,provider_wave_group:None,
+            provider_tensor_group:None,provider_wave_group:None,addressable:None,
         })
     }
     pub const fn population(self) -> ExpertRouteRegionPopulation { self.population }
@@ -89,9 +89,9 @@ impl ExpertRouteRegionSource<'_> {
             size_of::<(&[usize], &[usize], ExpertRoutePackingGeometry, usize)>(),
             size_of::<ExpertRouteRegionCause>(), size_of::<FundedExpertRouteRegionFailure>(),
             size_of::<Result<ExpertRouteRegionRows, ExpertRouteRegionCause>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(), size_of::<[usize; 7]>(),
+            size_of::<Result<(), HostMetadataFundingError>>(), size_of::<[usize; 7]>(),
             size_of::<std::slice::ChunksExact<'_, usize>>(), size_of::<std::slice::Iter<'_, usize>>(),
-            eredu_nn::Error::retained_source_control_bytes::<FundedExpertRouteRegionFailure>()?];
+            eredu_nn::Error::retained_source_construction_bytes::<FundedExpertRouteRegionFailure>()?];
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
     /// Binds exact source-major counts; no selected expert IDs are invented.
@@ -132,16 +132,16 @@ impl ExpertRouteRegionRows {
 pub struct FundedExpertRouteRegionFailure {
     #[source] cause: ExpertRouteRegionCause,
     completed_source: Option<eredu_core::ErasedSharedStorageOwner>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl FundedExpertRouteRegionFailure {
-    pub(super) fn new(cause: ExpertRouteRegionCause, funding: WorkspaceMetadataFunding) -> Self {
+    pub(super) fn new(cause: ExpertRouteRegionCause, funding: HostMetadataFunding) -> Self {
         Self { cause, completed_source: None, funding }
     }
     pub(super) fn with_completed_source(mut self, source: Option<eredu_core::ErasedSharedStorageOwner>) -> Self {
         self.completed_source = source; self
     }
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 
 /// Actual received routing values, kept with the completed issuing count
@@ -152,18 +152,18 @@ pub struct FundedExpertRegionSelection {
     local_indices: Vec<i32>,
     rows: ExpertRouteRegionRows,
     completed_source: eredu_core::ErasedSharedStorageOwner,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl FundedExpertRegionSelection {
     pub fn local_expert_rows(&self) -> &[usize] { &self.local_rows }
     pub fn local_indices(&self) -> &[i32] { &self.local_indices }
     pub fn rows(&self) -> ExpertRouteRegionRows { self.rows }
     pub fn completed_source(&self) -> &eredu_core::ErasedSharedStorageOwner { &self.completed_source }
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 pub(super) fn bind_local(source: ExpertRouteRegionSource<'_>, rows: ExpertRouteRegionRows,
     global: &[usize], local: &[usize], completed_source: eredu_core::ErasedSharedStorageOwner,
-    funding: WorkspaceMetadataFunding) -> Result<FundedExpertRegionSelection, FundedExpertRouteRegionFailure> {
+    funding: HostMetadataFunding) -> Result<FundedExpertRegionSelection, FundedExpertRouteRegionFailure> {
     let result = (|| {
         let frames = [size_of::<FundedExpertRegionSelection>(), size_of::<[Vec<usize>; 1]>(),
             size_of::<Vec<i32>>(), size_of::<ExpertRouteRegionRows>(),
@@ -172,7 +172,7 @@ pub(super) fn bind_local(source: ExpertRouteRegionSource<'_>, rows: ExpertRouteR
             size_of::<Result<FundedExpertRegionSelection, FundedExpertRouteRegionFailure>>(),
             size_of::<std::slice::Iter<'_, usize>>(),
             size_of::<std::iter::Zip<std::slice::Iter<'_, usize>, std::slice::Iter<'_, usize>>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>()];
+            size_of::<Result<(), HostMetadataFundingError>>()];
         let controls = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
             .and_then(|bytes| bytes.checked_add(ExpertRouteRegionSource::binding_control_bytes()?))
             .ok_or(ExpertRouteRegionCause::Overflow)?;

@@ -510,7 +510,7 @@ pub(super) fn broadcast(
     context: &WorkspaceContext,
 ) -> Result<Vec<i32>, Error> {
     let plan = super::WorkspaceBroadcastShape::new(a, b)
-        .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
+        .map_err(|cause| context.metadata_error(format_args!("{cause}: {a:?} and {b:?}")))?;
     let mut shape = context.metadata_vec(plan.rank())?;
     shape.extend(plan.dimensions());
     Ok(shape)
@@ -615,6 +615,9 @@ impl Tensor for WorkspaceTensor {
     }
     fn full_i32(_: i32, shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
         Self::initialized(shape, WorkspaceDtype::Int32, context)
+    }
+    fn full_u32(_: u32, shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
+        Self::initialized(shape, WorkspaceDtype::Uint32, context)
     }
     binary!(add, subtract, multiply);
     unary!(square);
@@ -813,6 +816,12 @@ impl Tensor for WorkspaceTensor {
         self.view(&shape, "squeeze", context)
     }
     fn index(&self, indexes: &[Index], context: &WorkspaceContext) -> Result<Self, Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            &Self, &[Index], &WorkspaceContext, usize, [Vec<i32>; 4],
+            std::slice::Iter<'_, Index>, std::iter::Enumerate<std::iter::Copied<std::slice::Iter<'_, i32>>>,
+            usize, i32, Index, [i64; 2], i32, WorkspaceOperationKind,
+            Result<Self, Error>,
+        )>())?;
         if indexes.len() > self.shape().len() {
             return Err(context.metadata_error(format_args!("too many workspace indexes")));
         }
@@ -821,6 +830,11 @@ impl Tensor for WorkspaceTensor {
             .filter(|index| matches!(index, Index::At(_)))
             .count();
         let mut shape = context.metadata_vec(self.shape().len() - selected_axes)?;
+        // Full/Range are the only rank-preserving Index variants. Preserve
+        // their normalized coordinates instead of erasing them to a rank count.
+        let mut starts = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
+        let mut ends = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
+        let mut strides = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
         for (i, size) in self.shape().iter().copied().enumerate() {
             let position = |n: i32| {
                 if n < 0 {
@@ -830,7 +844,10 @@ impl Tensor for WorkspaceTensor {
                 }
             };
             match indexes.get(i).copied().unwrap_or(Index::Full) {
-                Index::Full => shape.push(size),
+                Index::Full => {
+                    shape.push(size);
+                    if selected_axes == 0 { starts.push(0); ends.push(size); strides.push(1); }
+                },
                 Index::At(n) => {
                     let n = position(n);
                     if n < 0 || n >= i64::from(size) {
@@ -848,11 +865,19 @@ impl Tensor for WorkspaceTensor {
                         );
                     }
                     shape.push(extent(end - start, context)?);
+                    if selected_axes == 0 {
+                        // Bounds above prove both values fit the original i32 extent.
+                        starts.push(start as i32); ends.push(end as i32); strides.push(1);
+                    }
                 }
             }
         }
         Self::operation(
-            WorkspaceOperationKind::Index { selected_axes },
+            if selected_axes == 0 {
+                WorkspaceOperationKind::StaticSlice { starts, ends, strides }
+            } else {
+                WorkspaceOperationKind::Index { selected_axes }
+            },
             &[self],
             &shape,
             self.layout.dtype,
@@ -905,13 +930,14 @@ impl Tensor for WorkspaceTensor {
         )
     }
     fn zeros_like(&self, context: &WorkspaceContext) -> Result<Self, Error> {
-        Self::operation(
-            WorkspaceOperationKind::Initialize,
-            &[self],
-            self.shape(),
-            self.layout.dtype,
-            context,
-        )
+        context.charge_metadata(std::mem::size_of::<(
+            &Self, &WorkspaceContext, WorkspaceLayoutView<'_>, Result<Self, Error>,
+        )>())?;
+        self.validate_context(context)?;
+        // The native zeros-like worker reads only this prototype's shape and
+        // scalar type, then invokes the same typed zero constructor. Its data
+        // is not a graph input or a generic host initialization source.
+        Self::zeros_from_prototype(self.shape(), self.layout.as_view(), context)
     }
     fn equal_i32(&self, _: i32, context: &WorkspaceContext) -> Result<Self, Error> {
         Self::operation(
@@ -958,14 +984,11 @@ impl Tensor for WorkspaceTensor {
         source: &Self,
         context: &WorkspaceContext,
     ) -> Result<Self, Error> {
-        if mask.layout.dtype != WorkspaceDtype::Bool
-            || !super::WorkspaceBroadcastShape::new(self.shape(), mask.shape())
-                .map_err(|cause| context.metadata_error(format_args!("{cause}")))?
-                .dimensions()
-                .eq(self.shape().iter().copied())
-        {
+        if mask.layout.dtype != WorkspaceDtype::Bool {
             return Err(context.metadata_error(format_args!("invalid workspace scatter mask")));
         }
+        super::validate_masked_scatter_shapes(self.shape(), mask.shape(), source.shape())
+            .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
         Self::operation(
             WorkspaceOperationKind::Elementwise("masked_scatter"),
             &[self, mask, source],
@@ -1012,7 +1035,10 @@ impl Tensor for WorkspaceTensor {
                     .any(|(i, n)| i != selected && *n != shape[i])
             {
                 return Err(
-                    context.metadata_error(format_args!("incompatible workspace concatenation"))
+                    context.metadata_error(format_args!(
+                        "incompatible workspace concatenation on axis {selected}: first {:?} {:?}, input {:?} {:?}",
+                        first.shape(), first.layout.dtype, value.shape(), value.layout.dtype
+                    ))
                 );
             }
             shape[selected] = shape[selected]
@@ -1232,7 +1258,7 @@ impl Tensor for WorkspaceTensor {
         inputs.extend(weight);
         inputs.extend(bias);
         Self::operation(
-            WorkspaceOperationKind::Normalization("layer_norm", None),
+            WorkspaceOperationKind::LayerNorm { weight: weight.is_some(), bias: bias.is_some() },
             &inputs,
             input.shape(),
             input.layout.dtype,

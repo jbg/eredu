@@ -166,7 +166,7 @@ pub(crate) fn composite_partition_boundary_schema(
     }
     let continuation = source_group == destination_group;
     if let CompositeConfig::Muse(args) = &config {
-        return crate::muse_glimmer::model::vision_partition_boundary_schema(args, continuation)
+        return crate::muse_glimmer::model::vision_partition_boundary_schema(args, continuation, None)
             .map(Some)
             .map_err(|error| error.to_string());
     }
@@ -633,6 +633,13 @@ enum PreparedCompositeUnitStrategy {
 }
 
 impl PreparedCompositeExecutorPlan {
+    fn bank_plans(&self) -> Option<&std::collections::BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>> {
+        match &self.strategy {
+            PreparedCompositeUnitStrategy::Direct => None,
+            PreparedCompositeUnitStrategy::Routed { plans, .. }
+            | PreparedCompositeUnitStrategy::RoutedCollective { plans, .. } => Some(plans),
+        }
+    }
     fn new<A, B, S, G, W>(
         prepared: &PreparedPartitionedAdmission<
             A,
@@ -1459,7 +1466,7 @@ fn prepare_composite_partition_banks<G, W: eredu_runtime::ArchitectureBoundary>(
             .map(|member| member.with_owner_rank(selected.requirements().topology().global_rank()))
             .collect();
         let local_bank = bank
-            .with_partition_geometry(routed.plan.clone(), bank.catalog().clone(), members, layout)
+            .with_partition_geometry(routed.plan.clone(), bank.catalog().clone(), members, layout, execution.bank_residency())
             .map_err(|error| error.to_string())?;
         let banks = crate::prepared_execution::PreparedPartitionBanks::prepare(
             execution.bank_residency(),
@@ -1504,7 +1511,7 @@ where
     V: AuthoritativeCompositePartitionVisitor<B, S>,
     F: FnOnce(V, PreparedCompositePartition<A, G, W>) -> Result<V::Output, V::Error>,
 {
-    let banks = prepare_composite_partition_banks(
+    let mut banks = prepare_composite_partition_banks(
         &selected,
         &partition,
         &details.layout,
@@ -1512,6 +1519,13 @@ where
         details.routed.as_ref(),
     )
     .map_err(CompositePartitionPreparationError::Architecture)?;
+    if let (Some(routed), Some(banks)) = (&mut details.routed, &banks) {
+        let bank = banks.banks().get(&eredu_runtime::RoutedBankId::new(0))
+            .ok_or_else(|| CompositePartitionPreparationError::Architecture("composite bank source is absent".into()))?;
+        // The bank localizer has already checked catalog distribution and local
+        // coordinates. Its plan owns the sole physical-completion slot.
+        routed.plan = bank.plan().clone();
+    }
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
         .map_err(CompositePartitionPreparationError::Architecture)?;
     let mut executor = PreparedCompositeExecutorPlan::new::<A, B, S, G, W>(
@@ -1536,6 +1550,17 @@ where
             CompositePartitionPreparationError::Architecture("composite source publication failed".into()))?
             .composite_executor(source.selected(), rank)
             .map_err(CompositePartitionPreparationError::Architecture)?;
+        match (&mut banks, executor.bank_plans(), &mut details.routed) {
+            (Some(banks), Some(plans), Some(routed)) => {
+                banks.adopt_execution_sources(plans)
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
+                routed.plan = plans.get(&eredu_runtime::RoutedBankId::new(0))
+                    .ok_or_else(|| CompositePartitionPreparationError::Architecture("retained composite bank is absent".into()))?.clone();
+            }
+            (None, None, None) => {}
+            _ => return Err(CompositePartitionPreparationError::Architecture(
+                "retained composite bank and execution source presence differ".into())),
+        }
     }
     visit(
         visitor,
@@ -1794,7 +1819,7 @@ where
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
             let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -1963,13 +1988,17 @@ where
             let mut source_architecture =
                 gemma4_transform_source::<B, S>(&exact, &selected, &parameters, &geometry, context)
                     .map_err(CompositePartitionPreparationError::Architecture)?;
-            let workspace = if source.is_some() && !routed {
-                Some(crate::prepared_execution::PreparedCompositeModelSource::Gemma4(
-                    architecture.prepare_source(context).map_err(|cause|
-                        CompositePartitionPreparationError::Architecture(cause.to_string()))?,
-                    source_architecture.as_mut().map(|(value,_)| value.prepare_source(context))
-                        .transpose().map_err(|cause| CompositePartitionPreparationError::Architecture(cause.to_string()))?,
-                ))
+            let workspace = if source.is_some() {
+                // The completed model graph is also required by the routed
+                // boundary and unit constructors. Keep its preparation separate
+                // from publication of the direct composite equation source.
+                let target = architecture.prepare_source(context).map_err(|cause|
+                    CompositePartitionPreparationError::Architecture(cause.to_string()))?;
+                let transformed = source_architecture.as_mut().map(|(value,_)| value.prepare_source(context))
+                    .transpose().map_err(|cause| CompositePartitionPreparationError::Architecture(cause.to_string()))?;
+                if routed { None } else {
+                    Some(crate::prepared_execution::PreparedCompositeModelSource::Gemma4(target, transformed))
+                }
             } else { None };
             prepare!(
                 visit_media,
@@ -2151,8 +2180,8 @@ where
                 source_architecture
             )
         }
-        CompositeConfig::QwenVl(source) => {
-            let args = qwen_vl_with_formats(source, target_linear_formats)
+        CompositeConfig::QwenVl(source_args) => {
+            let args = qwen_vl_with_formats(source_args, target_linear_formats)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             if routed != args.text.is_moe() {
                 return Err(CompositePartitionPreparationError::Architecture(
@@ -2223,7 +2252,7 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = architecture.with_partition_geometry(geometry.clone());
+            let mut architecture = architecture.with_partition_geometry(geometry.clone());
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2249,8 +2278,8 @@ where
             let capability = crate::capability::qwen_vl(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
-            let source_architecture = qwen_vl_transform_source::<B, S>(
-                source,
+            let mut source_architecture = qwen_vl_transform_source::<B, S>(
+                source_args,
                 &selected,
                 &parameters,
                 &geometry,
@@ -2258,9 +2287,18 @@ where
             )
             .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.effective_model_type().to_owned();
+            let workspace = if source.is_some() && !routed {
+                Some(crate::prepared_execution::PreparedCompositeModelSource::QwenVl(
+                    architecture.prepare_source(context).map_err(|cause|
+                        CompositePartitionPreparationError::Architecture(cause.to_string()))?,
+                    source_architecture.as_mut().map(|(value, _)| value.prepare_source(context))
+                        .transpose().map_err(|cause|
+                            CompositePartitionPreparationError::Architecture(cause.to_string()))?,
+                ))
+            } else { None };
             prepare!(
                 visit_media,
-                None,
+                workspace,
                 architecture,
                 parameters,
                 layout,
@@ -2672,7 +2710,7 @@ where
         return Err("Qwen3-VL transform source changed partition state or ownership".into());
     }
     architecture = architecture.with_partition_geometry(geometry.clone());
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
         .map_err(|e| e.to_string())?;
     let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
         &architecture,
@@ -2790,7 +2828,7 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
         .map_err(|error| error.to_string())?;
     let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
         &architecture,
@@ -2899,7 +2937,7 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
         .map_err(|error| error.to_string())?;
     let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
         &architecture,
@@ -3019,7 +3057,7 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
         .map_err(|error| error.to_string())?;
     let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
         &architecture,
@@ -3104,7 +3142,7 @@ where
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
             let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture, B::construction_metadata(context))
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;

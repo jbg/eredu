@@ -27,8 +27,6 @@ mod encoded;
 pub(crate) use encoded::{
     RECORD_ENCODING_CONTROL_BYTES, intervention_fits_encoding, record_fits_encoding,
 };
-mod source;
-use source::CapturePlanSource;
 mod host_preparation;
 use host_preparation::CaptureHostOwner;
 mod empty;
@@ -80,7 +78,7 @@ pub struct CaptureSession {
     transaction: Option<(eredu_core::DistributedCommitEpoch, CaptureTransactionStatus)>,
     last_transaction_epoch: Option<eredu_core::DistributedCommitEpoch>,
     partition: Option<partition::PartitionCaptureRun>,
-    pub(crate) plan: CapturePlanSource,
+    pub(crate) plan: SharedCapturePlan,
     pub(crate) ledger: CaptureLedger,
     pub(crate) records: Option<Vec<CaptureRecord>>,
     pub(crate) prediction: u64,
@@ -104,21 +102,10 @@ enum CaptureTransactionStatus {
 }
 
 impl CaptureSession {
-    /// Creates an unstarted capture run owning its admission and ledger.
-    pub fn new(plan: AdmittedCapturePlan) -> Self {
-        Self::from_source(CapturePlanSource::Legacy(std::sync::Arc::new(plan)))
-    }
-
-    /// Starts an unstarted run retaining the actual immutable shared source.
-    /// No admitted payload is cloned, re-admitted or reconstructed. Existing
-    /// per-domain source attachment remains on the original owner, including
-    /// attachments added after this alias was created. This does not fund the
-    /// session/records, register a source or authorize managed instrumentation.
-    pub fn from_shared_plan(plan: SharedCapturePlan) -> Self {
-        Self::from_source(CapturePlanSource::Shared(plan))
-    }
-
-    fn from_source(plan: CapturePlanSource) -> Self {
+    /// Creates an unstarted capture run retaining its exact immutable source.
+    /// Existing source attachments remain on that owner; session storage,
+    /// logical capture quotas and native admission remain separate obligations.
+    pub fn new(plan: SharedCapturePlan) -> Self {
         Self {
             owner: std::sync::Arc::new(CaptureHostOwner::default()),
             ordinary_error_custody: None,
@@ -169,10 +156,9 @@ impl CaptureSession {
         &self.plan
     }
 
-    /// Borrow the actual shared source when constructed through the additive
-    /// shared route. Legacy sessions expose no fabricated shared registration.
-    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
-        self.plan.shared()
+    /// Borrow this run's exact retained source without creating a registration.
+    pub fn shared_plan_source(&self) -> &SharedCapturePlan {
+        &self.plan
     }
 
     pub(crate) fn prepare_transaction(
@@ -235,7 +221,7 @@ impl CaptureSession {
         prediction: u64,
     ) -> Result<(), CaptureError> {
         self.claim_step_epoch(epoch, false)
-            .map_err(policy::legacy_error)?;
+            .map_err(policy::public_error)?;
         let phase = match pass {
             crate::ExpertPass::Prefill => CapturePhase::Prefill,
             crate::ExpertPass::Decode => CapturePhase::Decode,
@@ -347,12 +333,12 @@ impl CaptureSession {
         prediction: u64,
     ) -> Result<(), CaptureError> {
         self.validate_step_start(prediction)
-            .map_err(policy::legacy_error)?;
+            .map_err(policy::public_error)?;
         self.reset_step_ledger()?;
         // Required control is charged and preallocated before any record field.
         // Keep it local until records are installed; partial construction errors
         // drop the records before this actual host authority.
-        let ordinary_frame = self.prepare_ordinary_frame()?;
+        let ordinary_frame = self.prepare_frame()?;
         let mut records = Vec::new();
         for (selection, point) in self.plan.plan().selections.iter().zip(self.plan.points()) {
             let charged = policy::reserve_metadata(
@@ -384,7 +370,7 @@ impl CaptureSession {
             });
         }
         self.records = Some(records);
-        self.ordinary_frame = ordinary_frame;
+        self.ordinary_frame = Some(ordinary_frame);
         self.phase = phase;
         self.prediction = prediction;
         self.capture_seconds = 0.0;
@@ -485,14 +471,10 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// Moves a legacy bounded record batch to its consumer. An installed
-    /// ordinary prepared-media run must use `take_ordinary_shared_step`; this
-    /// raw compatibility path leaves its pending/ready owner untouched.
-    pub fn take_step(&mut self) -> Option<CapturedStep> {
-        if self.ordinary_prefill.is_some() {
-            return None;
-        }
-        self.take_step_inner()
+    /// Test diagnostics are explicit caller-owned copies of the delivered frame.
+    #[cfg(test)]
+    pub(crate) fn take_step(&mut self) -> Option<CapturedStep> {
+        self.take_shared_step().map(|step| step.as_step().clone())
     }
 
     fn take_step_inner(&mut self) -> Option<CapturedStep> {

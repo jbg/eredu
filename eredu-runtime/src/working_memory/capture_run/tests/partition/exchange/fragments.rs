@@ -1,7 +1,7 @@
 use super::*;
 
 fn receipt(source: &SharedCapturePlan, combination: PartitionCaptureCombination,
-    funding: &WorkspaceMetadataFunding, ledger: &mut CaptureLedger) -> PartitionCaptureReceiptPlan
+    funding: &HostMetadataFunding, ledger: &mut CaptureLedger) -> PartitionCaptureReceiptPlan
 {
     let global = CaptureTensorGeometry::prepare(source.admission(), 0, CapturePhase::Prefill, 0, None).unwrap();
     let width = *global.source_shape().last().unwrap() as u64;
@@ -403,8 +403,8 @@ fn paid_fragment_assembly_matches_ordinary_rank_order_and_post_sum_nonlinear_res
             let limits=PartitionCaptureReceiptLimits{max_producers:3,max_fragments:3,max_record_bytes:receipt.max_record_bytes()};
             let mut ordinary_quota=CaptureLedger::new(source.admission());ordinary_quota.begin_step();
             let ordinary=if combination==PartitionCaptureCombination::SumF64ToF32 {
-                PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)
-            }else{PartitionCaptureReceiptPlan::new_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
+                PartitionCaptureReceiptPlan::new_sum(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)
+            }else{PartitionCaptureReceiptPlan::new(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
             assert_eq!(ordinary.identity(),receipt.identity());let mut delivery=ordinary.into_delivery();
             for (producer,projection) in receipt.producers() {
                 let mut fragments=Vec::new();

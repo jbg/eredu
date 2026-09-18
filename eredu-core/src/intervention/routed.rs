@@ -11,6 +11,8 @@ pub struct RoutedUnitInterventionPoint {
 }
 impl RoutedUnitInterventionPoint {
     pub(super) fn validate(&self, point: &InterventionPoint) -> Result<(), CaptureError> {
+        require(self.geometry.experts != 0 && self.geometry.units_per_expert != 0
+            && self.geometry.routes_per_token != 0, "empty routed-unit geometry")?;
         let count = self.geometry.components()?;
         require(
             !self.routing.is_empty()

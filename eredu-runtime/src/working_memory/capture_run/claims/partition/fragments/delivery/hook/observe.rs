@@ -15,7 +15,7 @@ pub(super) enum LocalCause<E:std::error::Error+'static> {
     #[error(transparent)] Host(#[from] CaptureRunHostError),
     #[error(transparent)] Destination(#[from] PartitionFragmentDestinationError),
     #[error(transparent)] Capture(#[from] CaptureError),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Work(#[from] FundedCaptureError<E>),
 }
 /// A failed callback consumes its owner; unfinished chunks cannot be returned
@@ -109,7 +109,7 @@ fn validate_or_begin<E:std::error::Error+'static>(bank:&mut PreparedPartitionFra
     Ok(())
 }
 fn control_bytes<T,E:std::error::Error+Send+Sync+'static>(receipt:&PartitionCaptureReceiptPlan)->Option<usize> {
-    let transform=&receipt.shared_plan_source()?.admission().plan().selections.get(receipt.context().selection_index)?.transform;
+    let transform=&receipt.shared_plan_source().admission().plan().selections.get(receipt.context().selection_index)?.transform;
     let raw=receipt.combination()==PartitionCaptureCombination::SumF64ToF32
         || matches!(transform,CaptureTransform::FullTensor|CaptureTransform::Slice|CaptureTransform::Preview{..});
     let worker=if raw {

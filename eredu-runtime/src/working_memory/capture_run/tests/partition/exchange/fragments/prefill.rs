@@ -37,16 +37,16 @@ declaration.selections.truncate(1);
 }
 pub(super) fn inference()->InferenceGeometry {InferenceGeometry{batch_size:1,cached_positions:2,input_positions:3,
     max_output_tokens:4,prefill_chunk_positions:1,output:OutputDemand::LastPosition}}
-pub(super) fn projected_receipt(source:&SharedCapturePlan,combination:PartitionCaptureCombination,funding:&WorkspaceMetadataFunding,
+pub(super) fn projected_receipt(source:&SharedCapturePlan,combination:PartitionCaptureCombination,funding:&HostMetadataFunding,
     quota:&mut CaptureLedger)->PartitionCaptureReceiptPlan {
     projected_receipt_at(source,combination,funding,quota,context(source,0))
 }
 pub(in super::super) fn projected_decode_receipt(source:&SharedCapturePlan,combination:PartitionCaptureCombination,
-    funding:&WorkspaceMetadataFunding,quota:&mut CaptureLedger)->PartitionCaptureReceiptPlan {
+    funding:&HostMetadataFunding,quota:&mut CaptureLedger)->PartitionCaptureReceiptPlan {
     let mut context=context(source,0);context.phase=CapturePhase::Decode;context.prediction=1;
     projected_receipt_at(source,combination,funding,quota,context)
 }
-fn projected_receipt_at(source:&SharedCapturePlan,combination:PartitionCaptureCombination,funding:&WorkspaceMetadataFunding,
+fn projected_receipt_at(source:&SharedCapturePlan,combination:PartitionCaptureCombination,funding:&HostMetadataFunding,
     quota:&mut CaptureLedger,context:PartitionCaptureContext)->PartitionCaptureReceiptPlan {
     let rows=if combination==PartitionCaptureCombination::SumF64ToF32 {
         vec![PartitionCaptureContiguousProducer{rank:0,coordinates:0..7},PartitionCaptureContiguousProducer{rank:3,coordinates:0..7}]

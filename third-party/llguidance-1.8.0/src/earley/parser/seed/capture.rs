@@ -4,7 +4,7 @@ use super::{agenda::InitialCapture, reserve, Cause, PreparedEarleySeed};
 use std::mem::{size_of, size_of_val};
 use toktrie::{RawTokenDecodeError, RawTokenDecodeFailure, RawTokenDecodePlan, TokTrie};
 impl PreparedEarleySeed {
-    pub(super) fn capture_source<F: Fn(usize) -> Result<(), E>, E>(
+    pub(super) fn capture_source<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         trie: &TokTrie,
         symbol: CSymIdx,
@@ -33,7 +33,7 @@ impl PreparedEarleySeed {
             size_of::<std::iter::Rev<std::slice::Iter<'_, InitialCapture>>>(),
             size_of::<Option<&[u8]>>(),
         ];
-        funding(
+        funding.reserve(
             parts
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
@@ -60,7 +60,7 @@ impl PreparedEarleySeed {
             },
         )?;
         let plan = trie.raw_decode_plan(raw).map_err(Cause::DecodeSource)?;
-        funding(plan.required_bytes()).map_err(Cause::Funding)?;
+        funding.reserve(plan.required_bytes()).map_err(Cause::Funding)?;
         self.capture_pending = Some(plan.compile().map_err(Cause::Decode)?);
         let record = InitialCapture {
             symbol,

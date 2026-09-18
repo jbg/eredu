@@ -111,6 +111,27 @@ impl TextControllerContract {
         self.output_width
     }
 
+    /// Describes the already admitted filter's future sampling work without
+    /// retaining or constructing witness bits. A mandatory mask projects to
+    /// the conservative optional-mask worker; this never changes the original
+    /// contract's validation of each actual decision.
+    pub fn sampling_workspace_bound(
+        &self,
+    ) -> Result<TextFilterWorkspace<'static>, TextControllerContractError> {
+        Ok(match self.filter {
+            FilterMechanism::All => TextFilterWorkspace::Exact(&TokenFilter::All),
+            FilterMechanism::Mask { capacity } => TextFilterWorkspace::OptionalMask {
+                max_mask_positions: usize::try_from(capacity / std::mem::size_of::<bool>() as u64)
+                    .map_err(|_| TextControllerContractError::CapacityOverflow)?,
+                mask_capacity_bytes: capacity,
+            },
+            FilterMechanism::OptionalMask { positions, capacity } => TextFilterWorkspace::OptionalMask {
+                max_mask_positions: positions,
+                mask_capacity_bytes: capacity,
+            },
+        })
+    }
+
     /// Whether the quote permits an explicit closed-mask filtering mechanism.
     /// Optional declarations may also produce unfiltered All decisions.
     pub fn uses_mask(&self) -> bool {

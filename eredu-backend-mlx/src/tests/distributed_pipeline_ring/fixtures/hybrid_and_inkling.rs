@@ -262,7 +262,7 @@ fn verify_bounded_hybrid_capture(
     let mut tokens = Vec::new();
     while let Some(token) = generated.next() {
         tokens.push(token.unwrap().token_id());
-        let step = generated.take_captured_step().unwrap().unwrap();
+        let step = generated.take_captured_delivery().unwrap().unwrap();
         assert_eq!(
             step.phase,
             if tokens.len() == 1 {
@@ -884,10 +884,10 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
             let parameter = parameter.as_array();
             self.arrays.push((
-                metadata.id.to_string(),
+                metadata.id().to_string(),
                 safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
                     .unwrap(),
             ));
@@ -907,11 +907,11 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
         State,
     >>::execution_graph(&architecture)
     .unwrap();
-    for group in 0..graph.groups().len() {
+    for group in 0..graph.group_count() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
             State,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<

@@ -1,8 +1,8 @@
 use super::*;
-use eredu_core::{capture::*, HostPreparationAuthority};
+use eredu_core::{HostPreparationAuthority, capture::*};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 struct Retired(Arc<AtomicUsize>);
 impl Drop for Retired {
@@ -54,7 +54,7 @@ fn facade_shared_success_and_failure_keep_entire_ordinary_frame_custody() {
             capture_seconds: 0.0,
         });
         let records = frame.records().as_ptr();
-        let delivery = CapturedStepDelivery::Shared(frame);
+        let delivery = frame;
         let event = if failed {
             ObservedGenerationEvent::from_failed_delivery(0, [0, 5], delivery, 0.0)
         } else {
@@ -65,13 +65,10 @@ fn facade_shared_success_and_failure_keep_entire_ordinary_frame_custody() {
         if failed {
             assert!(matches!(
                 &event,
-                ObservedGenerationEvent::SharedCaptureFailure { .. }
+                ObservedGenerationEvent::CaptureFailure { .. }
             ))
         } else {
-            assert!(matches!(
-                &event,
-                ObservedGenerationEvent::SharedToken { .. }
-            ))
+            assert!(matches!(&event, ObservedGenerationEvent::Token { .. }))
         }
         drop(event);
         assert_eq!(retired.load(Ordering::SeqCst), 0);

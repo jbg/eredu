@@ -1,6 +1,6 @@
 //! Exact lowered sparse recipe retained through index ingress and execution.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::intervention::PreparedRoutedIntervention;
 mod envelope;
 pub(crate) use envelope::SparseScalarEnvelope;
@@ -14,7 +14,7 @@ pub(crate) struct PreparedSparseActivation {
     shape: [i32; 2],
     dtype: InterventionDtype,
     // All aliases and C above retire before their concrete allocation account.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("original sparse native preparation failed: {cause}")]
@@ -27,7 +27,7 @@ impl PreparedSparseActivation {
     /// Convert only the actual native-row-order indices, under an existing
     /// metadata account. Partial construction retains the original row owner.
     pub(crate) fn prepare(lowered: PreparedRoutedIntervention, shape: [i32; 2],
-        dtype: InterventionDtype, funding: WorkspaceMetadataFunding,
+        dtype: InterventionDtype, funding: HostMetadataFunding,
     ) -> Result<Self, SparseActivationFailure> {
         let mut owner = Self { lowered, indices: Vec::new(), shape, dtype, funding };
         let result = (|| -> Result<(), Failure> {
@@ -140,3 +140,5 @@ fn run_selected<T: Kernel>(worker: &mut Adapter<T>, input: &T::Value, shape: [i3
     let output = worker.indexed_update(&flat, &indices, &changed)?;
     worker.0.emit(Op::Reshape(&output, &shape)).map(Some)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

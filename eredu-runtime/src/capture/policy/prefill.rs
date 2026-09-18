@@ -1,7 +1,7 @@
 //! Logical row progression only. Geometry does not prove causal/readout support.
 use super::*;
 use crate::prefill::PrefillChunk;
-use eredu_core::{InferenceGeometry, capture::*};
+use eredu_core::InferenceGeometry;
 
 /// Allocation-free logical sequencing rejection; never a completion or grant.
 #[derive(Debug, thiserror::Error)]

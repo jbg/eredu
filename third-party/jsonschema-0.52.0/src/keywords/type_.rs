@@ -20,10 +20,11 @@ pub(crate) struct MultipleTypesValidator {
 
 impl MultipleTypesValidator {
     #[inline]
-    pub(crate) fn compile<F: Json>(
-        items: &[Value],
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        items: &'a [Value],
         location: Location,
-    ) -> CompilationResult<'_, F> {
+    ) -> CompilationResult<'a, F> {
         let mut types = JsonTypeSet::empty();
         for item in items {
             match item {
@@ -31,38 +32,55 @@ impl MultipleTypesValidator {
                     if let Ok(ty) = JsonType::from_str(string.as_str()) {
                         types = types.insert(ty);
                     } else {
-                        return Err(ValidationError::enumeration(
+                        let options = ctx.funding().copy_vec(
+                            &[
+                                "array", "boolean", "integer", "null", "number", "object", "string",
+                            ],
+                            |name| Ok(Value::String(ctx.funding().copy_str(name)?)),
+                        )?;
+                        return Err(ValidationError::new_with_funding(
+                            Cow::Borrowed(item),
+                            crate::error::ValidationErrorKind::Enum {
+                                options: Value::Array(options),
+                            },
+                            Location::new_with_funding(ctx.funding())?,
                             location.clone(),
                             location,
-                            Location::new(),
-                            Cow::Borrowed(item),
-                            &json!([
-                                "array", "boolean", "integer", "null", "number", "object", "string"
-                            ]),
-                        ));
+                            ctx.funding(),
+                        )?
+                        .into());
                     }
                 }
                 _ => {
-                    return Err(ValidationError::single_type_error(
+                    return Err(ValidationError::single_type_error_with_funding(
                         location.clone(),
                         location,
-                        Location::new(),
+                        Location::new_with_funding(ctx.funding())?,
                         Cow::Borrowed(item),
                         JsonType::String,
-                    ))
+                        ctx.funding(),
+                    )?
+                    .into())
                 }
             }
         }
-        Ok(Box::new(MultipleTypesValidator { types, location }))
+        Ok(ctx
+            .funding()
+            .boxed(MultipleTypesValidator { types, location })?)
     }
 }
 
 impl<F: Json> Validate<F> for MultipleTypesValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature="arbitrary-precision") {return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision integer classification")));}
+
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<crate::types::JsonType>(),
             std::mem::size_of::<crate::types::JsonTypeSet>(),
@@ -72,10 +90,13 @@ impl<F: Json> Validate<F> for MultipleTypesValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         self.types.contains_value_type::<F>(instance)
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -85,13 +106,11 @@ impl<F: Json> Validate<F> for MultipleTypesValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::multiple_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                self.types,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Multiple(self.types),
+                })
+            })
         }
     }
     fn evaluate(
@@ -116,13 +135,19 @@ pub(crate) struct NullTypeValidator {
 
 impl NullTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(NullTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(NullTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for NullTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -136,10 +161,13 @@ impl<F: Json> Validate<F> for NullTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.is_null()
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -149,13 +177,11 @@ impl<F: Json> Validate<F> for NullTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Null,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Null),
+                })
+            })
         }
     }
     fn evaluate(
@@ -182,13 +208,19 @@ pub(crate) struct BooleanTypeValidator {
 
 impl BooleanTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(BooleanTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(BooleanTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for BooleanTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -202,10 +234,13 @@ impl<F: Json> Validate<F> for BooleanTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.as_boolean().is_some()
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -215,13 +250,11 @@ impl<F: Json> Validate<F> for BooleanTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Boolean,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Boolean),
+                })
+            })
         }
     }
     fn evaluate(
@@ -248,13 +281,19 @@ pub(crate) struct StringTypeValidator {
 
 impl StringTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(StringTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(StringTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for StringTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -268,11 +307,14 @@ impl<F: Json> Validate<F> for StringTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.is_string()
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -282,13 +324,11 @@ impl<F: Json> Validate<F> for StringTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::String,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::String),
+                })
+            })
         }
     }
     fn evaluate(
@@ -315,13 +355,19 @@ pub(crate) struct ArrayTypeValidator {
 
 impl ArrayTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ArrayTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ArrayTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ArrayTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -335,11 +381,14 @@ impl<F: Json> Validate<F> for ArrayTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.as_array().is_some()
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -349,13 +398,11 @@ impl<F: Json> Validate<F> for ArrayTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Array,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Array),
+                })
+            })
         }
     }
     fn evaluate(
@@ -382,13 +429,19 @@ pub(crate) struct ObjectTypeValidator {
 
 impl ObjectTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ObjectTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ObjectTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ObjectTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -402,10 +455,13 @@ impl<F: Json> Validate<F> for ObjectTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.as_object().is_some()
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -415,13 +471,11 @@ impl<F: Json> Validate<F> for ObjectTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Object,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Object),
+                })
+            })
         }
     }
     fn evaluate(
@@ -448,13 +502,19 @@ pub(crate) struct NumberTypeValidator {
 
 impl NumberTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(NumberTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(NumberTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for NumberTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -468,10 +528,13 @@ impl<F: Json> Validate<F> for NumberTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         instance.is_number()
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -481,13 +544,11 @@ impl<F: Json> Validate<F> for NumberTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Number,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Number),
+                })
+            })
         }
     }
     fn evaluate(
@@ -514,17 +575,25 @@ pub(crate) struct IntegerTypeValidator {
 
 impl IntegerTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(IntegerTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(IntegerTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for IntegerTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature="arbitrary-precision") {return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision integer classification")));}
+
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<crate::types::JsonType>(),
             std::mem::size_of::<crate::types::JsonTypeSet>(),
@@ -534,6 +603,9 @@ impl<F: Json> Validate<F> for IntegerTypeValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(num) = instance.as_number() {
             is_integer(&num)
@@ -541,7 +613,7 @@ impl<F: Json> Validate<F> for IntegerTypeValidator {
             false
         }
     }
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -551,13 +623,11 @@ impl<F: Json> Validate<F> for IntegerTypeValidator {
         if Validate::<F>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::single_type_error(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                JsonType::Integer,
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::Type {
+                    kind: crate::error::TypeKind::Single(JsonType::Integer),
+                })
+            })
         }
     }
     fn evaluate(
@@ -625,60 +695,76 @@ pub(crate) fn compile<'a, F: Json>(
     if crate::keywords::items::array_shape_fusion(ctx, parent) {
         return None;
     }
-    let location = ctx.location().join("type");
+    let location =
+        crate::keywords::try_compile!(ctx.location().join_with_funding("type", ctx.funding()));
     match schema {
-        Value::String(item) => Some(compile_single_type(item.as_str(), location, schema)),
+        Value::String(item) => Some(compile_single_type(ctx, item.as_str(), location, schema)),
         Value::Array(items) => {
             if items.len() == 1 {
                 let item = &items[0];
                 if let Value::String(ty) = item {
-                    Some(compile_single_type(ty.as_str(), location, item))
+                    Some(compile_single_type(ctx, ty.as_str(), location, item))
                 } else {
-                    Some(Err(ValidationError::single_type_error(
-                        location.clone(),
-                        location,
-                        Location::new(),
-                        Cow::Borrowed(item),
-                        JsonType::String,
-                    )))
+                    Some(Err(crate::keywords::try_compile!(
+                        ValidationError::single_type_error_with_funding(
+                            location.clone(),
+                            location,
+                            crate::keywords::try_compile!(Location::new_with_funding(
+                                ctx.funding()
+                            )),
+                            Cow::Borrowed(item),
+                            JsonType::String,
+                            ctx.funding()
+                        )
+                    )
+                    .into()))
                 }
             } else {
-                Some(MultipleTypesValidator::compile(items, location))
+                Some(MultipleTypesValidator::compile(ctx, items, location))
             }
         }
         _ => {
-            let location = ctx.location().join("type");
-            Some(Err(ValidationError::multiple_type_error(
-                location.clone(),
-                location,
-                Location::new(),
-                Cow::Borrowed(schema),
-                JsonTypeSet::from(JsonType::String).insert(JsonType::Array),
-            )))
+            let location = crate::keywords::try_compile!(ctx
+                .location()
+                .join_with_funding("type", ctx.funding()));
+            Some(Err(crate::keywords::try_compile!(
+                ValidationError::multiple_type_error_with_funding(
+                    location.clone(),
+                    location,
+                    crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                    Cow::Borrowed(schema),
+                    JsonTypeSet::from(JsonType::String).insert(JsonType::Array),
+                    ctx.funding()
+                )
+            )
+            .into()))
         }
     }
 }
 
 fn compile_single_type<'a, F: Json>(
+    ctx: &compiler::Context<F>,
     item: &str,
     location: Location,
     instance: &'a Value,
 ) -> CompilationResult<'a, F> {
     match JsonType::from_str(item) {
-        Ok(JsonType::Array) => ArrayTypeValidator::compile(location),
-        Ok(JsonType::Boolean) => BooleanTypeValidator::compile(location),
-        Ok(JsonType::Integer) => IntegerTypeValidator::compile(location),
-        Ok(JsonType::Null) => NullTypeValidator::compile(location),
-        Ok(JsonType::Number) => NumberTypeValidator::compile(location),
-        Ok(JsonType::Object) => ObjectTypeValidator::compile(location),
-        Ok(JsonType::String) => StringTypeValidator::compile(location),
-        Err(()) => Err(ValidationError::compile_error(
+        Ok(JsonType::Array) => ArrayTypeValidator::compile(ctx, location),
+        Ok(JsonType::Boolean) => BooleanTypeValidator::compile(ctx, location),
+        Ok(JsonType::Integer) => IntegerTypeValidator::compile(ctx, location),
+        Ok(JsonType::Null) => NullTypeValidator::compile(ctx, location),
+        Ok(JsonType::Number) => NumberTypeValidator::compile(ctx, location),
+        Ok(JsonType::Object) => ObjectTypeValidator::compile(ctx, location),
+        Ok(JsonType::String) => StringTypeValidator::compile(ctx, location),
+        Err(()) => Err(ValidationError::compile_error_with_funding(
             location.clone(),
             location,
-            Location::new(),
+            Location::new_with_funding(ctx.funding())?,
             Cow::Borrowed(instance),
-            "Unexpected type",
-        )),
+            ctx.funding().copy_str("Unexpected type")?,
+            ctx.funding(),
+        )?
+        .into()),
     }
 }
 

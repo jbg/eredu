@@ -13,16 +13,19 @@ pub(crate) use contiguous::{PreparedPartitionContiguousRow,PreparedPartitionRout
 pub use local_hook::PartitionCaptureLocalHook;
 pub use run_identity::PreparedPartitionCaptureRunIdentity;
 use eredu_core::{checkpoint::TensorDtype, Completion, DistributedCommitEpoch};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use crate::working_memory::{ScheduledCaptureStep, PreparedPartitionTensorDelivery,
     PartitionCaptureTensorDeliveryError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
+    #[error("{0}")]
+    Coordinates(#[from] eredu_core::component::ComponentCoordinateConstructionError),
+
     #[error("original partition observer source: {0}")]
     Source(&'static str),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Destination(#[from] eredu_nn::Error),
     #[error(transparent)] Receipt(#[from] PartitionCaptureReceiptConstructionError),
     #[error(transparent)] Allowance(#[from] PartitionCaptureAllowanceError),
@@ -44,7 +47,7 @@ enum Cause {
 pub struct PartitionCaptureProgramError {
     #[source] cause: Cause,
     _source: SharedCapturePlan,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 mod sealed { pub trait Sealed {} }
 /// A runtime-owned program around the existing receipt transaction. Backends
@@ -181,7 +184,7 @@ pub struct PreparedPartitionCaptureProgram<'t, T: PartitionCaptureTransport> {
     coordination_complete: bool,
     delivered: bool,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 impl<T: PartitionCaptureTransport> std::fmt::Debug for PreparedPartitionCaptureProgram<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,7 +202,7 @@ where T::Error: Send + Sync + 'static, <T::Completion as Completion>::Error: Sen
     /// the owner to a managed model callback.
     pub fn new(transport: &'t T, source: &SharedCapturePlan, context: &PartitionCaptureContext,
         rows: &[PartitionCaptureProducerSource], limits: PartitionCaptureReceiptLimits,
-        metadata: &WorkspaceMetadataFunding) -> Result<Self, PartitionCaptureProgramError>
+        metadata: &HostMetadataFunding) -> Result<Self, PartitionCaptureProgramError>
     {
         Self::new_rows(transport,source,context,rows.iter().map(PreparedPartitionCaptureRow::Complete),limits,metadata)
     }
@@ -207,22 +210,22 @@ where T::Error: Send + Sync + 'static, <T::Completion as Completion>::Error: Sen
     /// source for a partition. Every projected slot must be attached once.
     pub fn new_selected(transport:&'t T,source:&SharedCapturePlan,context:&PartitionCaptureContext,
         rows:&[PreparedPartitionCaptureRow<'_>],limits:PartitionCaptureReceiptLimits,
-        metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::new_rows(transport,source,context,rows.iter().copied(),limits,metadata)
     }
     fn new_rows<'a,I:ExactSizeIterator<Item=PreparedPartitionCaptureRow<'a>>>(transport:&'t T,
         source:&SharedCapturePlan,context:&PartitionCaptureContext,rows:I,limits:PartitionCaptureReceiptLimits,
-        metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         let error = |cause| PartitionCaptureProgramError { cause,
             _source: source.clone(), _metadata: metadata.clone() };
         let parts = [size_of::<Self>() * 2, size_of::<Result<Self, PartitionCaptureProgramError>>(),
             size_of::<PartitionCaptureProgramError>(), size_of::<Cause>(),
             size_of::<PartitionCaptureContext>() * 2, size_of::<PartitionCaptureProducerSource>(),
             size_of::<I>(),size_of::<Option<PartitionCaptureProducerSource>>(),size_of::<PreparedPartitionCaptureRow<'_>>(),
-            size_of::<(&T,&SharedCapturePlan,&PartitionCaptureContext,&[PreparedPartitionCaptureRow<'_>],PartitionCaptureReceiptLimits,&WorkspaceMetadataFunding)>(),
+            size_of::<(&T,&SharedCapturePlan,&PartitionCaptureContext,&[PreparedPartitionCaptureRow<'_>],PartitionCaptureReceiptLimits,&HostMetadataFunding)>(),
             size_of::<Option<Entry<'t, T>>>(), size_of::<Vec<Option<DistributedCommitEpoch>>>(),
             size_of::<Option<DistributedCommitEpoch>>(), size_of::<(&T, &SharedCapturePlan,
-                &PartitionCaptureContext, &[PartitionCaptureProducerSource], &WorkspaceMetadataFunding)>()];
+                &PartitionCaptureContext, &[PartitionCaptureProducerSource], &HostMetadataFunding)>()];
         let bytes = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or_else(|| error(Cause::Source("constructor controls overflow")))?;
         metadata.reserve_metadata(bytes).map_err(|cause| error(cause.into()))?;
@@ -313,7 +316,7 @@ where T::Error: Send + Sync + 'static, <T::Completion as Completion>::Error: Sen
                 .map_err(|cause| self.error(cause))?;
         }
         frame.prepare_partition_evidence(&self.metadata).map_err(|cause| self.error(cause.into()))?;
-        let mut coordination = PreparedPartitionCaptureCoordination::prepare(self.transport,
+        let coordination = PreparedPartitionCaptureCoordination::prepare(self.transport,
             &self.source, &self.context, &self.metadata, ledger).map_err(|cause| self.error(cause.into()))?;
         for index in 0..self.rows.len() {
             if !self.source.admission().plan().selections[index].schedule.includes(phase, prediction) { continue; }
@@ -607,3 +610,5 @@ where T::Error: Send + Sync + 'static, <T::Completion as Completion>::Error: Sen
         Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

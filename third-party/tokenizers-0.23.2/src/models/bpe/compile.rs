@@ -1,6 +1,6 @@
 //! Source-derived model construction, not a full tokenizer or allocation grant.
 use super::{
-    storage::{MergeEntry, Packed, Storage, VocabEntry},
+    storage::{MergeEntry, Storage, VocabEntry},
     BPE,
 };
 use crate::utils::borrowed_json as json;
@@ -264,7 +264,7 @@ impl<'a> BpeCompilePlan<'a> {
                 partial,
             });
         }
-        Ok(BPE::from_packed(
+        Ok(BPE::from_tables(
             partial.packed,
             partial.strings,
             self.flags,
@@ -363,7 +363,7 @@ impl<'a> BpeCompilePlan<'a> {
         Ok(())
     }
 }
-fn lookup(p: &Packed, bytes: impl Iterator<Item = u8> + Clone) -> Option<usize> {
+fn lookup(p: &Storage, bytes: impl Iterator<Item = u8> + Clone) -> Option<usize> {
     p.entries
         .binary_search_by(|e| p.spelling(e).bytes().cmp(bytes.clone()))
         .ok()
@@ -477,7 +477,7 @@ fn write_string(text: Text<'_>, target: &mut String) {
 
 #[derive(Debug, Default)]
 struct Partial {
-    packed: Packed,
+    packed: Storage,
     strings: [Option<String>; 3],
 }
 impl Partial {
@@ -599,7 +599,6 @@ fn requirements(
         size_of::<&&Vec<VocabEntry>>(), // borrowed closure capture
         size_of::<MergeEntry>(),
         size_of::<Partial>(),
-        size_of::<Packed>(),
         size_of::<Storage>(),
         size_of::<BPE>(),
         size_of::<Reader<'_>>(),

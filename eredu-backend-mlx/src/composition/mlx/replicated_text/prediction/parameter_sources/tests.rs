@@ -21,11 +21,9 @@ impl Parameterized<MlxTensor> for Partial {
         visitor: &mut V,
     ) -> Result<(), ParameterSourceError> {
         self.0.visit_parameter_sources(visitor)?;
-        Err(ParameterSourceError::Unavailable)
+        Err(ParameterSourceError::UnclassifiedRetainedField)
     }
-    fn visit_parameters<'a, V: ParameterVisitor<'a, MlxTensor>>(&'a self, visitor: &mut V) {
-        self.0.visit_parameters(visitor);
-    }
+
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, MlxTensor>>(
         &'a mut self,
         visitor: &mut V,
@@ -63,19 +61,19 @@ fn actual_metadata_and_auxiliary_descriptors_match_ordinary_static_rows() {
         frozen: bool,
     }
     impl<'a> ParameterVisitor<'a, MlxTensor> for Ordinary {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a MlxTensor) {
             self.named += 1;
-            self.bytes += metadata.id.as_str().len()
-                + metadata.alias_of.as_ref().unwrap().as_str().len()
-                + metadata.group.as_ref().unwrap().len()
+            self.bytes += metadata.id().as_str().len()
+                + metadata.alias_of().as_ref().unwrap().as_str().len()
+                + metadata.group().as_ref().unwrap().len()
                 + metadata
-                    .linear_companion_of
+                    .linear_companion_of()
                     .as_ref()
                     .unwrap()
                     .as_str()
                     .len();
             self.shape += value.as_array().shape().len();
-            self.frozen &= !metadata.trainable;
+            self.frozen &= !metadata.trainable();
         }
     }
     let mut ordinary = Ordinary {
@@ -117,7 +115,7 @@ fn failed_source_and_overflow_never_publish_partial_role_counts() {
         Err(ParameterOwnerSourceError::Observation {
             role: ParameterOwnerRole::Static,
             module: None,
-            source: ParameterCountError::Traversal(ParameterSourceError::Unavailable)
+            source: ParameterCountError::Traversal(ParameterSourceError::UnclassifiedRetainedField)
         })
     );
     assert_eq!(counts, before);

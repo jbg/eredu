@@ -71,8 +71,14 @@ impl SlicerSourceRequirements {
 
 /// One lexical loan of an already recognized ordinary slicer.
 pub struct SlicerSourcePlan<'a> {
-    source: &'a SlicedBiasComputer,
+    source: RecognizedSource<'a>,
     requirements: SlicerSourceRequirements,
+}
+#[derive(Clone, Copy)]
+struct RecognizedSource<'a> {
+    trie: &'a TokTrie,
+    root: &'a TokenizerSlice,
+    regexes: &'a [String],
 }
 impl SlicerSourcePlan<'_> {
     /// Exact source-derived destination and writer controls.
@@ -98,7 +104,11 @@ impl SlicerSourcePlan<'_> {
         bytes.resize(self.requirements.layout.bytes, 0);
         let result = encode(self.source, Writer::new(Some(&mut bytes)));
         match result {
-            Ok(layout) if layout == self.requirements.layout => Ok(SlicerSource { bytes, layout }),
+            Ok(layout) if layout == self.requirements.layout => Ok(SlicerSource {
+                bytes,
+                layout,
+                funding: derivre::ParserAllocationFunding::unenforced(),
+            }),
             Ok(_) => Err(SlicerSourceFailure {
                 cause: Cause::Source(SlicerSourceError::Destination),
                 bytes,
@@ -110,11 +120,9 @@ impl SlicerSourcePlan<'_> {
         }
     }
 }
-impl SlicedBiasComputer {
-    /// Records this actual slicer's regex ordering, containment tree and masks.
-    /// No regex matching or containment recognition is repeated by this worker.
-    pub fn source_plan(&self) -> Result<SlicerSourcePlan<'_>, SlicerSourceError> {
-        let layout = encode(self, Writer::new(None))?;
+impl<'a> SlicerSourcePlan<'a> {
+    fn prepare(source: RecognizedSource<'a>) -> Result<Self, SlicerSourceError> {
+        let layout = encode(source, Writer::new(None))?;
         Layout::array::<u8>(layout.bytes).map_err(|_| SlicerSourceError::Overflow)?;
         let recursive = [
             size_of::<(&TokenizerSlice, &mut Writer<'_>, usize)>(),
@@ -154,7 +162,9 @@ impl SlicedBiasComputer {
             size_of::<(usize, usize)>(),
             size_of::<[u8; 8]>(),
             size_of::<[u8; 4]>(),
-            size_of::<(&SlicedBiasComputer, Writer<'_>)>(),
+            size_of::<SlicedBiasComputer>(),
+            size_of::<RecognizedSource<'_>>(),
+            size_of::<(RecognizedSource<'_>, Writer<'_>)>(),
             size_of::<(&TokRxInfo,)>(),
             size_of::<(&mut Writer<'_>, &[u8])>(),
             size_of::<Result<u64, std::num::TryFromIntError>>(),
@@ -163,12 +173,24 @@ impl SlicedBiasComputer {
         ];
         let controls = parts.into_iter().try_fold(size_of_val(&parts), add)?;
         Ok(SlicerSourcePlan {
-            source: self,
+            source,
             requirements: SlicerSourceRequirements {
                 layout,
                 controls,
                 total: add(layout.bytes, controls)?,
             },
+        })
+    }
+}
+
+impl SlicedBiasComputer {
+    /// Records this actual slicer's regex ordering, containment tree and masks.
+    /// No regex matching or containment recognition is repeated by this worker.
+    pub fn source_plan(&self) -> Result<SlicerSourcePlan<'_>, SlicerSourceError> {
+        SlicerSourcePlan::prepare(RecognizedSource {
+            trie: self.tok_env.tok_trie(),
+            root: &self.top_slice,
+            regexes: &self.slice_regexes,
         })
     }
 
@@ -206,8 +228,52 @@ impl SlicedBiasComputer {
 pub struct SlicerSource {
     bytes: Vec<u8>,
     layout: RecordLayout,
+    funding: derivre::ParserAllocationFunding,
+}
+
+/// Actual recognition failure with the original compiler allocation account.
+#[derive(Debug)]
+pub struct SlicerRecognitionError {
+    cause: derivre::ParserError,
+    funding: derivre::ParserAllocationFunding,
+}
+impl fmt::Display for SlicerRecognitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::error::Error for SlicerRecognitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 impl SlicerSource {
+    /// Recognizes slices against an immutable trie through the same worker as
+    /// ordinary parser construction. No tokenizer callback or parser is built.
+    pub fn recognize(
+        trie: &TokTrie,
+        regexes: &[String],
+        funding: derivre::ParserAllocationFunding,
+    ) -> Result<Self, SlicerRecognitionError> {
+        let result = (|| -> derivre::ParserResult<Self> {
+            let root = SlicedBiasComputer::recognize(trie, regexes, &funding)?;
+            let plan = SlicerSourcePlan::prepare(RecognizedSource {
+                trie,
+                root: &root,
+                regexes,
+            }).map_err(|error| derivre::ParserError::cause(error, &funding))?;
+            funding.reserve(plan.requirements().required_bytes())?;
+            plan.compile().map_err(|error| derivre::ParserError::cause(error, &funding))
+        })();
+        match result {
+            Ok(mut source) => {
+                source.funding = funding;
+                Ok(source)
+            }
+            Err(cause) => Err(SlicerRecognitionError { cause, funding }),
+        }
+    }
+
     /// Actual closed record for registration in the caller's historical source.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -584,10 +650,10 @@ fn encode_node(node: &TokenizerSlice, output: &mut Writer<'_>) -> Result<(), Sli
     Ok(())
 }
 fn encode(
-    source: &SlicedBiasComputer,
+    source: RecognizedSource<'_>,
     mut output: Writer<'_>,
 ) -> Result<RecordLayout, SlicerSourceError> {
-    let trie = source.tok_env.tok_trie();
+    let trie = source.trie;
     output.put(MAGIC)?;
     for word in info_words(trie.info()) {
         output.put(&word.to_le_bytes())?;
@@ -600,13 +666,13 @@ fn encode(
         output.bytes(trie.token(id as u32))?;
     }
     let source_end = output.position;
-    output.usize(source.slice_regexes.len())?;
-    for regex in &source.slice_regexes {
+    output.usize(source.regexes.len())?;
+    for regex in source.regexes {
         output.bytes(regex.as_bytes())?;
     }
     let root_offset = output.position;
-    let (_, nodes, depth) = node_geometry(&source.top_slice)?;
-    encode_node(&source.top_slice, &mut output)?;
+    let (_, nodes, depth) = node_geometry(source.root)?;
+    encode_node(source.root, &mut output)?;
     Ok(RecordLayout {
         bytes: output.position,
         source_end,
@@ -719,13 +785,11 @@ mod tests {
         // source validation preserves that exact tree rather than inventing nodes.
         let duplicate = SlicedBiasComputer::new(&env, &["a".into(), "a".into()]).unwrap();
         let duplicate_source = duplicate.source_plan().unwrap().compile().unwrap();
-        assert!(
-            duplicate_source
-                .descriptor()
-                .checked_view(duplicate_source.as_bytes())
-                .unwrap()
-                .matches_trie(env.tok_trie())
-        );
+        assert!(duplicate_source
+            .descriptor()
+            .checked_view(duplicate_source.as_bytes())
+            .unwrap()
+            .matches_trie(env.tok_trie()));
         let duplicate_copy =
             SlicedBiasComputer::from_source_ordinary(&env, &duplicate_source).unwrap();
         assert_eq!(duplicate_copy.stats(true), duplicate.stats(true));
@@ -736,17 +800,22 @@ mod tests {
         assert!(plan.requirements().control_bytes() > 0);
         let bytes = plan.requirements().buffer_bytes();
         let source = plan.compile().unwrap();
+        let direct = SlicerSource::recognize(
+            env.tok_trie(),
+            &regexes,
+            derivre::ParserAllocationFunding::unenforced(),
+        )
+        .unwrap();
+        assert_eq!(source.as_bytes(), direct.as_bytes());
         assert_eq!(source.as_bytes().len(), bytes);
         let copied = source.as_bytes().to_vec();
         let descriptor = source.descriptor();
         assert!(descriptor.control_bytes().unwrap() > 0);
         let view = descriptor.checked_view(&copied).unwrap();
         assert!(view.matches_trie(env.tok_trie()));
-        assert!(
-            descriptor
-                .checked_view(&copied[..copied.len() - 1])
-                .is_err()
-        );
+        assert!(descriptor
+            .checked_view(&copied[..copied.len() - 1])
+            .is_err());
         let mut invalid = copied.clone();
         invalid[source.layout.root_offset..source.layout.root_offset + 8].fill(0);
         assert!(matches!(

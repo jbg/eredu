@@ -6,7 +6,7 @@ use super::{original_branch::{OriginalRealtimeSessionState,RealtimeBranchSource}
 use crate::backend::{OriginalCopyEnvironment,
     nn::workspace::{ResidentExecutionMechanisms,MlxMetalWorkspaceMechanisms}};
 use eredu_core::{BackendFailure,scheduler::{SchedulerError,SchedulerProgress,WorkId}};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::{RealtimePayloadState,RealtimePayloadContract,RealtimeSessionScheduler,
     working_memory::{RealtimeFrameRequirements,WorkingMemoryError}};
 use std::{cell::RefCell,mem::{size_of,size_of_val},time::Instant};
@@ -33,9 +33,9 @@ type FrameCompletionFailure=eredu_runtime::RealtimePrepublicationError<Error,Err
 #[error("realtime frame completion: {cause}")]
 struct FundedCompletionFailure {
     #[source] cause:FrameCompletionFailure,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
-fn completion_failure_callback<'a>(first:Option<&'a FirstFrameFailure>,funding:Option<&'a WorkspaceMetadataFunding>)
+fn completion_failure_callback<'a>(first:Option<&'a FirstFrameFailure>,funding:Option<&'a HostMetadataFunding>)
     ->impl FnMut(WorkId,FrameCompletionFailure)+'a + use<'a> {
     move |_,cause| {
         let first=first.expect("actual completion callback retains its prepaid first source slot");
@@ -48,12 +48,12 @@ fn completion_failure_callback<'a>(first:Option<&'a FirstFrameFailure>,funding:O
 
 #[derive(Debug,thiserror::Error)]
 #[error("{cause}")]
-struct FundedSchedulerFailure {#[source] cause:SchedulerError,_funding:WorkspaceMetadataFunding}
+struct FundedSchedulerFailure {#[source] cause:SchedulerError,_funding:HostMetadataFunding}
 
 #[derive(Debug,thiserror::Error)]
 #[error("realtime frame {stage}: {cause}")]
-struct FundedFailure {stage:&'static str,#[source] cause:Error,_funding:WorkspaceMetadataFunding}
-fn funded(cause:Error,funding:WorkspaceMetadataFunding,stage:&'static str)->BackendFailure {
+struct FundedFailure {stage:&'static str,#[source] cause:Error,_funding:HostMetadataFunding}
+fn funded(cause:Error,funding:HostMetadataFunding,stage:&'static str)->BackendFailure {
     match cause.take_retained_backend_failure() {
         Ok(cause)=>cause,
         Err(cause)=>BackendFailure::from_error(FundedFailure{stage,cause,_funding:funding}),
@@ -104,7 +104,7 @@ fn planning_control_bytes()->Option<usize> {
 /// Source of the public submit wrapper, debited once before borrowing the
 /// original runtime. The retained model/stream allocations have separate owners.
 pub(super) fn submission_control_bytes()->Option<usize> {
-    let parts=[size_of::<FundedFailure>(),size_of::<WorkspaceMetadataFunding>(),
+    let parts=[size_of::<FundedFailure>(),size_of::<HostMetadataFunding>(),
         size_of::<Arc<neutral_moshi::SelectedRealtimeResources>>(),
         size_of::<PreparedOriginalRealtimeFrame>(),
         size_of::<Result<MlxPrepublicationFrame,BackendFailure>>(),
@@ -115,12 +115,12 @@ pub(super) fn submission_control_bytes()->Option<usize> {
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
 #[cfg(all(target_vendor="apple",feature="metal",not(feature="cuda")))]
-fn mechanisms(stream:&Stream,funding:&WorkspaceMetadataFunding)->Result<ResidentExecutionMechanisms,Error> {
+fn mechanisms(stream:&Stream,funding:&HostMetadataFunding)->Result<ResidentExecutionMechanisms,Error> {
     ResidentExecutionMechanisms::from_stream(MlxMetalWorkspaceMechanisms::current_host().map_err(Error::Neural)?,
         stream,funding).map_err(Error::Neural)
 }
 #[cfg(not(all(target_vendor="apple",feature="metal",not(feature="cuda"))))]
-fn mechanisms(_stream:&Stream,_funding:&WorkspaceMetadataFunding)->Result<ResidentExecutionMechanisms,Error> {
+fn mechanisms(_stream:&Stream,_funding:&HostMetadataFunding)->Result<ResidentExecutionMechanisms,Error> {
     Err(Error::PrefillControl(WorkingMemoryError::UnknownBound))
 }
 impl MlxRealtimeExecutionContext {
@@ -139,7 +139,7 @@ impl MlxRealtimeExecutionContext {
         if !std::ptr::eq(self.backend(),resources.backend()) {
             return Err(identity().into_backend_failure());
         }
-        let funding:WorkspaceMetadataFunding=self.backend().memory_pool()
+        let funding:HostMetadataFunding=self.backend().memory_pool()
             .prepare_workspace_metadata(resources.execution_identity(),capacity_bytes)
             .map_err(|cause|Error::WorkspacePlanning(cause).into_backend_failure())?.into();
         let mut stage="planning controls";
@@ -257,7 +257,7 @@ impl MlxRealtimeExecutionContext {
         let parts=[size_of_val(&callback_shape),size_of_val(&completion_shape),size_of::<FirstFrameFailure>(),
             size_of::<FrameCompletionFailure>(),size_of::<FundedCompletionFailure>(),
             size_of::<(WorkId,FrameCompletionFailure)>(),
-            size_of::<(Option<&FirstFrameFailure>,Option<&WorkspaceMetadataFunding>)>(),
+            size_of::<(Option<&FirstFrameFailure>,Option<&HostMetadataFunding>)>(),
             size_of::<std::cell::Ref<'_,Option<BackendFailure>>>(),
             size_of::<std::cell::RefMut<'_,Option<BackendFailure>>>(),
             BackendFailure::source_retention_peak_bytes::<FundedCompletionFailure>().ok_or_else(||overflow().into_backend_failure())?,
@@ -280,3 +280,5 @@ impl MlxRealtimeExecutionContext {
             cause,_funding:transport.funding().clone()}))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

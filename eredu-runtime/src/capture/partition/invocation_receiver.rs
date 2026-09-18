@@ -14,7 +14,7 @@ impl PartitionInvocationReceiverSource {
     pub(crate) fn prepare_local(receipt:&PartitionCaptureReceiptPlan,producer:usize,
         dtype:TensorDtype,shape:&[u64])->Result<Self,PartitionInvocationCaptureSourceError> {
         use PartitionInvocationCaptureSourceError as E;
-        let source=receipt.shared_plan_source().ok_or(E::Source)?;
+        let source=receipt.shared_plan_source();
         let context=receipt.context();
         if context.phase!=CapturePhase::Decode||context.prediction==0||context.invocation.is_some()
             ||context.capture_plan_identity!=source.admission().identity()||producer>=receipt.world_size()

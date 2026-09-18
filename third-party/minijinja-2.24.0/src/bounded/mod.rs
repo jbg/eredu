@@ -24,7 +24,7 @@ pub use input::{
     InputError, Messages, RenderContext, ScalarBinding, ScalarBindingValue, TextMessage,
 };
 #[cfg(feature = "json")]
-pub use input::{RecordField, RecordFields, RecordValue};
+pub use input::{InputArray, RecordField, RecordFields, RecordValue};
 
 pub use render::{
     JsonCapacity, RenderBuffer, RenderCause, RenderError, RenderFailure, RenderPlan,

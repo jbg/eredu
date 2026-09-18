@@ -13,7 +13,7 @@ use eredu_core::{
         SpeculativeCaptureScope, SpeculativeControlError, SpeculativePrefillSpan,
     },
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     ActivationObserver, ExpertPass,
     capture::{
@@ -31,7 +31,7 @@ struct Observer {
     failure: Option<SpeculativeControlError>,
     control: control::Source,
     // Array-free account alias only, retained after source state and errors.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Observer {
     fn signal<E: std::error::Error + Send + Sync + 'static>(&mut self, cause: E) -> Error {
@@ -67,7 +67,7 @@ pub(in crate::composition::mlx) fn prepare(
         size_of::<Option<OriginalInterventionSource>>(),
         size_of::<&[SpeculativeCaptureScope]>(),
         OriginalInterventionSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?,
         size_of::<eredu_runtime::working_memory::OriginalEmbeddedCaptureLineage>(),
         size_of::<
@@ -95,7 +95,7 @@ pub(in crate::composition::mlx) fn prepare(
             &OriginalSpeculativeNumericalSources,
         )>(),
         OriginalCaptureSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?,
     ];
     funding
@@ -104,7 +104,7 @@ pub(in crate::composition::mlx) fn prepare(
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?,
         )
         .map_err(Error::WorkspacePlanning)?;

@@ -1,5 +1,4 @@
 //! Fixed request controls derived from the actual recognized format profile.
-pub(crate) mod selected;
 pub(crate) mod tagged;
 use super::{ChatTemplateRequest, TextModelError};
 use crate::runtime::chat::{
@@ -202,5 +201,42 @@ impl ProfileRequestError {
             }
         };
         TextModelError::ToolConstraint(message)
+    }
+}
+
+/// Fixed failure from the shared recognized-profile request policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ProfileRequestFailure {
+    #[error(transparent)]
+    Control(#[from] ProfileRequestError),
+    #[error(transparent)]
+    History(#[from] tagged::Failure),
+}
+impl ProfileRequestFailure {
+    pub(super) fn ordinary(self, profile: &PreparedFormatProfile, request: &ChatTemplateRequest) -> TextModelError {
+        match self {
+            Self::Control(cause) => cause.ordinary(profile, request),
+            Self::History(cause) => cause.ordinary(&request.messages, profile.identity.unwrap_or("unregistered")),
+        }
+    }
+}
+impl PreparedFormatProfile {
+    pub(crate) fn request_bindings<'a>(&self, request: &'a ChatTemplateRequest)
+        -> Result<ProfileRequestBindings<'a>, ProfileRequestFailure>
+    {
+        let controls = ProfileRequestControls::from_profile(self);
+        controls.validate_effort(request)?;
+        if self.identity.is_some_and(|identity| identity.starts_with("qwen3.6.") || identity.starts_with("qwen3.8.")) {
+            tagged::validate(&request.messages, "</parameter>")?;
+        }
+        controls.validate_strength(request)?;
+        Ok(controls.bindings(request)?)
+    }
+    pub(crate) fn control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let parts = [size_of::<Self>(), size_of::<super::probes::selection::Selected>(),
+            size_of::<ProfileRequestFailure>(), size_of::<Result<ProfileRequestBindings<'_>, ProfileRequestFailure>>(),
+            size_of::<(&Self, &ChatTemplateRequest)>(), ProfileRequestControls::control_bytes(), tagged::control_bytes()?];
+        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
     }
 }

@@ -3,7 +3,7 @@ use super::*;
 use eredu_checkpoint::artifact::{
     ArtifactFileReadError, ArtifactFileReadFailure, PreparedArtifactFileRead,
 };
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
 use std::mem::{size_of, size_of_val};
 
 /// Paid move-only read from an exact published cache source. Opening the supplied
@@ -13,7 +13,7 @@ use std::mem::{size_of, size_of_val};
 pub struct PreparedLiveCacheRead {
     read: PreparedArtifactFileRead,
     source: LiveCacheBlockSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -34,7 +34,7 @@ pub struct LiveCacheReadFailure {
     // A transfer cause owns the actual opened handle and drops before the file
     // publication. Every actual source alias then retires before read funding.
     source: LiveCacheBlockSource,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl LiveCacheReadFailure {
     /// Exact source publication retained through this failure.
@@ -100,8 +100,8 @@ impl LiveCacheBlockSource {
             size_of::<LiveCacheReadFailure>(),
             size_of::<LiveCacheBlockSource>(),
             size_of::<Cause>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<Option<HostMetadataFunding>>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<(&Self, File, &WorkspaceContext)>(),
             size_of::<(PreparedLiveCacheRead, &mut [u8])>(),
             size_of::<Result<PreparedLiveCacheRead, LiveCacheReadFailure>>(),

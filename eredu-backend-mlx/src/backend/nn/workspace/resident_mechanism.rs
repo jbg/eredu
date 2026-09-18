@@ -1,7 +1,7 @@
 //! Quote the implementation already carried by the actual borrowed stream.
 use super::{MlxMetalWorkspaceMechanisms, ResidentRecipeRecorder, MetalAllocationFacts, MlxWorkspaceFactError};
 use eredu_nn::workspace::*;
-use eredu_nn::{Error, workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding}};
+use eredu_nn::{Error, workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding}};
 use std::mem::{size_of, size_of_val};
 use crate::backend::nn::workspace::{MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms};
 use eredu_nn::CpuMatmulImplementation;
@@ -11,7 +11,7 @@ use safemlx::{CpuMatmulKernel, DeviceType, Stream, StreamCopyPlan};
 #[error("resident equation stream source: {cause}")]
 struct StreamFailure {
     #[source] cause:safemlx::StreamCopyCause,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 
 /// Cold facts only. The caller keeps its exact environment/source loan through
@@ -57,7 +57,7 @@ impl ResidentExecutionMechanisms {
         match self { Self::Metal(facts) => Some(facts), Self::Cpu { .. } => None }
     }
     pub(crate) fn from_stream(ordinary:MlxMetalWorkspaceMechanisms, stream:&Stream,
-        funding:&WorkspaceMetadataFunding) -> Result<Self,Error> {
+        funding:&HostMetadataFunding) -> Result<Self,Error> {
         // The fixed source queries have no owning side effects. Price their
         // actual scalar transports before reading the retained stream value.
         let selected=MlxCpuMatmulMechanism::select(CpuMatmulImplementation::Float32Tiles);
@@ -71,8 +71,8 @@ impl ResidentExecutionMechanisms {
             size_of::<StreamCopyPlan<()>>(),size_of::<Result<StreamCopyPlan<()>,safemlx::StreamCopyCause>>(),
             size_of::<DeviceType>(),size_of::<CpuMatmulKernel>(),
             WorkspaceContext::metadata_source_bytes::<StreamFailure>().ok_or(WorkspaceMetadataError::Overflow)?,
-            size_of::<(Self,WorkspaceMetadataFunding)>(),
-            size_of::<(MlxMetalWorkspaceMechanisms,&Stream,&WorkspaceMetadataFunding)>()];
+            size_of::<(Self,HostMetadataFunding)>(),
+            size_of::<(MlxMetalWorkspaceMechanisms,&Stream,&HostMetadataFunding)>()];
         funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or(WorkspaceMetadataError::Overflow)?).map_err(WorkspaceMetadataError::Funding)?;
         let source=StreamCopyPlan::<()>::capture(stream).map_err(|cause|Error::backend_retained_source(
@@ -80,7 +80,7 @@ impl ResidentExecutionMechanisms {
         Self::from_source(ordinary, &source).map_err(Into::into)
     }
 
-    pub(crate) fn context(self,funding:WorkspaceMetadataFunding)->Result<WorkspaceContext,WorkspaceMetadataError> {
+    pub(crate) fn context(self,funding:HostMetadataFunding)->Result<WorkspaceContext,WorkspaceMetadataError> {
         match self {
             Self::Metal(mechanism)=>WorkspaceContext::new_with_metadata_funding(mechanism,funding),
             Self::Cpu {cpu,..}=>WorkspaceContext::new_with_metadata_funding(cpu,funding),
@@ -141,7 +141,7 @@ impl WorkspaceMechanisms for ResidentExecutionMechanisms {
 impl WorkspaceFactMechanisms for ResidentExecutionMechanisms {
     type Error = MlxWorkspaceFactError;
     fn with_prepared_facts<T>(&self, operation: WorkspaceOperationView<'_>,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
         visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T)
         -> Result<T, Self::Error> {
         selected!(self, with_prepared_facts(operation, funding, visit))

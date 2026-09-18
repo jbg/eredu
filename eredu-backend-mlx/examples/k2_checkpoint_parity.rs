@@ -121,11 +121,11 @@ struct Bind<'s> {
     failure: Option<String>,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, tensor: &'a mut MlxTensor) {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, tensor: &'a mut MlxTensor) {
         if self.failure.is_some() {
             return;
         }
-        let name = metadata.id.as_str();
+        let name = metadata.id().as_str();
         let source_recipe = DerivedWeightRecipe::source(name, TensorSelection::Full);
         let recipe = self.recipes.get(name).unwrap_or(&source_recipe);
         let result = (|| -> anyhow::Result<Array> {

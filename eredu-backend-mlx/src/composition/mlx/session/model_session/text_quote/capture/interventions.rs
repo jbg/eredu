@@ -7,7 +7,7 @@ use eredu_core::{
     intervention::{PreparedInterventionPlanCopy, SharedInterventionPlan},
     HostPreparationAuthority,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     intervention::StaticInterventionPreflight,
     working_memory::{OriginalInterventionSource, OriginalInterventionSourceError},
@@ -34,10 +34,10 @@ impl<'a> CaptureAdmission<'a> {
                 capacity,
             )
             .map_err(Error::WorkspacePlanning)?;
-        let overflow = || Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+        let overflow = || Error::WorkspacePlanning(HostMetadataFundingError::Overflow);
         let frames = [
             size_of::<(&Self, &SharedInterventionPlan, u64)>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<OriginalInterventionSource>(),
             size_of::<Option<OriginalInterventionDeclaration>>(),
             size_of::<Result<Option<OriginalInterventionDeclaration>, Error>>(),
@@ -47,7 +47,7 @@ impl<'a> CaptureAdmission<'a> {
             OriginalInterventionDeclaration::validation_control_bytes().ok_or_else(overflow)?,
             NativeInterventionEstimator::prepared_preflight_control_bytes().ok_or_else(overflow)?,
             StaticInterventionPreflight::required_bytes().ok_or_else(overflow)?,
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                 .ok_or_else(overflow)?,
         ];
         funding
@@ -110,8 +110,8 @@ pub(super) fn validate_saved_source(
     let parts = [
         size_of::<(&MlxModelSession, Option<&OriginalInterventionSource>,
             eredu_runtime::working_memory::WorkspaceReportMetadata<'_>)>(),
-        size_of::<Option<WorkspaceMetadataFunding>>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<Option<HostMetadataFunding>>(),
+        size_of::<HostMetadataFunding>(),
         size_of::<Option<OriginalInterventionDeclaration>>(),
         size_of::<Result<Option<OriginalInterventionDeclaration>, Error>>(),
         size_of::<Result<(), Error>>(),

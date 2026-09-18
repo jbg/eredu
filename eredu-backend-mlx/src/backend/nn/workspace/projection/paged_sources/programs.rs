@@ -27,7 +27,7 @@ pub(super) struct PagedAppendProgram {
     pub(super) scan: Option<super::scan_program::PreparedPagedScan>,
     pub(super) visible: Option<super::visible_program::PreparedPagedVisible>,
     pub(super) failed_root: Option<safemlx::Array>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 pub(super) struct PagedBlockPublication {
     pub(super) id: CacheBlockId,
@@ -262,3 +262,5 @@ fn native_controls(plan: PagedAppendPlan, reporting: usize) -> Option<usize> {
         .checked_add(manager)?
         .checked_add(reporting.checked_mul(reports)?)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

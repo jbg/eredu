@@ -46,7 +46,10 @@ macro_rules! define_numeric_keywords {
                     crate::validator::workspace::body_controls::<F, Self>(&[numeric, std::mem::size_of::<T>()])
                 }
 
-                fn validate<'i>(
+                fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+                    <Self as Validate<F>>::original_controls(self)
+                }
+                fn validate_body<'i>(
                     &self,
                     instance: &F::Node<'i>,
                     location: &LazyLocation,
@@ -56,13 +59,9 @@ macro_rules! define_numeric_keywords {
                     if Validate::<F>::is_valid(self, instance, ctx) {
                         Ok(())
                     } else {
-                        Err(ValidationError::$error_fn_name(
-                            self.location.clone(),
-                            crate::paths::capture_evaluation_path(tracker, &self.location),
-                            location.into(),
-                            instance.to_value(),
-                            self.limit_val.clone(),
-                        ))
+                        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                            Ok(crate::error::ValidationErrorKind::$struct_name { limit: funding.value(&self.limit_val)? })
+                        })
                     }
                 }
 
@@ -118,7 +117,7 @@ pub(crate) mod bigint_validators {
             }
 
             impl<F: Json> Validate<F> for $struct_name {
-                fn validate<'i>(
+                fn validate_body<'i>(
                     &self,
                     instance: &F::Node<'i>,
                     location: &LazyLocation,
@@ -231,7 +230,7 @@ pub(crate) mod bigint_validators {
             }
 
             impl<F: Json> Validate<F> for $struct_name {
-                fn validate<'i>(
+                fn validate_body<'i>(
                     &self,
                     instance: &F::Node<'i>,
                     location: &LazyLocation,
@@ -327,7 +326,9 @@ where
     V: From<(T, Value, Location)> + Validate<F> + 'static,
 {
     let location = ctx.location().join(keyword);
-    Ok(Box::new(V::from((limit, schema.clone(), location))))
+    Ok(ctx
+        .funding()
+        .boxed(V::from((limit, schema.clone(), location)))?)
 }
 
 fn number_type_error<'a, F: Json>(
@@ -342,7 +343,8 @@ fn number_type_error<'a, F: Json>(
         Location::new(),
         Cow::Borrowed(schema),
         JsonType::Number,
-    ))
+    )
+    .into())
 }
 
 macro_rules! create_numeric_validator {
@@ -412,18 +414,38 @@ fn create_bigint_validator<F: Json>(
     if let Some(bigint_limit) = numeric::bignum::try_parse_bigint(limit) {
         let location = ctx.location().join(keyword);
         let validator: Box<dyn Validate<F>> = match keyword {
-            "minimum" => Box::new(BigIntMinimum::new(bigint_limit, schema.clone(), location)),
-            "maximum" => Box::new(BigIntMaximum::new(bigint_limit, schema.clone(), location)),
-            "exclusiveMinimum" => Box::new(BigIntExclusiveMinimum::new(
+            "minimum" => match ctx.funding().boxed(BigIntMinimum::new(
                 bigint_limit,
                 schema.clone(),
                 location,
-            )),
-            "exclusiveMaximum" => Box::new(BigIntExclusiveMaximum::new(
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "maximum" => match ctx.funding().boxed(BigIntMaximum::new(
                 bigint_limit,
                 schema.clone(),
                 location,
-            )),
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "exclusiveMinimum" => match ctx.funding().boxed(BigIntExclusiveMinimum::new(
+                bigint_limit,
+                schema.clone(),
+                location,
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "exclusiveMaximum" => match ctx.funding().boxed(BigIntExclusiveMaximum::new(
+                bigint_limit,
+                schema.clone(),
+                location,
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
             _ => return None,
         };
         return Some(Ok(validator));
@@ -433,18 +455,38 @@ fn create_bigint_validator<F: Json>(
     if let Some(bigfrac_limit) = numeric::bignum::try_parse_bigfraction(limit) {
         let location = ctx.location().join(keyword);
         let validator: Box<dyn Validate<F>> = match keyword {
-            "minimum" => Box::new(BigFracMinimum::new(bigfrac_limit, schema.clone(), location)),
-            "maximum" => Box::new(BigFracMaximum::new(bigfrac_limit, schema.clone(), location)),
-            "exclusiveMinimum" => Box::new(BigFracExclusiveMinimum::new(
+            "minimum" => match ctx.funding().boxed(BigFracMinimum::new(
                 bigfrac_limit,
                 schema.clone(),
                 location,
-            )),
-            "exclusiveMaximum" => Box::new(BigFracExclusiveMaximum::new(
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "maximum" => match ctx.funding().boxed(BigFracMaximum::new(
                 bigfrac_limit,
                 schema.clone(),
                 location,
-            )),
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "exclusiveMinimum" => match ctx.funding().boxed(BigFracExclusiveMinimum::new(
+                bigfrac_limit,
+                schema.clone(),
+                location,
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
+            "exclusiveMaximum" => match ctx.funding().boxed(BigFracExclusiveMaximum::new(
+                bigfrac_limit,
+                schema.clone(),
+                location,
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
+            },
             _ => return None,
         };
         return Some(Ok(validator));

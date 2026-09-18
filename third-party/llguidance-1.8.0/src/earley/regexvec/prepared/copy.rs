@@ -1,7 +1,7 @@
 //! Copies the actual lexical DFA and its owning expression machine.
 use super::{grow, Cause as OperationCause, PreparedRegexVector, StateDesc, MatchingLexemes, LexemeSet};
 use crate::earley::lexerspec::RegexVectorInput;
-use derivre::{AlphabetInfo, raw::{ExprSet, ExprSetCopyFailure, HashConsCopyFailure, HashConsCapacityError, PreparedExprError, PreparedExpressionCopyFailure, PreparedHashConsFunding}};
+use derivre::{AlphabetInfo, raw::{ExprSet, ExprSetCopyFailure, HashConsCopyFailure, HashConsCapacityError, PreparedExprError, PreparedExpressionCopyFailure, ParserAllocationFunding}};
 use std::{fmt, mem::{size_of, size_of_val}};
 use toktrie::{SimpleVob, TokenMaskConstructionPlan};
 #[derive(Debug)]
@@ -16,7 +16,7 @@ impl<E> From<OperationCause<E>> for Cause<E> {
 /// A failed independent DFA copy owns every reached destination and the new
 /// backing account. The borrowed original remains unchanged.
 pub struct PreparedRegexVectorCopyFailure<E> {
-    cause: Cause<E>, prefix: Option<PreparedRegexVector>, backing: Option<PreparedHashConsFunding>,
+    cause: Cause<E>, prefix: Option<PreparedRegexVector>, backing: Option<ParserAllocationFunding>,
 }
 impl<E: fmt::Debug> fmt::Debug for PreparedRegexVectorCopyFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -128,7 +128,7 @@ impl PreparedRegexVector {
     /// cache and source configuration. Future growth uses only `backing`, never
     /// the original account. The enclosing owner retains copy funding.
     pub fn try_copy<F: Fn(usize) -> Result<(), E>, E>(
-        &self, backing: Option<PreparedHashConsFunding>, funding: &F,
+        &self, backing: Option<ParserAllocationFunding>, funding: &F,
     ) -> Result<Self, PreparedRegexVectorCopyFailure<E>> {
         let mut prefix = None;
         let result = (|| -> Result<(), Cause<E>> {

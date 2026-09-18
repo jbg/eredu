@@ -63,7 +63,7 @@ impl WorkspaceMechanisms for OptionalFacts {
                         }
                     }
                     WorkspaceOperationKind::Sampling(S::ReadToken | S::SelectRandomKey { .. })
-                    | WorkspaceOperationKind::Index { .. } => WorkspaceOutputStorage::AliasInput(0),
+                    | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. } => WorkspaceOutputStorage::AliasInput(0),
                     _ if !op.inputs.is_empty() && out == &op.inputs[0] => {
                         // Intermediate transforms may preserve the filtered score's
                         // backing, so later token aliases reach all original roots.

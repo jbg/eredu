@@ -74,7 +74,18 @@ pub type HashSet<K> = std::collections::HashSet<K, RandomState>;
 /// Most users should prefer the high-level [`Regex`] and [`RegexBuilder`] APIs.
 /// The types in this module expose the internal expression set, derivative
 /// cache, and other structures needed to build custom matching pipelines.
+/// Dependency-internal prospective fixed-frame funding, shared with parser workers.
+#[doc(hidden)]
+pub mod prepared_funding;
+mod allocation_funding;
+mod parser_error;
+pub use parser_error::{ParserError, ParserResult};
+pub use allocation_funding::is_storage_failure as is_parser_storage_failure;
+pub use allocation_funding::{ParserAllocationFailure, ParserAllocationFunding, ParserAllocationPreparationError, ParserStorageError};
+
 pub mod raw {
+    pub use crate::ast::mapping::MappingValue;
+    pub use super::{ParserAllocationFailure, ParserAllocationFunding, ParserAllocationPreparationError};
     pub use super::ast::{
         Expr, ExprEncodingError, ExprFlags, ExprSet, ExprSetCopyFailure, ExprSetCopyPlan,
         ExprSetCopyRequirements, ExprSetPreparedSourcePlan, ExprSetPreparedSourceRequirements,
@@ -88,8 +99,8 @@ pub mod raw {
     pub use super::deriv::DerivCache;
     pub use super::hashcons::{
         HashConsCapacityError, HashConsCopyFailure, HashConsCopyPlan, HashConsCopyRequirements,
-        HashConsEmptySourcePlan, HashConsFundingFailure, HashConsFundingPreparationError,
-        HashConsPreparedSourcePlan, HashConsPreparedSourceRequirements, PreparedHashConsFunding,
+        HashConsEmptySourcePlan,
+        HashConsPreparedSourcePlan, HashConsPreparedSourceRequirements,
         PreparedInsertion, PreparedVecHashCons, VecHashCons,
     };
     pub use super::nextbyte::NextByteCache;

@@ -138,7 +138,7 @@ fn dense_with_deepstack<C: Config>(
             c.feed_forward_output_normalization(i),
             width,
         );
-        let point = c.routed_observation_points(&path, i);
+        let point = c.routed_observation_points(&path, i, None).expect("ordinary routed point construction");
         let dense_ffn = point.is_none();
         if let Some(attributes) = moe_policy.as_ref().filter(|_| !dense_ffn) {
             g.moe(
@@ -321,7 +321,7 @@ fn qwen_with_deepstack(g: &mut Builder, c: &crate::qwen::ModelArgs, deepstack_co
     if let Ok(spec) = c.routing_spec() {
         for layer in 0..c.num_hidden_layers as usize {
             let unit = format!("{}.layers.{layer}", c.parameter_root);
-            if let Some(point) = c.routed_observation_points(&unit, layer) {
+            if let Some(point) = c.routed_observation_points(&unit, layer, None).expect("ordinary routed point construction") {
                 g.routing_control(
                     &format!("decoder.layers.{layer}.feed_forward"),
                     point
@@ -759,7 +759,7 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
             ArchitectureNodeKind::FeedForward,
         );
         if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_points(&path, i).expect("sparse layer");
+            let point = c.routed_observation_points(&path, i, None).expect("ordinary routed point construction").expect("sparse layer");
             g.moe(
                 &ff,
                 &format!("{path}.feed_forward"),
@@ -881,7 +881,7 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
             ArchitectureNodeKind::FeedForward,
         );
         if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_points(&path, i).expect("sparse layer");
+            let point = c.routed_observation_points(&path, i, None).expect("ordinary routed point construction").expect("sparse layer");
             let mut attrs = moe(
                 c.num_experts,
                 c.num_experts_per_token,
@@ -1612,7 +1612,7 @@ fn k2_horizon(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
     };
     for layer in 0..c.num_hidden_layers as usize {
         let path = format!("model.layers.{layer}");
-        let Some(points) = c.routed_observation_points(&path, layer) else {
+        let Some(points) = c.routed_observation_points(&path, layer, None).expect("ordinary routed point construction") else {
             continue;
         };
         for (bank, node, count, topk, shared, normalized) in [

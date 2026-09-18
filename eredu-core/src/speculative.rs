@@ -1,7 +1,6 @@
 //! High-level contracts and orchestration for speculative execution backends.
 
-mod semantic_owner;
-pub use semantic_owner::SpeculativeSemanticOwner;
+use crate::generation::{SemanticState, SemanticStateOwner};
 
 /// Allocation-free byte-trigger matching shared by semantic controllers.
 pub mod byte_trigger;
@@ -55,7 +54,7 @@ use crate::{
         TextGenerationConfig,
     },
     generation::{
-        FinishReason, GenerationCancellationToken, GenerationError, SemanticEvent,
+        FinishReason, GenerationCancellationToken, GenerationError,
         SpeculativeCancellationDisposition, SpeculativeConfig, SpeculativeRequestId,
         SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
         SpeculativeSchedulerOptions, TokenTerminalSignals,
@@ -151,7 +150,7 @@ where
     /// Portable canonical grammar state.
     constraint: Option<C>,
     /// Transactional decoded semantic parser state.
-    semantic: Option<SpeculativeSemanticOwner>,
+    semantic: Option<SemanticStateOwner>,
     /// Cooperative cancellation owned by this lane.
     cancellation: Option<GenerationCancellationToken>,
     /// Called synchronously for canonical events from this lane.
@@ -170,7 +169,7 @@ where
         generation: TextGenerationConfig,
         config: impl Into<SpeculativeConfiguration>,
         constraint: C,
-        semantic: impl Into<SpeculativeSemanticOwner>,
+        semantic: impl Into<SemanticStateOwner>,
         cancellation: GenerationCancellationToken,
         on_event: impl Into<SpeculativeEventCallback<'a>>,
     ) -> Self {
@@ -229,13 +228,13 @@ where
             .expect("lane constraint already taken")
     }
     /// Borrows the closed semantic source without permitting replacement.
-    pub fn semantic(&self) -> &SpeculativeSemanticOwner {
+    pub fn semantic(&self) -> &SemanticStateOwner {
         self.semantic
             .as_ref()
             .expect("lane semantic state already taken")
     }
     /// Takes semantic state exactly once.
-    pub fn take_semantic(&mut self) -> SpeculativeSemanticOwner {
+    pub fn take_semantic(&mut self) -> SemanticStateOwner {
         self.semantic
             .take()
             .expect("lane semantic state already taken")
@@ -2225,68 +2224,9 @@ pub trait SpeculativePublisher<C> {
     fn publish_cancelled(&mut self, constraint: &mut C) -> Result<(), SpeculativeOutputError>;
 }
 
-/// Object-safe forkable semantic state used by speculative transactions.
-///
-/// This interface owns decoded semantic events and never exposes a backend
-/// tensor, stream, completion, or error type.
-pub trait SpeculativeSemanticState {
-    /// Complete conservative bytes retained by a semantic fork, or unknown.
-    fn control_snapshot_bytes(&self) -> Option<u64> {
-        None
-    }
-
-    /// Actual isolated host copy allocations; unknown callbacks remain unknown.
-    fn control_snapshot_metadata_bytes(&self) -> Option<usize> {
-        None
-    }
-    /// Actual prepared source for read-only concrete authentication only.
-    fn prepared_source(&self) -> Option<&dyn std::any::Any> {
-        None
-    }
-    /// Ordinary defaults retain their existing fork. Prepared implementations
-    /// reserve before copying and return a closed owner instead of a raw Box.
-    fn fork_owned(&self) -> Result<SpeculativeSemanticOwner, SpeculativeOutputError> {
-        self.fork_box().map(Into::into)
-    }
-    /// Copy after the shared snapshot driver pays this source's exact query.
-    fn fork_prepared(
-        &self,
-        host: crate::HostPreparationAuthority,
-    ) -> Result<SpeculativeSemanticOwner, SpeculativeOutputError> {
-        if !host.is_unmanaged() {
-            return Err(SpeculativeOutputError::Storage(
-                "semantic state has no paid isolated copy",
-            ));
-        }
-        self.fork_owned()
-    }
-    /// Ordinary boxes retain ordinary drop; prepared implementations move the
-    /// concrete payload out so the shell retires before its funding.
-    fn retire(self: Box<Self>) {
-        drop(self);
-    }
-    /// Forks the exact committed prefix for tentative verification.
-    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError>;
-    /// Stages one token and reports whether a stop sequence matched.
-    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError>;
-    /// Stages normal terminal output.
-    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError>;
-    /// Stages cancellation output.
-    fn cancel(&mut self) -> Result<(), SpeculativeOutputError>;
-    /// Drains events authorized by the next exact commit boundary.
-    fn take_events(&mut self) -> SpeculativeBuffer<crate::generation::SemanticEvent>;
-    /// Synchronous publication through the same callback. Prepared implementations
-    /// can drain in place, retaining their exact fixed queue for the next round.
-    fn publish_events(&mut self, emit: &mut dyn FnMut(crate::generation::SemanticEvent)) {
-        for event in self.take_events() {
-            emit(event);
-        }
-    }
-}
-
 /// Optional transactional semantic state shared by plain and structured speculative decoding.
 pub struct SpeculativeSemanticConstraint {
-    state: Option<SpeculativeSemanticOwner>,
+    state: Option<SemanticStateOwner>,
 }
 
 impl SpeculativeSemanticConstraint {
@@ -2296,7 +2236,7 @@ impl SpeculativeSemanticConstraint {
     }
 
     /// Creates a transactional structured-output state.
-    pub fn semantic(state: impl Into<SpeculativeSemanticOwner>) -> Self {
+    pub fn semantic(state: impl Into<SemanticStateOwner>) -> Self {
         Self {
             state: Some(state.into()),
         }
@@ -5164,11 +5104,11 @@ mod tests {
         events: Vec<crate::generation::SemanticEvent>,
     }
 
-    impl SpeculativeSemanticState for PortableSemanticState {
-        fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
+    impl SemanticState for PortableSemanticState {
+        fn fork_owned(&self) -> Result<SemanticStateOwner, SpeculativeOutputError> {
             let mut fork = self.clone();
             fork.events.clear();
-            Ok(Box::new(fork))
+            Ok(Box::new(fork).into())
         }
 
         fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {

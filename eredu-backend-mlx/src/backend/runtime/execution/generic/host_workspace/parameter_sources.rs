@@ -52,6 +52,9 @@ impl LayerwiseWorkspace {
 }
 
 impl Rows for LayerwiseWorkspace {
+    fn excludes_parameter(&self, name: &str) -> bool {
+        LayerwiseWorkspace::excludes_parameter(self, name)
+    }
     fn layout(&self) -> &ExecutionUnitLayout {
         LayerwiseWorkspace::layout(self)
     }

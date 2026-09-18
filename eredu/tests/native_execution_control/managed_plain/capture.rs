@@ -49,10 +49,10 @@ fn native_managed_observed_plain_delivers_full_prompt_and_retained_decode_frames
     );
     let mut frames = Vec::new();
     let mut tokens = Vec::new();
-    let mut observer = |token: Option<u32>, frame: Option<CapturedStepDelivery>, seconds: f64| {
+    let mut observer = |token: Option<u32>, frame: Option<SharedCapturedStep>, seconds: f64| {
         assert!(seconds >= 0.0);
         tokens.push(token.expect("successful committed token"));
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+        let Some(frame) = frame else {
             panic!("original capture returns its shared paid owner")
         };
         assert_eq!(frame.prediction_index() as usize, frames.len());

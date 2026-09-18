@@ -1,8 +1,6 @@
 //! Source-derived five-buffer construction; no serde allocation or account API.
 use super::*;
-use crate::tokenizer::compile::{
-    add, err, fields, required, text_is, Error, K,
-};
+use crate::tokenizer::compile::{add, err, fields, required, text_is, Error, K};
 use crate::utils::borrowed_json::{self as json, Reader, Span, Text};
 use std::result::Result;
 use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
@@ -71,11 +69,7 @@ fn special(input: &str, span: Span) -> Result<SpecialPlan<'_>, Error> {
         bytes,
     })
 }
-fn find(
-    input: &str,
-    table: Span,
-    name: Text<'_>,
-) -> Result<(usize, usize), Error> {
+fn find(input: &str, table: Span, name: Text<'_>) -> Result<(usize, usize), Error> {
     let mut a = Reader::new(input, table).object()?;
     let mut index = 0;
     while let Some((key, value)) = a.next()? {
@@ -86,12 +80,7 @@ fn find(
     }
     Err(err(K::ComponentProfile, name.offset))
 }
-fn piece(
-    input: &str,
-    span: Span,
-    table: Span,
-    pair: bool,
-) -> Result<(Piece, usize), Error> {
+fn piece(input: &str, span: Span, table: Span, pair: bool) -> Result<(Piece, usize), Error> {
     let f = fields(input, span, ["Sequence", "SpecialToken"])?;
     let (special_piece, value) = match f {
         [Some(v), None] => (false, v),
@@ -115,10 +104,8 @@ fn piece(
 }
 impl<'a> Plan<'a> {
     pub(crate) fn prepare(input: &'a str, span: Span) -> Result<Self, Error> {
-        let f =
-            fields(input, span, ["type", "single", "pair", "special_tokens"])?;
-        if !text_is(input, required(f[0], span.start)?, "TemplateProcessing")?
-        {
+        let f = fields(input, span, ["type", "single", "pair", "special_tokens"])?;
+        if !text_is(input, required(f[0], span.start)?, "TemplateProcessing")? {
             return Err(err(K::ComponentProfile, span.start));
         }
         let single = required(f[1], span.start)?;
@@ -177,10 +164,10 @@ impl<'a> Plan<'a> {
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
             size_of::<Requirements>(),
-            size_of::<CompiledTemplate>(),
+            size_of::<TemplateProcessing>(),
             size_of::<Failure>(),
             size_of::<Cause>(),
-            size_of::<Result<CompiledTemplate, Failure>>(),
+            size_of::<Result<TemplateProcessing, Failure>>(),
             size_of::<Result<(), Cause>>(),
             size_of::<Result<(), TryReserveError>>(),
             size_of::<[usize; 5]>(),
@@ -222,11 +209,8 @@ impl<'a> Plan<'a> {
     pub(crate) fn requirements(&self) -> Requirements {
         self.requirements
     }
-    pub(crate) fn compile(
-        self,
-        failure: Option<usize>,
-    ) -> Result<CompiledTemplate, Failure> {
-        let mut p = CompiledTemplate::empty();
+    pub(crate) fn compile(self, failure: Option<usize>) -> Result<TemplateProcessing, Failure> {
+        let mut p = TemplateProcessing::empty();
         let result = (|| -> Result<(), Cause> {
             macro_rules! reserve {
                 ($field:ident,$i:expr) => {{
@@ -235,14 +219,9 @@ impl<'a> Plan<'a> {
                     } else {
                         self.requirements.counts[$i]
                     };
-                    p.$field
-                        .try_reserve_exact(count)
-                        .map_err(Cause::Reserve)?;
+                    p.$field.try_reserve_exact(count).map_err(Cause::Reserve)?;
                     if p.$field.capacity() > self.requirements.counts[$i] {
-                        return Err(Cause::Source(err(
-                            K::CapacityExceeded,
-                            self.table.start,
-                        )));
+                        return Err(Cause::Source(err(K::CapacityExceeded, self.table.start)));
                     }
                 }};
             }
@@ -269,8 +248,7 @@ impl<'a> Plan<'a> {
                     .array()
                     .map_err(Error::from)?;
                 while let Some(v) = a.next().map_err(Error::from)? {
-                    p.tokens
-                        .push(push_text(&mut p.bytes, text(self.input, v)?));
+                    p.tokens.push(push_text(&mut p.bytes, text(self.input, v)?));
                 }
                 p.specials.push(Special {
                     key,
@@ -279,12 +257,8 @@ impl<'a> Plan<'a> {
                     len: s.len,
                 });
             }
-            for (i, span) in
-                [self.single, self.pair].iter().copied().enumerate()
-            {
-                let mut a = Reader::new(self.input, span)
-                    .array()
-                    .map_err(Error::from)?;
+            for (i, span) in [self.single, self.pair].iter().copied().enumerate() {
+                let mut a = Reader::new(self.input, span).array().map_err(Error::from)?;
                 while let Some(v) = a.next().map_err(Error::from)? {
                     p.pieces.push(piece(self.input, v, self.table, i == 1)?.0);
                 }
@@ -322,7 +296,7 @@ impl From<Error> for Cause {
 #[derive(Debug)]
 pub struct Failure {
     cause: Cause,
-    partial: CompiledTemplate,
+    partial: TemplateProcessing,
 }
 impl Failure {
     /// Real reserve error from the selected destination, if reservation failed.

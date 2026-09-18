@@ -268,9 +268,6 @@ impl
     fn input<'a>(&'a self, chunk: &'a FakeTensor) -> &'a FakeTensor {
         chunk
     }
-    fn cache_identity(&self) -> Option<PreparedInputCacheIdentity> {
-        panic!("scheduled shared sources must not rebuild a raw identity")
-    }
     fn shared_cache_identity(&self) -> Option<SharedPreparedInputCacheIdentity> {
         self.shared_calls.set(self.shared_calls.get() + 1);
         Some(self.identity.clone())

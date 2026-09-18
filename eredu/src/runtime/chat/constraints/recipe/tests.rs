@@ -13,6 +13,54 @@ fn grammar() -> TopLevelGrammar {
     TopLevelGrammar::from_json_schema(json!({"type":"object", "maxProperties":0}))
 }
 
+#[test]
+fn original_recipe_refuses_each_reached_reservation_and_retains_the_original_payer() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("recipe test account refused")]
+    struct Refused;
+    let tools = [json!({"type":"function","function":{
+        "name":"measure_界", "parameters":{"type":"object","properties":{
+            "z":{"default":[-0.0, 7, "É🙂"]},"a":{"type":"string"}}}}})];
+    let grammar = grammar();
+    let run = |cutoff| {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::new(());
+        let weak = Arc::downgrade(&marker);
+        let funding = ParserAllocationFunding::prepare({
+            let calls = calls.clone();
+            move |_| {
+                let _retained = &marker;
+                if calls.fetch_add(1, Ordering::SeqCst) == cutoff { Err(Refused) }
+                else { Ok(()) }
+            }
+        }).unwrap();
+        let authority = HostPreparationAuthority::retain(funding.clone());
+        let result = ConstraintRecipe::build(None, &grammar, &tools, &[3], &[], &[],
+            &[], None, None, None, None, &funding, &authority);
+        drop((authority, funding));
+        (result, calls.load(Ordering::SeqCst), weak)
+    };
+    let (success, calls, weak) = run(usize::MAX);
+    let recipe = success.unwrap();
+    assert_eq!(recipe.tools().unwrap(), tools);
+    let bytes = recipe.source().clone();
+    let identity = *bytes.identity();
+    drop(recipe);
+    assert!(weak.upgrade().is_some(), "escaped bytes retain original construction");
+    drop(bytes);
+    assert!(weak.upgrade().is_none(), "value identity needs no allocated custody");
+    let _ = identity;
+    for cutoff in 1..calls {
+        let (result, attempts, weak) = run(cutoff);
+        let error = result.unwrap_err();
+        assert!(attempts > cutoff);
+        assert!(error.to_string().contains("recipe test account refused"));
+        assert!(weak.upgrade().is_some(), "failure {cutoff} retains its actual payer");
+        drop(error);
+        assert!(weak.upgrade().is_none(), "failure {cutoff} releases its payer last");
+    }
+}
+
 fn recipe(
     tools: &[Value],
     spellings: &[String],
@@ -185,7 +233,7 @@ fn absent_and_empty_optional_sections_remain_distinct_with_exact_empty_iterators
 #[test]
 fn mismatched_token_metadata_and_checked_geometry_reject_without_partial_cursor_changes() {
     let mismatch = ConstraintRecipe::new(None, &grammar(), &[], &[], &["x".into()], &[], &[], None);
-    assert!(mismatch.unwrap_err().contains("differ in length"));
+    assert!(mismatch.unwrap_err().to_string().contains("differ in length"));
     let mut cursor = usize::MAX;
     assert!(take_span(&mut cursor, 1).is_err());
     assert_eq!(cursor, usize::MAX);

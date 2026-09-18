@@ -2,7 +2,7 @@
 use super::*;
 use super::prepared::{Cause, ResourceCustody, ReadyCompletionResources, error};
 use crate::backend::runtime::distributed::topology::OriginalCommunicationSource;
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use std::{alloc::Layout,mem::{size_of,size_of_val},ops::Deref};
 
 /// Every escaped alias retains account custody after the actual Rc allocation.
@@ -57,7 +57,7 @@ impl PreparedCommunicationScalar {
     }
     fn prepare(source:&OriginalCommunicationSource<'_>,selector:Selector)->Result<Self,Error> {
         source.validate()?;
-        source.funding().reserve_metadata(Self::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        source.funding().reserve_metadata(Self::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let custody=ResourceCustody { source:source.source().clone(),funding:source.funding().clone() };
         let kind=match selector {
@@ -111,7 +111,7 @@ impl PreparedCommunicationScalar {
             size_of::<crate::backend::runtime::distributed::topology::AcceptedCommunicationSource<'_>>(),
             size_of::<ReadyCompletionResources>(),
             size_of::<Result<(crate::backend::runtime::distributed::topology::OriginalCommunicationConstructed,OriginalCommunicationCompletion),Error>>(),
-            size_of::<(Array,eredu_runtime::RetainedCommunicationSource,eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            size_of::<(Array,eredu_runtime::RetainedCommunicationSource,eredu_nn::workspace::HostMetadataFunding)>(),
             size_of::<Result<Self,Error>>(),size_of::<Result<bool,Error>>(),
             size_of::<Result<(OriginalCommunicationBool,OriginalCommunicationCompletion),Error>>(),
             size_of::<(OriginalCommunicationBool,OriginalCommunicationCompletion)>(),size_of::<Option<bool>>(),

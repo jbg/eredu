@@ -1,7 +1,7 @@
 //! Initial reservation metadata, paid by the already retained planning account.
 use super::*;
 use eredu_nn::workspace::{
-    WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceMetadataError, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::{
     error::Error as StdError,
@@ -12,13 +12,21 @@ use std::{
 struct Failure {
     cause: eredu_nn::Error,
     // The closed outer Arc and exact cause retire before this account alias.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 /// An owning metadata-construction failure retaining the original typed cause.
 /// Clones share its closed owner without cloning or formatting that cause.
 /// Equality denotes the same retained failure, not diagnostic text equality.
 pub struct WorkspaceReservationMetadataError(Option<Arc<Failure>>);
+impl WorkspaceReservationMetadataError {
+    /// Borrow a planning refusal enclosed by this exact metadata producer.
+    /// Retaining its payer must not change candidate-selection policy.
+    pub(super) fn planning_error(&self) -> Option<&PrefillPlanningError> {
+        self.0.as_ref().expect("live metadata failure").cause.source()
+            .and_then(|source| source.downcast_ref())
+    }
+}
 impl Clone for WorkspaceReservationMetadataError {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -58,23 +66,23 @@ impl StdError for WorkspaceReservationMetadataError {
     }
 }
 
-pub(super) fn funding_error(cause: WorkspaceMetadataFundingError) -> WorkingMemoryError {
+pub(super) fn funding_error(cause: HostMetadataFundingError) -> WorkingMemoryError {
     match cause {
-        WorkspaceMetadataFundingError::Capacity {
+        HostMetadataFundingError::Capacity {
             required,
             available,
         } => WorkingMemoryError::BudgetExceeded {
             required_bytes: required,
             available_bytes: available,
         },
-        WorkspaceMetadataFundingError::Overflow => WorkingMemoryError::Overflow,
+        HostMetadataFundingError::Overflow => WorkingMemoryError::Overflow,
         cause => WorkingMemoryError::MetadataConstruction(WorkspaceMetadataError::Funding(cause)),
     }
 }
 
 pub(super) fn neural_error(
     cause: eredu_nn::Error,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> WorkingMemoryError {
     // Fixed admission errors own no source payload. Preserve the shared
     // smaller-chunk classification without wrapping them into an owning error.
@@ -100,7 +108,7 @@ pub(super) fn neural_error(
         size_of::<Option<Arc<Failure>>>(),
         size_of::<Option<Failure>>(),
         size_of::<WorkingMemoryError>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
     ];
     let bytes = qualified_storage::shared_bytes::<Failure>()
         .and_then(|value| usize::try_from(value).map_err(|_| WorkingMemoryError::Overflow))
@@ -151,7 +159,7 @@ pub(super) fn constructor_bytes() -> Result<usize, WorkingMemoryError> {
             >,
         >(),
         size_of::<WorkspaceReportMetadata<'_>>(),
-        size_of::<Option<WorkspaceMetadataFunding>>(),
+        size_of::<Option<HostMetadataFunding>>(),
         size_of::<ControlMutex<text_preparation::RequestStart>>(),
         size_of::<(u64, u64, u64, Option<u64>, InferenceGeometry)>(),
     ];

@@ -1,6 +1,6 @@
 // based on https://github.com/lark-parser/lark/blob/24f19a35f376b9320d53f4d987793fb8b1765f37/lark/grammars/common.lark
 
-use anyhow::Result;
+use derivre::{ParserResult as Result, parser_error as anyhow};
 
 const COMMON_REGEX: &[(&str, &str)] = &[
     ("common.DIGIT", r#"[0-9]"#),
@@ -42,19 +42,26 @@ const COMMON_REGEX: &[(&str, &str)] = &[
     ("common.SQL_COMMENT", r#"--[^\n]*"#),
 ];
 
-pub fn lookup_common_regex(name: &str) -> Result<&str> {
+pub fn lookup_common_regex(name: &str, funding: &derivre::ParserAllocationFunding) -> Result<&'static str> {
     COMMON_REGEX
         .iter()
         .find_map(|(n, r)| if *n == name { Some(*r) } else { None })
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(funding,
                 "Unknown common regex: {}; following are available: {}",
                 name,
-                COMMON_REGEX
-                    .iter()
-                    .map(|(n, _)| *n)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                CommonNames
             )
         })
+}
+
+struct CommonNames;
+impl std::fmt::Display for CommonNames {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (name, _)) in COMMON_REGEX.iter().enumerate() {
+            if index != 0 { output.write_str(", ")?; }
+            output.write_str(name)?;
+        }
+        Ok(())
+    }
 }

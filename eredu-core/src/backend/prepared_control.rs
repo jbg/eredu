@@ -173,6 +173,25 @@ struct AttributionOwner {
 /// No raw Arc/Weak, mutable payload or execution authority is exposed.
 pub struct SharedPromptAttribution(Option<Arc<AttributionOwner>>);
 impl SharedPromptAttribution {
+    /// Exact shared shell and named publication/validation controls for
+    /// `from_prepared`. Payload vectors and strings are funded by their producer.
+    /// This fact grants neither allocation credit nor source authority.
+    #[doc(hidden)]
+    pub fn construction_bytes() -> Option<usize> {
+        use std::{alloc::Layout, mem::size_of, sync::atomic::AtomicUsize};
+        let shell = Layout::new::<[AtomicUsize; 2]>()
+            .extend(Layout::new::<AttributionOwner>()).ok()?.0.pad_to_align().size();
+        let parts = [shell, size_of::<AttributionOwner>(),
+            size_of::<PreparedPromptAttribution>(), size_of::<Self>(),
+            size_of::<Result<Self, PreparedControlInputError>>(),
+            size_of::<Result<(), PreparedControlInputError>>(),
+            size_of::<(u64, u64, usize)>(),
+            size_of::<std::iter::Enumerate<std::iter::Zip<
+                std::slice::Iter<'static, PreparedPromptSegment>,
+                std::slice::Iter<'static, crate::InputPartDescriptor>>>>(),
+            size_of::<(&PreparedPromptSegment, &crate::InputPartDescriptor)>()];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
     /// Provider publication after acquiring custody before constructing the payload.
     /// This checks diagnostic structure only; the provider separately authenticates
     /// its closed input and actual session/selection/revision before consumption.

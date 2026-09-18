@@ -220,7 +220,7 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         ));
     }
     assert_eq!(pool.used_bytes().unwrap(), initial_bytes);
-    let (_, reservation, accepted) = plan_prefill_incremental_with_capacity(
+    let (reservation, accepted) = plan_prefill_incremental_with_capacity(
         session.identity(),
         &pool,
         session.capabilities(),

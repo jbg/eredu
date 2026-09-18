@@ -18,7 +18,7 @@ fn funded_component_receipt_preserves_permuted_runs_empty_ack_and_ordinary_ident
         let ordinary_rows=rows.iter().map(|row|PartitionCaptureProducer{rank:row.rank,
             projection:CaptureCoordinateProjectionPlan::prepare(&global,&slice,axis,row.coordinates,width).unwrap().construct()}).collect();
         let mut ordinary_ledger=CaptureLedger::new(source.admission());ordinary_ledger.begin_step();
-        let ordinary=PartitionCaptureReceiptPlan::new_shared(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_ledger).unwrap();
+        let ordinary=PartitionCaptureReceiptPlan::new(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_ledger).unwrap();
         let mut ledger=CaptureLedger::new(source.admission());ledger.begin_step();
         let (funding,_,_,retired)=funding();
         let actual=PartitionCaptureReceiptPlan::new_coordinates_shared_funded(&source,&context,axis,&rows,

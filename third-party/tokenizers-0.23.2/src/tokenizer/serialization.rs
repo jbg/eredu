@@ -24,6 +24,15 @@ where
     where
         S: Serializer,
     {
+        self.serialize_with_model(serializer, &self.model)
+    }
+}
+impl<M, N: Serialize, PT: Serialize, PP: Serialize, D: Serialize> TokenizerImpl<M, N, PT, PP, D> {
+    pub(super) fn serialize_with_model<S: Serializer, SM: Serialize>(
+        &self,
+        serializer: S,
+        model: &SM,
+    ) -> Result<S::Ok, S::Error> {
         let mut tokenizer = serializer.serialize_struct("Tokenizer", 9)?;
 
         // Start by adding the current version
@@ -41,7 +50,7 @@ where
         tokenizer.serialize_field("pre_tokenizer", &self.pre_tokenizer)?;
         tokenizer.serialize_field("post_processor", &self.post_processor)?;
         tokenizer.serialize_field("decoder", &self.decoder)?;
-        tokenizer.serialize_field("model", &self.model)?;
+        tokenizer.serialize_field("model", model)?;
 
         tokenizer.end()
     }

@@ -14,7 +14,7 @@ impl GenerationCopySource<'_> {
             Self::Copied(c) => c.inner().ticket.pool(),
         }
     }
-    fn execution(&self) -> &InferenceExecutionIdentity {
+    pub(in crate::working_memory) fn execution(&self) -> &InferenceExecutionIdentity {
         match self {
             Self::Original(_, r) => &r.0.execution,
             Self::Copied(c) => &c.inner().execution,

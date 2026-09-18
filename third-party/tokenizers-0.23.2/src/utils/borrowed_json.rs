@@ -24,10 +24,15 @@ pub(crate) struct Text<'a> {
 impl<'a> Text<'a> {
     pub fn bytes(self) -> Bytes<'a> {
         Bytes {
-            chars: self.raw.chars(),
+            chars: self.chars(),
             buffer: [0; 4],
             at: 0,
             len: 0,
+        }
+    }
+    pub fn chars(self) -> Chars<'a> {
+        Chars {
+            raw: self.raw.chars(),
         }
     }
     pub fn is(self, expected: &str) -> bool {
@@ -39,7 +44,7 @@ impl<'a> Text<'a> {
 }
 #[derive(Clone)]
 pub(crate) struct Bytes<'a> {
-    chars: std::str::Chars<'a>,
+    chars: Chars<'a>,
     buffer: [u8; 4],
     at: usize,
     len: usize,
@@ -52,8 +57,23 @@ impl Iterator for Bytes<'_> {
             self.at += 1;
             return Some(b);
         }
-        let c = match self.chars.next()? {
-            '\\' => match self.chars.next().expect("validated escape") {
+        let c = self.chars.next()?;
+        self.len = c.encode_utf8(&mut self.buffer).len();
+        self.at = 1;
+        Some(self.buffer[0])
+    }
+}
+
+/// Decoded scalars from an already validated JSON string loan.
+#[derive(Clone)]
+pub(crate) struct Chars<'a> {
+    raw: std::str::Chars<'a>,
+}
+impl Iterator for Chars<'_> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> {
+        Some(match self.raw.next()? {
+            '\\' => match self.raw.next().expect("validated escape") {
                 '"' => '"',
                 '\\' => '\\',
                 '/' => '/',
@@ -65,15 +85,15 @@ impl Iterator for Bytes<'_> {
                 'u' => {
                     let mut read = || {
                         (0..4).fold(0, |n, _| {
-                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
+                            n * 16 + self.raw.next().expect("hex").to_digit(16).expect("hex")
                         })
                     };
                     let high = read();
                     let scalar = if (0xd800..=0xdbff).contains(&high) {
-                        self.chars.next();
-                        self.chars.next();
+                        self.raw.next();
+                        self.raw.next();
                         let low = (0..4).fold(0, |n, _| {
-                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
+                            n * 16 + self.raw.next().expect("hex").to_digit(16).expect("hex")
                         });
                         0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
                     } else {
@@ -84,10 +104,7 @@ impl Iterator for Bytes<'_> {
                 _ => unreachable!("validated escape"),
             },
             c => c,
-        };
-        self.len = c.encode_utf8(&mut self.buffer).len();
-        self.at = 1;
-        Some(self.buffer[0])
+        })
     }
 }
 

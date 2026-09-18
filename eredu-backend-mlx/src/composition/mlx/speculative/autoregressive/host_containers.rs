@@ -1,7 +1,7 @@
 //! Exact actual shared-driver host destinations and request identity.
 use super::*;
 use eredu_core::{HostPreparationAuthority, SpeculativeBuffer, SpeculativeRequestIdentity};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 pub(in crate::composition::mlx::speculative) fn buffer_bytes<T>(capacity: usize) -> Option<usize> {
@@ -17,7 +17,7 @@ pub(in crate::composition::mlx::speculative) fn buffer_bytes<T>(capacity: usize)
     ];
     SpeculativeBuffer::<T>::retained_control_bytes(capacity)?
         .checked_add(HostPreparationAuthority::retention_bytes::<
-            WorkspaceMetadataFunding,
+            HostMetadataFunding,
         >()?)?
         .checked_add(size_of_val(&frames))
         .and_then(|n| frames.into_iter().try_fold(n, usize::checked_add))
@@ -31,7 +31,7 @@ pub(in crate::composition::mlx::speculative) fn buffer<T>(
     };
     sources.validate_environment(environment)?;
     let bytes = buffer_bytes::<T>(capacity).ok_or(Error::WorkspacePlanning(
-        WorkspaceMetadataFundingError::Overflow,
+        HostMetadataFundingError::Overflow,
     ))?;
     sources
         .metadata_funding()
@@ -50,7 +50,7 @@ pub(in crate::composition::mlx::speculative) fn identity(
     sources.validate_environment(environment)?;
     let parts = [
         SpeculativeRequestIdentity::retained_control_bytes(),
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>(),
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>(),
         Some(size_of::<Result<SpeculativeRequestIdentity, Error>>()),
         Some(size_of::<SpeculativeExecutionStreams<'static>>()),
         Some(size_of::<
@@ -64,7 +64,7 @@ pub(in crate::composition::mlx::speculative) fn identity(
         .into_iter()
         .try_fold(size_of_val(&parts), |n, p| n.checked_add(p?))
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     sources
         .metadata_funding()
@@ -87,14 +87,14 @@ pub(in crate::composition::mlx::speculative) fn metadata(
     sources.validate_environment(environment)?;
     let parts = [
         bytes,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>(),
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>(),
         Some(size_of::<Result<HostPreparationAuthority, Error>>()),
         Some(size_of::<(Option<usize>, SpeculativeExecutionStreams<'static>)>()),
         Some(size_of::<Option<(&crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
             &crate::backend::OriginalCopyEnvironment<'static>)>>()),
     ];
     let bytes = parts.into_iter().try_fold(size_of_val(&parts), |n, p| n.checked_add(p?))
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Unavailable))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Unavailable))?;
     sources.metadata_funding().reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
     Ok(HostPreparationAuthority::retain(sources.metadata_funding().clone()))
 }

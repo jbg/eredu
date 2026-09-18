@@ -257,7 +257,7 @@ impl GenerationDecoderInput for OriginalGenerationDecoderInput {
 /// Request source removed before the first original chunk-candidate estimate.
 /// It is staging until consumed by the matching accepted sequence bank. A shared
 /// lease retains its separate original cold allowance; it grants no request
-/// authority. The unique compatibility path retains its existing caller scope.
+/// authority. Unique storage retains its existing caller scope.
 #[derive(Debug)]
 pub struct OriginalGenerationDecoderSource {
     pub(super) binding: DecoderBinding,
@@ -265,27 +265,12 @@ pub struct OriginalGenerationDecoderSource {
     pub(super) stops: Option<StopStorage>,
 }
 impl OriginalGenerationDecoderSource {
-    /// Takes the actual input once, outside candidate retries. No source means
-    /// no decoder request; replay/busy/foreign inputs use existing fixed typed
-    /// bank preflight failures without custody cloning or an error allocation.
-    /// Shared headers require `take_original_for_pool`; this compatibility entry
-    /// rejects them before consumption because it has no actual target account.
+    /// Takes the source once before adaptive retries and validates its actual
+    /// target account before consuming a shared header. Replay, busy and foreign
+    /// inputs retain their fixed typed rejection without consuming the source.
     pub fn take_original(
         claim: &GenerationSequencePreparation<'_, '_>,
-    ) -> Result<Option<Self>, BackendFailure> {
-        Self::take_original_inner(claim, None)
-    }
-    /// Takes a shared or unique source before adaptive retries, validating a
-    /// shared source's original account before its atomic one-use claim.
-    pub fn take_original_for_pool(
-        claim: &GenerationSequencePreparation<'_, '_>,
         pool: &WorkingMemoryPool,
-    ) -> Result<Option<Self>, BackendFailure> {
-        Self::take_original_inner(claim, Some(pool))
-    }
-    fn take_original_inner(
-        claim: &GenerationSequencePreparation<'_, '_>,
-        pool: Option<&WorkingMemoryPool>,
     ) -> Result<Option<Self>, BackendFailure> {
         DecoderBinding::terminal_text_bytes(claim).map_err(|_| {
             GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure()

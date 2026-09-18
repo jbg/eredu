@@ -3,7 +3,7 @@ use super::*;
 use eredu_core::{capture::InterventionEvidenceSide,intervention::InterventionEvidence};
 use eredu_runtime::capture::partition::PreparedPartitionInterventionEvidence;
 use crate::composition::mlx::session::intervention::PreparedTextInterventions;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 
 pub(super) fn control_bytes()->Option<usize> {
     let parts=[size_of::<host::evidence::Operation>()*2,
@@ -16,7 +16,7 @@ pub(super) fn control_bytes()->Option<usize> {
         size_of::<std::array::IntoIter<InterventionEvidenceSide,2>>(),
         size_of::<(usize,Option<WorkspaceFloatingType>)>(),
         size_of::<(&OriginalCaptureTransport,&str,&str,eredu_runtime::CommunicationSessionIdentity,Option<&str>,
-            &SharedCapturePlan,&PreparedTextInterventions,CapturePhase,u64,&mut [Option<host::evidence::Operation>],&WorkspaceMetadataFunding)>(),
+            &SharedCapturePlan,&PreparedTextInterventions,CapturePhase,u64,&mut [Option<host::evidence::Operation>],&HostMetadataFunding)>(),
         size_of::<Result<Vec<Option<PreparedPartitionInterventionEvidence<'_,OriginalCaptureTransport>>>,Error>>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
@@ -24,7 +24,7 @@ pub(super) fn control_bytes()->Option<usize> {
 pub(super) fn prepare<'t>(transport:&'t OriginalCaptureTransport,artifact:&str,execution:&str,
     setup:eredu_runtime::CommunicationSessionIdentity,overlay:Option<&str>,parent:&SharedCapturePlan,
     interventions:&PreparedTextInterventions,phase:CapturePhase,prediction:u64,
-    hosts:&mut [Option<host::evidence::Operation>],metadata:&WorkspaceMetadataFunding)
+    hosts:&mut [Option<host::evidence::Operation>],metadata:&HostMetadataFunding)
     ->Result<Vec<Option<PreparedPartitionInterventionEvidence<'t,OriginalCaptureTransport>>>,Error> {
     metadata.reserve_metadata(control_bytes().ok_or_else(||memory(WorkingMemoryError::Overflow))?)?;
     let original=interventions.source();let plan=original.plan().admission();
@@ -60,3 +60,5 @@ pub(super) fn prepare<'t>(transport:&'t OriginalCaptureTransport,artifact:&str,e
     }
     Ok(output)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

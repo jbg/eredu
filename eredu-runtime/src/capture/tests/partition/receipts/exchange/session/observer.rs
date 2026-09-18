@@ -196,7 +196,7 @@ fn partition_observer_uses_shared_callbacks_and_only_active_stage_votes() {
             .iter()
             .all(|step| step.cumulative_usage == results[0].cumulative_usage));
         if committed {
-            let mut ordinary = CaptureSession::new(plan_for(CaptureTransform::Slice, false));
+            let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan_for(CaptureTransform::Slice, false)));
             ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
             ordinary
                 .observe(&mut Backend::default(), "block.output", &global())

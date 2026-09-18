@@ -4,7 +4,7 @@ use crate::backend::{
     error::Error as NativeError,
     submission_recovery::addressable::request_sources::AddressableRequestSourcePlan,
 };
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
     HostSourceConstructionFacts, InferenceTextStep, WorkingMemoryError,
 };
@@ -47,7 +47,7 @@ impl ResidentNativeRecipe {
         &self,
         target: Option<HostSourceConstructionFacts>,
         paged: Option<HostSourceConstructionFacts>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Option<HostSourceConstructionFacts>, NativeError> {
         let state = &self.addressable_program;
         if let Some(inputs) = state.inputs.get() {
@@ -91,10 +91,8 @@ impl ResidentNativeRecipe {
                 return Err(identity());
             }
             for (_, quote) in row.occurrences() {
-                let native = quote
-                    .capacity
-                    .graph
-                    .checked_add(quote.capacity.records)
+                let native = quote.native_capacity().graph
+                    .checked_add(quote.native_capacity().records)
                     .ok_or_else(overflow)?;
                 arenas = arenas
                     .checked_add(u64::try_from(native).map_err(|_| overflow())?)
@@ -215,3 +213,5 @@ impl ResidentNativeRecipe {
         self.addressable_for_row(row)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

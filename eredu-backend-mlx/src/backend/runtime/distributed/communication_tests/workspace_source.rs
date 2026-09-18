@@ -45,6 +45,16 @@ fn worker() {
     let logical=[WorkspaceLayout::new(&[2,3],WorkspaceDtype::Float32).unwrap()];
     let ambiguous=WorkspaceOperationView{inputs:WorkspaceLayoutList::Owned(&logical),outputs:WorkspaceLayoutList::Owned(&logical),..equation};
     let missing=source.sum_workspace_storage(id,ambiguous).err().expect("logical F32 cannot invent actual floating representation");
+    let mut cause:Option<&(dyn std::error::Error+'static)>=Some(&missing);
+    let diagnostic=loop {
+        let current=cause.expect("the retained source error must expose its fixed scalar cause");
+        let text=current.to_string();
+        if text.contains("lacks floating scalar evidence") {break text;}
+        cause=current.source();
+    };
+    assert!(diagnostic.contains("AllReduceSum"));
+    assert!(diagnostic.contains(&format!("local rank {rank}/2")));
+    assert!(diagnostic.contains("input rank 2, width Some(3), elements Some(6)"));
     let changed=WorkspaceOperationView{kind:WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum{partitions:2,rank:1-rank}),..equation};
     let foreign=source.sum_workspace_storage(id,changed).err().expect("equal geometry must retain exact local rank");
     drop(source);drop((actual,authority,funding,world,lazy,base,wrong));

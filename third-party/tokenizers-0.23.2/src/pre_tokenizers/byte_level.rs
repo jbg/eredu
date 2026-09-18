@@ -1,5 +1,5 @@
 use ahash::AHashSet;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::utils::SysRegex;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ static RE: LazyLock<SysRegex> = LazyLock::new(|| {
     SysRegex::new(DEFAULT_PATTERN).unwrap()
 });
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 /// Provides all the necessary steps to handle the BPE tokenization at the byte-level. Takes care
 /// of all the required processing steps to transform a UTF-8 string as needed before and after the
 /// BPE model does its job.
@@ -49,7 +49,24 @@ pub struct ByteLevel {
     /// Set it to False if you want to use your own splitting.
     #[serde(default = "default_true")]
     pub use_regex: bool,
+    #[serde(skip)]
+    regex: OnceLock<SysRegex>,
 }
+
+/// Copyable source settings used by the allocation-free aggregate planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteLevelSettings {
+    pub(crate) add_prefix_space: bool,
+    pub(crate) trim_offsets: bool,
+    pub(crate) use_regex: bool,
+}
+impl ByteLevelSettings {
+    pub(crate) fn build(self) -> ByteLevel { ByteLevel::new(self.add_prefix_space, self.trim_offsets, self.use_regex) }
+}
+impl PartialEq for ByteLevel {
+    fn eq(&self, other: &Self) -> bool { self.settings() == other.settings() }
+}
+impl Eq for ByteLevel {}
 
 fn default_true() -> bool {
     true
@@ -61,6 +78,7 @@ impl Default for ByteLevel {
             add_prefix_space: true,
             trim_offsets: true,
             use_regex: true,
+            regex: OnceLock::new(),
         }
     }
 }
@@ -71,7 +89,23 @@ impl ByteLevel {
             add_prefix_space,
             trim_offsets,
             use_regex,
+            regex: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn settings(&self) -> ByteLevelSettings {
+        ByteLevelSettings { add_prefix_space: self.add_prefix_space, trim_offsets: self.trim_offsets, use_regex: self.use_regex }
+    }
+    #[cfg(feature = "fancy-regex")]
+    pub(crate) fn with_compiled_regex(self, regex: SysRegex) -> Self {
+        debug_assert!(self.use_regex);
+        debug_assert_eq!(regex.pattern(), DEFAULT_PATTERN);
+        self.regex.set(regex).expect("fresh ByteLevel source");
+        self
+    }
+    #[cfg(feature = "fancy-regex")]
+    pub(crate) fn workspace_plan(&self) -> Option<std::result::Result<fancy_regex::workspace::Plan<'_>, fancy_regex::workspace::PlanError>> {
+        self.regex.get()?.workspace_plan()
     }
 
     pub fn alphabet() -> AHashSet<char> {
@@ -113,7 +147,7 @@ pub(crate) fn transformations(s: &str) -> impl Iterator<Item = (char, isize)> + 
 // TODO: Give the ability to modify this regex
 impl ByteLevel {
     // The same prefix, split and byte/alignment transform for both source owners.
-    // Ordinary callers retain their existing LazyLock branch and allocation behavior.
+    // Ordinary callers lazily share their default program; admitted sources already own theirs.
     pub(crate) fn pre_tokenize_with(
         &self,
         pretokenized: &mut PreTokenizedString,
@@ -140,9 +174,11 @@ impl ByteLevel {
 }
 impl PreTokenizer for ByteLevel {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        let matcher = if self.use_regex {
+            Some(self.regex.get_or_init(|| (*RE).clone()).matcher()?)
+        } else { None };
         self.pre_tokenize_with(pretokenized, |normalized| {
-            let re_ref: &SysRegex = &RE;
-            normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
+            normalized.split(matcher.as_ref().expect("selected ByteLevel regex"), SplitDelimiterBehavior::Isolated)
         })
     }
 }
@@ -596,3 +632,6 @@ mod tests {
 #[cfg(test)]
 #[path = "byte_level/static_alphabet_tests.rs"]
 mod static_alphabet_tests;
+
+#[cfg(all(test, feature = "fancy-regex"))]
+mod workspace_tests;

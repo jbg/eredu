@@ -414,8 +414,8 @@ where
         args: &crate::inkling::ModelArgs,
     ) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError> {
         let Self {
-            extension,
-            topology,
+            extension: _,
+            topology: _,
             tensor_rank,
             tasks,
             source_context,
@@ -440,7 +440,7 @@ where
             crate::inkling::with_checkpoint_formats(args, formats).map_err(invalid)?;
         let parameters =
             crate::inkling::LayeredModel::<B>::new(target_args.clone(), execution_context)
-                .and_then(|model| model.parameter_description(execution_context))
+                .and_then(|model| model.parameter_description(execution_context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(execution_context))))
                 .map_err(|error| invalid(error.to_string()))?;
         let layout =
             crate::partitioned_execution::derive_partitioned_local_layout(&parameters, tensor_rank)
@@ -517,10 +517,10 @@ where
         // of the target's expert residency policy.
         let description = if args.vision.is_some() {
             crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), source_context)
-                .and_then(|model| model.parameter_description(source_context))
+                .and_then(|model| model.parameter_description(source_context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(source_context))))
         } else {
             crate::qwen::hybrid::LayeredModel::<B>::new(args.text.clone(), source_context)
-                .and_then(|model| model.parameter_description(source_context))
+                .and_then(|model| model.parameter_description(source_context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(source_context))))
         }
         .map_err(|error| invalid(error.to_string()))?;
         let layout = crate::partitioned_execution::derive_partitioned_local_layout(
@@ -640,7 +640,7 @@ where
             crate::nemotron_h::LayeredModel::<B>::new(args.clone(), source_context)
                 .map_err(|error| invalid(error.to_string()))?;
         let source_description = source_architecture
-            .parameter_description(source_context)
+            .parameter_description(source_context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(source_context)))
             .map_err(|error| invalid(error.to_string()))?;
         // Auxiliary tasks can lower prediction matrices independently of the
         // target. Preserve source formats elsewhere and construct executable
@@ -666,7 +666,7 @@ where
         let description =
             crate::nemotron_h::LayeredModel::<B>::new(target_args.clone(), execution_context)
                 .map_err(|error| invalid(error.to_string()))?
-                .parameter_description(execution_context)
+                .parameter_description(execution_context).and_then(|description| eredu_runtime::ArchitectureParameterDescription::into_owned(description,B::construction_metadata(execution_context)))
                 .map_err(|error| invalid(error.to_string()))?;
         let layout = crate::partitioned_execution::derive_partitioned_local_layout(
             &description,

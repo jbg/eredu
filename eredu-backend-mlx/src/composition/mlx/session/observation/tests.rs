@@ -113,7 +113,7 @@ impl RoutedUnitObserver<MlxTensor> for Observer<'_> {
         );
         self.started += 1;
         if self.fail {
-            Err(eredu_nn::Error::backend_source(Sentinel))
+            Err(eredu_nn::Error::backend_retained_source(Sentinel))
         } else {
             Ok(())
         }

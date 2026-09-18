@@ -17,7 +17,9 @@ fn fixture(auto_tool: bool) -> Fixture {
     // ordinary decoder and activation worker. No callback injects output.
     let first = if auto_tool {
         "<tool_call>Ċ{\"name\":\"read\",\"arguments\":{}}Ċ</tool_call>"
-    } else { "<tool_call>Ċ" };
+    } else {
+        "<tool_call>Ċ"
+    };
     vocab.insert(first.into(), 8.into());
     assert_eq!(vocab.remove("?"), Some(serde_json::json!(63)));
     vocab.insert("<|im_end|>".into(), 63.into());
@@ -38,15 +40,19 @@ fn fixture(auto_tool: bool) -> Fixture {
         // original nonzero fixture values; no sampler or event is replaced.
         let hidden = usize::try_from(config["hidden_size"].as_u64().unwrap()).unwrap();
         let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-        write_tensor_plan_with_values(&fixture.0, resolved.architecture.checkpoint(), |key, index| {
-            if key == "model.embed_tokens.weight" {
-                Some(32.0 + (index % hidden) as f32 * 0.01)
-            } else if key == "lm_head.weight" && index / hidden == 8 {
-                Some(2.0)
-            } else {
-                None
-            }
-        });
+        write_tensor_plan_with_values(
+            &fixture.0,
+            resolved.architecture.checkpoint(),
+            |key, index| {
+                if key == "model.embed_tokens.weight" {
+                    Some(32.0 + (index % hidden) as f32 * 0.01)
+                } else if key == "lm_head.weight" && index / hidden == 8 {
+                    Some(2.0)
+                } else {
+                    None
+                }
+            },
+        );
     }
     std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     // Released template; profile selection is the production behavioral recognizer.
@@ -60,7 +66,9 @@ fn fixture(auto_tool: bool) -> Fixture {
     .unwrap();
     fixture
 }
-fn run(mode: &str) -> serde_json::Value { run_controller(mode, false) }
+fn run(mode: &str) -> serde_json::Value {
+    run_controller(mode, false)
+}
 fn run_controller(mode: &str, active: bool) -> serde_json::Value {
     run_request(mode, active, false)
 }
@@ -79,14 +87,14 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
             .unwrap();
     let options = loaded.speculative_generation_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    let chat = model.source_chat_with_capacity(ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user","content":"abcde"})],
         // No tool surface selects the actual active grammar in the shared
         // production plan; ToolChoice::None with a surface selects forbidden.
         tools: if active { Vec::new() } else { vec![serde_json::json!({"type":"function","function":{"name":"read", "parameters":{"type":"object","properties":{},"additionalProperties":false}}})] },
         tool_choice: if auto_tool { ToolChoice::Auto } else { ToolChoice::None }, add_generation_prompt: true,
         ..Default::default()
-    }).unwrap();
+    }, 8 * 1024 * 1024 * 1024).unwrap();
     assert!(matches!(
         chat.semantic_support(),
         eredu::runtime::chat::SemanticSupport::Supported
@@ -96,79 +104,85 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
     settings.inference.prefill_chunk_positions = std::num::NonZeroU64::new(64);
     let mut events = Vec::new();
     let mut committed = Vec::new();
-    let output = if mode == "ordinary" {
-        settings.inference.managed_memory_capacity_bytes = None;
+    let request = PreparedChatSpeculativeRequest {
+        chat: &chat,
+        input: PreparedChatPrompt::Rendered,
+        output_mode: PreparedChatOutputMode::Semantic,
+        skip_special_tokens: true,
+        drafting: drafting.as_speculative_draft().unwrap(),
+        settings: chat_settings(&chat, settings),
+        options,
+        caller_stop_sequences: &[],
+        cancellation: Default::default(),
+        on_event: |event| events.push(event),
+    };
+    let output = if mode == "controlled" {
         model
-            .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&chat),
-                drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |event| events.push(event),
-            })
+            .with_controlled_prepared_chat_speculative(
+                request,
+                ControlledSpeculativeOptions::default(),
+                |session| {
+                    while let Some(step) = session.step()? {
+                        committed.extend(step.committed_token_ids);
+                    }
+                    assert_eq!(committed, session.token_ids());
+                    Ok(())
+                },
+            )
             .unwrap_or_else(report_failure)
     } else {
-        let source = model
-            .compile_managed_plain_text_source(
-                std::fs::File::open(fixture.0.join("tokenizer.json")).unwrap(),
-            )
-            .unwrap_or_else(report_failure);
-        let request = ManagedPreparedChatSpeculativeRequest {
-            chat: &chat,
-            drafting: drafting.as_speculative_draft().unwrap(),
-            settings,
-            options,
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |event| events.push(event),
-        };
-        if mode == "controlled" {
-            model
-                .with_controlled_managed_prepared_chat_speculative(
-                    &source,
-                    request,
-                    ControlledSpeculativeOptions::default(),
-                    |session| {
-                        while let Some(step) = session.step()? {
-                            committed.extend(step.committed_token_ids);
-                        }
-                        assert_eq!(committed, session.token_ids());
-                        Ok(())
-                    },
-                )
-                .unwrap_or_else(report_failure)
-        } else {
-            assert_eq!(mode, "managed");
-            model
-                .generate_managed_prepared_chat_speculative(&source, request)
-                .unwrap_or_else(report_failure)
-        }
+        assert_eq!(mode, "managed");
+        model
+            .generate_prepared_chat_speculative(request)
+            .unwrap_or_else(report_failure)
     };
     assert!(!output.token_ids().is_empty());
     if auto_tool {
-        assert_eq!(output.token_ids().first(), Some(&8), "actual Auto trigger must be sampled first; ids={:?}, events={events:?}", output.token_ids());
+        assert_eq!(
+            output.token_ids().first(),
+            Some(&8),
+            "actual Auto trigger must be sampled first; ids={:?}, events={events:?}",
+            output.token_ids()
+        );
         assert!(events.iter().any(|event| matches!(event, SemanticEvent::ToolCallStart { index:0, name, .. } if name.as_str() == "read")));
-        let arguments = events.iter().filter_map(|event| match event {
-            SemanticEvent::ToolArgumentsDelta { index:0, json_fragment } => Some(json_fragment.as_str()),
-            _ => None,
-        }).collect::<String>();
+        let arguments = events
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment,
+                } => Some(json_fragment.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
         assert_eq!(arguments, "{}");
-        assert_eq!(events.iter().filter(|event| matches!(event, SemanticEvent::ToolCallEnd)).count(), 1,
-            "the shared tool callback must validate and complete exactly one call");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                .count(),
+            1,
+            "the shared tool callback must validate and complete exactly one call"
+        );
     } else {
-        assert!(!output.token_ids().contains(&8),
-            "actual forbidden trigger or absent-tool grammar ID must be filtered");
+        assert!(
+            !output.token_ids().contains(&8),
+            "actual forbidden trigger or absent-tool grammar ID must be filtered"
+        );
     }
     if auto_tool {
         // The complete tool token terminates at the shared prefill commit,
         // before any speculative verification round can be submitted.
         assert_eq!(output.token_ids(), &[8]);
         assert_eq!(output.stats().rounds(), 0);
-        assert!(matches!(output.finish_reason(),
-            eredu_core::FinishReason::GrammarComplete | eredu_core::FinishReason::StopSequence),
-            "atomic tool completion must be terminal: {:?}", output.finish_reason());
+        assert!(
+            matches!(
+                output.finish_reason(),
+                eredu_core::FinishReason::GrammarComplete | eredu_core::FinishReason::StopSequence
+            ),
+            "atomic tool completion must be terminal: {:?}",
+            output.finish_reason()
+        );
     } else {
         assert!(output.stats().rounds() > 0);
     }
@@ -180,7 +194,11 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
         1
     );
     if !auto_tool {
-        assert!(events.iter().any(|event| matches!(event, SemanticEvent::TextDelta(text) if !text.is_empty())));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::TextDelta(text) if !text.is_empty()))
+        );
     }
     if mode == "controlled" {
         assert_eq!(committed, output.token_ids());
@@ -194,19 +212,34 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_prepared_chat_forbidden_semantics_match_ordinary_and_controlled() {
-    super::parity_with("semantic-forbidden", CASE, |_, mode| run(mode));
+    super::parity_with(
+        "semantic-forbidden",
+        CASE,
+        &["managed", "controlled"],
+        |_, mode| run(mode),
+    );
 }
 
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_prepared_chat_active_semantics_match_ordinary_and_controlled() {
     const ACTIVE_CASE: &str = "managed_plain::embedded::semantic::native_original_prepared_chat_active_semantics_match_ordinary_and_controlled";
-    super::parity_with("semantic-active", ACTIVE_CASE, |_, mode| run_controller(mode, true));
+    super::parity_with(
+        "semantic-active",
+        ACTIVE_CASE,
+        &["managed", "controlled"],
+        |_, mode| run_controller(mode, true),
+    );
 }
 
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_prepared_chat_auto_tool_semantics_match_ordinary_and_controlled() {
     const AUTO_CASE: &str = "managed_plain::embedded::semantic::native_original_prepared_chat_auto_tool_semantics_match_ordinary_and_controlled";
-    super::parity_with("semantic-auto-tool", AUTO_CASE, |_, mode| run_request(mode, false, true));
+    super::parity_with(
+        "semantic-auto-tool",
+        AUTO_CASE,
+        &["managed", "controlled"],
+        |_, mode| run_request(mode, false, true),
+    );
 }

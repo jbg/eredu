@@ -5,7 +5,7 @@ use eredu_core::{
     intervention::PreparedInterventionPlanCopy,
     speculative::{AdmittedSpeculativeActivations, SpeculativeControlError},
 };
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
@@ -59,17 +59,17 @@ pub(super) fn observer(
                 >,
             >(),
             PreparedInterventionPlanCopy::inspection_control_bytes().ok_or(
-                Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
             )?,
             PreparedCapturePlanCopy::inspection_control_bytes().ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
         ];
         let bytes = frames
             .into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         sources
             .metadata_funding()

@@ -1,6 +1,6 @@
 //! Actual destinations for the shared logical aggregate constructor.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataError, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceMetadataError, HostMetadataFunding};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
@@ -42,12 +42,12 @@ impl ConstructionError {
     }
 }
 #[derive(Clone, Copy)]
-pub(in crate::capture) struct Metadata<'a>(Option<&'a WorkspaceMetadataFunding>);
+pub(in crate::capture) struct Metadata<'a>(Option<&'a HostMetadataFunding>);
 impl<'a> Metadata<'a> {
     pub(in crate::capture) fn ordinary() -> Self {
         Self(None)
     }
-    pub(in crate::capture) fn original(funding: &'a WorkspaceMetadataFunding) -> Self {
+    pub(in crate::capture) fn original(funding: &'a HostMetadataFunding) -> Self {
         Self(Some(funding))
     }
     pub(in crate::capture) fn controls(self, bytes: usize) -> Result<(), ConstructionError> {
@@ -132,3 +132,5 @@ impl WindowReductions {
             .try_fold(size_of_val(&parts), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

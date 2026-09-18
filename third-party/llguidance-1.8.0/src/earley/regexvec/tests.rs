@@ -6,7 +6,7 @@ fn regexes(patterns: &[&str]) -> RegexVec {
 }
 
 fn regexes_with_limits(patterns: &[&str], limits: &mut ParserLimits) -> Result<RegexVec> {
-    let mut builder = RegexBuilder::new();
+    let mut builder = RegexBuilder::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
     let regexes = patterns
         .iter()
         .map(|pattern| RxLexeme {

@@ -61,7 +61,7 @@ pub(super) fn call_control_bytes(rows: usize) -> Option<usize> {
         size_of::<usize>(),
         size_of::<usize>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<CallFailure>()?,
-        eredu_nn::Error::retained_source_control_bytes::<Error>()?,
+        eredu_nn::Error::retained_source_construction_bytes::<Error>()?,
         NestedRoots::submission_control_bytes::<RootIter<'_>>()?,
         crate::backend::runtime::checkpoint::binding::original_parameter_binding_control_bytes(
             rows,

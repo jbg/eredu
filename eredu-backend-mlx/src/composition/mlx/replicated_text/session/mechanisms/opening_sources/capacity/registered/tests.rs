@@ -93,7 +93,7 @@ where
             "one byte short must reject before native snapshot allocation"
         );
         assert_eq!(pool.used_bytes().unwrap(), before);
-        let (_, reservation, accepted) = plan_prefill_incremental_with_capacity(
+        let (reservation, accepted) = plan_prefill_incremental_with_capacity(
             session.inference_execution_identity(),
             pool,
             caps,

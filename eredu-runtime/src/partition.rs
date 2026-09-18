@@ -1,9 +1,10 @@
 //! Backend-neutral ownership of one rank-local architecture partition.
 
 mod description;
+mod ownership;
 
 use std::ops::Deref;
-use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
+use std::{collections::BTreeSet, ops::Range};
 
 use crate::{
     ArchitectureStatePartitionError, ArchitectureStatePartitionPlan, ArchitectureStatePlacement,
@@ -199,6 +200,14 @@ pub struct ArchitectureParameterDescription {
 }
 
 impl ArchitectureParameterDescription {
+    /// Moves an owned declaration or copies a borrowed one through the actual destination.
+    /// A borrowed description never silently allocates when a metadata owner is supplied.
+    pub fn into_owned(description:std::borrow::Cow<'_,Self>,metadata:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Self,eredu_nn::Error>{
+        let Some(context)=metadata.filter(|context|context.uses_checked_metadata()) else{return Ok(description.into_owned());};
+        context.charge_metadata(std::mem::size_of::<(std::borrow::Cow<'_,Self>,Option<&eredu_nn::workspace::WorkspaceContext>,Self,Result<Self,eredu_nn::Error>)>())?;
+        match description{std::borrow::Cow::Owned(value)=>Ok(value),std::borrow::Cow::Borrowed(value)=>description::copy(value,context)}
+    }
+
     /// Validates explicit ownership against the canonical graph/layout and an
     /// authoritative set of neutral parameter groups.
     pub fn new(
@@ -983,42 +992,6 @@ pub struct PartitionOwnership {
 }
 
 impl PartitionOwnership {
-    /// Creates validated boundary and static-module ownership.
-    pub fn new(
-        input: bool,
-        output: bool,
-        static_roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<Self, ArchitecturePartitionError> {
-        let static_roles = static_roles.into_iter().map(Into::into).collect::<Vec<_>>();
-        let mut unique = BTreeSet::new();
-        for role in &static_roles {
-            if role.trim().is_empty() {
-                return Err(ArchitecturePartitionError::EmptyStaticRole);
-            }
-            if !unique.insert(role.clone()) {
-                return Err(ArchitecturePartitionError::DuplicateStaticRole(
-                    role.clone(),
-                ));
-            }
-        }
-        Ok(Self {
-            input,
-            output,
-            static_roles,
-            replicated_static_roles: Vec::new(),
-        })
-    }
-
-    /// Retains static storage needed by auxiliary invocations on every rank.
-    /// These replicas do not grant ownership of the ordinary input/output hook.
-    pub fn with_replicated_static_roles(
-        mut self,
-        roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<Self, ArchitecturePartitionError> {
-        self.replicated_static_roles = Self::new(false, false, roles)?.static_roles;
-        Ok(self)
-    }
-
     /// Auxiliary storage dependencies, distinct from ordinary invocation roles.
     pub fn replicated_static_roles(&self) -> &[String] {
         &self.replicated_static_roles
@@ -1106,7 +1079,7 @@ impl PartitionState {
         M::DefinitionError: std::fmt::Display,
     {
         architecture
-            .state_identity(self, topology)
+            .state_identity(self, topology, None)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?
             .prompt_cache_identity(self.layout())
             .map_err(|error| ArchitecturePartitionError::PromptCacheIdentity(error.to_string()))
@@ -1194,7 +1167,7 @@ impl<G, A> ArchitecturePartition<G, A> {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
         }
         let complete_state = architecture
-            .state_layout()
+            .state_layout(None)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
         let plan = architecture.state_partition_plan(&complete_state);
         let mut partition = Self::new(
@@ -1803,7 +1776,7 @@ impl LayeredPartitionDriver {
         // `state` is the partition-local allocation selected by `PartitionState`.
         // Global ownership is carried separately by that partition's offset, so
         // architecture code must index this allocation from local ordinal zero.
-        let mut forward = match observer {
+        let mut forward = match observer.filter(|observer| observer.observes_activations()) {
             Some(observer) => architecture.begin_partition_observed(
                 input, mask, state, expected, 0, parallel, context, observer,
             ),
@@ -2050,7 +2023,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?.into_owned();
     let primary = architecture.primary_execution_group();
     let primary_index = graph.group_index(primary).ok_or_else(|| {
         ArchitecturePartitionError::ArchitectureTopology(format!(
@@ -2090,11 +2063,11 @@ where
     let mut paths = BTreeSet::new();
     for group in 0..graph.groups().len() {
         let count = architecture
-            .group_unit_count(group)
+            .group_unit_count(group, None)
             .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
         counts.push(count);
         for index in 0..count {
-            let path = architecture.unit_path(group, index).map_err(|error| {
+            let path = architecture.unit_path(group, index, None).map_err(|error| {
                 ArchitecturePartitionError::ArchitectureTopology(error.to_string())
             })?;
             if path.trim().is_empty() {
@@ -2123,6 +2096,16 @@ fn validate_canonical_layout(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitecturePartitionError {
+    /// The actual source account refused a metadata producer.
+    #[error("{0}")]
+    MetadataFunding(#[from] eredu_core::HostMetadataFundingError),
+    /// The host allocator refused an admitted metadata request.
+    #[error("partition metadata allocation: {0}")]
+    MetadataAllocation(#[from] std::collections::TryReserveError),
+    /// The selected allocator returned an unqualified capacity.
+    #[error("partition metadata capacity differs from its request")]
+    MetadataCapacity,
+
     /// The architecture supplied an invalid partition-boundary wire schema.
     #[error("invalid architecture partition boundary: {0}")]
     InvalidBoundary(#[from] ArchitectureBoundaryError),

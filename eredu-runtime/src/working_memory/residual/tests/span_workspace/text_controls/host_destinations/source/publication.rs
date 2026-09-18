@@ -178,6 +178,13 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
             .take_native_partition(funding::native_partition::test_receipt(&br, 100))
             .unwrap();
         let bs = br.scope().unwrap();
+        let mut key_only = PreparedNativePublication::prepare_slots(bp.clone(), 1);
+        key_only.push_source(&2u32, 16, None, &pool).unwrap();
+        let before = balances(&pool);
+        assert_eq!(key_only.publish(&bs), Err(WorkingMemoryError::IdentityMismatch));
+        assert_eq!(balances(&pool), before);
+        assert!(key_only.take_input(0).is_none());
+        drop(key_only);
         // Same generation may not cross immutable/mutable coverage kinds, and
         // an unseen immutable generation cannot originate through B.
         for input in [
@@ -221,6 +228,58 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
             drop(output);
         }
         assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
+}
+
+
+#[test]
+fn immutable_existing_alias_refuses_foreign_pool_and_quarantined_donor_without_credit() {
+    let Some(total) = total() else { return; };
+    for quarantine in [false, true] {
+        let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let Some(quote) = qualified_request(&pool, total) else { return; };
+        let (r, run, accepted) = accept(&pool, quote);
+        let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
+        let controls = span.control_guard();
+        let mut host = span.take_host_destinations().unwrap().unwrap();
+        let mut bank = host.take_source_constructions().unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let output = bank.construct(producer(&controls, &pool, &calls, 2, false)).unwrap();
+        assert_eq!((calls.get(), bank.remaining_bytes(), bank.remaining_attempts()), (1, 0, 0));
+        if quarantine {
+            // Real unfinished native custody fences A; no private account mutation.
+            drop(run.scope().unwrap());
+        }
+        drop((bank, host, controls, span, r, run, root));
+        let donor = pool.used_bytes().unwrap();
+        let target = if quarantine { pool.clone() } else {
+            WorkingMemoryPool::new(10_000_000, 0).unwrap()
+        };
+        let (b, br) = funding::tests::reservation(&target, 200, 10_000_000).into_funding().unwrap();
+        let bp = br.take_native_partition(funding::native_partition::test_receipt(&br, 100)).unwrap();
+        let bs = br.scope().unwrap();
+        let mut attempt = PreparedNativePublication::prepare_slots(bp.clone(), 1);
+        attempt.push_observation(NativeStorageObservation::ExistingImmutable(2u32, 16)).unwrap();
+        let before = balances(&target);
+        assert_eq!(attempt.publish(&bs), Err(if quarantine {
+            WorkingMemoryError::ExecutionFenced
+        } else {
+            WorkingMemoryError::IdentityMismatch
+        }));
+        assert_eq!(balances(&target), before);
+        assert!(attempt.take_input(0).is_none());
+        assert_eq!(attempt.publish(&bs), Err(WorkingMemoryError::PreparationAlreadyStarted));
+        bs.certify().unwrap();
+        drop((attempt, bp, b, br));
+        assert_eq!(pool.used_bytes().unwrap(), donor);
+        drop(output);
+        if quarantine {
+            assert!(pool.used_bytes().unwrap() > 0, "failed source cannot refund its account");
+        } else {
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(target.used_bytes().unwrap(), 0);
+        }
     }
 }
 

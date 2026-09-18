@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use crate::{parser_bail as bail, ParserResult as Result};
 use regex_syntax::{
     hir::{self, ClassUnicode, Hir, HirKind, Look},
     utf8::Utf8Sequences,
@@ -7,7 +7,6 @@ use regex_syntax::{
 
 use crate::{
     ast::{byteset_256, byteset_from_range, byteset_set, ExprSet},
-    regexbuilder::write_regex,
     ExprRef,
 };
 
@@ -24,7 +23,7 @@ struct StackEntry<'a> {
 #[derive(PartialEq, Eq, Debug)]
 enum TrieSelector {
     Byte(u8),
-    ByteSet(Vec<u32>),
+    ByteSet([u32; 8]),
 }
 
 struct TrieNode {
@@ -42,56 +41,53 @@ impl TrieNode {
         }
     }
 
-    fn child_at(&mut self, sel: TrieSelector) -> &mut Self {
-        let idx = self
-            .children
-            .iter()
-            .position(|child| child.selector == sel)
-            .unwrap_or_else(|| {
-                let l = self.children.len();
-                self.children.push(Self::new(sel));
-                l
-            });
-        &mut self.children[idx]
+    fn child_at(&mut self, sel: TrieSelector, funding: &crate::ParserAllocationFunding) -> Result<&mut Self> {
+        let idx = if let Some(idx) = self.children.iter().position(|child| child.selector == sel) { idx } else {
+            let idx = self.children.len();
+            funding.try_push(&mut self.children, Self::new(sel))?;
+            idx
+        };
+        Ok(&mut self.children[idx])
     }
 
-    fn build_tail(&self, set: &mut ExprSet) -> ExprRef {
+    fn build_tail(&self, set: &mut ExprSet) -> Result<ExprRef> {
+        let funding = set.construction_funding()?.clone();
         let mut children = Vec::new();
         for child in &self.children {
-            children.push(child.build(set));
+            let result = child.build(set)?;
+            funding.try_push(&mut children, result)?;
         }
         if self.is_match {
-            children.push(ExprRef::EMPTY_STRING);
+            funding.try_push(&mut children, ExprRef::EMPTY_STRING)?;
         }
         if children.len() == 1 {
-            children[0]
+            Ok(children[0])
         } else {
-            set.mk_or(&mut children)
+            Ok(set.mk_or(&mut children)?)
         }
     }
 
-    fn build(&self, set: &mut ExprSet) -> ExprRef {
-        let tail = self.build_tail(set);
+    fn build(&self, set: &mut ExprSet) -> Result<ExprRef> {
+        let tail = self.build_tail(set)?;
         let head = match &self.selector {
-            TrieSelector::Byte(b) => set.mk_byte(*b),
-            TrieSelector::ByteSet(bs) => set.mk_byte_set(bs),
+            TrieSelector::Byte(b) => set.mk_byte(*b)?,
+            TrieSelector::ByteSet(bs) => set.mk_byte_set(bs)?,
         };
-        set.mk_concat(head, tail)
+        Ok(set.mk_concat(head, tail)?)
     }
 }
 
 impl ExprSet {
-    fn handle_unicode_ranges(&mut self, u: &ClassUnicode) -> ExprRef {
+    fn handle_unicode_ranges(&mut self, u: &ClassUnicode) -> Result<ExprRef> {
         let mut root = TrieNode::new(TrieSelector::Byte(0));
 
-        let key = u
-            .ranges()
-            .iter()
-            .map(|r| (r.start(), r.end()))
-            .collect::<Vec<_>>();
+        let funding = self.construction_funding()?.clone();
+        let mut key = Vec::new();
+        funding.try_grow_vec(&mut key, u.ranges().len())?;
+        key.extend(u.ranges().iter().map(|r| (r.start(), r.end())));
 
         if let Some(r) = self.unicode_cache.get(&key) {
-            return *r;
+            return Ok(*r);
         }
 
         let ranges = u.ranges();
@@ -103,9 +99,9 @@ impl ExprSet {
                     let sel = if s.start == s.end {
                         TrieSelector::Byte(s.start)
                     } else {
-                        TrieSelector::ByteSet(byteset_from_range(s.start, s.end))
+                        { let mut words = [0; 8]; for byte in s.start..=s.end { byteset_set(&mut words, usize::from(byte)); } TrieSelector::ByteSet(words) }
                     };
-                    node_ptr = node_ptr.child_at(sel);
+                    node_ptr = node_ptr.child_at(sel, &funding)?;
                 }
                 node_ptr.is_match = true;
             }
@@ -115,6 +111,7 @@ impl ExprSet {
         self.optimize = false;
         let r = root.build_tail(self);
         self.optimize = opt;
+        let r = r?;
 
         if !self.any_unicode.is_valid()
             && ranges.len() == 1
@@ -134,25 +131,28 @@ impl ExprSet {
             self.any_unicode_non_nl = r;
         }
 
-        self.unicode_cache.insert(key, r);
+        funding.try_insert(&mut self.unicode_cache, key, r)?;
 
-        r
+        Ok(r)
     }
 
-    fn mk_any_unicode_star(&mut self) -> ExprRef {
+    fn mk_any_unicode_star(&mut self) -> Result<ExprRef> {
         if self.any_unicode_star.is_valid() {
-            return self.any_unicode_star;
+            return Ok(self.any_unicode_star);
         }
         let mut all = ClassUnicode::empty();
-        all.negate();
-        let any_unicode = self.handle_unicode_ranges(&all);
+        let funding = self.construction_funding()?.clone();
+        all.negate_with_allocations(regex_syntax::allocation::Allocator::new(&funding)).map_err(|error| funding.syntax_allocation_error(error))?;
+        let any_unicode = self.handle_unicode_ranges(&all)?;
         assert_eq!(any_unicode, self.any_unicode);
-        self.any_unicode_star = self.mk_repeat(any_unicode, 0, u32::MAX);
-        self.any_unicode_star
+        self.any_unicode_star = self.mk_repeat(any_unicode, 0, u32::MAX)?;
+        Ok(self.any_unicode_star)
     }
 
     fn mk_from_ast(&mut self, ast: &Hir, for_search: bool) -> Result<ExprRef> {
-        let mut todo = vec![StackEntry {
+        let funding = self.construction_funding()?.clone();
+        let mut todo = Vec::new();
+        funding.try_push(&mut todo, StackEntry {
             ast,
             args: Vec::new(),
             anchored: Vec::new(),
@@ -160,15 +160,17 @@ impl ExprSet {
             result_vec_offset: 0,
             at_start: true,
             at_end: true,
-        }];
+        })?;
         while let Some(mut node) = todo.pop() {
             let subs = node.ast.kind().subs();
             if subs.len() != node.args.len() {
                 assert!(node.args.is_empty());
                 let n_args = subs.len();
-                node.args = vec![ExprRef::INVALID; n_args];
+                funding.try_grow_vec(&mut node.args, n_args)?;
+                node.args.resize(n_args, ExprRef::INVALID);
                 if for_search {
-                    node.anchored = vec![(false, false); n_args];
+                    funding.try_grow_vec(&mut node.anchored, n_args)?;
+                    node.anchored.resize(n_args, (false, false));
                 }
                 let result_stack_idx = todo.len();
                 let is_concat = matches!(node.ast.kind(), HirKind::Concat(_));
@@ -178,9 +180,9 @@ impl ExprSet {
                 );
                 let at_start = (derives_start || is_concat) && node.at_start;
                 let at_end = (derives_start || is_concat) && node.at_end;
-                todo.push(node);
+                funding.try_push(&mut todo, node)?;
                 for (idx, sub) in subs.iter().enumerate() {
-                    todo.push(StackEntry {
+                    funding.try_push(&mut todo, StackEntry {
                         ast: sub,
                         args: Vec::new(),
                         anchored: Vec::new(),
@@ -188,7 +190,7 @@ impl ExprSet {
                         result_vec_offset: idx,
                         at_start: (!is_concat || idx == 0) && at_start,
                         at_end: (!is_concat || idx == subs.len() - 1) && at_end,
-                    });
+                    })?;
                 }
                 continue;
             } else {
@@ -200,17 +202,17 @@ impl ExprSet {
 
             let mut r = match node.ast.kind() {
                 HirKind::Empty => ExprRef::EMPTY_STRING,
-                HirKind::Literal(bytes) => self.mk_byte_literal(&bytes.0),
+                HirKind::Literal(bytes) => self.mk_byte_literal(&bytes.0)?,
                 HirKind::Class(hir::Class::Bytes(ranges)) => {
-                    let mut bs = byteset_256();
+                    let mut bs = [0; 8];
                     for r in ranges.ranges() {
                         for idx in r.start()..=r.end() {
                             byteset_set(&mut bs, idx as usize);
                         }
                     }
-                    self.mk_byte_set(&bs)
+                    self.mk_byte_set(&bs)?
                 }
-                HirKind::Class(hir::Class::Unicode(u)) => self.handle_unicode_ranges(u),
+                HirKind::Class(hir::Class::Unicode(u)) => self.handle_unicode_ranges(u)?,
                 // ignore ^ and $ anchors:
                 HirKind::Look(Look::Start) if node.at_start => {
                     anchored_start = true;
@@ -221,12 +223,12 @@ impl ExprSet {
                     ExprRef::EMPTY_STRING
                 }
                 HirKind::Look(l) => {
-                    bail!("lookarounds not supported yet; {:?}", l)
+                    bail!(&funding, "lookarounds not supported yet; {:?}", l)
                 }
                 HirKind::Repetition(r) => {
                     assert!(node.args.len() == 1);
                     // ignoring greedy flag
-                    self.mk_repeat(node.args[0], r.min, r.max.unwrap_or(u32::MAX))
+                    self.mk_repeat(node.args[0], r.min, r.max.unwrap_or(u32::MAX))?
                 }
                 HirKind::Capture(c) => {
                     assert!(node.args.len() == 1);
@@ -235,7 +237,7 @@ impl ExprSet {
                     }
                     // use (?P<stop>R) as syntax for lookahead
                     if c.name.as_deref() == Some("stop") {
-                        self.mk_lookahead(node.args[0], 0)
+                        self.mk_lookahead(node.args[0], 0)?
                     } else {
                         // ignore capture idx/name
                         node.args[0]
@@ -247,7 +249,7 @@ impl ExprSet {
                         anchored_start = node.anchored[0].0;
                         anchored_end = node.anchored[node.args.len() - 1].1;
                     }
-                    self.mk_concat_vec(&node.args)
+                    self.mk_concat_vec(&node.args)?
                 }
                 HirKind::Alternation(args) => {
                     assert!(args.len() == node.args.len());
@@ -266,34 +268,34 @@ impl ExprSet {
                             anchored_start = some_start;
                             anchored_end = some_end;
                             if !all_start || !all_end {
-                                let dot_star = self.mk_any_unicode_star();
+                                let dot_star = self.mk_any_unicode_star()?;
                                 for ((st, en), arg) in
                                     node.anchored.iter().zip(node.args.iter_mut())
                                 {
                                     let needs_st = !*st && anchored_start;
                                     let needs_en = !*en && anchored_end;
                                     if needs_en {
-                                        *arg = self.mk_concat(*arg, dot_star);
+                                        *arg = self.mk_concat(*arg, dot_star)?;
                                     }
                                     if needs_st {
-                                        *arg = self.mk_concat(dot_star, *arg);
+                                        *arg = self.mk_concat(dot_star, *arg)?;
                                     }
                                 }
                             }
                         }
                     }
-                    self.mk_or(&mut node.args)
+                    self.mk_or(&mut node.args)?
                 }
             };
 
             if todo.is_empty() {
                 if for_search {
-                    let dot_star = self.mk_any_unicode_star();
+                    let dot_star = self.mk_any_unicode_star()?;
                     if !anchored_end {
-                        r = self.mk_concat(r, dot_star);
+                        r = self.mk_concat(r, dot_star)?;
                     }
                     if !anchored_start {
-                        r = self.mk_concat(dot_star, r);
+                        r = self.mk_concat(dot_star, r)?;
                     }
                 }
                 return Ok(r);
@@ -314,11 +316,26 @@ impl ExprSet {
         rx: &str,
         for_search: bool,
     ) -> Result<ExprRef> {
-        let hir = parser.parse(rx)?;
-        self.mk_from_ast(&hir, for_search).map_err(|e| {
-            let mut err = format!("{e} in regex ");
-            write_regex(&mut err, rx);
-            anyhow::anyhow!(err)
-        })
+        let funding = self.construction_funding()?.clone();
+        let hir = parser.parse_with_allocations(rx, &funding).map_err(|error| {
+            let allocation = match &error {
+                regex_syntax::Error::Parse(error) => match error.kind() {
+                    regex_syntax::ast::ErrorKind::Allocation(cause) => Some(*cause),
+                    _ => None,
+                },
+                regex_syntax::Error::Translate(error) => match error.kind() {
+                    regex_syntax::hir::ErrorKind::Allocation(cause) => Some(*cause),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match allocation {
+                Some(cause) => crate::ParserError::from(funding.syntax_allocation_error(cause)),
+                None => crate::ParserError::cause(error, &funding),
+            }
+        })?;
+        // Preserve allocation causes; callers retain the source text and may
+        // format context only after inspecting this typed error chain.
+        self.mk_from_ast(&hir, for_search)
     }
 }

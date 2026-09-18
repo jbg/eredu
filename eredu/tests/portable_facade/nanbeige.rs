@@ -1,10 +1,10 @@
 use super::*;
 use eredu::api::{
-    PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    PreparedChatGenerationSettings,
 };
 use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
 use eredu_core::{FinishReason, SemanticEvent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TEMPLATE: &str = include_str!("../fixtures/chat_templates/nanbeige4.2-0e137298.jinja");
 const TOKENIZER: &str =
@@ -12,12 +12,12 @@ const TOKENIZER: &str =
 
 type Calls = std::rc::Rc<std::cell::RefCell<BackendCalls>>;
 
-fn model() -> (LoadedModel<MockBackend>, Calls) {
+fn model() -> (original_sources::Fixture<MockBackend>, Calls) {
     let tokenizer = Tokenizer::from_bytes(TOKENIZER).unwrap();
     let backend = MockBackend::default();
     let calls = backend.calls.clone();
     (
-        LoadedModel::from_runtime(
+        original_sources::Fixture::from_runtime(
             ModelRuntime::prepare(backend, ()).unwrap(),
             ChatTokenizer::from_tokenizer(tokenizer),
             LoadedTextModelConfig {
@@ -55,11 +55,14 @@ fn request(thinking: bool, tools: Vec<Value>) -> ChatTemplateRequest {
 }
 
 fn generate(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut original_sources::Fixture<MockBackend>,
     prepared: &eredu::runtime::chat::PreparedChat,
     calls: &Calls,
     text: &str,
-) -> (eredu_core::GenerationOutput, Vec<SemanticEvent>) {
+) -> (
+    eredu_core::GenerationOutput<(), eredu_core::GenerationTokenIds>,
+    Vec<SemanticEvent>,
+) {
     // No initial Metaspace prefix: these are continuation tokens, as emitted by
     // the model, including the checkpoint's non-special atomic XML markers.
     let mut tokenizer = Tokenizer::from_bytes(TOKENIZER).unwrap();
@@ -71,28 +74,46 @@ fn generate(
     let ids = tokenizer.encode(text, false).unwrap().get_ids().to_vec();
     calls.borrow_mut().scripted_tokens = ids.into();
     let mut events = Vec::new();
-    let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(prepared),
-            settings: PreparedChatGenerationSettings {
+    let output = {
+        let cancel = Default::default();
+        let mut request = eredu::api::PreparedChatRequest::new(
+            prepared,
+            original_sources::settings(PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
                     max_new_tokens: Some(1024),
                     ..Default::default()
                 },
                 ..Default::default()
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |e| events.push(e),
-        })
-        .unwrap();
+            }),
+        );
+        request.stop_sequences = &[];
+        model
+            .start_prepared_chat(request, &cancel)
+            .and_then(|session| {
+                session
+                    .expect("active request")
+                    .run(&cancel, &mut (|e| events.push(e)))
+            })
+    }
+    .unwrap();
     (output, events)
 }
 
 #[test]
 fn official_nanbeige_reasoning_closing_token_is_selectable() {
     let (mut model, calls) = model();
-    let prepared = model.prepare_chat(request(true, vec![])).unwrap();
+    let prepared = {
+        let request = request(true, vec![]);
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancel)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .map(|chat| chat.expect("active preparation"))
+    }
+    .unwrap();
     assert!(prepared.rendered_prompt().ends_with("<think>\n"));
     let (_, events) = generate(
         &mut model,
@@ -121,26 +142,47 @@ fn official_nanbeige_reasoning_closing_token_is_selectable() {
 #[test]
 fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
     let (mut model, calls) = model();
-    let prepared = model.prepare_chat(request(false, tools())).unwrap();
+    let prepared = {
+        let request = request(false, tools());
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancel)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .map(|chat| chat.expect("active preparation"))
+    }
+    .unwrap();
     calls.borrow_mut().scripted_tokens = [166105].into();
     let mut events = Vec::new();
-    let result = model.generate_prepared_chat(PreparedChatGenerationRequest {
-        input: PreparedChatInput::rendered_prompt(&prepared),
-        settings: PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                max_new_tokens: Some(1),
+    let result = {
+        let cancel = Default::default();
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &prepared,
+            original_sources::settings(PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(1),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |e| events.push(e),
-    });
+            }),
+        );
+        request.stop_sequences = &[];
+        model
+            .start_prepared_chat(request, &cancel)
+            .and_then(|session| {
+                session
+                    .expect("active request")
+                    .run(&cancel, &mut (|e| events.push(e)))
+            })
+    };
     assert!(result.is_err());
-    assert!(!events
-        .iter()
-        .any(|e| matches!(e, SemanticEvent::ToolCallEnd | SemanticEvent::TextDelta(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SemanticEvent::ToolCallEnd | SemanticEvent::TextDelta(_)))
+    );
 }
 
 #[test]
@@ -151,7 +193,20 @@ fn official_nanbeige_replay_rejects_unescaped_parameter_delimiters() {
         request.messages.push(json!({"role":"assistant", "content":"", "tool_calls":[{
             "id":"call_0", "type":"function", "function":{"name":"todo__todo_write", "arguments":{"content":content}}
         }]}));
-        assert!(model.prepare_chat(request).is_err());
+        assert!(
+            {
+                let request = request;
+                let cancel = eredu_core::GenerationCancellationToken::new();
+                let source = model
+                    .chat_source(!request.tools.is_empty(), &cancel)
+                    .unwrap()
+                    .unwrap();
+                model
+                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                    .map(|chat| chat.expect("active preparation"))
+            }
+            .is_err()
+        );
     }
 }
 
@@ -163,9 +218,22 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
         req.parallel_tool_calls = ParallelToolCallPolicy::Enabled {
             max_calls: std::num::NonZeroUsize::new(2),
         };
-        let prepared = model.prepare_chat(req.clone()).unwrap();
+        let prepared = {
+            let request = req.clone();
+            let cancel = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancel)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                .map(|chat| chat.expect("active preparation"))
+        }
+        .unwrap();
         let value = "  first\n\n第二行\t \n";
-        let call = format!("<tool_call>{whitespace}<function=todo__todo_write>{whitespace}<parameter=content>\n{value}\n</parameter>{whitespace}</function>{whitespace}</tool_call>");
+        let call = format!(
+            "<tool_call>{whitespace}<function=todo__todo_write>{whitespace}<parameter=content>\n{value}\n</parameter>{whitespace}</function>{whitespace}</tool_call>"
+        );
         let (_, events) = generate(
             &mut model,
             &prepared,
@@ -192,9 +260,11 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
             args,
             vec![json!({"content":value}), json!({"content":value})]
         );
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, SemanticEvent::TextDelta(t) if !t.trim().is_empty())));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SemanticEvent::TextDelta(t) if !t.trim().is_empty()))
+        );
         req.messages.push(json!({"role":"assistant", "content":"", "reasoning_content":"Use the tool.", "tool_calls":[
             {"id":"call_0", "type":"function", "function":{"name":"todo__todo_write", "arguments":args[0]}},
             {"id":"call_1", "type":"function", "function":{"name":"todo__todo_write", "arguments":args[1]}}
@@ -203,13 +273,28 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
             .push(json!({"role":"tool", "tool_call_id":"call_0", "content":"Saved two items."}));
         req.messages
             .push(json!({"role":"tool", "tool_call_id":"call_1", "content":"Saved two items."}));
-        let replay = model.prepare_chat(req).unwrap();
-        assert!(replay
-            .rendered_prompt()
-            .contains(&format!("<parameter=content>\n{value}\n</parameter>")));
-        assert!(replay
-            .rendered_prompt()
-            .contains("<tool_response>\nSaved two items.\n</tool_response>"));
+        let replay = {
+            let request = req;
+            let cancel = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancel)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                .map(|chat| chat.expect("active preparation"))
+        }
+        .unwrap();
+        assert!(
+            replay
+                .rendered_prompt()
+                .contains(&format!("<parameter=content>\n{value}\n</parameter>"))
+        );
+        assert!(
+            replay
+                .rendered_prompt()
+                .contains("<tool_response>\nSaved two items.\n</tool_response>")
+        );
         let (_, answer) = generate(
             &mut model,
             &replay,

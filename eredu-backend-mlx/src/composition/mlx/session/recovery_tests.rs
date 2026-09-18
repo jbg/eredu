@@ -645,7 +645,7 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
         },
     )
     .unwrap();
-    let mut capture = eredu_runtime::capture::CaptureSession::new(plan);
+    let mut capture = eredu_runtime::capture::CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
     let prompt = super::MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap();
     let result = session.submit_prefill_with_observer(
         &backend,
@@ -670,7 +670,7 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
         source.downcast_ref::<CaptureError>(),
         Some(CaptureError::Invalid(_))
     ));
-    assert!(capture.take_step().is_none());
+    assert!(capture.take_shared_step().map(|frame| frame.as_step().clone()).is_none());
     recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
     // A new complete observed forward is allowed after native retirement. Reuse
     // the capture owner too, proving its failed pending transaction was drained.
@@ -685,7 +685,7 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
         .completion
         .wait()
         .unwrap();
-    assert_eq!(capture.take_step().unwrap().prediction_index, 0);
+    assert_eq!(capture.take_shared_step().map(|frame| frame.as_step().clone()).unwrap().prediction_index, 0);
     session
         .submit_token_decode(&backend, 3)
         .unwrap()

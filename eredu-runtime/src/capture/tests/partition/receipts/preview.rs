@@ -29,7 +29,7 @@ fn previews_match_global_prefix_across_strides_permutations_and_source_types() {
                 shape: vec![3, 20],
                 data: data.clone(),
             };
-            let mut ordinary = CaptureSession::new(plan.clone());
+            let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
             ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
             ordinary
                 .observe(&mut Backend::default(), "block.output", &global)

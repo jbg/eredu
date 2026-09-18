@@ -19,6 +19,37 @@ impl From<RawSpanHostOwner> for OriginalHostMetadataCustody {
     fn from(value: RawSpanHostOwner) -> Self { Self { _raw: Accounting::Text(value) } }
 }
 impl OriginalHostMetadataCustody {
+    pub(in crate::working_memory) fn matches_operation(
+        &self,
+        other: &crate::working_memory::operation_custody::Custody,
+    ) -> bool {
+        use crate::working_memory::operation_custody::Custody;
+        match (&self._raw, other) {
+            (Accounting::Text(a), Custody::Text(b)) => b.same_raw_account(a),
+            (Accounting::Speculative(a), Custody::Speculative(b)) => a.same_account(b),
+            (Accounting::Realtime(a), Custody::Realtime(b)) => a.same_account(b),
+            _ => false,
+        }
+    }
+
+    pub(in crate::working_memory) fn operation_origin_control_bytes() -> Option<usize> {
+        use crate::working_memory::{
+            operation_custody::Custody, OriginalRealtimeBudgetCustody,
+            OriginalSpeculativeBudgetCustody, OriginalTextMetadataCustody,
+        };
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(&Self, &Custody)>(),
+            size_of::<(&Accounting, &Custody)>(),
+            size_of::<(&OriginalTextMetadataCustody, &RawSpanHostOwner)>(),
+            size_of::<(&RawSpanHostOwner, &RawSpanHostOwner)>(),
+            size_of::<(&OriginalSpeculativeBudgetCustody, &OriginalSpeculativeBudgetCustody)>(),
+            size_of::<(&OriginalRealtimeBudgetCustody, &OriginalRealtimeBudgetCustody)>(),
+            size_of::<bool>(),
+        ];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
     pub(in crate::working_memory) fn from_realtime(value:crate::working_memory::OriginalRealtimeBudgetCustody)->Self {
         Self{_raw:Accounting::Realtime(value)}
     }

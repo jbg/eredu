@@ -22,15 +22,18 @@ impl ContainsValidator {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("contains");
-        Ok(Box::new(ContainsValidator {
+        let ctx = ctx.new_at_location("contains")?;
+        Ok(ctx.funding().boxed(ContainsValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for ContainsValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -41,6 +44,9 @@ impl<F: Json> Validate<F> for ContainsValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().any(|item| self.node.is_valid(&item, ctx))
@@ -49,7 +55,7 @@ impl<F: Json> Validate<F> for ContainsValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -61,12 +67,9 @@ impl<F: Json> Validate<F> for ContainsValidator<F> {
                 return Ok(());
             }
             let loc = self.node.location();
-            Err(ValidationError::contains(
-                loc.clone(),
-                crate::paths::capture_evaluation_path(tracker, loc),
-                location.into(),
-                instance.to_value(),
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, loc, |_| {
+                Ok(crate::error::ValidationErrorKind::Contains)
+            })
         } else {
             Ok(())
         }
@@ -134,16 +137,19 @@ impl MinContainsValidator {
         schema: &'a Value,
         min_contains: u64,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("minContains");
-        Ok(Box::new(MinContainsValidator {
+        let ctx = ctx.new_at_location("minContains")?;
+        Ok(ctx.funding().boxed(MinContainsValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
             min_contains,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for MinContainsValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -154,6 +160,9 @@ impl<F: Json> Validate<F> for MinContainsValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             let mut matches = 0;
@@ -175,7 +184,7 @@ impl<F: Json> Validate<F> for MinContainsValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -198,12 +207,9 @@ impl<F: Json> Validate<F> for MinContainsValidator<F> {
             }
             if self.min_contains > 0 {
                 let loc = self.node.location();
-                Err(ValidationError::contains(
-                    loc.clone(),
-                    crate::paths::capture_evaluation_path(tracker, loc),
-                    location.into(),
-                    instance.to_value(),
-                ))
+                ctx.diagnostic::<F>(instance, location, tracker, loc, |_| {
+                    Ok(crate::error::ValidationErrorKind::Contains)
+                })
             } else {
                 Ok(())
             }
@@ -228,16 +234,19 @@ impl MaxContainsValidator {
         schema: &'a Value,
         max_contains: u64,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("maxContains");
-        Ok(Box::new(MaxContainsValidator {
+        let ctx = ctx.new_at_location("maxContains")?;
+        Ok(ctx.funding().boxed(MaxContainsValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
             max_contains,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for MaxContainsValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -248,6 +257,9 @@ impl<F: Json> Validate<F> for MaxContainsValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             let mut matches = 0;
@@ -269,7 +281,7 @@ impl<F: Json> Validate<F> for MaxContainsValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -287,24 +299,18 @@ impl<F: Json> Validate<F> for MaxContainsValidator<F> {
                 {
                     matches += 1;
                     if matches > self.max_contains {
-                        return Err(ValidationError::contains(
-                            loc.clone(),
-                            crate::paths::capture_evaluation_path(tracker, loc),
-                            location.into(),
-                            instance.to_value(),
-                        ));
+                        return ctx.diagnostic::<F>(instance, location, tracker, loc, |_| {
+                            Ok(crate::error::ValidationErrorKind::Contains)
+                        });
                     }
                 }
             }
             if matches > 0 {
                 Ok(())
             } else {
-                Err(ValidationError::contains(
-                    loc.clone(),
-                    crate::paths::capture_evaluation_path(tracker, loc),
-                    location.into(),
-                    instance.to_value(),
-                ))
+                ctx.diagnostic::<F>(instance, location, tracker, loc, |_| {
+                    Ok(crate::error::ValidationErrorKind::Contains)
+                })
             }
         } else {
             Ok(())
@@ -334,22 +340,31 @@ impl MinMaxContainsValidator {
         min_contains: u64,
         max_contains: u64,
     ) -> CompilationResult<'a, F> {
-        let min_location = ctx.location().join("minContains");
-        let max_location = ctx.location().join("maxContains");
-        let ctx = ctx.new_at_location("contains");
-        Ok(Box::new(MinMaxContainsValidator {
+        let min_location = ctx
+            .location()
+            .join_with_funding("minContains", ctx.funding())?;
+        let max_location = ctx
+            .location()
+            .join_with_funding("maxContains", ctx.funding())?;
+        let ctx = ctx.new_at_location("contains")?;
+        Ok(ctx.funding().boxed(MinMaxContainsValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
             min_contains,
             max_contains,
             min_location,
             max_location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for MinMaxContainsValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.node)?; source.location(&self.min_location)?; source.location(&self.max_location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.node)?;
+        source.location(&self.min_location)?;
+        source.location(&self.max_location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -359,6 +374,9 @@ impl<F: Json> Validate<F> for MinMaxContainsValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             let mut matches = 0;
@@ -380,7 +398,7 @@ impl<F: Json> Validate<F> for MinMaxContainsValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -397,25 +415,20 @@ impl<F: Json> Validate<F> for MinMaxContainsValidator<F> {
                 {
                     matches += 1;
                     if matches > self.max_contains {
-                        let eval_path =
-                            crate::paths::capture_evaluation_path(tracker, &self.max_location);
-                        return Err(ValidationError::contains(
-                            self.max_location.clone(),
-                            eval_path,
-                            location.into(),
-                            instance.to_value(),
-                        ));
+                        return ctx.diagnostic::<F>(
+                            instance,
+                            location,
+                            tracker,
+                            &self.max_location,
+                            |_| Ok(crate::error::ValidationErrorKind::Contains),
+                        );
                     }
                 }
             }
             if matches < self.min_contains {
-                let eval_path = crate::paths::capture_evaluation_path(tracker, &self.min_location);
-                Err(ValidationError::contains(
-                    self.min_location.clone(),
-                    eval_path,
-                    location.into(),
-                    instance.to_value(),
-                ))
+                ctx.diagnostic::<F>(instance, location, tracker, &self.min_location, |_| {
+                    Ok(crate::error::ValidationErrorKind::Contains)
+                })
             } else {
                 Ok(())
             }
@@ -448,11 +461,11 @@ fn compile_contains<'a, F: Json>(
 ) -> Option<CompilationResult<'a, F>> {
     let min_contains = match map_get_u64(parent, ctx, "minContains").transpose() {
         Ok(n) => n,
-        Err(err) => return Some(Err(err)),
+        Err(err) => return Some(Err(err.into())),
     };
     let max_contains = match map_get_u64(parent, ctx, "maxContains").transpose() {
         Ok(n) => n,
-        Err(err) => return Some(Err(err)),
+        Err(err) => return Some(Err(err.into())),
     };
 
     match (min_contains, max_contains) {

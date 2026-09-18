@@ -2,13 +2,13 @@ use super::*;
 use eredu_core::HostPreparationAuthority;
 
 struct RetiredPlan {
-    plan: std::sync::Weak<AdmittedCapturePlan>,
+    plan: crate::capture::tests::PlanRetirementProbe,
     drops: Arc<AtomicUsize>,
 }
 impl Drop for RetiredPlan {
     fn drop(&mut self) {
         assert!(
-            self.plan.upgrade().is_none(),
+            self.plan.is_retired(),
             "partition plan must retire before custody"
         );
         self.drops.fetch_add(1, Ordering::SeqCst);
@@ -27,7 +27,7 @@ fn existing_partition_work_keeps_late_attached_custody_after_session_retirement(
     assert!(work.global_reserved().host_bytes > 0);
     let drops = Arc::new(AtomicUsize::new(0));
     let authority = HostPreparationAuthority::retain(RetiredPlan {
-        plan: Arc::downgrade(session.plan.legacy_arc().expect("legacy session source")),
+        plan: crate::capture::tests::plan_retirement_probe(&session.plan),
         drops: drops.clone(),
     });
     // Work predates attachment and has its own shared plan reference.

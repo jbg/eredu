@@ -1,12 +1,11 @@
 use super::*;
-use eredu::api::ControlledSpeculativeGenerationError;
 use eredu_core::{BackendFailure, BackendFailureKind, SharedBackendFailure};
 use std::{
     cell::{Cell, RefCell},
     error::Error as _,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -122,9 +121,12 @@ fn controlled_scheduler_transfers_executor_and_sampler_sources_through_actual_dr
         let armed = Armed::new(at, owner, false);
         let mut events = Vec::new();
         let error = model
-            .with_controlled_chat_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                    skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
                     settings,
                     options: Default::default(),
@@ -145,10 +147,7 @@ fn controlled_scheduler_transfers_executor_and_sampler_sources_through_actual_dr
                 },
             )
             .unwrap_err();
-        let ControlledSpeculativeGenerationError::Control(error) = error else {
-            panic!("lost controlled error")
-        };
-        armed.assert_error(&error);
+        armed.assert_error(error.control_failure().expect("retained controlled error"));
         assert_eq!(HOOKS.get(), calls);
         assert!(events.is_empty());
         let drops = armed.drops.clone();
@@ -164,8 +163,11 @@ fn controlled_scheduler_transfers_executor_and_sampler_sources_through_actual_dr
 fn repeated_reseed_errors_keep_sources_and_leave_sampling_and_tokens_unchanged() {
     let (mut model, chat, settings) = setup();
     let baseline = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+            output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
             settings,
             options: Default::default(),
@@ -177,9 +179,12 @@ fn repeated_reseed_errors_keep_sources_and_leave_sampling_and_tokens_unchanged()
     let mut errors = Vec::new();
     let mut final_drops = None;
     let output = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -244,9 +249,12 @@ fn ordinary_speculative_failure_keeps_driver_wrapper_and_both_refused_hook_calls
     let (mut model, chat, settings) = setup();
     let armed = Armed::new("prefill", Owner::Executor, true);
     let error = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -261,14 +269,12 @@ fn ordinary_speculative_failure_keeps_driver_wrapper_and_both_refused_hook_calls
             },
         )
         .unwrap_err();
-    let ControlledSpeculativeGenerationError::Control(SpeculativeControlError::Backend(error)) =
-        error
-    else {
-        panic!("wrong ordinary branch")
+    let Some(SpeculativeControlError::Backend(backend)) = error.control_failure() else {
+        panic!("wrong backend branch")
     };
     assert_eq!(HOOKS.get(), (1, 1));
-    assert_eq!(error.kind(), BackendFailureKind::Other);
-    let wrapped = error
+    assert_eq!(backend.kind(), BackendFailureKind::Other);
+    let wrapped = backend
         .source()
         .unwrap()
         .downcast_ref::<eredu_core::SpeculativeDriverError<MockError>>()

@@ -1336,7 +1336,7 @@ Retry requires native settlement and uses a fresh epoch. The new fallible-input
 entrypoints reject partitioned execution without bounded phase agreement, even
 when the local input is valid; final-commit support alone is insufficient.
 
-`eredu_nn::Error::backend_source` retains the original typed preparation cause.
+`eredu_nn::Error::backend_retained_source` retains the original typed preparation cause.
 This does not establish source preservation for every existing native error
 conversion. Initial native prompt construction and run admission remain part of the
 cold-failure audit. Common run identity and loaded capture integration are now
@@ -4854,9 +4854,9 @@ Public speculative activation plans use a separate loaded contract:
    Admission binds the exact source, selected execution, active overlay and session.
 3. Supply the result in `ControlledSpeculativeOptions.activations`. The existing
    `capture` option still selects one-row sampler observations.
-4. Use `with_controlled_chat_speculative` / `with_controlled_text_speculative`, or
-   continuously deliver steps with `generate_observed_chat_speculative` /
-   `generate_observed_text_speculative`. Both use the same advancement driver.
+4. Use `with_controlled_prepared_chat_speculative` / `with_controlled_managed_plain_text_speculative`, or
+   continuously deliver steps with `generate_observed_prepared_chat_speculative` /
+   `generate_observed_managed_plain_text_speculative`. Both use the same advancement driver.
 
 A scoped controller may drain `take_activation_evidence()` after cancellation or
 a failed action. Those host envelopes retain run/epoch and invocation identity,

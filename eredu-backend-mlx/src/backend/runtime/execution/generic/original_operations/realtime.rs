@@ -47,6 +47,10 @@ impl<U:'static> OriginalOperationPlan<'_,U> {
                 scope_limit: 1,
                 registered_scopes: Cell::new(1),
                 active: Cell::new(true),
+                // These banks are constructed inside one already accepted
+                // speculative/realtime invocation and retire with that owner.
+                entered: Cell::new(true),
+                retirement_failure: Cell::new(None),
             });
             let background = prepared.background.take();
             let bank = Rc::new(Bank {

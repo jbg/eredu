@@ -1,21 +1,18 @@
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 use core::{fmt, mem};
 
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
 
 #[cfg(feature = "syntax")]
-use crate::nfa::thompson::{
-    compiler::{Compiler, Config},
-    error::BuildError,
-};
+use crate::nfa::thompson::compiler::{Compiler, Config};
+use crate::nfa::thompson::error::BuildError;
 use crate::{
     nfa::thompson::builder::Builder,
     util::{
         alphabet::{self, ByteClassSet, ByteClasses},
-        captures::{GroupInfo, GroupInfoError},
+        captures::GroupInfo,
         look::{Look, LookMatcher, LookSet},
-        primitives::{
-            IteratorIndexExt, PatternID, PatternIDIter, SmallIndex, StateID,
-        },
+        primitives::{IteratorIndexExt, PatternID, PatternIDIter, SmallIndex, StateID},
         sparse_set::SparseSet,
     },
 };
@@ -272,28 +269,23 @@ impl NFA {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn always_match() -> NFA {
-        // We could use NFA::new("") here and we'd get the same semantics, but
-        // hand-assembling the NFA (as below) does the same thing with a fewer
-        // number of states. It also avoids needing the 'syntax' feature
-        // enabled.
-        //
-        // Technically all we need is the "match" state, but we add the
-        // "capture" states so that the PikeVM can use this NFA.
-        //
-        // The unwraps below are OK because we add so few states that they will
-        // never exhaust any default limits in any environment.
+        Self::always_match_with_allocations(&Unenforced).expect("always-match NFA allocation")
+    }
+
+    /// Build the same fixed always-match NFA under a prospective policy.
+    pub fn always_match_with_allocations(funding: &dyn Allocation) -> Result<NFA, BuildError> {
         let mut builder = Builder::new();
-        let pid = builder.start_pattern().unwrap();
+        let pid = builder.start_pattern_with_allocations(funding)?;
         assert_eq!(pid.as_usize(), 0);
         let start_id =
-            builder.add_capture_start(StateID::ZERO, 0, None).unwrap();
-        let end_id = builder.add_capture_end(StateID::ZERO, 0).unwrap();
-        let match_id = builder.add_match().unwrap();
-        builder.patch(start_id, end_id).unwrap();
-        builder.patch(end_id, match_id).unwrap();
-        let pid = builder.finish_pattern(start_id).unwrap();
+            builder.add_capture_start_with_allocations(StateID::ZERO, 0, None, funding)?;
+        let end_id = builder.add_capture_end_with_allocations(StateID::ZERO, 0, funding)?;
+        let match_id = builder.add_match_with_allocations(funding)?;
+        builder.patch_with_allocations(start_id, end_id, funding)?;
+        builder.patch_with_allocations(end_id, match_id, funding)?;
+        let pid = builder.finish_pattern(start_id)?;
         assert_eq!(pid.as_usize(), 0);
-        builder.build(start_id, start_id).unwrap()
+        builder.build_with_allocations(start_id, start_id, funding)
     }
 
     /// Returns an NFA that never matches at any position.
@@ -316,11 +308,14 @@ impl NFA {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn never_match() -> NFA {
-        // This always succeeds because it only requires one NFA state, which
-        // will never exhaust any (default) limits.
+        Self::never_match_with_allocations(&Unenforced).expect("never-match NFA allocation")
+    }
+
+    /// Build the same zero-pattern NFA under a prospective policy.
+    pub fn never_match_with_allocations(funding: &dyn Allocation) -> Result<NFA, BuildError> {
         let mut builder = Builder::new();
-        let sid = builder.add_fail().unwrap();
-        builder.build(sid, sid).unwrap()
+        let sid = builder.add_fail_with_allocations(funding)?;
+        builder.build_with_allocations(sid, sid, funding)
     }
 
     /// Return a default configuration for an `NFA`.
@@ -1170,8 +1165,8 @@ impl NFA {
         use core::mem::size_of;
 
         size_of::<Inner>() // allocated on the heap via Arc
-            + self.0.states.len() * size_of::<State>()
-            + self.0.start_pattern.len() * size_of::<StateID>()
+            + self.0.states.capacity() * size_of::<State>()
+            + self.0.start_pattern.capacity() * size_of::<StateID>()
             + self.0.group_info.memory_usage()
             + self.0.memory_extra
     }
@@ -1191,7 +1186,6 @@ impl fmt::Debug for NFA {
 /// NFA before finalizing it, but the high level construction process is
 /// controlled by the builder abstraction. (Which is complicated enough to
 /// get its own module.)
-#[derive(Default)]
 pub(super) struct Inner {
     /// The state sequence. This sequence is guaranteed to be indexable by all
     /// starting state IDs, and it is also guaranteed to contain at most one
@@ -1268,14 +1262,39 @@ pub(super) struct Inner {
 }
 
 impl Inner {
+    pub(super) fn new(group_info: GroupInfo) -> Self {
+        Self {
+            states: Vec::new(),
+            start_anchored: StateID::ZERO,
+            start_unanchored: StateID::ZERO,
+            start_pattern: Vec::new(),
+            group_info,
+            byte_class_set: ByteClassSet::default(),
+            byte_classes: ByteClasses::default(),
+            has_capture: false,
+            has_empty: false,
+            utf8: false,
+            reverse: false,
+            look_matcher: LookMatcher::default(),
+            look_set_any: LookSet::empty(),
+            look_set_prefix_any: LookSet::empty(),
+            memory_extra: 0,
+        }
+    }
+    pub(super) fn reserve_states(
+        &mut self,
+        count: usize,
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
+        allocation.grow(&mut self.states, count)
+    }
+
     /// Runs any last finalization bits and turns this into a full NFA.
-    pub(super) fn into_nfa(mut self) -> NFA {
+    pub(super) fn into_nfa(mut self, allocation: Allocator<'_>) -> Result<NFA, AllocationError> {
         let mut stack = vec![];
-        let mut seen = SparseSet::new(self.states.len());
-        self.finalize_properties(&mut stack, &mut seen);
-        self.states.shrink_to_fit();
-        self.start_pattern.shrink_to_fit();
-        NFA(Arc::new(self))
+        let mut seen = SparseSet::new_with_allocations(self.states.len(), allocation.policy())?;
+        self.finalize_properties(&mut stack, &mut seen, allocation)?;
+        Ok(NFA(allocation.arc(self)?))
     }
 
     // Same property walk for ordinary construction and the closed source
@@ -1284,13 +1303,14 @@ impl Inner {
         &mut self,
         stack: &mut Vec<StateID>,
         seen: &mut SparseSet,
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         self.byte_classes = self.byte_class_set.byte_classes();
         // Do epsilon closure from the start state of every pattern in order
         // to compute various properties such as look-around assertions and
         // whether the empty string can be matched.
         for &start_id in self.start_pattern.iter() {
-            stack.push(start_id);
+            allocation.push(stack, start_id)?;
             seen.clear();
             // let mut prefix_all = LookSet::full();
             let mut prefix_any = LookSet::empty();
@@ -1299,9 +1319,7 @@ impl Inner {
                     continue;
                 }
                 match self.states[sid] {
-                    State::ByteRange { .. }
-                    | State::Dense { .. }
-                    | State::Fail => continue,
+                    State::ByteRange { .. } | State::Dense { .. } | State::Fail => continue,
                     State::Sparse(_) => {
                         // This snippet below will rewrite this sparse state
                         // as a dense state. By doing it here, we apply this
@@ -1330,27 +1348,27 @@ impl Inner {
                     State::Match { .. } => self.has_empty = true,
                     State::Look { look, next } => {
                         prefix_any = prefix_any.insert(look);
-                        stack.push(next);
+                        allocation.push(stack, next)?;
                     }
                     State::Union { ref alternates } => {
                         // Order doesn't matter here, since we're just dealing
                         // with look-around sets. But if we do richer analysis
                         // here that needs to care about preference order, then
                         // this should be done in reverse.
-                        stack.extend(alternates.iter());
+                        allocation.extend_copy(stack, alternates)?;
                     }
                     State::BinaryUnion { alt1, alt2 } => {
-                        stack.push(alt2);
-                        stack.push(alt1);
+                        allocation.push(stack, alt2)?;
+                        allocation.push(stack, alt1)?;
                     }
                     State::Capture { next, .. } => {
-                        stack.push(next);
+                        allocation.push(stack, next)?;
                     }
                 }
             }
-            self.look_set_prefix_any =
-                self.look_set_prefix_any.union(prefix_any);
+            self.look_set_prefix_any = self.look_set_prefix_any.union(prefix_any);
         }
+        Ok(())
     }
 
     /// Returns the capturing group info for this NFA.
@@ -1383,14 +1401,16 @@ impl Inner {
             State::Capture { .. } => {
                 self.has_capture = true;
             }
-            State::Union { .. }
-            | State::BinaryUnion { .. }
-            | State::Fail
-            | State::Match { .. } => {}
+            State::Union { .. } | State::BinaryUnion { .. } | State::Fail | State::Match { .. } => {
+            }
         }
 
         let id = StateID::new(self.states.len()).unwrap();
         self.memory_extra += state.memory_usage();
+        assert!(
+            self.states.len() < self.states.capacity(),
+            "original NFA states were reserved before construction"
+        );
         self.states.push(state);
         id
     }
@@ -1406,10 +1426,12 @@ impl Inner {
         start_anchored: StateID,
         start_unanchored: StateID,
         start_pattern: &[StateID],
-    ) {
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         self.start_anchored = start_anchored;
         self.start_unanchored = start_unanchored;
-        self.start_pattern = start_pattern.to_vec();
+        self.start_pattern = allocation.copy_slice(start_pattern)?;
+        Ok(())
     }
 
     /// Sets the UTF-8 mode of this NFA.
@@ -1425,26 +1447,6 @@ impl Inner {
     /// Sets the look-around assertion matcher for this NFA.
     pub(super) fn set_look_matcher(&mut self, m: LookMatcher) {
         self.look_matcher = m;
-    }
-
-    /// Set the capturing groups for this NFA.
-    ///
-    /// The given slice should contain the capturing groups for each pattern,
-    /// The capturing groups in turn should correspond to the total number of
-    /// capturing groups in the pattern, including the anonymous first capture
-    /// group for each pattern. If a capturing group does have a name, then it
-    /// should be provided as a Arc<str>.
-    ///
-    /// This returns an error if a corresponding `GroupInfo` could not be
-    /// built.
-    pub(super) fn set_captures(
-        &mut self,
-        captures: &[Vec<Option<Arc<str>>>],
-    ) -> Result<(), GroupInfoError> {
-        self.group_info = GroupInfo::new(
-            captures.iter().map(|x| x.iter().map(|y| y.as_ref())),
-        )?;
-        Ok(())
     }
 
     /// Remap the transitions in every state of this NFA using the given map.
@@ -1490,11 +1492,7 @@ impl fmt::Debug for Inner {
             }
         }
         writeln!(f)?;
-        writeln!(
-            f,
-            "transition equivalence classes: {:?}",
-            self.byte_classes,
-        )?;
+        writeln!(f, "transition equivalence classes: {:?}", self.byte_classes,)?;
         writeln!(f, ")")?;
         Ok(())
     }
@@ -1691,9 +1689,7 @@ impl State {
                 transitions.len() * mem::size_of::<Transition>()
             }
             State::Dense { .. } => 256 * mem::size_of::<StateID>(),
-            State::Union { ref alternates } => {
-                alternates.len() * mem::size_of::<StateID>()
-            }
+            State::Union { ref alternates } => alternates.len() * mem::size_of::<StateID>(),
         }
     }
 
@@ -1705,15 +1701,17 @@ impl State {
     /// its intermediate NFA into the final NFA.
     fn remap(&mut self, remap: &[StateID]) {
         match *self {
-            State::ByteRange { ref mut trans } => {
-                trans.next = remap[trans.next]
-            }
-            State::Sparse(SparseTransitions { ref mut transitions }) => {
+            State::ByteRange { ref mut trans } => trans.next = remap[trans.next],
+            State::Sparse(SparseTransitions {
+                ref mut transitions,
+            }) => {
                 for t in transitions.iter_mut() {
                     t.next = remap[t.next];
                 }
             }
-            State::Dense(DenseTransitions { ref mut transitions }) => {
+            State::Dense(DenseTransitions {
+                ref mut transitions,
+            }) => {
                 for sid in transitions.iter_mut() {
                     *sid = remap[*sid];
                 }
@@ -1724,7 +1722,10 @@ impl State {
                     *alt = remap[*alt];
                 }
             }
-            State::BinaryUnion { ref mut alt1, ref mut alt2 } => {
+            State::BinaryUnion {
+                ref mut alt1,
+                ref mut alt2,
+            } => {
                 *alt1 = remap[*alt1];
                 *alt2 = remap[*alt2];
             }
@@ -1769,14 +1770,14 @@ impl fmt::Debug for State {
                 write!(f, "union({alts})")
             }
             State::BinaryUnion { alt1, alt2 } => {
-                write!(
-                    f,
-                    "binary-union({}, {})",
-                    alt1.as_usize(),
-                    alt2.as_usize()
-                )
+                write!(f, "binary-union({}, {})", alt1.as_usize(), alt2.as_usize())
             }
-            State::Capture { next, pattern_id, group_index, slot } => {
+            State::Capture {
+                next,
+                pattern_id,
+                group_index,
+                slot,
+            } => {
                 write!(
                     f,
                     "capture(pid={:?}, group={:?}, slot={:?}) => {:?}",
@@ -1827,10 +1828,7 @@ impl SparseTransitions {
     /// `haystack`. If the given alphabet unit is [`EOI`](alphabet::Unit::eoi),
     /// then this always returns `None`.
     #[inline]
-    pub(crate) fn matches_unit(
-        &self,
-        unit: alphabet::Unit,
-    ) -> Option<StateID> {
+    pub(crate) fn matches_unit(&self, unit: alphabet::Unit) -> Option<StateID> {
         unit.as_u8().and_then(|byte| self.matches_byte(byte))
     }
 
@@ -1916,10 +1914,7 @@ impl DenseTransitions {
     /// If the given alphabet unit is [`EOI`](alphabet::Unit::eoi), then
     /// this returns `None`.
     #[inline]
-    pub(crate) fn matches_unit(
-        &self,
-        unit: alphabet::Unit,
-    ) -> Option<StateID> {
+    pub(crate) fn matches_unit(&self, unit: alphabet::Unit) -> Option<StateID> {
         unit.as_u8().and_then(|byte| self.matches_byte(byte))
     }
 
@@ -2107,6 +2102,23 @@ mod tests {
     }
 }
 
-/// Checked construction of the pinned anonymous source profile.
-#[cfg(feature = "nfa-pikevm")]
-pub mod source;
+impl NFA {
+    /// Visit actual immutable backing, preserving shared GroupInfo identity.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        use crate::util::source_storage as storage;
+        if !storage::arc(&self.0, 0, visitor)? { return Ok(()); }
+        if storage::vector(&self.0.states, visitor) {
+            for state in &self.0.states {
+                match state {
+                    State::Sparse(SparseTransitions { transitions }) => { storage::boxed(transitions, visitor); }
+                    State::Dense(DenseTransitions { transitions }) => { storage::boxed(transitions, visitor); }
+                    State::Union { alternates } => { storage::boxed(alternates, visitor); }
+                    State::ByteRange { .. } | State::Look { .. } | State::BinaryUnion { .. } |
+                    State::Capture { .. } | State::Fail | State::Match { .. } => {}
+                }
+            }
+        }
+        storage::vector(&self.0.start_pattern, visitor);
+        self.0.group_info.visit_source_storage(visitor)
+    }
+}

@@ -124,7 +124,7 @@ impl OwnedGroupCpuCompletionLayoutStorage {
     /// recomputes every constructor/Eval and completion population before use.
     pub fn bind_actual_in_group<'a>(&'a self,group:&'a Group,input:&'a Array)
         ->std::result::Result<GroupCpuCompletionStorage<'a>,GroupStorageUnavailable> {
-        let operation=self.operation.view_with_group(group)?.bind_actual(input)?;
+        let operation=self.operation.view_with_group(group)?.bind_actual(input).map_err(|_|GroupStorageUnavailable)?;
         let actual=operation.with_completion_storage()?;
         if !matches(&actual,self.traversal,&self.native) {return Err(GroupStorageUnavailable);}
         Ok(actual)

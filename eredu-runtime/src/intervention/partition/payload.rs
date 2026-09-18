@@ -1,6 +1,6 @@
 //! One row-major payload projection, shared by ordinary and prepaid windows.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 mod columns;
 
@@ -19,7 +19,7 @@ enum Cause {
     #[error(transparent)]
     Geometry(#[from] WindowInterventionPayloadError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Metadata(#[from] eredu_nn::Error),
     #[error(transparent)]
@@ -31,14 +31,14 @@ enum Cause {
 pub struct PreparedWindowInterventionPayloadError {
     #[source]
     cause: Cause,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 /// Immutable local payload storage; this carries no source, phase or native grant.
 /// Nonpayload actions continue to be borrowed from the enclosing immutable C.
 #[derive(Debug)]
 pub struct PreparedWindowInterventionPayload {
     action: Option<InterventionAction>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedWindowInterventionPayload {
     /// Copy only the selected payload values using the ordinary projection worker.
@@ -47,7 +47,7 @@ impl PreparedWindowInterventionPayload {
     pub fn prepare(
         action: &InterventionAction,
         destination: &ResolvedCaptureSlice,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, PreparedWindowInterventionPayloadError> {
         let result: Result<Option<InterventionAction>, Cause> = (|| {
             funding.reserve_metadata(
@@ -79,15 +79,15 @@ impl PreparedWindowInterventionPayload {
             size_of::<PreparedWindowInterventionPayloadError>(),
             size_of::<Cause>(),
             size_of::<WindowInterventionPayloadError>(),
-            size_of::<WorkspaceMetadataFundingError>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFundingError>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Paid<'_>>(),
             size_of::<Result<Self, PreparedWindowInterventionPayloadError>>(),
             size_of::<Result<Option<InterventionAction>, Cause>>(),
             size_of::<(
                 &InterventionAction,
                 &ResolvedCaptureSlice,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<(&InterventionAction, &ResolvedCaptureSlice, &mut Paid<'_>)>(),
             size_of::<Option<InterventionAction>>(),
@@ -98,9 +98,9 @@ impl PreparedWindowInterventionPayload {
             size_of::<(
                 &InterventionAction,
                 &ResolvedCaptureSlice,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Option<usize>>(),
             size_of::<usize>(),
             copy_controls::<f32>(),
@@ -149,7 +149,7 @@ impl From<WindowInterventionPayloadError> for CaptureError {
         }
     }
 }
-struct Paid<'a>(&'a WorkspaceMetadataFunding);
+struct Paid<'a>(&'a HostMetadataFunding);
 impl Allocation for Paid<'_> {
     type Error = Cause;
     fn vector<T>(&mut self, capacity: usize) -> Result<Vec<T>, Cause> {
@@ -281,3 +281,5 @@ fn select_payload<T: Copy, A: Allocation>(
 }
 #[cfg(test)]
 mod tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

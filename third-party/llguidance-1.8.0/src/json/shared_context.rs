@@ -1,5 +1,6 @@
-use crate::{json::schema::OptSchemaExt, regex_to_lark, HashMap, HashSet};
-use anyhow::{anyhow, bail, Result};
+use crate::{json::schema::OptSchemaExt, regex_to_lark};
+use derivre::{SourceHashMap as HashMap, ParserAllocationFunding};
+use derivre::{ParserResult as Result, ParserError, parser_error as anyhow, parser_bail as bail, parser_ensure as ensure};
 use derivre::{Regex, RegexAst, RegexBuilder};
 
 use super::{
@@ -13,60 +14,64 @@ pub struct SharedContext {
     n_compiled: usize,
     pending_warnings: Vec<String>,
     pattern_cache: PatternPropertyCache,
+    funding: ParserAllocationFunding,
 }
 
-#[derive(Default)]
 pub struct PatternPropertyCache {
     inner: HashMap<String, Regex>,
+    funding: ParserAllocationFunding,
 }
+
+type HashSet<T> = hashbrown::HashSet<T, derivre::RandomState>;
 
 const CHECK_LIMIT: u64 = 10_000;
 
 impl PatternPropertyCache {
+    pub fn new(funding: ParserAllocationFunding) -> Self { Self { inner: HashMap::default(), funding } }
     pub fn is_match(&mut self, regex: &str, value: &str) -> Result<bool> {
-        let lark_regex = regex_to_lark(regex, "dw");
+        let lark_regex = self.funding.try_format(format_args!("{}", regex_to_lark(regex, "dw")))?;
         if let Some(cached_regex) = self.inner.get_mut(lark_regex.as_str()) {
-            return Ok(cached_regex.is_match(value));
+            return cached_regex.is_match(value);
         }
 
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(self.funding.clone())?;
         let eref = builder.mk_regex_for_serach(lark_regex.as_str())?;
         let mut rx = builder.to_regex_limited(eref, CHECK_LIMIT)?;
-        let res = rx.is_match(value);
-        self.inner.insert(lark_regex, rx);
+        let res = rx.is_match(value)?;
+        self.funding.try_insert(&mut self.inner, lark_regex, rx)?;
         Ok(res)
     }
 
     pub fn check_disjoint(&mut self, regexes: &[&String]) -> Result<()> {
         // TODO cache something?
-        let mut builder = RegexBuilder::new();
-        let erefs = regexes
-            .iter()
-            .map(|regex| {
-                let regex = regex_to_lark(regex, "dw");
-                builder.mk_regex_for_serach(regex.as_str())
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut builder = RegexBuilder::new(self.funding.clone())?;
+        let mut erefs = Vec::new();
+        for regex in regexes {
+            let regex = self.funding.try_format(format_args!("{}", regex_to_lark(regex, "dw")))?;
+            let expr = builder.mk_regex_for_serach(&regex)?;
+            self.funding.try_push(&mut erefs, expr)?;
+        }
         for (ai, a) in erefs.iter().enumerate() {
             for (bi, b) in erefs.iter().enumerate() {
                 if ai >= bi {
                     continue;
                 }
-                let intersect = builder.mk(&RegexAst::And(vec![
-                    RegexAst::ExprRef(*a),
-                    RegexAst::ExprRef(*b),
-                ]))?;
+                let mut args = Vec::new();
+                self.funding.try_push(&mut args, RegexAst::ExprRef(*a))?;
+                self.funding.try_push(&mut args, RegexAst::ExprRef(*b))?;
+                let intersect = builder.mk(&RegexAst::And(args))?;
                 let mut rx = builder
                     .to_regex_limited(intersect, CHECK_LIMIT)
-                    .map_err(|_| {
-                        anyhow!(
+                    .map_err(|error| {
+                        if crate::earley::is_grammar_storage_failure(&error) { return error; }
+                        anyhow!(&self.funding,
                             "can't determine if patternProperty regexes /{}/ and /{}/ are disjoint",
                             regex_to_lark(regexes[ai], ""),
                             regex_to_lark(regexes[bi], "")
                         )
                     })?;
                 if !rx.always_empty() {
-                    return Err(anyhow!(
+                    return Err(anyhow!(&self.funding,
                         "patternProperty regexes /{}/ and /{}/ are not disjoint",
                         regex_to_lark(regexes[ai], ""),
                         regex_to_lark(regexes[bi], "")
@@ -94,31 +99,33 @@ impl PatternPropertyCache {
 }
 
 impl SharedContext {
-    pub fn new() -> Self {
+    pub fn new(funding: ParserAllocationFunding) -> Self {
         SharedContext {
             defs: HashMap::default(),
             seen: HashSet::default(),
             n_compiled: 0,
             pending_warnings: Vec::new(),
-            pattern_cache: PatternPropertyCache::default(),
+            pattern_cache: PatternPropertyCache::new(funding.clone()),
+            funding,
         }
     }
 }
 
 impl Context<'_> {
-    pub fn insert_ref(&self, uri: &str, schema: Schema) {
-        self.shared
-            .borrow_mut()
-            .defs
-            .insert(uri.to_string(), schema);
+    pub fn insert_ref(&self, uri: &str, schema: Schema) -> Result<()> {
+        let mut shared = self.shared.borrow_mut();
+        self.funding.try_insert(&mut shared.defs, self.funding.try_copy_str(uri)?, schema)?;
+        Ok(())
     }
 
-    pub fn get_ref_cloned(&self, uri: &str) -> Option<Schema> {
-        self.shared.borrow().defs.get(uri).cloned()
+    pub fn get_ref_cloned(&self, uri: &str) -> Result<Option<Schema>> {
+        self.shared.borrow().defs.get(uri).map(|schema| schema.copy_with_funding(&self.funding)).transpose()
     }
 
-    pub fn mark_seen(&self, uri: &str) {
-        self.shared.borrow_mut().seen.insert(uri.to_string());
+    pub fn mark_seen(&self, uri: &str) -> Result<()> {
+        let mut shared = self.shared.borrow_mut();
+        self.funding.try_insert_set(&mut shared.seen, self.funding.try_copy_str(uri)?)?;
+        Ok(())
     }
 
     pub fn been_seen(&self, uri: &str) -> bool {
@@ -139,13 +146,14 @@ impl Context<'_> {
         let mut shared = self.shared.borrow_mut();
         shared.n_compiled += 1;
         if shared.n_compiled > self.options.max_size {
-            bail!("schema too large");
+            bail!(&self.funding, "schema too large");
         }
         Ok(())
     }
 
-    pub fn record_warning(&self, msg: String) {
-        self.shared.borrow_mut().pending_warnings.push(msg);
+    pub fn record_warning(&self, msg: String) -> Result<()> {
+        self.funding.try_push(&mut self.shared.borrow_mut().pending_warnings, msg)?;
+        Ok(())
     }
 
     pub fn property_schema<'a>(&self, obj: &'a ObjectSchema, prop: &str) -> Result<&'a Schema> {
@@ -175,7 +183,7 @@ impl Context<'_> {
             schema,
             definitions: std::mem::take(&mut shared.defs),
             warnings: std::mem::take(&mut shared.pending_warnings),
-            pattern_cache: std::mem::take(&mut shared.pattern_cache),
+            pattern_cache: std::mem::replace(&mut shared.pattern_cache, PatternPropertyCache::new(self.funding.clone())),
         }
     }
 }
@@ -188,12 +196,12 @@ pub struct BuiltSchema {
 }
 
 impl BuiltSchema {
-    pub fn simple(schema: Schema) -> Self {
+    pub fn simple(schema: Schema, funding: ParserAllocationFunding) -> Self {
         BuiltSchema {
             schema,
             definitions: HashMap::default(),
             warnings: Vec::new(),
-            pattern_cache: PatternPropertyCache::default(),
+            pattern_cache: PatternPropertyCache::new(funding),
         }
     }
 }

@@ -16,8 +16,8 @@ pub(super) fn tiny_config(skip_norm: bool) -> serde_json::Value {
 // This deliberately does not call the production alias planner.
 pub(super) struct FixtureAliases;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for FixtureAliases {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         let Some((layer, suffix)) = name
             .strip_prefix("model.layers.")
             .and_then(|s| s.split_once('.'))
@@ -208,7 +208,7 @@ fn nanbeige_prepared_session_and_block_streaming_share_checkpoint_values_and_sta
         execute_numeric_replicated_inspection(&inspection, &bound_context, &tokens, None);
     assert_eq!(last_reference_stage_evidence().family, "nanbeige");
     let model = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let parameters = model.parameter_description(&context).unwrap();
+    let parameters = model.parameter_description(&context).unwrap().into_owned();
     assert_eq!(parameters.unit_layout().group_range(0).unwrap().len(), 4);
     let mut streamed = LayerwiseRuntime::new(model, FixturePolicy::default());
     let mut state =

@@ -1,9 +1,7 @@
 //! Exact native representation dispatch; no conversion or extra prompt claim.
 use super::super::{
     hybrid::{
-        InitializedHybridDenseGroup, PreparedDenseHybridGroupedState, PreparedDenseHybridKvState,
-        PublishedDenseHybridGroupedState, PublishedDenseHybridKvState,
-    },
+        InitializedHybridDenseGroup, PreparedDenseHybridGroupedState, PublishedDenseHybridGroupedState, },
     key_value::{
         InitializedPagedDenseCopy, PreparedDenseResidentKvState, PublishedDenseResidentKvState,
     },
@@ -27,7 +25,6 @@ fn other(e: impl std::error::Error + Send + Sync + 'static) -> Error {
 pub(crate) enum PreparedResidentDenseCopy<'a> {
     Paged(PreparedPagedKvCopy<'a>),
     KeyValue(PreparedResidentKvCopy<'a>),
-    HybridKvOnly(PreparedHybridKvCopy<'a>),
     HybridGrouped(PreparedHybridGroupedCopy<'a>),
     Pooling(PreparedResidentPoolingCopy<'a>),
 }
@@ -46,7 +43,7 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         use crate::backend::runtime::cache::state::snapshot_estimate;
         let state_bytes = match self {
             Self::KeyValue(_) | Self::Paged(_) => std::mem::size_of::<MlxKeyValueState>(),
-            Self::HybridKvOnly(_) | Self::HybridGrouped(_) => std::mem::size_of::<MlxHybridState>(),
+            Self::HybridGrouped(_) => std::mem::size_of::<MlxHybridState>(),
             Self::Pooling(_) => std::mem::size_of::<MlxPoolingAttentionState>(),
         };
         let mut total = snapshot_estimate::state_metadata(
@@ -94,7 +91,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         match self {
             Self::Paged(p) => p.shared_layout(),
             Self::KeyValue(p) => p.shared_layout(),
-            Self::HybridKvOnly(p) => p.shared_layout(),
             Self::HybridGrouped(p) => p.shared_layout(),
             Self::Pooling(p) => p.shared_layout(),
         }
@@ -131,7 +127,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
                 });
             }
             Self::KeyValue(p) => p.visit_operands(visitor),
-            Self::HybridKvOnly(p) => p.visit_operands(visitor),
             Self::HybridGrouped(p) => {
                 if p.is_paged(){return p.visit_paged_arrays(visitor);}
                 p.visit_operands(visitor)
@@ -152,7 +147,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
                 });
             }
             Self::KeyValue(p) => p.visit_operands(visitor),
-            Self::HybridKvOnly(p) => p.visit_operands(visitor),
             Self::HybridGrouped(p) => {
                 if p.is_paged(){return p.visit_paged_arrays(visitor);}
                 p.visit_retained_arrays(visitor)
@@ -170,7 +164,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
                 .dense_host_copy(pool)
                 .map_err(other)?
                 .initialization_peak_bytes()),
-            Self::HybridKvOnly(p) => Ok(p.dense_host_copy(pool)?.initialization_peak_bytes()),
             Self::HybridGrouped(p) => Ok(p.dense_host_copy(pool)?.initialization_peak_bytes()),
             Self::Pooling(p) => Ok(p
                 .dense_host_copy(pool)
@@ -184,7 +177,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         match self {
             Self::Paged(p) => p.dense_initialization_peak_bytes_fixed(),
             Self::KeyValue(p) => p.dense_initialization_peak_bytes_fixed(),
-            Self::HybridKvOnly(p) => p.dense_initialization_peak_bytes_fixed(),
             Self::HybridGrouped(p) => p.dense_initialization_peak_bytes_fixed(),
             Self::Pooling(p) => p.dense_initialization_peak_bytes_fixed(),
         }
@@ -198,7 +190,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         let registered = match self {
             Self::Paged(p) => p.registered_source_tables(),
             Self::KeyValue(p) => p.registered_source_tables(),
-            Self::HybridKvOnly(p) => p.registered_source_tables(),
             Self::HybridGrouped(p) => p.registered_source_tables().map_err(|e| match e {
                 WorkingMemoryError::Overflow => E::Overflow,
                 _ => E::UnknownBound,
@@ -208,7 +199,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         let tables = match self {
             Self::Paged(p) => p.dense_host_preparation_bytes()?,
             Self::KeyValue(p) => p.dense_host_preparation_bytes()?,
-            Self::HybridKvOnly(p) => p.dense_host_preparation_bytes()?,
             Self::HybridGrouped(p) => p.dense_host_preparation_bytes()?,
             Self::Pooling(p) => p.dense_host_preparation_bytes()?,
         };
@@ -296,16 +286,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
                     .map_err(other)?;
                 Ok((InitializedDenseResidentCopy::KeyValue(slots), native))
             }
-            Self::HybridKvOnly(p) => {
-                let (slots, native) = stage
-                    .construct_dense_decoder(
-                        p.dense_host_copy_with_preparation(pool, host)?,
-                        funding,
-                        complete,
-                    )
-                    .map_err(other)?;
-                Ok((InitializedDenseResidentCopy::HybridKvOnly(slots), native))
-            }
             Self::Pooling(p) => {
                 let (slots, native) = stage
                     .construct_dense_decoder(
@@ -338,16 +318,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         roots: &RefCell<Vec<Array>>,
         observe: &mut dyn FnMut(&Array) -> Result<(), Error>,
     ) -> Result<PreparedDenseResidentState<'a>, Error> {
-        self.copy_dense_retained_with_preparation(slots, stream, roots, observe, None)
-    }
-    pub(crate) fn copy_dense_retained_with_preparation(
-        self,
-        slots: InitializedDenseResidentCopy<'a>,
-        stream: &Stream,
-        roots: &RefCell<Vec<Array>>,
-        observe: &mut dyn FnMut(&Array) -> Result<(), Error>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
-    ) -> Result<PreparedDenseResidentState<'a>, Error> {
         match (self, slots) {
             (Self::Paged(p), InitializedDenseResidentCopy::Paged(s)) => p
                 .copy_dense_retained_with(s, stream, roots, observe)
@@ -356,9 +326,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
                 .copy_dense_retained(s, stream, roots)
                 .map(PreparedDenseResidentState::KeyValue)
                 .map_err(other),
-            (Self::HybridKvOnly(p), InitializedDenseResidentCopy::HybridKvOnly(s)) => p
-                .copy_dense_retained_with_preparation(s, stream, roots, host)
-                .map(PreparedDenseResidentState::HybridKvOnly),
             (Self::HybridGrouped(p), InitializedDenseResidentCopy::HybridGrouped(s)) => p
                 .copy_dense_retained_with(s, stream, roots, observe)
                 .map(PreparedDenseResidentState::HybridGrouped),
@@ -385,14 +352,6 @@ impl<'a> PreparedResidentDenseCopy<'a> {
             }
             Self::KeyValue(p) => {
                 let p = p.project_dense_workspace(batch, context).map_err(other)?;
-                Ok(ProjectedDenseResidentCopy {
-                    state: p.state,
-                    source_storage: p.source_storage,
-                    copy: p.copy,
-                })
-            }
-            Self::HybridKvOnly(p) => {
-                let p = p.project_dense_workspace(batch, context)?;
                 Ok(ProjectedDenseResidentCopy {
                     state: p.state,
                     source_storage: p.source_storage,
@@ -442,14 +401,10 @@ pub(crate) enum InitializedDenseResidentCopy<'a> {
             StorageIdentity,
         >,
     ),
-    HybridKvOnly(
-        InitializedDenseDecoderSlots<'a, MlxHybridLayerState, MlxHybridLayerState, StorageIdentity>,
-    ),
 }
 pub(crate) enum PreparedDenseResidentState<'a> {
     Paged(PreparedDenseResidentKvState<'a>),
     KeyValue(PreparedDenseResidentKvState<'a>),
-    HybridKvOnly(PreparedDenseHybridKvState<'a>),
     HybridGrouped(PreparedDenseHybridGroupedState<'a>),
     Pooling(PreparedDenseResidentPoolingState<'a>),
 }
@@ -457,7 +412,6 @@ impl PreparedDenseResidentState<'_> {
     pub(crate) fn slot_metadata(&self) -> &HostSlotMetadata {
         match self {
             Self::Paged(p) | Self::KeyValue(p) => p.slot_metadata(),
-            Self::HybridKvOnly(p) => p.slot_metadata(),
             Self::HybridGrouped(p) => p.slot_metadata(),
             Self::Pooling(p) => p.slot_metadata(),
         }
@@ -469,7 +423,6 @@ impl PreparedDenseResidentState<'_> {
         match self {
             Self::Paged(p) => return p.visit_paged_operands(visitor),
             Self::KeyValue(p) => p.visit_operands(visitor),
-            Self::HybridKvOnly(p) => p.visit_operands(visitor),
             Self::HybridGrouped(p) => return p.visit_complete_operands(visitor),
             Self::Pooling(p) => p.visit_operands(visitor),
         }
@@ -504,16 +457,6 @@ impl<'a> PreparedDenseResidentState<'a> {
                         error,
                     }
                 }),
-            Self::HybridKvOnly(p) => p
-                .publish_for_control()
-                .map(|(s, c)| (PublishedResidentDecoderState::HybridKvOnly(s), c))
-                .map_err(|e| {
-                    let (p, error) = e.into_parts();
-                    DenseResidentPublishError {
-                        owner: Self::HybridKvOnly(p),
-                        error,
-                    }
-                }),
             Self::Pooling(p) => p
                 .publish_for_control()
                 .map(|(s, c)| (PublishedResidentDecoderState::Pooling(s), c))
@@ -541,7 +484,6 @@ impl<'a> PreparedDenseResidentState<'a> {
 /// This grants neither settled native values nor runnable session authority.
 pub(crate) enum PublishedResidentDecoderState {
     KeyValue(PublishedDenseResidentKvState),
-    HybridKvOnly(PublishedDenseHybridKvState),
     HybridGrouped(PublishedDenseHybridGroupedState),
     Pooling(PublishedDenseResidentPoolingState),
 }
@@ -551,7 +493,6 @@ impl PublishedResidentDecoderState {
         visitor: &mut dyn FnMut(&HostSlotMetadata) -> Result<(), Error>,
     ) -> Result<(), Error> {
         match self {
-            Self::HybridKvOnly(state) => state.visit_empty_child_metadata(visitor),
             Self::HybridGrouped(state) => state.visit_registered_child_metadata(visitor),
             Self::KeyValue(_) | Self::Pooling(_) => Ok(()),
         }

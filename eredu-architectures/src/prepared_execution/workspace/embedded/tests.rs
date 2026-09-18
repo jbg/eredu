@@ -152,6 +152,7 @@ fn selected_embedded_target_keeps_hidden_without_scores_and_does_not_materialize
             .quote_embedded_target_invocation(
                 workspace,
                 WorkspaceDtype::Uint32,
+                None,
                 &state,
                 &context,
                 None,

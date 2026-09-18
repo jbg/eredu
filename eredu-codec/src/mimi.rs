@@ -22,7 +22,7 @@ use eredu_checkpoint::{
 };
 use eredu_nn::{
     AttentionMask, Index, LayerNorm, Linear, LinearSpec, NeuralBackend, PadMode, Parameter,
-    ParameterId, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    ParameterId, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     Parameterized, Rope, Tensor,
 };
 use eredu_runtime::{
@@ -200,7 +200,7 @@ impl<T: Tensor> Mimi<T> {
     /// Creates an unloaded Mimi tokenizer from config.
     pub fn new(config: Config, context: &T::Context) -> Result<Self, Error> {
         config.validate()?;
-        Ok(Self {
+        let mut model = Self {
             quantizer: SplitResidualVectorQuantizer::unloaded(&config, context)?,
             encoder: SeaNetEncoder::unloaded(context)?,
             encoder_transformer: MimiTransformer::unloaded(context)?,
@@ -225,7 +225,9 @@ impl<T: Tensor> Mimi<T> {
             decoder_transformer: MimiTransformer::unloaded(context)?,
             decoder: SeaNetDecoder::unloaded(context)?,
             config,
-        })
+        };
+        model.bind_parameter_names("");
+        Ok(model)
     }
 
     /// Returns the Mimi configuration.
@@ -965,11 +967,24 @@ impl Tensor for PlanningTensor {
     }
 }
 
+fn visit_mimi_topology<T: Tensor>(
+    model: &Mimi<T>,
+    visitor: &mut dyn FnMut(eredu_nn::ParameterMetadataView<'_>, &T),
+) {
+    struct Observe<'a, T>(&'a mut dyn FnMut(eredu_nn::ParameterMetadataView<'_>, &T));
+    impl<'a, T: Tensor> ParameterVisitor<'a, T> for Observe<'_, T> {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a T) {
+            self.0(metadata, value);
+        }
+    }
+    model.visit_parameters(&mut Observe(visitor)).expect("constructed Mimi source is complete");
+}
+
 fn parameter_topology(config: Config) -> Result<BTreeMap<String, Vec<usize>>, MimiArtifactError> {
     let mimi = Mimi::<PlanningTensor>::new(config, &())?;
     let mut topology = BTreeMap::new();
     let mut duplicate = None;
-    mimi.visit_mimi_parameters("", &mut |metadata, parameter| {
+    visit_mimi_topology(&mimi, &mut |metadata, parameter| {
         let shape = parameter
             .shape()
             .iter()
@@ -977,7 +992,7 @@ fn parameter_topology(config: Config) -> Result<BTreeMap<String, Vec<usize>>, Mi
                 usize::try_from(*dimension).map_err(|_| {
                     MimiArtifactError::Topology(format!(
                         "parameter {:?} has invalid shape {:?}",
-                        metadata.id,
+                        metadata.id(),
                         parameter.shape()
                     ))
                 })
@@ -985,8 +1000,8 @@ fn parameter_topology(config: Config) -> Result<BTreeMap<String, Vec<usize>>, Mi
             .collect::<Result<Vec<_>, _>>();
         match shape {
             Ok(shape) => {
-                if topology.insert(metadata.id.to_string(), shape).is_some() {
-                    duplicate = Some(metadata.id.to_string());
+                if topology.insert(metadata.id().to_string(), shape).is_some() {
+                    duplicate = Some(metadata.id().to_string());
                 }
             }
             Err(error) => duplicate = Some(error.to_string()),
@@ -2403,218 +2418,73 @@ impl<T: Tensor> Conv1x1NoBias<T> {
     }
 }
 
-trait MimiModuleParameters<T: Tensor> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    );
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    );
-    fn set_mimi_trainable(&mut self, trainable: bool);
+// Checkpoint names are constructed once while building the module. Every later
+// traversal borrows the same retained ParameterSpec identities.
+trait BindParameterNames {
+    fn bind_parameter_names(&mut self, prefix: &str);
 }
-
-struct PrefixVisitor<'a, F: ?Sized> {
-    prefix: &'a str,
-    visitor: &'a mut F,
-    exact: bool,
-}
-
-impl<'a, 'value, T, F: ?Sized> ParameterVisitor<'value, T> for PrefixVisitor<'a, F>
-where
-    T: 'value,
-    F: FnMut(ParameterMetadata, &'value T),
-{
-    fn visit(&mut self, mut metadata: ParameterMetadata, value: &'value T) {
-        let id = if self.exact {
-            self.prefix.to_owned()
-        } else {
-            parameter_name(self.prefix, metadata.id.as_str())
-        };
-        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
-        (self.visitor)(metadata, value);
+impl<T> BindParameterNames for Parameter<T> {
+    fn bind_parameter_names(&mut self, prefix: &str) {
+        self.set_identity(ParameterId::new(prefix).expect("nonempty constructed parameter path"));
     }
 }
-
-struct PrefixVisitorMut<'a, F: ?Sized> {
-    prefix: &'a str,
-    visitor: &'a mut F,
-    exact: bool,
-}
-
-impl<'a, 'value, T, F: ?Sized> ParameterVisitorMut<'value, T> for PrefixVisitorMut<'a, F>
-where
-    T: 'value,
-    F: FnMut(ParameterMetadata, &'value mut T),
-{
-    fn visit_mut(&mut self, mut metadata: ParameterMetadata, value: &'value mut T) {
-        let id = if self.exact {
-            self.prefix.to_owned()
-        } else {
-            parameter_name(self.prefix, metadata.id.as_str())
-        };
-        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
-        (self.visitor)(metadata, value);
+impl<M: BindParameterNames> BindParameterNames for Vec<M> {
+    fn bind_parameter_names(&mut self, prefix: &str) {
+        for (index, module) in self.iter_mut().enumerate() {
+            module.bind_parameter_names(&parameter_name(prefix, &index.to_string()));
+        }
     }
 }
-
-impl<T: Tensor> MimiModuleParameters<T> for Parameter<T> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        self.visit_parameters(&mut PrefixVisitor {
-            prefix,
-            visitor,
-            exact: true,
-        });
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        self.visit_parameters_mut(&mut PrefixVisitorMut {
-            prefix,
-            visitor,
-            exact: true,
-        });
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        self.set_trainable(trainable);
+impl<M: BindParameterNames> BindParameterNames for Option<M> {
+    fn bind_parameter_names(&mut self, prefix: &str) {
+        if let Some(module) = self {
+            module.bind_parameter_names(prefix);
+        }
     }
 }
-
-macro_rules! structured_leaf_parameters {
-    ($type:ty) => {
-        impl<T: Tensor> MimiModuleParameters<T> for $type {
-            fn visit_mimi_parameters<'a>(
-                &'a self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-            ) {
-                self.visit_parameters(&mut PrefixVisitor {
-                    prefix,
-                    visitor,
-                    exact: false,
-                });
-            }
-
-            fn visit_mimi_parameters_mut<'a>(
-                &'a mut self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-            ) {
-                self.visit_parameters_mut(&mut PrefixVisitorMut {
-                    prefix,
-                    visitor,
-                    exact: false,
-                });
-            }
-
-            fn set_mimi_trainable(&mut self, trainable: bool) {
-                self.set_trainable(trainable);
+macro_rules! named_structured_leaf {
+    ($type:ident) => {
+        impl<T> BindParameterNames for $type<T> {
+            fn bind_parameter_names(&mut self, prefix: &str) {
+                self.weight
+                    .bind_parameter_names(&parameter_name(prefix, "weight"));
+                self.bias
+                    .bind_parameter_names(&parameter_name(prefix, "bias"));
             }
         }
     };
 }
-
-structured_leaf_parameters!(Linear<T>);
-structured_leaf_parameters!(LayerNorm<T>);
-
-impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Vec<M> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        for (index, module) in self.iter().enumerate() {
-            module.visit_mimi_parameters(&parameter_name(prefix, &index.to_string()), visitor);
-        }
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        for (index, module) in self.iter_mut().enumerate() {
-            module.visit_mimi_parameters_mut(&parameter_name(prefix, &index.to_string()), visitor);
-        }
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        for module in self {
-            module.set_mimi_trainable(trainable);
-        }
-    }
-}
-
-impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Option<M> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        if let Some(module) = self {
-            module.visit_mimi_parameters(prefix, visitor);
-        }
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        if let Some(module) = self {
-            module.visit_mimi_parameters_mut(prefix, visitor);
-        }
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        if let Some(module) = self {
-            module.set_mimi_trainable(trainable);
-        }
-    }
-}
+named_structured_leaf!(Linear);
+named_structured_leaf!(LayerNorm);
 
 macro_rules! module_parameters {
-    ($module:ident { $($field:ident),+ $(,)? }) => {
-        impl<T: Tensor> MimiModuleParameters<T> for $module<T> {
-            fn visit_mimi_parameters<'a>(
-                &'a self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-            ) {
-                $(
-                    self.$field.visit_mimi_parameters(
-                        &parameter_name(prefix, stringify!($field)),
-                        visitor,
-                    );
-                )+
+    ($module:ident { $($field:ident),+ $(,)? } $(; retained [$($retained:ident),*])?) => {
+        impl<T: Tensor> BindParameterNames for $module<T> {
+            fn bind_parameter_names(&mut self, prefix: &str) {
+                $(self.$field.bind_parameter_names(&parameter_name(prefix, stringify!($field)));)+
+            }
+        }
+        impl<T: Tensor> Parameterized<T> for $module<T> {
+            fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a,T>>(
+                &'a self, visitor: &mut V,
+            ) -> Result<(), eredu_nn::ParameterSourceError> {
+                let mut result = Ok(());
+                $(result = result.and(self.$field.visit_parameter_sources(visitor));)+
+                $($(if let Some(value) = &self.$retained { visitor.retained(value); })*)?
+                result
+            }
+            fn retained_value_slot_bound(&self) -> Option<usize> {
+                let mut count = 0usize;
+                $(count = count.checked_add(self.$field.retained_value_slot_bound()?)?;)+
+                $($(let _ = &self.$retained; count = count.checked_add(1)?;)*)?
+                Some(count)
             }
 
-            fn visit_mimi_parameters_mut<'a>(
-                &'a mut self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-            ) {
-                $(
-                    self.$field.visit_mimi_parameters_mut(
-                        &parameter_name(prefix, stringify!($field)),
-                        visitor,
-                    );
-                )+
+            fn visit_parameters_mut<'a,V: ParameterVisitorMut<'a,T>>(&'a mut self, visitor: &mut V) {
+                $(self.$field.visit_parameters_mut(visitor);)+
             }
-
-            fn set_mimi_trainable(&mut self, trainable: bool) {
-                $(self.$field.set_mimi_trainable(trainable);)+
+            fn set_trainable(&mut self, trainable: bool) {
+                $(self.$field.set_trainable(trainable);)+
             }
         }
     };
@@ -2649,7 +2519,7 @@ module_parameters!(MimiTransformerLayer {
 });
 module_parameters!(LayerScale { scale });
 module_parameters!(MimiMlp { linear1, linear2 });
-module_parameters!(MimiSelfAttention { in_proj, out_proj });
+module_parameters!(MimiSelfAttention { in_proj, out_proj }; retained [key_cache,value_cache]);
 module_parameters!(SeaNetDecoder {
     init_conv1d,
     layers,
@@ -2660,8 +2530,8 @@ module_parameters!(DecoderLayer {
     residuals,
 });
 module_parameters!(SeaNetResnetBlock { block });
-module_parameters!(StreamableConv1d { weight, bias });
-module_parameters!(StreamableConvTranspose1d { weight, bias });
+module_parameters!(StreamableConv1d { weight, bias }; retained [state_prev_xs]);
+module_parameters!(StreamableConvTranspose1d { weight, bias }; retained [state_prev_ys]);
 module_parameters!(SplitResidualVectorQuantizer {
     rvq_first,
     rvq_rest,
@@ -2679,30 +2549,6 @@ module_parameters!(EuclideanCodebook {
     embedding_sum,
 });
 module_parameters!(Conv1x1NoBias { weight });
-
-impl<T: Tensor> Parameterized<T> for Mimi<T> {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        self.visit_mimi_parameters("", &mut |metadata, value| {
-            visitor.visit(metadata, value);
-        });
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, T>,
-    {
-        self.visit_mimi_parameters_mut("", &mut |metadata, value| {
-            visitor.visit_mut(metadata, value);
-        });
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        self.set_mimi_trainable(trainable);
-    }
-}
 
 fn validate_latent<T: Tensor>(latent: &T) -> Result<(), Error> {
     if latent.shape().len() != 3 || latent.dim(1) != 512 {
@@ -2747,13 +2593,15 @@ mod tests {
     use super::{
         checkpoint_key_for_parameter, checkpoint_layout_axes, checkpoint_parameter_for_key,
         parameter_topology, prepare_catalog, prepare_source, released_checkpoint_requirements,
-        Config, Mimi, MimiArtifactError, MimiParameterRequirement, RecipeDtype,
+        Config, Mimi, MimiArtifactError, MimiParameterRequirement, RecipeDtype, PlanningTensor,
     };
     use eredu_checkpoint::store::{
         CheckpointLease, CheckpointSource, TensorMetadata, TensorReadRequest,
         TensorSourceProvenance, WeightStoreBackend, WeightStoreDiagnostics,
     };
     use eredu_checkpoint::{SourceTensorEncoding, StoredDtype};
+
+    use eredu_nn::Parameterized;
 
     struct MetadataSource {
         tensors: BTreeMap<String, TensorMetadata>,
@@ -2884,6 +2732,34 @@ mod tests {
                 "checkpoint mapping did not round-trip"
             );
         }
+    }
+
+    #[test]
+    fn sources_borrow_stable_names_and_include_live_streaming_buffers() {
+        struct Rows { named: usize, auxiliary: usize, trained: usize }
+        impl<'a> eredu_nn::ParameterSourceVisitor<'a, PlanningTensor> for Rows {
+            fn parameter(&mut self, metadata: eredu_nn::ParameterMetadataView<'a>, _: &'a PlanningTensor) {
+                self.named += 1;
+                self.trained += usize::from(metadata.trainable());
+                assert!(!metadata.id().as_str().is_empty());
+            }
+            fn retained(&mut self, _: &'a PlanningTensor) { self.auxiliary += 1; }
+        }
+        let mut model = Mimi::<PlanningTensor>::new(Config::v0_1(Some(8)), &()).unwrap();
+        model.encoder_transformer.layers[0].self_attn.key_cache = Some(PlanningTensor(vec![1,2,3]));
+        model.encoder_transformer.layers[0].self_attn.value_cache = Some(PlanningTensor(vec![1,2,3]));
+        model.encoder.init_conv1d.state_prev_xs = Some(PlanningTensor(vec![1,1,4]));
+        model.upsample.state_prev_ys = Some(PlanningTensor(vec![1,1,5]));
+        let mut rows = Rows { named: 0, auxiliary: 0, trained: 0 };
+        model.visit_parameter_sources(&mut rows).unwrap();
+        assert_eq!((rows.named, rows.auxiliary, rows.trained), (246,4,246));
+        let bound = model.retained_value_slot_bound().unwrap();
+        assert!(bound >= rows.named + rows.auxiliary);
+        model.set_trainable(false);
+        let mut frozen = Rows { named: 0, auxiliary: 0, trained: 0 };
+        model.visit_parameter_sources(&mut frozen).unwrap();
+        assert_eq!((frozen.named, frozen.auxiliary, frozen.trained), (246,4,0));
+        assert_eq!(model.retained_value_slot_bound(), Some(bound));
     }
 
     #[test]

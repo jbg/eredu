@@ -30,8 +30,8 @@ struct Bind<'w, T> {
     bias: &'w T,
 }
 impl<'a, T: Tensor + 'a> ParameterVisitorMut<'a, T> for Bind<'_, T> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut T) {
-        *value = if metadata.id.as_str() == "matrix.bias" {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut T) {
+        *value = if metadata.id().as_str() == "matrix.bias" {
             self.bias
         } else {
             self.weight

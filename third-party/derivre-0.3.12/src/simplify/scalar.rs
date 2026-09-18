@@ -1,6 +1,5 @@
 //! Scalar constructors share equations; their emitter owns actual storage.
 use crate::ast::{Expr, ExprFlags, ExprRef, ExprSet, PreparedExprError};
-use std::convert::Infallible;
 
 pub(super) trait Emission {
     type Error;
@@ -14,42 +13,6 @@ pub(super) trait Emission {
         flags: ExprFlags,
         args: &mut [ExprRef],
     ) -> Result<ExprRef, Self::Error>;
-}
-pub(super) struct Ordinary<'a>(pub(super) &'a mut ExprSet);
-impl Emission for Ordinary<'_> {
-    type Error = Infallible;
-    fn source(&self) -> &ExprSet {
-        self.0
-    }
-    fn pay(&mut self, cost: usize) -> Result<(), Infallible> {
-        self.0.pay(cost);
-        Ok(())
-    }
-    fn emit(&mut self, expression: Expr<'_>) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk(expression))
-    }
-    fn optimized_or(
-        &mut self,
-        flags: ExprFlags,
-        args: &mut [ExprRef],
-    ) -> Result<ExprRef, Infallible> {
-        Ok(self.0.or_optimized(flags, args))
-    }
-    fn power10(&mut self, scale: u32) -> Result<u32, Infallible> {
-        Ok(10u32.pow(scale))
-    }
-    fn invalid_repeat(&mut self) -> Infallible {
-        panic!("invalid repetition interval")
-    }
-}
-pub(super) fn ordinary(
-    source: &mut ExprSet,
-    operation: impl FnOnce(&mut Ordinary<'_>) -> Result<ExprRef, Infallible>,
-) -> ExprRef {
-    match operation(&mut Ordinary(source)) {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
 }
 pub(super) struct Prepared<'a>(pub(super) &'a mut ExprSet);
 impl Emission for Prepared<'_> {
@@ -65,10 +28,10 @@ impl Emission for Prepared<'_> {
     }
     fn optimized_or(
         &mut self,
-        _: ExprFlags,
-        _: &mut [ExprRef],
+        flags: ExprFlags,
+        args: &mut [ExprRef],
     ) -> Result<ExprRef, PreparedExprError> {
-        Err(PreparedExprError::Optimized)
+        self.0.or_optimized(flags, args)
     }
     fn power10(&mut self, scale: u32) -> Result<u32, PreparedExprError> {
         10u32.checked_pow(scale).ok_or(PreparedExprError::Source)
@@ -188,7 +151,6 @@ pub(super) fn lookahead<S: Emission>(
 
 impl ExprSet {
     fn prepared_child(&self, arg: ExprRef) -> Result<(), PreparedExprError> {
-        self.require_prepared()?;
         if self.is_valid(arg) {
             Ok(())
         } else {
@@ -196,7 +158,6 @@ impl ExprSet {
         }
     }
     pub(crate) fn try_mk_byte(&mut self, byte_value: u8) -> Result<ExprRef, PreparedExprError> {
-        self.require_prepared()?;
         if byte_value as usize >= self.alphabet_size {
             return Err(PreparedExprError::Source);
         }
@@ -243,11 +204,11 @@ mod tests {
 
     #[test]
     fn prepared_expression_source_uses_shared_scalars_and_preserves_exhausted_owner() {
-        let mut source = ExprSet::new(256);
-        source.mk_byte_literal(&[b'x'; ExprRef::MAX_BYTE_CONCAT + 1]);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        source.mk_byte_literal(&[b'x'; ExprRef::MAX_BYTE_CONCAT + 1]).unwrap();
         // Historical ordinary construction owns this actual table layout. Its
         // completed source supplies finite slots; the prepared copy never grows.
-        source.reserve(24);
+        source.reserve(24).unwrap();
         let mut ordinary = source.clone();
         let plan = source.prepared_source_plan().unwrap();
         let requirements = plan.requirements();
@@ -259,25 +220,25 @@ mod tests {
         drop(source);
 
         let a = prepared.source_mut().try_mk_byte(b'Q').unwrap();
-        assert_eq!(a, ordinary.mk_byte(b'Q'));
+        assert_eq!(a, ordinary.mk_byte(b'Q').unwrap());
         let repeat = prepared.source_mut().try_mk_repeat(a, 0, 3).unwrap();
-        assert_eq!(repeat, ordinary.mk_repeat(a, 0, 3));
+        assert_eq!(repeat, ordinary.mk_repeat(a, 0, 3).unwrap());
         assert!(prepared.source().is_nullable(repeat));
         let not = prepared.source_mut().try_mk_not(repeat).unwrap();
-        assert_eq!(not, ordinary.mk_not(repeat));
+        assert_eq!(not, ordinary.mk_not(repeat).unwrap());
         assert_eq!(
             prepared.source_mut().try_mk_not(not).unwrap(),
-            ordinary.mk_not(not)
+            ordinary.mk_not(not).unwrap()
         );
         let ahead = prepared.source_mut().try_mk_lookahead(repeat, 7).unwrap();
-        assert_eq!(ahead, ordinary.mk_lookahead(repeat, 7));
+        assert_eq!(ahead, ordinary.mk_lookahead(repeat, 7).unwrap());
         assert!(matches!(
             prepared.source().get(ahead),
             Expr::Lookahead(_, ExprRef::EMPTY_STRING, 7)
         ));
         let bytes = [b'y'; ExprRef::MAX_BYTE_CONCAT + 3];
         let literal = prepared.source_mut().try_mk_byte_concat(&bytes, a).unwrap();
-        assert_eq!(literal, ordinary.mk_byte_concat(&bytes, a));
+        assert_eq!(literal, ordinary.mk_byte_concat(&bytes, a).unwrap());
         for id in [a, repeat, not, ahead, literal] {
             assert_eq!(
                 prepared.source().expr_to_string(id),
@@ -319,10 +280,8 @@ mod tests {
             prepared.source().expr_to_string(literal),
             ordinary.expr_to_string(literal)
         );
-        assert!(matches!(
-            ordinary.try_mk_byte(b'R'),
-            Err(PreparedExprError::Storage)
-        ));
+        let original_node = ordinary.try_mk_byte(b'R').unwrap();
+        assert_eq!(ordinary.mk_byte(b'R').unwrap(), original_node);
     }
 }
 

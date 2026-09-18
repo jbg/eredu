@@ -9,6 +9,7 @@ use safemlx::{PreparedHostTransferPlan, PreparedInputRuntime};
 /// bind once to the actual canonical Host source after an accepted role enters.
 pub(crate) struct PreparedCacheHostPromotionSlots {
     aliases: [PreparedArrayClone; 2],
+    device_retirement: super::super::device_retirement::DeviceRetirement,
     reservation: eredu_runtime::cache::PreparedCachePoolReservation,
     shapes: [[i32; 4]; 2],
     dtypes: [Dtype; 2],
@@ -20,7 +21,7 @@ pub(crate) struct PreparedCacheHostPromotionSlots {
     manager: CacheResidencyManager,
     generation: u64,
     context: WorkspaceContext,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl CacheBlockSourceLoan<'_> {
     pub(crate) fn prepare_declared_host_promotion(
@@ -141,8 +142,10 @@ impl CacheBlockSourceLoan<'_> {
             .map_err(|cause| {
                 CacheSourceFailure::metadata(context.metadata_source(cause), context)
             })?;
+        let device_retirement = super::super::device_retirement::DeviceRetirement::prepare(context)?;
         Ok(PreparedCacheHostPromotionSlots {
             aliases,
+            device_retirement,
             reservation,
             shapes,
             dtypes,
@@ -276,7 +279,8 @@ impl PreparedCacheHostPromotionSlots {
             manager: self.manager,
             generation: self.generation,
             pin,
-            reservation,
+            reservation: Some(reservation),
+            device_retirement: self.device_retirement,
             attempted: false,
             completed: false,
             published: false,
@@ -285,3 +289,5 @@ impl PreparedCacheHostPromotionSlots {
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

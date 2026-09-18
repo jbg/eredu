@@ -38,20 +38,21 @@ pub(crate) fn run<D: Destination>(
     Ok(None)
 }
 pub(super) struct Ordinary {
+    pub(super) funding: crate::ParserAllocationFunding,
     pub(super) stack: Vec<ExprRef>,
     pub(super) rows: Vec<(ExprRef, u32)>,
 }
 impl Destination for Ordinary {
-    type Error = anyhow::Error;
-    fn push(&mut self, node: ExprRef) -> anyhow::Result<()> {
-        self.stack.push(node);
+    type Error = crate::ParserError;
+    fn push(&mut self, node: ExprRef) -> crate::ParserResult<()> {
+        self.funding.try_push(&mut self.stack, node)?;
         Ok(())
     }
     fn pop(&mut self) -> Option<ExprRef> {
         self.stack.pop()
     }
-    fn leftover(&mut self, node: ExprRef, maximum: u32) -> anyhow::Result<()> {
-        self.rows.push((node, maximum));
+    fn leftover(&mut self, node: ExprRef, maximum: u32) -> crate::ParserResult<()> {
+        self.funding.try_push(&mut self.rows, (node, maximum))?;
         Ok(())
     }
 }

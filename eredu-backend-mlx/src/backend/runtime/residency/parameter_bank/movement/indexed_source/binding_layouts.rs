@@ -19,16 +19,16 @@ pub(crate) struct IndexedBindingIdentity {
     source:IndexedBankSource,
     first:Option<AddressableChunkCensus>,
     revision:u64,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl IndexedBindingIdentity {
     pub(crate) fn source(&self)->&IndexedBankSource{&self.source}
     pub(crate) fn first(&self)->Option<AddressableChunkCensus>{self.first}
     pub(crate) fn revision(&self)->u64{self.revision}
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding{&self.funding}
+    pub(crate) fn funding(&self)->&HostMetadataFunding{&self.funding}
 }
 fn first_from_source(binding:&IndexedBankSource,bank:&AddressableBankSourceLoan<'_>,
-    region:WorkspaceAddressableRegionView<'_>,funding:&WorkspaceMetadataFunding,
+    region:WorkspaceAddressableRegionView<'_>,funding:&HostMetadataFunding,
 )->Result<Option<AddressableChunkCensus>,Error> {
     let fail=|cause|failed(cause,&binding.bank,funding,None);
     region.validate().map_err(|_|fail(Cause::Geometry))?;
@@ -51,7 +51,7 @@ fn first_from_source(binding:&IndexedBankSource,bank:&AddressableBankSourceLoan<
 }
 impl IndexedBankSource {
     /// Authenticates the architecture's descriptive chunk plan against this bank.
-    pub(crate) fn first_census(&self,region:WorkspaceAddressableRegionView<'_>,funding:&WorkspaceMetadataFunding)
+    pub(crate) fn first_census(&self,region:WorkspaceAddressableRegionView<'_>,funding:&HostMetadataFunding)
         ->Result<Option<AddressableChunkCensus>,Error> {
         let bytes=AddressableChunkPlan::control_bytes().checked_add(size_of::<(WorkspaceAddressableRegionView<'_>,
             Option<AddressableChunkCensus>,Result<Option<AddressableChunkCensus>,Error>)>())
@@ -123,3 +123,5 @@ impl IndexedBankSource {
         }).map_err(|cause|fail(Cause::Bank(cause)))?
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

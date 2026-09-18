@@ -1702,3 +1702,16 @@ pub fn inline_basic_index_control_bytes() -> Option<usize> {
             + size_of::<&Stream>(),
     )
 }
+
+/// Controls of the same basic worker for borrowed Full/Range declarations.
+/// There are no removed/new axes, array indices, ellipsis, or nonunit steps.
+/// Its three coordinate SmallVecs use from_elem/from_slice, whose spilled
+/// backing has exactly the input rank; the gather and reshape vectors stay empty.
+/// The caller separately accounts for its declaration container.
+pub fn basic_range_index_control_bytes(rank: usize) -> Option<usize> {
+    inline_basic_index_control_bytes()?.checked_add(
+        if rank > DEFAULT_STACK_VEC_LEN {
+            rank.checked_mul(3)?.checked_mul(std::mem::size_of::<i32>())?
+        } else { 0 }
+    )
+}

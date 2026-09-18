@@ -26,7 +26,6 @@ pub(super) enum CopyPreparationCause {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct CopyRequirements {
     operands: usize,
-    metadata_rows: usize,
     native: Option<NativeRequirements>,
     publication_controls: usize,
     controls: usize,
@@ -67,13 +66,12 @@ impl CopyRequirements {
                 .map(NativeRequirements::inspect)
                 .transpose()?
         };
-        let metadata_rows = decoder.copy_publication_metadata_rows();
         let host_rows = native.map_or(0, |value| value.host_destinations);
         let roots = operands
             .checked_add(host_rows)
             .ok_or(WorkingMemoryError::Overflow)?;
         let publication =
-            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, metadata_rows)?;
+            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
         let parts = [
             native.map_or(0, |value| value.controls),
             publication.control_bytes(),
@@ -120,7 +118,6 @@ impl CopyRequirements {
             .ok_or(WorkingMemoryError::Overflow)?;
         Ok(Self {
             operands,
-            metadata_rows,
             native,
             publication_controls: publication.control_bytes(),
             controls,
@@ -152,18 +149,14 @@ impl CopyRequirements {
     }
     pub(super) fn publication_plan(
         self,
-        decoder: &PreparedResidentDecoderCopy<'_>,
     ) -> Result<text_funding::SnapshotPublicationPlan, WorkingMemoryError> {
-        if decoder.copy_publication_metadata_rows() != self.metadata_rows {
-            return Err(WorkingMemoryError::IdentityMismatch);
-        }
         let host_rows = self.host_rows();
         let roots = self
             .operands
             .checked_add(host_rows)
             .ok_or(WorkingMemoryError::Overflow)?;
         let plan =
-            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, self.metadata_rows)?;
+            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
         if plan.control_bytes() != self.publication_controls {
             return Err(WorkingMemoryError::IdentityMismatch);
         }

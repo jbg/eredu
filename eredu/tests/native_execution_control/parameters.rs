@@ -59,7 +59,12 @@ pub(super) fn verify_native_projections<B: ParameterBackend>(
 
 pub(super) fn parameter_logits<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     prefix: &[u32],
@@ -69,7 +74,12 @@ pub(super) fn parameter_logits<
 
 pub(super) fn parameter_logits_mode<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     prefix: &[u32],
@@ -77,7 +87,7 @@ pub(super) fn parameter_logits_mode<
 ) -> (Vec<f32>, Option<String>) {
     model.reset().unwrap();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"left"})],
             add_generation_prompt: true,
             ..Default::default()
@@ -137,36 +147,39 @@ pub(super) fn parameter_logits_mode<
         },
     };
     let branch_limits = plan.limits.clone();
-    let prepared = model
-        .prepare_observed_token_ids(
-            &chat,
-            prefix.to_vec(),
-            settings,
-            plan,
-            TraceLimits {
-                per_record_bytes: 1 << 20,
-                total_bytes: 4 << 20,
-            },
-        )
-        .unwrap();
+    let prepared_prefix = prefix.to_vec();
+    let prepared_capture = plan;
+    let prepared_trace = TraceLimits {
+        per_record_bytes: 1 << 20,
+        total_bytes: 4 << 20,
+    };
+    let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+    prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+    prepared.output_mode = PreparedChatOutputMode::Text;
+    prepared.capture = Some(&prepared_capture);
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |record| {
-                records.push(record.generation);
+            .start_controlled_chat(prepared, prepared_trace, Default::default(), |record| {
+                records.push(record);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
         let mut emit = |record: ControlledGenerationRecord| {
-            records.push(record.generation);
+            records.push(record);
             ControlFlow::Continue(())
         };
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 2,
-            max_branches: 1,
-            retained_bytes: 64 << 20,
-            cumulative_copy_bytes: 256 << 20,
-        })
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 2,
+                max_branches: 1,
+                retained_bytes: 64 << 20,
+                cumulative_copy_bytes: 256 << 20,
+            },
+            ORIGINAL_CAPACITY,
+            copy_limits(),
+        )
         .unwrap();
         let initial = run.snapshot(&mut emit).unwrap();
         run.run(&mut emit).unwrap();
@@ -193,21 +206,31 @@ pub(super) fn parameter_logits_mode<
         run.run(&mut emit).unwrap();
         run.exchange(&mut child, &mut emit).unwrap();
     } else {
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |record| {
                 records.push(record);
                 ControlFlow::Continue(())
-            })
-            .unwrap();
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap();
     }
     let mut result = None;
     let mut count = 0;
     for record in records {
-        if let ObservedGenerationEvent::Token {
+        if let Some(ObservedGenerationEvent::Token {
             forced,
             captures: Some(step),
             ..
-        } = record.event
+        }) = record.event.progress()
         {
             assert!(!forced);
             let Some(CapturePayload::Tensor(tensor)) = &step.records[0].payload else {
@@ -236,7 +259,7 @@ pub(super) fn parameter_logits_mode<
                     (score.log_probability - (expected as f64 - maximum - log_mass)).abs() < 2e-7
                 );
             }
-            let value = (values.clone(), record.parameter_overlay_id);
+            let value = (values.clone(), record.parameter_overlay_id.clone());
             if let Some(prior) = &result {
                 assert_eq!(&value, prior, "snapshot and sibling parameter isolation");
             }
@@ -644,7 +667,12 @@ pub(super) struct ParameterDecodeStep {
 /// controlled path also restores the post-prefill cache and replays both steps.
 pub(super) fn parameter_decode_logits<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     prefix: &[u32],
@@ -652,7 +680,7 @@ pub(super) fn parameter_decode_logits<
 ) -> Vec<ParameterDecodeStep> {
     model.reset().unwrap();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"left"})],
             add_generation_prompt: true,
             ..Default::default()
@@ -664,53 +692,54 @@ pub(super) fn parameter_decode_logits<
         host_bytes: 4 << 20,
         encoded_bytes: 4 << 20,
     };
-    let prepared = model
-        .prepare_observed_token_ids(
-            &chat,
-            prefix.to_vec(),
-            PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    max_new_tokens: Some(3),
-                    ..Default::default()
-                },
-                seed: 17,
+    let prepared_prefix = prefix.to_vec();
+    let prepared_capture = CapturePlan {
+        schema_version: CAPTURE_SCHEMA_VERSION,
+        selections: vec![CaptureSelection {
+            id: "cached-logits".into(),
+            path: "model.logits".into(),
+            schedule: Default::default(),
+            slices: vec![],
+            transform: CaptureTransform::FullTensor,
+        }],
+        limits: CaptureLimits {
+            per_step: usage,
+            cumulative: usage,
+            physical_native_bytes: None,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    };
+    let prepared_trace = TraceLimits {
+        per_record_bytes: 1 << 20,
+        total_bytes: 8 << 20,
+    };
+    let mut prepared = PreparedChatRequest::new(
+        &chat,
+        original_settings(PreparedChatGenerationSettings {
+            overrides: GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(3),
                 ..Default::default()
             },
-            CapturePlan {
-                schema_version: CAPTURE_SCHEMA_VERSION,
-                selections: vec![CaptureSelection {
-                    id: "cached-logits".into(),
-                    path: "model.logits".into(),
-                    schedule: Default::default(),
-                    slices: vec![],
-                    transform: CaptureTransform::FullTensor,
-                }],
-                limits: CaptureLimits {
-                    per_step: usage,
-                    cumulative: usage,
-                    physical_native_bytes: None,
-                    on_limit: CaptureLimitPolicy::Fail,
-                },
-            },
-            TraceLimits {
-                per_record_bytes: 1 << 20,
-                total_bytes: 8 << 20,
-            },
-        )
-        .unwrap();
-    let extract = |records: &[ObservedGenerationRecord], first: usize| {
+            seed: 17,
+            ..Default::default()
+        }),
+    );
+    prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+    prepared.output_mode = PreparedChatOutputMode::Text;
+    prepared.capture = Some(&prepared_capture);
+    let extract = |records: &[ControlledGenerationRecord], first: usize| {
         let result: Vec<_> = records
             .iter()
             .filter_map(|record| {
-                let ObservedGenerationEvent::Token {
+                let Some(ObservedGenerationEvent::Token {
                     token_id,
                     forced,
                     prediction_index,
                     input_range,
                     captures: Some(step),
                     ..
-                } = &record.event
+                }) = record.event.progress()
                 else {
                     return None;
                 };
@@ -757,26 +786,31 @@ pub(super) fn parameter_decode_logits<
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |e| {
-                records.push(e.generation);
+            .start_controlled_chat(prepared, prepared_trace, Default::default(), |e| {
+                records.push(e);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 2,
-            max_branches: 1,
-            retained_bytes: 64 << 20,
-            cumulative_copy_bytes: 256 << 20,
-        })
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 2,
+                max_branches: 1,
+                retained_bytes: 64 << 20,
+                cumulative_copy_bytes: 256 << 20,
+            },
+            ORIGINAL_CAPACITY,
+            copy_limits(),
+        )
         .unwrap();
         run.step(|e| {
-            records.push(e.generation);
+            records.push(e);
             ControlFlow::Continue(())
         })
         .unwrap();
         let snapshot = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
         run.run(|e| {
-            records.push(e.generation);
+            records.push(e);
             ControlFlow::Continue(())
         })
         .unwrap();
@@ -785,19 +819,29 @@ pub(super) fn parameter_decode_logits<
         run.restore(&snapshot, |_| ControlFlow::Continue(()))
             .unwrap();
         run.run(|e| {
-            records.push(e.generation);
+            records.push(e);
             ControlFlow::Continue(())
         })
         .unwrap();
         assert_eq!(original[1..], extract(&records, 1));
         original
     } else {
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |e| {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |e| {
                 records.push(e);
                 ControlFlow::Continue(())
-            })
-            .unwrap();
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap();
         extract(&records, 0)
     }
 }

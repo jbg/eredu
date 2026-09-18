@@ -179,7 +179,7 @@ fn dense_borrows_and_fp8_selected_factory_traces_fixed_program_without_skipped_c
                         ));
                         assert!(matches!(
                             report.operations[5].kind,
-                            WorkspaceOperationKind::Index { selected_axes: 0 }
+                            WorkspaceOperationKind::StaticSlice { .. }
                         ));
                         assert!(matches!(
                             report.operations[6].kind,

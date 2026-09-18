@@ -48,7 +48,7 @@ fn mismatched_origin_intervention_coupling_rejects_before_install_or_preflight()
         true,
     );
     let capture = with_origin(&original, 7);
-    let mut session = CaptureSession::new(capture.clone());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
     assert!(matches!(
         preflight(&capture, &intervention, &Estimates),
         Err(CaptureError::Invalid(_))
@@ -68,7 +68,7 @@ fn mismatched_origin_intervention_coupling_rejects_before_install_or_preflight()
     ));
     assert!(session.interventions.is_none());
     assert_eq!(session.cumulative_usage(), CaptureUsage::default());
-    let mut zero = CaptureSession::new(with_origin(&original, 0));
+    let mut zero = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(with_origin(&original, 0)));
     zero.enable_interventions(intervention, std::sync::Arc::new(Estimates))
         .unwrap();
     assert!(zero.interventions.is_some());
@@ -105,7 +105,7 @@ fn matching_cached_origin_binds_original_host_and_canonical_prefill_positions() 
         )
         .unwrap();
     preflight(&capture, &intervention, &Estimates).unwrap();
-    let mut run = CaptureSession::new(capture.clone());
+    let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
     run.enable_interventions(intervention.clone(), std::sync::Arc::new(Estimates))
         .unwrap();
     assert!(run.interventions.is_some());

@@ -18,7 +18,7 @@ struct Payload {
     source: OriginalCaptureSource,
     lineage: crate::working_memory::OriginalEmbeddedCaptureLineage,
     // No observer, native state, mutable ledger snapshot or invocation counter.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Clone, Debug)]
 pub(in crate::capture::speculative) struct Saved(Option<Arc<Payload>>);
@@ -234,3 +234,5 @@ impl OriginalSpeculativeCapture {
         Ok(Box::new(Prepared { observer: self, identity, interventions }))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

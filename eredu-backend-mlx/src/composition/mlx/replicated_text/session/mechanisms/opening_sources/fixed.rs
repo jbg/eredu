@@ -1,4 +1,5 @@
 //! Fixed borrowed-owner retention. A failed prefix stays in its caller's capsule.
+use crate::backend::runtime::residency::storage::RetainedArray;
 use super::capacity::OpeningSlots;
 use super::*;
 use crate::backend::runtime::residency::storage::{
@@ -109,7 +110,7 @@ enum Status {
     Complete,
 }
 pub(super) struct FixedOpeningOwners {
-    arrays: Slots<Array, ArrayAllocationInfo>,
+    arrays: Slots<RetainedArray, ArrayAllocationInfo>,
     hosts: Slots<crate::backend::runtime::residency::manager::RetainedHostBuffer, AllocationInfo>,
     bytes: Slots<Arc<[u8]>, u64>,
     sources: Slots<SourceStorageOwner, u64>,
@@ -262,7 +263,7 @@ impl FixedOpeningOwners {
     }
     pub(super) fn buffer_bytes(n: OpeningSlots) -> Result<u64, OpeningError> {
         let terms = [
-            (n.arrays, size_of::<Slot<Array, ArrayAllocationInfo>>()),
+            (n.arrays, size_of::<Slot<RetainedArray, ArrayAllocationInfo>>()),
             (
                 n.hosts,
                 size_of::<
@@ -281,7 +282,7 @@ impl FixedOpeningOwners {
             sum.checked_add(n.checked_mul(size).ok_or(OpeningError::Overflow)?)
                 .ok_or(OpeningError::Overflow)
         })?;
-        u64::try_from(total).map_err(|_| OpeningError::Overflow)
+        u64::try_from(total.checked_add(RetainedArray::control_bytes().ok_or(OpeningError::Overflow)?).ok_or(OpeningError::Overflow)?).map_err(|_| OpeningError::Overflow)
     }
     pub(super) fn empty(n: OpeningSlots) -> Self {
         Self {
@@ -317,7 +318,7 @@ impl FixedOpeningOwners {
         }
         self.arrays.available()?;
         let retained = value.try_clone_for_inspection()?;
-        self.arrays.install(retained);
+        self.arrays.install(retained.into());
         Ok(())
     }
     pub(super) fn retain(&mut self, value: RetainedStorageRef<'_>) -> Result<(), OpeningError> {
@@ -326,6 +327,11 @@ impl FixedOpeningOwners {
         }
         match value {
             RetainedStorageRef::Array(value) => self.retain_array(value),
+            RetainedStorageRef::CanonicalArray(cell) => {
+                self.arrays.available()?;
+                self.arrays.install(RetainedArray::from_canonical(cell));
+                Ok(())
+            },
             RetainedStorageRef::Host(value) => {
                 self.hosts.available()?;
                 self.hosts.install(Arc::clone(value).into());

@@ -249,18 +249,6 @@ impl PendingCopyPublication {
             || inventory.source_capacities().next().is_some()
             || !inventory.byte_buffers.is_empty()
         {
-            if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-                eprintln!(
-                    "HOST_SAVED_PUBLICATION_INVENTORY bound={:?} metadata={} captures={} sources={} buffers={} arrays={} host={}",
-                    inventory.byte_bound()?,
-                    inventory.metadata_entries().count(),
-                    inventory.capture_entries().count(),
-                    inventory.source_capacities().count(),
-                    inventory.byte_buffers.len(),
-                    inventory.array_entries().count(),
-                    inventory.host_entries().count()
-                );
-            }
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
         }
         for (identity, (bytes, array)) in inventory.array_entries() {
@@ -401,6 +389,7 @@ impl PendingCopyPublication {
             UnquotedOriginalSlotSources::default(),
             None,
             Some(self._host.clone()),
+            scope.pool().shared_storage_domain(),
         ))
     }
 }

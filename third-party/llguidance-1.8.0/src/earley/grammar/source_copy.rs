@@ -3,22 +3,41 @@ use super::{
     CGrammar, CSymIdx, CSymbol, GenGrammarOptions, GrammarId, ParamCond, ParamExpr, RhsPtr,
     SymFlags, SymbolProps,
 };
-use crate::earley::lexerspec::{LexerSpec, LexerSpecCopyFailure};
+use crate::earley::lexerspec::{LexerSpec, LexerSpecCopyFailure, LexerSpecCopyPlan};
+use crate::earley::{PreparedFunding, FrameError};
+use derivre::prepared_funding::Scope;
+use derivre::{ParserAllocationFunding, ParserAllocationFailure};
 use std::{
     alloc::Layout,
     collections::TryReserveError,
     fmt,
     mem::{size_of, size_of_val},
 };
-/// Source condition geometry cannot be represented.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConditionSourceError;
-impl fmt::Display for ConditionSourceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("condition source geometry overflow")
+/// Source inspection overflow or the original prospective funding refusal.
+#[derive(Debug)]
+pub enum ConditionSourceError {
+    /// Exact source geometry cannot be represented.
+    Overflow,
+    /// Inspection stopped before entering an unpaid recursive frame.
+    Funding(ParserAllocationFailure),
+}
+impl ConditionSourceError {
+    pub(super) fn frame(error: FrameError<ParserAllocationFailure>) -> Self {
+        match error { FrameError::Overflow => Self::Overflow,
+            FrameError::Funding(error) => Self::Funding(error) }
     }
 }
-impl std::error::Error for ConditionSourceError {}
+impl fmt::Display for ConditionSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { Self::Overflow => f.write_str("condition source geometry overflow"),
+            Self::Funding(error) => fmt::Display::fmt(error, f) }
+    }
+}
+impl std::error::Error for ConditionSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Funding(error) => Some(error), Self::Overflow => None }
+    }
+}
 /// Actual boxed descendants and bounded constructor/inspection depth.
 #[derive(Clone, Copy, Debug)]
 pub struct ConditionCopyRequirements {
@@ -52,26 +71,33 @@ impl fmt::Debug for ConditionCopyPlan<'_> {
             .finish()
     }
 }
-fn condition_geometry(
+fn condition_geometry<F: PreparedFunding<Error = ParserAllocationFailure>>(
     c: &ParamCond,
     depth: usize,
     boxes: &mut usize,
     max_depth: &mut usize,
-) -> Option<()> {
+    funding: &F,
+) -> Result<(), ConditionSourceError> {
+    let _frame = funding.frame(size_of::<(
+        &ParamCond, usize, &mut usize, &mut usize, &F,
+        usize, Option<usize>, Result<(), ConditionSourceError>,
+    )>()).map_err(ConditionSourceError::frame)?;
     *max_depth = (*max_depth).max(depth);
     match c {
         ParamCond::And(a, b) | ParamCond::Or(a, b) => {
-            *boxes = boxes.checked_add(2)?;
-            condition_geometry(a, depth.checked_add(1)?, boxes, max_depth)?;
-            condition_geometry(b, depth.checked_add(1)?, boxes, max_depth)?;
+            *boxes = boxes.checked_add(2).ok_or(ConditionSourceError::Overflow)?;
+            let next = depth.checked_add(1).ok_or(ConditionSourceError::Overflow)?;
+            condition_geometry(a, next, boxes, max_depth, funding)?;
+            condition_geometry(b, next, boxes, max_depth, funding)?;
         }
         ParamCond::Not(a) => {
-            *boxes = boxes.checked_add(1)?;
-            condition_geometry(a, depth.checked_add(1)?, boxes, max_depth)?;
+            *boxes = boxes.checked_add(1).ok_or(ConditionSourceError::Overflow)?;
+            condition_geometry(a, depth.checked_add(1).ok_or(ConditionSourceError::Overflow)?,
+                boxes, max_depth, funding)?;
         }
         _ => {}
     }
-    Some(())
+    Ok(())
 }
 fn condition_copy(c: &ParamCond) -> ParamCond {
     match c {
@@ -99,12 +125,25 @@ fn condition_copy(c: &ParamCond) -> ParamCond {
 }
 impl ParamCond {
     /// Quotes actual immutable condition topology without evaluating parameters.
-    pub fn source_copy_plan(&self) -> Result<ConditionCopyPlan<'_>, ConditionSourceError> {
+    pub fn source_copy_plan(&self, funding: &ParserAllocationFunding)
+        -> Result<ConditionCopyPlan<'_>, ConditionSourceError> {
+        let scope = Scope::new(funding).map_err(ConditionSourceError::frame)?;
+        self.condition_copy_plan(&scope)
+    }
+    pub(super) fn condition_copy_plan<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        &self, funding: &F,
+    ) -> Result<ConditionCopyPlan<'_>, ConditionSourceError> {
+        let _frame = funding.frame(size_of::<(
+            &ParamCond, &F, usize, usize, usize, usize, usize,
+            Layout, [usize; 5], ConditionCopyPlan<'_>,
+            ConditionCopyRequirements, Result<ConditionCopyPlan<'_>, ConditionSourceError>,
+            Result<Layout, std::alloc::LayoutError>, Option<usize>,
+        )>()).map_err(ConditionSourceError::frame)?;
         let mut boxes = 0;
         let mut depth = 0;
-        condition_geometry(self, 1, &mut boxes, &mut depth).ok_or(ConditionSourceError)?;
+        condition_geometry(self, 1, &mut boxes, &mut depth, funding)?;
         let buffers = Layout::array::<ParamCond>(boxes)
-            .map_err(|_| ConditionSourceError)?
+            .map_err(|_| ConditionSourceError::Overflow)?
             .size();
         let frame = size_of::<(
             &ParamCond,
@@ -127,8 +166,8 @@ impl ParamCond {
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
             .and_then(|n| n.checked_add(frame.checked_mul(depth)?))
-            .ok_or(ConditionSourceError)?;
-        let total = buffers.checked_add(controls).ok_or(ConditionSourceError)?;
+            .ok_or(ConditionSourceError::Overflow)?;
+        let total = buffers.checked_add(controls).ok_or(ConditionSourceError::Overflow)?;
         Ok(ConditionCopyPlan {
             source: self,
             requirements: ConditionCopyRequirements {
@@ -178,7 +217,7 @@ impl CompiledGrammarCopyRequirements {
     }
 }
 #[derive(Debug)]
-enum Cause {
+pub(super) enum Cause {
     Overflow,
     Capacity,
     Vector(TryReserveError),
@@ -231,6 +270,9 @@ pub struct CompiledGrammarCopyFailure {
     cause: Cause,
     partial: Option<Partial>,
 }
+impl CompiledGrammarCopyFailure {
+    pub(super) fn inspection(cause: Cause) -> Self { Self { cause, partial: None } }
+}
 impl fmt::Debug for CompiledGrammarCopyFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledGrammarCopyFailure")
@@ -253,6 +295,7 @@ impl std::error::Error for CompiledGrammarCopyFailure {
 /// creation is performed by this constructor.
 pub struct CompiledGrammarCopyPlan<'a> {
     source: &'a CGrammar,
+    lexer_plan: LexerSpecCopyPlan<'a>,
     requirements: CompiledGrammarCopyRequirements,
     text_bytes: usize,
 }
@@ -291,7 +334,8 @@ fn copy_text(source: &str, dst: &mut Vec<u8>, left: &mut usize) -> Result<(), Ca
 fn condition_list(source: &[ParamCond], dst: &mut Vec<ParamCond>) -> Result<(), Cause> {
     reserve(dst, source.len())?;
     for c in source {
-        dst.push(c.source_copy_plan().map_err(Cause::Condition)?.compile());
+        // The enclosing immutable grammar plan already inspected and priced this topology.
+        dst.push(condition_copy(c));
     }
     Ok(())
 }
@@ -340,21 +384,32 @@ fn symbol_copy(s: &CSymbol, p: &mut SymbolPartial, left: &mut usize) -> Result<C
 impl CGrammar {
     /// Quotes the exact compiled symbols/rules and their retained lexer source.
     pub fn source_copy_plan(
-        &self,
+        &self, funding: &ParserAllocationFunding,
     ) -> Result<CompiledGrammarCopyPlan<'_>, CompiledGrammarCopyFailure> {
-        CompiledGrammarCopyPlan::prepare(self).map_err(|cause| CompiledGrammarCopyFailure {
+        let inspect = || {
+            let scope = Scope::new(funding).map_err(|e| Cause::Condition(ConditionSourceError::frame(e)))?;
+            CompiledGrammarCopyPlan::prepare(self, &scope)
+        };
+        inspect().map_err(|cause| CompiledGrammarCopyFailure {
             cause,
             partial: None,
         })
     }
 }
 impl<'a> CompiledGrammarCopyPlan<'a> {
-    fn prepare(s: &'a CGrammar) -> Result<Self, Cause> {
-        let lexer = s
-            .lexer_spec
-            .source_copy_plan()
-            .map_err(Cause::Lexer)?
-            .requirements();
+    fn prepare<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        s: &'a CGrammar, funding: &F,
+    ) -> Result<Self, Cause> {
+        let _frame = funding.frame(size_of::<(
+            &CGrammar, &F, usize, usize, usize, usize, usize,
+            CompiledGrammarCopyPlan<'_>, CompiledGrammarCopyRequirements,
+            Result<CompiledGrammarCopyPlan<'_>, Cause>,
+            std::slice::Iter<'_, CSymbol>,
+            std::iter::Chain<std::slice::Iter<'_, ParamCond>, std::slice::Iter<'_, ParamCond>>,
+            Option<usize>, Result<Layout, std::alloc::LayoutError>, [usize; 23],
+        )>()).map_err(|e| Cause::Condition(ConditionSourceError::frame(e)))?;
+        let lexer_plan = s.lexer_spec.source_copy_plan(funding).map_err(Cause::Lexer)?;
+        let lexer = lexer_plan.requirements();
         let mut buffers = lexer.buffer_bytes();
         let scratch = lexer
             .buffer_bytes()
@@ -390,7 +445,7 @@ impl<'a> CompiledGrammarCopyPlan<'a> {
             add(&mut buffers, bytes::<ParamCond>(symbol.rules_cond.len())?)?;
             for condition in symbol.cond_nullable.iter().chain(&symbol.rules_cond) {
                 let q = condition
-                    .source_copy_plan()
+                    .condition_copy_plan(funding)
                     .map_err(Cause::Condition)?
                     .requirements();
                 add(&mut buffers, q.buffer_bytes())?;
@@ -438,6 +493,7 @@ impl<'a> CompiledGrammarCopyPlan<'a> {
         let retained = buffers.checked_sub(scratch).ok_or(Cause::Overflow)?;
         Ok(Self {
             source: s,
+            lexer_plan,
             text_bytes,
             requirements: CompiledGrammarCopyRequirements {
                 buffers,
@@ -458,13 +514,7 @@ impl<'a> CompiledGrammarCopyPlan<'a> {
         let mut p = Partial::default();
         let mut left = self.text_bytes;
         let result = (|| -> Result<(), Cause> {
-            p.lexer = Some(
-                s.lexer_spec
-                    .source_copy_plan()
-                    .map_err(Cause::Lexer)?
-                    .compile()
-                    .map_err(Cause::Lexer)?,
-            );
+            p.lexer = Some(self.lexer_plan.compile().map_err(Cause::Lexer)?);
             reserve(&mut p.symbols, s.symbols.len())?;
             for symbol in &s.symbols {
                 p.symbols
@@ -498,6 +548,7 @@ impl<'a> CompiledGrammarCopyPlan<'a> {
             rhs_params: p.params,
             rhs_ptr_to_sym_idx: p.index,
             rhs_ptr_to_sym_flags: p.flags,
+            compilation_funding: derivre::ParserAllocationFunding::unenforced(),
         })
     }
 }
@@ -510,6 +561,114 @@ mod tests {
         earley::grammar::{Grammar, ParamRef, ParamValue},
     };
     use derivre::RegexAst;
+    #[derive(Debug)]
+    struct InspectionRefused;
+    impl std::fmt::Display for InspectionRefused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original inspection refusal")
+        }
+    }
+    impl std::error::Error for InspectionRefused {}
+    fn inspection_funding(stop: usize) -> (
+        ParserAllocationFunding, std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Weak<()>,
+    ) {
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let armed = Arc::new(AtomicBool::new(false));
+        let ready = armed.clone();
+        let life = Arc::new(());
+        let weak = Arc::downgrade(&life);
+        let funding = ParserAllocationFunding::prepare(move |_| {
+            let _keep = &life;
+            if ready.load(Ordering::SeqCst) && count.fetch_add(1, Ordering::SeqCst) + 1 == stop {
+                Err(InspectionRefused)
+            } else { Ok(()) }
+        }).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        (funding, calls, weak)
+    }
+    fn nested_condition(depth: usize) -> ParamCond {
+        (0..depth).fold(ParamCond::True, |child, _| ParamCond::Not(Box::new(child)))
+    }
+    #[test]
+    fn condition_inspection_pays_recursive_overlap_reuses_siblings_and_retains_refusal() {
+        use std::{error::Error, sync::atomic::Ordering};
+        let one = nested_condition(10);
+        let both = ParamCond::And(Box::new(nested_condition(10)), Box::new(nested_condition(10)));
+        let (funding, calls, _) = inspection_funding(usize::MAX);
+        let one_plan = one.source_copy_plan(&funding).unwrap();
+        assert_eq!(one_plan.requirements().buffer_bytes(), 10 * size_of::<ParamCond>());
+        let one_calls = calls.load(Ordering::SeqCst);
+        let (funding, calls, _) = inspection_funding(usize::MAX);
+        let both_plan = both.source_copy_plan(&funding).unwrap();
+        assert_eq!(both_plan.requirements().buffer_bytes(), 22 * size_of::<ParamCond>());
+        assert_eq!(both_plan.compile(), both);
+        let all_calls = calls.load(Ordering::SeqCst);
+        assert_eq!(all_calls, one_calls + 1, "siblings reuse only returned frame capacity");
+        // Preparation's own callback is separate; all inspection reservations
+        // fail in turn, before the unpaid descendant can be visited.
+        for stop in 1..=all_calls {
+            let (funding, calls, weak) = inspection_funding(stop);
+            let error = both.source_copy_plan(&funding).unwrap_err();
+            assert_eq!(calls.load(Ordering::SeqCst), stop);
+            assert!(error.source().unwrap().source().unwrap().is::<InspectionRefused>());
+            drop(funding);
+            assert!(weak.upgrade().is_some(), "escaped refusal retains its original payer");
+            drop(error);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[cfg(feature = "lark")]
+    #[test]
+    fn compiled_source_inspections_pay_before_descending_and_keep_the_first_refusal() {
+        use std::{error::Error, sync::atomic::Ordering};
+        #[derive(Debug)]
+        enum Refusal { Retained(CompiledGrammarCopyFailure), Copy(CompiledGrammarCopyFailure) }
+        impl std::fmt::Display for Refusal {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self { Self::Retained(e) => e.fmt(f), Self::Copy(e) => e.fmt(f) }
+            }
+        }
+        impl Error for Refusal {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(match self { Self::Retained(e) => e, Self::Copy(e) => e })
+            }
+        }
+        let mut source = crate::api::GrammarInit::Serialized(
+            crate::api::TopLevelGrammar::from_lark("start: \"x\"".into()),
+        ).to_cgrammar(None, &mut crate::Logger::new(0, 0), ParserLimits::default(), &[],
+            ParserAllocationFunding::unenforced()).unwrap();
+        // Exceed the earlier lexer-inspection peak so this branch must grow its own live depth.
+        source.symbols[0].cond_nullable.push(nested_condition(256));
+        for copy in [false, true] {
+            let inspect = |funding: &ParserAllocationFunding| {
+                if copy { source.source_copy_plan(funding)
+                    .map(|plan| plan.requirements().retained_bytes()).map_err(Refusal::Copy) }
+                else { source.retained_capacity_bytes(funding).map_err(Refusal::Retained) }
+            };
+            let expected = inspect(&ParserAllocationFunding::unenforced()).unwrap();
+            let (funding, calls, _) = inspection_funding(usize::MAX);
+            assert_eq!(inspect(&funding).unwrap(), expected);
+            let reached = calls.load(Ordering::SeqCst);
+            assert!(reached > 10, "the actual nested condition must be inspected");
+            for stop in 1..=reached {
+                let (funding, calls, weak) = inspection_funding(stop);
+                let error = inspect(&funding).unwrap_err();
+                assert_eq!(calls.load(Ordering::SeqCst), stop);
+                let mut cause: &(dyn Error + 'static) = &error;
+                while let Some(next) = cause.source() { cause = next; }
+                assert!(cause.is::<InspectionRefused>());
+                drop(funding);
+                assert!(weak.upgrade().is_some());
+                drop(error);
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+
     #[test]
     fn compiled_source_copy_preserves_parametric_rules_captures_and_failed_symbol_prefix() {
         let condition = ParamCond::And(
@@ -519,7 +678,7 @@ mod tests {
                 1,
             )))),
         );
-        let condition_copy = condition.source_copy_plan().unwrap().compile();
+        let condition_copy = condition.source_copy_plan(&ParserAllocationFunding::unenforced()).unwrap().compile();
         assert_eq!(condition, condition_copy);
         for m in [0, 1, 2, 3, 7, 8, u64::MAX] {
             assert_eq!(
@@ -527,12 +686,12 @@ mod tests {
                 condition_copy.eval(ParamValue(m))
             );
         }
-        let mut lexer = LexerSpec::new().unwrap();
+        let mut lexer = LexerSpec::new(derivre::ParserAllocationFunding::unenforced()).unwrap();
         lexer.setup_lexeme_class(RegexAst::NoMatch).unwrap();
         let terminal = lexer
             .add_simple_literal("word".into(), "done", false)
             .unwrap();
-        let mut grammar = Grammar::new(Some("actual source".into()));
+        let mut grammar = Grammar::new(Some("actual source".into()), derivre::ParserAllocationFunding::unenforced());
         let start = grammar.fresh_symbol_ext(
             "start",
             SymbolProps {
@@ -540,7 +699,7 @@ mod tests {
                 parametric: true,
                 ..SymbolProps::default()
             },
-        );
+        ).unwrap();
         let word = grammar.fresh_symbol_ext(
             "word",
             SymbolProps {
@@ -550,7 +709,7 @@ mod tests {
                 max_tokens: 17,
                 ..SymbolProps::default()
             },
-        );
+        ).unwrap();
         grammar.make_terminal(word, terminal, &lexer).unwrap();
         grammar
             .add_rule_ext(start, condition, vec![(word, ParamExpr::Null)])
@@ -558,9 +717,15 @@ mod tests {
         grammar
             .add_rule_ext(start, condition_copy, Vec::new())
             .unwrap();
-        let source = grammar.compile(lexer, &ParserLimits::default()).unwrap();
+        let source = grammar
+            .compile(
+                lexer,
+                &ParserLimits::default(),
+                derivre::ParserAllocationFunding::unenforced(),
+            )
+            .unwrap();
         assert!(source.parametric);
-        let plan = source.source_copy_plan().unwrap();
+        let plan = source.source_copy_plan(&ParserAllocationFunding::unenforced()).unwrap();
         let quote = plan.requirements();
         let copied = plan.compile().unwrap();
         assert!(quote.required_bytes() > quote.buffer_bytes());
@@ -593,13 +758,11 @@ mod tests {
             assert_eq!(a.sym_flags.0, b.sym_flags.0);
         }
         assert!(copied.symbols.iter().any(|s| !s.cond_nullable.is_empty()));
-        assert!(
-            copied
-                .symbols
-                .iter()
-                .any(|s| s.props.capture_name.as_deref() == Some("word-capture"))
-        );
-        let mut failing = source.source_copy_plan().unwrap();
+        assert!(copied
+            .symbols
+            .iter()
+            .any(|s| s.props.capture_name.as_deref() == Some("word-capture")));
+        let mut failing = source.source_copy_plan(&ParserAllocationFunding::unenforced()).unwrap();
         failing.text_bytes = source.symbols[0].name.len();
         let failure = match failing.compile() {
             Err(e) => e,

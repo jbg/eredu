@@ -564,7 +564,7 @@ fn exact_incremental_resume_capacity_accepts_and_one_short_rejects_before_work()
         let mut actual = Vec::new();
         for _ in 0..3 {
             let output = driver.advance(&mut state).unwrap().unwrap().into_output();
-            driver.take_completed_step(&mut state).unwrap();
+            driver.take_completed_delivery(&mut state).unwrap();
             actual.push(output.token_id().unwrap());
         }
         assert_eq!(actual, expected);
@@ -638,6 +638,7 @@ fn saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth() 
         &source_runtime,
         &saved,
         source_config(true, 3, u64::MAX),
+        &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Restore),
     )
     .expect("complete saved dense source has a logical destination estimate");
     assert!(estimate.retained_bytes > 0 && estimate.copy_bytes >= estimate.retained_bytes);
@@ -645,6 +646,7 @@ fn saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth() 
         &source_runtime,
         &saved,
         source_config(true, 11, u64::MAX),
+        &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Restore),
     )
     .unwrap();
     assert_eq!(estimate.retained_bytes, longer.retained_bytes);
@@ -654,6 +656,7 @@ fn saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth() 
             &foreign_runtime,
             &saved,
             source_config(true, 3, u64::MAX),
+        &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Restore),
         )
         .is_none()
     );

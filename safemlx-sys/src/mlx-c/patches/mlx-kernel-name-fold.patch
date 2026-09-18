@@ -1,0 +1,109 @@
+diff --git a/mlx/backend/common/kernel_name.h b/mlx/backend/common/kernel_name.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/kernel_name.h
+@@ -0,0 +1,29 @@
++// Copyright © 2023-2024 Apple Inc.
++
++// Shared kernel-name append worker; entry values preserve alias snapshots.
++#pragma once
++#include <string>
++#include <type_traits>
++
++namespace mlx::core {
++template <typename T>
++constexpr bool is_numeric_except_char = std::is_arithmetic_v<T> &&
++    !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
++    !std::is_same_v<T, unsigned char> && !std::is_same_v<T, wchar_t>;
++
++template <typename T>
++void append_kernel_name_part(std::string& acc, const T& part) {
++  if constexpr (is_numeric_except_char<T>) {
++    acc += std::to_string(part);
++  } else {
++    acc += part;
++  }
++}
++
++template <typename T, typename... Args>
++void concatenate(std::string& acc, T first, Args... args) {
++  append_kernel_name_part(acc, first);
++  (append_kernel_name_part(acc, args), ...);
++}
++
++} // namespace mlx::core
+diff --git a/mlx/backend/metal/utils.h b/mlx/backend/metal/utils.h
+--- a/mlx/backend/metal/utils.h
++++ b/mlx/backend/metal/utils.h
+@@ -2,7 +2,7 @@
+ 
+ #pragma once
+ 
+-#include <type_traits>
++#include "mlx/backend/common/kernel_name.h"
+ 
+ #include "mlx/array.h"
+ #include "mlx/backend/metal/device.h"
+@@ -45,30 +45,6 @@
+ #endif
+ }
+ 
+-template <typename T>
+-constexpr bool is_numeric_except_char = std::is_arithmetic_v<T> &&
+-    !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
+-    !std::is_same_v<T, unsigned char> && !std::is_same_v<T, wchar_t>;
+-
+-template <typename T>
+-void concatenate(std::string& acc, T first) {
+-  if constexpr (is_numeric_except_char<T>) {
+-    acc += std::to_string(first);
+-  } else {
+-    acc += first;
+-  }
+-}
+-
+-template <typename T, typename... Args>
+-void concatenate(std::string& acc, T first, Args... args) {
+-  if constexpr (is_numeric_except_char<T>) {
+-    acc += std::to_string(first);
+-  } else {
+-    acc += first;
+-  }
+-  concatenate(acc, args...);
+-}
+-
+ inline int get_work_per_thread(Dtype dtype) {
+   return std::max(1, 8 / dtype.size());
+ }
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -129,21 +129,20 @@
+   constexpr size_t linked = 0;
+   constexpr size_t allocation = name_owners * name_sequence +
+       constants * sizeof(MTLFCList::value_type);
+-  // The longest selected concatenate has 18 arguments (quantized NAX matrix);
+-  // each recursive frame retains its by-value suffix: 18+17+...+1 parameters.
+-  // Every parameter is string, pointer, char or int, no larger than string.
+-  // Only base_name can exceed inline storage and it is the first argument
+-  // of its separate hash call, so this recursion adds no hidden long copies.
++  // The longest selected concatenate has 18 arguments (quantized NAX matrix).
++  // The shared fold retains one by-value entry pack and borrows one part at a
++  // time. Values preserve the original snapshot behavior when acc is also an
++  // argument; no recursive suffix copies remain. Each selected value is at
++  // most one string. Account the append's numeric conversion temporary too.
+   constexpr size_t concatenate_arguments = 18;
+-  constexpr size_t concatenate_parameters =
+-      concatenate_arguments * (concatenate_arguments + 1) / 2;
++  constexpr size_t concatenate_parameters = concatenate_arguments + 1;
+   constexpr size_t controls = sizeof(ResidentSelectorLayout) * 2 +
+       sizeof(fmt::memory_buffer) + sizeof(FormatArguments) + sizeof(fmt::format_args) +
+       // Scatter also keeps its inline index-type and reduction-name strings.
+       sizeof(std::string) * (4 + concatenate_parameters) +
+       sizeof(MTLFCList) + sizeof(MTLFCList::value_type) * constants +
+       sizeof(std::vector<MTL::Function*>) +
+-      sizeof(std::string*) * concatenate_arguments + sizeof(IndexMetadata) +
++      sizeof(std::string*) * 3 + sizeof(IndexMetadata) + // entry acc and append loans
+       // Single-block sort has a second inline stride list. Index metadata's
+       // three range loans remain live through the synchronous encoder binding.
+       sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool) +

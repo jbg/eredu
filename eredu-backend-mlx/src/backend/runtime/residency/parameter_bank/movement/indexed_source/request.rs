@@ -7,7 +7,11 @@ use eredu_runtime::expert::IndexedInvocationRequest;
 /// Actual accepted request source. The implementation owns native parent
 /// admission/completion and occurrence order; this trait grants none of them.
 pub(crate) trait IndexedRequestSource {
-    fn funding(&self)->&WorkspaceMetadataFunding;
+    fn funding(&self)->&HostMetadataFunding;
+    fn enter_local(&self, bank: &IndexedBankSource,
+        declaration: eredu_nn::workspace::WorkspaceAddressableRegionView<'_>, rows: usize) -> Result<(), Error>;
+    fn complete_local(&self, completed: bool) -> Result<(), Error>;
+    fn abort_local(&self);
     fn with_region(&self,bank:&IndexedBankSource,request:IndexedInvocationRequest<'_,MlxTensor>,stream:&Stream,
         run:&mut dyn FnMut(OriginalIndexedResidencyFactory)->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)
         ->Result<TensorParallelGroupedOutput<MlxTensor>,Error>;
@@ -16,7 +20,7 @@ struct Activation {active:Cell<bool>}
 struct Binding {
     owner:Weak<dyn IndexedRequestSource>,
     activation:Weak<Activation>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 #[derive(Default)]
 pub(super) struct Channel {binding:RefCell<Option<Binding>>}
@@ -29,7 +33,7 @@ impl Channel {
 pub(crate) struct IndexedRequestInstallation {
     source:IndexedBankSource,
     activation:Rc<Activation>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl Drop for IndexedRequestInstallation {
     fn drop(&mut self) {
@@ -48,6 +52,31 @@ impl IndexedRequestInstallation {
             size_of::<std::cell::RefMut<'_,Option<Binding>>>(),size_of::<Result<Self,Error>>(),
             Layout::new::<[usize;2]>().extend(Layout::new::<Activation>()).ok()?.0.pad_to_align().size()];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
+    }
+}
+/// The existing channel remains borrowed for the entire actual local callback.
+/// A failed callback or unwind fences its accepted source without refunding it.
+pub(crate) struct IndexedLocalRequest<'a> {
+    _slot: std::cell::Ref<'a, Option<Binding>>,
+    owner: Rc<dyn IndexedRequestSource>,
+    activation: Rc<Activation>,
+    finished: bool,
+}
+impl IndexedLocalRequest<'_> {
+    pub(crate) fn finish(mut self, completed: bool) -> Result<(), Error> {
+        if !self.activation.active.get() {
+            self.owner.abort_local();
+            self.finished = true;
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        }
+        let result = self.owner.complete_local(completed);
+        self.finished = true;
+        result
+    }
+}
+impl Drop for IndexedLocalRequest<'_> {
+    fn drop(&mut self) {
+        if !self.finished { self.owner.abort_local(); }
     }
 }
 impl IndexedBankSource {
@@ -80,6 +109,40 @@ impl IndexedBankSource {
             size_of::<(&Self,&Stream,&mut dyn FnMut(OriginalIndexedResidencyFactory)
                 ->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)>()];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
+    }
+    pub(crate) fn local_request_control_bytes() -> Option<usize> {
+        let frames = [size_of::<std::cell::Ref<'_, Option<Binding>>>(),
+            size_of::<Rc<dyn IndexedRequestSource>>(), size_of::<Rc<Activation>>(),
+            size_of::<eredu_nn::workspace::WorkspaceAddressableRegionView<'_>>(),
+            size_of::<(&Self, usize)>(), size_of::<Result<(), Error>>(),
+            size_of::<IndexedLocalRequest<'_>>(), size_of::<Option<IndexedLocalRequest<'_>>>(),
+            size_of::<Result<IndexedLocalRequest<'_>, Error>>(),
+            size_of::<(IndexedLocalRequest<'_>, bool, Result<(), Error>)>(),
+            size_of::<&mut IndexedLocalRequest<'_>>()];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    /// Completed expert rows select the authentic installed occurrence. The
+    /// returned lexical loan spans the caller's existing typed callback/result;
+    /// the channel neither owns nor erases that generic storage.
+    pub(crate) fn enter_local_request(&self,
+        declaration: eredu_nn::workspace::WorkspaceAddressableRegionView<'_>, rows: usize)
+        -> Result<IndexedLocalRequest<'_>, Error> {
+        let slot = self.request.binding.try_borrow().map_err(|_| Error::OriginalSourceContract {
+            stage: "expert local request channel is mutably borrowed",
+            cause: eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        })?;
+        let binding = slot.as_ref().ok_or(Error::OriginalSourceContract {
+            stage: "expert local request channel is absent",
+            cause: eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        })?;
+        let fail = |cause| failed(cause, &self.bank, &binding.funding, None);
+        binding.funding.reserve_metadata(Self::local_request_control_bytes()
+            .ok_or_else(|| fail(Cause::Overflow))?).map_err(|cause| fail(Cause::Funding(cause)))?;
+        let active = binding.activation.upgrade().ok_or_else(|| fail(Cause::Spent))?;
+        let owner = binding.owner.upgrade().ok_or_else(|| fail(Cause::Spent))?;
+        if !active.active.get() || !owner.funding().same_account(&binding.funding) { return Err(fail(Cause::Identity)); }
+        owner.enter_local(self, declaration, rows)?;
+        Ok(IndexedLocalRequest { _slot: slot, owner, activation: active, finished: false })
     }
     /// None means no installed request; an expired installed request refuses.
     /// The immutable channel borrow remains held through the lexical callback,

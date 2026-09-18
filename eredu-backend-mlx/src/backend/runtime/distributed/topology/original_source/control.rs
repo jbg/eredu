@@ -26,12 +26,12 @@ pub(crate) enum ControlCause {
     #[error(transparent)]
     WorkingMemory(eredu_runtime::working_memory::WorkingMemoryError),
 }
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,parts:&[usize])->Result<(),Error>{
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,parts:&[usize])->Result<(),Error>{
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
-fn control_error(cause:ControlCause,source:&RetainedCommunicationSource,funding:&WorkspaceMetadataFunding)->Error{
+fn control_error(cause:ControlCause,source:&RetainedCommunicationSource,funding:&HostMetadataFunding)->Error{
     failure(Cause::Control(cause),source,funding)
 }
 
@@ -56,7 +56,7 @@ pub(crate) struct OriginalParallelControlRequest {
     source:ControlSource,
     retained:RetainedCommunicationSource,
     fallback:eredu_core::SharedBackendFailure,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalParallelControlRequest {
     pub(crate) fn new(source:OriginalParallelSource)->Result<Self,Error>{
@@ -154,7 +154,7 @@ struct State {
     consumed:Cell<bool>,
     closed:Cell<bool>,
     retained:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Group clones carry only a weak occurrence loan and account-only custody.
 /// They cannot extend native ownership, rebind a cursor, or find a latest scope.
@@ -162,7 +162,7 @@ pub(crate) struct OriginalControlBinding {
     state:Weak<State>,
     retained:RetainedCommunicationSource,
     fallback:eredu_core::SharedBackendFailure,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl Clone for OriginalControlBinding {
     fn clone(&self)->Self {
@@ -174,7 +174,7 @@ impl Clone for OriginalControlBinding {
 pub(crate) struct OriginalParallelControlInvocation {
     context:Group,
     state:Option<Rc<State>>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl Drop for OriginalParallelControlInvocation {
     fn drop(&mut self){if let Some(state)=self.state.take(){drop(Rc::into_inner(state));}}
@@ -187,7 +187,7 @@ impl OriginalParallelControlInvocation {
     /// control-role producer. Native constructors independently validate it.
     pub(crate) fn with_context<T,E,F>(&self,observer:&OriginalScopeObserver,stream:&Stream,run:F)
         ->Result<Result<T,E>,Error>
-    where F:FnOnce(&Group,&WorkspaceMetadataFunding)->Result<T,E>, {
+    where F:FnOnce(&Group,&HostMetadataFunding)->Result<T,E>, {
         let state=self.state();
         reserve(&self.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),
             size_of::<Result<T,E>>(),size_of::<Result<Result<T,E>,Error>>(),
@@ -226,9 +226,9 @@ impl OriginalControlBinding {
         Ok(Loan(Some(state)))
     }
     pub(crate) fn with_context<T,E,F>(&self,prepared:&Group,run:F)->Result<Result<T,E>,Error>
-    where F:FnOnce(Option<(&Group,&WorkspaceMetadataFunding)>)->Result<T,E>, {
+    where F:FnOnce(Option<(&Group,&HostMetadataFunding)>)->Result<T,E>, {
         reserve(&self.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),size_of::<Result<T,E>>(),
-            size_of::<Result<Result<T,E>,Error>>(),size_of::<Option<(&Group,&WorkspaceMetadataFunding)>>(),
+            size_of::<Result<Result<T,E>,Error>>(),size_of::<Option<(&Group,&HostMetadataFunding)>>(),
             failure_control_bytes().ok_or_else(overflow)?])?;
         let loan=self.loan()?;let state=loan.state();
         if state.closed.get() || state.bound.get().is_none() {
@@ -237,11 +237,11 @@ impl OriginalControlBinding {
         Ok(run(Some((prepared,&self.funding))))
     }
     pub(crate) fn with_group<T,E,F>(&self,event:ParallelControlEvent,group:&Group,prepared:&Group,
-        funding:&WorkspaceMetadataFunding,executor:&Stream,run:F)->Result<Result<T,E>,Error>
+        funding:&HostMetadataFunding,executor:&Stream,run:F)->Result<Result<T,E>,Error>
     where F:FnOnce(Option<&Group>)->Result<T,E>, {
         reserve(&self.funding,&[size_of::<F>(),size_of::<T>(),size_of::<E>(),size_of::<Result<T,E>>(),
             size_of::<Result<Result<T,E>,Error>>(),size_of::<Option<&Group>>(),
-            size_of::<(ParallelControlEvent,&Group,&Group,&WorkspaceMetadataFunding,&Stream)>(),
+            size_of::<(ParallelControlEvent,&Group,&Group,&HostMetadataFunding,&Stream)>(),
             failure_control_bytes().ok_or_else(overflow)?])?;
         let loan=self.loan()?;let state=loan.state();
         state.validate(prepared,executor)?;

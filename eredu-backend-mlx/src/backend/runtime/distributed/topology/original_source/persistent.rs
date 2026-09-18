@@ -6,7 +6,7 @@ pub(crate) struct OriginalCommunicatorPersistent<'a>{
     native:GroupPersistentStorage<'a>,
     source:RetainedCommunicationSource,
     // Account outlives source/native loan, including every admitted C++ owner.
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 impl OriginalCommunicatorPersistent<'_>{
     pub(crate) fn native(&self)->&GroupPersistentStorage<'_>{&self.native}
@@ -23,17 +23,17 @@ impl<'a> OriginalCommunicationSource<'a>{
             size_of::<(usize,usize,usize)>(),size_of::<bool>()*3,
             size_of::<Option<(&Group,&CommunicationGroupDescriptor,bool)>>(),
             size_of::<Option<(&CommunicationRouteRealization,&CommunicationRouteDescriptor,bool)>>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             group.map(|g|g.native_group().persistent_storage_control_bytes()).unwrap_or(Some(0))
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)
     }
     fn retain_persistent(&self,group:&'a Group)->Result<OriginalCommunicatorPersistent<'a>,Error>{
         self.validate()?;
         let native=group.native_group().persistent_storage()
             .map_err(|_|failure(Cause::Resource,&self.source,&self.funding))?;
-        let bytes=native.retained_owner_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+        let bytes=native.retained_owner_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         let bytes=if self.registered_buffers.is_some() {
             // Only this closed table proof can exclude the existing buffer.
             // The source alias below retains its pin, and the actual query

@@ -1,6 +1,6 @@
 //! Source-explicit capture through the ordinary managed plain session.
 use super::*;
-use eredu_core::capture::{CapturedStepDelivery, SharedCapturePlan};
+use eredu_core::capture::{SharedCapturedStep, SharedCapturePlan};
 use eredu_core::intervention::SharedInterventionPlan;
 
 impl<'a, B: TextGenerationBackend> ManagedPlainTextSession<'a, B> {
@@ -21,7 +21,7 @@ impl<'a, B: TextGenerationBackend> ManagedPlainTextSession<'a, B> {
     /// callback state is caller-owned and is never snapshotted.
     pub fn with_capture_observer(
         mut self,
-        observer: &'a mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &'a mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
     ) -> Self {
         self.0.set_capture_observer(observer);
         self
@@ -50,7 +50,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         request: ManagedPlainTextRequest<'_>,
         capture: SharedCapturePlan,
         cancellation: &GenerationCancellationToken,
-        observer: &'a mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &'a mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
     ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedPlainTextError> {
         self.start_managed_plain_text_with_options(
             source,
@@ -77,7 +77,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         capture: SharedCapturePlan,
         interventions: SharedInterventionPlan,
         cancellation: &GenerationCancellationToken,
-        observer: &'a mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &'a mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
     ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedPlainTextError> {
         self.start_managed_plain_text_with_options(
             source, request, cancellation,
@@ -97,14 +97,13 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         request: ManagedPlainTextRequest<'_>,
         capture: SharedCapturePlan,
         cancellation: &GenerationCancellationToken,
-        observer: &mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
     ) -> Result<Option<GenerationPlainTextOutput>, ManagedPlainTextError> {
         self.start_observed_managed_plain_text(source, request, capture, cancellation, observer)?
             .map(|session| {
                 session
                     .run(cancellation, emit)
-                    .map_err(|cause| ManagedPlainTextError::new(Cause::Backend(cause)))
             })
             .transpose()
     }
@@ -121,7 +120,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         request: ManagedPreparedInputRequest<'_, B::Prompt>,
         capture: SharedCapturePlan,
         cancellation: &GenerationCancellationToken,
-        observer: &'a mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &'a mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
     ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedPlainTextError> {
         self.start_managed_prepared_input_with_options(
             source, request, cancellation,
@@ -139,7 +138,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         capture: SharedCapturePlan,
         interventions: SharedInterventionPlan,
         cancellation: &GenerationCancellationToken,
-        observer: &'a mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &'a mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
     ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedPlainTextError> {
         self.start_managed_prepared_input_with_options(
             source, request, cancellation,
@@ -157,13 +156,12 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         request: ManagedPreparedInputRequest<'_, B::Prompt>,
         capture: SharedCapturePlan,
         cancellation: &GenerationCancellationToken,
-        observer: &mut dyn FnMut(Option<u32>, Option<CapturedStepDelivery>, f64),
+        observer: &mut dyn FnMut(Option<u32>, Option<SharedCapturedStep>, f64),
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
     ) -> Result<Option<GenerationPlainTextOutput>, ManagedPlainTextError> {
         self.start_observed_managed_prepared_input(
             source, request, capture, cancellation, observer,
-        )?.map(|session| session.run(cancellation, emit)
-            .map_err(|cause| ManagedPlainTextError::new(Cause::Backend(cause))))
+        )?.map(|session| session.run(cancellation, emit))
             .transpose()
     }
 }

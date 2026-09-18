@@ -77,50 +77,58 @@ pub(super) fn run(mode: &str) -> serde_json::Value {
             .into_parts();
     if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
                 add_generation_prompt: true,
                 ..Default::default()
             })
             .unwrap();
         let mut settings = settings(0.0);
-        settings.inference.managed_memory_capacity_bytes = None;
-        let prepared = model
-            .prepare_observed_token_ids(
-                &chat,
-                vec![0, 1, 2, 3, 4],
-                settings,
-                plan(mode),
-                TraceLimits {
-                    per_record_bytes: 1 << 20,
-                    total_bytes: 4 << 20,
-                },
-            )
-            .unwrap();
+        settings.inference.managed_memory_capacity_bytes = Some(ORIGINAL_CAPACITY);
+        let prepared_prefix = vec![0, 1, 2, 3, 4];
+        let prepared_capture = plan(mode);
+        let prepared_trace = TraceLimits {
+            per_record_bytes: 1 << 20,
+            total_bytes: 4 << 20,
+        };
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+        prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&prepared_capture);
         let mut tokens = Vec::new();
         let mut frames = Vec::new();
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
-                if let ObservedGenerationEvent::Token {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |record: ControlledGenerationRecord| {
+                if let Some(ObservedGenerationEvent::Token {
                     token_id,
                     captures: Some(frame),
                     ..
-                } = record.event
+                }) = record.event.progress()
                 {
-                    tokens.push(token_id);
-                    frames.push(frame);
+                    tokens.push(*token_id);
+                    frames.push(frame.clone());
                 }
                 ControlFlow::Continue(())
-            })
-            .unwrap_or_else(report_failure);
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap_or_else(report_failure);
         drop((model, root));
         assert_eq!(frames.len(), 4);
         let rows: Vec<_> = frames
             .iter()
             .enumerate()
             .map(|(i, frame)| {
-                assert_eq!(frame.prediction_index as usize, i);
-                full_row(&frame.records, i)
+                assert_eq!(frame.prediction_index() as usize, i);
+                full_row(&frame.as_step().records, i)
             })
             .collect();
         return serde_json::json!({"ids": tokens, "rows": rows});
@@ -148,10 +156,10 @@ pub(super) fn run(mode: &str) -> serde_json::Value {
     );
     let mut frames = Vec::new();
     let mut tokens = Vec::new();
-    let mut observer = |token: Option<u32>, frame: Option<CapturedStepDelivery>, seconds: f64| {
+    let mut observer = |token: Option<u32>, frame: Option<SharedCapturedStep>, seconds: f64| {
         assert!(seconds >= 0.0);
         tokens.push(token.expect("committed token"));
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+        let Some(frame) = frame else {
             panic!("paid shared frame")
         };
         assert_eq!(frame.prediction_index() as usize, frames.len());
@@ -160,7 +168,7 @@ pub(super) fn run(mode: &str) -> serde_json::Value {
             if mode == "controlled" { 2 } else { 1 }
         );
 
-        frames.push(frame);
+        frames.push(frame.clone());
     };
     let cancellation = GenerationCancellationToken::new();
     let mut visible = String::new();

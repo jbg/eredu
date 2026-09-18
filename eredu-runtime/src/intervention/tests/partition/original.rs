@@ -1,19 +1,19 @@
 use super::*;
 use crate::working_memory::WorkingMemoryPool;
 use eredu_core::intervention::PreparedInterventionPlanCopy;
-use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 #[derive(Debug)]
 struct Account { retired: Arc<AtomicBool>, refuse: Arc<AtomicBool> }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, _bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
-        if self.refuse.load(Ordering::SeqCst) { Err(WorkspaceMetadataFundingError::Overflow) } else { Ok(()) }
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, _bytes: usize) -> Result<(), HostMetadataFundingError> {
+        if self.refuse.load(Ordering::SeqCst) { Err(HostMetadataFundingError::Overflow) } else { Ok(()) }
     }
 }
 impl Drop for Account { fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); } }
-fn funding() -> (WorkspaceMetadataFunding, Arc<AtomicBool>, Arc<AtomicBool>) {
+fn funding() -> (HostMetadataFunding, Arc<AtomicBool>, Arc<AtomicBool>) {
     let retired = Arc::new(AtomicBool::new(false)); let refuse = Arc::new(AtomicBool::new(false));
-    (WorkspaceMetadataFunding::new(Account { retired: retired.clone(), refuse: refuse.clone() }).unwrap(), retired, refuse)
+    (HostMetadataFunding::new(Account { retired: retired.clone(), refuse: refuse.clone() }).unwrap(), retired, refuse)
 }
 #[test]
 fn original_projection_preserves_ordinary_payloads_coordinates_and_additive_sources() {

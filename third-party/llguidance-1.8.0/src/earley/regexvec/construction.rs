@@ -40,15 +40,15 @@ pub(super) struct Ordinary<'a> {
     pub relevance: &'a mut RelevanceCache,
 }
 impl Expressions for Ordinary<'_> {
-    type Error = anyhow::Error;
+    type Error = derivre::ParserError;
     fn source(&self) -> &ExprSet {
         self.source
     }
-    fn non_empty(&mut self, root: ExprRef, fuel: u64) -> anyhow::Result<bool> {
+    fn non_empty(&mut self, root: ExprRef, fuel: u64) -> derivre::ParserResult<bool> {
         self.relevance.is_non_empty_limited(self.source, root, fuel)
     }
-    fn has_repeat(&mut self, root: ExprRef) -> anyhow::Result<bool> {
-        Ok(self.source.attr_has_repeat(root))
+    fn has_repeat(&mut self, root: ExprRef) -> derivre::ParserResult<bool> {
+        Ok(self.source.attr_has_repeat(root)?)
     }
 }
 

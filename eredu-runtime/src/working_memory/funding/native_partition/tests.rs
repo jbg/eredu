@@ -245,7 +245,7 @@ fn completed_host_transfer_preserves_the_native_protected_remainder() {
     let completed = builder.finish().unwrap();
     let before = pool.used_bytes().unwrap();
     let key = Key(completed.metadata().identity().registry_key().clone());
-    publish_dense_host_slots(&completed, &mut host, &execution, retained, protected, key).unwrap();
+    publish_dense_host_slots(&completed, &mut host, &execution, retained, protected, key, None).unwrap();
     assert_eq!(
         completed.iter().copied().collect::<Vec<_>>(),
         original.slots()

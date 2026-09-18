@@ -1186,7 +1186,7 @@ fn verify_hyper_head_coefficients(device: DeviceType) {
     struct Reject;
     impl eredu_nn::TensorValueObserver<MlxTensor> for Reject {
         fn observe(&mut self, _: &MlxTensor) -> Result<(), eredu_nn::Error> {
-            Err(eredu_nn::Error::backend_source(std::io::Error::other(
+            Err(eredu_nn::Error::backend_retained_source(std::io::Error::other(
                 "coefficient admission rejected",
             )))
         }

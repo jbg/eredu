@@ -33,7 +33,7 @@ impl ForegroundDiskRequestPlan {
         windows: &[crate::backend::runtime::residency::manager::WindowPopulation],
         ids: &[OffloadUnitId],
         population: ResidencyPopulation,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Self, Error> {
         if let Some(funding) = funding {
             let bytes = [
@@ -51,7 +51,7 @@ impl ForegroundDiskRequestPlan {
                 size_of::<Vec<eredu_runtime::residency::ResidencyClosureSlot>>(),
                 size_of::<std::collections::TryReserveError>(),
                 size_of::<Box<std::collections::TryReserveError>>(),
-                size_of::<eredu_nn::workspace::WorkspaceMetadataFunding>(),
+                size_of::<eredu_nn::workspace::HostMetadataFunding>(),
             ];
             funding
                 .reserve_metadata(
@@ -99,7 +99,7 @@ impl ForegroundDiskRequestPlan {
         value.population().ok_or_else(overflow)?;
         Ok(value)
     }
-    pub(crate) fn with_background(mut self, selection: Option<&BackgroundSelection>, manager: &ResidencyManager, ids: &[OffloadUnitId], device_sources: &[crate::backend::runtime::residency::manager::WindowPopulation], funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>) -> Result<Self, Error> {
+    pub(crate) fn with_background(mut self, selection: Option<&BackgroundSelection>, manager: &ResidencyManager, ids: &[OffloadUnitId], device_sources: &[crate::backend::runtime::residency::manager::WindowPopulation], funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Result<Self, Error> {
         if let Some(selection) = selection {
             self.background = Some(BackgroundRequestPlan::new(selection, manager, &self.pool, ids, &self.windows, device_sources, self.forwards, funding.ok_or_else(unknown)?)?);
         }
@@ -289,14 +289,14 @@ impl ForegroundDiskRequestPlan {
 /// snapshot. Its vectors/source aliases retire before the quote's funding.
 pub(crate) struct PreparedSpeculativeForegroundSource {
     plan: ForegroundDiskRequestPlan,
-    _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    _funding: eredu_nn::workspace::HostMetadataFunding,
 }
 impl PreparedSpeculativeForegroundSource {
     pub(crate) fn new(
         manager: &ResidencyManager, pool: &WorkingMemoryPool,
         windows: &[crate::backend::runtime::residency::manager::WindowPopulation],
         ids: &[OffloadUnitId], population: ResidencyPopulation,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         funding
             .reserve_metadata(
@@ -401,3 +401,5 @@ impl PreparedSpeculativeForegroundSource {
         Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -307,7 +307,7 @@ impl ScheduledCaptureBackend for PublicationBackend {
                         .is_err());
                 }
                 self.failure = Some(error);
-                Err(FundedCaptureError::Backend(Error::backend_source(
+                Err(FundedCaptureError::Backend(Error::backend_retained_source(
                     Original(Arc::new(())),
                 )))
             }
@@ -475,7 +475,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         |_| Ok(q.clone())
     )
     .is_err());
-    let (_, r, accepted) = plan_prefill_incremental_with_capacity(
+    let (r, accepted) = plan_prefill_incremental_with_capacity(
         session.inference_execution_identity(),
         &pool,
         &caps,
@@ -523,7 +523,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         funded.with_prefill_observer(
             &mut backend,
             bound,
-            &|e| Error::backend_source(e),
+            &|e| Error::backend_retained_source(e),
             |observer| {
                 let mut driver = eredu_runtime::prefill::PrefillDriver::new(
                     session.inference_execution_identity(),

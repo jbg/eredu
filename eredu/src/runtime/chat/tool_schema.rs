@@ -1,12 +1,13 @@
 //! Application schemas and completion validation, independent of wire grammars.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use eredu_core::HostPreparationAuthority;
-use serde_json::{Map, Value};
+use serde_json::Value;
+pub(crate) mod declarations;
+mod projection;
+pub(crate) use declarations::{ToolDeclarations, ToolDefinition};
+pub(crate) use projection::{ArgumentsSchema, ToolCallSchema};
 
 pub(crate) mod original;
 pub(crate) mod registered;
@@ -37,10 +38,21 @@ impl ToolSchemas {
         tools: &[Value],
         authority: &HostPreparationAuthority,
     ) -> Result<Self, String> {
-        let schemas = parse_tools(tools)?
-            .into_iter()
-            .map(|tool| (tool.name, tool.validator))
-            .collect();
+        let declarations = ToolDeclarations::prepare(
+            tools,
+            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        )
+        .map_err(|e| e.to_string())?;
+        let schemas = declarations
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let validator = compile(tool.parameters)
+                    .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
+                Ok((tool.name.to_owned(), validator))
+            })
+            .collect::<Result<_, String>>()?;
         Ok(Self(Arc::new(ToolSchemasPayload {
             schemas,
             _authority: authority.clone(),
@@ -72,186 +84,6 @@ impl crate::runtime::generation::storage::SnapshotStorage for ToolSchemas {
         // Immutable compiled validators are shared by all forks.
         Some(0)
     }
-}
-
-/// Tool protocols carry argument objects even when the application uses a
-/// typeless, Boolean or union schema. Preserve that wire contract explicitly.
-pub(crate) fn arguments_schema(schema: &Value, prefix: &str) -> Result<Value, String> {
-    Ok(serde_json::json!({"allOf": [
-        {"type": "object"},
-        embed(schema, &format!("{prefix}/allOf/1"))?,
-    ]}))
-}
-
-/// Relocate fragment references when a parameter schema is embedded in a call
-/// envelope. Visit schema positions only: defaults/enums/examples are data.
-pub(crate) fn embed(schema: &Value, prefix: &str) -> Result<Value, String> {
-    let Some(object) = schema.as_object() else {
-        return Ok(schema.clone());
-    };
-    let mut output = object.clone();
-    // These change reference scope, which the grammar engine's simple resolver
-    // does not implement. Completion validation retains their full semantics.
-    if [
-        "$id",
-        "id",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "$recursiveRef",
-        "x-guidance",
-    ]
-    .iter()
-    .any(|key| object.contains_key(*key))
-    {
-        return Ok(Value::Bool(true));
-    }
-    for (key, value) in &mut output {
-        match key.as_str() {
-            "$ref" => {
-                let reference = value.as_str().ok_or("$ref must be a string")?;
-                let Some(pointer) = reference
-                    .strip_prefix('#')
-                    .filter(|pointer| pointer.is_empty() || pointer.starts_with('/'))
-                else {
-                    return Ok(Value::Bool(true));
-                };
-                *value = Value::String(format!("#{prefix}{pointer}"));
-            }
-            "$defs" | "definitions" | "properties" | "patternProperties" | "dependentSchemas" => {
-                if let Some(map) = value.as_object_mut() {
-                    for schema in map.values_mut() {
-                        *schema = embed(schema, prefix)?;
-                    }
-                }
-            }
-            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
-                if let Some(items) = value.as_array_mut() {
-                    for schema in items {
-                        *schema = embed(schema, prefix)?;
-                    }
-                }
-            }
-            "items" if value.is_array() => {
-                for schema in value.as_array_mut().expect("array") {
-                    *schema = embed(schema, prefix)?;
-                }
-            }
-            "additionalProperties"
-            | "unevaluatedProperties"
-            | "propertyNames"
-            | "items"
-            | "additionalItems"
-            | "unevaluatedItems"
-            | "contains"
-            | "not"
-            | "if"
-            | "then"
-            | "else" => {
-                *value = embed(value, prefix)?;
-            }
-            "dependencies" => {
-                if let Some(map) = value.as_object_mut() {
-                    for schema in map.values_mut().filter(|value| !value.is_array()) {
-                        *schema = embed(schema, prefix)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(Value::Object(output))
-}
-
-#[derive(Debug)]
-pub(crate) struct ToolDefinition<V = jsonschema::Validator> {
-    pub(crate) name: String,
-    pub(crate) parameters: Value,
-    pub(super) validator: V,
-}
-
-pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
-    parse_tools_with(tools, compile)
-}
-// One ordinary declaration/validation worker; only the compiled representation differs.
-fn parse_tools_with<V>(tools: &[Value], mut compile: impl FnMut(&Value) -> Result<V, String>) -> Result<Vec<ToolDefinition<V>>, String> {
-    let mut names = HashSet::new();
-    tools
-        .iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            let path = format!("tools[{index}]");
-            let object = tool
-                .as_object()
-                .ok_or_else(|| format!("{path} must be an object"))?;
-            reject_unknown_keys(object, &["type", "function"], &path)?;
-            if object.get("type").and_then(Value::as_str) != Some("function") {
-                return Err(format!("{path}.type must be \"function\""));
-            }
-            let function = object
-                .get("function")
-                .and_then(Value::as_object)
-                .ok_or_else(|| format!("{path}.function must be an object"))?;
-            reject_unknown_keys(
-                function,
-                &["name", "description", "parameters"],
-                &format!("{path}.function"),
-            )?;
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
-            validate_function_name(name, &format!("{path}.function.name"))?;
-            let name = name.to_owned();
-            if !names.insert(name.clone()) {
-                return Err(format!("duplicate tool function name {name:?}"));
-            }
-            if function
-                .get("description")
-                .is_some_and(|description| !description.is_string())
-            {
-                return Err(format!("{path}.function.description must be a string"));
-            }
-            let parameters = function
-                .get("parameters")
-                .ok_or_else(|| format!("{path}.function.parameters is required"))?;
-            let validator = compile(parameters)
-                .map_err(|error| format!("{path}.function.parameters: {error}"))?;
-            let parameters = parameters.clone();
-            Ok(ToolDefinition {
-                name,
-                parameters,
-                validator,
-            })
-        })
-        .collect()
-}
-
-fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
-    if name.len() > 64 {
-        return Err(format!("{path} must be at most 64 bytes"));
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Err(format!(
-            "{path} must contain only ASCII letters, digits, underscores, or hyphens"
-        ));
-    }
-    Ok(())
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    allowed: &[&str],
-    path: &str,
-) -> Result<(), String> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{path} contains unsupported field {key:?}"));
-    }
-    Ok(())
 }
 
 /// Whether a dialect can enumerate the argument fields without interpreting

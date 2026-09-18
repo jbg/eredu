@@ -252,7 +252,7 @@ pub(super) fn token_id(
         })();
         recovery.seal();
         let status = if result.is_ok() {
-            recovery.finish()
+            recovery.finish().map_err(|cause| { owner.reject_unresolved(); Cause::Backend(cause.into_error()) })?
         } else {
             recovery.progress()
         };
@@ -290,6 +290,8 @@ pub(in crate::composition::mlx::session) fn control_bytes() -> Option<u64> {
         size_of::<Result<u32, Cause>>(),
         size_of::<Result<u32, Error>>(),
         size_of::<Result<(), Cause>>(),
+        size_of::<&SubmissionResourcesOwner>(),
+        size_of::<Result<crate::backend::submission_recovery::Status, crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause>>(),
         size_of::<Result<&[u32], safemlx::error::AsSliceError>>(),
         size_of::<&Array>(),
         size_of::<&[u32]>(),

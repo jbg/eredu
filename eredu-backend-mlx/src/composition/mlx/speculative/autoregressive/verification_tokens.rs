@@ -1,7 +1,7 @@
 //! Immutable verification inputs retain their actual host-construction account.
 use crate::backend::error::Error;
 use eredu_core::{GenerationTokenIdStorage, GenerationTokenIds};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::{
     alloc::Layout,
     mem::{size_of, size_of_val},
@@ -12,7 +12,7 @@ use std::{
 struct Tokens {
     values: Vec<u32>,
     // Last: backing and all token owners retire before the cumulative account.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl GenerationTokenIdStorage for Tokens {
     fn token_ids(&self) -> &[u32] {
@@ -28,7 +28,7 @@ impl GenerationTokenIdStorage for Tokens {
 struct Failure {
     #[source]
     cause: eredu_nn::Error,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn controls() -> Option<usize> {
     let shared = Layout::new::<[AtomicUsize; 2]>()
@@ -42,17 +42,17 @@ fn controls() -> Option<usize> {
         size_of::<Result<GenerationTokenIds, Error>>(),
         size_of::<Vec<u32>>(),
         size_of::<Failure>(),
-        size_of::<(&[u32], &WorkspaceMetadataFunding)>(),
-        eredu_nn::Error::retained_source_control_bytes::<Failure>()?,
+        size_of::<(&[u32], &HostMetadataFunding)>(),
+        eredu_nn::Error::retained_source_construction_bytes::<Failure>()?,
     ];
     parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
 }
 pub(super) fn copy(
     tokens: &[u32],
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<GenerationTokenIds, Error> {
     funding.reserve_metadata(controls().ok_or(Error::WorkspacePlanning(
-        WorkspaceMetadataFundingError::Overflow,
+        HostMetadataFundingError::Overflow,
     ))?).map_err(Error::WorkspacePlanning)?;
     let mut values = funding.metadata_vec(tokens.len()).map_err(|cause| {
         // This erasure was paid above; it preserves the exact inner refusal.
@@ -71,7 +71,7 @@ pub(super) fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_nn::workspace::WorkspaceMetadataAccount;
+    use eredu_nn::workspace::HostMetadataAccount;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug)]
@@ -79,12 +79,12 @@ mod tests {
         available: Arc<AtomicUsize>,
         retired: Arc<AtomicBool>,
     }
-    impl WorkspaceMetadataAccount for Account {
-        fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             self.available.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
                 |available| available.checked_sub(bytes))
                 .map(|_| ())
-                .map_err(|available| WorkspaceMetadataFundingError::Capacity {
+                .map_err(|available| HostMetadataFundingError::Capacity {
                     required: u64::try_from(bytes).unwrap(), available: u64::try_from(available).unwrap(),
                 })
         }
@@ -96,13 +96,13 @@ mod tests {
     fn refusal_precedes_copy_and_cloned_tokens_retain_the_account() {
         let available = Arc::new(AtomicUsize::new(1 << 20));
         let retired = Arc::new(AtomicBool::new(false));
-        let funding = WorkspaceMetadataFunding::new(Account {
+        let funding = HostMetadataFunding::new(Account {
             available: available.clone(), retired: retired.clone(),
         }).unwrap();
         available.store(0, Ordering::SeqCst);
         let refusal = copy(&[7, 31, 5], &funding).unwrap_err();
         assert!(matches!(refusal, Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Capacity { available: 0, .. }
+            HostMetadataFundingError::Capacity { available: 0, .. }
         )));
         assert_eq!(available.load(Ordering::SeqCst), 0);
         available.store(1 << 20, Ordering::SeqCst);
@@ -119,3 +119,5 @@ mod tests {
         assert!(retired.load(Ordering::SeqCst));
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

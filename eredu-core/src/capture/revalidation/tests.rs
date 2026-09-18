@@ -460,3 +460,71 @@ fn fixed_borrowed_revalidation_shares_transform_limits_and_enabled_phases() {
         assert!(plan.revalidate(&current).is_err());
     }
 }
+
+#[derive(Debug)]
+struct AdmissionAccount {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refuse: usize,
+}
+impl crate::HostMetadataAccount for AdmissionAccount {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), crate::HostMetadataFundingError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let index = self.calls.fetch_add(1, SeqCst);
+        if index == self.refuse {
+            Err(crate::HostMetadataFundingError::Capacity { required: bytes as u64, available: 0 })
+        } else { Ok(()) }
+    }
+}
+fn paid_admission(raw: &CapturePlan, discovery: &CaptureDiscovery, request: CaptureRequestShape,
+    refuse: usize) -> (Result<AdmittedCapturePlan, CaptureError>, usize) {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering::SeqCst}};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let funding = crate::HostMetadataFunding::new(AdmissionAccount { calls: calls.clone(), refuse }).unwrap();
+    let result = raw.copy_with_funding(&funding).and_then(|plan| plan.admit_with_funding(
+        &discovery.catalog, &discovery.support, &discovery.support.capture, request, &funding));
+    (result, calls.load(SeqCst))
+}
+
+#[test]
+fn funded_admission_preserves_all_transforms_and_refuses_each_reached_producer() {
+    let (ordinary, discovery) = fixture();
+    let (paid, calls) = paid_admission(ordinary.plan(), &discovery, ordinary.request(), usize::MAX);
+    let paid = paid.unwrap();
+    assert_eq!(paid.identity(), ordinary.identity());
+    assert_eq!(paid.plan(), ordinary.plan());
+    assert_eq!(paid.points(), ordinary.points());
+    assert_ne!(paid.plan().selections.as_ptr(), ordinary.plan().selections.as_ptr());
+    assert!(calls > 20);
+    // Index zero constructs the test account, before the compiler invocation.
+    for refusal in 1..calls {
+        let (result, reached) = paid_admission(ordinary.plan(), &discovery, ordinary.request(), refusal);
+        assert!(matches!(result, Err(CaptureError::AdmissionStorage(
+            CaptureAdmissionStorageError::Funding(crate::HostMetadataFundingError::Capacity { available: 0, .. })))),
+            "producer {refusal}: {result:?}");
+        assert_eq!(reached, refusal + 1, "producer after first refusal");
+    }
+}
+
+#[test]
+fn funded_diagnostics_keep_first_source_error_and_refuse_before_formatting() {
+    let (ordinary, discovery) = fixture();
+    let mut cases = Vec::new();
+    let mut raw = ordinary.plan().clone(); raw.schema_version += 1; cases.push(raw);
+    let mut raw = ordinary.plan().clone(); raw.selections[0].path = "missing target".into(); cases.push(raw);
+    let mut raw = ordinary.plan().clone(); raw.selections[1].id = raw.selections[0].id.clone();
+    raw.selections[2].path = "later missing target".into(); cases.push(raw);
+    let mut raw = ordinary.plan().clone(); let duplicate = raw.selections[1].slices[0].clone(); raw.selections[1].slices.push(duplicate); cases.push(raw);
+    let mut raw = ordinary.plan().clone(); raw.selections[6].transform = CaptureTransform::TokenScores { token_ids: vec![3, 3] }; cases.push(raw);
+    for raw in cases {
+        let ordinary_error = raw.clone().admit(&discovery.catalog, &discovery.support,
+            &discovery.support.capture, ordinary.request()).unwrap_err();
+        let (result, calls) = paid_admission(&raw, &discovery, ordinary.request(), usize::MAX);
+        assert_eq!(result.unwrap_err().to_string(), ordinary_error.to_string());
+        for refusal in 1..calls {
+            let (result, reached) = paid_admission(&raw, &discovery, ordinary.request(), refusal);
+            assert!(matches!(result, Err(CaptureError::AdmissionStorage(CaptureAdmissionStorageError::Funding(_)))),
+                "producer {refusal}: {result:?}");
+            assert_eq!(reached, refusal + 1);
+        }
+    }
+}

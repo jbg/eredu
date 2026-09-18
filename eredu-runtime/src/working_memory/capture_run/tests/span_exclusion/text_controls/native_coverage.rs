@@ -9,7 +9,7 @@ struct CoverageOnly(NativeStorageSelection);
 impl OriginalNativeStorageMechanism for CoverageOnly {
     type Key = u32;
     type Budget = std::sync::Arc<OriginalNativeBudgetCustody>;
-    type Root = ();
+    type Root<'a> = &'a ();
     type Attachment = NativeStorageRegistration<u32>;
     type Error = WorkingMemoryError;
     type Observation<'a> = ();
@@ -19,7 +19,7 @@ impl OriginalNativeStorageMechanism for CoverageOnly {
     fn create_budget(&self, _: OriginalNativeBudgetCustody) -> Result<Self::Budget, Self::Error> {
         unreachable!("this test issues the accounting partition, not a native counter")
     }
-    fn observe<'a>(&'a self, _: &'a Self::Budget, _: &'a ()) -> Result<(), Self::Error> {
+    fn observe<'a, 'root: 'a>(&'a self, _: &'a Self::Budget, _: &'root ()) -> Result<(), Self::Error> {
         unreachable!()
     }
     fn describe(_: &()) -> NativeStorageObservation<u32> {

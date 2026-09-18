@@ -133,7 +133,7 @@ impl<'a> OriginalControlExchangePlan<'a> {
             size_of::<Result<Option<eredu_runtime::working_memory::CopiedMediaStateBinding>, Error>>(
             ),
             size_of::<Option<&eredu_runtime::working_memory::MediaSessionBinding>>(),
-            size_of::<&eredu_nn::workspace::WorkspaceMetadataFunding>(),
+            size_of::<&eredu_nn::workspace::HostMetadataFunding>(),
             size_of::<Result<Self, ExchangeSourceCause>>(),
             size_of::<Result<(), ExchangeSourceCause>>(),
             size_of::<ExchangeSourceCause>(),
@@ -193,7 +193,7 @@ impl PreparedControlExchange {
         mut self,
         runtime: &mut ModelRuntime<MlxBackend<'_>>,
         slot: &mut MlxNativeTextState,
-        metadata: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        metadata: &eredu_nn::workspace::HostMetadataFunding,
         media: Option<&eredu_runtime::working_memory::MediaSessionBinding>,
     ) -> Result<Option<eredu_runtime::working_memory::CopiedMediaStateBinding>, Error> {
         check_target(runtime).map_err(error)?;
@@ -224,14 +224,16 @@ impl PreparedControlExchange {
             slot.state.as_mut(),
             metadata,
             media,
+            None,
         )?;
+        slot.displaced_placement = transition.displaced;
         let prior = std::mem::take(&mut payload.state_memory);
         slot.memory_retention =
             NativeMemoryRetention::from_prepared_owners(std::mem::take(&mut self.owners));
         // Slot's independent H remains last; prior metadata is replaced by the
         // exact separately constructed list, preserving every actual authority.
         drop(prior);
-        Ok(transition)
+        Ok(transition.media)
     }
 }
 

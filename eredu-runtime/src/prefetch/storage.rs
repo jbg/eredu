@@ -1,6 +1,6 @@
 //! Exact selected Rust queue/source storage. Thread/PAL and read authority are separate.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use std::{
     alloc::Layout,
     fmt,
@@ -12,18 +12,18 @@ use std::{
 pub(super) struct Funded<T> {
     pub(super) value: T,
     // Last: the value and shared allocation retire before this account alias.
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 pub(super) struct Retained<T> {
     owner: Option<Arc<Funded<T>>>,
 }
 impl<T> Retained<T> {
-    fn new(value: T, funding: Option<WorkspaceMetadataFunding>) -> Self {
+    fn new(value: T, funding: Option<HostMetadataFunding>) -> Self {
         Self {
             owner: Some(Arc::new(Funded { value, funding })),
         }
     }
-    pub(super) fn funding(&self) -> Option<&WorkspaceMetadataFunding> {
+    pub(super) fn funding(&self) -> Option<&HostMetadataFunding> {
         self.owner.as_ref().expect("live storage").funding.as_ref()
     }
     #[cfg(test)]
@@ -95,7 +95,7 @@ impl fmt::Debug for PrefetchUnit {
 
 pub(super) struct Retirement<E> {
     pub(super) values: Vec<E>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl<E: BackgroundPrefetchFailure> Retirement<E> {
     pub(super) fn bytes(count: usize) -> Option<usize> {
@@ -112,7 +112,7 @@ impl<E: BackgroundPrefetchFailure> Retirement<E> {
     }
     fn prepaid(
         count: usize,
-        funding: Option<WorkspaceMetadataFunding>,
+        funding: Option<HostMetadataFunding>,
     ) -> Result<Self, std::collections::TryReserveError> {
         let mut values = Vec::new();
         values.try_reserve_exact(count)?;
@@ -165,7 +165,7 @@ pub struct PrefetchStoragePreparationError<E> {
     cause: PreparationCause<E>,
     units: Vec<OffloadUnitId>,
     retirement: Vec<E>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 enum PreparationCause<E> {
     Funding(eredu_core::HostMetadataFundingError),
@@ -234,7 +234,7 @@ impl<E: BackgroundPrefetchFailure> PreparedPrefetchStorage<E> {
             size_of::<Result<Self, PrefetchStoragePreparationError<E>>>(),
             size_of::<std::slice::Iter<'_, OffloadUnitId>>(),
             size_of::<Option<usize>>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<eredu_core::HostMetadataFundingError>(),
             size_of::<PrefetchUnit>(),
             size_of::<BackgroundPrefetchWorkerError<E>>(),
@@ -248,7 +248,7 @@ impl<E: BackgroundPrefetchFailure> PreparedPrefetchStorage<E> {
     pub fn prepare(
         units: &[OffloadUnitId],
         queue_capacity: usize,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, PrefetchStoragePreparationError<E>> {
         let mut partial = PrefetchStoragePreparationError {
             cause: PreparationCause::Funding(eredu_core::HostMetadataFundingError::Overflow),
@@ -317,7 +317,7 @@ impl<E: BackgroundPrefetchFailure> PreparedPrefetchStorage<E> {
     }
     fn shared(
         lifecycle: Lifecycle<E>,
-        funding: Option<WorkspaceMetadataFunding>,
+        funding: Option<HostMetadataFunding>,
     ) -> Retained<(Mutex<Shared<E>>, Condvar)> {
         Retained::new(
             (

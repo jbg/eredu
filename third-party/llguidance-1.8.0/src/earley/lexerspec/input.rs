@@ -82,6 +82,7 @@ impl RegexVectorInput {
 }
 #[derive(Debug)]
 enum Cause {
+    Construction(derivre::ParserError),
     Overflow,
     Capacity,
     Source,
@@ -97,6 +98,7 @@ pub struct LexerInputFailure {
 impl fmt::Display for LexerInputFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
+            Cause::Construction(error) => fmt::Display::fmt(error, f),
             Cause::Overflow => f.write_str("lexer root geometry overflow"),
             Cause::Capacity => {
                 f.write_str("lexer root destination differs from its exact capacity")
@@ -109,6 +111,7 @@ impl fmt::Display for LexerInputFailure {
 impl std::error::Error for LexerInputFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
+            Cause::Construction(error) => Some(error),
             Cause::Vector(e) => Some(e),
             _ => None,
         }
@@ -280,7 +283,10 @@ impl LexerRootSource {
         self,
         expressions: ExprSet,
     ) -> Result<RegexVectorInput, LexerInputFailure> {
-        let (alpha, expressions, roots) = AlphabetInfo::from_exprset(expressions, &self.roots);
+        let (alpha, expressions, roots) = match AlphabetInfo::from_exprset(expressions, &self.roots) {
+            Ok(value) => value,
+            Err(error) => return Err(LexerInputFailure { cause: Cause::Construction(error), source: Some(self), input: None }),
+        };
         self.finish(alpha, expressions, roots)
     }
 }

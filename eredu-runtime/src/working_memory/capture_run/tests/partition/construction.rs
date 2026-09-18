@@ -18,8 +18,8 @@ fn paid_contiguous_receipts_preserve_ordinary_shard_and_sum_order_with_empty_pee
             projection:CaptureContiguousProjectionPlan::prepare(&global,&slice,axis,row.coordinates.clone(),3).unwrap().construct()}).collect();
         let limits=PartitionCaptureReceiptLimits{max_producers:3,max_fragments:3,max_record_bytes:64<<10};
         let mut ordinary_quota=CaptureLedger::new(source.admission());ordinary_quota.begin_step();
-        let ordinary=if sum {PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}
-            else {PartitionCaptureReceiptPlan::new_shared(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
+        let ordinary=if sum {PartitionCaptureReceiptPlan::new_sum(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}
+            else {PartitionCaptureReceiptPlan::new(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
         let mut quota=CaptureLedger::new(source.admission());quota.begin_step();
         let (funding,used,_,retired)=funding();
         let combination=if sum {PartitionCaptureCombination::SumF64ToF32}else{PartitionCaptureCombination::Disjoint};
@@ -82,7 +82,7 @@ fn paid_complete_receipt_keeps_ordinary_identity_geometry_and_source_custody() {
         };
         let mut ordinary_quota = CaptureLedger::new(source.admission());
         ordinary_quota.begin_step();
-        let ordinary = PartitionCaptureReceiptPlan::new_shared(source.clone(), context.clone(),
+        let ordinary = PartitionCaptureReceiptPlan::new(source.clone(), context.clone(),
             vec![PartitionCaptureProducer { rank: 3, projection }], 4, limits,
             &mut ordinary_quota).unwrap();
         let mut original_quota = CaptureLedger::new(source.admission());
@@ -94,7 +94,7 @@ fn paid_complete_receipt_keeps_ordinary_identity_geometry_and_source_custody() {
         assert!(used.load(Ordering::SeqCst) > before);
         assert_eq!(original.identity(), ordinary.identity());
         assert_eq!(original.context(), ordinary.context());
-        assert!(std::ptr::eq(original.shared_plan_source().unwrap().admission(), source.admission()));
+        assert!(std::ptr::eq(original.shared_plan_source().admission(), source.admission()));
         assert_eq!(original.producers().map(|(rank, _)| rank).collect::<Vec<_>>(), [3]);
         assert!(original.producer(0).is_none());
         let actual = original.producer(3).unwrap();
@@ -157,8 +157,8 @@ fn paid_explicit_invocation_receipt_preserves_original_axes_bounds_and_host_sour
             let limits=PartitionCaptureReceiptLimits{max_producers:2,max_fragments:2,max_record_bytes:64<<10};
             let combination=if sum{PartitionCaptureCombination::SumF64ToF32}else{PartitionCaptureCombination::Disjoint};
             let mut ordinary_quota=CaptureLedger::new(source.admission());ordinary_quota.begin_step();
-            let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}
-                else{PartitionCaptureReceiptPlan::new_shared(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
+            let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}
+                else{PartitionCaptureReceiptPlan::new(source.clone(),context.clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
             let (funding,used,_,retired)=funding();
             let mut quota=CaptureLedger::new(source.admission());quota.begin_step();
             let actual=PartitionCaptureReceiptPlan::new_contiguous_shared_funded(&source,&context,2,&rows,

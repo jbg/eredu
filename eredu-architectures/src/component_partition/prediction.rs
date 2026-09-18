@@ -8,39 +8,59 @@ use eredu_core::{
 
 impl ComponentPartitionLayouts {
     pub(crate) fn with_prediction(
-        mut self,
+        self,
         descriptor: &ArchitectureDescriptor,
         prepared: &PreparedPredictionPlacement,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
     ) -> Result<Self, ComponentPartitionError> {
+        self.with_prediction_worker(descriptor, prepared, execution, Destination(None))
+    }
+
+    pub(crate) fn with_prediction_worker(
+        mut self,
+        descriptor: &ArchitectureDescriptor,
+        prepared: &PreparedPredictionPlacement,
+        execution: &crate::speculative_execution::SpeculativeActivationExecution,
+        allocation: Destination<'_>,
+    ) -> Result<Self, ComponentPartitionError> {
+        allocation.controls::<(
+            Self,
+            &ArchitectureDescriptor,
+            &PreparedPredictionPlacement,
+            &crate::speculative_execution::SpeculativeActivationExecution,
+            SourceMap<usize, crate::prediction_extension::placement::PredictionLayout<'_>>,
+            usize,
+            usize,
+            ComponentPartitionLayout,
+        )>()?;
         if prepared.topology().topology() != self.topology {
-            return Err(CaptureError::Invalid(
-                "prediction placement differs from target topology".into(),
-            )
-            .into());
+            return Err(allocation
+                .capture_invalid(format_args!(
+                    "prediction placement differs from target topology"
+                ))
+                .into());
         }
         let parameters = prepared.parameters().ok_or_else(|| {
-            CaptureError::Unsupported(
-                "prepared prediction has no declared parameter placement".into(),
-            )
+            allocation.capture_unsupported(format_args!(
+                "prepared prediction has no declared parameter placement"
+            ))
         })?;
-        let mut tensors = BTreeMap::new();
+        let mut tensors = SourceMap::new();
         for rank in 0..self.layouts.len() {
             let topology = self.layouts[rank].topology;
             let tensor_rank = topology.tensor_parallel_rank();
-            if let std::collections::btree_map::Entry::Vacant(entry) = tensors.entry(tensor_rank) {
-                entry.insert(
-                    prepared
-                        .layout_for_rank(rank)
-                        .map_err(ComponentPartitionError::ParameterLayout)?
-                        .ok_or_else(|| {
-                            CaptureError::Unsupported(
-                                "prediction parameter placement is absent".into(),
-                            )
-                        })?,
-                );
+            if !tensors.contains_key(&tensor_rank) {
+                let layout = prepared
+                    .layout_projection(rank, allocation.allocation())
+                    .map_err(|error| allocation.source_error(error))?
+                    .ok_or_else(|| {
+                        allocation.capture_unsupported(format_args!(
+                            "prediction parameter placement is absent"
+                        ))
+                    })?;
+                allocation.insert(&mut tensors, tensor_rank, layout)?;
             }
-            let local = &tensors[&tensor_rank];
+            let local = tensors[&tensor_rank].layout();
             for scope in &descriptor.component_scopes {
                 let invocation = match scope.kind {
                     ComponentExecutionScopeKind::Prediction { depth } => {
@@ -50,7 +70,7 @@ impl ComponentPartitionLayouts {
                         eredu_core::speculative::SpeculativeCaptureScope::FusedProposal
                     }
                 };
-                execution.validate_scope(invocation)?;
+                allocation.validate_scope(execution, invocation)?;
                 // A sequential depth can be entirely static. Parameter ownership
                 // below must prove every declared dependency belongs to those
                 // roles; removing an actual execution group does not bypass it.
@@ -68,18 +88,18 @@ impl ComponentPartitionLayouts {
                     || scope
                         .execution_groups
                         .iter()
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        != expected_groups
+                        .enumerate()
+                        .any(|(index, id)| scope.execution_groups[..index].contains(id))
                     || scope
                         .execution_groups
                         .iter()
                         .any(|id| !descriptor.layer_groups.iter().any(|group| &group.id == id))
                 {
-                    return Err(CaptureError::Invalid(
-                        "prediction scope differs from its physical execution groups".into(),
-                    )
-                    .into());
+                    return Err(allocation
+                        .capture_invalid(format_args!(
+                            "prediction scope differs from its physical execution groups"
+                        ))
+                        .into());
                 }
                 let owns = |parameter: &str| {
                     let group = parameters
@@ -91,7 +111,7 @@ impl ComponentPartitionLayouts {
                                 .iter()
                                 .any(|member| member.target() == parameter)
                         })
-                        .ok_or_else(|| ComponentPartitionError::MissingWeight(parameter.into()))?;
+                        .ok_or_else(|| allocation.missing(parameter))?;
                     let owned = match group.owner() {
                         eredu_runtime::ParameterGroupOwner::ExecutionUnit { group, .. } => {
                             scope.execution_groups.iter().any(|id| id == group.as_str())
@@ -118,10 +138,11 @@ impl ComponentPartitionLayouts {
                         _ => false,
                     };
                     if !owned {
-                        return Err(CaptureError::Invalid(format!(
-                            "prediction parameter belongs to another invocation: {parameter}"
-                        ))
-                        .into());
+                        return Err(allocation
+                            .capture_invalid(format_args!(
+                                "prediction parameter belongs to another invocation: {parameter}"
+                            ))
+                            .into());
                     }
                     Ok(true)
                 };
@@ -132,12 +153,13 @@ impl ComponentPartitionLayouts {
                 {
                     owns(parameter)?;
                 }
-                let mut projected = ComponentPartitionLayout::from_components(
+                let mut projected = ComponentPartitionLayout::from_components_worker(
                     descriptor,
                     &scope.components,
                     local,
                     topology,
                     &owns,
+                    allocation,
                 )?;
                 if let ComponentResidualBase::LinearFusion {
                     inputs,
@@ -192,67 +214,70 @@ impl ComponentPartitionLayouts {
                         owns(parameter)?;
                     }
                 }
-                projected.prediction_boundaries(descriptor, scope)?;
-                transforms::register(
+                projected.prediction_boundaries(descriptor, scope, allocation)?;
+                transforms::worker(
                     &mut projected.observations,
                     descriptor,
                     local,
                     invocation,
                     &owns,
+                    allocation,
                 )?;
-                register_routed_boundaries(
+                invocations::routed(
                     &mut projected.observations,
                     descriptor,
                     &scope.routed_components,
                     |node| {
-                        let actual = crate::speculative_execution::speculative_capture_scope(
-                            descriptor, node,
-                        )?;
+                        let actual = allocation.scope(descriptor, node)?;
                         if actual != invocation {
-                            return Err(CaptureError::Invalid(
-                                "routed prediction input belongs to another invocation".into(),
-                            )
-                            .into());
+                            return Err(allocation
+                                .capture_invalid(format_args!(
+                                    "routed prediction input belongs to another invocation"
+                                ))
+                                .into());
                         }
                         Ok(true)
                     },
+                    allocation,
                 )?;
                 if let Some(streams) = &scope.readout.stream_residual {
-                    streams::register(
+                    streams::worker(
                         &mut projected.observations,
                         descriptor,
                         streams,
                         &owns,
                         (true, ObservationHookSite::Unit),
                         (true, ObservationHookSite::Unit),
+                        allocation,
                     )?;
                 }
-                projected.routed = routed::placement::prediction_observations(
+                projected.routed = routed::placement::prediction_worker(
                     descriptor,
                     &scope.routed_components,
                     local,
+                    allocation,
                 )?;
-                self.layouts[rank].merge_prediction(projected)?;
+                self.layouts[rank].merge_prediction(projected, allocation)?;
             }
             // Fused context preparation executes on every prediction replica,
             // independently of the proposal's scored decoder invocation. It
             // owns only the declared cache-input seams, never proposal writes.
             for point in &descriptor.observations.points {
-                if crate::speculative_execution::speculative_capture_scope(
-                    descriptor,
-                    &point.node_id,
-                )? == eredu_core::speculative::SpeculativeCaptureScope::PredictionContext
+                if allocation.scope(descriptor, &point.node_id)?
+                    == eredu_core::speculative::SpeculativeCaptureScope::PredictionContext
                 {
-                    execution.validate_scope(
+                    allocation.validate_scope(
+                        execution,
                         eredu_core::speculative::SpeculativeCaptureScope::PredictionContext,
                     )?;
-                    replicated_observation(
+                    observations::replicated(
                         &mut self.layouts[rank].observations,
                         descriptor,
                         &point.path,
                         "hidden",
                         true,
                         ObservationHookSite::Unit,
+                        allocation,
                     )?;
                 }
             }
@@ -265,15 +290,24 @@ impl ComponentPartitionLayout {
         &mut self,
         descriptor: &ArchitectureDescriptor,
         scope: &ComponentExecutionScope,
+        allocation: Destination<'_>,
     ) -> Result<(), ComponentPartitionError> {
+        allocation.controls::<(
+            &mut Self,
+            &ArchitectureDescriptor,
+            &ComponentExecutionScope,
+            &str,
+            &str,
+        )>()?;
         let mut add = |path: &str, axis: &str| {
-            replicated_observation(
+            observations::replicated(
                 &mut self.observations,
                 descriptor,
                 path,
                 axis,
                 true,
                 ObservationHookSite::Unit,
+                allocation,
             )
         };
         // These are actual scope inputs/outputs, not target publication. The
@@ -308,9 +342,17 @@ impl ComponentPartitionLayout {
                 effective_output,
                 ..
             } => {
-                validate_residual_source(descriptor, input, expansion, output, effective_output)?;
+                validate_residual_source(
+                    descriptor,
+                    input,
+                    expansion,
+                    output,
+                    effective_output,
+                    allocation,
+                )?;
                 let original = input.strip_suffix(".effective").ok_or_else(|| {
-                    CaptureError::Invalid("residual source lacks its original seam".into())
+                    allocation
+                        .capture_invalid(format_args!("residual source lacks its original seam"))
                 })?;
                 for path in [original, input, output, effective_output] {
                     add(path, "hidden")?;
@@ -321,15 +363,15 @@ impl ComponentPartitionLayout {
                 output,
                 effective_output,
             } => {
-                validate_projected_sum(descriptor, inputs, output, effective_output)?;
+                validate_projected_sum(descriptor, inputs, output, effective_output, allocation)?;
                 for input in inputs {
                     // The equation points to the consumed normalized value;
                     // admission also retains its original intervention seam.
                     let original =
                         input.normalized.strip_suffix(".effective").ok_or_else(|| {
-                            CaptureError::Invalid(
-                                "projected normalization has no original seam".into(),
-                            )
+                            allocation.capture_invalid(format_args!(
+                                "projected normalization has no original seam"
+                            ))
                         })?;
                     add(original, "hidden")?;
                     for path in [
@@ -354,7 +396,9 @@ impl ComponentPartitionLayout {
             } => {
                 for input in inputs {
                     let original = input.output.strip_suffix(".effective").ok_or_else(|| {
-                        CaptureError::Invalid("fusion normalization has no original seam".into())
+                        allocation.capture_invalid(format_args!(
+                            "fusion normalization has no original seam"
+                        ))
                     })?;
                     add(original, "hidden")?;
                     if let eredu_core::component::ComponentFusionSource::Observation { path } =
@@ -379,9 +423,9 @@ impl ComponentPartitionLayout {
             add(path, "vocabulary")?;
         }
         for write in &readout.score_writes {
-            validate_score_write(descriptor, write, &readout.logits)?;
+            validate_score_write(descriptor, write, &readout.logits, allocation)?;
             let original = write.input.strip_suffix(".effective").ok_or_else(|| {
-                CaptureError::Invalid("score input lacks its original seam".into())
+                allocation.capture_invalid(format_args!("score input lacks its original seam"))
             })?;
             for path in [original, &write.input, &write.projection_input] {
                 add(path, "hidden")?;
@@ -404,24 +448,48 @@ impl ComponentPartitionLayout {
         }
         Ok(())
     }
-    fn merge_prediction(&mut self, prediction: Self) -> Result<(), ComponentPartitionError> {
+    fn merge_prediction(
+        &mut self,
+        prediction: Self,
+        allocation: Destination<'_>,
+    ) -> Result<(), ComponentPartitionError> {
+        allocation.controls::<(
+            &mut Self,
+            Self,
+            String,
+            PartitionedComponentGroup,
+            PartitionedObservation,
+            PartitionedRoutedObservation,
+        )>()?;
         for (key, value) in prediction.groups {
-            if self.groups.insert(key.clone(), value).is_some() {
+            if allocation
+                .insert(&mut self.groups, allocation.text(&key)?, value)?
+                .is_some()
+            {
                 return Err(ComponentPartitionError::DuplicateIdentity(key));
             }
         }
         for (key, value) in prediction.paths {
-            if self.paths.insert(key.clone(), value).is_some() {
+            if allocation
+                .insert(&mut self.paths, allocation.text(&key)?, value)?
+                .is_some()
+            {
                 return Err(ComponentPartitionError::DuplicateIdentity(key));
             }
         }
         for (key, value) in prediction.observations {
-            if self.observations.insert(key.clone(), value).is_some() {
+            if allocation
+                .insert(&mut self.observations, allocation.text(&key)?, value)?
+                .is_some()
+            {
                 return Err(ComponentPartitionError::DuplicateIdentity(key));
             }
         }
         for (key, value) in prediction.routed {
-            if self.routed.insert(key.clone(), value).is_some() {
+            if allocation
+                .insert(&mut self.routed, allocation.text(&key)?, value)?
+                .is_some()
+            {
                 return Err(ComponentPartitionError::DuplicateIdentity(key));
             }
         }
@@ -433,20 +501,28 @@ fn observation_axes(
     descriptor: &ArchitectureDescriptor,
     path: &str,
     position: eredu_core::ObservationPosition,
+    allocation: Destination<'_>,
 ) -> Result<Vec<eredu_core::TensorAxis>, ComponentPartitionError> {
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &str,
+        eredu_core::ObservationPosition,
+        Vec<eredu_core::TensorAxis>,
+    )>()?;
     let point = descriptor
         .observations
         .get(path)
-        .ok_or_else(|| CaptureError::MissingPath(path.into()))?;
+        .ok_or_else(|| allocation.capture_missing(path))?;
     if point.position != position {
-        return Err(
-            CaptureError::Invalid("component equation observation timing differs".into()).into(),
-        );
+        return Err(allocation
+            .capture_invalid(format_args!(
+                "component equation observation timing differs"
+            ))
+            .into());
     }
-    point
-        .axes
-        .clone()
-        .ok_or_else(|| CaptureError::Invalid("component equation has no tensor axes".into()).into())
+    allocation.axes(point.axes.as_deref().ok_or_else(|| {
+        allocation.capture_invalid(format_args!("component equation has no tensor axes"))
+    })?)
 }
 
 fn validate_residual_source(
@@ -455,15 +531,28 @@ fn validate_residual_source(
     expansion: &eredu_core::component::ComponentFusionExpansion,
     output: &str,
     effective_output: &str,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &str,
+        &str,
+        Vec<eredu_core::TensorAxis>,
+        Vec<eredu_core::TensorAxis>,
+        usize,
+    )>()?;
     use eredu_core::{
-        component::ComponentFusionExpansion, ObservationPosition as P, SymbolicDimension,
+        ObservationPosition as P, SymbolicDimension, component::ComponentFusionExpansion,
     };
-    let invalid =
-        || CaptureError::Invalid("expanded residual source has inconsistent geometry".into());
-    let mut source = observation_axes(descriptor, input, P::AfterIntervention)?;
+    let invalid = || {
+        allocation.capture_invalid(format_args!(
+            "expanded residual source has inconsistent geometry"
+        ))
+    };
+    let mut source = observation_axes(descriptor, input, P::AfterIntervention, allocation)?;
     let original = input.strip_suffix(".effective").ok_or_else(invalid)?;
-    if source.is_empty() || source != observation_axes(descriptor, original, P::BeforeIntervention)?
+    if source.is_empty()
+        || source != observation_axes(descriptor, original, P::BeforeIntervention, allocation)?
     {
         return Err(invalid().into());
     }
@@ -475,16 +564,23 @@ fn validate_residual_source(
         {
             return Err(invalid().into());
         }
+        allocation.grow(&mut source, 1)?;
         source.insert(
             *axis,
             eredu_core::TensorAxis {
-                name: name.clone(),
+                name: allocation.text(name)?,
                 dimension: SymbolicDimension::Known(*extent),
             },
         );
     }
-    if source != observation_axes(descriptor, output, P::BeforeIntervention)?
-        || source != observation_axes(descriptor, effective_output, P::AfterIntervention)?
+    if source != observation_axes(descriptor, output, P::BeforeIntervention, allocation)?
+        || source
+            != observation_axes(
+                descriptor,
+                effective_output,
+                P::AfterIntervention,
+                allocation,
+            )?
     {
         return Err(invalid().into());
     }
@@ -495,14 +591,25 @@ fn validate_score_write(
     descriptor: &ArchitectureDescriptor,
     write: &eredu_core::component::ComponentScoreWrite,
     logits: &str,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &str,
+        &str,
+        Vec<eredu_core::TensorAxis>,
+        Vec<eredu_core::TensorAxis>,
+        usize,
+    )>()?;
     use eredu_core::{ObservationPosition as P, SymbolicDimension};
     let invalid = || {
-        CaptureError::Invalid("dynamic score write has inconsistent producer or geometry".into())
+        allocation.capture_invalid(format_args!(
+            "dynamic score write has inconsistent producer or geometry"
+        ))
     };
-    let input = observation_axes(descriptor, &write.input, P::AfterIntervention)?;
+    let input = observation_axes(descriptor, &write.input, P::AfterIntervention, allocation)?;
     let original = write.input.strip_suffix(".effective").ok_or_else(invalid)?;
-    let output = observation_axes(descriptor, &write.output, P::BeforeIntervention)?;
+    let output = observation_axes(descriptor, &write.output, P::BeforeIntervention, allocation)?;
     let scores = descriptor
         .observations
         .get(logits)
@@ -511,9 +618,15 @@ fn validate_score_write(
     if input.is_empty()
         || input.len() != output.len()
         || output.len() != scores.len()
-        || input != observation_axes(descriptor, original, P::BeforeIntervention)?
-        || input != observation_axes(descriptor, &write.projection_input, P::ReadOnly)?
-        || output != observation_axes(descriptor, &write.effective_output, P::AfterIntervention)?
+        || input != observation_axes(descriptor, original, P::BeforeIntervention, allocation)?
+        || input != observation_axes(descriptor, &write.projection_input, P::ReadOnly, allocation)?
+        || output
+            != observation_axes(
+                descriptor,
+                &write.effective_output,
+                P::AfterIntervention,
+                allocation,
+            )?
         || input[..input.len() - 1] != output[..output.len() - 1]
         || !matches!(input.last(), Some(eredu_core::TensorAxis { name, dimension: SymbolicDimension::Known(width) }) if name == "hidden" && *width > 0)
         || output.last() != scores.last()
@@ -525,9 +638,8 @@ fn validate_score_write(
         || write
             .broadcast_axes
             .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != write.broadcast_axes.len()
+            .enumerate()
+            .any(|(index, axis)| write.broadcast_axes[..index].contains(axis))
     {
         return Err(invalid().into());
     }
@@ -555,20 +667,31 @@ fn validate_projected_sum(
     inputs: &[eredu_core::component::ComponentProjectedFusionInput],
     output: &str,
     effective_output: &str,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
-    use eredu_core::{component::ComponentFusionExpansion, ObservationPosition, SymbolicDimension};
+    allocation.controls::<(
+        &ArchitectureDescriptor,
+        &str,
+        &str,
+        Vec<eredu_core::TensorAxis>,
+        Vec<eredu_core::TensorAxis>,
+        usize,
+    )>()?;
+    use eredu_core::{ObservationPosition, SymbolicDimension, component::ComponentFusionExpansion};
     let invalid = || {
-        CaptureError::Invalid("projected residual sum has inconsistent geometry or timing".into())
+        allocation.capture_invalid(format_args!(
+            "projected residual sum has inconsistent geometry or timing"
+        ))
     };
     let axes = |path: &str, position| {
         let point = descriptor
             .observations
             .get(path)
-            .ok_or_else(|| CaptureError::MissingPath(path.into()))?;
+            .ok_or_else(|| allocation.capture_missing(path))?;
         if point.position != position {
             return Err(invalid());
         }
-        point.axes.clone().ok_or_else(invalid)
+        allocation.axes(point.axes.as_deref().ok_or_else(invalid)?)
     };
     let target = axes(output, ObservationPosition::BeforeIntervention)?;
     if inputs.is_empty()
@@ -615,10 +738,11 @@ fn validate_projected_sum(
             {
                 return Err(invalid().into());
             }
+            allocation.grow(&mut projected, 1)?;
             projected.insert(
                 *axis,
                 eredu_core::TensorAxis {
-                    name: name.clone(),
+                    name: allocation.text(name)?,
                     dimension: SymbolicDimension::Known(*extent),
                 },
             );
@@ -669,7 +793,14 @@ mod tests {
         else {
             panic!("projected sum")
         };
-        validate_projected_sum(&descriptor, inputs, output, effective_output).unwrap();
+        validate_projected_sum(
+            &descriptor,
+            inputs,
+            output,
+            effective_output,
+            Destination(None),
+        )
+        .unwrap();
         for (axis, name, extent) in [
             (1, "stream", 2),
             (2, "stream", 3),
@@ -683,13 +814,49 @@ mod tests {
                 name: name.into(),
                 extent,
             };
-            assert!(validate_projected_sum(&descriptor, &bad, output, effective_output).is_err());
+            assert!(
+                validate_projected_sum(
+                    &descriptor,
+                    &bad,
+                    output,
+                    effective_output,
+                    Destination(None)
+                )
+                .is_err()
+            );
         }
         let mut bad = inputs.clone();
         bad[1].projection_input = inputs[0].projection_input.clone();
-        assert!(validate_projected_sum(&descriptor, &bad, output, effective_output).is_err());
-        assert!(validate_projected_sum(&descriptor, inputs, effective_output, output).is_err());
-        assert!(validate_projected_sum(&descriptor, &[], output, effective_output).is_err());
+        assert!(
+            validate_projected_sum(
+                &descriptor,
+                &bad,
+                output,
+                effective_output,
+                Destination(None)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_projected_sum(
+                &descriptor,
+                inputs,
+                effective_output,
+                output,
+                Destination(None)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_projected_sum(
+                &descriptor,
+                &[],
+                output,
+                effective_output,
+                Destination(None)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -730,15 +897,21 @@ mod tests {
                 Some(Arc::clone(&parameters)),
                 Some(local),
             );
+            if (tensor, pipeline, expert) == (2, 1, 1) {
+                construction::tests::verify(|allocation| {
+                    let target = construction::tests::empty_source(topology, allocation)?;
+                    target.with_prediction_worker(&descriptor, &prepared, &execution, allocation)
+                });
+            }
             let layouts = ComponentPartitionLayouts::new(
                 topology,
                 (0..topology.world_size())
                     .map(|rank| ComponentPartitionLayout {
                         topology: ParallelRankTopology::new(topology, rank).unwrap(),
-                        groups: BTreeMap::new(),
-                        paths: BTreeMap::new(),
-                        observations: BTreeMap::new(),
-                        routed: BTreeMap::new(),
+                        groups: SourceMap::new(),
+                        paths: SourceMap::new(),
+                        observations: SourceMap::new(),
+                        routed: SourceMap::new(),
                     })
                     .collect(),
             )
@@ -849,25 +1022,43 @@ mod tests {
         else {
             panic!("embedding source")
         };
-        validate_residual_source(&descriptor, input, expansion, output, effective_output).unwrap();
-        assert!(validate_residual_source(
+        validate_residual_source(
             &descriptor,
             input,
-            &ComponentFusionExpansion::BroadcastAxis {
-                axis: 2,
-                name: "stream".into(),
-                extent: 3
-            },
+            expansion,
             output,
-            effective_output
+            effective_output,
+            Destination(None),
         )
-        .is_err());
+        .unwrap();
         assert!(
-            validate_residual_source(&descriptor, input, expansion, effective_output, output)
-                .is_err()
+            validate_residual_source(
+                &descriptor,
+                input,
+                &ComponentFusionExpansion::BroadcastAxis {
+                    axis: 2,
+                    name: "stream".into(),
+                    extent: 3
+                },
+                output,
+                effective_output,
+                Destination(None)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_residual_source(
+                &descriptor,
+                input,
+                expansion,
+                effective_output,
+                output,
+                Destination(None)
+            )
+            .is_err()
         );
         let write = &scope.readout.score_writes[0];
-        validate_score_write(&descriptor, write, &scope.readout.logits).unwrap();
+        validate_score_write(&descriptor, write, &scope.readout.logits, Destination(None)).unwrap();
         for invalid in 0..4 {
             let mut other = write.clone();
             match invalid {
@@ -876,7 +1067,15 @@ mod tests {
                 2 => other.broadcast_axes = vec!["vocabulary".into()],
                 _ => other.node_id = "output".into(),
             }
-            assert!(validate_score_write(&descriptor, &other, &scope.readout.logits).is_err());
+            assert!(
+                validate_score_write(
+                    &descriptor,
+                    &other,
+                    &scope.readout.logits,
+                    Destination(None)
+                )
+                .is_err()
+            );
         }
         for (tensor, pipeline, expert) in [
             (1, 1, 1),
@@ -908,10 +1107,10 @@ mod tests {
                     (0..topology.world_size())
                         .map(|rank| ComponentPartitionLayout {
                             topology: ParallelRankTopology::new(topology, rank).unwrap(),
-                            groups: BTreeMap::new(),
-                            paths: BTreeMap::new(),
-                            observations: BTreeMap::new(),
-                            routed: BTreeMap::new(),
+                            groups: SourceMap::new(),
+                            paths: SourceMap::new(),
+                            observations: SourceMap::new(),
+                            routed: SourceMap::new(),
                         })
                         .collect(),
                 )
@@ -985,9 +1184,11 @@ mod tests {
                             ComponentExecutionScopeKind::Prediction { depth: 0 };
                     }
                 }
-                assert!(empty()
-                    .with_prediction(&other, &prepared, &execution)
-                    .is_err());
+                assert!(
+                    empty()
+                        .with_prediction(&other, &prepared, &execution)
+                        .is_err()
+                );
             }
         }
     }
@@ -1012,12 +1213,14 @@ mod tests {
                 ParallelRankTopology::new(ParallelTopology::new(2, 2, 1, 1).unwrap(), 3).unwrap();
             let mut layout = ComponentPartitionLayout {
                 topology,
-                groups: BTreeMap::new(),
-                paths: BTreeMap::new(),
-                observations: BTreeMap::new(),
-                routed: BTreeMap::new(),
+                groups: SourceMap::new(),
+                paths: SourceMap::new(),
+                observations: SourceMap::new(),
+                routed: SourceMap::new(),
             };
-            layout.prediction_boundaries(&descriptor, scope).unwrap();
+            layout
+                .prediction_boundaries(&descriptor, scope, Destination(None))
+                .unwrap();
             for suffix in [
                 "hidden",
                 "embedding",
@@ -1097,10 +1300,10 @@ mod tests {
                     (0..topology.world_size())
                         .map(|rank| ComponentPartitionLayout {
                             topology: ParallelRankTopology::new(topology, rank).unwrap(),
-                            groups: BTreeMap::new(),
-                            paths: BTreeMap::new(),
-                            observations: BTreeMap::new(),
-                            routed: BTreeMap::new(),
+                            groups: SourceMap::new(),
+                            paths: SourceMap::new(),
+                            observations: SourceMap::new(),
+                            routed: SourceMap::new(),
                         })
                         .collect(),
                 )
@@ -1227,16 +1430,18 @@ mod tests {
                     8
                 );
             }
-            assert!(empty()
-                .with_prediction(
-                    &descriptor,
-                    &prepared,
-                    &crate::speculative_execution::SpeculativeActivationExecution {
-                        depth: 1,
-                        strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
-                    }
-                )
-                .is_err());
+            assert!(
+                empty()
+                    .with_prediction(
+                        &descriptor,
+                        &prepared,
+                        &crate::speculative_execution::SpeculativeActivationExecution {
+                            depth: 1,
+                            strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
+                        }
+                    )
+                    .is_err()
+            );
             // A pinned module may serve several prediction invocations. Its
             // physical placement is unchanged, but only declared consumers may use it.
             let ComponentResidualBase::LinearFusion { weight, .. } =
@@ -1306,9 +1511,11 @@ mod tests {
                 shared.component_scopes[0]
                     .static_parameter_roles
                     .retain(|role| role != "shared-prediction");
-                assert!(empty()
-                    .with_prediction(&shared, &placement, &execution)
-                    .is_err());
+                assert!(
+                    empty()
+                        .with_prediction(&shared, &placement, &execution)
+                        .is_err()
+                );
             }
             let mut wrong_fusion = descriptor.clone();
             let ComponentResidualBase::LinearFusion { weight, .. } =
@@ -1317,14 +1524,18 @@ mod tests {
                 unreachable!()
             };
             *weight = "model.norm.weight".into();
-            assert!(empty()
-                .with_prediction(&wrong_fusion, &prepared, &execution)
-                .is_err());
+            assert!(
+                empty()
+                    .with_prediction(&wrong_fusion, &prepared, &execution)
+                    .is_err()
+            );
             let mut stale = descriptor.clone();
             stale.component_scopes[0].execution_groups = vec!["target".into()];
-            assert!(empty()
-                .with_prediction(&stale, &prepared, &execution)
-                .is_err());
+            assert!(
+                empty()
+                    .with_prediction(&stale, &prepared, &execution)
+                    .is_err()
+            );
         }
     }
 }

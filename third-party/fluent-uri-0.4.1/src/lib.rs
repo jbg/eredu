@@ -82,6 +82,8 @@
 //! [`Deserialize`]: serde::Deserialize
 
 #[cfg(feature = "alloc")]
+pub mod allocation;
+#[cfg(feature = "alloc")]
 pub mod build;
 pub mod component;
 mod convert;

@@ -110,7 +110,7 @@ fn every_prefill_and_decode_span_keeps_constructed_helpers_through_unit_completi
         output: eredu_core::OutputDemand::LastPosition,
     };
     let mut builds = 0;
-    let report = quote_inference_workspace(geometry, |_| {
+    let report = quote_inference_workspace_with_context(geometry, &context, |_| {
         context.begin_state_span(std::iter::empty::<&WorkspaceTensor>())?;
         let mut forward = LayerwisePolicyForward::<WorkspaceBackend, Unit, _>::begin(
             &mut policy,

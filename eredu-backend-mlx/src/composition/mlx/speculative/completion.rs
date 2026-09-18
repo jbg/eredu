@@ -22,7 +22,7 @@ enum CompletionKind {
     Original(eredu_runtime::working_memory::OriginalSpeculativeRole),
     Embedded {
         _evidence: eredu_architectures::speculative_execution::PreparedEmbeddedEvidence,
-        _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+        _funding: eredu_nn::workspace::HostMetadataFunding,
     },
 }
 impl MlxSpeculativeCompletion {
@@ -319,7 +319,7 @@ impl TypedSpeculativeCompletion {
         let parts=[size_of::<Self>(),size_of::<MlxSpeculativeCompletion>(),size_of::<CompletionKind>(),
             size_of::<Result<Self,Error>>(),size_of::<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>()];
         sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         super::tensor_sources::validate_tensor_sources(&[&evidence],sources,environment)?;
         Ok(Self(MlxSpeculativeCompletion{kind:CompletionKind::Embedded{_evidence:evidence,_funding:sources.metadata_funding().clone()}}))
     }
@@ -334,11 +334,11 @@ impl TypedSpeculativeCompletion {
         environment: &crate::backend::OriginalCopyEnvironment<'_>,
     ) -> Result<Self, Error> {
         use crate::backend::runtime::cache::state::CompletedResidentSource;
-        use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+        use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
         use eredu_runtime::working_memory::{SpeculativeNumericalSource, WorkingMemoryError};
         use std::mem::{size_of, size_of_val};
         let invalid = || Error::PrefillControl(WorkingMemoryError::IdentityMismatch);
-        let overflow = || Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+        let overflow = || Error::WorkspacePlanning(HostMetadataFundingError::Overflow);
         sources.validate_environment(environment)?;
         let completed = evidence
             .get::<CompletedResidentSource>()
@@ -348,7 +348,7 @@ impl TypedSpeculativeCompletion {
             size_of::<MlxSpeculativeCompletion>(),
             size_of::<CompletionKind>(),
             size_of::<Result<Self, Error>>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>(),
             size_of::<[&Array; 2]>(),
             CompletedResidentSource::array_source_control_bytes()

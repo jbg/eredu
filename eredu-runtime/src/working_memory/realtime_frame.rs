@@ -220,6 +220,18 @@ impl OriginalRealtimeBudgetCustody {
     pub(in crate::working_memory) fn account_id(&self)->u64 {self.account.value().ticket.id()}
     pub(in crate::working_memory) fn pool(&self)->&WorkingMemoryPool {self.account.value().ticket.pool()}
     pub(in crate::working_memory) fn quarantine(&self){self.account.value().ticket.quarantine();}
+    #[cfg(test)]
+    pub(crate) fn assert_closed_metadata_origin_refusal(&self, pool: &WorkingMemoryPool) {
+        let retained: super::OriginalOperationMetadataCustody = self.clone().into();
+        retained.validate_retained_origin(pool).unwrap();
+        let before = pool.used_bytes().unwrap();
+        let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        assert_eq!(retained.validate_retained_origin(&foreign), Err(WorkingMemoryError::IdentityMismatch));
+        // Exercise the same real account fence used by source failure custody.
+        self.quarantine();
+        assert_eq!(retained.validate_retained_origin(pool), Err(WorkingMemoryError::ExecutionFenced));
+        assert_eq!(pool.used_bytes().unwrap(), before);
+    }
     pub(in crate::working_memory) fn validate_copy_source(&self,pool:&WorkingMemoryPool,usage:&Usage)
         ->Result<(),WorkingMemoryError> {
         if !self.pool().same_domain(pool){return Err(WorkingMemoryError::IdentityMismatch);}

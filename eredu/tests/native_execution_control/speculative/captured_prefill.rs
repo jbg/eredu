@@ -71,7 +71,7 @@ pub(crate) fn source(kind: &str) -> Fixture {
         .build()
         .unwrap();
     let mut tokenizer = Tokenizer::new(words);
-    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     tokenizer.with_decoder(Some(ByteLevel::default()));
     tokenizer
         .save(root.0.join("tokenizer.json"), false)
@@ -149,11 +149,14 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             let generation = loaded.speculative_generation_options().unwrap().unwrap();
             let (mut model, _) = loaded.into_parts();
             let chat = model
-                .prepare_chat(ChatTemplateRequest {
-                    messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
-                    add_generation_prompt: true,
-                    ..Default::default()
-                })
+                .source_chat_with_capacity(
+                    ChatTemplateRequest {
+                        messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+                        add_generation_prompt: true,
+                        ..Default::default()
+                    },
+                    ORIGINAL_CAPACITY,
+                )
                 .unwrap();
             let settings = PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -164,16 +167,22 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
                 seed: 17,
                 ..Default::default()
             };
-            let request = |chunk, cancellation| PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5]),
+            let request = |chunk, cancellation| PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[1, 3, 2, 4, 5]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings: PreparedChatGenerationSettings {
-                    inference: eredu_core::TextInferencePolicy {
-                        prefill_chunk_positions: chunk,
-                        ..Default::default()
+                settings: chat_settings(
+                    &chat,
+                    PreparedChatGenerationSettings {
+                        inference: eredu_core::TextInferencePolicy {
+                            prefill_chunk_positions: chunk,
+                            ..Default::default()
+                        },
+                        ..settings
                     },
-                    ..settings
-                },
+                ),
                 options: generation.clone(),
                 caller_stop_sequences: &[],
                 cancellation,
@@ -218,7 +227,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             };
             let mut baseline_records = Vec::new();
             let baseline = model
-                .generate_observed_text_speculative(
+                .generate_observed_prepared_chat_speculative(
                     request(None, Default::default()),
                     control.clone(),
                     |step| {
@@ -229,7 +238,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
                 .unwrap();
             let mut chunk_records = Vec::new();
             let chunked = model
-                .generate_observed_text_speculative(
+                .generate_observed_prepared_chat_speculative(
                     request(std::num::NonZeroU64::new(2), Default::default()),
                     control.clone(),
                     |step| {
@@ -250,7 +259,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             compare_scores(&scores(&chunk_records), &expected);
             let mut default_controlled_records = Vec::new();
             let default_controlled = model
-                .with_controlled_text_speculative(
+                .with_controlled_prepared_chat_speculative(
                     request(None, Default::default()),
                     control.clone(),
                     |session| {
@@ -265,11 +274,12 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             compare_scores(&scores(&default_controlled_records), &expected);
             let mut controlled_records = Vec::new();
             let controlled = model
-                .with_controlled_text_speculative(
+                .with_controlled_prepared_chat_speculative(
                     request(std::num::NonZeroU64::new(2), Default::default()),
                     control,
                     |session| {
-                        controlled_records.extend(session.step()?.unwrap().captures.iter().cloned());
+                        controlled_records
+                            .extend(session.step()?.unwrap().captures.iter().cloned());
                         assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                         let saved = session.snapshot()?;
                         let start = controlled_records.len();
@@ -301,7 +311,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
                 let cancellation = eredu_core::GenerationCancellationToken::new();
                 cancellation.cancel();
                 let cancelled = model
-                    .generate_prepared_text_speculative(request(chunk, cancellation))
+                    .generate_prepared_chat_speculative(request(chunk, cancellation))
                     .unwrap();
                 assert!(cancelled.token_ids().is_empty());
                 assert_eq!(cancelled.stats().target_tokens(), 0);
@@ -309,7 +319,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             }
             // Cancellation rollback leaves both actual lanes reusable.
             let retried = model
-                .generate_prepared_text_speculative(request(None, Default::default()))
+                .generate_prepared_chat_speculative(request(None, Default::default()))
                 .unwrap();
             assert_eq!(retried.token_ids(), baseline.token_ids());
         }
@@ -347,11 +357,14 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         let generation = loaded.speculative_generation_options().unwrap().unwrap();
         let (mut model, _) = loaded.into_parts();
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user","content":"hello"})],
-                add_generation_prompt: true,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+                ORIGINAL_CAPACITY,
+            )
             .unwrap();
         let usage = CaptureUsage {
             captures: 1024,
@@ -407,16 +420,22 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
             },
             ..Default::default()
         };
-        let request = |chunk| PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5, 6]),
+        let request = |chunk| PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[1, 3, 2, 4, 5, 6]),
+            output_mode: eredu::api::PreparedChatOutputMode::Text,
+            skip_special_tokens: true,
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: PreparedChatGenerationSettings {
-                inference: eredu_core::TextInferencePolicy {
-                    prefill_chunk_positions: chunk,
-                    ..Default::default()
+            settings: chat_settings(
+                &chat,
+                PreparedChatGenerationSettings {
+                    inference: eredu_core::TextInferencePolicy {
+                        prefill_chunk_positions: chunk,
+                        ..Default::default()
+                    },
+                    ..settings
                 },
-                ..settings
-            },
+            ),
             options: generation.clone(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -449,14 +468,18 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         };
         let mut full_scores = Vec::new();
         let full = model
-            .generate_observed_text_speculative(request(None), score_control.clone(), |step| {
-                full_scores.extend(step.captures.iter().cloned());
-                ControlFlow::Continue(())
-            })
+            .generate_observed_prepared_chat_speculative(
+                request(None),
+                score_control.clone(),
+                |step| {
+                    full_scores.extend(step.captures.iter().cloned());
+                    ControlFlow::Continue(())
+                },
+            )
             .unwrap();
         let mut default_scores = Vec::new();
         let default = model
-            .generate_observed_text_speculative(
+            .generate_observed_prepared_chat_speculative(
                 request(std::num::NonZeroU64::new(2)),
                 score_control.clone(),
                 |step| {
@@ -471,7 +494,7 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         let mut records = Vec::new();
         let mut observed_scores = Vec::new();
         let output = model
-            .generate_observed_text_speculative(
+            .generate_observed_prepared_chat_speculative(
                 request(std::num::NonZeroU64::new(2)),
                 ControlledSpeculativeOptions {
                     activations: Some(admitted),
@@ -488,10 +511,12 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         assert_eq!(default.token_ids(), full.token_ids());
         assert_eq!(output.stats().target_tokens(), full.stats().target_tokens());
         let expected_scores = scores(&full_scores);
-        assert!(expected_scores
-            .iter()
-            .flat_map(|x| &x.2)
-            .any(|x| x.1 != 0.0));
+        assert!(
+            expected_scores
+                .iter()
+                .flat_map(|x| &x.2)
+                .any(|x| x.1 != 0.0)
+        );
         compare_scores(&scores(&default_scores), &expected_scores);
         compare_scores(&scores(&observed_scores), &expected_scores);
         assert_eq!(output.token_ids().len(), 13);
@@ -518,12 +543,17 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
                     .collect::<Vec<_>>(),
                 widths
             );
-            assert!(spans
-                .iter()
-                .all(|r| r.completed && r.origin.prediction == 0));
+            assert!(
+                spans
+                    .iter()
+                    .all(|r| r.completed && r.origin.prediction == 0)
+            );
             for record in spans {
                 let span = record.prefill_span.unwrap();
-                assert!(span.validate(phase, record.captures.as_step().invocation.unwrap().sequence as usize));
+                assert!(span.validate(
+                    phase,
+                    record.captures.as_step().invocation.unwrap().sequence as usize
+                ));
                 assert_eq!(span.prompt_tokens, 6);
                 assert!(record.captures.as_step().records.iter()
                     .filter_map(|record| record.payload.as_ref().and_then(CapturePayload::as_tensor))
@@ -540,14 +570,21 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
             .unwrap();
         assert_eq!(last_target.prefill_span.unwrap().sequence, 2);
         assert!(
-            last_target.captures.as_step().records.iter().any(|record| record
-                .payload
-                .as_ref()
-                .and_then(CapturePayload::as_tensor)
-                .is_some_and(|tensor| tensor.shape().get(1) == Some(&2))),
+            last_target
+                .captures
+                .as_step()
+                .records
+                .iter()
+                .any(|record| record
+                    .payload
+                    .as_ref()
+                    .and_then(CapturePayload::as_tensor)
+                    .is_some_and(|tensor| tensor.shape().get(1) == Some(&2))),
             "{kind}: the observed final span must retain both physical rows: {:?}",
             last_target
-                .captures.as_step().records
+                .captures
+                .as_step()
+                .records
                 .iter()
                 .map(|record| (
                     &record.outcome,
@@ -559,14 +596,18 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         assert!(records.iter().filter(|r|r.phase==SpeculativeActivationPhase::TargetPrefill)
             .flat_map(|r|&r.captures.as_step().records).filter_map(|r| r.payload.as_ref().and_then(CapturePayload::as_tensor))
             .any(|t| matches!(t.data(),eredu_core::TensorObservationData::F32(v) if v.iter().any(|x|*x!=0.0))));
-        assert!(records
-            .iter()
-            .any(|r| r.phase == SpeculativeActivationPhase::Verification
-                && r.prefill_span.is_none()
-                && r.captures.as_step().invocation.unwrap().sequence > 1));
-        assert!(records
-            .windows(2)
-            .all(|r| r[1].captures.as_step().cumulative_usage.host_bytes
-                >= r[0].captures.as_step().cumulative_usage.host_bytes));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.phase == SpeculativeActivationPhase::Verification
+                    && r.prefill_span.is_none()
+                    && r.captures.as_step().invocation.unwrap().sequence > 1)
+        );
+        assert!(
+            records
+                .windows(2)
+                .all(|r| r[1].captures.as_step().cumulative_usage.host_bytes
+                    >= r[0].captures.as_step().cumulative_usage.host_bytes)
+        );
     }
 }

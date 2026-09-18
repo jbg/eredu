@@ -21,30 +21,37 @@ impl NotValidator<SerdeJson> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("not");
-        Ok(Box::new(NotValidator {
-            original: schema.clone(),
+        let ctx = ctx.new_at_location("not")?;
+        Ok(ctx.funding().boxed(NotValidator {
+            original: ctx.funding().value(schema)?,
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for NotValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.value(&self.original)?; source.node(&self.node)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.value(&self.original)?;
+        source.node(&self.node)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<&crate::node::SchemaNode<F>>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<
+            &crate::node::SchemaNode<F>,
+        >()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         !self.node.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -54,13 +61,17 @@ impl<F: Json> Validate<F> for NotValidator<F> {
         if self.is_valid(instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::not(
-                self.node.location().clone(),
-                crate::paths::capture_evaluation_path(tracker, self.node.location()),
-                location.into(),
-                instance.to_value(),
-                self.original.clone(),
-            ))
+            ctx.diagnostic::<F>(
+                instance,
+                location,
+                tracker,
+                self.node.location(),
+                |funding| {
+                    Ok(crate::error::ValidationErrorKind::Not {
+                        schema: funding.value(&self.original)?,
+                    })
+                },
+            )
         }
     }
 }

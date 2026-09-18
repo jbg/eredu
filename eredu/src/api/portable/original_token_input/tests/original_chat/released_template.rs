@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::{ManagedChatRequest, PreparedChatGenerationSettings};
+use crate::api::PreparedChatGenerationSettings;
 
 pub(super) fn run_case(
     template: &str,
@@ -37,7 +37,7 @@ pub(super) fn run_case(
     let mut template_file = tempfile::tempfile().unwrap();
     template_file.write_all(config.as_bytes()).unwrap();
     let source = model
-        .compile_managed_chat_source(&tokenizer, template_file, &cancellation)
+        .compile_managed_chat_source(&tokenizer, template_file, false, &cancellation)
         .unwrap()
         .unwrap();
     let cold = pool.used_bytes().unwrap();
@@ -71,32 +71,35 @@ pub(super) fn run_case(
         },
         ..Default::default()
     };
+    let prepared = model
+        .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.rendered_prompt(), prompt);
+    let prepared_bytes = pool.used_bytes().unwrap();
     // A refusal after rendering must retain the actual J/C/H; retries
     // use the same source and leave no previous render allowance alive.
     facts.borrow_mut().short = true;
-    let error = match model.start_managed_chat(
-        &source,
-        ManagedChatRequest::new(&chat, settings),
-        &cancellation,
-    ) {
+    let error = match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+    {
         Err(error) => error,
         Ok(_) => panic!("exact short admission must refuse"),
     };
     assert!(pool.used_bytes().unwrap() > cold);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
     facts.borrow_mut().short = false;
     facts.borrow_mut().ids.clear();
     let mut visible = String::new();
-    let mut emit = |event: GenerationPlainTextEvent<'_>| {
-        if let GenerationPlainTextEvent::TextDelta(value) = event {
-            visible.push_str(value);
+    let mut emit = |event: SemanticEvent| {
+        if let SemanticEvent::TextDelta(value) = event {
+            visible.push_str(&value);
         }
     };
-    let request = ManagedChatRequest::new(&chat, settings);
+    let request = literal_request(&prepared, settings);
     let output = if manual {
         let mut session = model
-            .start_managed_chat(&source, request, &cancellation)
+            .start_prepared_chat(request, &cancellation)
             .unwrap()
             .unwrap();
         while session.finish_reason().is_none() {
@@ -107,20 +110,20 @@ pub(super) fn run_case(
             .unwrap_or_else(|_| panic!("terminal released-template chat"))
     } else {
         model
-            .generate_managed_chat(&source, request, &cancellation, &mut emit)
+            .start_prepared_chat(request, &cancellation)
             .unwrap()
+            .unwrap()
+            .run(&cancellation, &mut emit)
             .unwrap()
     };
     assert_eq!(facts.borrow().ids, expected.get_ids());
-    assert_eq!(output.text.as_str(), "h hih");
-    assert_eq!(output.text.as_str(), visible);
+    assert_eq!(visible, "h hih");
     assert_eq!(output.token_ids.as_ref(), &[0, 8, 0]);
     assert_eq!(facts.borrow().chat_sources, 1);
-    assert_eq!(facts.borrow().chat_renders, 2);
-    let escaped = output.text.clone();
-    drop((output, chat, source, tokenizer, model));
+    let escaped = output.token_ids.clone();
+    drop((output, prepared, chat, source, tokenizer, model));
     assert!(pool.used_bytes().unwrap() > 0);
-    assert_eq!(escaped.as_str(), "h hih");
+    assert_eq!(escaped.as_ref(), &[0, 8, 0]);
     drop(escaped);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }

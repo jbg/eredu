@@ -4,8 +4,11 @@ mod post;
 mod regex;
 use self::post::PostPlan;
 use self::regex::RegexPlan;
-use super::{ModelWrapper, Tokenizer};
-use crate::models::bpe::BpeScratch;
+pub use super::normalization_source::pipeline::{
+    Cause as NormalizationPipelineError, Failure as NormalizationPipelineFailure,
+};
+use super::{ModelWrapper, Tokenizer, TokenizerInput};
+use crate::models::{bpe::BpeScratch, unigram::UnigramScratch};
 use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
 pub use unicode_normalization_alignments::workspace::Buffer as NormalizationBuffer;
 
@@ -14,9 +17,9 @@ pub use unicode_normalization_alignments::workspace::Buffer as NormalizationBuff
 pub enum EncodeIdsError {
     /// Normalization, pre/postprocessing, padding or truncation needs a later operation plan.
     PipelineProfile,
-    /// Added normalization/word/strip modes or legacy matching need a later plan.
+    /// Added normalization/word/strip modes need a matching profile.
     AddedProfile,
-    /// A cache, non-packed model, dropout, nonempty prefix/suffix or fallback needs a later plan.
+    /// A cache, unsupported model, dropout or nonempty prefix/suffix needs a matching profile.
     ModelProfile,
     /// Checked destination geometry overflowed.
     Overflow,
@@ -25,13 +28,13 @@ pub enum EncodeIdsError {
     /// The original attempt on an actual destination failed.
     Reserve(TryReserveError),
     /// Actual partial normalization destinations and their real reserve error.
-    NormalizationPreparation(
-        unicode_normalization_alignments::workspace::PrepareFailure,
-    ),
+    NormalizationPreparation(unicode_normalization_alignments::workspace::PrepareFailure),
     /// Invalid source subrange; the original ID path derives ranges from its matcher.
-    NormalizationRange(
-        unicode_normalization_alignments::workspace::InvalidRange,
-    ),
+    NormalizationRange(unicode_normalization_alignments::workspace::InvalidRange),
+    /// Failed ordered normalization operation; the genuine NFC partial is retained.
+    NormalizationPipeline(NormalizationPipelineError),
+    /// Failed ordered text destination construction, including the actual partial.
+    NormalizationPipelinePreparation(NormalizationPipelineFailure),
     /// Exact immutable source workspace geometry/profile rejection.
     #[cfg(feature = "fancy-regex")]
     RegexPlan(fancy_regex::workspace::PlanError),
@@ -45,14 +48,24 @@ pub enum EncodeIdsError {
 impl fmt::Display for EncodeIdsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PipelineProfile => f.write_str("ID encoding requires a supported immutable pipeline and single-input template"),
-            Self::AddedProfile => f.write_str("identity ID encoding requires packed literal added tokens without word or strip modes"),
-            Self::ModelProfile => f.write_str("identity ID encoding requires packed uncached BPE without dropout, nonempty affixes or byte fallback"),
+            Self::PipelineProfile => f.write_str(
+                "ID encoding requires a supported immutable pipeline and single-input template",
+            ),
+            Self::AddedProfile => f.write_str(
+                "identity ID encoding requires literal added tokens without word or strip modes",
+            ),
+            Self::ModelProfile => f.write_str(
+                "identity ID encoding requires uncached BPE without dropout or nonempty affixes",
+            ),
             Self::Overflow => f.write_str("identity ID encoding layout overflow"),
-            Self::MissingUnknown => f.write_str("configured unknown token is absent from the model vocabulary"),
+            Self::MissingUnknown => {
+                f.write_str("configured unknown token is absent from the model vocabulary")
+            }
             Self::Reserve(error) => fmt::Display::fmt(error, f),
             Self::NormalizationPreparation(error) => fmt::Display::fmt(error, f),
             Self::NormalizationRange(error) => fmt::Display::fmt(error, f),
+            Self::NormalizationPipeline(error) => fmt::Display::fmt(error, f),
+            Self::NormalizationPipelinePreparation(error) => fmt::Display::fmt(error, f),
             #[cfg(feature = "fancy-regex")]
             Self::RegexPlan(error) => fmt::Display::fmt(error, f),
             #[cfg(feature = "fancy-regex")]
@@ -68,6 +81,8 @@ impl std::error::Error for EncodeIdsError {
             Self::Reserve(error) => Some(error),
             Self::NormalizationPreparation(error) => Some(error),
             Self::NormalizationRange(error) => Some(error),
+            Self::NormalizationPipeline(error) => Some(error),
+            Self::NormalizationPipelinePreparation(error) => Some(error),
             #[cfg(feature = "fancy-regex")]
             Self::RegexPlan(error) => Some(error),
             #[cfg(feature = "fancy-regex")]
@@ -96,6 +111,7 @@ pub struct EncodeIdsRequirements {
     regex: usize,
     regex_delegates: usize,
     normalization: [usize; 3],
+    unigram: usize,
     buffers: usize,
     controls: usize,
     total: usize,
@@ -145,7 +161,7 @@ impl EncodeIdsRequirements {
 
 /// One immutable source/input borrow. Profile checks and geometry allocate nothing.
 pub struct EncodeIdsPlan<'a> {
-    source: &'a Tokenizer,
+    source: TokenizerInput<'a>,
     input: &'a str,
     regex: RegexPlan<'a>,
     post: PostPlan<'a>,
@@ -158,41 +174,53 @@ impl<'a> EncodeIdsPlan<'a> {
     /// Inspects the actual source and selected single-template special policy.
     /// Embedded special matching remains a separate immutable source setting.
     pub fn prepare(
-        source: &'a Tokenizer,
+        source: impl Into<TokenizerInput<'a>>,
         input: &'a str,
         add_special_tokens: bool,
     ) -> Result<Self, EncodeIdsError> {
-        let post = PostPlan::inspect(source, add_special_tokens)?;
-        let regex = RegexPlan::inspect(source)?;
+        let source = source.into();
+        let post = PostPlan::inspect(source.root, add_special_tokens)?;
         let matching = normalization::Plan::inspect(source, input)?;
-        match &source.model {
-            ModelWrapper::BPE(model)
-                if model.has_identity_packed_profile() => {}
+        let regex = RegexPlan::inspect(source, matching.text_bound())?;
+        match &source.root.model {
+            ModelWrapper::BPE(model) if model.has_identity_profile() => {}
+            ModelWrapper::WordLevel(_) => {}
+            ModelWrapper::Unigram(model) if model.has_identity_profile() => {}
             _ => return Err(EncodeIdsError::ModelProfile),
         }
-        let symbols = matching.text_bound();
+        let token_capacity = regex.symbol_capacity(matching.text_bound())?;
+        let symbols = if matches!(source.root.model, ModelWrapper::BPE(_)) {
+            token_capacity
+        } else {
+            0
+        };
         let merges = symbols
             .saturating_sub(1)
             .checked_mul(3)
             .ok_or(EncodeIdsError::Overflow)?;
-        let ids = symbols
+        let mapped = regex.mapped_capacity(token_capacity)?;
+        let unigram = if matches!(source.root.model, ModelWrapper::Unigram(_)) {
+            token_capacity.max(mapped)
+        } else {
+            0
+        };
+        let ids = token_capacity
+            .max(unigram)
             .checked_add(post.special_ids())
             .ok_or(EncodeIdsError::Overflow)?;
-        let mapped = regex.mapped_capacity(symbols)?;
         let regex_bytes = regex.required_bytes()?;
         let regex_delegates = regex.delegate_count();
         let normalization = matching.capacities();
         let buffers = BpeScratch::buffer_bytes(symbols, merges)
-            .and_then(|bytes| {
-                bytes.checked_add(Layout::array::<u32>(ids).ok()?.size())
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(Layout::array::<u8>(mapped).ok()?.size())
-            })
+            .and_then(|bytes| bytes.checked_add(Layout::array::<u32>(ids).ok()?.size()))
+            .and_then(|bytes| bytes.checked_add(Layout::array::<u8>(mapped).ok()?.size()))
             .and_then(|bytes| bytes.checked_add(matching.buffer_bytes()))
+            .and_then(|bytes| bytes.checked_add(UnigramScratch::buffer_bytes(unigram)?))
             .ok_or(EncodeIdsError::Overflow)?;
         let controls = [
             PostPlan::control_bytes().ok_or(EncodeIdsError::Overflow)?,
+            crate::models::bpe::BPE::fallback_control_bytes(),
+            UnigramScratch::control_bytes(),
             size_of::<InputEncoder<'_, '_>>(),
             size_of::<PostInputEncoder<'_, '_>>(),
             size_of::<&mut InputEncoder<'_, '_>>(),
@@ -233,6 +261,7 @@ impl<'a> EncodeIdsPlan<'a> {
                 regex: regex_bytes,
                 regex_delegates,
                 normalization,
+                unigram,
                 buffers,
                 controls,
                 total,
@@ -249,21 +278,35 @@ impl<'a> EncodeIdsPlan<'a> {
     #[doc(hidden)]
     /// Development-only capacity overflow of the selected actual target reserve.
     pub fn fail_reservation(mut self, stage: usize) -> Self {
-        assert!(stage < 4);
-        self.failure = Some(stage);
+        assert!(stage < 17);
+        if stage >= 11 {
+            self.regex.fail_pipeline_buffer(stage - 11);
+        } else if stage >= 6 {
+            self.matching.fail_pipeline(stage - 6);
+        } else {
+            self.failure = Some(stage);
+        }
         self
     }
     /// Development-only actual outer/nested regex reserve selection.
-    #[cfg(all(
-        feature = "fancy-regex",
-        feature = "tokenizer-compiler-test-support"
-    ))]
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
     #[doc(hidden)]
     pub fn fail_regex_reservation(
         mut self,
         failure: fancy_regex::workspace::PrepareFailure,
     ) -> Result<Self, EncodeIdsError> {
         self.regex.fail(failure)?;
+        Ok(self)
+    }
+    /// Development-only actual reserve in a selected ordered regex workspace.
+    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
+    #[doc(hidden)]
+    pub fn fail_regex_reservation_at(
+        mut self,
+        ordinal: usize,
+        failure: fancy_regex::workspace::PrepareFailure,
+    ) -> Result<Self, EncodeIdsError> {
+        self.regex.fail_at(ordinal, failure)?;
         Ok(self)
     }
     /// Development-only overflow of one actual NFC target reserve.
@@ -289,6 +332,7 @@ impl<'a> EncodeIdsPlan<'a> {
     pub fn encode(self) -> Result<EncodeIdsOutput, EncodeIdsFailure> {
         let mut output = EncodeIdsOutput {
             scratch: BpeScratch::new(),
+            unigram: UnigramScratch::default(),
             ids: Vec::new(),
             mapped: String::new(),
             normalization: None,
@@ -313,6 +357,19 @@ impl<'a> EncodeIdsPlan<'a> {
                     .try_reserve_exact(mapped_requested)
                     .map_err(EncodeIdsError::Reserve)?;
             }
+            let nodes = if self.requirements.unigram == 0 {
+                0
+            } else {
+                self.requirements.unigram + 1
+            };
+            output
+                .unigram
+                .reserve_nodes(self.capacity(4, nodes))
+                .map_err(EncodeIdsError::Reserve)?;
+            output
+                .unigram
+                .reserve_spans(self.capacity(5, self.requirements.unigram))
+                .map_err(EncodeIdsError::Reserve)?;
             let input = self.input;
             let source = self.source;
             let post = self.post;
@@ -322,9 +379,8 @@ impl<'a> EncodeIdsPlan<'a> {
                 let mut regex = regex_plan.prepare()?;
                 let mapped_reserved = output.mapped.capacity();
                 let reserved = output.capacities();
-                let ModelWrapper::BPE(model) = &source.model else {
-                    unreachable!("checked immutable model")
-                };
+                let unigram_reserved = output.unigram.capacities();
+                let model = &source.root.model;
                 let result = post.encode(&mut PostInputEncoder {
                     input: InputEncoder {
                         output: &mut output,
@@ -342,10 +398,11 @@ impl<'a> EncodeIdsPlan<'a> {
                     mapped_reserved,
                     "encoding grew mapped storage"
                 );
+                debug_assert_eq!(output.capacities(), reserved, "encoding grew a destination");
                 debug_assert_eq!(
-                    output.capacities(),
-                    reserved,
-                    "encoding grew a destination"
+                    output.unigram.capacities(),
+                    unigram_reserved,
+                    "encoding grew a path destination"
                 );
                 result
             })();
@@ -368,7 +425,7 @@ impl<'a> EncodeIdsPlan<'a> {
 struct InputEncoder<'a, 's> {
     output: &'a mut EncodeIdsOutput,
     regex: &'a mut regex::Runtime<'s>,
-    model: &'a crate::models::bpe::BPE,
+    model: &'a ModelWrapper,
     input: &'a str,
 }
 impl InputEncoder<'_, '_> {
@@ -385,6 +442,14 @@ impl InputEncoder<'_, '_> {
                 self.output,
                 self.model,
                 &self.input[start..end],
+                if start == 0 {
+                    self.input[start..end]
+                        .chars()
+                        .next()
+                        .map_or(0, char::len_utf8)
+                } else {
+                    0
+                },
             )
         }
     }
@@ -394,10 +459,7 @@ struct PostInputEncoder<'a, 's> {
     matching: &'a mut normalization::Runtime<'s>,
 }
 impl PostInputEncoder<'_, '_> {
-    fn piece(
-        &mut self,
-        special: Option<&[u32]>,
-    ) -> Result<(), EncodeIdsError> {
+    fn piece(&mut self, special: Option<&[u32]>) -> Result<(), EncodeIdsError> {
         if let Some(ids) = special {
             self.input.output.ids.extend_from_slice(ids);
             Ok(())
@@ -417,12 +479,52 @@ impl fmt::Debug for EncodeIdsPlan<'_> {
 #[derive(Debug)]
 pub struct EncodeIdsOutput {
     scratch: BpeScratch,
+    unigram: UnigramScratch,
     ids: Vec<u32>,
     mapped: String,
-    normalization:
-        Option<unicode_normalization_alignments::workspace::Retired>,
+    normalization: Option<normalization::Retired>,
+}
+/// Both token and ID output reuse the selected model's original lexical worker.
+fn encode_model(
+    model: &ModelWrapper,
+    scratch: &mut BpeScratch,
+    unigram: &mut UnigramScratch,
+    text: &str,
+    ids: &mut Vec<u32>,
+) -> Result<(), EncodeIdsError> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    match model {
+        ModelWrapper::BPE(model) => scratch
+            .encode(model, text, ids)
+            .map_err(|_| EncodeIdsError::MissingUnknown),
+        ModelWrapper::WordLevel(model) => {
+            let (id, _) = model
+                .lookup(text)
+                .map_err(|_| EncodeIdsError::MissingUnknown)?;
+            ids.push(id);
+            Ok(())
+        }
+        ModelWrapper::Unigram(model) => {
+            unigram
+                .encode(model, text)
+                .map_err(|_| EncodeIdsError::MissingUnknown)?;
+            for &(start, end) in unigram.spans() {
+                model
+                    .visit_piece_ids(&text[start..end], |id, _| ids.push(id))
+                    .map_err(|_| EncodeIdsError::MissingUnknown)?;
+            }
+            Ok(())
+        }
+        _ => unreachable!("checked immutable model"),
+    }
 }
 impl EncodeIdsOutput {
+    /// Actual Unigram path row/span capacities, including partial preparation.
+    pub fn unigram_capacities(&self) -> [usize; 2] {
+        self.unigram.capacities()
+    }
     /// Borrows the completed IDs; no destination ownership escapes.
     pub fn ids(&self) -> &[u32] {
         &self.ids
@@ -450,12 +552,15 @@ pub struct EncodeIdsFailure {
     partial: EncodeIdsOutput,
 }
 impl EncodeIdsFailure {
+    /// Actual Unigram path destinations retained in a failed operation.
+    pub fn unigram_capacities(&self) -> [usize; 2] {
+        self.partial.unigram.capacities()
+    }
     /// All actual normalization destinations, including a failed preparation prefix.
     pub fn normalization_capacities(&self) -> [usize; 3] {
         match &self.cause {
-            EncodeIdsError::NormalizationPreparation(error) => {
-                error.capacities()
-            }
+            EncodeIdsError::NormalizationPreparation(error) => error.capacities(),
+            EncodeIdsError::NormalizationPipelinePreparation(error) => error.capacities(),
             _ => self.partial.normalization_capacities(),
         }
     }
@@ -503,3 +608,6 @@ mod regex_tests;
     feature = "tokenizer-compiler-test-support"
 ))]
 mod nfc_tests;
+
+#[cfg(all(test, feature = "fancy-regex"))]
+mod metaspace_tests;

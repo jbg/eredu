@@ -356,12 +356,16 @@ impl<M> std::ops::DerefMut for MlxPredictionModule<M> {
     }
 }
 impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxPredictionModule<M> {
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, MlxTensor>>(
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, MlxTensor>>(
         &'a self,
         visitor: &mut V,
-    ) {
-        self.inner.visit_parameters(visitor);
-    }
+    ) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+__source_result = __source_result.and(        self.inner.visit_parameter_sources(visitor));
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, MlxTensor>>(
         &'a mut self,
         visitor: &mut V,
@@ -439,7 +443,7 @@ where
 
 struct Slots<'a>(&'a mut dyn ParameterSlotVisitor<MlxTensor>);
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Slots<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut MlxTensor) {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
         self.0.visit_slot(metadata, value);
     }
 }
@@ -521,8 +525,8 @@ pub(in crate::composition::mlx::replicated_text) struct Publish<'a>(
     pub &'a BTreeMap<String, MlxTensor>,
 );
 impl ParameterSlotVisitor<MlxTensor> for Publish<'_> {
-    fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut MlxTensor) {
-        if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
+        if let Some(replacement) = self.0.get(metadata.id().as_str()) {
             *value = replacement.clone();
         }
     }
@@ -592,13 +596,13 @@ pub(super) fn placeholders<M: Parameterized<MlxTensor>>(
         failure: Option<Error>,
     }
     impl<'a> eredu_nn::ParameterVisitor<'a, MlxTensor> for Collect<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a MlxTensor) {
             if self.failure.is_some() {
                 return;
             }
             match placeholder(value, self.stream) {
                 Ok(value) => {
-                    self.values.insert(metadata.id.as_str().to_owned(), value);
+                    self.values.insert(metadata.id().as_str().to_owned(), value);
                 }
                 Err(error) => self.failure = Some(error),
             }
@@ -609,7 +613,7 @@ pub(super) fn placeholders<M: Parameterized<MlxTensor>>(
         stream,
         failure: None,
     };
-    module.visit_parameters(&mut collect);
+    module.visit_parameters(&mut collect)?;
     if let Some(error) = collect.failure {
         return Err(error);
     }

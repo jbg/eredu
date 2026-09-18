@@ -37,6 +37,8 @@ pub enum CpuBinaryOperation {
     Less = 13,
     /// Existing lessequal equation.
     LessEqual = 14,
+    /// Existing Float32 log-add-exp floating task.
+    LogAddExp = 15,
 }
 /// Exact task/alias/cleanup and strided-worker storage source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

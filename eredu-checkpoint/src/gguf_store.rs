@@ -1,7 +1,6 @@
 //! Backend-neutral logical GGUF storage and portable encoded leases.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +10,8 @@ use std::{
 
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_gguf::{
     Checkpoint, ConvertedCheckpointTensor, DenseTensorSpan, DenseTensorSpanPlan, LogicalDtype,

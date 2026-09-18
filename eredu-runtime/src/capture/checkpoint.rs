@@ -13,9 +13,9 @@ use std::sync::Arc;
 /// It contains no estimator or native handle. Admission proofs remain opaque and
 /// cannot be deserialized. Clones copy admitted plan payloads while sharing the
 /// source identity and host custody. Shared custody is not fresh destination
-/// admission or a finite copy-byte allowance. A checkpoint from a shared-source
-/// session also retains that existing physical source separately from its copied
-/// destination plan; source attachment never pays for this clone.
+/// admission or a finite copy-byte allowance. A checkpoint also retains its
+/// existing physical source separately from the copied destination plan; source
+/// attachment never pays for that copy.
 #[derive(Clone)]
 pub struct CaptureCheckpoint {
     artifact_identity: String,
@@ -28,7 +28,7 @@ pub struct CaptureCheckpoint {
     usage: CaptureUsage,
     // Existing source retention only: plan above is a distinct copied payload.
     // Keep this after destination payload and before final preparation custody.
-    shared_source: Option<SharedCapturePlan>,
+    shared_source: SharedCapturePlan,
     ordinary_prefill: Option<OrdinaryPrefillCapture>,
     // Fresh only for each actual ordinary captured checkpoint. Clone preserves
     // this immutable snapshot instance; the marker contains no payload/custody.
@@ -168,7 +168,7 @@ impl CaptureSession {
             phase: self.phase,
             has_step: self.has_step,
             usage: self.ledger.total(),
-            shared_source: self.plan.shared().cloned(),
+            shared_source: self.plan.clone(),
             ordinary_prefill: self.ordinary_prefill.clone(),
             ordinary_identity: self.ordinary_prefill.as_ref().map(|_| Arc::new(())),
         })
@@ -323,8 +323,8 @@ impl CaptureCheckpoint {
     }
     /// Existing shared source retained separately from the copied checkpoint
     /// plan. It covers neither this copied destination nor child re-admission.
-    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
-        self.shared_source.as_ref()
+    pub fn shared_plan_source(&self) -> &SharedCapturePlan {
+        &self.shared_source
     }
 
     /// Logical storage of this immutable copied admission/schedule checkpoint.
@@ -533,7 +533,7 @@ impl CaptureCheckpoint {
                 &source_authority,
             )?
         } else {
-            CaptureSession::new(plan)
+            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan))
         };
         child.ordinary_prefill_parent = self.ordinary_identity.clone();
         if self.ordinary_prefill.is_none() {

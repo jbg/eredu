@@ -2,7 +2,7 @@
 use super::*;
 #[path = "realtime_transaction/reporting.rs"]
 mod prepared_reporting;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use safemlx::error::Exception;
 use std::{mem::{size_of,size_of_val},sync::TryLockError};
 
@@ -10,14 +10,14 @@ use std::{mem::{size_of,size_of_val},sync::TryLockError};
 enum Cause {
     #[error(transparent)] Source(#[from] CacheSourceError),
     #[error(transparent)] Residency(#[from] CacheResidencyError),
-    #[error(transparent)] Metadata(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    #[error(transparent)] Metadata(#[from] eredu_nn::workspace::HostMetadataFundingError),
     #[error(transparent)] Neural(#[from] eredu_nn::Error),
 }
 #[derive(Debug,thiserror::Error)]
 #[error("original cache transaction rollback: {cause}")]
 struct Failure {
     #[source] cause:Cause,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 fn source(cause:CacheSourceError)->Cause { Cause::Source(cause) }
 impl CacheResidencyManager {
@@ -26,7 +26,7 @@ impl CacheResidencyManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rollback_realtime_checkpoint(&self,session:u64,layer:usize,expected_layer:usize,
         tail:Option<MutableCacheTail>,tail_start:i64,offset:i64,current_offset:i64,original:&[CacheBlockId],
-        controls:usize,funding:&WorkspaceMetadataFunding)->Result<(),Exception> {
+        controls:usize,funding:&HostMetadataFunding)->Result<(),Exception> {
         let result=(|| {
             funding.reserve_metadata(controls)?;
             if session!=self.session_id || layer!=expected_layer || offset<tail_start || tail_start<0 || current_offset<offset
@@ -90,7 +90,7 @@ impl CacheResidencyManager {
     }
     pub(crate) fn realtime_transaction_rollback_control_bytes()->Option<usize> {
         let frames=[
-            size_of::<(&Self,u64,usize,usize,Option<MutableCacheTail>,i64,i64,i64,&[CacheBlockId],usize,&WorkspaceMetadataFunding)>(),
+            size_of::<(&Self,u64,usize,usize,Option<MutableCacheTail>,i64,i64,i64,&[CacheBlockId],usize,&HostMetadataFunding)>(),
             size_of::<Failure>(),Exception::retained_source_control_bytes::<Failure>()?,
             size_of::<MutexGuard<'_,CacheManagerState>>(),
             size_of::<Result<MutexGuard<'_,CacheManagerState>,Cause>>(),

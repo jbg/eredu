@@ -4,14 +4,12 @@ use fancy_regex::Regex;
 use std::error::Error;
 
 #[derive(Debug)]
-pub struct SysRegex {
+pub(super) struct GeneralRegex {
     regex: Regex,
 }
 
-impl SysRegex {
-    pub(crate) fn matches_pattern(&self, pattern: &str) -> bool {
-        self.regex.as_str() == pattern
-    }
+impl GeneralRegex {
+    pub(super) fn pattern(&self) -> &str { self.regex.as_str() }
 
     pub fn find_iter<'r, 't>(&'r self, inside: &'t str) -> Matches<'r, 't> {
         Matches(self.regex.find_iter(inside))
@@ -24,17 +22,13 @@ impl SysRegex {
     }
 }
 
-pub struct Matches<'r, 't>(fancy_regex::Matches<'r, 't>);
+pub struct Matches<'r, 't>(fancy_regex::Matches<'r, 't, str>);
 
 impl Iterator for Matches<'_, '_> {
-    type Item = (usize, usize);
+    type Item = crate::Result<(usize, usize)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.0.next() {
-            Some(Ok(mat)) => Some((mat.start(), mat.end())),
-            // stop if an error is encountered
-            None | Some(Err(_)) => None,
-        }
+        self.0.next().map(|m| m.map(|m| (m.start(), m.end())).map_err(|e| Box::new(e) as crate::Error))
     }
 }
 

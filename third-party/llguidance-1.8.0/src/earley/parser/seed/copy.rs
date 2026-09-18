@@ -1,7 +1,7 @@
 //! Exact independent copies of the actual committed chart storage.
 use super::{agenda::InitialCapture, reserve, Cause, PreparedEarleySeed, PreparedEarleySeedError};
 use super::super::{GrammarStackNode, Item, Lexeme, LexemeSet, LexerState, ParamValue, Row, RowInfo, Scratch};
-use std::{mem::{size_of, size_of_val}, sync::Arc};
+use std::{mem::{size_of, size_of_val}};
 use toktrie::{SimpleVob, TokenMaskConstructionPlan};
 // T: Copy closes this helper over fixed data; nested heap owners require their
 // own paid constructor and failure prefix below.
@@ -13,20 +13,20 @@ fn fixed_controls<T: Copy, E>() -> Option<usize> {
 pub(super) fn fixed_required_bytes<T: Copy, E>(source: &[T]) -> Option<usize> {
     fixed_controls::<T, E>()?.checked_add(super::allocation_bytes::<T>(source.len())?)
 }
-pub(super) fn fixed<T: Copy, F: Fn(usize) -> Result<(), E>, E>(
+pub(super) fn fixed<T: Copy, F: crate::earley::PreparedFunding<Error = E>, E>(
     target: &mut Vec<T>, source: &[T], funding: &F,
 ) -> Result<(), Cause<E>> {
-    funding(fixed_controls::<T, E>().ok_or(Cause::Overflow)?)
+    funding.reserve(fixed_controls::<T, E>().ok_or(Cause::Overflow)?)
         .map_err(Cause::Funding)?;
     reserve(target, source.len(), funding)?;
     target.extend_from_slice(source);
     Ok(())
 }
-pub(super) fn mask<F: Fn(usize) -> Result<(), E>, E>(
+pub(super) fn mask<F: crate::earley::PreparedFunding<Error = E>, E>(
     source: &SimpleVob, funding: &F,
 ) -> Result<SimpleVob, Cause<E>> {
     let plan = TokenMaskConstructionPlan::copy(source).map_err(Cause::MaskSource)?;
-    funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+    funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
     plan.compile().map_err(Cause::Mask)
 }
 impl PreparedEarleySeed {
@@ -88,20 +88,20 @@ impl PreparedEarleySeed {
     /// initialized history, capture, mask and current-row scalar. Immutable
     /// grammar ownership is shared; no lexer or source growth authority is copied.
     /// The enclosing owner retains the new funding through success or failure.
-    pub fn try_copy<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn try_copy<F: crate::earley::PreparedFunding<Error = E>, E>(
         &self, funding: &F,
     ) -> Result<Self, PreparedEarleySeedError<E>> {
-        let mut copied = Self::vacant(Arc::clone(&self.grammar));
+        let mut copied = Self::vacant(self.grammar.clone());
         let result = (|| -> Result<(), Cause<E>> {
-            funding(Self::copy_controls::<E>().ok_or(Cause::Overflow)?)
+            funding.reserve(Self::copy_controls::<E>().ok_or(Cause::Overflow)?)
                 .map_err(Cause::Funding)?;
             let source = self.copy_source().ok_or(Cause::Source)?;
             let lexemes = source.push_allowed_lexemes.copy_plan().map_err(Cause::MaskSource)?;
-            funding(lexemes.requirements().required_bytes()).map_err(Cause::Funding)?;
+            funding.reserve(lexemes.requirements().required_bytes()).map_err(Cause::Funding)?;
             copied.lexemes = Some(LexemeSet::from_owned_vob(lexemes.compile().map_err(Cause::Mask)?));
             copied.grammars = Some(mask(&source.push_allowed_grammar_ids, funding)?);
             copied.scratch = Some(Scratch::from_masks(
-                Arc::clone(&copied.grammar), copied.lexemes.take().expect("copied lexemes"),
+                copied.grammar.clone(), copied.lexemes.take().expect("copied lexemes"),
                 copied.grammars.take().expect("copied grammars"),
             ));
             let scratch = copied.scratch.as_mut().expect("copied scratch");

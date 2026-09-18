@@ -256,7 +256,7 @@ fn native_observer_error_returns_actual_cause_and_retains_original_payload_until
     let f = Fixture::new(5);
     let active = f.prepared().activate(f.payload(), f.observer());
     let unboxed = UNBOXED.with(Cell::get);
-    let error = guarded(|| active.finish()).unwrap_err();
+    let FinishRetainingError::Native(error) = guarded(|| active.finish()).unwrap_err() else { panic!("native cause expected"); };
     assert!(Rc::ptr_eq(&error.0, &f.cause));
     // The typed finish returns the actual cause. Its consuming Drop then runs
     // the existing guarded retirement attempt, whose error maps to a
@@ -425,7 +425,7 @@ fn terminal_retirement_busy_and_actual_error_keep_node_until_successful_retry() 
                 assert_eq!(observed.outcome, ScopedSubmissionProgress::Busy);
                 assert!(observed.status.settled && !observed.can_retire());
             }
-            Err(cause) if retirement == 2 => assert!(Rc::ptr_eq(&cause.0, &f.cause)),
+            Err(FinishRetainingError::Native(cause)) if retirement == 2 => assert!(Rc::ptr_eq(&cause.0, &f.cause)),
             _ => panic!("actual retirement refusal expected"),
         }
         assert!(f.log.borrow().is_empty());
@@ -614,12 +614,12 @@ fn consuming_refusal_maps_actual_cause_before_observer_can_disappear() {
     f.map_error.set(true);
     let ready =
         PreparedObservedRecovery::<FailurePayload, Custody, Fake>::new(Custody(f.log.clone()));
-    let cause = guarded(|| {
+    let FinishRetainingError::Native(cause) = guarded(|| {
         ready
             .activate(FailurePayload(f.payload()), f.observer())
             .finish()
     })
-    .unwrap_err();
+    .unwrap_err() else { panic!("native cause expected"); };
     assert!(Rc::ptr_eq(&cause.0, &f.cause));
     f.retire();
     assert!(Rc::ptr_eq(&cause.0, &f.cause));
@@ -713,15 +713,15 @@ fn retained_child_finishes_once_after_pending_busy_and_retirement_error() {
         .prepared()
         .activate(fixture.payload(), fixture.observer());
     let identity = child.allocation_identity();
-    assert!(!child.try_finish_successfully().unwrap());
+    assert!(matches!(child.try_finish_successfully().unwrap(), RetirementAttempt::Pending));
     assert_eq!(child.allocation_identity(), identity);
     assert_eq!(fixture.retire_calls.get(), 0);
 
     fixture.mode.set(2); // Actual observer contention keeps the same child.
-    assert!(!child.try_finish_successfully().unwrap());
+    assert!(matches!(child.try_finish_successfully().unwrap(), RetirementAttempt::Pending));
     fixture.mode.set(1);
     fixture.retirement.set(1); // Native registry contention is independent.
-    assert!(!child.try_finish_successfully().unwrap());
+    assert!(matches!(child.try_finish_successfully().unwrap(), RetirementAttempt::Pending));
     assert_eq!(child.allocation_identity(), identity);
     assert!(fixture.log.borrow().is_empty());
 
@@ -733,7 +733,7 @@ fn retained_child_finishes_once_after_pending_busy_and_retirement_error() {
     assert!(fixture.log.borrow().is_empty());
 
     fixture.retirement.set(4);
-    assert!(child.try_finish_successfully().unwrap());
+    assert!(matches!(child.try_finish_successfully().unwrap(), RetirementAttempt::Retired));
     assert_eq!(
         fixture
             .log

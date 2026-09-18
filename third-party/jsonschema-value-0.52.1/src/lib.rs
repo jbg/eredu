@@ -100,7 +100,29 @@ pub trait Json: Sized + Send + Sync + 'static {
     /// Scratch storage for [`Json::with_string_node`], reusable across calls.
     type StringBuffer: Default;
 
-    fn prepare_key(key: &str) -> Self::PreparedKey;
+    /// Ordinary preparation uses the same representation-owned producer.
+    fn prepare_key(key: &str) -> Self::PreparedKey {
+        Self::prepare_key_with_allocations(key, &::serde_json::allocation::Unenforced)
+            .expect("ordinary prepared-key construction")
+    }
+
+    /// Prepare one key with prospective storage checks. Opaque host runtimes
+    /// must refuse enforced construction before calling an unqualified allocator.
+    fn prepare_key_with_allocations(
+        key: &str, allocations: &dyn ::serde_json::allocation::Allocation,
+    ) -> Result<Self::PreparedKey, KeyPreparationError>;
+
+    /// Materialize diagnostic JSON through the representation's actual producer.
+    /// Borrowing an existing JSON node needs no backing; opaque host conversions
+    /// must supply a prospective contract before an enforced invocation calls them.
+    fn prepare_value_with_allocations<'a>(
+        node: &Self::Node<'a>, allocations: &dyn ::serde_json::allocation::Allocation,
+    ) -> Result<Cow<'a, Value>, KeyPreparationError> {
+        if allocations.is_enforced() {
+            return Err(KeyPreparationError::Unqualified("JSON diagnostic value"));
+        }
+        Ok(node.to_value())
+    }
 
     /// Call `f` with a node holding `string`, backed by `buffer`.
     ///
@@ -113,8 +135,44 @@ pub trait Json: Sized + Send + Sync + 'static {
         buffer: &mut Self::StringBuffer,
         string: &str,
         f: impl FnOnce(Self::Node<'_>) -> T,
-    ) -> T;
+    ) -> T {
+        let node = Self::prepare_string_node_with_allocations(buffer, string, &::serde_json::allocation::Unenforced)
+            .expect("ordinary string-node construction");
+        f(node)
+    }
+
+    /// Construct a temporary string node with prospective backing reservations.
+    /// The returned node borrows the buffer or input, never the allocation policy.
+    /// Opaque callback-only host representations remain unqualified until they
+    /// supply a construction contract that can retain the actual node safely.
+    fn prepare_string_node_with_allocations<'a>(
+        _buffer: &'a mut Self::StringBuffer, _string: &'a str,
+        _allocations: &dyn ::serde_json::allocation::Allocation,
+    ) -> Result<Self::Node<'a>, KeyPreparationError> {
+        Err(KeyPreparationError::Unqualified("JSON temporary string node"))
+    }
 }
+
+/// A fixed failure from a representation-owned key or string-node constructor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyPreparationError {
+    /// The reached allocation failed.
+    Allocation(::serde_json::allocation::AllocationError),
+    /// The representation has no prospective contract for this host producer.
+    Unqualified(&'static str),
+}
+impl From<::serde_json::allocation::AllocationError> for KeyPreparationError {
+    fn from(error: ::serde_json::allocation::AllocationError) -> Self { Self::Allocation(error) }
+}
+impl fmt::Display for KeyPreparationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allocation(error) => error.fmt(f),
+            Self::Unqualified(source) => write!(f, "unqualified prepared-key source: {source}"),
+        }
+    }
+}
+impl std::error::Error for KeyPreparationError {}
 
 /// What tells one node from another within a validation call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

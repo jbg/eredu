@@ -11,7 +11,7 @@ use eredu_core::{
         SpeculativeCaptureScope, SpeculativePrefillSpan,
     },
 };
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
 use std::mem::{size_of, size_of_val};
 
 mod aggregate;
@@ -157,7 +157,7 @@ impl<'a> OriginalSpeculativeCaptureInvocation<'a> {
             size_of::<Result<CaptureUsage, CaptureError>>(),
             size_of::<(CapturePhase, CaptureInvocationShape)>(),
             size_of::<Result<(), crate::working_memory::CaptureRunHostError>>(),
-            size_of::<CapturedStepDelivery>(),
+            size_of::<SharedCapturedStep>(),
             size_of::<Option<SpeculativeActivationCapture>>(),
             size_of::<String>(),
             size_of::<Result<SpeculativeActivationCapture, CaptureProtocolError>>(),
@@ -191,7 +191,7 @@ impl<'a> OriginalSpeculativeCaptureInvocation<'a> {
             phase: self.active.phase,
             prefill_span: self.active.span,
             completed,
-            captures: CapturedStepDelivery::Shared(frame),
+            captures: frame,
             prefill_reductions: None,
         })
     }
@@ -214,7 +214,7 @@ pub struct OriginalSpeculativeCaptureError {
     cause: eredu_nn::Error,
     _source: OriginalCaptureSource,
     _interventions: Option<OriginalInterventionSource>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 /// Array-free source, scope mask and delivery state for one original request.
@@ -248,7 +248,7 @@ pub struct OriginalSpeculativeCapture {
     source: OriginalCaptureSource,
     lineage: Option<crate::working_memory::OriginalEmbeddedCaptureLineage>,
     interventions: Option<InterventionSelection>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalSpeculativeCapture {
     /// Source-copy-independent constructor frames. Caller Box/adapter/error
@@ -273,7 +273,7 @@ impl OriginalSpeculativeCapture {
                 &[SpeculativeCaptureScope],
                 &str,
                 SpeculativeRequestId,
-                WorkspaceMetadataFunding,
+                HostMetadataFunding,
             )>(),
         ];
         parts
@@ -287,7 +287,7 @@ impl OriginalSpeculativeCapture {
         scopes: &[SpeculativeCaptureScope],
         identity: &str,
         request: SpeculativeRequestId,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, OriginalSpeculativeCaptureError> {
         let reject = |cause| OriginalSpeculativeCaptureError {
             cause,
@@ -559,10 +559,7 @@ impl OriginalSpeculativeCapture {
         {
             return Err(CaptureProtocolError::Geometry);
         }
-        let frame = envelope
-            .captures
-            .shared()
-            .ok_or(CaptureProtocolError::Invocation)?;
+        let frame = &envelope.captures;
         if frame.phase() != phase(active.phase)
             || frame.prediction_index() != active.origin.prediction as u64
             || !frame
@@ -632,3 +629,5 @@ impl OriginalSpeculativeCapture {
         (!self.records.is_empty()).then(|| self.records.remove(0))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

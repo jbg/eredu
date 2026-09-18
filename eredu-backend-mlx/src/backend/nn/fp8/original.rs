@@ -46,7 +46,7 @@ pub(super) fn validate(
         }
         let (rows, _, _, _) = geometry(input.shape(), weight.shape())
             .ok_or_else(|| observer.invalid_input_error())?;
-        crate::backend::managed_memory::fp8_kernel::validate_call()?;
+        crate::backend::nn::fp8::kernel::validate_call()?;
         Ok(Some(rows))
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
@@ -65,7 +65,7 @@ pub(super) fn invalid(message: std::fmt::Arguments<'_>) -> Exception {
 }
 
 pub(crate) fn control_bytes() -> Option<usize> {
-    let native = crate::backend::managed_memory::fp8_kernel::control_bytes()?
+    let native = crate::backend::nn::fp8::kernel::control_bytes()?
         .checked_add(Stream::device_type_control_bytes()?)?
         .checked_add(safemlx::ops::reshape_like_prefix_control_bytes()?)?;
     [
@@ -231,7 +231,7 @@ pub(super) fn validate_grouped(
         {
             return Err(observer.invalid_input_error());
         }
-        crate::backend::managed_memory::fp8_kernel::validate_call()?;
+        crate::backend::nn::fp8::kernel::validate_call()?;
         Ok(())
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
@@ -242,7 +242,7 @@ pub(super) fn validate_grouped(
 }
 pub(crate) fn grouped_control_bytes() -> Option<usize> {
     let controls = [
-        crate::backend::managed_memory::fp8_kernel::grouped_control_bytes()?,
+        crate::backend::nn::fp8::kernel::grouped_control_bytes()?,
         Stream::device_type_control_bytes()?,
         OriginalScopeObserver::control_bytes()?,
         size_of::<QuantizedActivations>(),

@@ -127,14 +127,14 @@ fn validate_commit_value_inner(
 }
 fn retain_result<T>(
     result: Result<T, Error>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<T, Error> {
     result.map_err(|cause| match cause.take_retained_backend_failure() {
         Ok(cause) => Error::StorageSource(cause),
         Err(cause) => retain_planning_error(cause, funding.clone()),
     })
 }
-fn reserve_controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
+fn reserve_controls(funding: &HostMetadataFunding) -> Result<(), Error> {
     let parts = [
         size_of::<SamplingPlacement>(),size_of::<Result<u32,Error>>(),
         size_of::<(&OriginalNumericalValue,f32,SamplingPlacement,SpeculativeExecutionStreams<'_>)>(),
@@ -161,7 +161,7 @@ fn reserve_controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     funding
         .reserve_metadata(bytes)

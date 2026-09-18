@@ -14,11 +14,11 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_device_plan, reset_local_allocator_peak, LoadedModel,
-        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
-        LocalRuntimeConfiguration, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeGenerationRequest, TextDecoder, TextModelError,
+        inspect_local_model, local_device_plan, reset_local_allocator_peak, ChatSourceInput,
+        LoadedModel, LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
+        LocalRuntimeConfiguration, ManagedPlainTextRequest, PreparedChatGenerationSettings,
+        PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeRequest, TokenizerSourceInput,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -29,11 +29,11 @@ use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan,
     DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, ResidencyPlan, SemanticEvent,
-    SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
-    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, GenerationPlainTextEvent,
+    HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest,
+    ResidencyPlan, SemanticEvent, SessionCapabilities, SpeculativeSchedulerOptions,
+    TextInferencePolicy, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -263,6 +263,10 @@ struct Cli {
     /// Process-global MLX allocator-cache limit in bytes; zero disables caching.
     #[arg(long, value_name = "BYTES")]
     mlx_cache_limit_bytes: Option<u64>,
+
+    /// Managed source and generation capacity in bytes, separate from weight residency.
+    #[arg(long, default_value_t = 1_073_741_824, value_name = "BYTES")]
+    managed_memory_capacity_bytes: u64,
 
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
@@ -649,7 +653,6 @@ enum StopReason {
     GrammarComplete,
     MaxTokens,
     Cancelled,
-    GeneratorExhausted,
 }
 
 impl StopReason {
@@ -660,7 +663,6 @@ impl StopReason {
             Self::GrammarComplete => "grammar_complete",
             Self::MaxTokens => "max_tokens",
             Self::Cancelled => "cancelled",
-            Self::GeneratorExhausted => "generator_exhausted",
         }
     }
 }
@@ -674,19 +676,6 @@ impl From<FinishReason> for StopReason {
             FinishReason::MaxTokens => Self::MaxTokens,
             FinishReason::Cancelled => Self::Cancelled,
         }
-    }
-}
-
-fn stop_reason(output_ids: &[u32], eos_token_ids: &[u32], max_tokens: usize) -> StopReason {
-    if output_ids
-        .last()
-        .is_some_and(|token| eos_token_ids.contains(token))
-    {
-        StopReason::Eos
-    } else if output_ids.len() >= max_tokens {
-        StopReason::MaxTokens
-    } else {
-        StopReason::GeneratorExhausted
     }
 }
 
@@ -740,20 +729,6 @@ fn write_timing_report(
     Ok(())
 }
 
-fn write_streamed_token(
-    decoder: &mut TextDecoder,
-    stdout: &mut impl Write,
-    streamed_text: &mut String,
-    token_id: u32,
-) -> Result<()> {
-    if let Some(text) = decoder.step(token_id)? {
-        stdout.write_all(text.as_bytes())?;
-        stdout.flush()?;
-        streamed_text.push_str(&text);
-    }
-    Ok(())
-}
-
 fn write_semantic_event(
     event: &SemanticEvent,
     stdout: &mut impl Write,
@@ -769,7 +744,9 @@ fn write_semantic_event(
             serde_json::to_string(id)?,
             serde_json::to_string(name)?,
         )),
-        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.as_str().to_owned()),
+        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+            Some(json_fragment.as_str().to_owned())
+        }
         SemanticEvent::ToolCallEnd => Some("}}\n".into()),
         SemanticEvent::ReasoningDelta(text) => {
             reasoning_stream.write_delta(stderr, text, reasoning_output)?;
@@ -1577,6 +1554,7 @@ fn isolated_benchmark_trial(
     tokens: usize,
     timeout_seconds: u64,
     prompt: &str,
+    managed_capacity: u64,
 ) -> AutoBenchmarkTrial {
     let plan_path = temporary_trial_path("plan", candidate, run);
     let telemetry_path = temporary_trial_path("telemetry", candidate, run);
@@ -1608,6 +1586,8 @@ fn isolated_benchmark_trial(
             .arg(&telemetry_path)
             .arg("--max-tokens")
             .arg(tokens.to_string())
+            .arg("--managed-memory-capacity-bytes")
+            .arg(managed_capacity.to_string())
             .arg("--raw")
             .arg(prompt)
             .stdin(Stdio::null())
@@ -1701,6 +1681,7 @@ fn benchmark_automatic_plans(
     runs: usize,
     timeout_seconds: u64,
     prompt: &str,
+    managed_capacity: u64,
 ) -> Result<AutoBenchmarkReport> {
     let plans = automatic_benchmark_candidates(model_path, &heuristic)?;
     let candidate_count = plans.len();
@@ -1723,6 +1704,7 @@ fn benchmark_automatic_plans(
                     tokens,
                     timeout_seconds,
                     prompt,
+                    managed_capacity,
                 )
             })
             .collect::<Vec<_>>();
@@ -2085,6 +2067,7 @@ fn main() -> Result<()> {
                         args.auto_benchmark_runs,
                         args.auto_benchmark_timeout_seconds,
                         args.prompt.as_deref().unwrap_or(AUTO_BENCHMARK_PROMPT),
+                        args.managed_memory_capacity_bytes,
                     )?;
                     if let Some(path) = &args.auto_cache {
                         write_auto_plan_cache(
@@ -2240,13 +2223,12 @@ fn main() -> Result<()> {
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
     let generation_overrides = args.generation_overrides();
-    let mut resolved_generation = model.resolve_generation_config(generation_overrides)?;
+    let resolved_generation = model.resolve_generation_config(generation_overrides)?;
     let temperature = resolved_generation.temperature;
     let top_k = resolved_generation.top_k;
     let top_p = resolved_generation.top_p;
     let min_p = resolved_generation.min_p;
     let max_tokens = resolved_generation.max_new_tokens.unwrap_or(256);
-    resolved_generation.max_new_tokens = Some(max_tokens);
     if args.mirostat_v2 && temperature == 0.0 {
         bail!("--mirostat-v2 requires an effective temperature greater than zero");
     }
@@ -2278,8 +2260,11 @@ fn main() -> Result<()> {
         .map(read_tools)
         .transpose()?
         .unwrap_or_default();
-    let (prepared_chat, rendered_prompt, add_special_tokens) = if args.raw {
-        (None, prompt, true)
+    let cancellation = GenerationCancellationToken::new();
+    let tokenizer_source =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let prepared_chat = if args.raw || (!model.has_chat_template() && !tools_requested) {
+        None
     } else {
         let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({
@@ -2304,51 +2289,77 @@ fn main() -> Result<()> {
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
         };
-        match model.prepare_chat(request) {
-            Ok(prepared) => {
-                let semantic = use_semantic_generation(
-                    prepared.semantic_support(),
-                    prepared.native_tool_support(),
-                    tools_requested,
-                )?;
-                let rendered_prompt = prepared.rendered_prompt().to_owned();
-                if semantic {
-                    if args.verbose {
-                        let label = if tools_requested {
-                            "native_tool_profile"
-                        } else {
-                            "semantic_profile"
-                        };
-                        eprintln!(
-                            "{label}: {}",
-                            prepared.format_profile_identity().unwrap_or("unregistered")
-                        );
-                    }
-                    (Some(prepared), rendered_prompt, false)
+        let source = model
+            .compile_managed_chat_source(
+                &tokenizer_source,
+                ChatSourceInput::RetainedConfiguration,
+                !request.tools.is_empty(),
+                &cancellation,
+            )?
+            .context("cancelled before template source compilation")?;
+        let prepared = model
+            .prepare_chat(
+                &source,
+                &request,
+                args.managed_memory_capacity_bytes,
+                &cancellation,
+            )?
+            .context("cancelled before chat preparation")?;
+        let semantic = use_semantic_generation(
+            prepared.semantic_support(),
+            prepared.native_tool_support(),
+            tools_requested,
+        )?;
+        if args.verbose {
+            if semantic {
+                let label = if tools_requested {
+                    "native_tool_profile"
                 } else {
-                    if args.verbose {
-                        eprintln!(
-                            "semantic_profile: unavailable ({}); using templated text fallback",
-                            prepared
-                                .native_tool_support()
-                                .unsupported_reason()
-                                .unwrap_or("unknown reason")
-                        );
-                    }
-                    (Some(prepared), rendered_prompt, false)
-                }
+                    "semantic_profile"
+                };
+                eprintln!(
+                    "{label}: {}",
+                    prepared.format_profile_identity().unwrap_or("unregistered")
+                );
+            } else {
+                eprintln!(
+                    "semantic_profile: unavailable ({}); using templated text fallback",
+                    prepared
+                        .semantic_support()
+                        .unsupported_reason()
+                        .unwrap_or("unknown reason")
+                );
             }
-            Err(TextModelError::MissingChatTemplate) if !tools_requested => (None, prompt, true),
-            Err(error) => return Err(error.into()),
         }
+        Some(prepared)
     };
 
-    let prompt_token_ids = model.encode(&rendered_prompt, add_special_tokens)?;
-    if prompt_token_ids.is_empty() {
-        bail!("the prompt produced no input tokens");
-    }
+    let rendered_prompt = prepared_chat
+        .as_ref()
+        .map(|prepared| prepared.rendered_prompt())
+        .unwrap_or(&prompt);
+    // Numerical benchmark witnesses and optional diagnostics are application
+    // inspection. Generation consumes the retained source directly.
+    let prompt_diagnostics = args.verbose || args.telemetry_json.is_some();
+    let prompt_token_ids = if args.expert_cache_benchmark
+        || (prompt_diagnostics && (prepared_chat.is_none() || drafting.is_enabled()))
+    {
+        let ids = model.encode(rendered_prompt, prepared_chat.is_none())?;
+        if ids.is_empty() {
+            bail!("the prompt produced no input tokens");
+        }
+        Some(ids)
+    } else {
+        None
+    };
+    let mut prompt_token_count = prompt_token_ids.as_ref().map(Vec::len);
     if args.expert_cache_benchmark {
-        let benchmark = benchmark_local_expert_cache(&mut model, &prompt_token_ids)?;
+        let benchmark = benchmark_local_expert_cache(
+            &mut model,
+            prompt_token_ids
+                .as_deref()
+                .expect("benchmark prompt inspection"),
+        )?;
         print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
         print_expert_benchmark_result("repeated_prefill", benchmark.repeated_prefill);
         print_expert_benchmark_result("cached_decode", benchmark.cached_decode);
@@ -2356,11 +2367,10 @@ fn main() -> Result<()> {
     }
 
     let eos_token_ids = model.eos_token_ids().to_vec();
-    let mut output_ids = Vec::with_capacity(max_tokens);
+    let mut output_ids;
     let generation_started = Instant::now();
-    let mut time_to_first_token = None;
+    let time_to_first_token;
     let mut speculative_stats: Option<SpeculativeStats> = None;
-    let mut decoder = model.text_decoder(true);
     let mut streamed_text = String::new();
     let mut reasoning_stream = ReasoningStream::default();
     let stdout = io::stdout();
@@ -2387,31 +2397,41 @@ fn main() -> Result<()> {
         ..SpeculativeSchedulerOptions::default()
     }
     .with_lookahead(!args.disable_speculative_lookahead);
-    let mut prepared_finish_reason = None;
+    let settings = PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            max_new_tokens: Some(max_tokens),
+            ..generation_overrides
+        },
+        inference: TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(args.managed_memory_capacity_bytes),
+            ..Default::default()
+        },
+        seed: args.seed,
+        strategy: if args.mirostat_v2 {
+            eredu::api::TextSamplingStrategy::MirostatV2 {
+                tau: args.mirostat_tau,
+                eta: args.mirostat_eta,
+            }
+        } else {
+            eredu::api::TextSamplingStrategy::Standard
+        },
+        ..Default::default()
+    };
+    let finish_reason;
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
-        let settings = PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                max_new_tokens: Some(max_tokens),
-                ..generation_overrides
-            },
-            seed: args.seed,
-            strategy: if args.mirostat_v2 {
-                eredu::api::TextSamplingStrategy::MirostatV2 {
-                    tau: args.mirostat_tau,
-                    eta: args.mirostat_eta,
-                }
-            } else {
-                eredu::api::TextSamplingStrategy::Standard
-            },
-            ..Default::default()
-        };
         let mut semantic_error = None;
         if drafting.is_enabled() {
-            let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let request = PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(prepared),
+            let request = PreparedChatSpeculativeRequest {
+                chat: prepared,
+                input: PreparedChatPrompt::Rendered,
+                output_mode: if semantic {
+                    PreparedChatOutputMode::Semantic
+                } else {
+                    PreparedChatOutputMode::Text
+                },
+                skip_special_tokens: true,
                 drafting: drafting
                     .as_speculative_draft()
                     .expect("drafting is enabled"),
@@ -2422,7 +2442,7 @@ fn main() -> Result<()> {
                     scheduler: scheduler_options,
                 },
                 caller_stop_sequences: &args.stop_sequences,
-                cancellation,
+                cancellation: cancellation.clone(),
                 on_event: |event| {
                     if semantic_error.is_none() {
                         semantic_error = write_semantic_event(
@@ -2440,48 +2460,50 @@ fn main() -> Result<()> {
                     }
                 },
             };
-            let output = if semantic {
-                model.generate_prepared_chat_speculative(request)
-            } else {
-                model.generate_prepared_text_speculative(request)
-            }?;
+            let output = model.generate_prepared_chat_speculative(request)?;
             output_ids = output.token_ids().to_vec();
             time_to_first_token = output.timing().time_to_first_token();
-            prepared_finish_reason = Some(output.finish_reason());
+            finish_reason = output.finish_reason();
             speculative_stats = Some(output.into_stats());
         } else {
-            let cancellation = GenerationCancellationToken::new();
-            let cancel_on_error = cancellation.clone();
-            let request = PreparedChatGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(prepared),
-                settings,
-                caller_stop_sequences: &args.stop_sequences,
-                cancellation,
-                on_event: |event| {
-                    if semantic_error.is_none() {
-                        semantic_error = write_semantic_event(
-                            &event,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut streamed_text,
-                            &mut reasoning_stream,
-                            reasoning_output,
-                        )
-                        .err();
-                        if semantic_error.is_some() {
-                            cancel_on_error.cancel();
-                        }
-                    }
-                },
-            };
-            let output = if semantic {
-                model.generate_prepared_chat(request)
+            let mut request = PreparedChatRequest::new(prepared, settings);
+            request.stop_sequences = &args.stop_sequences;
+            request.output_mode = if semantic {
+                PreparedChatOutputMode::Semantic
             } else {
-                model.generate_prepared_text(request)
-            }?;
+                PreparedChatOutputMode::Text
+            };
+            let cancel_on_error = cancellation.clone();
+            let mut emit = |event| {
+                if semantic_error.is_none() {
+                    semantic_error = write_semantic_event(
+                        &event,
+                        &mut stdout,
+                        &mut stderr,
+                        &mut streamed_text,
+                        &mut reasoning_stream,
+                        reasoning_output,
+                    )
+                    .err();
+                    if semantic_error.is_some() {
+                        cancel_on_error.cancel();
+                    }
+                }
+            };
+            let session = model
+                .start_prepared_chat(request, &cancellation)?
+                .context("cancelled before generation")?;
+            if prompt_diagnostics {
+                prompt_token_count = session
+                    .prompt_attribution()
+                    .and_then(|source| source.attribution().complete_token_ids())
+                    .map(<[u32]>::len)
+                    .or(prompt_token_count);
+            }
+            let output = session.run(&cancellation, &mut emit)?;
             time_to_first_token = output.timing().time_to_first_token();
-            output_ids = output.token_ids;
-            prepared_finish_reason = Some(output.finish_reason);
+            output_ids = output.token_ids.to_vec();
+            finish_reason = output.finish_reason;
         }
         if let Some(error) = semantic_error {
             return Err(error);
@@ -2491,46 +2513,52 @@ fn main() -> Result<()> {
             "speculative generation requires a prepared template prompt; raw prompts use ordinary generation"
         );
     } else {
-        let config = TextGenerationConfig::new(resolved_generation).with_seed(args.seed);
-        let config = if args.mirostat_v2 {
-            config.with_mirostat_v2(args.mirostat_tau, args.mirostat_eta)?
-        } else {
-            config
+        let request = ManagedPlainTextRequest::new(rendered_prompt, settings);
+        let mut output_error = None;
+        let cancel_on_error = cancellation.clone();
+        let mut emit = |event: GenerationPlainTextEvent<'_>| {
+            if let GenerationPlainTextEvent::TextDelta(text) = event {
+                if output_error.is_none() {
+                    output_error = (|| -> io::Result<()> {
+                        stdout.write_all(text.as_bytes())?;
+                        stdout.flush()?;
+                        streamed_text.push_str(text);
+                        Ok(())
+                    })()
+                    .err();
+                    if output_error.is_some() {
+                        cancel_on_error.cancel();
+                    }
+                }
+            }
         };
-        let generator = model.generate_tokens(prompt_token_ids.clone(), config)?;
-        for token in generator {
-            let token_id = token?.token_id()?;
-            if time_to_first_token.is_none() {
-                time_to_first_token = Some(generation_started.elapsed());
-            }
-            output_ids.push(token_id);
-            if eos_token_ids.contains(&token_id) {
-                break;
-            }
-            write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
+        let output = model
+            .generate_managed_plain_text(&tokenizer_source, request, &cancellation, &mut emit)?
+            .context("cancelled before generation")?;
+        if let Some(error) = output_error {
+            return Err(error.into());
         }
+        time_to_first_token = output.timing.time_to_first_token();
+        output_ids = output.token_ids.to_vec();
+        finish_reason = output.finish_reason;
     }
     reasoning_stream.close(&mut stderr, reasoning_output)?;
     drop(stderr);
 
     let generation_elapsed = generation_started.elapsed();
-    let stop_reason = prepared_finish_reason
-        .map(StopReason::from)
-        .unwrap_or_else(|| stop_reason(&output_ids, &eos_token_ids, max_tokens));
+    if prompt_diagnostics && prompt_token_count.is_none() {
+        prompt_token_count = Some(
+            model
+                .encode(rendered_prompt, prepared_chat.is_none())?
+                .len(),
+        );
+    }
+    let stop_reason = StopReason::from(finish_reason);
     if prepared_chat.is_none() && stop_reason == StopReason::Eos {
         output_ids.pop();
     }
 
-    if prepared_chat.is_none() {
-        let output = model.decode(&output_ids, true)?;
-        let remaining = output.strip_prefix(&streamed_text).with_context(|| {
-            "incremental tokenizer output did not match the final decoded response"
-        })?;
-        stdout.write_all(remaining.as_bytes())?;
-        if !output.ends_with('\n') {
-            writeln!(stdout)?;
-        }
-    } else if !streamed_text.ends_with('\n') {
+    if !streamed_text.ends_with('\n') {
         writeln!(stdout)?;
     }
     stdout.flush()?;
@@ -2557,7 +2585,7 @@ fn main() -> Result<()> {
             "model_family: {}, effective_model_type: {}, prompt_tokens: {}, generated_tokens: {}",
             model.effective_model_type(),
             model.effective_model_type(),
-            prompt_token_ids.len(),
+            prompt_token_count.expect("verbose prompt inspection"),
             output_ids.len(),
         );
         write_timing_report(
@@ -2657,9 +2685,6 @@ fn main() -> Result<()> {
                 StopReason::MaxTokens => {
                     eprintln!("warning: generation reached --max-tokens before EOS");
                 }
-                StopReason::GeneratorExhausted => {
-                    eprintln!("warning: the token generator ended before EOS");
-                }
                 StopReason::Eos
                 | StopReason::StopSequence
                 | StopReason::GrammarComplete
@@ -2701,7 +2726,7 @@ fn main() -> Result<()> {
             plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,
             resources: resource_profile,
-            prompt_tokens: prompt_token_ids.len(),
+            prompt_tokens: prompt_token_count.expect("telemetry prompt inspection"),
             generated_tokens: output_ids.len(),
             stop_reason: stop_reason.label().into(),
             timing: TimingTelemetry::new(
@@ -2855,6 +2880,9 @@ fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkS
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    if args.managed_memory_capacity_bytes == 0 {
+        bail!("--managed-memory-capacity-bytes must be greater than zero");
+    }
     if args.max_tokens == Some(0) {
         bail!("--max-tokens must be greater than zero");
     }
@@ -2930,10 +2958,14 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     requested_load_quantization(args)?;
     if args.layerwise_host && args.quantize.is_some() {
-        bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
+        bail!(
+            "--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization"
+        );
     }
     if args.dense_disk_stream && args.quantize.is_some() {
-        bail!("--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights");
+        bail!(
+            "--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights"
+        );
     }
     if args.dense_disk_stream && args.layerwise_host {
         bail!("--dense-disk-stream conflicts with --layerwise-host");
@@ -2960,10 +2992,14 @@ fn validate_args(args: &Cli) -> Result<()> {
         bail!("--revision can only be used with a Hugging Face model identifier");
     }
     if args.raw && args.thinking != ThinkingMode::Auto {
-        bail!("--thinking on/off cannot be used with --raw because raw prompts bypass the chat template");
+        bail!(
+            "--thinking on/off cannot be used with --raw because raw prompts bypass the chat template"
+        );
     }
     if args.raw && args.reasoning_effort.is_some() {
-        bail!("--reasoning-effort cannot be used with --raw because raw prompts bypass the chat template");
+        bail!(
+            "--reasoning-effort cannot be used with --raw because raw prompts bypass the chat template"
+        );
     }
     if args.allow_unparsed_reasoning && args.thinking != ThinkingMode::On {
         bail!("--allow-unparsed-reasoning requires --thinking on");
@@ -3490,13 +3526,13 @@ mod tests {
         discover_local_hardware, format_bytes, median, read_automatic_feedback,
         requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
+        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
         write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
         AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
-        ExecutionPlan, ExecutionPlanReport, ModelResourceProfile, NativeToolSupport, Observed,
-        PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan,
-        ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice,
+        ExecutionPlan, ExecutionPlanReport, FinishReason, ModelResourceProfile, NativeToolSupport,
+        Observed, PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream,
+        ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice,
         SpeculativeSchedulerOptions, StopReason, WeightTransformationPlan,
     };
 
@@ -4304,10 +4340,41 @@ mod tests {
     }
 
     #[test]
-    fn classifies_generation_stop_reason() {
-        assert_eq!(stop_reason(&[4, 2], &[2], 10), StopReason::Eos);
-        assert_eq!(stop_reason(&[4, 5], &[2], 2), StopReason::MaxTokens);
-        assert_eq!(stop_reason(&[4], &[2], 2), StopReason::GeneratorExhausted);
+    fn preserves_canonical_generation_finish_reasons() {
+        for (reason, expected) in [
+            (FinishReason::Eos, StopReason::Eos),
+            (FinishReason::StopSequence, StopReason::StopSequence),
+            (FinishReason::GrammarComplete, StopReason::GrammarComplete),
+            (FinishReason::MaxTokens, StopReason::MaxTokens),
+            (FinishReason::Cancelled, StopReason::Cancelled),
+        ] {
+            assert_eq!(StopReason::from(reason), expected);
+        }
+    }
+
+    #[test]
+    fn validates_managed_capacity_without_changing_generation_overrides() {
+        let args = Cli::try_parse_from([
+            "eredu",
+            "--model",
+            "model-id",
+            "--managed-memory-capacity-bytes",
+            "4096",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&args).unwrap();
+        assert_eq!(args.managed_memory_capacity_bytes, 4096);
+        assert_eq!(
+            args.generation_overrides(),
+            eredu_core::GenerationConfigOverrides::default()
+        );
+        let mut args = args;
+        args.managed_memory_capacity_bytes = 0;
+        assert!(validate_args(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--managed-memory-capacity-bytes"));
     }
 
     #[test]
@@ -4467,10 +4534,7 @@ mod tests {
     fn reports_only_max_tokens_without_verbose_output() {
         assert!(should_report_stop_reason(StopReason::MaxTokens, false));
         assert!(!should_report_stop_reason(StopReason::Eos, false));
-        assert!(!should_report_stop_reason(
-            StopReason::GeneratorExhausted,
-            false
-        ));
+        assert!(!should_report_stop_reason(StopReason::Cancelled, false));
         assert!(should_report_stop_reason(StopReason::Eos, true));
     }
 

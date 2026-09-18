@@ -552,7 +552,7 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
     );
 
     let mut outputs_b = vec![driver.advance(&mut first).unwrap().unwrap().into_output()];
-    assert!(driver.take_completed_step(&mut first).unwrap().is_none());
+    assert!(driver.take_completed_delivery(&mut first).unwrap().is_none());
     assert_frontier(driver.runtime(), 10);
     assert_eq!(controller_first.0.get().0, 1);
     assert_eq!(controller_first.0.get().1, 1);
@@ -576,7 +576,7 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
     // that actually advanced this native session.
     for _ in 0..2 {
         outputs_b.push(driver.advance(&mut first).unwrap().unwrap().into_output());
-        assert!(driver.take_completed_step(&mut first).unwrap().is_none());
+        assert!(driver.take_completed_delivery(&mut first).unwrap().is_none());
     }
     assert!(driver.advance(&mut first).unwrap().is_none());
     assert_frontier(driver.runtime(), 12);

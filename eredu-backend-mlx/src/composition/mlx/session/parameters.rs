@@ -208,9 +208,9 @@ struct Catalog {
     slots: Vec<LoadedParameter>,
 }
 impl ParameterSlotVisitor<MlxTensor> for Catalog {
-    fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut MlxTensor) {
+    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
         self.record(
-            metadata,
+            metadata.to_owned(),
             value.as_array().dtype(),
             value.shape().iter().map(|n| *n as u64).collect(),
         );
@@ -307,10 +307,10 @@ struct Select<'a> {
     values: BTreeMap<String, MlxTensor>,
 }
 impl ParameterSlotVisitor<MlxTensor> for Select<'_> {
-    fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut MlxTensor) {
-        if self.ids.contains(metadata.id.as_str()) {
+    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
+        if self.ids.contains(metadata.id().as_str()) {
             self.values
-                .insert(metadata.id.as_str().into(), value.clone());
+                .insert(metadata.id().as_str().into(), value.clone());
         }
     }
 }

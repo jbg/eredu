@@ -8,7 +8,7 @@ use crate::composition::mlx::{
 };
 use eredu_runtime::{prefill::PrefillControlPlan,
     speculative::embedded_occurrence::EmbeddedSchedulePlan,
-    working_memory::OriginalSpeculativeSemanticPreparation};
+    working_memory::PreparedSemanticSource};
 use eredu_core::SpeculativeBuffer;
 use super::batch::{buffer, inspect};
 
@@ -24,12 +24,12 @@ struct Lane<'lane, 'world, C: SpeculativeTokenFilterController> {
     chunk: u64,
     source: OriginalSpeculativeNumericalPreparation,
     declaration: Option<OriginalInterventionDeclaration>,
-    preparation: OriginalSpeculativeSemanticPreparation,
+    preparation: PreparedSemanticSource,
 }
 struct Bound<'selected> {
     cache: OriginalEmbeddedCachePreparation,
     sources: OriginalEmbeddedSources<'selected>,
-    preparation: OriginalSpeculativeSemanticPreparation,
+    preparation: PreparedSemanticSource,
 }
 
 
@@ -47,13 +47,13 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
         size_of::<Continuation<'_, 'lane, 'world, C, V>>(),
         size_of::<SpeculativeBuffer<SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>>>(),
         size_of::<eredu_core::SpeculativeBufferIntoIter<SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>>>(),
-        size_of::<OriginalSpeculativeSemanticPreparation>(),
-        size_of::<Result<(OriginalSpeculativeSemanticPreparation, NonZeroU64), Error>>(),
+        size_of::<PreparedSemanticSource>(),
+        size_of::<Result<(PreparedSemanticSource, NonZeroU64), Error>>(),
         size_of::<Result<SpeculativeGenerationBatchOutput, Error>>(),
-        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+        OriginalCopyEnvironment::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
     let result = (|| {
         // Validate the complete source batch before making independent state copies.
         for lane in &lanes { inspect(backend, session, lane)?; }
@@ -76,7 +76,7 @@ where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor {
 }
 
 fn prepare<'lane, 'world, C: SpeculativeTokenFilterController>(backend: &MlxBackend<'_>, session: &MlxModelSession,
-    lane: SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>, preparation: OriginalSpeculativeSemanticPreparation,
+    lane: SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>, preparation: PreparedSemanticSource,
     input_positions: NonZeroU64, environment: &OriginalCopyEnvironment<'_>,
 ) -> Result<Lane<'lane, 'world, C>, Error> {
     let funding = preparation.metadata_funding();
@@ -92,7 +92,7 @@ fn prepare<'lane, 'world, C: SpeculativeTokenFilterController>(backend: &MlxBack
             OriginalSpeculativeNumericalPreparation, Option<OriginalInterventionDeclaration>, u64), Error>>(),
     ];
     funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
     let result = (|| {
         let model = session.original_model_source().map_err(Error::PrefillControl)?;
         preparation.validate(backend.memory_pool(), model.erased().inference_execution_identity()).map_err(Error::PrefillControl)?;
@@ -122,12 +122,12 @@ struct Continuation<'request, 'lane, 'world, C: SpeculativeTokenFilterController
     options: eredu_core::SpeculativeSchedulerOptions,
     visitor: Option<V>,
     // Retires after all provisional lane and visitor transport fields.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl<C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor> MlxEmbeddedExecutorContinuation
     for Continuation<'_, '_, '_, C, V> {
     fn construction_controls(&self, bytes: Option<usize>) -> Result<(), Error> {
-        self.funding.reserve_metadata(bytes.ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        self.funding.reserve_metadata(bytes.ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)
     }
     fn execute(&mut self, selected: &eredu_runtime::SelectedSpeculativeRealization,

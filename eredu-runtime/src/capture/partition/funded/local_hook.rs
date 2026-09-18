@@ -16,7 +16,7 @@ impl PartitionCaptureLocalHook {
         let parts=[eredu_core::BackendFailure::source_retention_peak_bytes::<RejectedHook>()?,
             size_of::<Self>()*2,size_of::<Option<Self>>(),size_of::<Result<Option<Self>,PartitionCaptureProgramError>>(),
             size_of::<Result<(),PartitionCaptureProgramError>>(),size_of::<RejectedHook>(),
-            size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>()];
+            size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
     pub(crate) fn new(hook:PartitionLocalCaptureHook)->Self {Self(hook)}
@@ -57,7 +57,7 @@ impl PartitionCaptureLocalHook {
 }
 impl PartitionCaptureProgramError {
     pub(crate) fn local<E:std::error::Error+Send+Sync+'static>(cause:E,
-        source:SharedCapturePlan,metadata:WorkspaceMetadataFunding)->Self {
+        source:SharedCapturePlan,metadata:HostMetadataFunding)->Self {
         Self{cause:Cause::Local(eredu_core::BackendFailure::from_error(cause)),_source:source,_metadata:metadata}
     }
 }

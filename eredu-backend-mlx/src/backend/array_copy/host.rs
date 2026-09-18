@@ -1,7 +1,7 @@
 //! Retained Host-load prefix feeding the existing isolated Array-copy worker.
 use super::*;
 use crate::backend::error::Error;
-use eredu_nn::workspace::{WorkspaceMetadataError, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceMetadataError, HostMetadataFunding};
 use eredu_runtime::working_memory::WorkingMemoryError;
 use safemlx::{
     HostTransferDescriptor, ImmutableHostTransferBuffer, OperationEvent, OriginalScopeObserver,
@@ -19,7 +19,7 @@ pub(crate) struct PreparedHostArrayCopy {
     source: Arc<ImmutableHostTransferBuffer>,
     descriptor: HostTransferDescriptor<4>,
     attempted: bool,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedHostArrayCopy {
     pub(crate) fn control_bytes() -> Option<usize> {
@@ -126,3 +126,5 @@ impl PreparedHostArrayCopy {
         Ok(IsolatedArrayCopy::new(array).copy_retained(stream, roots)?)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

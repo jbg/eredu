@@ -87,6 +87,10 @@ needing to re-create the scratch space for every search, which could wind up
 being quite expensive.
 */
 
+use crate::util::allocation::{
+    Allocation, AllocationError, Allocator, Unenforced,
+};
+
 /// A thread safe pool that works in an `alloc`-only context.
 ///
 /// Getting a value out comes with a guard. When that guard is dropped, the
@@ -154,10 +158,41 @@ being quite expensive.
 pub struct Pool<T, F = fn() -> T>(alloc::boxed::Box<inner::Pool<T, F>>);
 
 impl<T, F> Pool<T, F> {
+    /// Visit the actual empty pool shell and constructor backing. A pool that
+    /// has served an ordinary search rejects; its mutable caches need their
+    /// own invocation census instead of an immutable-source description.
+    pub fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+        constructor: impl FnOnce(
+            &F,
+            &mut dyn crate::util::source_storage::Visitor,
+        )
+            -> Result<(), crate::util::source_storage::Error>,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        let bytes = self.0.source_storage_bytes()?;
+        if visitor
+            .visit((&*self.0 as *const inner::Pool<T, F>).cast::<()>(), bytes)
+        {
+            constructor(self.0.create_ref(), visitor)?;
+        }
+        Ok(())
+    }
+
     /// Create a new pool. The given closure is used to create values in
     /// the pool when necessary.
     pub fn new(create: F) -> Pool<T, F> {
-        Pool(alloc::boxed::Box::new(inner::Pool::new(create)))
+        Self::new_with_allocations(create, &Unenforced)
+            .expect("ordinary pool allocation")
+    }
+
+    /// Create the original pool after funding its concrete retained storage.
+    pub fn new_with_allocations(
+        create: F,
+        funding: &dyn Allocation,
+    ) -> Result<Pool<T, F>, AllocationError> {
+        let inner = inner::Pool::new_with_allocations(create, funding)?;
+        Ok(Pool(Allocator::new(funding).boxed(inner)?))
     }
 
     /// Create a new pool. The given closure is used to create values in
@@ -177,9 +212,20 @@ impl<T, F> Pool<T, F> {
     /// The capacity must be at least 1. If it's less than 1, then it is
     /// forced to be 1.
     pub fn with_capacity(capacity: usize, create: F) -> Pool<T, F> {
-        Pool(alloc::boxed::Box::new(inner::Pool::with_capacity(
-            capacity, create,
-        )))
+        Self::with_capacity_and_allocations(capacity, create, &Unenforced)
+            .expect("ordinary pool allocation")
+    }
+
+    /// Create the same thread-aware pool with prospective storage funding.
+    pub fn with_capacity_and_allocations(
+        capacity: usize,
+        create: F,
+        funding: &dyn Allocation,
+    ) -> Result<Pool<T, F>, AllocationError> {
+        let inner = inner::Pool::with_capacity_and_allocations(
+            capacity, create, funding,
+        )?;
+        Ok(Pool(Allocator::new(funding).boxed(inner)?))
     }
 
     /// Create a new pool. The given closure is used to create values in
@@ -502,10 +548,45 @@ mod inner {
     }
 
     impl<T, F> Pool<T, F> {
+        pub(super) fn create_ref(&self) -> &F {
+            &self.create
+        }
+        pub(super) fn source_storage_bytes(
+            &self,
+        ) -> Result<usize, crate::util::source_storage::Error> {
+            use crate::util::source_storage::Error;
+            if self.owner.load(Ordering::Acquire) != THREAD_ID_UNOWNED {
+                return Err(Error::WarmedPool);
+            }
+            core::mem::size_of::<Self>()
+                .checked_add(
+                    self.stacks.capacity()
+                        * core::mem::size_of::<CacheLine<Mutex<Vec<Box<T>>>>>(
+                        ),
+                )
+                .ok_or(Error::SizeOverflow)
+        }
+
         /// Create a new pool. The given closure is used to create values in
         /// the pool when necessary.
         pub(super) fn new(create: F) -> Pool<T, F> {
-            Pool::with_capacity(MAX_POOL_STACKS, create)
+            Self::new_with_allocations(
+                create,
+                &crate::util::allocation::Unenforced,
+            )
+            .expect("ordinary pool allocation")
+        }
+
+        pub(super) fn new_with_allocations(
+            create: F,
+            funding: &dyn crate::util::allocation::Allocation,
+        ) -> Result<Pool<T, F>, crate::util::allocation::AllocationError>
+        {
+            Self::with_capacity_and_allocations(
+                MAX_POOL_STACKS,
+                create,
+                funding,
+            )
         }
 
         /// Create a new pool. The given closure is used to create values in
@@ -517,6 +598,20 @@ mod inner {
         /// The capacity must be at least 1. If it's less than 1, then it is
         /// forced to be 1.
         pub(super) fn with_capacity(capacity: usize, create: F) -> Pool<T, F> {
+            Self::with_capacity_and_allocations(
+                capacity,
+                create,
+                &crate::util::allocation::Unenforced,
+            )
+            .expect("ordinary pool allocation")
+        }
+
+        pub(super) fn with_capacity_and_allocations(
+            capacity: usize,
+            create: F,
+            funding: &dyn crate::util::allocation::Allocation,
+        ) -> Result<Pool<T, F>, crate::util::allocation::AllocationError>
+        {
             // FIXME: Now that we require 1.65+, Mutex::new is available as
             // const... So we can almost mark this function as const. But of
             // course, we're creating a Vec of stacks below (we didn't when I
@@ -555,13 +650,20 @@ mod inner {
             // Back to square one. I maybe we just don't make a pool's
             // constructor const and live with it. It's probably not a huge
             // deal.
-            let mut stacks = Vec::with_capacity(capacity.max(1));
+            let mut stacks = Vec::new();
+            crate::util::allocation::Allocator::new(funding)
+                .grow(&mut stacks, capacity.max(1))?;
             for _ in 0..stacks.capacity() {
                 stacks.push(CacheLine(Mutex::new(vec![])));
             }
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
             let owner_val = UnsafeCell::new(None); // init'd on first access
-            Pool { create, stacks, owner, owner_val }
+            Ok(Pool {
+                create,
+                stacks,
+                owner,
+                owner_val,
+            })
         }
     }
 
@@ -690,13 +792,21 @@ mod inner {
         /// Create a guard that represents the special owned T.
         #[inline]
         fn guard_owned(&self, caller: usize) -> PoolGuard<'_, T, F> {
-            PoolGuard { pool: self, value: Err(caller), discard: false }
+            PoolGuard {
+                pool: self,
+                value: Err(caller),
+                discard: false,
+            }
         }
 
         /// Create a guard that contains a value from the pool's stack.
         #[inline]
         fn guard_stack(&self, value: Box<T>) -> PoolGuard<'_, T, F> {
-            PoolGuard { pool: self, value: Ok(value), discard: false }
+            PoolGuard {
+                pool: self,
+                value: Ok(value),
+                discard: false,
+            }
         }
 
         /// Create a guard that contains a value from the pool's stack with an
@@ -704,7 +814,11 @@ mod inner {
         /// into the pool.
         #[inline]
         fn guard_stack_transient(&self, value: Box<T>) -> PoolGuard<'_, T, F> {
-            PoolGuard { pool: self, value: Ok(value), discard: true }
+            PoolGuard {
+                pool: self,
+                value: Ok(value),
+                discard: true,
+            }
         }
     }
 
@@ -896,6 +1010,7 @@ mod inner {
         /// A function to create more T values when stack is empty and a caller
         /// has requested a T.
         create: F,
+        used: core::sync::atomic::AtomicBool,
     }
 
     // If T is UnwindSafe, then since we provide exclusive access to any
@@ -904,10 +1019,43 @@ mod inner {
     impl<T: UnwindSafe, F: UnwindSafe> RefUnwindSafe for Pool<T, F> {}
 
     impl<T, F> Pool<T, F> {
+        pub(super) fn create_ref(&self) -> &F {
+            &self.create
+        }
+        pub(super) fn source_storage_bytes(
+            &self,
+        ) -> Result<usize, crate::util::source_storage::Error> {
+            if self.used.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(crate::util::source_storage::Error::WarmedPool);
+            }
+            Ok(core::mem::size_of::<Self>())
+        }
+
         /// Create a new pool. The given closure is used to create values in
         /// the pool when necessary.
         pub(super) const fn new(create: F) -> Pool<T, F> {
-            Pool { stack: Mutex::new(vec![]), create }
+            Pool {
+                stack: Mutex::new(vec![]),
+                create,
+                used: core::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        pub(super) fn new_with_allocations(
+            create: F,
+            _funding: &dyn crate::util::allocation::Allocation,
+        ) -> Result<Pool<T, F>, crate::util::allocation::AllocationError>
+        {
+            Ok(Self::new(create))
+        }
+
+        pub(super) fn with_capacity_and_allocations(
+            _capacity: usize,
+            create: F,
+            funding: &dyn crate::util::allocation::Allocation,
+        ) -> Result<Pool<T, F>, crate::util::allocation::AllocationError>
+        {
+            Self::new_with_allocations(create, funding)
         }
 
         /// This is a no-op since this pool implementation isn't thread-aware.
@@ -924,12 +1072,16 @@ mod inner {
         /// attempting to retrieve a value from the pool.
         #[inline]
         pub(super) fn get(&self) -> PoolGuard<'_, T, F> {
+            self.used.store(true, core::sync::atomic::Ordering::Release);
             let mut stack = self.stack.lock();
             let value = match stack.pop() {
                 None => Box::new((self.create)()),
                 Some(value) => value,
             };
-            PoolGuard { pool: self, value: Some(value) }
+            PoolGuard {
+                pool: self,
+                value: Some(value),
+            }
         }
 
         #[inline]
@@ -1072,7 +1224,10 @@ mod inner {
             // 'locked' to true, which implies we must be the only thread here
             // and thus have exclusive access to 'data'.
             let data = unsafe { &mut *self.data.get() };
-            MutexGuard { locked: &self.locked, data }
+            MutexGuard {
+                locked: &self.locked,
+                data,
+            }
         }
     }
 
@@ -1117,6 +1272,47 @@ mod tests {
     use alloc::{boxed::Box, vec, vec::Vec};
 
     use super::*;
+
+    #[test]
+    fn pool_construction_refuses_each_reached_destination() {
+        struct Funding {
+            calls: core::cell::Cell<usize>,
+            limit: usize,
+        }
+        impl Allocation for Funding {
+            fn reserve(&self, _: usize) -> Result<(), AllocationError> {
+                let call = self.calls.get();
+                self.calls.set(call + 1);
+                if call < self.limit {
+                    Ok(())
+                } else {
+                    Err(AllocationError::Refused)
+                }
+            }
+        }
+        let paid = Funding {
+            calls: core::cell::Cell::new(0),
+            limit: usize::MAX,
+        };
+        let pool =
+            Pool::with_capacity_and_allocations(4, || 7usize, &paid).unwrap();
+        assert_eq!(*pool.get(), 7);
+        for limit in 0..paid.calls.get() {
+            let refuse = Funding {
+                calls: core::cell::Cell::new(0),
+                limit,
+            };
+            assert!(matches!(
+                Pool::<usize, _>::with_capacity_and_allocations(
+                    4,
+                    || 7usize,
+                    &refuse
+                ),
+                Err(AllocationError::Refused)
+            ));
+            assert_eq!(refuse.calls.get(), limit + 1);
+        }
+    }
 
     #[test]
     fn oibits() {

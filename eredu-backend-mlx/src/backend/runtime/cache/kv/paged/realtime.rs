@@ -1,7 +1,7 @@
 //! Same append-only checkpoint, with paid exact catalog and tail owners.
 use super::*;
 use crate::backend::{error::Error,runtime::cache::residency::CacheSourceError};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::{MutableCacheTail,working_memory::WorkingMemoryError};
 use sha2::{Digest,Sha256};
 use std::{hash::{Hash,Hasher},mem::{size_of,size_of_val}};
@@ -15,7 +15,7 @@ pub(in crate::backend::runtime::cache) struct RealtimePagedSource {
 #[derive(Debug)]
 pub(super) struct OriginalRollback {
     tail:Option<MutableCacheTail>,tail_start:i64,controls:usize,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 struct SourceHash(Sha256);
 impl Hasher for SourceHash {
@@ -61,7 +61,7 @@ fn prepare_controls()->Option<usize> {
         size_of::<Sha256>(),size_of::<Result<RealtimePagedSource,Error>>(),
         size_of::<Result<Option<MutableCacheTail>,Error>>(),size_of::<[Option<Array>;2]>(),
         size_of::<PagedKeyValueTransactionCheckpoint>(),size_of::<Result<(PagedKeyValueCache,PagedKeyValueTransactionCheckpoint),Error>>(),
-        size_of::<(&PagedKeyValueCache,RealtimePagedSource,&WorkspaceMetadataFunding,&mut dyn FnMut(&Array)->Result<Array,Error>)>(),
+        size_of::<(&PagedKeyValueCache,RealtimePagedSource,&HostMetadataFunding,&mut dyn FnMut(&Array)->Result<Array,Error>)>(),
         size_of::<(&PagedKeyValueSource<'_>,usize,usize)>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<CacheSourceError>()?,
         PagedKeyValueCache::workspace_source_control_bytes::<Option<MutableCacheTail>,_>(&callback)?,
@@ -92,7 +92,7 @@ impl PagedKeyValueCache {
         if let Some(array)=&self.tail_values {visit(array,false);}
     }
     pub(in crate::backend::runtime::cache) fn prepare_realtime_branch(&self,expected:RealtimePagedSource,
-        funding:&WorkspaceMetadataFunding,alias:&mut dyn FnMut(&Array)->Result<Array,Error>)
+        funding:&HostMetadataFunding,alias:&mut dyn FnMut(&Array)->Result<Array,Error>)
         ->Result<(Self,PagedKeyValueTransactionCheckpoint),Error> {
         funding.reserve_metadata(expected.prepare_controls).map_err(Error::WorkspacePlanning)?;
         let mut ids=funding.metadata_vec(expected.blocks).map_err(Error::Neural)?;
@@ -115,3 +115,5 @@ impl PagedKeyValueCache {
             original.controls,&original.funding)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

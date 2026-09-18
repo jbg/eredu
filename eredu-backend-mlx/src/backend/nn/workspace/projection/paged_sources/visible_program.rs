@@ -28,7 +28,7 @@ pub(super) struct PreparedPagedVisible {
     pub(super) started: bool,
     pub(super) read_finished: bool,
     pub(super) completed: bool,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 
 impl PreparedPagedVisible {
@@ -215,3 +215,5 @@ pub(super) fn retirement_control_bytes() -> Option<usize> {
         .into_iter()
         .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

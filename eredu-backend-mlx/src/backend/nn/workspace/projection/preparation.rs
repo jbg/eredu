@@ -45,7 +45,7 @@ impl ProjectionSourceError {
             Self::Metadata(cause)
             | Self::Inventory(ProjectionInventoryError::Metadata(cause))
             | Self::Import(WorkspaceImportError::Metadata(cause)) => cause,
-            Self::Descriptor(cause) => Error::backend_source(cause),
+            Self::Descriptor(cause) => Error::backend_retained_source(cause),
             Self::Inventory(cause) => Error::backend_retained_source(cause),
             cause => Error::backend(cause),
         }

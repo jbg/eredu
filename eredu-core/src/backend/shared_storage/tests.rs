@@ -7,14 +7,67 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Barrier, Weak,
+        Barrier,
     },
 };
 
 fn bytes() -> SharedControllerBytes {
     let mut bytes = Vec::with_capacity(73);
     bytes.extend_from_slice(&[0, 17, 255, 63]);
-    SharedControllerBytes::new(bytes)
+    SharedControllerBytes::new(bytes, crate::HostPreparationAuthority::unmanaged())
+}
+
+fn bytes_with_retirement(retired: &Arc<AtomicBool>) -> SharedControllerBytes {
+    SharedControllerBytes(SharedStorageOwner::new(BytesInner {
+        bytes: vec![0, 17, 255, 63],
+        custody: SharedStorageCustody::new(),
+        authority: HostPreparationAuthority::unmanaged(),
+        payload_retired: Some(retired.clone()),
+    }))
+}
+
+#[test]
+fn source_authority_survives_byte_aliases_but_detached_value_keys_need_no_storage() {
+    struct Authority {
+        payload_retired: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
+    }
+    impl Drop for Authority {
+        fn drop(&mut self) {
+            assert!(self.payload_retired.load(Ordering::SeqCst));
+            self.retired.store(true, Ordering::SeqCst);
+        }
+    }
+    let payload_retired = Arc::new(AtomicBool::new(false));
+    let authority_retired = Arc::new(AtomicBool::new(false));
+    let source = SharedControllerBytes(SharedStorageOwner::new(BytesInner {
+        bytes: vec![1, 7, 19],
+        custody: SharedStorageCustody::new(),
+        authority: HostPreparationAuthority::retain(Authority {
+            payload_retired: payload_retired.clone(),
+            retired: authority_retired.clone(),
+        }),
+        payload_retired: Some(payload_retired.clone()),
+    }));
+    let key = *source.identity();
+    let alias = source.clone();
+    drop(source);
+    assert!(!authority_retired.load(Ordering::SeqCst));
+    assert_eq!(alias.as_ref(), &[1, 7, 19]);
+    drop(alias);
+    assert!(authority_retired.load(Ordering::SeqCst));
+    assert_ne!(key, *bytes().identity());
+}
+
+#[test]
+fn concurrent_source_identities_do_not_repeat_after_payload_retirement() {
+    let keys = std::thread::scope(|scope| {
+        let workers = (0..4).map(|_| scope.spawn(|| {
+            (0..64).map(|_| *bytes().identity()).collect::<Vec<_>>()
+        })).collect::<Vec<_>>();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert_eq!(keys.iter().copied().collect::<BTreeSet<_>>().len(), keys.len());
 }
 
 struct Charge {
@@ -70,7 +123,7 @@ fn transfer_preserves_pointer_spare_capacity_and_distinct_equal_owner_identity()
     raw.extend_from_slice(&[0, 17, 255, 63]);
     let pointer = raw.as_ptr();
     let capacity = raw.capacity();
-    let source = SharedControllerBytes::new(raw);
+    let source = SharedControllerBytes::new(raw, crate::HostPreparationAuthority::unmanaged());
     let alias = source.clone();
     let equal = bytes();
     assert_eq!(source.as_ref(), &[0, 17, 255, 63]);
@@ -83,28 +136,28 @@ fn transfer_preserves_pointer_spare_capacity_and_distinct_equal_owner_identity()
     assert_eq!(source.identity(), alias.identity());
     assert_ne!(source.identity(), equal.identity());
     assert_eq!(
-        SharedControllerBytes::new(Vec::new()).capacity_bytes(),
+        SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged()).capacity_bytes(),
         Some(0)
     );
-    let empty_spare = SharedControllerBytes::new(Vec::with_capacity(19));
+    let empty_spare = SharedControllerBytes::new(Vec::with_capacity(19), crate::HostPreparationAuthority::unmanaged());
     assert!(empty_spare.as_ref().is_empty());
     assert_eq!(empty_spare.capacity_bytes(), Some(19));
 }
 
 #[test]
 fn identity_keys_survive_without_retaining_payload_or_domain_charges() {
-    let source = bytes();
-    let weak = Arc::downgrade(&source.0);
+    let retired = Arc::new(AtomicBool::new(false));
+    let source = bytes_with_retirement(&retired);
     let identity = source.identity().clone();
     let domain = SharedStorageDomain::default();
     let used = Arc::new(AtomicUsize::new(0));
     attach(&source, &domain, &used);
     drop(source);
-    assert!(weak.upgrade().is_none());
+    assert!(retired.load(Ordering::SeqCst));
     assert_eq!(used.load(Ordering::SeqCst), 0);
     let other = bytes();
     let filter = SharedTokenFilter::new(TokenFilter::All);
-    let filter_identity: &SharedTokenFilterIdentity = filter.identity();
+    let filter_identity: &SharedStorageIdentity = filter.identity();
     assert_ne!(&identity, other.identity());
     assert_ne!(&identity, filter_identity);
     assert_eq!(
@@ -194,7 +247,7 @@ fn simultaneous_attachments_publish_one_handle_per_domain() {
 
 #[derive(Debug)]
 struct Rejected {
-    owner: Weak<BytesInner>,
+    owner: SharedControllerBytes,
     dropped: Arc<AtomicBool>,
 }
 impl fmt::Display for Rejected {
@@ -205,8 +258,7 @@ impl fmt::Display for Rejected {
 impl Error for Rejected {}
 impl Drop for Rejected {
     fn drop(&mut self) {
-        let owner = self.owner.upgrade().expect("caller retains source");
-        assert!(owner.custody.attachments.try_lock().is_ok());
+        assert!(self.owner.0.custody.attachments.try_lock().is_ok());
         self.dropped.store(true, Ordering::SeqCst);
     }
 }
@@ -223,7 +275,7 @@ fn rejected_provider_preserves_prior_custody_and_error_drops_after_unlock() {
     let error = source
         .try_attach(&second, || {
             Err(Rejected {
-                owner: Arc::downgrade(&source.0),
+                owner: source.clone(),
                 dropped: dropped.clone(),
             })
         })
@@ -271,14 +323,12 @@ fn provider_panic_preserves_old_charge_and_poison_blocks_all_new_acquisition() {
 struct RetireProbe {
     payload_retired: Arc<AtomicBool>,
     custody_retired: Arc<AtomicBool>,
-    owner: Weak<BytesInner>,
     other: SharedControllerBytes,
     domain: SharedStorageDomain,
 }
 impl Drop for RetireProbe {
     fn drop(&mut self) {
         assert!(self.payload_retired.load(Ordering::SeqCst));
-        assert!(self.owner.upgrade().is_none());
         assert!(self
             .other
             .try_attach(&self.domain, || Ok::<_, Infallible>(
@@ -292,9 +342,8 @@ impl Drop for RetireProbe {
 #[test]
 fn closed_payload_retires_before_reentrant_custody_drop_even_after_poison() {
     for poison in [false, true] {
-        let mut source = bytes();
         let payload_retired = Arc::new(AtomicBool::new(false));
-        Arc::get_mut(&mut source.0).unwrap().payload_retired = Some(payload_retired.clone());
+        let source = bytes_with_retirement(&payload_retired);
         let custody_retired = Arc::new(AtomicBool::new(false));
         let other = bytes();
         let other_alias = other.clone();
@@ -304,7 +353,6 @@ fn closed_payload_retires_before_reentrant_custody_drop_even_after_poison() {
                 Ok::<_, Infallible>(Box::new(RetireProbe {
                     payload_retired: payload_retired.clone(),
                     custody_retired: custody_retired.clone(),
-                    owner: Arc::downgrade(&source.0),
                     other,
                     domain: domain.clone(),
                 }) as Box<dyn Send + Sync>)
@@ -345,7 +393,7 @@ fn mixed_inventory_preserves_kind_and_never_misreports_complete_filter_only_stor
     let filters = [SharedTokenFilter::new(TokenFilter::Allowed(vec![
         true, false, true,
     ]))];
-    let bytes = [bytes(), SharedControllerBytes::new(Vec::new())];
+    let bytes = [bytes(), SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged())];
     let mixed = TextControllerStorage::RunOwnedWithSharedStorage {
         filters: &filters,
         bytes: &bytes,
@@ -397,8 +445,8 @@ fn forced_overrides_preserve_borrowed_post_callback_source_witness() {
     let filters = [SharedTokenFilter::new(TokenFilter::Allowed(vec![
         true, true, false,
     ]))];
-    let bytes = [bytes()];
-    let byte_owners = Arc::strong_count(&bytes[0].0);
+    let retired = Arc::new(AtomicBool::new(false));
+    let bytes = [bytes_with_retirement(&retired)];
     let legacy = crate::TokenSamplingDecision::new(TokenFilter::All)
         .with_shared_tokenizer_validity(&filters[0]);
     assert!(legacy.controller_storage().is_none());
@@ -409,7 +457,7 @@ fn forced_overrides_preserve_borrowed_post_callback_source_witness() {
                 filters: &filters,
                 bytes: &bytes,
             });
-    assert_eq!(Arc::strong_count(&bytes[0].0), byte_owners);
+    assert!(!retired.load(Ordering::SeqCst));
     for forced in [vec![false, true, false], vec![true, false, false]] {
         decision.override_filter(TokenFilter::Allowed(forced.clone()));
         assert_eq!(decision.filter().allowed_mask(), Some(forced.as_slice()));
@@ -432,5 +480,6 @@ fn forced_overrides_preserve_borrowed_post_callback_source_witness() {
         );
     }
     drop(decision);
-    assert_eq!(Arc::strong_count(&bytes[0].0), byte_owners);
+    drop(bytes);
+    assert!(retired.load(Ordering::SeqCst));
 }

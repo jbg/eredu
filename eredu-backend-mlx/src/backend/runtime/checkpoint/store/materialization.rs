@@ -592,17 +592,23 @@ impl WeightMaterialization {
     pub(crate) fn finish(mut self) -> Result<(), CheckpointMaterializationError> {
         self.retained.seal();
         let original = self.retained.original_observer().is_some();
-        let status = self
+        let observed = self
             .retained
             .finish()
             .map_err(|source| {
-                if original {
-                    CheckpointMaterializationError::OriginalNative(source)
-                } else {
-                    materialization_error(&self.key, "retirement", source)
+                use crate::backend::submission_recovery::observed::FinishRetainingError;
+                match source {
+                    FinishRetainingError::Native(source) if original =>
+                        CheckpointMaterializationError::OriginalNative(source),
+                    FinishRetainingError::Native(source) => materialization_error(&self.key, "retirement", source),
+                    FinishRetainingError::Retirement(cause) => CheckpointMaterializationError::OriginalRetirement(cause),
+                    FinishRetainingError::Observation(_) => CheckpointMaterializationError::OriginalOperationDomain,
                 }
-            })?
-            .status;
+            })?;
+        if !observed.can_retire() {
+            return Err(CheckpointMaterializationError::OriginalOperationRetirementTransferred);
+        }
+        let status = observed.status;
         if status.failed || status.blocked {
             return Err(materialization_error(
                 &self.key,

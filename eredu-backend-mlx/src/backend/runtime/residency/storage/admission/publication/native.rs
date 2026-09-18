@@ -1,7 +1,7 @@
 //! Retain the actual mixed inventory through checked native publication.
 use super::*;
 use crate::backend::runtime::residency::storage::native_storage::{
-    retained_failure_at, MlxNativeStorage,
+    retained_failure_at, MlxNativeStorage, NativeStorageRoot,
 };
 use eredu_runtime::working_memory::{OriginalNativePublication, OriginalTextControlGuard};
 
@@ -20,8 +20,16 @@ impl PendingNativePublication {
         use std::{alloc::Layout, mem::size_of};
         let keys = eredu_runtime::HostMetadataKey::maximum_clone_storage_bytes()?;
         let entries = Layout::array::<(StorageIdentity, u64)>(rows).ok()?.size();
+        // Infer the actual borrowed iterator representation without constructing
+        // an inventory, cloning a source, or invoking the iterator factory.
+        fn iterator_bytes<T>(_: impl FnOnce(&'static RetainedStorage) -> T) -> usize {
+            size_of::<T>()
+        }
         let fixed = [
             entries,
+            iterator_bytes(borrowed_native_roots),
+            size_of::<NativeStorageRoot<'static>>(),
+            size_of::<&RetainedStorage>(),
             size_of::<Self>(),
             size_of::<Result<RetainedStoragePublication, Error>>(),
             size_of::<(Vec<(StorageIdentity, u64)>, UnquotedOriginalSlotSources)>(),
@@ -98,15 +106,16 @@ impl PendingNativePublication {
         }
         self.entries.retain(|(key, _)| match key {
             StorageIdentity::Native(identity) => {
-                !inventory.array_entry(identity).is_some()
-                    || inventory.host_entry(identity).is_some()
+                inventory.array_entry(identity).is_none()
+                    && inventory.host_entry(identity).is_none()
             }
             _ => true,
         });
-        let roots = inventory
-            .array_entries()
-            .filter(|(identity, _)| !inventory.host_entry(identity).is_some())
-            .map(|(_, (_, array))| array);
+        // One checked physical root per allocation. A retained Host owner is
+        // sufficient even when no Array aliases it (the CPU General-copy case).
+        // Shared Host/Array backing uses that same immutable owner once; the
+        // paired identity/capacity check above still authenticates both sides.
+        let roots = borrowed_native_roots(inventory);
         let attempt = self.attempt.as_mut().expect("claimed exact scope");
         attempt
             .publish(scope, roots, &self.entries)
@@ -134,6 +143,20 @@ impl PendingNativePublication {
         Ok(inventory.finish_publication(
             || registrations,
             self.original.take().expect("source owner"),
+            scope.pool().shared_storage_domain(),
         ))
     }
+}
+
+
+pub(super) fn borrowed_native_roots(
+    inventory: &RetainedStorage,
+) -> impl Iterator<Item = NativeStorageRoot<'_>> {
+    inventory.array_entries()
+        .filter(|(identity, _)| inventory.host_entry(identity).is_none())
+        .map(|(_, (_, array))| match array.canonical() {
+            Some(cell) => NativeStorageRoot::CanonicalArray(cell),
+            None => NativeStorageRoot::Array(array),
+        })
+        .chain(inventory.host_entries().map(|(_, (_, host))| NativeStorageRoot::Host(host, host.attachment_receipt())))
 }

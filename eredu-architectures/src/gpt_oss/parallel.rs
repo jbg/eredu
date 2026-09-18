@@ -67,7 +67,7 @@ pub fn layer_parallel_parameter_groups<
         ParameterRole::ExpertIntermediate,
         units,
         &block.mlp.experts,
-        |metadata, shape| expert_member_sharding(metadata.id.as_str(), shape, intermediate),
+        |metadata, shape| expert_member_sharding(metadata.id().as_str(), shape, intermediate),
     )?);
     Ok(groups)
 }

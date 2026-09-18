@@ -105,7 +105,7 @@ impl<B: GroupedNeuralBackend> Projections<B> {
                 },
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         *shape.last_mut().expect("validated value shape") = values.output_width;
         completed::<B>(
             point,
@@ -191,7 +191,7 @@ impl<B: GroupedNeuralBackend> Projections<B> {
             .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?,
             None => provider
                 .forward_grouped(experts, request, context)
-                .map_err(Error::backend_source)?,
+                .map_err(Error::backend_retained_source)?,
         };
         let shared = shared
             .as_mut()
@@ -313,7 +313,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
                     B::parallel_size(parallel),
                     context,
                 )
-                .map_err(Error::backend_source)?,
+                .map_err(Error::backend_retained_source)?,
         };
         let routed =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;

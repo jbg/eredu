@@ -116,7 +116,7 @@ fn immutable_declaration_inventory_preserves_capacity_identity_and_final_alias_c
         ))
     ));
     let foreign_retired = Arc::new(AtomicBool::new(false));
-    let foreign = SharedControllerDeclaration::new(Declaration::new(13, &foreign_retired));
+    let foreign = SharedControllerDeclaration::new(Declaration::new(13, &foreign_retired), eredu_core::HostPreparationAuthority::unmanaged());
     assert!(!foreign.same_storage(&escaped));
     let replacement = DeclaredController {
         sources: vec![foreign],

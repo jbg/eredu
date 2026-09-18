@@ -16,14 +16,14 @@ pub(crate) struct PreparedDiskWorker {
     manager: CacheResidencyManager,
     worker: Arc<DiskWorker>,
     generation: u64,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Same installed storage and exact manager generation, not a file/native grant.
 pub(crate) struct InstalledDiskWorker {
     manager: CacheResidencyManager,
     worker: Arc<DiskWorker>,
     generation: u64,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(thiserror::Error)]
 #[error("{cause}")]

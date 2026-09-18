@@ -128,7 +128,7 @@ pub(super) fn receipt(
     ledger: &mut CaptureLedger,
 ) -> PartitionCaptureReceiptPlan {
     PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(plan),
         producers(plan, exchange),
         8,
@@ -366,7 +366,7 @@ fn sparse_ownership_is_complete_disjoint_and_part_of_receipt_identity() {
                     })
                     .collect();
                 assert!(PartitionCaptureReceiptPlan::new(
-                    plan.clone(),
+                    eredu_core::capture::SharedCapturePlan::new(plan.clone()),
                     context(&plan),
                     dense,
                     8,
@@ -379,7 +379,7 @@ fn sparse_ownership_is_complete_disjoint_and_part_of_receipt_identity() {
         }
         assert!(
             PartitionCaptureReceiptPlan::new_routed(
-                plan.clone(),
+                eredu_core::capture::SharedCapturePlan::new(plan.clone()),
                 context(&plan),
                 owned,
                 8,
@@ -393,7 +393,7 @@ fn sparse_ownership_is_complete_disjoint_and_part_of_receipt_identity() {
     let mut owned = producers(&plan, true);
     owned.reverse();
     let reordered = PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         owned,
         8,
@@ -407,7 +407,7 @@ fn sparse_ownership_is_complete_disjoint_and_part_of_receipt_identity() {
         p.ownership.source_peer = Some(1);
     }
     let other_peer = PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         owned,
         8,
@@ -424,7 +424,7 @@ fn sparse_ownership_is_complete_disjoint_and_part_of_receipt_identity() {
         );
     }
     let permuted = PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         owned,
         8,
@@ -454,7 +454,7 @@ fn sparse_preparation_respects_exact_prepaid_metadata_and_never_refunds_rejectio
     let bound = PartitionCaptureReceiptPlan::routed_preparation_usage(&declared).unwrap();
     let mut quota = ledger.reserve_quota(bound).unwrap();
     PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         declared,
         8,
@@ -468,7 +468,7 @@ fn sparse_preparation_respects_exact_prepaid_metadata_and_never_refunds_rejectio
     let mut quota = ledger.reserve_quota(short).unwrap();
     let charged = ledger.total();
     let rejected = PartitionCaptureReceiptPlan::new_routed(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         producers(&plan, true),
         8,

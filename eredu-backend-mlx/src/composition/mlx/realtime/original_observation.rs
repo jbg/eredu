@@ -3,7 +3,7 @@ use super::{MlxTensor,Error,CompletedRealtimeFrame,RealtimeOutputFrame,RealtimeD
 use crate::backend::submission_recovery::native_role::realtime::RealtimeRoleContext;
 use eredu_core::{BackendFailureKind,SharedBackendFailure};
 use eredu_nn::{Tensor,workspace::{WorkspaceContext,WorkspaceTensor,WorkspaceDtype,
-    WorkspaceFloatingType,WorkspaceMetadataFunding,WorkspaceMetadataError}};
+    WorkspaceFloatingType,HostMetadataFunding,WorkspaceMetadataError}};
 use eredu_runtime::working_memory::{OriginalRealtimeBudgetCustody,WorkingMemoryError};
 use safemlx::{Array,Dtype,OriginalScopeObserver};
 use std::{cell::RefCell,rc::Rc,mem::{size_of,size_of_val}};
@@ -17,7 +17,7 @@ pub(crate) struct RealtimeHostReadPlan {
     rows:Vec<Row>,
     diagnostics:usize,
     aligned:bool,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 #[derive(Debug,thiserror::Error)]
 enum Cause {
@@ -33,14 +33,14 @@ enum Cause {
 #[error("realtime completed host observation: {cause}")]
 struct Failure {
     #[source] cause:Cause,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
     _custody:OriginalRealtimeBudgetCustody,
 }
 struct Owner {
     plan:RealtimeHostReadPlan,
     observer:OriginalScopeObserver,
     attempted:bool,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
     custody:OriginalRealtimeBudgetCustody,
 }
 /// Clones share the same once-only attempt; no source budget is refunded.
@@ -89,7 +89,7 @@ impl RealtimeHostReadPlan {
         let frames=[size_of::<Self>(),size_of::<Owner>(),size_of::<OriginalRealtimeHostObserver>(),
             size_of::<Rc<RefCell<Owner>>>(),size_of::<std::cell::RefMut<'_,Owner>>(),
             size_of::<Result<RealtimeOutputFrame,Error>>(),size_of::<Failure>(),size_of::<Cause>(),
-            size_of::<WorkspaceMetadataFunding>(),size_of::<OriginalRealtimeBudgetCustody>(),
+            size_of::<HostMetadataFunding>(),size_of::<OriginalRealtimeBudgetCustody>(),
             size_of::<RealtimeOutputFrame>(),size_of::<Option<Vec<i32>>>(),size_of::<usize>()*3];
         let shared=std::alloc::Layout::new::<[std::cell::Cell<usize>;2]>()
             .extend(std::alloc::Layout::new::<RefCell<Owner>>()).ok()?.0.pad_to_align().size();
@@ -182,3 +182,5 @@ impl Owner {
             .with_host_source(self.funding.clone().into())?)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -284,8 +284,8 @@ struct ConstructionFailure {
     #[source]
     cause: Error,
     // Both original metadata accounts outlive the failure and its source buffers.
-    _source: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-    _local: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _source: Option<eredu_nn::workspace::HostMetadataFunding>,
+    _local: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 fn controls<T>(context: &WorkspaceContext) -> Result<(), Error> {
     let parts = [

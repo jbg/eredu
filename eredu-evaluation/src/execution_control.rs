@@ -38,7 +38,8 @@ fn step<B: TextSnapshotBackend, C: TokenFilterController>(
         state.boundary(driver),
         Err(eredu_core::TextContinuationError::NotQuiescent)
     ));
-    let records = state.take_completed_step(driver).unwrap().map(|mut step| {
+    let records = state.take_completed_delivery(driver).unwrap().map(|step| {
+        let mut step = step.as_step().clone();
         step.capture_seconds = 0.0;
         step.cumulative_usage = Default::default();
         step

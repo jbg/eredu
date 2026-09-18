@@ -1,0 +1,121 @@
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -3,6 +3,7 @@
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/primitives.h"
++#include "mlx/host_transfer.h"
+ #include "mlx/prepared_input.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/submission.h"
+@@ -69,7 +70,9 @@
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+       (exact_contiguous(output) || exact_cast(output) || exact_static_update(output) ||
+-       typeid(output.primitive())==typeid(View) || is_completion_synchronizer(output));
++       typeid(output.primitive())==typeid(View) ||
++       typeid(output.primitive())==typeid(CopyToHostTransfer) ||
++       typeid(output.primitive())==typeid(CopyFromHostTransfer) || is_completion_synchronizer(output));
+ }
+ static bool single_output_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage* dispatch_source, bool raw_task, SingleOutputEvalStorage& out) noexcept {
+@@ -176,6 +179,38 @@
+   out = value; return true;
+ }
+ 
++// Both host workers execute the existing General copy task. Store first
++// attaches its separately accepted Host allocation; load allocates one output.
++// The optional Contiguous before store is a distinct ordinary Eval.
++bool host_transfer_eval_layout(Dtype dtype,size_t rank,bool store,bool tracer,
++    CopyEvalStorage& out) noexcept {
++  if(rank==0||rank>4||(dtype!=float32&&dtype!=float16&&dtype!=bfloat16))return false;
++  CopyEvalStorage value;
++  if(!copy_eval_layout(rank,1,true,tracer,value))return false;
++  if(store)value.backing_births=0;
++  const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(store)+sizeof(tracer)+
++      sizeof(out)+sizeof(value)+sizeof(const array*)*3+sizeof(array*)+
++      sizeof(CopyToHostTransfer*)+sizeof(CopyFromHostTransfer*)+
++      sizeof(HostTransferBuffer)+sizeof(CopyType)+sizeof(Stream)+sizeof(size_t)*3+
++      sizeof(Shape::const_iterator)+sizeof(bool)*2;
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++static bool host_transfer_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(output.inputs().size()!=1)return false;
++  const auto& input=output.inputs()[0];
++  if(input.dtype()!=output.dtype()||input.shape()!=output.shape()||
++      input.ndim()<1||input.ndim()>4||!input.flags().row_contiguous||
++      input.size()==0||input.size()>size_t(INT_MAX)||input.data_size()<input.size())return false;
++  for(const auto dimension:input.shape())if(dimension<=0)return false;
++  const bool store=typeid(output.primitive())==typeid(CopyToHostTransfer);
++  // The load's completed leaf must still be the actual retained Host owner.
++  // Store destination identity is authenticated by copy_to_host_into before
++  // any graph construction; its private primitive retains that exact buffer.
++  if(!store&&!host_transfer_allocation_info(input))return false;
++  return host_transfer_eval_layout(input.dtype(),input.ndim(),store,output.is_tracer(),out);
++}
++
+ bool append_copy_temporary_layout(size_t rank,CopyEvalStorage& out) noexcept {
+   if(rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   CopyEvalStorage copy;
+@@ -338,6 +373,8 @@
+ }
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
++  if (typeid(output.primitive())==typeid(CopyToHostTransfer)||
++      typeid(output.primitive())==typeid(CopyFromHostTransfer))return host_transfer_eval_storage(output,out);
+   if (exact_static_update(output)) return static_update_eval_storage(output,out);
+   if (typeid(output.primitive())==typeid(View))return byte_view_eval_storage(output,out);
+   const bool cast = exact_cast(output);
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -11,6 +11,8 @@
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
++// Existing immutable Host transfer through the same General copy worker.
++MLX_API bool host_transfer_eval_layout(Dtype,size_t rank,bool store,bool tracer,CopyEvalStorage&) noexcept;
+ // Actual View reinterpretation: an alias or one ordinary General-copy temporary.
+ MLX_API bool byte_view_eval_layout(Dtype source,Dtype destination,size_t rank,size_t bytes,
+     bool copy,bool tracer,CopyEvalStorage&) noexcept;
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -530,7 +530,7 @@
+         source.status() != array::Status::available ||
+         destination.policy() != HostTransferPolicy::transfer ||
+         destination.storage_kind() != HostTransferStorageKind::metal_shared ||
+-        selected.device.type != Device::gpu ||
++        (selected.device.type != Device::gpu && selected.device.type != Device::cpu) ||
+         !original_host_store_control_bytes(source.ndim(), source.dtype(), original_controls))
+       throw ScopedEvaluationError(ScopedEvaluation::unobservable);
+     const auto ready = preflight_original_submission_stream(*submission::current_scope(), selected);
+@@ -554,7 +554,7 @@
+         *controls.graph, controls.scope_identity, 1, suspended);
+     if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
+     // The enclosing model can retain CPU collective and GPU streams. This
+-    // child uses the selected preflighted GPU stream and its fixed one-stream
++    // child uses the selected preflighted stream and its fixed one-stream
+     // traversal below; the enclosing limit is capacity, not child cardinality.
+     if (suspended.limits().streams < 1)
+       throw ScopedEvaluationError(ScopedEvaluation::domain);
+@@ -624,7 +624,7 @@
+       throw ScopedEvaluationError(ScopedEvaluation::domain);
+     if (source.policy() != HostTransferPolicy::transfer ||
+         source.storage_kind() != HostTransferStorageKind::metal_shared ||
+-        selected.device.type != Device::gpu ||
++        (selected.device.type != Device::gpu && selected.device.type != Device::cpu) ||
+         !original_host_copy_control_bytes(source.shape().size(), source.dtype(), original_controls))
+       throw ScopedEvaluationError(ScopedEvaluation::unobservable);
+     const auto ready = preflight_original_submission_stream(*submission::current_scope(), selected);
+@@ -649,7 +649,7 @@
+         *controls.graph, controls.scope_identity, 1, suspended);
+     if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
+     // The enclosing model can retain CPU collective and GPU streams. This
+-    // child uses the selected preflighted GPU stream and its fixed one-stream
++    // child uses the selected preflighted stream and its fixed one-stream
+     // traversal below; the enclosing limit is capacity, not child cardinality.
+     if (suspended.limits().streams < 1)
+       throw ScopedEvaluationError(ScopedEvaluation::domain);

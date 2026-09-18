@@ -1043,43 +1043,43 @@ pub fn dense_parameter_description(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "model.embed_tokens",
+pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(modules: &StaticModules<B>) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    static_parallel_parameter_groups_destination(modules, None).map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)
+}
+
+pub(crate) fn static_parallel_parameter_groups_destination<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(modules: &StaticModules<B>, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<ParameterGroupSpec>, crate::decoder::parameter_metadata::ParameterGroupError> {
+    let destination = crate::decoder::parameter_metadata::DeclarationDestination(metadata);
+    destination.controls::<(&StaticModules<B>, &ModelArgs, usize, String, Vec<ParameterGroupSpec>, [(&str, &B::Normalization);2], [(&B::Linear, eredu_runtime::ProjectionSharding);3], [std::ops::Range<usize>;3], usize, MemberSharding)>()?;
+
+    let mut groups = destination.vector(3)?;
+    groups.extend([
+        destination.module::<B::Tensor, _>(
+            format_args!("model.embed_tokens"),
             ParameterRole::Vocabulary,
             &modules.embeddings,
-            |_, shape| {
+            |shape| {
                 if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "LFM2 embedding parameter is scalar".into(),
-                    ))
+                    Err(destination.tensor_error(format_args!("LFM2 embedding parameter is scalar")))
                 } else {
                     Ok(MemberSharding::Balanced { axis: 0 })
                 }
             },
         )?,
-        module_parameter_group::<B::Tensor, _>(
-            "model.embedding_norm",
+        destination.module::<B::Tensor, _>(
+            format_args!("model.embedding_norm"),
             ParameterRole::Replicated,
             &modules.norm,
-            |_, _| Ok(MemberSharding::Replicated),
+            |_| Ok(MemberSharding::Replicated),
         )?,
-    ];
+    ]);
     if let Some(head) = &modules.lm_head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
+        groups.push(destination.module::<B::Tensor, _>(
+            format_args!("lm_head"),
             ParameterRole::Vocabulary,
             head,
-            |_, shape| {
+            |shape| {
                 if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "LFM2 output parameter is scalar".into(),
-                    ))
+                    Err(destination.tensor_error(format_args!("LFM2 output parameter is scalar")))
                 } else {
                     Ok(MemberSharding::Balanced { axis: 0 })
                 }
@@ -1090,30 +1090,30 @@ pub fn static_parallel_parameter_groups<
 }
 
 /// Declares semantic groups for one scheduled LFM2 block.
-pub fn layer_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    block: &Block<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    let mut groups = Vec::new();
+pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(block: &Block<B>, args: &ModelArgs, layer: usize) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    layer_parallel_parameter_groups_destination(block, args, layer, None).map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)
+}
+
+pub(crate) fn layer_parallel_parameter_groups_destination<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(block: &Block<B>, args: &ModelArgs, layer: usize, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<ParameterGroupSpec>, crate::decoder::parameter_metadata::ParameterGroupError> {
+    let destination = crate::decoder::parameter_metadata::DeclarationDestination(metadata);
+    destination.controls::<(&Block<B>, &ModelArgs, usize, String, Vec<ParameterGroupSpec>, [(&str, &B::Normalization);2], [(&B::Linear, eredu_runtime::ProjectionSharding);3], [std::ops::Range<usize>;3], usize, MemberSharding)>()?;
+
+    let root = destination.text(format_args!("model.layers.{layer}"))?;
+    let mut groups = destination.vector(6)?;
     match &block.mixer {
         TokenMixer::Attention(attention) => {
             let kv_heads = usize::try_from(args.num_key_value_heads).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 KV head count exceeds usize".into())
+                destination.group_error(format_args!("LFM2 KV head count exceeds usize"))
             })?;
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.self_attn.heads"),
+            groups.push(destination.partitioned_module_metadata::<B::Tensor, _>(
+                format_args!("{root}.self_attn.heads"),
                 ParameterRole::AttentionHeads,
                 kv_heads,
                 attention,
                 |metadata, shape| {
                     let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
+                        .linear_companion_of()
+                        .unwrap_or(metadata.id())
                         .as_str();
                     if name.ends_with("q_proj.weight")
                         || name.ends_with("k_proj.weight")
@@ -1130,28 +1130,27 @@ pub fn layer_parallel_parameter_groups<
         }
         TokenMixer::ShortConvolution(convolution) => {
             let channels = usize::try_from(args.hidden_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 convolution width exceeds usize".into())
+                destination.group_error(format_args!("LFM2 convolution width exceeds usize"))
             })?;
-            let segments = vec![
+            let segments = [
                 0..channels,
                 channels..2 * channels,
                 2 * channels..3 * channels,
             ];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.conv.channels"),
+            groups.push(destination.partitioned_module_metadata::<B::Tensor, _>(
+                format_args!("{root}.conv.channels"),
                 ParameterRole::Channels,
                 channels,
                 convolution,
                 |metadata, shape| {
                     let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
+                        .linear_companion_of()
+                        .unwrap_or(metadata.id())
                         .as_str();
                     if name.contains("in_proj") {
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 0,
-                            segments: segments.clone(),
+                            segments: { let mut copy = destination.vector(segments.len())?; copy.extend(segments.iter().cloned()); copy },
                         })
                     } else if name.ends_with("conv.weight") || name.ends_with("conv.bias") {
                         Ok(MemberSharding::Partitioned { axis: 0 })
@@ -1168,62 +1167,60 @@ pub fn layer_parallel_parameter_groups<
         ("operator_norm", &block.operator_norm),
         ("ffn_norm", &block.feed_forward_norm),
     ] {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.{name}"),
+        groups.push(destination.module::<B::Tensor, _>(
+            format_args!("{root}.{name}"),
             ParameterRole::Replicated,
             norm,
-            |_, _| Ok(MemberSharding::Replicated),
+            |_| Ok(MemberSharding::Replicated),
         )?);
     }
     match &block.feed_forward {
         FeedForward::Dense(DenseSwiGlu { gate, down, up }) => {
             let width = usize::try_from(args.dense_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 dense width exceeds usize".into())
+                destination.group_error(format_args!("LFM2 dense width exceeds usize"))
             })?;
             let alignment = args
-                .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
+                .weight_quantization_for(&destination.text(format_args!("{root}.feed_forward.w2.weight"))?)
                 .map_or(Ok(1), |quantization| {
                     usize::try_from(quantization.group_size()).map_err(|_| {
-                        ParallelPlanError::InvalidGroup(
-                            "LFM2 dense quantization group exceeds usize".into(),
-                        )
+                        destination.group_error(format_args!("LFM2 dense quantization group exceeds usize"))
                     })
                 })?;
-            groups.push(eredu_runtime::partitioned_projection_group::<
+            groups.push(destination.projections::<
                 B::Tensor,
                 B::Linear,
             >(
-                format!("{root}.feed_forward.intermediate"),
+                format_args!("{root}.feed_forward.intermediate"),
                 ParameterRole::FeedForwardIntermediate,
                 &[
                     (gate, eredu_runtime::ProjectionSharding::Column),
                     (up, eredu_runtime::ProjectionSharding::Column),
                     (down, eredu_runtime::ProjectionSharding::Row),
                 ],
-                aligned_partition_units(&root, width, 1, alignment)?,
+                destination.aligned(&root, width, 1, alignment)?,
             )?);
         }
         FeedForward::Routed(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.feed_forward.gate"),
+            groups.push(destination.module::<B::Tensor, _>(
+                format_args!("{root}.feed_forward.gate"),
                 ParameterRole::Replicated,
                 &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
+                |_| Ok(MemberSharding::Replicated),
             )?);
             let width = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 expert width exceeds usize".into())
+                destination.group_error(format_args!("LFM2 expert width exceeds usize"))
             })?;
-            let segments = vec![0..width, width..2 * width];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.feed_forward.experts.intermediate"),
+            let segments = [0..width, width..2 * width];
+            groups.push(destination.partitioned_module_metadata::<B::Tensor, _>(
+                format_args!("{root}.feed_forward.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
                 width,
                 &moe.experts,
                 |metadata, _| {
-                    if metadata.id.as_str().contains("gate_up_proj") {
+                    if metadata.id().as_str().contains("gate_up_proj") {
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 1,
-                            segments: segments.clone(),
+                            segments: { let mut copy = destination.vector(segments.len())?; copy.extend(segments.iter().cloned()); copy },
                         })
                     } else {
                         Ok(MemberSharding::Partitioned { axis: 2 })
@@ -1239,6 +1236,11 @@ pub fn layer_parallel_parameter_groups<
 mod tests {
     use super::*;
     use eredu_runtime::{LocalTensorLayout, ParameterRole};
+
+    #[test]
+    fn canonical_lfm2_parameters_state_and_identity_use_the_actual_destination() {
+        crate::architecture_parameter_metadata_tests::exercise(|context| crate::lfm2::LayeredModel::<eredu_nn::workspace::WorkspaceBackend>::new(args(),context));
+    }
 
     fn args() -> ModelArgs {
         crate::lfm2::model_args_from_config_value(&serde_json::json!({

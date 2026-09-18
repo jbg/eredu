@@ -95,68 +95,14 @@ impl Serialize for SharedSpeculativePrefillReductions {
     }
 }
 
-/// Ordinary or shared delivery of one logical prefill report.
-///
-/// Both variants have the report's existing wire format. Decoding produces only
-/// ordinary caller-owned data. Shared clones retain the actual paid owner; an
-/// explicit clone of the borrowed raw report is separate caller-owned storage.
-#[derive(Debug, Clone)]
-pub enum SpeculativePrefillReductionsDelivery {
-    /// Ordinary caller-owned report, including deserialized reports.
-    Legacy(SpeculativePrefillReductions),
-    /// Immutable report retaining its constructing runtime's custody.
-    Shared(SharedSpeculativePrefillReductions),
-}
-impl SpeculativePrefillReductionsDelivery {
-    /// Borrows the report in either storage representation.
-    pub fn as_reductions(&self) -> &SpeculativePrefillReductions {
-        match self {
-            Self::Legacy(value) => value,
-            Self::Shared(value) => value.as_reductions(),
-        }
-    }
-    /// Borrows the shared owner when the runtime supplied one.
-    pub fn shared(&self) -> Option<&SharedSpeculativePrefillReductions> {
-        match self {
-            Self::Legacy(_) => None,
-            Self::Shared(value) => Some(value),
-        }
-    }
-}
-impl From<SpeculativePrefillReductions> for SpeculativePrefillReductionsDelivery {
-    fn from(value: SpeculativePrefillReductions) -> Self {
-        Self::Legacy(value)
-    }
-}
-impl From<SharedSpeculativePrefillReductions> for SpeculativePrefillReductionsDelivery {
-    fn from(value: SharedSpeculativePrefillReductions) -> Self {
-        Self::Shared(value)
-    }
-}
-impl AsRef<SpeculativePrefillReductions> for SpeculativePrefillReductionsDelivery {
-    fn as_ref(&self) -> &SpeculativePrefillReductions {
-        self.as_reductions()
-    }
-}
-impl Deref for SpeculativePrefillReductionsDelivery {
+impl Deref for SharedSpeculativePrefillReductions {
     type Target = SpeculativePrefillReductions;
-    fn deref(&self) -> &Self::Target {
-        self.as_reductions()
-    }
+    fn deref(&self) -> &Self::Target { self.as_reductions() }
 }
-impl PartialEq for SpeculativePrefillReductionsDelivery {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_reductions() == other.as_reductions()
-    }
-}
-impl Serialize for SpeculativePrefillReductionsDelivery {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_reductions().serialize(serializer)
-    }
-}
-impl<'de> Deserialize<'de> for SpeculativePrefillReductionsDelivery {
+impl<'de> Deserialize<'de> for SharedSpeculativePrefillReductions {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        SpeculativePrefillReductions::deserialize(deserializer).map(Self::Legacy)
+        // Independent diagnostic ownership, never source or funding authority.
+        SpeculativePrefillReductions::deserialize(deserializer).map(|report| Self::retain(report, ()))
     }
 }
 

@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 
 pub mod equation;
 pub(crate) mod invocation;
-mod placement;
+pub(crate) mod placement;
 pub(crate) mod residency;
 mod snapshot;
 /// Source-bound metadata materialization of selected prediction equations.
@@ -1101,7 +1101,7 @@ where
     {
         let invocation = operation(module.as_mut());
         Self::complete_prediction_values(invocation.retained_values(), context)
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         invocation.into_outcome()
     }
 
@@ -2283,7 +2283,7 @@ where
         frontier
             .ok_or_else(|| eredu_nn::Error::backend("prediction lane has no stateful frontier"))?,
     )
-    .map_err(eredu_nn::Error::backend_source)
+    .map_err(eredu_nn::Error::backend_retained_source)
 }
 
 fn common_prefill_frontier(
@@ -2297,7 +2297,7 @@ fn common_prefill_frontier(
             "prediction seed state members have different frontiers",
         ));
     }
-    u64::try_from(first).map_err(eredu_nn::Error::backend_source)
+    u64::try_from(first).map_err(eredu_nn::Error::backend_retained_source)
 }
 
 /// Seed state has no score value; proposal and observed sequence forwards do.
@@ -2574,7 +2574,7 @@ where
             (Some(parallel), Some(observer)) => unit.forward_parallel_observed_with_provider(
                 shared,
                 path.as_deref().expect("observed prediction"),
-                unit.observation_points(depth),
+                unit.observation_points(depth)?,
                 hidden,
                 &embedded,
                 mask.as_ref(),
@@ -2587,7 +2587,7 @@ where
             (None, Some(observer)) => unit.forward_observed_with_provider(
                 shared,
                 path.as_deref().expect("observed prediction"),
-                unit.observation_points(depth),
+                unit.observation_points(depth)?,
                 hidden,
                 &embedded,
                 mask.as_ref(),

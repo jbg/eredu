@@ -134,6 +134,8 @@ pub(crate) struct MappingPlan<'a> {
     requirements: AlphabetCopyRequirements,
 }
 impl<'a> MappingPlan<'a> {
+    pub(crate) fn requirements(&self) -> AlphabetCopyRequirements { self.requirements }
+
     pub(crate) fn prepare(
         source: &'a ExprSet,
         roots: &'a [ExprRef],
@@ -211,7 +213,7 @@ impl<'a> MappingPlan<'a> {
         })();
         result.map_err(failure)
     }
-    fn inspection_control_bytes() -> Option<usize> {
+    pub(crate) fn inspection_control_bytes() -> Option<usize> {
         let parts = [
             size_of::<MappingPlan<'_>>(),
             size_of::<Geometry>(),
@@ -500,9 +502,9 @@ mod tests {
     use super::*;
     #[test]
     fn finite_alphabet_copy_preserves_group_order_all_256_classes_and_failed_destinations() {
-        let mut expressions = ExprSet::new(256);
+        let mut expressions = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
         let mut roots = (0..=255)
-            .map(|b| expressions.mk(Expr::Byte(b)))
+            .map(|b| expressions.mk(Expr::Byte(b)).unwrap())
             .collect::<Vec<_>>();
         // This repeated final root is visited first, fixing the ordinary DFS order.
         roots.push(roots[0]);
@@ -511,7 +513,7 @@ mod tests {
         assert!(plan.requirements().buffer_bytes() > 0);
         let (copied, copy, copied_roots) = plan.compile().unwrap();
         let (ordinary, ordinary_copy, ordinary_roots) =
-            AlphabetInfo::from_exprset(expressions.clone(), &roots);
+            AlphabetInfo::from_exprset(expressions.clone(), &roots).unwrap();
         assert_eq!(copied_roots, roots);
         assert_eq!(ordinary_roots, roots);
         assert_eq!(copied.len(), 256);
@@ -538,13 +540,13 @@ mod tests {
         assert_eq!(ordinary_copy.cost(), expected_cost);
         assert!(!copy.optimize);
 
-        let mut many = ExprSet::new(256);
+        let mut many = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
         let mut many_roots = Vec::new();
         for bit in 1..=70 {
             let mut words = [0u32; 8];
             words[0] |= 1;
             words[bit / 32] |= 1 << (bit % 32);
-            many_roots.push(many.mk(Expr::ByteSet(&words)));
+            many_roots.push(many.mk(Expr::ByteSet(&words)).unwrap());
         }
         let many_plan = AlphabetInfo::source_copy_plan(&many, &many_roots).unwrap();
         if cfg!(feature = "compress") {

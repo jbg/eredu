@@ -1,7 +1,7 @@
 //! Owned lexical copy-environment loan, using the existing prepared stream copy.
 use super::{OriginalCopyEnvironment, OriginalCopyEnvironmentError, RetainedOriginalCopyEnvironment};
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::WorkingMemoryPool;
 use safemlx::{PreparedStreamCopy, StreamCopyCause, StreamCopyError, StreamCopyPlan};
 use std::{alloc::Layout, mem::{size_of, size_of_val}, sync::atomic::AtomicUsize};
@@ -12,7 +12,7 @@ use std::{alloc::Layout, mem::{size_of, size_of_val}, sync::atomic::AtomicUsize}
 #[derive(Clone)]
 pub(crate) struct CopyEnvironmentCustody {
     _host: HostPreparationAuthority,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for CopyEnvironmentCustody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +27,7 @@ pub(crate) struct PreparedOriginalCopyEnvironment {
     stream: PreparedStreamCopy<CopyEnvironmentCustody>,
     environment: RetainedOriginalCopyEnvironment,
     // Wrapper/source values retire before their exact constructor metadata.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for PreparedOriginalCopyEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,13 +41,13 @@ pub(crate) enum PreparedOriginalCopyEnvironmentError {
     #[error(transparent)]
     Environment(#[from] OriginalCopyEnvironmentError),
     #[error(transparent)]
-    Metadata(#[from] WorkspaceMetadataFundingError),
+    Metadata(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Source(#[from] StreamCopyCause),
     #[error(transparent)]
     Stream(#[from] StreamCopyError<CopyEnvironmentCustody>),
 }
-fn overflow() -> WorkspaceMetadataFundingError { WorkspaceMetadataFundingError::Overflow }
+fn overflow() -> HostMetadataFundingError { HostMetadataFundingError::Overflow }
 
 impl PreparedOriginalCopyEnvironment {
     fn preparation_controls() -> Option<usize> {
@@ -59,8 +59,8 @@ impl PreparedOriginalCopyEnvironment {
             size_of::<Result<StreamCopyPlan<CopyEnvironmentCustody>, StreamCopyCause>>(),
             size_of::<Layout>(), size_of::<Result<(Layout, usize), std::alloc::LayoutError>>(),
             size_of::<Result<PreparedStreamCopy<CopyEnvironmentCustody>, StreamCopyError<CopyEnvironmentCustody>>>(),
-            size_of::<(&OriginalCopyEnvironment<'_>, &HostPreparationAuthority, &WorkspaceMetadataFunding)>(),
-            size_of::<WorkspaceMetadataFunding>(), size_of::<CopyEnvironmentCustody>(),
+            size_of::<(&OriginalCopyEnvironment<'_>, &HostPreparationAuthority, &HostMetadataFunding)>(),
+            size_of::<HostMetadataFunding>(), size_of::<CopyEnvironmentCustody>(),
             size_of::<PreparedOriginalCopyEnvironmentError>(),
             size_of::<Option<usize>>(),
             OriginalCopyEnvironment::control_bytes()?,
@@ -70,7 +70,7 @@ impl PreparedOriginalCopyEnvironment {
     pub(crate) fn prepare(
         environment: &OriginalCopyEnvironment<'_>,
         host: &HostPreparationAuthority,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, PreparedOriginalCopyEnvironmentError> {
         funding.reserve_metadata(Self::preparation_controls().ok_or_else(overflow)?)?;
         let retained = environment.retain_prerequisites()?;

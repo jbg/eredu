@@ -178,7 +178,7 @@ impl TextGenerationBackend for Backend {
     ) -> Result<Rc<Preparation>, BackendFailure> {
         // Actual source take precedes all candidate estimates and admission.
         let mut decoder =
-            crate::working_memory::OriginalGenerationDecoderSource::take_original_for_pool(
+            crate::working_memory::OriginalGenerationDecoderSource::take_original(
                 claim,
                 &runtime.backend().0.borrow().pool,
             )?;
@@ -190,7 +190,7 @@ impl TextGenerationBackend for Backend {
         if state.mode.audit_decoder {
             for _ in 0..32 {
                 let error =
-                    crate::working_memory::OriginalGenerationDecoderSource::take_original_for_pool(
+                    crate::working_memory::OriginalGenerationDecoderSource::take_original(
                         claim,
                         &state.pool,
                     )
@@ -233,7 +233,7 @@ impl TextGenerationBackend for Backend {
         let mut original = replacement_quote(&state.pool, g, 0).into_incremental();
         if state.mode.source {
             let q = replacement_quote(&state.pool, g, 0).into_incremental();
-            let (_, reservation, _) = sealed_plan(&state.pool, &q, 1_000_000).unwrap();
+            let (reservation, _) = sealed_plan(&state.pool, &q, 1_000_000).unwrap();
             let (reservation, run) = reservation.into_funding().unwrap();
             let scope = run.scope().unwrap();
             let source = scope
@@ -395,7 +395,7 @@ impl TextGenerationBackend for Backend {
             exact + state.mode.copy_headroom
         };
         let execution = InferenceExecutionIdentity::default();
-        let (_, reservation, accepted) = if state.mode.input_retry {
+        let (reservation, accepted) = if state.mode.input_retry {
             assert!(!state.mode.capture && !state.mode.source && !state.mode.explicit_source);
             // A complete synthetic enclosing requirement is deliberately too
             // large only for the first chunk. The existing adaptive planner

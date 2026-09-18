@@ -81,7 +81,7 @@ impl CaptureSession {
                 selections: vec![selection],
                 limits: self.plan.plan().limits.clone(),
             };
-            plans.push(Arc::new(match self.plan.invocation_bounds() {
+            plans.push(SharedCapturePlan::new(match self.plan.invocation_bounds() {
                 Some(bounds) => {
                     evidence.admit_invocations(&catalog, &support, &support.capture, bounds)?
                 }
@@ -153,7 +153,7 @@ impl CaptureSession {
             drop(native_selection);
             work.push(self.prepare_partition_selection(
                 transport,
-                plan.into(),
+                plan,
                 PartitionCaptureKey::InterventionEvidence {
                     operation,
                     evidence,

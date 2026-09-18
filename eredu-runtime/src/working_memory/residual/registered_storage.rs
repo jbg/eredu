@@ -255,6 +255,18 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
                 source: source.expect("supplied original source"),
             })
     }
+    /// Retains the same genuine prepared-input account without changing the
+    /// context selection. A caller can then select its complete source union.
+    pub fn construct_unselected_with_prepared_source(
+        self, pool: &WorkingMemoryPool, context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        source: crate::input::OriginalPreparedWorkspaceSource,
+    ) -> Result<RegisteredPreparedWorkspaceStorage<K>, WorkingMemoryError> {
+        self.construct_with_source(pool, context, storage, Some(source), false)
+            .map(|(registered, source)| RegisteredPreparedWorkspaceStorage {
+                registered, source: source.expect("supplied original source"),
+            })
+    }
     fn construct_with_source(
         self,
         pool: &WorkingMemoryPool,

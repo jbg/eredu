@@ -17,8 +17,6 @@ use crate::vm::context::{Frame, Stack};
 use crate::vm::loop_object::{Loop, LoopState};
 use crate::vm::state::BlockStack;
 
-#[cfg(feature = "macros")]
-use crate::vm::closure_object::Closure;
 
 pub(crate) use crate::vm::context::Context;
 pub use crate::vm::state::State;

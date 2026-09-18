@@ -10,7 +10,7 @@ struct Failure {
     #[source]
     cause: Error,
     // The paid diagnostic dies before its actual host account.
-    _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    _funding: eredu_nn::workspace::HostMetadataFunding,
 }
 fn retain(metadata: Metadata<'_>, cause: Error) -> Error {
     match metadata.context().and_then(|context| context.metadata_funding()) {
@@ -21,7 +21,7 @@ fn retain(metadata: Metadata<'_>, cause: Error) -> Error {
 #[inline(never)]
 pub(in crate::gemma4) fn with_metadata<R, F>(metadata: Metadata<'_>, operation: F) -> Result<R, Error>
 where F: FnOnce() -> Result<R, Error> {
-    metadata.controls::<(F, Result<R,Error>, Option<eredu_nn::workspace::WorkspaceMetadataFunding>)>()?;
+    metadata.controls::<(F, Result<R,Error>, Option<eredu_nn::workspace::HostMetadataFunding>)>()?;
     operation().map_err(|cause| retain(metadata, cause))
 }
 
@@ -197,7 +197,10 @@ where B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend {
         with_metadata(metadata, || {
         metadata.controls::<(LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
             ModelInput<'a, B::Tensor>, Option<&B::ParallelContext>, &mut S, Option<eredu_nn::workspace::WorkspaceContext>,
-            eredu_runtime::layered::LayeredForwardMetadata<Error>)>()?;
+            eredu_runtime::layered::LayeredMetadata<Error>)>()?;
+        if parallel.is_some() && self.parallel_geometry.is_none() {
+            return Err(metadata.error(format_args!("Gemma 4 model was not built with local geometry")));
+        }
         self.validate_partition_state_with_metadata(state, metadata)?;
         if metadata.context().is_some() && (input.vision.is_some() || input.audio.is_some()) {
             return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
@@ -318,3 +321,5 @@ fn token_count<T:Tensor>(parts:&[PreparedPart<T>], select:impl Fn(&PreparedPart<
         count.checked_add(tokens.dim(1)).ok_or_else(||metadata.error(format_args!("Gemma ordered token extent overflow")))
     })
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

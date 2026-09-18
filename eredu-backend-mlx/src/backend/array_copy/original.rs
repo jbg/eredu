@@ -263,7 +263,7 @@ impl OriginalCopyLayoutBuilder {
             size_of::<Result<StreamCopyPlan<()>,StreamCopyCause>>(),
             size_of::<StreamCopyCause>(),size_of::<(&Stream,)>(),
             size_of::<(Self, &super::PreparedPendingTokenInput<'_>, &Stream)>(),
-            size_of::<(Self, std::num::NonZeroU64, &Stream)>(),
+            size_of::<(Self, u64, &Stream)>(),
             size_of::<(Self, &super::PreparedPendingTokenInput<'_>, DeviceType)>(),
             size_of::<Result<OriginalResumeCopyPopulation, OriginalCopyCause>>(),
             Array::descriptor_control_bytes()?,
@@ -357,21 +357,22 @@ impl OriginalCopyLayoutBuilder {
         })
     }
 
-    /// No token tail is constructed for an already completed media input.
+    /// No token tail is constructed for a completed media input or a terminal
+    /// restore (zero positions).
     /// Counts are solely the actual saved decoder/key descriptor census. Empty
     /// state/key therefore has zero births/roots/completions, not a fake token.
     pub(crate) fn finish_resume_completed_input(
         self,
-        positions: std::num::NonZeroU64,
+        positions: u64,
     ) -> Result<OriginalResumeCopyPopulation, OriginalCopyCause> {
         self.finish_resume_completed_input_for(positions,DeviceType::Gpu)
     }
-    pub(crate) fn finish_resume_completed_input_on(self,positions:std::num::NonZeroU64,stream:&Stream)
+    pub(crate) fn finish_resume_completed_input_on(self,positions:u64,stream:&Stream)
         ->Result<OriginalResumeCopyPopulation,OriginalCopyCause> {
         let source=StreamCopyPlan::<()>::capture(stream)?;
         self.finish_resume_completed_input_for(positions,source.device_type())
     }
-    fn finish_resume_completed_input_for(self,positions:std::num::NonZeroU64,device:DeviceType)
+    fn finish_resume_completed_input_for(self,positions:u64,device:DeviceType)
         ->Result<OriginalResumeCopyPopulation,OriginalCopyCause> {
         if !self.host_stores.empty() {
             return Err(OriginalCopyCause::UnknownLayout);
@@ -400,7 +401,7 @@ impl OriginalCopyLayoutBuilder {
             logical_bytes,
             births,
             roots,
-            pending_positions: positions.get(),
+            pending_positions: positions,
         })
     }
 

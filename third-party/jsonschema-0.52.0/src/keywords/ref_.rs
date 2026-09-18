@@ -37,11 +37,15 @@ impl<F: Json> Validate<F> for RefValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<RefTracker<'_>>()).ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.inner.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -53,7 +57,7 @@ impl<F: Json> Validate<F> for RefValidator<F> {
             .validate(instance, location, Some(&child_tracker), ctx)
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -108,11 +112,15 @@ impl<F: Json> Validate<F> for DirectRefValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<RefTracker<'_>>()).ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.inner.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -124,7 +132,7 @@ impl<F: Json> Validate<F> for DirectRefValidator<F> {
             .validate(instance, location, Some(&child_tracker), ctx)
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -158,16 +166,34 @@ impl<F: Json> Validate<F> for DirectRefValidator<F> {
 ///
 /// JSON Pointer fragments (starting with `/`) become the location path.
 /// Anchor fragments (plain names like `#node`) resolve to root.
-fn extract_ref_target_base(alias: &referencing::Uri<String>) -> Location {
+fn extract_ref_target_base(alias: &referencing::Uri<String>, funding: &crate::compilation::Funding) -> Result<Location, crate::CompilationError> {
     if let Some(fragment) = alias.fragment() {
         let fragment = fragment.as_str();
         if fragment.starts_with('/') {
-            // Fragment is URI percent-encoded (RFC 3986); Location stores JSON Pointers (RFC 6901).
-            let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
-            return Location::from_escaped(&decoded);
+            if !fragment.as_bytes().windows(3).any(|bytes| bytes[0] == b'%' && bytes[1].is_ascii_hexdigit() && bytes[2].is_ascii_hexdigit()) {
+                return Location::from_escaped_with_funding(fragment, funding);
+            }
+            // Preserve percent-decoding and UTF-8 replacement semantics while
+            // paying the actual byte and text destinations before construction.
+            let decoded = percent_encoding::percent_decode_str(fragment);
+            let mut bytes = Vec::new();
+            funding.grow(&mut bytes, decoded.clone().count())?;
+            bytes.extend(decoded);
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                return Location::from_escaped_with_funding(text, funding);
+            }
+            let length = bytes.utf8_chunks().try_fold(0usize, |size, chunk| {
+                size.checked_add(chunk.valid().len())?.checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })
+            }).ok_or_else(|| funding.error(crate::CompilationAllocationError::Overflow))?;
+            let mut text = funding.string(length)?;
+            for chunk in bytes.utf8_chunks() {
+                text.push_str(chunk.valid());
+                if !chunk.invalid().is_empty() { text.push('�'); }
+            }
+            return Location::from_escaped_with_funding(&text, funding);
         }
     }
-    Location::new()
+    Location::new_with_funding(funding)
 }
 
 fn compile_reference_validator<'a, F: Json>(
@@ -183,18 +209,19 @@ fn compile_reference_validator<'a, F: Json>(
     }
     let alias = match ctx
         .resolve_reference_uri(reference)
-        .map_err(ValidationError::from)
+        .map_err(|error| ctx.funding().reference_error(error))
     {
         Ok(uri) => uri,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Some(Err(error.into())),
     };
 
-    let ref_suffix = ctx.suffix().join(keyword);
-    let ref_target_base = extract_ref_target_base(&alias);
+    let suffix = crate::keywords::try_compile!(ctx.suffix());
+    let ref_suffix = crate::keywords::try_compile!(suffix.join_with_funding(keyword, ctx.funding()));
+    let ref_target_base = crate::keywords::try_compile!(extract_ref_target_base(&alias, ctx.funding()));
 
     let resolved = match ctx.lookup(reference) {
         Ok(resolved) => resolved,
-        Err(error) => return Some(Err(ValidationError::from(error))),
+        Err(error) => return Some(Err(ctx.funding().reference_error(error))),
     };
 
     // Direct self-reference - skip to avoid infinite recursion. This compares node identity
@@ -211,22 +238,22 @@ fn compile_reference_validator<'a, F: Json>(
 
     match ctx.lookup_maybe_recursive(reference) {
         Ok(Some(validator)) => {
-            return Some(Ok(Box::new(RefValidator {
+            return Some(Ok(match ctx.funding().boxed(RefValidator {
                 inner: validator,
                 ref_suffix,
                 ref_target_base,
-            })));
+            }) { Ok(value) => value, Err(error) => return Some(Err(error.into())) }));
         }
         Ok(None) => {}
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Some(Err(error.into())),
     }
 
     if let Err(error) = ctx.mark_seen(reference) {
-        return Some(Err(ValidationError::from(error)));
+        return Some(Err(error));
     }
 
     let (contents, resolver, draft) = resolved.into_inner();
-    let vocabularies = resolver.find_vocabularies(draft, contents);
+    let vocabularies = crate::keywords::try_compile!(resolver.try_find_vocabularies(draft, contents).map_err(|error| ctx.funding().reference_error(error)));
     let resource_ref = draft.create_resource_ref(contents);
     let inner_ctx = match ctx.with_resolver_and_draft(
         resolver,
@@ -235,18 +262,18 @@ fn compile_reference_validator<'a, F: Json>(
         ref_target_base.clone(),
     ) {
         Ok(inner_ctx) => inner_ctx,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Some(Err(error.into())),
     };
     Some(
         compiler::compile_with_alias(&inner_ctx, resource_ref, alias)
-            .map(|node| {
-                Box::new(DirectRefValidator {
+            .and_then(|node| {
+                Ok(ctx.funding().boxed(DirectRefValidator {
                     inner: node,
                     ref_suffix,
                     ref_target_base,
-                }) as Box<dyn Validate<F>>
+                })? as Box<dyn Validate<F>>)
             })
-            .map_err(ValidationError::to_owned),
+            .map_err(|error| error.to_owned_with_funding(ctx.funding())),
     )
 }
 
@@ -254,62 +281,58 @@ fn compile_recursive_validator<'a, F: Json>(
     ctx: &compiler::Context<F>,
     reference: &str,
 ) -> CompilationResult<'a, F> {
-    let ref_suffix = ctx.suffix().join("$recursiveRef");
+    let ref_suffix = ctx.suffix()?.join_with_funding("$recursiveRef", ctx.funding())?;
     let alias = ctx
         .resolve_reference_uri(reference)
-        .map_err(ValidationError::from)?;
-    let ref_target_base = extract_ref_target_base(&alias);
+        .map_err(|error| ctx.funding().reference_error(error))?;
+    let ref_target_base = extract_ref_target_base(&alias, ctx.funding())?;
 
     match ctx.lookup_maybe_recursive(reference) {
         Ok(Some(validator)) => {
-            return Ok(Box::new(RefValidator {
+            return Ok(ctx.funding().boxed(RefValidator {
                 inner: validator,
                 ref_suffix,
                 ref_target_base,
-            }));
+            })?);
         }
         Ok(None) => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
 
     if let Err(error) = ctx.mark_seen(reference) {
-        return Err(ValidationError::from(error));
+        return Err(error);
     }
 
     let resolved = ctx
         .lookup_recursive_reference()
-        .map_err(ValidationError::from)?;
+        .map_err(|error| ctx.funding().reference_error(error))?;
     let (contents, resolver, draft) = resolved.into_inner();
-    let vocabularies = resolver.find_vocabularies(draft, contents);
+    let vocabularies = resolver.try_find_vocabularies(draft, contents).map_err(|error| ctx.funding().reference_error(error))?;
     let resource_ref = draft.create_resource_ref(contents);
     let target_base = ref_target_base.clone();
     let inner_ctx =
         ctx.with_resolver_and_draft(resolver, resource_ref.draft(), vocabularies, target_base)?;
     compiler::compile_with_alias(&inner_ctx, resource_ref, alias)
-        .map(|node| {
-            let inner: BoxedValidator<F> = Box::new(node);
-            Box::new(RefValidator {
+        .and_then(|node| {
+            let inner: BoxedValidator<F> = ctx.funding().boxed(node)?;
+            Ok(ctx.funding().boxed(RefValidator {
                 inner,
                 ref_suffix,
                 ref_target_base,
-            }) as Box<dyn Validate<F>>
+            })? as Box<dyn Validate<F>>)
         })
-        .map_err(ValidationError::to_owned)
+        .map_err(|error| error.to_owned_with_funding(ctx.funding()))
 }
 
 fn invalid_reference<'a, F: Json>(
-    ctx: &compiler::Context<F>,
-    keyword: &str,
-    schema: &'a Value,
-) -> ValidationError<'a> {
-    let location = ctx.location().join(keyword);
-    ValidationError::single_type_error(
-        location.clone(),
-        location.clone(),
-        location,
-        Cow::Borrowed(schema),
-        JsonType::String,
-    )
+    ctx: &compiler::Context<F>, keyword: &str, schema: &'a Value,
+) -> crate::compilation::CompileError<'a> {
+    let error = (|| {
+        let location = ctx.location().join_with_funding(keyword, ctx.funding())?;
+        ValidationError::single_type_error_with_funding(location.clone(), location.clone(), location,
+            Cow::Borrowed(schema), JsonType::String, ctx.funding())
+    })();
+    match error { Ok(error) => error.into(), Err(error) => error.into() }
 }
 
 #[inline]
@@ -322,7 +345,7 @@ pub(crate) fn compile_impl<'a, F: Json>(
     if let Some(reference) = schema.as_str() {
         compile_reference_validator(ctx, parent, reference, keyword)
     } else {
-        Some(Err(invalid_reference(ctx, keyword, schema)))
+        Some(Err(invalid_reference(ctx, keyword, schema).into()))
     }
 }
 
@@ -353,7 +376,7 @@ pub(crate) fn compile_recursive_ref<'a, F: Json>(
     Some(
         schema
             .as_str()
-            .ok_or_else(|| invalid_reference(ctx, "$recursiveRef", schema))
+            .ok_or_else(|| crate::compilation::CompileError::from(invalid_reference(ctx, "$recursiveRef", schema)))
             .and_then(|reference| compile_recursive_validator(ctx, reference)),
     )
 }

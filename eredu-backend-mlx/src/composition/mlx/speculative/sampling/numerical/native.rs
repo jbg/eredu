@@ -102,9 +102,9 @@ struct Failure {
     #[source]
     cause: Cause,
     custody: Custody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
-fn failure(cause: Cause, custody: &Custody, funding: &WorkspaceMetadataFunding) -> Error {
+fn failure(cause: Cause, custody: &Custody, funding: &HostMetadataFunding) -> Error {
     // Exact closed error owner paid by this phase before any native constructor.
     Error::with_original_control_source(
         eredu_core::BackendFailure::from_error(Failure {
@@ -135,8 +135,10 @@ pub(crate) struct NumericalProducer;
 #[derive(Clone, Copy)]
 enum Cut {
     TokenIds(u32),
+    RepeatedToken { token: u32, length: u32 },
     TensorRange { axis: u8, start: u32, end: u32, tokens: bool },
     TensorConcatenate,
+    TokenConcatenate(u32),
     CreateKey(u64),
     NextKey,
     UniformUnitInterval,
@@ -154,9 +156,11 @@ impl Cut {
     fn name(self) -> &'static str {
         match self {
             Self::TokenIds(_) => "token input",
+            Self::RepeatedToken { .. } => "repeated token input",
             Self::TensorRange { tokens: true, .. } => "token range",
             Self::TensorRange { tokens: false, .. } => "tensor range",
             Self::TensorConcatenate => "tensor concatenation",
+            Self::TokenConcatenate(_) => "token concatenation",
             Self::CreateKey(_) => "random key",
             Self::NextKey => "next random key",
             Self::UniformUnitInterval => "uniform draw",
@@ -185,7 +189,7 @@ struct Planning {
     reports: [Option<WorkspaceTraceReport>; 2],
     context: WorkspaceContext,
     capture: Option<capture::Plan>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 // Explicit closed Rc retirement frees its shell before the funding it owns.
 struct PlanningOwner(Option<Rc<Planning>>);
@@ -216,6 +220,7 @@ struct Retained {
     domains: Domains,
     left: Option<OriginalNumericalValue>,
     right: Option<OriginalNumericalValue>,
+    sequence: Option<super::token_projection::TokenSequence>,
     seed_stream: Option<ValueStream>,
     planning: PlanningOwner,
     custody: Custody,
@@ -263,7 +268,7 @@ impl NumericalProducer {
             .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
         let (roots,mechanism)=sources.numerical_prerequisites();
         Self::execute_inputs_with_mask(sources,environment,roots,mechanism,kind,left,right,
-            None,None,None,None,None,Some((context,placement)))
+            None,None,None,None,None,Some((context,placement)), None)
     }
     pub(crate) fn validate_input_at(value:&OriginalNumericalValue,
         context:crate::composition::mlx::speculative::SpeculativeExecutionStreams<'_>,
@@ -281,7 +286,7 @@ impl NumericalProducer {
             .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
         let (roots,mechanism)=sources.numerical_prerequisites();
         Self::execute_inputs_with_mask(sources,environment,roots,mechanism,Kind::ProcessLogits(policy),Some(left),None,
-            Some(history),mask,capture,Some(failed_capture),None,Some((context,placement)))
+            Some(history),mask,capture,Some(failed_capture),None,Some((context,placement)), None)
     }
     pub(super) fn execute_with_history(
         sources: &OriginalSpeculativeNumericalSources,
@@ -306,14 +311,14 @@ impl NumericalProducer {
         right: Option<&OriginalNumericalValue>,
         history: Option<&[u32]>,
     ) -> Result<NumericalOutput, Error> {
-        Self::execute_inputs_with_mask(sources,environment,roots_runtime,mechanism,kind,left,right,history,None,None,None,None,None)
+        Self::execute_inputs_with_mask(sources,environment,roots_runtime,mechanism,kind,left,right,history,None,None,None,None,None, None)
     }
     pub(super) fn execute_controlled_policy(
         sources:&OriginalSpeculativeNumericalSources,environment:&OriginalCopyEnvironment<'_>,roots_runtime:&PrefillRootsRuntime,
         mechanism:MlxMetalWorkspaceMechanisms,policy:SpeculativeLogitProgram,left:&OriginalNumericalValue,
         history:&[u32],mask:eredu_runtime::generation::TokenMaskPlan<'_>,
     )->Result<NumericalOutput,Error> {
-        Self::execute_inputs_with_mask(sources,environment,roots_runtime,mechanism,Kind::ProcessLogits(policy),Some(left),None,Some(history),Some(mask),None,None,None,None)
+        Self::execute_inputs_with_mask(sources,environment,roots_runtime,mechanism,Kind::ProcessLogits(policy),Some(left),None,Some(history),Some(mask),None,None,None,None, None)
     }
     pub(super) fn execute_captured_policy(
         sources:&OriginalSpeculativeNumericalSources,environment:&OriginalCopyEnvironment<'_>,roots_runtime:&PrefillRootsRuntime,
@@ -322,7 +327,7 @@ impl NumericalProducer {
         failed_capture:&mut Option<eredu_core::capture::SharedCapturedStep>,
     )->Result<NumericalOutput,Error> {
         Self::execute_inputs_with_mask(sources,environment,roots_runtime,mechanism,Kind::ProcessLogits(policy),
-            Some(left),None,Some(history),mask,Some(capture),Some(failed_capture),None,None)
+            Some(left),None,Some(history),mask,Some(capture),Some(failed_capture),None,None, None)
     }
     pub(super) fn execute_token_ids(
         sources: &OriginalSpeculativeNumericalSources,
@@ -336,7 +341,27 @@ impl NumericalProducer {
             eredu_runtime::working_memory::WorkingMemoryError::Overflow,
         ))?;
         Self::execute_inputs_with_mask(sources, environment, roots_runtime, mechanism,
-            Kind::TokenIds { length }, None, None, None, None, None, None, Some(tokens), None)
+            Kind::TokenIds { length }, None, None, None, None, None, None, Some(tokens), None, None)
+    }
+    pub(super) fn execute_repeated_token(
+        sources: &OriginalSpeculativeNumericalSources, environment: &OriginalCopyEnvironment<'_>,
+        roots: &PrefillRootsRuntime, mechanisms: MlxMetalWorkspaceMechanisms,
+        token: u32, length: u32,
+    ) -> Result<NumericalOutput, Error> {
+        Self::execute_inputs_with_mask(sources, environment, roots, mechanisms,
+            Kind::RepeatedToken { token, length }, None, None, None, None, None, None, None, None, None)
+    }
+    pub(super) fn execute_token_concatenate(sources: &OriginalSpeculativeNumericalSources,
+        environment: &OriginalCopyEnvironment<'_>, roots: &PrefillRootsRuntime,
+        mechanisms: MlxMetalWorkspaceMechanisms, sequence: &super::token_projection::TokenSequence,
+    ) -> Result<NumericalOutput, Error> {
+        let parts = u32::try_from(sequence.values().len()).map_err(|_| model::overflow())?;
+        let positions = sequence.values().iter().try_fold(0u32, |n, value| {
+            let [1, width] = value.value().array.shape() else { return None; };
+            n.checked_add(u32::try_from(*width).ok()?)
+        }).ok_or_else(model::overflow)?;
+        Self::execute_inputs_with_mask(sources, environment, roots, mechanisms,
+            Kind::TokenConcatenate { parts, positions }, None, None, None, None, None, None, None, None, Some(sequence))
     }
     fn execute_inputs_with_mask(
         sources:&OriginalSpeculativeNumericalSources,environment:&OriginalCopyEnvironment<'_>,roots_runtime:&PrefillRootsRuntime,
@@ -345,13 +370,14 @@ impl NumericalProducer {
         capture_source:Option<capture::CaptureSource<'_>>,
         failed_capture:Option<&mut Option<eredu_core::capture::SharedCapturedStep>>,
         tokens: Option<&[u32]>,inputs:Option<InputPlacement<'_>>,
+        sequence: Option<&super::token_projection::TokenSequence>,
     )->Result<NumericalOutput,Error> {
         let phase_funding = sources.prepare_phase_metadata()?;
         let funding = &phase_funding;
         let result = (|| -> Result<NumericalOutput, Error> {
             sources.validate_environment(environment)?;
             let fixed = planning_control_bytes().ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
             funding
                 .reserve_metadata(fixed)
@@ -366,15 +392,23 @@ impl NumericalProducer {
             }
             let stream = safemlx::StreamCopyPlan::<()>::capture(environment.stream())
                 .map_err(|_| cold(Cause::Source))?;
-            let token_shape = if let Kind::TokenIds { length } = kind {
-                if tokens.map(<[u32]>::len) != Some(length as usize) { return Err(cold(Cause::Source)); }
+            let token_shape = if let Kind::TokenIds { length } | Kind::RepeatedToken { length, .. } = kind {
+                if match kind {
+                    Kind::TokenIds { .. } => tokens.map(<[u32]>::len) != Some(length as usize),
+                    _ => tokens.is_some(),
+                } { return Err(cold(Cause::Source)); }
                 Some([1, i32::try_from(length).map_err(|_| cold(Cause::Source))?])
+            } else if let Kind::TokenConcatenate { positions, parts } = kind {
+                if tokens.is_some() || sequence.is_none_or(|source| source.values().len() != parts as usize) {
+                    return Err(cold(Cause::Source));
+                }
+                Some([1, i32::try_from(positions).map_err(|_| cold(Cause::Source))?])
             } else {
-                if tokens.is_some() { return Err(cold(Cause::Source)); }
+                if tokens.is_some() || sequence.is_some() { return Err(cold(Cause::Source)); }
                 None
             };
             let source_shape = match (kind, left) {
-                (Kind::TokenIds { .. }, None) => token_shape.as_ref().ok_or_else(|| cold(Cause::Source))?.as_slice(),
+                (Kind::TokenIds { .. } | Kind::RepeatedToken { .. } | Kind::TokenConcatenate { .. }, None) => token_shape.as_ref().ok_or_else(|| cold(Cause::Source))?.as_slice(),
                 (Kind::CreateKey { .. }, None) => &[2][..],
                 (_, Some(left)) => left.value().array.shape(),
                 _ => return Err(cold(Cause::Source)),
@@ -391,7 +425,7 @@ impl NumericalProducer {
             }
             let expected = match kind {
                 Kind::ProbabilityAt { .. } => Meaning::Probabilities,
-                Kind::TokenRange { .. } => Meaning::TokenIds,
+                Kind::TokenRange { .. } | Kind::TokenConcatenate { .. } => Meaning::TokenIds,
                 Kind::TensorRange { .. } | Kind::TensorAxisRange { .. } | Kind::TensorConcatenate { .. } => Meaning::Capture,
                 Kind::NextKey | Kind::UniformUnitInterval | Kind::KeyAt { .. } => Meaning::RandomKey,
                 _ => Meaning::Logits,
@@ -406,14 +440,16 @@ impl NumericalProducer {
             // shared vocabulary mask has its own complete CPU Select source.
             // Every other program needs its own complete native recipe.
             if (stream.device_type() != safemlx::DeviceType::Gpu
-                && !(cpu && matches!(kind, Kind::TensorConcatenate { .. } | Kind::NextKey | Kind::UniformUnitInterval | Kind::Categorical(_) | Kind::KeyAt { .. } | Kind::CreateKey { .. } | Kind::TokenIds { .. } | Kind::TokenRange { .. }
+                && !(cpu && matches!(kind, Kind::TensorConcatenate { .. } | Kind::TokenConcatenate { .. } | Kind::RepeatedToken { .. } | Kind::NextKey | Kind::UniformUnitInterval | Kind::Categorical(_) | Kind::KeyAt { .. } | Kind::CreateKey { .. } | Kind::TokenIds { .. } | Kind::TokenRange { .. }
                     | Kind::TensorRange { .. } | Kind::TensorAxisRange { .. } | Kind::Normalize | Kind::Correction | Kind::Greedy(_) | Kind::ProbabilityAt { .. } | Kind::LogitsRow { .. } | Kind::ProcessLogits(_)) && (capture_source.is_none()||matches!(kind,Kind::ProcessLogits(_)))))
-                || usize::from(left.is_some()) + usize::from(right.is_some()) != program.source_count() {
+                || usize::from(left.is_some()) + usize::from(right.is_some()) + sequence.map_or(0, |s| s.values().len()) != program.source_count() {
                 return Err(cold(Cause::Source));
             }
             for (value, meaning) in left.map(|v|(v,expected)).into_iter().chain(right.map(|v|
                 (v, if matches!(kind, Kind::Categorical(_)) { Meaning::RandomKey }
-                    else if matches!(kind, Kind::TensorConcatenate { .. }) { Meaning::Capture } else { Meaning::Logits }))) {
+                    else if matches!(kind, Kind::TensorConcatenate { .. }) { Meaning::Capture }
+                    else { Meaning::Logits })))
+                .chain(sequence.into_iter().flat_map(|s| s.values().iter().map(|value| (value, Meaning::TokenIds)))) {
                 if !value.value().provenance.source().belongs_to_request(sources.request())
                     || value.value().meaning != meaning
                     || (!stream.matches_source(&value.value().stream)
@@ -433,7 +469,7 @@ impl NumericalProducer {
             // Composed concatenation, logit policies and capture use the actual CPU model worker.
             // Retain its stream choice and exact completed input layouts; GPU
             // census cannot substitute for these copies or nested completions.
-            let cpu_equations = if cpu && matches!(kind,Kind::TensorConcatenate {..}|Kind::ProcessLogits(_)) {
+            let cpu_equations = if cpu && matches!(kind,Kind::TensorConcatenate {..}|Kind::TokenConcatenate {..}|Kind::RepeatedToken {..}|Kind::ProcessLogits(_)) {
                 match crate::backend::nn::workspace::ResidentExecutionMechanisms::from_stream(
                     mechanism,environment.stream(),funding)? {
                     crate::backend::nn::workspace::ResidentExecutionMechanisms::Cpu {cpu,..}=>Some(cpu),
@@ -445,7 +481,7 @@ impl NumericalProducer {
                 None=>WorkspaceContext::new_with_metadata_funding(mechanism,funding.clone()),
             }.map_err(|cause| Error::Neural(cause.into()))?;
             let metadata = |value: &OriginalNumericalValue| -> Result<WorkspaceTensor, Error> {
-                if cpu_equations.is_some() {return tensor_layout::completed_floating(value,&context);}
+                if cpu_equations.is_some() {return tensor_layout::completed(value,&context);}
 
                 let dtype = match (value.value().meaning, value.value().array.dtype()) {
                     (Meaning::RandomKey | Meaning::TokenIds, safemlx::Dtype::Uint32) => WorkspaceDtype::Uint32,
@@ -467,6 +503,20 @@ impl NumericalProducer {
                     &context,
                 )?)
             };
+            let mut segment_metadata = context.metadata_vec(sequence.map_or(0, |s| s.values().len()))?;
+            let mut segment_arrays = context.metadata_vec(sequence.map_or(0, |s| s.values().len()))?;
+            let mut segment_sources = context.metadata_vec(sequence.map_or(0, |s| s.values().len()))?;
+            if let Some(sequence) = sequence {
+                let mut positions = 0u32;
+                for value in sequence.values() {
+                    program.validate_source(value.value().array.shape()).map_err(|cause| cold(Cause::Program(cause)))?;
+                    positions = positions.checked_add(value.value().array.shape()[1] as u32).ok_or_else(|| cold(Cause::Overflow))?;
+                    segment_metadata.push(metadata(value)?);
+                    segment_arrays.push(&value.value().array);
+                    segment_sources.push(value.value().provenance.source());
+                }
+                if positions != program.shape()[1] as u32 { return Err(cold(Cause::Source)); }
+            }
             let left_metadata = left.map(metadata).transpose()?;
             let left_value = || left.ok_or_else(|| cold(Cause::Source));
             let left_meta = || left_metadata.as_ref().ok_or_else(|| cold(Cause::Source));
@@ -483,6 +533,10 @@ impl NumericalProducer {
                     )?;
                     (Cut::TokenIds(length), context.finish_report(&[input])?, None)
                 }
+                Kind::RepeatedToken { token, length } => {
+                    let output = <WorkspaceTensor as eredu_nn::Tensor>::full_u32(token, program.shape(), &context)?;
+                    (Cut::RepeatedToken { token, length }, context.finish_report(&[output])?, None)
+                }
                 Kind::TensorRange { start, end } | Kind::TokenRange { start, end } => {
                     let output = super::tensor::metadata_range(left_meta()?, start, end, &context)?;
                     (Cut::TensorRange { axis: 1, start, end, tokens: matches!(kind, Kind::TokenRange { .. }) },
@@ -491,6 +545,10 @@ impl NumericalProducer {
                 Kind::TensorAxisRange { axis, start, end } => {
                     let output = super::tensor::metadata_axis_range(left_meta()?, axis, start, end, &context)?;
                     (Cut::TensorRange { axis, start, end, tokens: false }, context.finish_report(&[output])?, None)
+                }
+                Kind::TokenConcatenate { parts, .. } => {
+                    let output = <WorkspaceTensor as eredu_nn::Tensor>::concatenate(&segment_metadata, 1, &context)?;
+                    (Cut::TokenConcatenate(parts), context.finish_report(&[output])?, None)
                 }
                 Kind::TensorConcatenate { .. } => {
                     let output = super::tensor::metadata_concatenate(left_meta()?,
@@ -625,12 +683,12 @@ impl NumericalProducer {
             let source_values = [left.map(|v|v.value().provenance.source()), right.map(|v|v.value().provenance.source())];
             let one = source_values[0].map(|v|[v]);
             let two = source_values[0].zip(source_values[1]).map(|(a,b)|[a,b]);
-            let admitted_sources = match program.source_count() {
+            let admitted_sources = if sequence.is_some() { segment_sources.as_slice() } else { match program.source_count() {
                 0 => &[][..],
                 1 => &one.as_ref().ok_or_else(||cold(Cause::Source))?[..],
                 2 => &two.as_ref().ok_or_else(||cold(Cause::Source))?[..],
                 _ => return Err(cold(Cause::Source)),
-            };
+            }};
             let phase = sources.request().reserve_numerical(requirements, admitted_sources)
                 .map_err(|e| retain_planning_error(e, funding.clone()))?;
             let (custody,capture_invocation)=if let Some(host)=capture_host {
@@ -671,9 +729,11 @@ impl NumericalProducer {
                 capture_invocation.as_mut(),
                 capture_source.and_then(capture::CaptureSource::domain),
                 tokens,
+                sequence,
+                &segment_arrays,
             )?;
             Ok(match kind {
-                Kind::TokenIds { .. } => NumericalOutput::Tensor(
+                Kind::TokenIds { .. } | Kind::RepeatedToken { .. } => NumericalOutput::Tensor(
                     OriginalNumericalValue::completed(output.value, output_stream,
                         Meaning::TokenIds, custody, funding.clone()).with_original_budget(output.budget),
                 ),
@@ -684,9 +744,12 @@ impl NumericalProducer {
                         .expect("unique completed tensor view")._readout_source = left.cloned().map(RetainedValues::One);
                     NumericalOutput::Tensor(value)
                 }
+                Kind::TokenConcatenate { .. } => NumericalOutput::Tensor(
+                    OriginalNumericalValue::completed(output.value, output_stream,
+                        Meaning::TokenIds, custody, funding.clone()).with_original_budget(output.budget)),
                 Kind::TensorConcatenate { .. } => {
                     let mut value = OriginalNumericalValue::completed(output.value, output_stream,
-                        Meaning::Capture, custody, funding.clone()).with_original_budget(output.budget);
+                        expected, custody, funding.clone()).with_original_budget(output.budget);
                     Rc::get_mut(value.0.as_mut().expect("unpublished concatenated tensor"))
                         .expect("unique completed concatenation")._readout_source = Some(RetainedValues::Two([
                             left.expect("validated left source").clone(), right.expect("validated right source").clone(),
@@ -783,6 +846,8 @@ impl NumericalProducer {
                             None,
                             None,
                             None,
+                            None,
+                            &[],
                         )?;
                         NumericalOutput::Correction(Some(OriginalNumericalValue::completed(
                             output.value,
@@ -818,7 +883,7 @@ impl Plan {
         } else { None };
         let recipe = match (cpu, eager) {
             (true, Some(source)) => SpeculativeNumericalRecipe::inspect_cpu_token_ids(report, source, mechanism, context),
-            (true,None) if matches!(cut,Cut::TensorConcatenate)&&capture.is_none()=>
+            (true,None) if matches!(cut,Cut::TensorConcatenate|Cut::TokenConcatenate(_)|Cut::RepeatedToken {..})&&capture.is_none()=>
                 SpeculativeNumericalRecipe::inspect_cpu_equations(report,mechanism,
                     cpu_equations.ok_or(Cause::Source)?,context),
             (true, None) if matches!(cut, Cut::TensorRange { .. }) && capture.is_none() =>
@@ -891,7 +956,7 @@ impl Plan {
         let range_controls=if matches!(cut,Cut::TensorRange{..}) {
             super::tensor::native_axis_range_control_bytes().ok_or(Cause::Overflow)?
         } else {0};
-        let concatenate_controls=if matches!(cut,Cut::TensorConcatenate){
+        let concatenate_controls=if matches!(cut,Cut::TensorConcatenate|Cut::TokenConcatenate(_)){
             safemlx::ops::concatenate_axis_control_bytes().ok_or(Cause::Unknown("concatenation controls"))?
                 .checked_add(size_of::<[&Array;2]>()).ok_or(Cause::Overflow)?
         }else{0};
@@ -1039,6 +1104,10 @@ impl Plan {
 }
 fn planning_control_bytes() -> Option<usize> {
     let parts = [
+        size_of::<Option<&super::token_projection::TokenSequence>>(),
+        size_of::<super::token_projection::TokenSequence>(),
+        size_of::<Vec<WorkspaceTensor>>(), size_of::<Vec<&Array>>(),
+        size_of::<Vec<SpeculativeNumericalSource<'_>>>(), size_of::<&[&Array]>(),
         size_of::<bool>() * 2, // actual device selection and Plan::inspect argument
         size_of::<Option<crate::backend::nn::workspace::MlxCpuWorkspaceMechanisms>>(),
         size_of::<crate::backend::nn::workspace::ResidentExecutionMechanisms>(),
@@ -1104,13 +1173,15 @@ fn run_cut(
     right: Option<&OriginalNumericalValue>,
     planning: &PlanningOwner,
     custody: &Custody,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     history: Option<&[u32]>,
     mask:Option<eredu_runtime::generation::TokenMaskPlan<'_>>,
     seed_stream: Option<ValueStream>,
     capture_invocation:Option<&mut eredu_runtime::capture::FundedSpeculativeCaptureInvocation>,
     capture_domain:Option<eredu_core::capture::CaptureTokenDomain<'_>>,
     tokens: Option<&[u32]>,
+    sequence: Option<&super::token_projection::TokenSequence>,
+    segment_arrays: &[&Array],
 ) -> Result<CutOutput, Error> {
     let err = |cause| failure(cause, custody, funding);
     let (domains, roots) = plan.prepare(environment, runtime, custody).map_err(err)?;
@@ -1126,6 +1197,7 @@ fn run_cut(
         domains,
         left: left.cloned(),
         right: right.cloned(),
+        sequence: sequence.cloned(),
         seed_stream,
         planning: planning.clone(),
         custody: custody.clone(),
@@ -1188,8 +1260,14 @@ fn run_cut(
                 let tokens = tokens.filter(|tokens| tokens.len() == length as usize).ok_or(Cause::Source)?;
                 (Array::try_from_original_prompt_ids(tokens)?, None)
             }
+            Cut::RepeatedToken { token, length } => (
+                <MlxTensor as eredu_nn::Tensor>::full_u32(token, &[1, length as i32], stream).map_err(|cause| Cause::Backend(Error::Neural(cause)))?.into_array(), None),
             Cut::TensorRange { axis, start, end, tokens: _ } => {
                 (super::tensor::native_axis_range(&left_value()?.value().array, axis, start, end, stream)?, None)
+            }
+            Cut::TokenConcatenate(parts) => {
+                if segment_arrays.len() != parts as usize { return Err(Cause::Source); }
+                (safemlx::ops::concatenate_axis(segment_arrays, 1, stream)?, None)
             }
             Cut::TensorConcatenate => (
                 safemlx::ops::concatenate_axis(&[&left_value()?.value().array,
@@ -1318,7 +1396,7 @@ fn run_cut(
     let output = result.map_err(err)?;
     // The final root event may become visible before every accepted record
     // publishes its terminal transition. One progress poll is not completion.
-    let status = recovery.finish();
+    let status = recovery.finish().map_err(|cause| err(Cause::Backend(cause.into_error())))?;
     if !status.settled || status.failed || status.blocked {
         return Err(err(Cause::RecoveryStatus(status)));
     }
@@ -1343,3 +1421,5 @@ pub(super) fn is_program_source_failure(error: &(dyn std::error::Error + 'static
     }
     false
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

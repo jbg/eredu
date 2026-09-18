@@ -55,7 +55,7 @@ impl PreparedSelectedResidency {
         bank:&mut OriginalHostSourceBank,custody:OriginalHostSourceCustody,
         reservation:Option<&WorkingMemoryReservation>,
         disk:Option<(&eredu_runtime::working_memory::WorkingMemoryPool,
-            &ForegroundDiskSourceCapacity,&eredu_nn::workspace::WorkspaceMetadataFunding)>,
+            &ForegroundDiskSourceCapacity,&eredu_nn::workspace::HostMetadataFunding)>,
     )->Result<Self,Error> {
         if !bank.belongs_to_source(&custody) { return Err(identity()); }
         if let Some((pool,capacity,_))=disk {

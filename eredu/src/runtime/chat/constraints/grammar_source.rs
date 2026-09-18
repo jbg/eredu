@@ -1,23 +1,14 @@
-//! Actual historical grammar tokenizer and marked trie, before parser admission.
-mod declaration;
+//! Retained original grammar, trie and compilation before mutable parser admission.
 mod controller;
+mod declaration;
 pub(crate) use lexer::OriginalPreparedGrammarController;
 mod lexer;
 mod slicer;
 mod tokenize;
 use super::{ConstraintBlueprint, GenerationRuntimePlan};
-use eredu_core::{
-    BackendFailure, HostPreparationAuthority, SharedControllerBytes, SpeculativeBuffer,
-    SpeculativeBufferAllocationError,
-};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
-use eredu_runtime::working_memory::{
-    OriginalChatBackend, OriginalTokenTrieSource, OriginalTokenTrieSourceError, OriginalTokenizer,
-};
-use eredu_text::{
-    token_trie_storage::TokRxInfo,
-    tokenizer_storage::{TokenizerPlan, TokenizerSourceError},
-};
+use eredu_core::SharedControllerBytes;
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
+use eredu_runtime::working_memory::{OriginalControllerCompilation, OriginalTokenTrieSource};
 pub(super) use slicer::{
     OriginalGrammarSlicer, OriginalGrammarSlicerError, OriginalGrammarSlicerStep,
     OriginalGrammarSlicerStepError,
@@ -30,7 +21,8 @@ pub(super) struct OriginalGrammarVocabulary {
     trie: OriginalTokenTrieSource,
     declaration: OriginalGrammarDeclaration,
     recipe: super::recipe::ConstraintRecipe,
-    funding: WorkspaceMetadataFunding,
+    compilation: OriginalControllerCompilation,
+    funding: HostMetadataFunding,
 }
 impl OriginalGrammarVocabulary {
     /// The exact originally constructed trie for a future paid grammar factory.
@@ -43,7 +35,7 @@ impl OriginalGrammarVocabulary {
     }
     pub(in crate::runtime::chat::constraints) fn grammar_owner(
         &self,
-    ) -> std::sync::Arc<llguidance::earley::CGrammar> {
+    ) -> llguidance::earley::SharedGrammar {
         self.declaration.grammar_owner()
     }
     /// Recognition records borrowed from the same registered historical owner.
@@ -64,18 +56,10 @@ enum Cause {
     Source,
     #[error("grammar vocabulary control geometry overflow")]
     Overflow,
-    #[error("grammar vocabulary destination changed")]
-    Destination,
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
-    Buffer(#[from] SpeculativeBufferAllocationError),
-    #[error(transparent)]
-    Tokenizer(#[from] TokenizerSourceError),
-    #[error(transparent)]
-    Backend(#[from] BackendFailure),
-    #[error(transparent)]
-    Trie(#[from] OriginalTokenTrieSourceError),
+    Compilation(#[from] eredu_runtime::working_memory::WorkingMemoryError),
     #[error(transparent)]
     Declaration(#[from] OriginalGrammarDeclarationError),
 }
@@ -86,64 +70,40 @@ pub(super) struct OriginalGrammarVocabularyError {
     #[source]
     cause: Cause,
     recipe: SharedControllerBytes,
-    funding: WorkspaceMetadataFunding,
+    compilation: OriginalControllerCompilation,
+    funding: HostMetadataFunding,
 }
 impl ConstraintBlueprint {
-    /// Builds only immutable tokenizer/trie sources. Shared slicer, lexer,
-    /// parser, masks and mutable controller construction remain separate.
-    pub(super) fn original_grammar_vocabulary<B: OriginalChatBackend>(
+    /// Loan the exact immutable trie and grammar produced by source compilation.
+    /// Startup cannot rebuild a tokenizer or register a replacement declaration.
+    pub(super) fn original_grammar_vocabulary(
         &self,
-        runtime: &eredu_core::ModelRuntime<B>,
-        funding: &WorkspaceMetadataFunding,
+        compilation: &OriginalControllerCompilation,
+        funding: &HostMetadataFunding,
     ) -> Result<OriginalGrammarVocabulary, OriginalGrammarVocabularyError> {
-        self.original_grammar_vocabulary_with(funding, |plan| {
-            B::compile_original_tokenizer(runtime, plan)
-        })
-    }
-    pub(super) fn original_grammar_vocabulary_with<'a, F>(
-        &'a self,
-        funding: &WorkspaceMetadataFunding,
-        compile: F,
-    ) -> Result<OriginalGrammarVocabulary, OriginalGrammarVocabularyError>
-    where
-        F: FnOnce(TokenizerPlan<'a>) -> Result<OriginalTokenizer, BackendFailure>,
-    {
         let retain = |cause| OriginalGrammarVocabularyError {
             cause,
             recipe: self.recipe.source().clone(),
+            compilation: compilation.clone(),
             funding: funding.clone(),
         };
         let parts = [
             self.recipe
                 .grammar_source_control_bytes()
                 .ok_or_else(|| retain(Cause::Overflow))?,
-            size_of::<Self>(),
+            OriginalControllerCompilation::validation_control_bytes()
+                .ok_or_else(|| retain(Cause::Overflow))?,
             size_of::<OriginalGrammarVocabulary>(),
             size_of::<OriginalGrammarDeclaration>(),
             size_of::<Result<OriginalGrammarDeclaration, OriginalGrammarDeclarationError>>(),
             size_of::<OriginalGrammarVocabularyError>(),
             size_of::<Cause>(),
-            size_of::<F>(),
-            size_of::<(&Self, &WorkspaceMetadataFunding, F)>(),
+            size_of::<OriginalControllerCompilation>(),
+            size_of::<(&Self, &OriginalControllerCompilation, &HostMetadataFunding)>(),
             size_of::<Result<OriginalGrammarVocabulary, OriginalGrammarVocabularyError>>(),
             size_of::<Result<OriginalGrammarVocabulary, Cause>>(),
-            size_of::<Result<OriginalTokenizer, BackendFailure>>(),
-            size_of::<OriginalTokenizer>(),
-            size_of::<Result<OriginalTokenTrieSource, OriginalTokenTrieSourceError>>(),
-            size_of::<Result<TokenizerPlan<'a>, TokenizerSourceError>>(),
-            size_of::<TokenizerPlan<'a>>(),
-            size_of::<(TokenizerPlan<'a>, bool)>(),
-            size_of::<TokRxInfo>(),
-            size_of::<Option<TokRxInfo>>(),
-            size_of::<Option<&[u8]>>(),
-            size_of::<Option<bool>>(),
-            size_of::<(usize, usize)>(),
-            size_of::<Result<SpeculativeBuffer<u32>, SpeculativeBufferAllocationError>>(),
-            size_of::<Result<(), eredu_core::generation::GenerationError>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-            size_of_val(&self.recipe.eos_token_ids()),
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-                .ok_or_else(|| retain(Cause::Overflow))?,
+            size_of::<Option<&OriginalTokenTrieSource>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
         ];
         funding
             .reserve_metadata(
@@ -154,41 +114,19 @@ impl ConstraintBlueprint {
             )
             .map_err(|cause| retain(cause.into()))?;
         let result = (|| -> Result<OriginalGrammarVocabulary, Cause> {
-            let declaration = self.original_grammar_declaration(funding)?;
-            let json = self
-                .recipe
-                .grammar_tokenizer_object_json()
-                .ok_or(Cause::Source)?;
-            let enabled = self
-                .recipe
-                .grammar_encode_special_tokens()
-                .ok_or(Cause::Source)?;
-            let info = self.recipe.trie_info().ok_or(Cause::Source)?;
-            let count = self.recipe.eos_token_ids().len().max(1);
-            funding.reserve_metadata(
-                SpeculativeBuffer::<u32>::retained_control_bytes(count).ok_or(Cause::Overflow)?,
-            )?;
-            let mut eos = SpeculativeBuffer::try_new_retained(
-                count,
-                HostPreparationAuthority::retain(funding.clone()),
-            )?;
-            if self.recipe.eos_token_ids().len() == 0 {
-                eos.try_push(info.tok_eos).map_err(|_| Cause::Destination)?;
-            } else {
-                eos.try_extend(self.recipe.eos_token_ids())
-                    .map_err(|_| Cause::Destination)?;
-            }
-            let plan = TokenizerPlan::prepare_json(json)?.with_encode_special_tokens(enabled);
-            let tokenizer = compile(plan)?;
-            let trie = tokenizer.compile_token_trie_source(&info, &eos)?;
+            let trie = self.recipe.original_trie().ok_or(Cause::Source)?;
+            let source = self.declaration.as_ref().ok_or(Cause::Source)?;
+            compilation.validate_grammar_sources(self.recipe.source(), source.source(), trie)?;
             let slicer = self.recipe.slicer_source().ok_or(Cause::Source)?;
             if !slicer.matches_trie(trie.trie()) {
                 return Err(Cause::Source);
             }
+            let declaration = self.original_grammar_declaration(funding)?;
             Ok(OriginalGrammarVocabulary {
-                trie,
+                trie: trie.clone(),
                 declaration,
                 recipe: self.recipe.clone(),
+                compilation: compilation.clone(),
                 funding: funding.clone(),
             })
         })();
@@ -208,4 +146,7 @@ pub(super) use lexer::{
 };
 
 pub(super) use lexer::OriginalPreparedGrammarControllerError;
-pub(super) use lexer::{OriginalGrammarState, OriginalGrammarStateError, OriginalGrammarStateCopyError, OriginalGrammarStartupError};
+pub(super) use lexer::{
+    OriginalGrammarStartupError, OriginalGrammarState, OriginalGrammarStateCopyError,
+    OriginalGrammarStateError,
+};

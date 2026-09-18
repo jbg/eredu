@@ -16,7 +16,7 @@ struct ResetRevision {
     _custody: super::resident_reset::ResetCustody,
 }
 struct PlannedRevision {
-    _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    _funding: eredu_nn::workspace::HostMetadataFunding,
 }
 impl std::fmt::Debug for PlannedRevision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,13 +85,13 @@ impl InferenceStateRevision {
         let allocation=std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize;2]>()
             .extend(std::alloc::Layout::new::<PlannedRevision>()).ok()?.0.pad_to_align().size();
         allocation.checked_add(size_of::<(Self,PlannedRevision,Option<Self>,
-            Result<Self,eredu_nn::workspace::WorkspaceMetadataFundingError>)>())
+            Result<Self,eredu_nn::workspace::HostMetadataFundingError>)>())
     }
     pub(crate) fn prepare_metadata(
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
-    )->Result<Self,eredu_nn::workspace::WorkspaceMetadataFundingError> {
+        funding:&eredu_nn::workspace::HostMetadataFunding,
+    )->Result<Self,eredu_nn::workspace::HostMetadataFundingError> {
         let bytes=Self::metadata_control_bytes()
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow)?;
+            .ok_or(eredu_nn::workspace::HostMetadataFundingError::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(Self(RevisionIdentity::Planned(Some(Arc::new(
             PlannedRevision {
@@ -238,7 +238,7 @@ impl InferenceRetention {
             eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<InferenceRequest>(self.requests.len())?,
             eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<WorkingMemoryUnquotedLease>(self.unquoted.len())?,
             if self.revision.get().is_none(){InferenceStateRevision::metadata_control_bytes()?}else{0},
-            size_of::<(Self,&Self,eredu_nn::workspace::WorkspaceMetadataFunding,Option<InferenceStateRevision>)>(),
+            size_of::<(Self,&Self,eredu_nn::workspace::HostMetadataFunding,Option<InferenceStateRevision>)>(),
             size_of::<Result<Self,eredu_core::BackendFailure>>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
@@ -247,10 +247,10 @@ impl InferenceRetention {
     /// The caller retains funding after the returned directories.
     pub fn clone_with_host_source(&self,funding:&eredu_core::HostMetadataFunding)
         ->Result<Self,eredu_core::BackendFailure> {
-        use eredu_nn::workspace::WorkspaceMetadataFunding;
-        let funding=WorkspaceMetadataFunding::from(funding.clone());
+        use eredu_nn::workspace::HostMetadataFunding;
+        let funding=funding.clone();
         // Actual dynamic directories and revision producer reserve themselves.
-        let fixed=std::mem::size_of::<(Self,&Self,WorkspaceMetadataFunding,Option<InferenceStateRevision>)>()
+        let fixed=std::mem::size_of::<(Self,&Self,HostMetadataFunding,Option<InferenceStateRevision>)>()
             .checked_add(std::mem::size_of::<Result<Self,eredu_core::BackendFailure>>())
             .and_then(|n|n.checked_add(std::mem::size_of::<[usize;5]>()))
             .ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
@@ -269,8 +269,8 @@ impl InferenceRetention {
     /// candidate retires normally and its spent metadata is never refunded.
     pub(crate) fn initialize_metadata_revision(
         &self,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
-    ) -> Result<(), eredu_nn::workspace::WorkspaceMetadataFundingError> {
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<(), eredu_nn::workspace::HostMetadataFundingError> {
         if self.revision.get().is_none() {
             let revision = InferenceStateRevision::prepare_metadata(funding)?;
             let _ = self.revision.set(revision);
@@ -504,3 +504,5 @@ pub(crate) fn exchange_inference_state<S: InferenceStateRetention>(
 
 #[cfg(test)]
 mod tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

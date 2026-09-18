@@ -546,7 +546,7 @@ fn speculative_span_capability_preserves_evidence_free_and_decode_only_operation
         raw.operations[0].evidence = evidence;
         raw.operations[0].schedule.prefill = prefill;
         let plan = raw.admit_invocations(&edits, bounds(), "session").unwrap();
-        let mut run = CaptureSession::new(capture);
+        let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
         run.enable_interventions(plan, Arc::new(Estimates)).unwrap();
         let mut observer = collector(run, Scope::Target);
         assert!(observer.supports_prefill_spans());

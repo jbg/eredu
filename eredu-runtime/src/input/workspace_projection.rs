@@ -6,7 +6,7 @@ use crate::working_memory::{PreparedInputHostCustody, WorkingMemoryError, Workin
 use eredu_nn::{
     Error, Tensor,
     workspace::{
-        WorkspaceBorrowedStorage, WorkspaceContext, WorkspaceMetadataFunding, WorkspaceTensor,
+        WorkspaceBorrowedStorage, WorkspaceContext, HostMetadataFunding, WorkspaceTensor,
     },
 };
 use std::mem::{size_of, size_of_val};
@@ -53,7 +53,7 @@ pub trait PreparedMediaWorkspaceTensor: Tensor + Send + Sync {
 pub struct OriginalPreparedWorkspaceSource {
     roots: Option<WorkspaceBorrowedStorage>,
     custody: PreparedInputHostCustody,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl OriginalPreparedWorkspaceSource {
     pub(super) fn cache_residence(custody: PreparedInputHostCustody) -> Self {
@@ -116,15 +116,24 @@ impl<T: PreparedMediaWorkspaceTensor> PreparedModelInputOwner<T> {
         &'a self,
         context: &'a WorkspaceContext,
     ) -> Result<(WorkspaceTensor, OriginalPreparedWorkspaceSource), Error> {
-        let custody = self
-            .workspace_custody()
-            .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?;
         let [part] = self.parts() else {
             return Err(context.metadata_source(WorkingMemoryError::IdentityMismatch));
         };
         if !part.metadata().is_empty() {
             return Err(context.metadata_source(WorkingMemoryError::IdentityMismatch));
         }
+        self.project_payload_with_metadata(0, context)
+    }
+    /// Projects one actual payload selected by its original ordered part index.
+    /// Metadata slots and other parts are not credited to this payload loan.
+    /// The source witness retains the same complete original B account.
+    pub fn project_payload_with_metadata<'a>(
+        &'a self, index: usize, context: &'a WorkspaceContext,
+    ) -> Result<(WorkspaceTensor, OriginalPreparedWorkspaceSource), Error> {
+        let custody = self.workspace_custody()
+            .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?;
+        let part = self.parts().get(index)
+            .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?;
         context.charge_metadata(size_of::<(
             T::Projection<'a>,
             WorkspaceTensor,

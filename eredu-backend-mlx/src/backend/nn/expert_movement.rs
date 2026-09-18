@@ -42,11 +42,11 @@ impl Operations for Native<'_> {
     fn gather(&self,value:&MlxTensor,indices:&MlxTensor)->Result<MlxTensor,Self::Error>{value.take_axis(indices,0,self.0)}
     fn zeros(&self,prototype:&MlxTensor,shape:&[i32])->Result<MlxTensor,Self::Error>{
         safemlx::ops::zeros_dtype(shape,prototype.as_array().dtype(),self.0)
-            .map(MlxTensor::from_array).map_err(eredu_nn::Error::backend_source)
+            .map(MlxTensor::from_array).map_err(eredu_nn::Error::backend_retained_source)
     }
     fn indexed_add(&self,base:&MlxTensor,indices:&MlxTensor,updates:&MlxTensor)->Result<MlxTensor,Self::Error>{
         base.as_array().scatter_add(indices.as_array(),updates.as_array(),0,self.0)
-            .map(MlxTensor::from_array).map_err(eredu_nn::Error::backend_source)
+            .map(MlxTensor::from_array).map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 pub(crate) struct Workspace<'a>(pub(crate) &'a WorkspaceContext);

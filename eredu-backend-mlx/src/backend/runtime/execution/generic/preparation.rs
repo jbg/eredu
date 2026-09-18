@@ -133,7 +133,7 @@ where
             .address(index)
             .expect("validated layout covers every flat unit");
         let path = architecture
-            .unit_path(address.group(), address.index())
+            .unit_path(address.group(), address.index(), None)
             .map_err(|error| Error::Other(Box::new(error)))?;
         let unit = architecture
             .build_unit(address.group(), address.index(), stream)

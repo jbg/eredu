@@ -90,6 +90,11 @@ use core::mem;
 
 use alloc::{sync::Arc, vec::Vec};
 
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
+
+#[cfg(test)]
+mod allocation_tests;
+
 use crate::util::{
     int::{I32, U32},
     look::LookSet,
@@ -128,7 +133,11 @@ impl core::fmt::Debug for State {
 /// For docs on these routines, see the internal Repr and ReprVec types below.
 impl State {
     pub(crate) fn dead() -> State {
-        StateBuilderEmpty::new().into_matches().into_nfa().to_state()
+        Self::dead_with_allocations(&Unenforced).expect("ordinary DFA state allocation")
+    }
+
+    pub(crate) fn dead_with_allocations(funding: &dyn Allocation) -> Result<State, AllocationError> {
+        StateBuilderEmpty::new().into_matches_with_allocations(funding)?.into_nfa().to_state_with_allocations(funding)
     }
 
     pub(crate) fn is_match(&self) -> bool {
@@ -160,7 +169,11 @@ impl State {
     }
 
     pub(crate) fn match_pattern_ids(&self) -> Option<Vec<PatternID>> {
-        self.repr().match_pattern_ids()
+        self.match_pattern_ids_with_allocations(&Unenforced).expect("ordinary DFA pattern allocation")
+    }
+
+    pub(crate) fn match_pattern_ids_with_allocations(&self, funding: &dyn Allocation) -> Result<Option<Vec<PatternID>>, AllocationError> {
+        self.repr().match_pattern_ids_with_allocations(funding)
     }
 
     #[cfg(all(test, not(miri)))]
@@ -187,18 +200,30 @@ impl State {
 /// NFA state IDs, no assertions set and no pattern IDs. No allocations are
 /// made when new() is called. Its main use is for being converted into a
 /// builder that can capture assertions and pattern IDs.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct StateBuilderEmpty(Vec<u8>);
 
 /// For docs on these routines, see the internal Repr and ReprVec types below.
+impl Clone for StateBuilderEmpty {
+    fn clone(&self) -> Self { self.clone_with_allocations(&Unenforced).expect("ordinary DFA builder clone") }
+}
+
 impl StateBuilderEmpty {
+    pub(crate) fn clone_with_allocations(&self, funding: &dyn Allocation) -> Result<Self, AllocationError> {
+        Ok(Self(Allocator::new(funding).copy_slice(&self.0)?))
+    }
+
     pub(crate) fn new() -> StateBuilderEmpty {
         StateBuilderEmpty(alloc::vec![])
     }
 
-    pub(crate) fn into_matches(mut self) -> StateBuilderMatches {
-        self.0.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        StateBuilderMatches(self.0)
+    pub(crate) fn into_matches(self) -> StateBuilderMatches {
+        self.into_matches_with_allocations(&Unenforced).expect("ordinary DFA state allocation")
+    }
+
+    pub(crate) fn into_matches_with_allocations(mut self, funding: &dyn Allocation) -> Result<StateBuilderMatches, AllocationError> {
+        Allocator::new(funding).extend_copy(&mut self.0, &[0; 9])?;
+        Ok(StateBuilderMatches(self.0))
     }
 
     fn clear(&mut self) {
@@ -214,7 +239,6 @@ impl StateBuilderEmpty {
 ///
 /// When collecting pattern IDs is finished, this can be converted into a
 /// builder that collects NFA state IDs.
-#[derive(Clone)]
 pub(crate) struct StateBuilderMatches(Vec<u8>);
 
 impl core::fmt::Debug for StateBuilderMatches {
@@ -224,7 +248,15 @@ impl core::fmt::Debug for StateBuilderMatches {
 }
 
 /// For docs on these routines, see the internal Repr and ReprVec types below.
+impl Clone for StateBuilderMatches {
+    fn clone(&self) -> Self { self.clone_with_allocations(&Unenforced).expect("ordinary DFA builder clone") }
+}
+
 impl StateBuilderMatches {
+    pub(crate) fn clone_with_allocations(&self, funding: &dyn Allocation) -> Result<Self, AllocationError> {
+        Ok(Self(Allocator::new(funding).copy_slice(&self.0)?))
+    }
+
     pub(crate) fn into_nfa(mut self) -> StateBuilderNFA {
         self.repr_vec().close_match_pattern_ids();
         StateBuilderNFA { repr: self.0, prev_nfa_state_id: StateID::ZERO }
@@ -250,7 +282,11 @@ impl StateBuilderMatches {
     }
 
     pub(crate) fn add_match_pattern_id(&mut self, pid: PatternID) {
-        self.repr_vec().add_match_pattern_id(pid)
+        self.add_match_pattern_id_with_allocations(pid, &Unenforced).expect("ordinary DFA pattern allocation")
+    }
+
+    pub(crate) fn add_match_pattern_id_with_allocations(&mut self, pid: PatternID, funding: &dyn Allocation) -> Result<(), AllocationError> {
+        self.repr_vec().add_match_pattern_id(pid, Allocator::new(funding))
     }
 
     fn repr(&self) -> Repr<'_> {
@@ -270,7 +306,6 @@ impl StateBuilderMatches {
 /// When dont with building a state (regardless of whether it got kept or not),
 /// it's usually a good idea to call `clear` to get an empty builder back so
 /// that it can be reused to build the next state.
-#[derive(Clone)]
 pub(crate) struct StateBuilderNFA {
     repr: Vec<u8>,
     prev_nfa_state_id: StateID,
@@ -283,9 +318,21 @@ impl core::fmt::Debug for StateBuilderNFA {
 }
 
 /// For docs on these routines, see the internal Repr and ReprVec types below.
+impl Clone for StateBuilderNFA {
+    fn clone(&self) -> Self { self.clone_with_allocations(&Unenforced).expect("ordinary DFA builder clone") }
+}
+
 impl StateBuilderNFA {
+    pub(crate) fn clone_with_allocations(&self, funding: &dyn Allocation) -> Result<Self, AllocationError> {
+        Ok(Self { repr: Allocator::new(funding).copy_slice(&self.repr)?, prev_nfa_state_id: self.prev_nfa_state_id })
+    }
+
     pub(crate) fn to_state(&self) -> State {
-        State(Arc::from(&*self.repr))
+        self.to_state_with_allocations(&Unenforced).expect("ordinary DFA state allocation")
+    }
+
+    pub(crate) fn to_state_with_allocations(&self, funding: &dyn Allocation) -> Result<State, AllocationError> {
+        Ok(State(Allocator::new(funding).copy_arc_slice(&self.repr)?))
     }
 
     pub(crate) fn clear(self) -> StateBuilderEmpty {
@@ -313,8 +360,11 @@ impl StateBuilderNFA {
     }
 
     pub(crate) fn add_nfa_state_id(&mut self, sid: StateID) {
-        ReprVec(&mut self.repr)
-            .add_nfa_state_id(&mut self.prev_nfa_state_id, sid)
+        self.add_nfa_state_id_with_allocations(sid, &Unenforced).expect("ordinary DFA state allocation")
+    }
+
+    pub(crate) fn add_nfa_state_id_with_allocations(&mut self, sid: StateID, funding: &dyn Allocation) -> Result<(), AllocationError> {
+        ReprVec(&mut self.repr).add_nfa_state_id(&mut self.prev_nfa_state_id, sid, Allocator::new(funding))
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -486,13 +536,12 @@ impl<'a> Repr<'a> {
 
     /// Returns a copy of all match pattern IDs in this state. If this state
     /// is not a match state, then this returns None.
-    fn match_pattern_ids(&self) -> Option<Vec<PatternID>> {
-        if !self.is_match() {
-            return None;
-        }
-        let mut pids = alloc::vec![];
+    fn match_pattern_ids_with_allocations(&self, funding: &dyn Allocation) -> Result<Option<Vec<PatternID>>, AllocationError> {
+        if !self.is_match() { return Ok(None); }
+        let mut pids = Vec::new();
+        Allocator::new(funding).grow(&mut pids, self.match_len())?;
         self.iter_match_pattern_ids(|pid| pids.push(pid));
-        Some(pids)
+        Ok(Some(pids))
     }
 
     /// Calls the given function on every pattern ID in this state.
@@ -564,15 +613,24 @@ impl<'a> Repr<'a> {
 
 impl<'a> core::fmt::Debug for Repr<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let mut nfa_ids = alloc::vec![];
-        self.iter_nfa_state_ids(|sid| nfa_ids.push(sid));
+        struct Ids<'a> { repr: &'a Repr<'a>, patterns: bool }
+        impl core::fmt::Debug for Ids<'_> {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                let mut list = f.debug_list();
+                if self.patterns { self.repr.iter_match_pattern_ids(|id| { list.entry(&id); }); }
+                else { self.repr.iter_nfa_state_ids(|id| { list.entry(&id); }); }
+                list.finish()
+            }
+        }
+        let nfa_ids = Ids { repr: self, patterns: false };
+        let pattern_ids = self.is_match().then_some(Ids { repr: self, patterns: true });
         f.debug_struct("Repr")
             .field("is_match", &self.is_match())
             .field("is_from_word", &self.is_from_word())
             .field("is_half_crlf", &self.is_half_crlf())
             .field("look_have", &self.look_have())
             .field("look_need", &self.look_need())
-            .field("match_pattern_ids", &self.match_pattern_ids())
+            .field("match_pattern_ids", &pattern_ids)
             .field("nfa_state_ids", &nfa_ids)
             .finish()
     }
@@ -654,7 +712,12 @@ impl<'a> ReprVec<'a> {
     ///
     /// The order in which patterns are added must correspond to the order
     /// in which patterns are reported as matches.
-    fn add_match_pattern_id(&mut self, pid: PatternID) {
+    fn add_match_pattern_id(&mut self, pid: PatternID, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        // Admit the entire emission before changing the compact header.
+        let additional = if self.repr().has_pattern_ids() { PatternID::SIZE }
+            else if pid == PatternID::ZERO { 0 }
+            else { PatternID::SIZE * if self.repr().is_match() { 3 } else { 2 } };
+        allocation.grow(self.0, additional)?;
         // As a (somewhat small) space saving optimization, in the case where
         // a matching state has exactly one pattern ID, PatternID::ZERO, we do
         // not write either the pattern ID or the number of patterns encoded.
@@ -668,7 +731,7 @@ impl<'a> ReprVec<'a> {
         if !self.repr().has_pattern_ids() {
             if pid == PatternID::ZERO {
                 self.set_is_match();
-                return;
+                return Ok(());
             }
             // Make room for 'close_match_pattern_ids' to write the total
             // number of pattern IDs written.
@@ -681,13 +744,14 @@ impl<'a> ReprVec<'a> {
             // which case, we want to make sure to represent ZERO explicitly
             // now.
             if self.repr().is_match() {
-                write_u32(self.0, 0)
+                write_u32(self.0, 0, allocation)?
             } else {
                 // Otherwise, just make sure the 'is_match' bit is set.
                 self.set_is_match();
             }
         }
-        write_u32(self.0, pid.as_u32());
+        write_u32(self.0, pid.as_u32(), allocation)?;
+        Ok(())
     }
 
     /// Indicate that no more pattern IDs will be added to this state.
@@ -717,10 +781,11 @@ impl<'a> ReprVec<'a> {
     /// Add an NFA state ID to this state. The order in which NFA states are
     /// added matters. It is the caller's responsibility to ensure that
     /// duplicate NFA state IDs are not added.
-    fn add_nfa_state_id(&mut self, prev: &mut StateID, sid: StateID) {
+    fn add_nfa_state_id(&mut self, prev: &mut StateID, sid: StateID, allocation: Allocator<'_>) -> Result<(), AllocationError> {
         let delta = sid.as_i32() - prev.as_i32();
-        write_vari32(self.0, delta);
+        write_vari32_with_allocations(self.0, delta, allocation)?;
         *prev = sid;
+        Ok(())
     }
 
     /// Return a read-only view of this state's representation.
@@ -732,12 +797,17 @@ impl<'a> ReprVec<'a> {
 /// Write a signed 32-bit integer using zig-zag encoding.
 ///
 /// https://developers.google.com/protocol-buffers/docs/encoding#varints
+#[cfg(test)]
 fn write_vari32(data: &mut Vec<u8>, n: i32) {
+    write_vari32_with_allocations(data, n, Allocator::unenforced()).expect("ordinary state varint")
+}
+
+fn write_vari32_with_allocations(data: &mut Vec<u8>, n: i32, allocation: Allocator<'_>) -> Result<(), AllocationError> {
     let mut un = n.to_bits() << 1;
     if n < 0 {
         un = !un;
     }
-    write_varu32(data, un)
+    write_varu32_with_allocations(data, un, allocation)
 }
 
 /// Read a signed 32-bit integer using zig-zag encoding. Also, return the
@@ -760,12 +830,22 @@ fn read_vari32(data: &[u8]) -> (i32, usize) {
 /// very common cases, it uses fewer than 4.
 ///
 /// https://developers.google.com/protocol-buffers/docs/encoding#varints
-fn write_varu32(data: &mut Vec<u8>, mut n: u32) {
+#[cfg(test)]
+fn write_varu32(data: &mut Vec<u8>, n: u32) {
+    write_varu32_with_allocations(data, n, Allocator::unenforced()).expect("ordinary state varint")
+}
+
+fn write_varu32_with_allocations(data: &mut Vec<u8>, mut n: u32, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+    let mut remaining = n;
+    let mut bytes = 1;
+    while remaining >= 0x80 { bytes += 1; remaining >>= 7; }
+    allocation.grow(data, bytes)?;
     while n >= 0b1000_0000 {
         data.push(n.low_u8() | 0b1000_0000);
         n >>= 7;
     }
     data.push(n.low_u8());
+    Ok(())
 }
 
 /// Read an unsigned 32-bit varint. Also, return the number of bytes read.
@@ -788,12 +868,14 @@ fn read_varu32(data: &[u8]) -> (u32, usize) {
 }
 
 /// Push a native-endian encoded `n` on to `dst`.
-fn write_u32(dst: &mut Vec<u8>, n: u32) {
+fn write_u32(dst: &mut Vec<u8>, n: u32, allocation: Allocator<'_>) -> Result<(), AllocationError> {
     use crate::util::wire::NE;
 
     let start = dst.len();
+    allocation.grow(dst, mem::size_of::<u32>())?;
     dst.extend(core::iter::repeat(0).take(mem::size_of::<u32>()));
     NE::write_u32(n, &mut dst[start..]);
+    Ok(())
 }
 
 #[cfg(test)]

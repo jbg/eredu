@@ -1,7 +1,7 @@
 //! Original source custody around the existing pre-forward coordination worker.
 use super::*;
 use eredu_core::{BoundedCompletion, BoundedCompletionWait};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 use crate::working_memory::PartitionCaptureRankSource;
@@ -15,7 +15,7 @@ enum Cause {
     #[error("partition capture coordination source: {0}")]
     Source(&'static str),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Capture(#[from] CaptureError),
     #[error(transparent)]
@@ -31,7 +31,7 @@ pub struct PartitionCaptureCoordinationError {
     #[source]
     cause: Cause,
     _source: SharedCapturePlan,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 
 /// One source-bound, move-only pre-forward vote. The enclosing observer adds
@@ -52,7 +52,7 @@ pub struct PreparedPartitionCaptureCoordination<'a, T: PartitionCaptureTransport
     intervention_last: Option<usize>,
     reserved: CaptureUsage,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 impl<T: PartitionCaptureTransport> std::fmt::Debug for PreparedPartitionCaptureCoordination<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,7 +69,7 @@ where T::Error: Send + Sync + 'static,
     /// labels alone do not authenticate a loaded native world or request.
     pub fn prepare(
         transport: &'a T, source: &SharedCapturePlan, context: &PartitionCaptureContext,
-        metadata: &WorkspaceMetadataFunding, ledger: &mut dyn CaptureReservation,
+        metadata: &HostMetadataFunding, ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureCoordinationError> {
         let error = |cause| PartitionCaptureCoordinationError {
             cause, _source: source.clone(), _metadata: metadata.clone(),
@@ -86,7 +86,7 @@ where T::Error: Send + Sync + 'static,
             size_of::<serde_json::Serializer<&mut HashWriter<'_>>>(),
             crate::capture::RECORD_ENCODING_CONTROL_BYTES,
             size_of::<(&T, &SharedCapturePlan, &PartitionCaptureContext,
-                &WorkspaceMetadataFunding, &mut dyn CaptureReservation)>(),
+                &HostMetadataFunding, &mut dyn CaptureReservation)>(),
             size_of::<[&String; 4]>(), size_of::<[u8; 8]>(),
             size_of::<CaptureUsage>() * 3,
         ];
@@ -159,7 +159,7 @@ where T::Error: Send + Sync + 'static,
             Option<&TensorDtype>,CaptureUsage,&CaptureLedger)>()
             +size_of::<Result<TensorDtype,PartitionCaptureCoordinationError>>())
             .map_err(|cause|self.error(cause.into()))?;
-        if !receipt.shared_plan_source().is_some_and(|source|source.same_storage(&self.source))
+        if !receipt.shared_plan_source().same_storage(&self.source)
             || !same_forward(&self.context,receipt.context()) || receipt.context().selection_index!=index
             || receipt.world_size()!=self.participants
             || receipt.producers().any(|(rank,p)|rank>=self.participants || p.fragments().len()>1
@@ -181,7 +181,7 @@ where T::Error: Send + Sync + 'static,
         ->Result<PartitionCaptureRoutedVote,PartitionCaptureCoordinationError> {
         self.metadata.reserve_metadata(size_of::<PartitionCaptureRoutedVote>()+size_of::<(&Self,usize,&PartitionCaptureReceiptPlan,bool,Option<&TensorDtype>,CaptureUsage,&CaptureLedger)>())
             .map_err(|e|self.error(e.into()))?;
-        if !receipt.shared_plan_source().is_some_and(|source|source.same_storage(&self.source))
+        if !receipt.shared_plan_source().same_storage(&self.source)
             || !same_forward(&self.context,receipt.context()) || receipt.context().selection_index!=index
             || receipt.world_size()!=self.participants || receipt.producers().any(|(rank,_)|
                 rank>=self.participants || receipt.routed_producer(rank).is_none())
@@ -299,7 +299,7 @@ where T::Error: Send + Sync + 'static,
         let actual = receipt.context();
         if index != Some(actual.selection_index)
             || receipt.world_size() != self.participants
-            || !receipt.shared_plan_source().is_some_and(|source| source.same_storage(&self.source))
+            || !receipt.shared_plan_source().same_storage(&self.source)
             || !same_forward(&self.context, actual)
             || !matches!(dtype, TensorDtype::F16 | TensorDtype::F32 | TensorDtype::Bf16)
         { return Err(self.error(Cause::Source("receipt order, source or forward differs"))); }
@@ -420,3 +420,5 @@ impl std::io::Write for HashWriter<'_> {
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

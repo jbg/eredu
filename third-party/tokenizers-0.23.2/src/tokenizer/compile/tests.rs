@@ -102,10 +102,9 @@ fn selected_regex_and_actual_normalizer_authority_reject_before_construction() {
     let mut value = source();
     value["normalizer"] = json!({"type":"NFC"});
     let input = value.to_string();
-    assert!(matches!(
-        TokenizerCompilePlan::prepare_json(input.as_bytes()),
-        Err(Error::Added(_))
-    ));
+    let actual = TokenizerCompilePlan::prepare_json(input.as_bytes()).unwrap().compile().unwrap();
+    let ordinary = Tokenizer::from_bytes(input.as_bytes()).unwrap();
+    compare(&actual, &ordinary, "HI hi e\u{301}");
     for field in ["single_word", "lstrip", "rstrip"] {
         let mut value = source();
         value["added_tokens"][0][field] = json!(true);
@@ -171,7 +170,7 @@ fn every_model_and_added_target_reserve_preserves_its_real_prefix_in_the_root_fa
         assert!(caps[..stage].iter().all(|&n| n > 0));
         assert!(caps[stage..].iter().all(|&n| n == 0));
     }
-    for stage in 0..4 {
+    for stage in 0..5 {
         let input = source().to_string();
         let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
             .unwrap()

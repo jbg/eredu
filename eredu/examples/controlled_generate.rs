@@ -1,16 +1,16 @@
 //! Complete local facade workflow; bounded JSONL records go to stdout.
 use eredu::{
     api::{
-        local_device_plan, ControlledGenerationRecord, GenerationBranchOptions, LoadedModel,
-        LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, SamplingOverride,
-        TraceLimits,
+        ChatSourceInput, ControlledGenerationRecord, GenerationBranchOptions, LoadedModel,
+        LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, PreparedChatRequest,
+        SamplingOverride, TokenizerSourceInput, TraceLimits, local_device_plan,
     },
     runtime::chat::{ChatTemplateRequest, ToolChoice},
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    capture::*, execution_control::*, intervention::*, ExecutionPlan, GenerationConfigOverrides,
-    ObservationSupportStatus, SemanticEvent, SessionCapabilities,
+    ExecutionPlan, GenerationConfigOverrides, ObservationSupportStatus, SemanticEvent,
+    SessionCapabilities, capture::*, execution_control::*, intervention::*,
 };
 use std::ops::ControlFlow;
 
@@ -18,7 +18,7 @@ fn output(
     events: &mut Vec<SemanticEvent>,
 ) -> impl FnMut(ControlledGenerationRecord) -> ControlFlow<()> + '_ {
     |record| {
-        if let ObservedGenerationEvent::Semantic { event, .. } = &record.generation.event {
+        if let Some(ObservedGenerationEvent::Semantic { event, .. }) = record.event.progress() {
             events.push(event.clone());
         }
         println!(
@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
     run_example(std::path::Path::new(artifact), prompt, dtype)
 }
 
-/// Runs the same complete workflow used by the CLI and its native fixture test.
+/// Runs the command-line example workflow also exercised by native fixture tests.
 pub fn run_example(
     artifact: &std::path::Path,
     prompt: &str,
@@ -116,20 +116,39 @@ pub fn run_example(
     };
     let original = intervention(InterventionAction::Scale { dtype, factor: 1.0 });
     let modified = intervention(InterventionAction::Zero { dtype });
-    // Current complete-snapshot coverage requires the ordinary forbidden-tool
-    // constraint owner. Active/automatic llguidance state has no complete cost
-    // estimator. This request declares a tool surface and explicitly forbids calls.
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            true,
+            &cancellation,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before chat source"))?;
+    let policy = ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":prompt})],
         tools: vec![serde_json::json!({"type":"function", "function": {
             "name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}
-        }})], tool_choice: ToolChoice::None, enable_thinking: Some(false),
-        add_generation_prompt: true, ..Default::default()
-    })?;
+        }})],
+        tool_choice: ToolChoice::None,
+        enable_thinking: Some(false),
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let chat = model
+        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before chat preparation"))?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(0.7),
             max_new_tokens: Some(12),
+            ..Default::default()
+        },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
             ..Default::default()
         },
         seed: 42,
@@ -139,20 +158,28 @@ pub fn run_example(
         per_record_bytes: 64 << 10,
         total_bytes: 128 << 10,
     };
-    let prepared = model.prepare_intervened_chat(&chat, settings, capture, original, trace)?;
+    let mut request = PreparedChatRequest::new(&chat, settings);
+    request.capture = Some(&capture);
+    request.intervention = Some(&original);
     let mut prefix = vec![];
-    let mut run = model.start_controlled_chat(
-        prepared,
-        &[],
-        GenerationControlHandle::default(),
-        output(&mut prefix),
+    let mut run = model
+        .start_controlled_chat(
+            request,
+            trace,
+            GenerationControlHandle::default(),
+            output(&mut prefix),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before generation"))?;
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_snapshots: 1,
+            max_branches: 1,
+            retained_bytes: 512 << 20,
+            cumulative_copy_bytes: 2 << 30,
+        },
+        CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
     )?;
-    run.enable_snapshots(SnapshotLimits {
-        max_snapshots: 1,
-        max_branches: 1,
-        retained_bytes: 512 << 20,
-        cumulative_copy_bytes: 2 << 30,
-    })?;
     for _ in 0..2 {
         anyhow::ensure!(
             matches!(

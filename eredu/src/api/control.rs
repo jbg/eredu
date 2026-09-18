@@ -1,103 +1,457 @@
-//! Stateful facade composition over the ordinary committed-token driver.
-
+//! Funded record delivery composed over the canonical prepared chat session.
 use super::{
-    loaded::map_prepared_chat_setup_error,
-    observed::{new_identity, TraceBudget},
-    request::{PreparedChatTokenDecoder, PreparedGenerationMode},
-    ConstraintError, LoadedModel, ObservedGenerationEvent, ObservedGenerationRecord,
-    PreparedChatError, PreparedObservedGeneration,
+    ConstraintError, GenerationSnapshotError, LoadedModel, ObservedGenerationEvent,
+    PreparedChatOutputMode, PreparedChatRequest, PreparedChatSession, PreparedChatSessionError,
+    TraceLimits, observed::TraceBudget,
 };
-use crate::runtime::{chat::constraints::ConstraintController, generation::streaming::*};
+use crate::runtime::generation::storage::SnapshotStorage;
+use eredu_core::generation::SemanticEvent;
 use eredu_core::{capture::*, execution_control::*, generation::*, *};
+use eredu_runtime::execution_control::TextSnapshotBackend;
 use eredu_runtime::execution_control::{
-    GenerationLifecycle, ManagedTextContinuation, SamplingOverride, SamplingOverrideError,
-    SamplingStateFacts, TextSamplingControlBackend, TokenChoiceController, TokenChoiceError,
+    SamplingOverride, SamplingOverrideError, SamplingStateFacts, SnapshotBudget,
+    TextSamplingControlBackend, TokenChoiceError,
 };
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, ops::ControlFlow, time::Instant};
+use std::{cell::RefCell, mem::size_of, ops::ControlFlow, time::Instant};
 
-type ControlConstraints = TokenChoiceController<ConstraintController>;
 type ControlConstraintError = TokenChoiceError<ConstraintError>;
-
-#[derive(Clone, Copy, Serialize)]
-enum OutputMode {
-    Semantic,
-    Text,
-}
-
-mod prepared;
-mod records;
-use prepared::StartupPolicy;
-pub use prepared::*;
-pub use records::*;
-use records::{BranchInfo, ControlEvent, PromptRecord, RecordContext, SnapshotInfo};
-
 mod branch;
 mod configuration_identity;
+mod delivery;
+mod failure;
+mod prepared;
+pub(crate) mod records;
 mod snapshot;
-pub use branch::{ControlledGenerationBranch, GenerationBranchMetadata, GenerationBranchOptions};
-pub use snapshot::{
-    ControlledGenerationSnapshot, GenerationOutputCheckpoint, GenerationSnapshotMetadata,
-};
+pub use branch::{ControlledGenerationBranch, GenerationBranchOptions};
+use delivery::Delivery;
+pub use failure::ControlledSessionFailure;
+pub use records::*;
+use records::{BranchInfo, ControlEvent, PromptRecord, RecordContext, SnapshotInfo};
+pub use snapshot::{ControlledGenerationSnapshot, GenerationOutputCheckpoint, GenerationOutputCheckpointData};
 
-/// Ordered, bounded delivery from a controllable run. Sequence numbers count
-/// delivered records monotonically; prediction positions are carried by the event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ControlledGenerationRecord {
-    /// Control record wire version.
-    pub schema_version: u32,
-    /// Monotone per-run output sequence, starting at zero.
-    pub sequence: u64,
-    /// Monotone restoration epoch; zero before any restore.
-    pub epoch: u64,
-    /// Active time to first commitment; absent until a token commits.
-    #[serde(default)]
-    pub timing: GenerationTiming,
-    /// Existing source/session/plan attribution and ordinary event semantics.
-    pub generation: ObservedGenerationRecord,
-}
-
-/// Typed setup, execution, semantic, lifecycle or bounded delivery failure.
+/// Original preparation, execution, record or copy failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlledGenerationError {
-    /// Existing prepared-chat generation failure.
     #[error(transparent)]
-    Generation(#[from] PreparedChatError),
-    /// Completed-token ownership, execution or completion failure.
+    Record(#[from] RecordConstructionError),
     #[error(transparent)]
-    Continuation(TextContinuationError<BackendFailure, ControlConstraintError>),
-    /// Prospective forced token conflicts with canonical vocabulary or grammar.
+    Session(#[from] PreparedChatSessionError),
     #[error(transparent)]
-    Choice(#[from] ControlConstraintError),
-    /// Invalid prospective sampling request or failure preparing a new native key.
+    Failed(ControlledSessionFailure),
+    #[error("{record}")]
+    RecordedFailure {
+        #[source]
+        record: RecordConstructionError,
+        session: ControlledSessionFailure,
+    },
+    #[error("{capture}")]
+    CaptureFailure {
+        #[source]
+        capture: CaptureError,
+        session: ControlledSessionFailure,
+    },
     #[error(transparent)]
-    Sampling(SamplingOverrideError<BackendFailure>),
-    /// Complete native or host snapshot preparation/compatibility failure.
-    #[error(transparent)]
-    Snapshot(eredu_runtime::execution_control::TextSnapshotError<BackendFailure>),
-    /// Invalid lifecycle transition or resource arithmetic.
+    Snapshot(#[from] GenerationSnapshotError),
     #[error(transparent)]
     Control(#[from] ExecutionControlError),
-    /// Unsupported configuration, admission or transport budget failure.
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    #[error(transparent)]
+    Backend(#[from] BackendFailure),
+    #[error("{0}")]
+    Rejected(&'static str),
 }
-
-impl From<eredu_core::run_preparation::TextCaptureSetupError> for ControlledGenerationError {
-    fn from(error: eredu_core::run_preparation::TextCaptureSetupError) -> Self {
-        PreparedChatError::from(error).into()
+impl ControlledGenerationError {
+    /// The canonical session failure, retaining its original source and prefix.
+    pub fn session_failure(&self) -> Option<&PreparedChatSessionError> {
+        match self {
+            Self::Session(error) => Some(error),
+            Self::Failed(error) => Some(error.error()),
+            Self::RecordedFailure { session, .. } | Self::CaptureFailure { session, .. } => {
+                Some(session.error())
+            }
+            _ => None,
+        }
+    }
+    /// Borrow the provider's neutral failure without replacing its typed source.
+    pub fn backend_failure(&self) -> Option<&BackendFailure> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::Snapshot(error) => match error.cause() {
+                eredu_runtime::execution_control::TextSnapshotError::Backend(error)
+                | eredu_runtime::execution_control::TextSnapshotError::HostPreparation(error) => Some(error),
+                error @ eredu_runtime::execution_control::TextSnapshotError::Resume(_) => error.resume_backend_failure(),
+                eredu_runtime::execution_control::TextSnapshotError::RetainedBackend(error) => {
+                    std::error::Error::source(error)?.downcast_ref()
+                }
+                _ => None,
+            },
+            _ => self.session_failure()?.backend_failure(),
+        }
     }
 }
 
-impl<E: std::error::Error + Send + Sync + 'static>
-    From<TextContinuationError<E, ControlConstraintError>> for ControlledGenerationError
-{
-    fn from(error: TextContinuationError<E, ControlConstraintError>) -> Self {
-        Self::Continuation(map_continuation_failure(error, BackendFailure::from_error))
+/// The prepared session owns all model, cursor, decoder, sampling and lifecycle
+/// state. This wrapper owns only synchronous record delivery and its journal.
+pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
+    session: Option<PreparedChatSession<'a, B>>,
+    failed: bool,
+    failure: ControlledSessionFailure,
+    tokenizer_identity: [u8; 32],
+    snapshot_budget: Option<SnapshotBudget>,
+    snapshot_host_capacity: u64,
+    native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits,
+    capabilities: ExecutionControlCapabilities,
+    delivery: Delivery,
+    // Copied record prefix destinations retire after all journal payloads.
+    journal_destination: Option<HostPreparationAuthority>,
+}
+impl<'a, B: TextGenerationBackend> ControlledGenerationSession<'a, B> {
+    fn active(&self) -> Result<&PreparedChatSession<'a, B>, ControlledGenerationError> {
+        if self.failed {
+            return Err(ControlledGenerationError::Rejected(
+                "recorded generation has failed",
+            ));
+        }
+        self.session
+            .as_ref()
+            .ok_or(ControlledGenerationError::Rejected(
+                "recorded generation has failed",
+            ))
+    }
+    fn active_mut(&mut self) -> Result<&mut PreparedChatSession<'a, B>, ControlledGenerationError> {
+        if self.failed {
+            return Err(ControlledGenerationError::Rejected(
+                "recorded generation has failed",
+            ));
+        }
+        self.session
+            .as_mut()
+            .ok_or(ControlledGenerationError::Rejected(
+                "recorded generation has failed",
+            ))
+    }
+    pub fn timing(&self) -> GenerationTiming {
+        self.delivery.timing
+    }
+    pub fn status(&self) -> GenerationStatus {
+        if self.failed {
+            GenerationStatus::Failed
+        } else {
+            self.session
+                .as_ref()
+                .map_or(GenerationStatus::Failed, PreparedChatSession::status)
+        }
+    }
+    pub fn next_prediction(&self) -> u64 {
+        self.session.as_ref().map_or(
+            self.delivery.prediction,
+            PreparedChatSession::next_prediction,
+        )
+    }
+    pub fn token_ids(&self) -> &[u32] {
+        self.session
+            .as_ref()
+            .map_or_else(|| self.failure.prefix(), PreparedChatSession::token_ids)
+    }
+    pub fn finish_reason(&self) -> Option<FinishReason> {
+        self.session
+            .as_ref()
+            .and_then(PreparedChatSession::finish_reason)
+    }
+    pub fn control_handle(&self) -> GenerationControlHandle {
+        self.delivery.control.clone()
+    }
+    pub fn emitted_bytes(&self) -> u64 {
+        self.delivery.budget.emitted_bytes()
+    }
+    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
+        self.delivery.prompt.prepared().attribution()
+    }
+    pub fn semantic_snapshot_bytes(&self) -> Option<u64> {
+        self.session
+            .as_ref()?
+            .semantic_snapshot_bytes()?
+            .checked_add(self.delivery.semantic_prefix.snapshot_bytes()?)
+    }
+    /// Borrowed report built under the original preparation account.
+    pub fn capabilities(&self) -> &ExecutionControlCapabilities {
+        &self.capabilities
+    }
+    pub fn force_next_token(&mut self, token: u32) -> Result<(), ControlledGenerationError> {
+        self.require_live_control()?;
+        self.active_mut()?.force_next_token(token)?;
+        Ok(())
+    }
+    pub fn clear_forced_token(&mut self) -> Result<bool, ControlledGenerationError> {
+        self.require_live_control()?;
+        Ok(self.active_mut()?.clear_forced_token()?)
+    }
+    pub fn pending_forced_token(&self) -> Option<u32> {
+        self.session
+            .as_ref()
+            .and_then(PreparedChatSession::pending_forced_token)
+    }
+    fn require_live_control(&self) -> Result<(), ControlledGenerationError> {
+        self.active()?;
+        if self.delivery.control.cancellation().is_cancelled() {
+            return Err(ControlledGenerationError::Rejected(
+                "generation cancellation was requested",
+            ));
+        }
+        Ok(())
+    }
+    fn lifecycle_record(
+        &mut self,
+        emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) {
+        self.delivery.send(
+            ObservedGenerationEvent::Lifecycle {
+                status: self.status(),
+                next_prediction: self.next_prediction(),
+            },
+            emit,
+        );
+    }
+    fn delivery_result(&mut self) -> Result<(), ControlledGenerationError> {
+        let local = match self.delivery.record_failure.take() {
+            Some(error) => Err(error.into()),
+            None => match self.delivery.failure.take() {
+                Some(error) => Err(error.into()),
+                None => Ok((!self.delivery.control.cancellation().is_cancelled()).then_some(())),
+            },
+        };
+        match self
+            .active()?
+            .finish_record_delivery(local, ControlledGenerationError::Backend)
+        {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => {
+                self.delivery.control.cancel();
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+    /// Advances the same prepared session once. Capture precedes semantic output;
+    /// record refusal participates in the same completed-delivery agreement.
+    pub fn step(
+        &mut self,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(emit))) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.failed = true;
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+    fn step_inner(
+        &mut self,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
+        self.active()?;
+        if matches!(
+            self.status(),
+            GenerationStatus::Completed | GenerationStatus::Cancelled
+        ) {
+            return Err(ExecutionControlError::Transition {
+                from: self.status(),
+                to: GenerationStatus::Running,
+            }
+            .into());
+        }
+        let cancellation = self.delivery.control.cancellation().clone();
+        let session = self.session.take().expect("checked live session");
+        let result = {
+            let delivery = RefCell::new((&mut self.delivery, &mut emit));
+            let mut observer = |token, captures, facts: crate::api::request::TokenDeliveryFacts| {
+                let mut cell = delivery.borrow_mut();
+                let (delivery, emit) = &mut *cell;
+                delivery.timing = facts.timing;
+                delivery.token(token, facts.forced, captures, facts.step_seconds, emit);
+            };
+            let failure = || {
+                let cell = delivery.borrow();
+                (cell.0.record_failure.is_some() || cell.0.failure.is_some())
+                    .then_some(CaptureError::Overflow)
+            };
+            let mut semantic = |event| {
+                let mut cell = delivery.borrow_mut();
+                let (delivery, emit) = &mut *cell;
+                delivery.send(
+                    ObservedGenerationEvent::Semantic {
+                        prediction_index: delivery.prediction.checked_sub(1),
+                        event,
+                    },
+                    emit,
+                );
+            };
+            session.advance_with_delivery(
+                &cancellation,
+                Some(&mut observer),
+                Some(&failure),
+                &mut semantic,
+            )
+        };
+        match result {
+            Ok(session) => {
+                self.delivery.timing = session.timing();
+                self.session = Some(session);
+            }
+            Err(error) => {
+                self.failed = true;
+                let shared = self.failure.publish(error);
+                // The typed source remains in `shared`; the diagnostic record
+                // has fixed qualified text, never an opaque provider formatter.
+                let diagnostic = records::construction::string(
+                    "prepared chat advancement failed",
+                    &self.delivery.funding,
+                );
+                match diagnostic {
+                    Ok(message) => self.delivery.send(
+                        ObservedGenerationEvent::Failed {
+                            message,
+                            elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
+                        },
+                        &mut emit,
+                    ),
+                    Err(cause) if self.delivery.record_failure.is_none() => {
+                        self.delivery.refuse_record(cause)
+                    }
+                    Err(_) => {}
+                }
+                return Err(match self.delivery.record_failure.take() {
+                    Some(record) => ControlledGenerationError::RecordedFailure {
+                        record,
+                        session: shared,
+                    },
+                    None => match self.delivery.failure.take() {
+                        Some(capture) => ControlledGenerationError::CaptureFailure {
+                            capture,
+                            session: shared,
+                        },
+                        None => ControlledGenerationError::Failed(shared),
+                    },
+                });
+            }
+        }
+        if let Some(reason) = self.finish_reason() {
+            self.delivery.send(
+                ObservedGenerationEvent::Completed {
+                    reason,
+                    generated_tokens: self.token_ids().len() as u64,
+                    elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
+                },
+                &mut emit,
+            );
+        }
+        self.lifecycle_record(&mut emit);
+        self.delivery_result()?;
+        Ok(self.status())
+    }
+    pub fn pause(
+        &mut self,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<(), ControlledGenerationError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.active_mut()?.pause()?;
+            self.delivery.control.request_pause();
+            self.lifecycle_record(&mut emit);
+            self.delivery_result()
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.failed = true;
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+    pub fn cancel(
+        &mut self,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
+        self.active()?;
+        if !matches!(
+            self.status(),
+            GenerationStatus::Prepared | GenerationStatus::Paused
+        ) {
+            return Err(ExecutionControlError::Transition {
+                from: self.status(),
+                to: GenerationStatus::Cancelled,
+            }
+            .into());
+        }
+        self.delivery.control.cancel();
+        self.step(emit)
+    }
+    pub fn run(
+        &mut self,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
+        while matches!(
+            self.status(),
+            GenerationStatus::Prepared | GenerationStatus::Paused
+        ) {
+            if self.delivery.control.pause_requested()
+                && !self.delivery.control.cancellation().is_cancelled()
+            {
+                self.pause(&mut emit)?;
+                break;
+            }
+            self.step(&mut emit)?;
+        }
+        Ok(self.status())
+    }
+    pub fn resume(
+        &mut self,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
+        self.active_mut()?.pause()?;
+        self.delivery.control.acknowledge_resume();
+        self.run(emit)
+    }
+}
+impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
+    pub fn sampling_state(&mut self) -> Result<SamplingStateFacts, ControlledGenerationError> {
+        self.require_live_control()?;
+        Ok(self.active_mut()?.sampling_state()?)
+    }
+    pub fn override_sampling(
+        &mut self,
+        request: SamplingOverride,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<(), ControlledGenerationError> {
+        self.require_live_control()?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let before = self.active_mut()?.sampling_state()?;
+            let after = self.active_mut()?.override_sampling(request)?;
+            self.delivery.send(
+                ObservedGenerationEvent::SamplingChanged {
+                    next_prediction: self.next_prediction(),
+                    request,
+                    before,
+                    after,
+                },
+                &mut emit,
+            );
+            self.delivery_result()
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.failed = true;
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 }
 
-fn map_continuation_failure<E: std::error::Error + 'static>(
+pub(crate) fn map_continuation_failure<E: std::error::Error + 'static>(
     error: TextContinuationError<E, ControlConstraintError>,
     convert: impl FnOnce(E) -> BackendFailure,
 ) -> TextContinuationError<BackendFailure, ControlConstraintError> {
@@ -121,36 +475,13 @@ fn map_continuation_failure<E: std::error::Error + 'static>(
     }
 }
 
-fn provider_continuation_error<B: BackendProvider>(
-    error: TextContinuationError<B::Error, ControlConstraintError>,
-) -> ControlledGenerationError {
-    ControlledGenerationError::Continuation(map_continuation_failure(
-        error,
-        B::into_backend_failure,
-    ))
-}
-
-fn map_sampling_failure<E: std::error::Error + 'static>(
+pub(crate) fn map_sampling_failure<E: std::error::Error + 'static>(
     error: SamplingOverrideError<E>,
     convert: impl FnOnce(E) -> BackendFailure,
 ) -> SamplingOverrideError<BackendFailure> {
     match error {
         SamplingOverrideError::Invalid(reason) => SamplingOverrideError::Invalid(reason),
         SamplingOverrideError::Backend(error) => SamplingOverrideError::Backend(convert(error)),
-    }
-}
-
-fn provider_sampling_error<B: BackendProvider>(
-    error: SamplingOverrideError<B::Error>,
-) -> ControlledGenerationError {
-    ControlledGenerationError::Sampling(map_sampling_failure(error, B::into_backend_failure))
-}
-
-impl<E: std::error::Error + Send + Sync + 'static> From<SamplingOverrideError<E>>
-    for ControlledGenerationError
-{
-    fn from(error: SamplingOverrideError<E>) -> Self {
-        Self::Sampling(map_sampling_failure(error, BackendFailure::from_error))
     }
 }
 
@@ -173,661 +504,6 @@ pub(crate) fn map_snapshot_failure<E: std::error::Error + 'static>(
         S::IncompatibleRun => S::IncompatibleRun,
         S::InconsistentState => S::InconsistentState,
         S::Unsupported(reason) => S::Unsupported(reason),
-    }
-}
-
-fn provider_snapshot_error<B: BackendProvider>(
-    error: eredu_runtime::execution_control::TextSnapshotError<B::Error>,
-) -> ControlledGenerationError {
-    ControlledGenerationError::Snapshot(map_snapshot_failure(error, B::into_backend_failure))
-}
-
-impl<E: std::error::Error + Send + Sync + 'static>
-    From<eredu_runtime::execution_control::TextSnapshotError<E>> for ControlledGenerationError
-{
-    fn from(error: eredu_runtime::execution_control::TextSnapshotError<E>) -> Self {
-        Self::Snapshot(map_snapshot_failure(error, BackendFailure::from_error))
-    }
-}
-
-struct Delivery<M: ControlRecordMode> {
-    configuration_identity: [u8; 32],
-    template: RecordContext,
-    budget: TraceBudget,
-    control: GenerationControlHandle,
-    sequence: u64,
-    epoch: u64,
-    prediction: u64,
-    prompt: PromptRecord,
-    mode: std::marker::PhantomData<M>,
-    started: Instant,
-    preparation_elapsed: std::time::Duration,
-    timing: GenerationTiming,
-    closed: bool,
-    failure: Option<CaptureError>,
-    semantic_prefix: Vec<SemanticEvent>,
-}
-impl<M: ControlRecordMode> Delivery<M> {
-    fn send(
-        &mut self,
-        event: impl Into<ControlEvent>,
-        emit: &mut impl FnMut(M::Record) -> ControlFlow<()>,
-    ) {
-        if self.closed || self.failure.is_some() {
-            return;
-        }
-        let event = event.into();
-        let semantic = match &event {
-            ControlEvent::Existing(ObservedGenerationEvent::Semantic { event, .. }) => {
-                Some(event.clone())
-            }
-            _ => None,
-        };
-        let record = M::record(
-            &self.template,
-            &self.prompt,
-            event,
-            self.sequence,
-            self.epoch,
-            self.timing,
-        );
-        let Some(next) = self.sequence.checked_add(1) else {
-            self.failure = Some(CaptureError::Invalid("output sequence overflow".into()));
-            self.control.cancel();
-            return;
-        };
-        if let Err(error) = self.budget.charge(&record) {
-            self.failure = Some(error);
-            self.control.cancel();
-            return;
-        }
-        // Charge and advance before invoking user code, including a caught panic.
-        self.sequence = next;
-        if let Some(event) = semantic {
-            self.semantic_prefix.push(event);
-        }
-        if emit(record).is_break() {
-            self.closed = true;
-            self.control.cancel();
-        }
-    }
-    fn token(
-        &mut self,
-        token: Option<u32>,
-        forced: bool,
-        captures: Option<CapturedStepDelivery>,
-        seconds: f64,
-        emit: &mut impl FnMut(M::Record) -> ControlFlow<()>,
-    ) {
-        let prediction_index = self.prediction;
-        let input_range = match self.prompt.range(prediction_index) {
-            Ok(range) => range,
-            Err(error) => {
-                self.failure = Some(CaptureError::Invalid(error.to_string()));
-                self.control.cancel();
-                return;
-            }
-        };
-        match token {
-            Some(token_id) => {
-                self.prediction += 1;
-                self.send(
-                    ObservedGenerationEvent::from_token_delivery(
-                        token_id,
-                        forced,
-                        prediction_index,
-                        input_range,
-                        captures,
-                        seconds,
-                    ),
-                    emit,
-                );
-            }
-            None => {
-                if let Some(captures) = captures {
-                    self.send(
-                        ObservedGenerationEvent::from_failed_delivery(
-                            prediction_index,
-                            input_range,
-                            captures,
-                            seconds,
-                        ),
-                        emit,
-                    );
-                }
-            }
-        }
-    }
-}
-
-struct Source<'a, 'b, B: TextGenerationBackend, M: ControlRecordMode, F> {
-    driver: &'a mut TextGenerationDriver<'b, B>,
-    state: &'a mut ManagedTextContinuation<B, ControlConstraints>,
-    delivery: &'a RefCell<(&'a mut Delivery<M>, &'a mut F)>,
-}
-impl<B: TextGenerationBackend, M: ControlRecordMode, F: FnMut(M::Record) -> ControlFlow<()>>
-    CommittedTokenSource for Source<'_, '_, B, M, F>
-{
-    type Error = TextContinuationError<B::Error, ControlConstraintError>;
-    fn finish_step<T, E>(
-        &mut self,
-        local: Result<T, E>,
-        cancelled: bool,
-        map_source: impl FnOnce(Self::Error) -> E,
-    ) -> Result<Option<T>, E> {
-        self.state.finish_text_preparation_cancellable(&self.driver,
-            eredu_core::run_preparation::TextPreparationStage::Delivery,
-            local.map(|value| (!cancelled).then_some(value)),
-            |error| map_source(ControlledTextGenerationError::Preparation(error).into()),
-        )
-    }
-    fn delivery_failure(&self) -> Option<CaptureError> {
-        self.delivery.borrow().0.failure.clone()
-    }
-    fn next_token(
-        &mut self,
-        cancellation: &eredu_core::GenerationCancellationToken,
-    ) -> Result<Option<u32>, Self::Error> {
-        let started = Instant::now();
-        let result = self.state.advance_cancellable(self.driver, cancellation);
-        if matches!(&result, Ok(Some(_))) {
-            let mut delivery = self.delivery.borrow_mut();
-            let delivery = &mut delivery.0;
-            if delivery.timing.time_to_first_token().is_none() {
-                delivery.timing =
-                    GenerationTiming::new(Some(delivery.preparation_elapsed + started.elapsed()));
-            }
-        }
-        let capture = self.state.take_completed_delivery(self.driver);
-        let token = match result {
-            Ok(token) => token.map(|token| token.token_id()),
-            Err(error) => {
-                if let Ok(capture) = capture {
-                    let mut delivery = self.delivery.borrow_mut();
-                    let (delivery, emit) = &mut *delivery;
-                    delivery.token(None, false, capture, started.elapsed().as_secs_f64(), emit);
-                }
-                return Err(error);
-            }
-        };
-        let capture = capture?;
-        let mut delivery = self.delivery.borrow_mut();
-        let (delivery, emit) = &mut *delivery;
-        delivery.token(
-            token,
-            self.state.controller().last_committed_was_forced(),
-            capture,
-            started.elapsed().as_secs_f64(),
-            emit,
-        );
-        Ok(token)
-    }
-    fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
-        self.state
-            .controller_is_complete()
-            .map_err(|error| ControlledTextGenerationError::Controller(error).into())
-    }
-}
-
-/// One ordinary generation run with explicit, completed-token advancement.
-/// It exclusively borrows its loaded model and retains incremental decoding,
-/// constraints, pending input and the backend's existing completion owner.
-/// Native objects remain thread-affine; `control_handle` may cross threads.
-pub struct ControlledGenerationSession<
-    'a,
-    B: TextGenerationBackend,
-    M: ControlRecordMode = LegacyText,
-> {
-    driver: TextGenerationDriver<'a, B>,
-    state: ManagedTextContinuation<B, ControlConstraints>,
-    vocabulary: eredu_text::tokenizer::TokenizerSnapshot,
-    tokenizer_identity: [u8; 32],
-    snapshot_budget: Option<eredu_runtime::execution_control::SnapshotBudget>,
-    branch_growth_known: bool,
-    cursor: CommittedGenerationCursor,
-    pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
-    lifecycle: GenerationLifecycle,
-    delivery: Delivery<M>,
-    // Travels with copied facade payload during restore and branch exchange.
-    host_preparation: HostPreparationAuthority,
-}
-
-impl<B: TextGenerationBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
-    /// Active preparation and execution through first commitment, before capture
-    /// delivery. Pauses and inspections are excluded; restoration never rewinds it.
-    pub fn timing(&self) -> GenerationTiming {
-        self.delivery.timing
-    }
-
-    /// Returns the current lifecycle state.
-    pub fn status(&self) -> GenerationStatus {
-        self.lifecycle.status()
-    }
-    /// Next absolute model prediction (zero is prompt prefill).
-    pub fn next_prediction(&self) -> u64 {
-        self.lifecycle.next_prediction()
-    }
-    /// Canonical committed history, including EOS/special tokens.
-    pub fn token_ids(&self) -> &[u32] {
-        self.cursor.token_ids()
-    }
-    /// Retained ordinary terminal outcome.
-    pub fn finish_reason(&self) -> Option<FinishReason> {
-        self.cursor.finish_reason()
-    }
-    /// Cross-thread pause and permanent cancellation requests.
-    pub fn control_handle(&self) -> GenerationControlHandle {
-        self.delivery.control.clone()
-    }
-    /// Cumulative compact-JSON transport bytes, including lifecycle records.
-    pub fn emitted_bytes(&self) -> u64 {
-        self.delivery.budget.emitted_bytes()
-    }
-    /// Known logical mutable semantic/decoding/history storage at this boundary.
-    /// Excludes native state, constraints, and shared immutable tokenizer data.
-    /// Unknown custom parser/decoder costs remain explicit.
-    pub fn semantic_snapshot_bytes(&self) -> Option<u64> {
-        snapshot::host_copy::payload_bytes(
-            &self.pipeline,
-            &self.cursor,
-            &self.delivery.semantic_prefix,
-            &self.delivery.prompt,
-        )
-    }
-    /// Full facade support; native model-state primitives alone do not imply
-    /// complete semantic/grammar snapshot support.
-    pub fn capabilities(&self) -> ExecutionControlCapabilities {
-        let mut result = ExecutionControlCapabilities::unsupported(
-            "snapshot support requires successful enable_snapshots with complete native/grammar/semantic estimates and explicit limits",
-        );
-        result.step = ControlSupport::Supported;
-        result.pause_resume = ControlSupport::Supported;
-        result.force_next_token = ControlSupport::Supported;
-        result.sampling_overrides = B::text_sampling_control_support(self.driver.runtime());
-        if self.snapshot_budget.is_some() {
-            result.snapshot = ControlSupport::Supported;
-            result.restore = ControlSupport::Supported;
-            result.isolation = Some(SnapshotIsolation::DeepCopy);
-        }
-        result.fork = if self.branch_growth_known {
-            ControlSupport::Supported
-        } else {
-            ControlSupport::Unsupported { reason: "create a snapshot with known complete native, decoder and parser continuation growth before branching".into() }
-        };
-        result
-            .conditions
-            .push("ordinary single-sequence input; serial completed-token delivery".into());
-        result.conditions.push("native in-process snapshots; exact exclusive driver and executable; same logical run for restore".into());
-        result.conditions.push("unchanged continuations preserve RNG and state; equality requires deterministic native execution on the same device".into());
-        result
-    }
-
-    fn validate_choice_boundary(&mut self) -> Result<(), ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
-            return Err(
-                CaptureError::Invalid("generation cancellation was requested".into()).into(),
-            );
-        }
-        if !matches!(
-            self.status(),
-            GenerationStatus::Prepared | GenerationStatus::Paused
-        ) {
-            return Err(ExecutionControlError::Transition {
-                from: self.status(),
-                to: GenerationStatus::Paused,
-            }
-            .into());
-        }
-        self.state.boundary(&mut self.driver)?;
-        Ok(())
-    }
-
-    /// Restricts the next decision to this canonical tokenizer ID after validating
-    /// active constraints. The ordinary sampler/RNG, adaptive update, penalties,
-    /// commitment and decoder still execute once. No text is re-tokenized.
-    /// This changes only the next decision; replacing a past token requires an
-    /// earlier snapshot. Clear an existing choice before replacing it.
-    pub fn force_next_token(&mut self, token: u32) -> Result<(), ControlledGenerationError> {
-        let host = self.host_preparation.clone();
-        self.force_next_token_retained_inner(token)
-            .map_err(|error| M::retain_error(error, host))
-    }
-
-    fn force_next_token_retained_inner(
-        &mut self,
-        token: u32,
-    ) -> Result<(), ControlledGenerationError> {
-        self.validate_choice_boundary()?;
-        if self.vocabulary.id_to_token(token).is_none() {
-            return Err(TokenChoiceError::InvalidToken(token).into());
-        }
-        self.state.controller_mut().force_next(token)?;
-        Ok(())
-    }
-    /// Removes a pending decision restriction without advancing generation.
-    pub fn clear_forced_token(&mut self) -> Result<bool, ControlledGenerationError> {
-        let host = self.host_preparation.clone();
-        self.clear_forced_token_retained_inner()
-            .map_err(|error| M::retain_error(error, host))
-    }
-
-    fn clear_forced_token_retained_inner(&mut self) -> Result<bool, ControlledGenerationError> {
-        self.validate_choice_boundary()?;
-        Ok(self.state.controller_mut().clear_forced())
-    }
-    /// Canonical choice waiting for commitment, if any.
-    pub fn pending_forced_token(&self) -> Option<u32> {
-        self.state.controller().pending_forced()
-    }
-
-    fn lifecycle_record(&mut self, emit: &mut impl FnMut(M::Record) -> ControlFlow<()>) {
-        self.delivery.send(
-            ObservedGenerationEvent::Lifecycle {
-                status: self.status(),
-                next_prediction: self.next_prediction(),
-            },
-            emit,
-        );
-    }
-    fn delivery_result(&mut self) -> Result<(), ControlledGenerationError> {
-        self.finish_record_delivery(Ok(()))
-    }
-
-    fn finish_record_delivery(
-        &mut self,
-        local: Result<(), ControlledGenerationError>,
-    ) -> Result<(), ControlledGenerationError> {
-        let local = local.and_then(|()| match self.delivery.failure.take() {
-            Some(error) => Err(error.into()),
-            None => Ok(()),
-        });
-        let cancelled = self.delivery.control.cancellation().is_cancelled();
-        let result = self.state.finish_text_preparation_cancellable(&self.driver,
-            eredu_core::run_preparation::TextPreparationStage::Delivery,
-            local.map(|()| (!cancelled).then_some(())),
-            |error| PreparedChatError::Backend(error).into(),
-        );
-        match result {
-            Ok(Some(())) => Ok(()),
-            Ok(None) => {
-                // Lifecycle-record callbacks occur after token commitment. Keep
-                // that boundary intact and cancel before the next prediction.
-                self.delivery.control.cancel();
-                Ok(())
-            }
-            Err(error) => {
-                self.lifecycle.fail();
-                Err(error)
-            }
-        }
-    }
-
-    /// Advances at most one committed prediction and synchronously delivers its
-    /// captures and semantic events. A paused handle remains sticky for `run`;
-    /// this explicit single-step request may still advance once. Callback Break
-    /// permanently cancels and closes delivery, preserving ordinary semantics.
-    pub fn step(
-        &mut self,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(emit))) {
-            Ok(result) => {
-                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
-            }
-            Err(payload) => {
-                self.lifecycle.fail();
-                std::panic::resume_unwind(payload)
-            }
-        }
-    }
-
-    fn step_inner(
-        &mut self,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError> {
-        let cancelled = self.delivery.control.cancellation().is_cancelled();
-        // Validate before touching the cursor, including terminal/error states.
-        if cancelled {
-            self.lifecycle.cancel()?;
-        } else {
-            self.lifecycle.begin_prediction()?;
-        }
-        let cancellation = self.delivery.control.cancellation().clone();
-        let committed_before = self.cursor.token_ids().len();
-        let result = {
-            let delivery = RefCell::new((&mut self.delivery, &mut emit));
-            let mut source = Source {
-                driver: &mut self.driver,
-                state: &mut self.state,
-                delivery: &delivery,
-            };
-            self.cursor.step(
-                &mut source,
-                &mut self.pipeline,
-                &cancellation,
-                &mut |event| {
-                    let mut delivery = delivery.borrow_mut();
-                    let (delivery, emit) = &mut *delivery;
-                    delivery.send(
-                        ObservedGenerationEvent::Semantic {
-                            prediction_index: delivery.prediction.checked_sub(1),
-                            event,
-                        },
-                        emit,
-                    );
-                },
-            )
-        };
-        if let Err(error) = result {
-            self.lifecycle.fail();
-            let error = match error {
-                CommittedGenerationError::Source(error) => ControlledGenerationError::Continuation(
-                    map_continuation_failure(error, B::into_backend_failure),
-                ),
-                CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
-                    PreparedChatError::Tokenizer(error).into()
-                }
-                CommittedGenerationError::Pipeline(
-                    CommittedTokenPipelineError::OriginalDecoder(error),
-                ) => {
-                    PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)).into()
-                }
-                CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Semantic(
-                    error,
-                )) => PreparedChatError::Semantic(error).into(),
-                CommittedGenerationError::Preparation(never) => match never {},
-                CommittedGenerationError::Lifecycle(error) => {
-                    PreparedChatError::Generation(error).into()
-                }
-                CommittedGenerationError::Delivery(error) => error.into(),
-                CommittedGenerationError::MissingTerminalToken => {
-                    PreparedChatError::MissingTerminalToken.into()
-                }
-            };
-            self.delivery.send(
-                ObservedGenerationEvent::Failed {
-                    message: error.to_string(),
-                    elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
-                },
-                &mut emit,
-            );
-            return Err(error);
-        }
-        let local = (|| {
-            if !cancelled {
-                if self.cursor.token_ids().len() == committed_before
-                    && self.cursor.finish_reason() == Some(FinishReason::Cancelled)
-                {
-                    self.state.boundary(&mut self.driver)?;
-                    self.lifecycle.cancel_without_prediction()?;
-                } else {
-                    self.lifecycle
-                        .complete_prediction(self.cursor.finish_reason())?;
-                }
-            }
-            if let Some(reason) = self.cursor.finish_reason() {
-                self.delivery.send(
-                    ObservedGenerationEvent::Completed {
-                        reason,
-                        generated_tokens: self.token_ids().len() as u64,
-                        elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
-                    },
-                    &mut emit,
-                );
-            }
-            self.lifecycle_record(&mut emit);
-            Ok(())
-        })();
-        self.finish_record_delivery(local)?;
-        Ok(self.status())
-    }
-
-    /// Pauses a quiescent session without consuming input, randomness or buffered
-    /// semantic text. An in-flight worker observes remote requests through `run`.
-    pub fn pause(
-        &mut self,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pause_inner(emit))) {
-            Ok(result) => {
-                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
-            }
-            Err(payload) => {
-                self.lifecycle.fail();
-                std::panic::resume_unwind(payload)
-            }
-        }
-    }
-
-    fn pause_inner(
-        &mut self,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError> {
-        self.lifecycle.pause()?;
-        self.delivery.control.request_pause();
-        self.lifecycle_record(&mut emit);
-        self.delivery_result()
-    }
-
-    /// Permanently cancels at the current completed boundary. Buffered decoder
-    /// text is discarded under the ordinary cancellation policy, never flushed.
-    pub fn cancel(
-        &mut self,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError> {
-        // Validate before changing the persistent cancellation handle.
-        self.lifecycle.checkpoint()?;
-        if self.status() == GenerationStatus::Completed {
-            return Err(ExecutionControlError::Transition {
-                from: GenerationStatus::Completed,
-                to: GenerationStatus::Cancelled,
-            }
-            .into());
-        }
-        self.delivery.control.cancel();
-        self.step(emit)
-    }
-    /// Advances until the current pause request or a terminal outcome. Each token
-    /// is delivered synchronously; no producer queue accumulates behind a consumer.
-    pub fn run(
-        &mut self,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError> {
-        while matches!(
-            self.status(),
-            GenerationStatus::Prepared | GenerationStatus::Paused
-        ) {
-            if self.delivery.control.pause_requested()
-                && !self.delivery.control.cancellation().is_cancelled()
-            {
-                self.pause(&mut emit)?;
-                break;
-            }
-            self.step(&mut emit)?;
-        }
-        Ok(self.status())
-    }
-    /// Explicitly acknowledges pause and continues the same ordinary run.
-    pub fn resume(
-        &mut self,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError> {
-        self.lifecycle.pause()?;
-        self.delivery.control.acknowledge_resume();
-        self.run(emit)
-    }
-}
-
-impl<B: TextSamplingControlBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
-    /// Current temperature and RNG/adaptive compatibility facts at a quiescent
-    /// boundary. No sampler or model work occurs.
-    pub fn sampling_state(&mut self) -> Result<SamplingStateFacts, ControlledGenerationError> {
-        let host = self.host_preparation.clone();
-        self.sampling_state_retained_inner()
-            .map_err(|error| M::retain_error(error, host))
-    }
-
-    fn sampling_state_retained_inner(
-        &mut self,
-    ) -> Result<SamplingStateFacts, ControlledGenerationError> {
-        self.validate_choice_boundary()?;
-        Ok(B::sampling_control_facts(
-            self.state.boundary(&mut self.driver)?.parts().1,
-        ))
-    }
-
-    /// Applies a prospective temperature change or explicit reseed. Inherited RNG,
-    /// penalties, committed history and adaptive counters remain unchanged unless
-    /// the request explicitly reseeds randomness. Emits bounded provenance at the
-    /// next absolute prediction; it cannot change earlier cache or semantic state.
-    pub fn override_sampling(
-        &mut self,
-        request: SamplingOverride,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.override_sampling_inner(request, emit)
-        })) {
-            Ok(Err(
-                error @ ControlledGenerationError::Sampling(SamplingOverrideError::Backend(_)),
-            )) => {
-                // A native preparation error alone is not completion evidence.
-                // Retain the backend recovery owner and fence further advancement.
-                self.lifecycle.fail();
-                Err(M::retain_error(error, self.host_preparation.clone()))
-            }
-            Ok(result) => {
-                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
-            }
-            Err(payload) => {
-                self.lifecycle.fail();
-                std::panic::resume_unwind(payload)
-            }
-        }
-    }
-
-    fn override_sampling_inner(
-        &mut self,
-        request: SamplingOverride,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError> {
-        self.validate_choice_boundary()?;
-        let before = B::sampling_control_facts(self.state.boundary(&mut self.driver)?.parts().1);
-        let after = eredu_runtime::execution_control::apply_sampling_override(
-            &mut self.state.boundary(&mut self.driver)?,
-            request,
-        )
-        .map_err(provider_sampling_error::<B>)?;
-        self.delivery.send(
-            ObservedGenerationEvent::SamplingChanged {
-                next_prediction: self.next_prediction(),
-                request,
-                before,
-                after,
-            },
-            &mut emit,
-        );
-        self.delivery_result()
     }
 }
 
@@ -866,342 +542,5 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         &self,
     ) -> Result<eredu_core::run_preparation::TextPreparationUsage, BackendFailure> {
         self.runtime.text_preparation_usage()
-    }
-
-    /// Starts a controllable ordinary/observed/intervened prepared request. No
-    /// model prediction or RNG draw occurs here. Initial attribution is charged
-    /// and delivered before returning the session. Unsupported execution fails
-    /// before native prompt or sampler construction.
-    /// Requires executable semantic support; never falls back to text.
-    pub fn start_controlled_chat<'a>(
-        &'a mut self,
-        prepared: PreparedObservedGeneration,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_generation(
-            prepared,
-            caller_stop_sequences,
-            control,
-            emit,
-            OutputMode::Semantic,
-        )
-    }
-
-    /// Starts controlled text generation from the exact prepared prompt IDs,
-    /// retaining observed/intervened admission, sampling, EOS and all controls.
-    /// No prediction or RNG draw occurs at startup. Incremental output uses
-    /// `SemanticEvent::TextDelta` and `Finished`, skips special tokens, and honors
-    /// caller stops. It applies tokenizer validity without a semantic grammar,
-    /// tool parsing, reasoning classification or profile-specific stops.
-    ///
-    /// Rejects tool declarations (including `ToolChoice::None`) and required
-    /// tool calls. Explicit thinking requires `allow_unparsed_reasoning` even
-    /// for recognized templates. Inspect `PreparedChat::text_generation_support`
-    /// before preparation; existing `prepare_chat` admission still applies.
-    ///
-    /// ```no_run
-    /// use eredu::api::*;
-    /// use eredu::runtime::chat::{ChatTemplateRequest, SemanticSupport};
-    /// use eredu_core::{TextGenerationBackend, capture::CapturePlan, intervention::InterventionPlan};
-    /// use std::ops::ControlFlow;
-    ///
-    /// fn generate<B: TextGenerationBackend>(
-    ///     model: &mut LoadedModel<B>,
-    ///     request: ChatTemplateRequest,
-    ///     capture: CapturePlan,
-    ///     intervention: Option<InterventionPlan>,
-    /// ) -> Result<(), Box<dyn std::error::Error>> {
-    ///     let chat = model.prepare_chat(request)?;
-    ///     let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
-    ///     let trace = TraceLimits { per_record_bytes: 65_536, total_bytes: 1_048_576 };
-    ///     let prepared = match intervention {
-    ///         Some(plan) => model.prepare_intervened_chat(
-    ///             &chat, Default::default(), capture, plan, trace)?,
-    ///         None => model.prepare_observed_chat(
-    ///             &chat, Default::default(), capture, trace)?,
-    ///     };
-    ///     let emit = |record: ControlledGenerationRecord| {
-    ///         println!("{record:?}");
-    ///         ControlFlow::Continue(())
-    ///     };
-    ///     // Text admission is enforced here; a UI can inspect
-    ///     // chat.text_generation_support() beforehand to explain rejection.
-    ///     let mut session = if semantic {
-    ///         model.start_controlled_chat(prepared, &[], Default::default(), emit)?
-    ///     } else {
-    ///         model.start_controlled_text(prepared, &[], Default::default(), emit)?
-    ///     };
-    ///     session.run(emit)?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn start_controlled_text<'a>(
-        &'a mut self,
-        prepared: PreparedObservedGeneration,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_generation(
-            prepared,
-            caller_stop_sequences,
-            control,
-            emit,
-            OutputMode::Text,
-        )
-    }
-
-    fn start_controlled_generation<'a>(
-        &'a mut self,
-        prepared: PreparedObservedGeneration,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-        mode: OutputMode,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        let PreparedObservedGeneration {
-            chat,
-            prompt_token_ids,
-            settings,
-            resolved,
-            plan,
-            intervention,
-            session_identity,
-            artifact_identity,
-            parameter_overlay_id,
-            trace_limits,
-        } = prepared;
-        let policy = StartupPolicy {
-            chat,
-            settings,
-            resolved,
-            plan: Some(plan),
-            prepared_capture: None,
-            intervention,
-            session_identity,
-            artifact_identity,
-            parameter_overlay_id,
-            trace_limits,
-        };
-        self.start_controlled_source::<LegacyText>(
-            policy,
-            |_: &ModelRuntime<B>| {
-                let prompt = PromptRecord::Tokens(prompt_token_ids.clone().into());
-                Ok((TextGenerationInput::TokenIds(prompt_token_ids), prompt))
-            },
-            caller_stop_sequences,
-            control,
-            emit,
-            mode,
-        )
-    }
-
-    fn start_controlled_source<'a, M: ControlRecordMode>(
-        &'a mut self,
-        prepared: StartupPolicy,
-        source: impl FnOnce(
-            &ModelRuntime<B>,
-        ) -> Result<
-            (TextGenerationInput<B::Prompt>, PromptRecord),
-            ControlledGenerationError,
-        >,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-        mode: OutputMode,
-    ) -> Result<ControlledGenerationSession<'a, B, M>, ControlledGenerationError> {
-        let preparation_started = Instant::now();
-        use eredu_core::run_preparation::TextPreparationStage as Stage;
-        let host = (|| {
-            if prepared.session_identity != self.session_identity {
-                return Err(CaptureError::Invalid(
-                    "prepared request belongs to another loaded session".into(),
-                )
-                .into());
-            }
-            if let ControlSupport::Unsupported { reason } =
-                B::text_execution_control_support(&self.runtime)
-            {
-                return Err(CaptureError::Unsupported(reason).into());
-            }
-            let (config, max_tokens) = self
-                .resolve_text_generation_settings(prepared.settings)
-                .map_err(PreparedChatError::Generation)?;
-            let preparation_mode = match mode {
-                OutputMode::Semantic => PreparedGenerationMode::Semantic,
-                OutputMode::Text => PreparedGenerationMode::Text,
-            };
-            let semantic = preparation_mode
-                .prepare_control(
-                    &self.runtime,
-                    &prepared.chat,
-                    caller_stop_sequences,
-                    self.token_validity.clone(),
-                )
-                .map_err(map_prepared_chat_setup_error)?;
-            // Versioned initial policy identity; saved native sampler state retains
-            // any later prospective changes. Compatibility also requires the opaque
-            // exact driver/run identities, never this digest alone.
-            let semantic_identity = match mode {
-                OutputMode::Text => None,
-                OutputMode::Semantic => {
-                    let plan = prepared
-                        .chat
-                        .generation_runtime_plan()
-                        .expect("validated semantic plan");
-                    let choice = match plan.tool_choice() {
-                        crate::runtime::chat::ToolChoice::None => "none",
-                        crate::runtime::chat::ToolChoice::Auto => "auto",
-                        crate::runtime::chat::ToolChoice::Required => "required",
-                    };
-                    Some((
-                        prepared.chat.format_profile_identity(),
-                        plan.generation_constraint().fingerprint,
-                        choice,
-                        prepared.chat.profile_stop_sequences(),
-                    ))
-                }
-            };
-            let configuration_identity = configuration_identity::digest(&(
-                M::VERSION,
-                mode,
-                self.tokenizer_fingerprint,
-                prepared.resolved,
-                prepared.settings.seed,
-                prepared.settings.inference,
-                semantic_identity,
-                prepared.chat.eos_token_ids(),
-                caller_stop_sequences,
-            ))
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-            let decoder = PreparedChatTokenDecoder {
-                decoder: self.text_decoder(true),
-            };
-            let vocabulary = decoder.decoder.tokenizer.clone();
-            let domain = eredu_runtime::TokenDomain::new(
-                self.token_validity
-                    .allowed_mask()
-                    .expect("facade always supplies a closed token domain")
-                    .len(),
-            );
-            let pipeline = CommittedTokenPipeline::new(
-                RawTokenDecoder::with_structural_tokens(decoder, semantic.structural_tokens),
-                semantic.parser,
-            );
-            let cursor = CommittedGenerationCursor::new(prepared.chat.eos_token_ids(), max_tokens);
-            let (input, prompt) = source(&self.runtime)?;
-            let delivery = Delivery::<M> {
-                configuration_identity,
-                template: RecordContext {
-                    run_id: new_identity("run"),
-                    artifact_identity: prepared.artifact_identity,
-                    parameter_overlay_id: prepared.parameter_overlay_id,
-                    session_id: self.session_identity.clone(),
-                    capture_plan_id: prepared
-                        .prepared_capture
-                        .as_ref()
-                        .map(|source| source.admission().identity().into())
-                        .or_else(|| prepared.plan.as_ref().map(|plan| plan.identity().into())),
-                    intervention_plan_id: prepared
-                        .intervention
-                        .as_ref()
-                        .map(|p| p.identity().into()),
-                },
-                budget: TraceBudget::new(prepared.trace_limits),
-                control,
-                sequence: 0,
-                epoch: 0,
-                prediction: 0,
-                prompt,
-                mode: std::marker::PhantomData,
-                started: Instant::now(),
-                preparation_elapsed: std::time::Duration::ZERO,
-                timing: GenerationTiming::default(),
-                closed: false,
-                failure: None,
-                semantic_prefix: Vec::new(),
-            };
-            let started = ControlEvent::Started {
-                generation: prepared.resolved,
-                seed: prepared.settings.seed,
-            };
-            Ok::<_, ControlledGenerationError>((
-                config,
-                vocabulary,
-                domain,
-                pipeline,
-                cursor,
-                delivery,
-                started,
-                semantic.controller,
-                input,
-            ))
-        })();
-        let (
-            config,
-            vocabulary,
-            domain,
-            pipeline,
-            cursor,
-            mut delivery,
-            started,
-            controller,
-            input,
-        ) = self
-            .runtime
-            .finish_text_preparation(Stage::Request, host, |error| {
-                PreparedChatError::Backend(error).into()
-            })?;
-        let mut driver = TextGenerationDriver::new(&mut self.runtime);
-        let mut state = driver
-            .start_input(
-                input,
-                config,
-                TokenChoiceController::new(controller, domain),
-            )
-            .map_err(TextContinuationError::Generation)
-            .map_err(provider_continuation_error::<B>)?;
-        if let Some(source) = prepared.prepared_capture {
-            driver.enable_prepared_capture(&mut state, source)?;
-        } else if let Some(capture) = prepared.plan {
-            match prepared.intervention {
-                Some(plan) => driver.enable_interventions(&mut state, capture, plan)?,
-                None => driver.enable_capture(&mut state, capture)?,
-            }
-        }
-        delivery.preparation_elapsed = preparation_started.elapsed();
-        delivery.send(started, &mut emit);
-        let delivered = match delivery.failure.take() {
-            Some(error) => Err(ControlledGenerationError::Capture(error)),
-            None => Ok(if delivery.control.cancellation().is_cancelled() {
-                None
-            } else {
-                Some(())
-            }),
-        };
-        let ready = driver.finish_text_preparation_cancellable(&state,
-            Stage::Delivery,
-            delivered,
-            |error| PreparedChatError::Backend(error).into(),
-        )?;
-        if ready.is_none() {
-            delivery.control.cancel();
-        }
-        let host_preparation = pipeline.host_preparation().clone();
-        Ok(ControlledGenerationSession {
-            driver,
-            state: ManagedTextContinuation::root(state),
-            vocabulary,
-            tokenizer_identity: self.tokenizer_fingerprint,
-            snapshot_budget: None,
-            branch_growth_known: false,
-            cursor,
-            pipeline,
-            lifecycle: GenerationLifecycle::default(),
-            delivery,
-            host_preparation,
-        })
     }
 }

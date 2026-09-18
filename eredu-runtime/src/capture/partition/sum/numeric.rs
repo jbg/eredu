@@ -36,6 +36,10 @@ pub(crate) fn sum_f32_at<'a>(terms: impl Iterator<Item=&'a [f32]>, index:usize)-
 }
 /// Existing finite/nonfinite Summary loop over the materialized F32 assembly.
 pub(crate) fn summarize_f32(values:&[f32])->CaptureSummary {
+    summarize_f32_values(values.iter().copied())
+}
+/// Same reduction over a finite checked host source in canonical selected order.
+pub(crate) fn summarize_f32_values(values: impl ExactSizeIterator<Item=f32>)->CaptureSummary {
             let mut summary = CaptureSummary {
                 elements: values.len() as u64,
                 finite: 0,
@@ -50,7 +54,7 @@ pub(crate) fn summarize_f32(values:&[f32])->CaptureSummary {
             };
             let mut sum = Sum::default();
             let mut squares = Sum::default();
-            for &value in values {
+            for value in values {
                 if value.is_finite() {
                     let value = f64::from(value);
                     summary.finite += 1;

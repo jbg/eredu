@@ -1,6 +1,6 @@
 //! Fixed borrowed invocation worker. The caller retains its typed failure.
 use super::*;
-use eredu_nn::{workspace::WorkspaceMetadataFunding, TensorParallelGroupedOutput};
+use eredu_nn::{workspace::HostMetadataFunding, TensorParallelGroupedOutput};
 use eredu_runtime::expert::{IndexedDemandLoanError, IndexedInvocationCallback, IndexedInvocationRequest};
 use std::mem::{size_of, size_of_val};
 
@@ -22,7 +22,7 @@ fn sum(parts: &[usize]) -> Option<usize> {
 /// Architecture provider and error layouts never enter this worker's census.
 struct Owner<'a> {
     callback: &'a mut Callback<'a>,
-    funding: &'a WorkspaceMetadataFunding,
+    funding: &'a HostMetadataFunding,
 }
 impl Owner<'_> {
     fn movement(owner: &mut Self) -> &mut MlxIndexedMovement { owner.callback.movement() }
@@ -36,7 +36,7 @@ fn factory_control_bytes() -> Option<usize> {
         size_of::<Output>(), size_of::<Result<Result<Output, ()>, Error>>(),
         size_of::<(IndexedInvocationRequest<'_, MlxTensor>, &mut Callback<'_>, &Stream,
             OriginalIndexedResidencyFactory)>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
     ])
 }
 fn owner_control_bytes() -> Option<usize> {

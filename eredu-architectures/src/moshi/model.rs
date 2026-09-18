@@ -306,36 +306,36 @@ impl<T> ForwardContext<T> {
 
 /// Builds the exact persistent-temporal plus frame-local-depth state layout.
 pub fn state_layout(config: &MoshiConfig) -> Result<StateLayout, Error> {
-    let temporal = decoder::cache_layout(config.temporal())?;
-    let depth = decoder::cache_layout(config.depth_template())?;
+    state_layout_destination(config, &crate::state_geometry::Ordinary(Error::backend_message))
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    config: &MoshiConfig,
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(&MoshiConfig, StateLayout,
+        [LayerSchedule<eredu_core::cache::LayerCachePolicy>; 2],
+        Vec<eredu_core::cache::LayerCachePolicy>, Vec<StateSegmentSpec>, usize, usize)>()?;
+    let temporal = decoder::cache_layout_destination(config.temporal(),
+        std::iter::repeat_n(config.temporal().num_key_value_heads(),
+            config.temporal().attention_schedule().len()), destination)?;
+    let depth = decoder::cache_layout_destination(config.depth_template(),
+        std::iter::repeat_n(config.depth_template().num_key_value_heads(),
+            config.depth_template().attention_schedule().len()), destination)?;
     let temporal_count = temporal.len();
-    let depth_count = depth.len();
-    let policies = temporal
-        .iter()
-        .cloned()
-        .chain(depth.iter().cloned())
-        .collect::<Vec<_>>();
-    let schedule = LayerSchedule::new(policies.len(), policies).map_err(Error::backend)?;
-    StateLayout::segmented(
-        schedule,
-        [
-            StateSegmentSpec::new(
-                TEMPORAL_STATE_SEGMENT,
-                0..temporal_count,
-                StateSegmentLifetime::Persistent,
-                0,
-            )
-            .map_err(Error::backend)?,
-            StateSegmentSpec::new(
-                DEPTH_STATE_SEGMENT,
-                temporal_count..temporal_count + depth_count,
-                StateSegmentLifetime::FrameLocal,
-                0,
-            )
-            .map_err(Error::backend)?,
-        ],
-    )
-    .map_err(Error::backend)
+    let total = temporal_count.checked_add(depth.len())
+        .ok_or_else(|| destination.error(format_args!("Moshi state layer count overflowed")))?;
+    // Both decoder producers emit key/value policies, whose clone owns no nested allocation.
+    let mut policies = destination.vector(total)?;
+    policies.extend(temporal.iter().cloned());
+    policies.extend(depth.iter().cloned());
+    let schedule = destination.schedule(total, policies)?;
+    let mut segments = destination.vector(2)?;
+    segments.push(destination.segment(TEMPORAL_STATE_SEGMENT, 0..temporal_count,
+        StateSegmentLifetime::Persistent, 0)?);
+    segments.push(destination.segment(DEPTH_STATE_SEGMENT, temporal_count..total,
+        StateSegmentLifetime::FrameLocal, 0)?);
+    destination.segmented(schedule, segments)
 }
 
 /// One portable Moshi-family model shared by resident and bounded runtimes.
@@ -364,7 +364,9 @@ impl MoshiRealtimeModelSource {
     pub fn is_partitioned(&self)->bool {self.0.parallel_geometry.is_some()}
 
     /// Borrows the dependency graph retained by the same ordinary constructor.
-    pub fn execution_graph(&self)->&ExecutionGraph {&self.0.graph}
+    pub fn execution_graph(&self) -> &ExecutionGraph {
+        &self.0.graph
+    }
 
     /// Builds unloaded metadata modules from this exact selected architecture.
     /// Actual static/unit bindings and projected state remain separate inputs.
@@ -413,44 +415,55 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::Archi
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+    fn state_layout(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl(context)
     }
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        topology.validate().map_err(Error::backend)?;
-        let layer_count = self.state_layout_impl()?.len();
-        let global_layer_end = state
-            .global_layer_offset()
-            .checked_add(state.layout().len())
-            .ok_or_else(|| Error::backend("Moshi owned state range overflowed"))?;
+        let metadata = decoder::identity::Metadata::new(context);
+        metadata.controls::<(&Self, &eredu_runtime::PartitionState,
+            eredu_core::cache::PromptCacheTopology, eredu_runtime::ModelStateIdentity,
+            usize, usize)>()?;
+        topology.validate_with_diagnostic(|message| metadata.prompt_error(message))?;
+        // Configuration and selected local geometry were validated at source birth.
+        // Identity needs their exact cardinality, not another allocated state layout.
+        let layer_count = match &self.source.0.parallel_geometry {
+            Some(geometry) => geometry.state_layout().len(),
+            None => self.source.0.config.temporal().attention_schedule().len()
+                .checked_add(self.source.0.config.depth_template().attention_schedule().len())
+                .ok_or_else(|| metadata.error(format_args!("Moshi state layer count overflowed")))?,
+        };
+        let global_layer_end = state.global_layer_offset().checked_add(state.layout().len())
+            .ok_or_else(|| metadata.error(format_args!("Moshi owned state range overflowed")))?;
         if global_layer_end > layer_count {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "Moshi owns state layers {}..{global_layer_end}, outside {layer_count} layers",
-                state.global_layer_offset()
-            )));
+                state.global_layer_offset())));
         }
-        eredu_runtime::ModelStateIdentity::new(
-            self.source.0.config.family(),
-            self.source.0.config.effective_model_type().as_str(),
-            self.source.0.config.architecture_fingerprint(),
-            layer_count,
-            state.global_layer_offset(),
-            0,
-            topology,
-        )
-        .map_err(Error::backend)
+        eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+            metadata.text(self.source.0.config.family())?,
+            metadata.text(self.source.0.config.effective_model_type().as_str())?,
+            metadata.text(self.source.0.config.architecture_fingerprint())?,
+            layer_count, state.global_layer_offset(), 0, topology,
+            |message| metadata.prompt_error(message))
     }
 
     fn parameter_description(
         &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::parameter_description(&self.source.0.config).map_err(Error::backend)
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        let metadata = B::construction_metadata(context);
+        decoder::identity::Metadata::new(metadata).controls::<(&Self,
+            &<B::Tensor as Tensor>::Context,
+            std::borrow::Cow<'_, ArchitectureParameterDescription>)>()?;
+        super::parallel::declaration::description(&self.source.0.config, metadata)
+            .map(std::borrow::Cow::Owned)
     }
 
     fn static_parameter_recipes(
@@ -575,11 +588,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     }
 
     /// State layout for this model's replicated or rank-local construction.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.source.0.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.source.0.config), Ok)
+    fn state_layout_impl(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<StateLayout, Error> {
+        let metadata = decoder::identity::Metadata::new(context);
+        metadata.controls::<(&Self, StateLayout)>()?;
+        match (&self.source.0.parallel_geometry, metadata.context()) {
+            (Some(geometry), Some(context)) => geometry.state_layout().clone_workspace(context),
+            (Some(geometry), None) => Ok(geometry.state_layout().clone()),
+            (None, Some(context)) => state_layout_destination(&self.source.0.config,
+                &crate::state_geometry::Counted::new(context, Error::backend_message)),
+            (None, None) => state_layout(&self.source.0.config),
+        }
     }
 
     fn build_unit_impl(
@@ -631,15 +650,20 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
         S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(&Self, B::Tensor, Option<&B::Tensor>, &mut S,
+            &StateLayout, &<B::Tensor as Tensor>::Context, StateSegmentId,
+            Option<B::Tensor>, LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>)>()?;
         if state.layout() != expected {
-            return Err(Error::backend("Moshi runtime state layout mismatch"));
+            return Err(metadata.error(format_args!("Moshi runtime state layout mismatch")));
         }
-        let depth = StateSegmentId::new(DEPTH_STATE_SEGMENT).map_err(Error::backend)?;
-        state.reset_segment(&depth).map_err(Error::backend)?;
+        let depth = StateSegmentId::new(metadata.text(format_args!("{DEPTH_STATE_SEGMENT}"))?)
+            .map_err(|cause| metadata.source(cause))?;
+        state.reset_segment(&depth).map_err(|cause| metadata.source(cause))?;
         let temporal_mask = if let Some(mask) = supplied_mask {
             Some(mask.clone())
         } else if hidden.dim(1) > 1 {
-            let offset = state.layer(0).map_err(Error::backend)?.offset();
+            let offset = state.layer(0).map_err(|cause| metadata.source(cause))?.offset();
             Some(B::causal_mask(hidden.dim(1), offset, None, context)?)
         } else {
             None
@@ -712,46 +736,49 @@ where
         crate::transport::pipeline_with_output_state(0, temporal_layers, layout)
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.source.0.graph.clone())
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            &self.source.0.graph,
+        ))
     }
 
-    fn execution_graph_with_metadata(&self,_:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<eredu_runtime::ArchitectureExecutionGraph<'_>,Self::Error> {
-        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.source.0.graph))
-    }
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         match group {
             0 => {
-                usize::try_from(self.source.0.config.temporal().num_hidden_layers()).map_err(Error::backend)
+                usize::try_from(self.source.0.config.temporal().num_hidden_layers()).map_err(|cause| metadata.source(cause))
             }
             1 => Ok(self.source.0.config.frame_schedule().depth_audio_codebooks()),
-            _ => Err(Error::backend(format!(
+            _ => Err(metadata.error(format_args!(
                 "Moshi execution group {group} is outside 0..2"
             ))),
         }
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         let count = match group {
             0 => usize::try_from(self.source.0.config.temporal().num_hidden_layers())
-                .map_err(Error::backend)?,
+                .map_err(|cause| metadata.source(cause))?,
             1 => self.source.0.config.frame_schedule().depth_audio_codebooks(),
             _ => {
-                return Err(Error::backend(format!(
+                return Err(metadata.error(format_args!(
                     "Moshi execution group {group} is outside 0..2"
                 )));
             }
         };
         if index >= count {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "Moshi unit {index} is outside execution group {group}"
             )));
         }
         match group {
-            0 => Ok(format!("transformer.layers.{index}")),
-            1 => Ok(format!("depformer.slices.{index}")),
+            0 => metadata.text(format_args!("transformer.layers.{index}")),
+            1 => metadata.text(format_args!("depformer.slices.{index}")),
             _ => unreachable!("group was validated"),
         }
     }
@@ -779,18 +806,26 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(&mut Self, Self::Input<'_>, &mut S,
+            &<B::Tensor as Tensor>::Context, Vec<&B::Tensor>, B::Tensor, StateLayout,
+            LayeredForwardState<B::Tensor, Self::ForwardContext>)>()?;
         if input.audio.len() != self.source.0.config.frame_schedule().total_audio_codebooks() {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "Moshi temporal input has {} audio codebooks, expected {}",
-                input.audio.len(),
-                self.source.0.config.frame_schedule().total_audio_codebooks()
-            )));
+                input.audio.len(), self.source.0.config.frame_schedule().total_audio_codebooks())));
         }
-        let tokens = std::iter::once(input.text)
-            .chain(input.audio.iter().copied())
-            .collect::<Vec<_>>();
+        let count = input.audio.len().checked_add(1)
+            .ok_or_else(|| metadata.error(format_args!("Moshi token input count overflowed")))?;
+        let mut tokens = metadata.vector(count)?;
+        tokens.push(input.text);
+        tokens.extend(input.audio.iter().copied());
         let hidden = self.static_modules.embeddings.forward(&tokens, context)?;
-        let expected = state_layout(&self.source.0.config)?;
+        let expected = match B::construction_metadata(context).filter(|context| context.uses_checked_metadata()) {
+            Some(context) => state_layout_destination(&self.source.0.config,
+                &crate::state_geometry::Counted::new(context, Error::backend_message))?,
+            None => state_layout(&self.source.0.config)?,
+        };
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
 
@@ -1009,21 +1044,23 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let geometry = self.source.0
-            .parallel_geometry
-            .as_ref()
-            .ok_or_else(|| Error::backend("Moshi model was not built with local geometry"))?;
-        if input.audio.len() != self.source.0.config.frame_schedule().total_audio_codebooks() {
-            return Err(Error::backend("Moshi parallel audio input count drifted"));
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(&mut Self, Self::Input<'_>, &mut S, &B::ParallelContext,
+            &<B::Tensor as Tensor>::Context, Vec<&B::Tensor>, B::Tensor, StateLayout,
+            LayeredForwardState<B::Tensor, Self::ForwardContext>)>()?;
+        if self.source.0.parallel_geometry.is_none() {
+            return Err(metadata.error(format_args!("Moshi model was not built with local geometry")));
         }
-        let tokens = std::iter::once(input.text)
-            .chain(input.audio.iter().copied())
-            .collect::<Vec<_>>();
-        let hidden = self
-            .static_modules
-            .embeddings
-            .forward_parallel(&tokens, parallel, context)?;
-        let expected = geometry.state_layout().clone();
+        if input.audio.len() != self.source.0.config.frame_schedule().total_audio_codebooks() {
+            return Err(metadata.error(format_args!("Moshi parallel audio input count drifted")));
+        }
+        let count = input.audio.len().checked_add(1)
+            .ok_or_else(|| metadata.error(format_args!("Moshi token input count overflowed")))?;
+        let mut tokens = metadata.vector(count)?;
+        tokens.push(input.text);
+        tokens.extend(input.audio.iter().copied());
+        let hidden = self.static_modules.embeddings.forward_parallel(&tokens, parallel, context)?;
+        let expected = self.state_layout_impl(B::construction_metadata(context))?;
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
 

@@ -7,11 +7,8 @@ use eredu_core::{
 };
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
-fn shared(delivery: CapturedStepDelivery) -> SharedCapturedStep {
-    match delivery {
-        CapturedStepDelivery::Shared(frame) => frame,
-        CapturedStepDelivery::Legacy(_) => panic!("original managed capture must retain custody"),
-    }
+fn shared(delivery: SharedCapturedStep) -> SharedCapturedStep {
+    delivery
 }
 fn assert_decode(frame: &SharedCapturedStep) {
     assert_eq!(frame.prediction_index(), 1);
@@ -215,7 +212,6 @@ fn controlled_commit_failure_preserves_original_error_and_completed_decode_captu
     assert_eq!(controller.calls.get(), (2, 2, 1));
     // Exact completions settled before the fallible commit hook. The failed
     // logical permit does not authorize another step or erase committed capture.
-    assert!(run.take_captured_step().unwrap().is_none());
     assert!(run.capture_pending());
     let frame = shared(run.take_captured_delivery().unwrap().unwrap());
     assert_decode(&frame);

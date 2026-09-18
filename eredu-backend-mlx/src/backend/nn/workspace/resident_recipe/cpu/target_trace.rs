@@ -12,7 +12,7 @@ type State=DeviceState<WorkspaceBackend,WorkspaceResidentLayerState>;
 type Architecture=gemma4::LayeredModel<WorkspaceBackend>;
 struct Sources<'a>(&'a WorkspaceContext,WorkspaceFloatingType);
 impl<'a> ParameterVisitorMut<'a,WorkspaceTensor> for Sources<'_> {
-    fn visit_mut(&mut self,_:ParameterMetadata,value:&'a mut WorkspaceTensor) {
+    fn visit_mut(&mut self,_:eredu_nn::ParameterMetadataView<'_>,value:&'a mut WorkspaceTensor) {
         let layout=value.layout().clone().with_representation(Some(
             WorkspaceRepresentation::new(self.1,true)));
         *value=WorkspaceTensor::existing(layout,self.0).unwrap();

@@ -28,7 +28,7 @@ impl Producers {
 
     pub(super) fn admit(
         self,
-        plan: crate::capture::CapturePlanSource,
+        plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         world: usize,
         limits: PartitionCaptureReceiptLimits,

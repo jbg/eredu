@@ -1,7 +1,7 @@
 //! Independent token/session output around the actual paid chart copy.
 use super::{Cause, PreparedEarleySeedError, PreparedTokenParser, PreparedTokenParserError, State};
 use super::super::{copy, PreparedEarleySeed};
-use std::{mem::{size_of, size_of_val}, sync::Arc};
+use std::{mem::{size_of, size_of_val}};
 impl PreparedTokenParser {
     /// Exact complete committed-session copy payment from its chart and actual
     /// initialized output. The lexer copy remains a separate paired source.
@@ -28,7 +28,7 @@ impl PreparedTokenParser {
     /// Copies the committed token/chart state into independent destinations.
     /// The enclosing owner must pair this with its independently copied lexer
     /// and retain new funding; no mutable lexer or growth authority is aliased.
-    pub fn try_copy<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn try_copy<F: crate::earley::PreparedFunding<Error = E>, E>(
         &self, funding: &F,
     ) -> Result<Self, PreparedTokenParserError<E>> {
         let mut state = State {
@@ -38,14 +38,14 @@ impl PreparedTokenParser {
             had_rollback: self.state.had_rollback,
         };
         let preparation = (|| -> Result<(), Cause<E>> {
-            funding(Self::copy_controls::<E>().ok_or(Cause::Overflow)?)
+            funding.reserve(Self::copy_controls::<E>().ok_or(Cause::Overflow)?)
                 .map_err(Cause::Funding)
         })();
 
         if let Err(cause) = preparation {
             return Err(PreparedTokenParserError {
                 cause: PreparedEarleySeedError {
-                    cause, prefix: PreparedEarleySeed::vacant(Arc::clone(&self.chart.grammar)),
+                    cause, prefix: PreparedEarleySeed::vacant(self.chart.grammar.clone()),
                 }, state,
             });
         }

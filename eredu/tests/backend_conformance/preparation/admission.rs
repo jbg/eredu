@@ -75,7 +75,7 @@ fn ordinary_prepared_input_uses_admission_and_retains_it_until_drop_completion()
         let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
         let _guard = probe(Fault::None);
         let mut generation = if prepared {
-            TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3], config())
+            TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3].into(), config())
         } else {
             TextGeneration::new(&mut runtime, vec![11, 7, 3], config())
         }
@@ -125,7 +125,7 @@ fn detached_fork_retains_one_admission_after_driver_and_parent_drop() {
         boundary.fork_host_state(
             observed_mock::State::default(),
             boundary.controller().clone(),
-            Some(eredu_core::PendingTextInput::Prefill(vec![11, 7, 3])),
+            Some(eredu_core::PendingTextInput::Prefill(vec![11, 7, 3].into())),
             Some(2),
         )
     };
@@ -156,7 +156,7 @@ fn ordinary_and_controlled_facades_share_admission_order_and_output() {
         outputs.push(run(&mut model, &chat, settings, controlled).unwrap());
         let seen = snapshot();
         assert_eq!(seen.admissions.len(), 1);
-        assert_eq!(seen.inference_settings, [(Default::default(), Some(2))]);
+        assert_eq!(seen.inference_settings, [(settings.inference, Some(2))]);
         assert!(seen.admissions[0].is_some());
         assert_eq!(&seen.lifecycle[..3], ["admit", "prompt", "sampling"]);
         let admitted = seen
@@ -189,7 +189,12 @@ fn facade_inference_policy_reaches_shared_admission_with_exact_output_allowance(
     use eredu::api::TextInferencePolicy;
     for controlled in [false, true] {
         for explicit_allowance in [false, true] {
-            for budget in [None, Some(0), Some(16 << 20)] {
+            for budget in [
+                None,
+                Some(original_sources::CAPACITY),
+                Some(0),
+                Some(16 << 20),
+            ] {
                 let (mut model, chat, mut settings) = setup();
                 settings.overrides.max_new_tokens = explicit_allowance.then_some(2);
                 settings.inference = TextInferencePolicy {
@@ -202,21 +207,23 @@ fn facade_inference_policy_reaches_shared_admission_with_exact_output_allowance(
                 // asking this neutral fixture to execute an unbounded output.
                 let _guard = probe(Fault::Local(Stage::Admission));
                 let error = run(&mut model, &chat, settings, controlled).unwrap_err();
-                assert!(has_source::<MockError>(error.as_ref()));
                 let seen = snapshot();
-                assert_eq!(
-                    seen.inference_settings,
-                    [(
-                        settings.inference,
-                        if explicit_allowance {
-                            Some(2)
-                        } else if budget.is_some() {
-                            Some(256)
-                        } else {
-                            None
-                        }
-                    )]
-                );
+                if budget.is_some_and(|bytes| bytes != original_sources::CAPACITY) {
+                    let error = error
+                        .downcast_ref::<eredu::api::ControlledGenerationError>()
+                        .unwrap();
+                    assert!(error.session_failure().unwrap().input_rejection().is_some());
+                    assert!(seen.inference_settings.is_empty());
+                } else {
+                    assert!(has_source::<MockError>(error.as_ref()));
+                    assert_eq!(
+                        seen.inference_settings,
+                        [(
+                            original_sources::settings(settings).inference,
+                            Some(if explicit_allowance { 2 } else { 256 }),
+                        )]
+                    );
+                }
                 assert!(seen.native.is_empty());
                 assert_eq!(seen.forwards, 0);
             }
@@ -242,7 +249,7 @@ fn enforced_unbounded_core_requests_reject_before_backend_or_controller() {
             let observed = controller.clone();
             let error: Box<dyn std::error::Error> = if controlled {
                 let input = if prepared {
-                    TextGenerationInput::Prepared(vec![11, 7, 3])
+                    TextGenerationInput::Prepared(vec![11, 7, 3].into())
                 } else {
                     TextGenerationInput::TokenIds(vec![11, 7, 3])
                 };
@@ -252,7 +259,7 @@ fn enforced_unbounded_core_requests_reject_before_backend_or_controller() {
                     .into()
             } else {
                 let result = if prepared {
-                    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3], config)
+                    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3].into(), config)
                 } else {
                     TextGeneration::new(&mut runtime, vec![11, 7, 3], config)
                 };

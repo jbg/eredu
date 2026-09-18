@@ -3,7 +3,7 @@ use crate::backend::{error::Error,nn::workspace::SpeculativeNumericalRecipe,
     runtime::execution::generic::{RealtimeNeuralPlan,QualifiedRealtimeNeuralPlan,RealtimeNeuralOwner,
         RealtimeLayerwisePlan,QualifiedRealtimeLayerwisePlan,LayerwiseWorkspace,MlxResidentPolicy,MlxLayerwisePolicy},
     submission_recovery::native_role::realtime::RealtimeOperationClaim};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataError,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataError,HostMetadataFunding};
 use std::mem::{size_of,size_of_val};
 use crate::backend::nn::workspace::MetalAllocationFacts;
 use eredu_runtime::working_memory::{WorkingMemoryPool,OriginalHostSourceBank,HostSourceConstructionFacts};
@@ -32,8 +32,8 @@ impl<U:'static> RealtimeOperationPolicy<U> for MlxLayerwisePolicy<U,()> {
 
 /// Move-only descriptive model source; constructing or cloning accounting
 /// handles cannot create it. The concrete slot remains inside this owner.
-pub(crate) struct RealtimeOperationPlan { source:Box<dyn Source>, _funding:WorkspaceMetadataFunding }
-pub(crate) struct RealtimeOperationRecipe { source:Box<dyn Qualified>, _funding:WorkspaceMetadataFunding }
+pub(crate) struct RealtimeOperationPlan { source:Box<dyn Source>, _funding:HostMetadataFunding }
+pub(crate) struct RealtimeOperationRecipe { source:Box<dyn Qualified>, _funding:HostMetadataFunding }
 trait Source {
     fn qualify(self:Box<Self>,recipe:SpeculativeNumericalRecipe,layerwise:Option<&LayerwiseWorkspace>,context:&WorkspaceContext)
         ->Result<RealtimeOperationRecipe,Error>;
@@ -52,13 +52,13 @@ fn reserve(parts:&[usize],context:&WorkspaceContext)->Result<(),Error> {
 impl RealtimeOperationPlan {
     pub(super) fn new<U:'static>(plan:RealtimeNeuralPlan<U>,context:&WorkspaceContext)->Result<Self,Error> {
         let funding=context.metadata_funding().ok_or_else(||Error::Neural(WorkspaceMetadataError::Unqualified.into()))?;
-        reserve(&[size_of::<WorkspaceMetadataFunding>(),size_of::<Self>(),size_of::<RealtimeNeuralPlan<U>>(),size_of::<Box<dyn Source>>(),
+        reserve(&[size_of::<HostMetadataFunding>(),size_of::<Self>(),size_of::<RealtimeNeuralPlan<U>>(),size_of::<Box<dyn Source>>(),
             size_of::<Result<Self,Error>>()],context)?;
         Ok(Self{source:Box::new(plan),_funding:funding})
     }
     fn new_bounded<U:'static>(plan:RealtimeLayerwisePlan<U>,context:&WorkspaceContext)->Result<Self,Error> {
         let funding=context.metadata_funding().ok_or_else(||Error::Neural(WorkspaceMetadataError::Unqualified.into()))?;
-        reserve(&[size_of::<WorkspaceMetadataFunding>(),size_of::<Self>(),size_of::<RealtimeLayerwisePlan<U>>(),
+        reserve(&[size_of::<HostMetadataFunding>(),size_of::<Self>(),size_of::<RealtimeLayerwisePlan<U>>(),
             size_of::<Box<dyn Source>>(),size_of::<Result<Self,Error>>()],context)?;
         Ok(Self{source:Box::new(plan),_funding:funding})
     }
@@ -70,7 +70,7 @@ impl<U:'static> Source for RealtimeNeuralPlan<U> {
         ->Result<RealtimeOperationRecipe,Error> {
         if layerwise.is_some(){return Err(Error::Neural(WorkspaceMetadataError::Unqualified.into()));}
         let funding=context.metadata_funding().ok_or_else(||Error::Neural(WorkspaceMetadataError::Unqualified.into()))?;
-        reserve(&[size_of::<WorkspaceMetadataFunding>(),size_of::<RealtimeOperationRecipe>(),size_of::<QualifiedRealtimeNeuralPlan<U>>(),
+        reserve(&[size_of::<HostMetadataFunding>(),size_of::<RealtimeOperationRecipe>(),size_of::<QualifiedRealtimeNeuralPlan<U>>(),
             size_of::<Box<dyn Qualified>>(),size_of::<Result<RealtimeOperationRecipe,Error>>(),
             size_of::<(RealtimeNeuralPlan<U>,SpeculativeNumericalRecipe,&WorkspaceContext)>()],context)?;
         Ok(RealtimeOperationRecipe{source:Box::new((*self).qualify(recipe,context)?),_funding:funding})
@@ -99,7 +99,7 @@ impl<U:'static> Source for RealtimeLayerwisePlan<U> {
         ->Result<RealtimeOperationRecipe,Error> {
         let source=layerwise.ok_or_else(||Error::Neural(WorkspaceMetadataError::Unqualified.into()))?;
         let funding=context.metadata_funding().ok_or_else(||Error::Neural(WorkspaceMetadataError::Unqualified.into()))?;
-        reserve(&[size_of::<WorkspaceMetadataFunding>(),size_of::<RealtimeOperationRecipe>(),size_of::<QualifiedRealtimeLayerwisePlan<U>>(),
+        reserve(&[size_of::<HostMetadataFunding>(),size_of::<RealtimeOperationRecipe>(),size_of::<QualifiedRealtimeLayerwisePlan<U>>(),
             size_of::<Box<dyn Qualified>>(),size_of::<Result<RealtimeOperationRecipe,Error>>(),
             size_of::<(RealtimeLayerwisePlan<U>,SpeculativeNumericalRecipe,&LayerwiseWorkspace,&WorkspaceContext)>()],context)?;
         Ok(RealtimeOperationRecipe{source:Box::new((*self).qualify(recipe,source,context)?),_funding:funding})

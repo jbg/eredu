@@ -45,6 +45,8 @@ pub use graph_metadata::{GraphMetadataFacts, OriginalGraphMetadata};
 pub use tracking::{OriginalSubmissionTracking, SubmissionTrackingFacts};
 mod prefill_capture;
 mod preparation;
+mod sampling_extension;
+pub use sampling_extension::{SamplingExtensionQuote, OriginalTextSamplingExtension};
 pub use prediction::{
     OriginalPredictionNativeCustody, OriginalPredictionRecoveryCustody,
     OriginalPredictionScopeRole, OriginalTextPredictionScopeSet, OriginalTextPredictionScopes,
@@ -123,6 +125,7 @@ impl TextHostControlFacts {
 #[derive(Debug, Clone)]
 pub(in crate::working_memory) struct TextControlBinding {
     identity: Arc<()>,
+    sampling_extension: Option<crate::working_memory::text_preparation::SamplingExtensionBinding>,
     source: Option<eredu_core::SharedStorageIdentity>,
     sequence: Option<SequenceBinding>,
     prefill_paths: Option<crate::host_metadata::HostMetadataIdentity>,
@@ -136,10 +139,12 @@ pub(in crate::working_memory) struct TextControlBinding {
     graph_metadata: Option<GraphMetadataFacts>,
     host_destinations: Option<HostDestinationFacts>,
     output_sources: Option<HostSourceConstructionFacts>,
-    native_storage: Option<Arc<native_storage::plan::NativeStorageLayout>>,
+    native_storage: Option<native_storage::plan::NativeStorageLayoutOwner>,
     pins: Option<Arc<PinLayout>>,
     publication: Option<Arc<PublicationLayout>>,
     batches: Option<Arc<BatchPublicationLayout>>,
+    // Last: all detached descriptors and the identity shell precede their payer.
+    _metadata_funding: Option<eredu_core::HostMetadataFunding>,
 }
 impl TextControlBinding {
     pub(in crate::working_memory) fn native_span_remainder(
@@ -169,6 +174,11 @@ impl TextControlBinding {
     }
     pub(in crate::working_memory) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.identity, &other.identity)
+            && match (&self.sampling_extension, &other.sampling_extension) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same(b),
+                _ => false,
+            }
             && self.source == other.source
             && self.sequence == other.sequence
             && self.prefill_paths == other.prefill_paths
@@ -183,7 +193,7 @@ impl TextControlBinding {
             && self.host_destinations == other.host_destinations
             && match (&self.native_storage, &other.native_storage) {
                 (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (Some(a), Some(b)) => a.same(b),
                 _ => false,
             }
             && match (&self.publication, &other.publication) {
@@ -269,6 +279,8 @@ impl PreparedTextControlWorkspace {
         Ok(Self {
             binding: TextControlBinding {
                 identity: Arc::new(()),
+                _metadata_funding: plan.metadata_funding(),
+                sampling_extension: None,
                 source: Some(source.storage_identity().clone()),
                 sequence: None,
                 prefill_paths: None,
@@ -435,22 +447,6 @@ impl InferenceSpanWorkspace {
             .and_then(|c| c.binding.sequence.as_ref())
             .and_then(|s| s.input.as_ref())
             .map_or(0, token_input::TokenInputBinding::bytes);
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-            eprintln!("ORIGINAL_QUOTE_PROTECTED chunk={} records={} retention={} input={} controls={} sequence={} pins={} publication={} batches={}",
-                self.plan.geometry().prefill_chunk_positions, self.plan.records().len(),
-                p, input, q, r, s, publication, batches);
-            if let Some(controls) = self.text_controls.as_ref() {
-                eprintln!("ORIGINAL_QUOTE_CONTROLS admission={:?} carrier={:?} work={:?} graph_capacity={:?} graph_provider={:?} prefill_scopes={:?} prefill_spans={:?} prefill_total={:?} prefill_operations={:?}",
-                    controls.facts().admission_bytes(), controls.facts().carrier_bytes(), controls.facts().work_bytes(),
-                    controls.binding.graph_metadata.map(|graph| graph.capacity().get()),
-                    controls.binding.graph_metadata.map(|graph| graph.provider_bytes()),
-                    controls.binding.prefill_scopes.map(|prefill| prefill.plan().scope_count()),
-                    controls.binding.prefill_scopes.map(|prefill| prefill.plan().span_count()),
-                    controls.binding.prefill_scopes.map(|prefill| prefill.total_bytes()),
-                    controls.binding.prefill_scopes.map(|prefill| prefill.operation_control_bytes()));
-            }
-        }
         p.checked_add(input)
             .and_then(|n| n.checked_add(q))
             .and_then(|n| n.checked_add(r))
@@ -473,14 +469,6 @@ impl IncrementalInferenceQuote {
             || !controls.plan.same_plan(self.span_workspace.plan())
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
-        }
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            eprintln!("HOST_PARALLEL_STORAGE_SEAL controls={:?} prefill={:?} native_generations={:?} equation_incremental={:?} host_records_complete={}",
-                controls.facts(), controls.binding.prefill_scopes,
-                controls.binding.native_storage.as_ref().and_then(|native| native.equation_generations),
-                self.equation_incremental_bytes,
-                self.span_workspace.plan.records().iter().all(|record| record.host_workspace_bytes().is_some()));
         }
         controls
             .facts()
@@ -508,6 +496,10 @@ impl IncrementalInferenceQuote {
                         record.host_workspace_bytes().map(|bytes| peak.max(bytes))
                     })
                     .ok_or(WorkingMemoryError::UnknownBound)?;
+                // Sampling's complete host envelope is already in vocabulary;
+                // only its tensor term is replaced. Model equation quotations
+                // include their disjoint host peak in the replaced term itself.
+                let host = if self.span_workspace.sampling.is_some() { 0 } else { host };
                 let replacement = generations
                     .checked_add(host)
                     .ok_or(WorkingMemoryError::Overflow)?;
@@ -519,8 +511,9 @@ impl IncrementalInferenceQuote {
                     .incremental_bytes
                     .checked_add(extra)
                     .ok_or(WorkingMemoryError::Overflow)?;
+                let report_funding = self.span_workspace.plan.metadata_funding();
                 let workspace = self
-                    .state
+                    .state_mut()?
                     .execution_workspace
                     .as_mut()
                     .ok_or(WorkingMemoryError::UnknownBound)?;
@@ -531,7 +524,9 @@ impl IncrementalInferenceQuote {
                 *bytes = bytes
                     .checked_add(extra)
                     .ok_or(WorkingMemoryError::Overflow)?;
-                assumptions.push_str("; registered equation peak replaced once by all selected native generations plus the original disjoint host peak");
+                append_assumptions(assumptions,
+                    "; registered equation peak replaced once by all selected native generations plus the original disjoint host peak",
+                    "", report_funding.as_ref())?;
             }
         }
         self.span_workspace.text_controls = Some(controls);
@@ -606,6 +601,12 @@ pub struct OriginalTextMetadataCustody {
     _raw: crate::working_memory::funding::RawSpanHostOwner,
 }
 impl OriginalTextMetadataCustody {
+    pub(in crate::working_memory) fn same_raw_account(
+        &self,
+        other: &crate::working_memory::funding::RawSpanHostOwner,
+    ) -> bool {
+        self._raw.same(other)
+    }
     pub(in crate::working_memory) fn same_account(&self, other: &Self) -> bool { self._raw.same(&other._raw) }
     /// Whether this is the only remaining alias of this exact request's raw
     /// host custody. This test observation neither grants exclusive access nor
@@ -649,6 +650,14 @@ impl OriginalTextMetadataCustody {
     ) -> Result<(), WorkingMemoryError>
     where K: Ord + Send + Sync + 'static + crate::working_memory::GgufSourceStorageKey {
         self._raw.pool().validate_retained_source_inventory(key, bytes)
+    }
+
+    pub(in crate::working_memory) fn validate_retained_origin_locked(
+        &self,
+        pool: &WorkingMemoryPool,
+        usage: &crate::working_memory::Usage,
+    ) -> Result<(), WorkingMemoryError> {
+        self._raw.validate_origin_locked(pool, usage)
     }
 
     /// Read-only validation against the original raw account's pool. The

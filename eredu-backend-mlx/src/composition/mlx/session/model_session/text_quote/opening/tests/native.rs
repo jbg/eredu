@@ -203,7 +203,7 @@ fn ordinary_successor_keeps_exact_predecessor_and_rejects_a_later_revision() {
     let mut outputs = Vec::new();
     for _ in 0..2 {
         outputs.push(driver.advance(&mut state).unwrap().unwrap().into_output());
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
     }
     let (preparation, quote, original) = {
         let mut boundary = driver.quiescent(&mut state).unwrap();
@@ -241,7 +241,7 @@ fn ordinary_successor_keeps_exact_predecessor_and_rejects_a_later_revision() {
         (preparation, quote, retained)
     };
     outputs.push(driver.advance(&mut state).unwrap().unwrap().into_output());
-    driver.take_completed_step(&mut state).unwrap();
+    driver.take_completed_delivery(&mut state).unwrap();
     {
         let mut boundary = driver.quiescent(&mut state).unwrap();
         let (runtime, _, _) = boundary.copy_mechanism_parts();

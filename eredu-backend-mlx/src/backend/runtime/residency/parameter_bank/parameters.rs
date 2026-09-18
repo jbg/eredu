@@ -83,7 +83,7 @@ impl SharedAddressableParameterBank {
         }
         operation(&mut |visitor| {
             for (metadata, value) in &mut values {
-                visitor.visit_slot(metadata.clone(), value);
+                visitor.visit_slot(metadata.as_view(), value);
             }
         })?;
         Ok(true)

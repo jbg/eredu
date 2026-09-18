@@ -46,7 +46,7 @@ fn session_preflight_borrows_original_selections_and_rejects_before_estimation()
 #[test]
 fn checkpoint_revalidation_preserves_live_source_usage_and_rejects_changed_facts() {
     let (plan, discovery) = source();
-    let mut session = CaptureSession::new(plan);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
     let selection = session.plan().plan().selections.as_ptr();
     session.begin_step(CapturePhase::Prefill, 0).unwrap();
     let mut backend = ProbeBackend {

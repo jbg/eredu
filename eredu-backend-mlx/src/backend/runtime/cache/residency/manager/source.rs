@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, HostMetadataFunding},
 };
 use eredu_runtime::CacheBlockSelection;
 use std::{
@@ -54,6 +54,10 @@ pub(crate) enum CacheSourceError {
     #[error(transparent)]
     HostStore(safemlx::PreparedHostCopyError),
     #[error(transparent)]
+    DeviceRetirementPreparation(safemlx::PreparedAllocationOwnerCause),
+    #[error(transparent)]
+    DeviceRetirementAttachment(safemlx::OriginalBufferCause),
+    #[error(transparent)]
     HostPublication(host_demotion::HostPublicationError),
     #[error(transparent)]
     Lifecycle(#[from] CacheLifecycleError),
@@ -90,7 +94,7 @@ pub(crate) enum CacheSourceFailureCause {
 pub(crate) struct CacheSourceFailure {
     #[source]
     cause: CacheSourceFailureCause,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl CacheSourceFailure {
     pub(crate) fn source(cause: CacheSourceError, context: &WorkspaceContext) -> Self {
@@ -344,7 +348,7 @@ impl CacheResidencyManager {
             size_of::<R>(),
             size_of::<bool>(),
             size_of::<CacheSourceFailure>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             callback_bytes,
             reporting::report_query_control_bytes()?,
         ];
@@ -501,3 +505,6 @@ pub(crate) use host_promotion::PreparedInitialDiskReturn;
 
 #[path = "source/disk_backing.rs"]
 mod disk_backing;
+
+#[path = "source/device_retirement.rs"]
+mod device_retirement;

@@ -6,6 +6,19 @@ use eredu_nn::workspace::WorkspaceContext;
 #[derive(Clone, Copy)]
 pub(crate) struct ModuleMetadata<'a>(Option<&'a WorkspaceContext>);
 impl<'a> ModuleMetadata<'a> {
+    pub(crate) fn destination(context: Option<&'a WorkspaceContext>) -> Self {
+        Self(context)
+    }
+    pub(crate) fn source<E: std::error::Error + Send + Sync + 'static>(self, cause: E) -> Error {
+        match self.0 {
+            Some(context) => context.metadata_source(cause),
+            None => Error::backend_retained_source(cause),
+        }
+    }
+    pub(crate) fn optional_path(self, path: Option<&str>) -> Result<Option<String>, Error> {
+        self.controls::<(Option<&str>, Option<String>)>()?;
+        path.map(|path| self.text(format_args!("{path}"))).transpose()
+    }
     pub(crate) fn funded(context: &'a WorkspaceContext) -> Self {
         Self(Some(context))
     }
@@ -21,6 +34,15 @@ impl<'a> ModuleMetadata<'a> {
             Some(context) => context.metadata_vec(capacity),
             None => Ok(Vec::with_capacity(capacity)),
         }
+    }
+    pub(crate) fn push<T>(self, values: &mut Vec<T>, value: T) -> Result<(), Error> {
+        self.controls::<(&mut Vec<T>, T)>()?;
+        match self.0 {
+            Some(context) => context.reserve_metadata_vec(values, 1)?,
+            None => values.reserve(1),
+        }
+        values.push(value);
+        Ok(())
     }
     pub(crate) fn text(self, args: std::fmt::Arguments<'_>) -> Result<String, Error> {
         match self.0 {
@@ -232,14 +254,14 @@ impl<'a> FormatStorage<'a> for ModuleMetadata<'_> {
         Ok(companion)
     }
     fn unscaled(&mut self, format: LinearFormat) -> Result<Self::Output, Error> {
-        self.finish_format(format, None, None)
+        self.declared_format(format, None, None)
     }
     fn scaled(
         &mut self,
         format: LinearFormat,
         scale: ParameterSpec,
     ) -> Result<Self::Output, Error> {
-        self.finish_format(format, Some(scale), None)
+        self.declared_format(format, Some(scale), None)
     }
     fn affine(
         &mut self,
@@ -247,7 +269,7 @@ impl<'a> FormatStorage<'a> for ModuleMetadata<'_> {
         scale: ParameterSpec,
         bias: ParameterSpec,
     ) -> Result<Self::Output, Error> {
-        self.finish_format(format, Some(scale), Some(bias))
+        self.declared_format(format, Some(scale), Some(bias))
     }
 }
 impl ModuleMetadata<'_> {
@@ -273,17 +295,8 @@ impl ModuleMetadata<'_> {
             },
         }
     }
-    fn finish_format(
-        self,
-        format: LinearFormat,
-        scale: Option<ParameterSpec>,
-        bias: Option<ParameterSpec>,
-    ) -> Result<eredu_nn::LinearFormatSpec, Error> {
-        eredu_nn::LinearFormatSpec::from_parts_with_metadata(
-            format,
-            scale,
-            bias,
-            self.0.expect("checked format worker"),
-        )
-    }
+
 }
+
+#[cfg(test)]
+mod path_tests;

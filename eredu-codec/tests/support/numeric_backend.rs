@@ -919,11 +919,15 @@ impl Tensor for NumericTensor {
 #[derive(Clone, Debug, Default)]
 pub struct NullOperator;
 impl Parameterized<NumericTensor> for NullOperator {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, NumericTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
-    }
+ let mut __source_result = Ok(());
+
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
     where
         V: ParameterVisitorMut<'a, NumericTensor>,

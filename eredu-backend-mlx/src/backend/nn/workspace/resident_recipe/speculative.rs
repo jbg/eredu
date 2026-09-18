@@ -226,7 +226,7 @@ impl ResidentNativeRecipe {
             eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
         );
         let row = self.records.get(ordinal).ok_or_else(unknown)?;
-        if row.unqualified_kernel_owner.is_some() || !self.sampling.is_empty()
+        if row.unqualified_kernel_owner.is_some() || !self.sampling.rows.is_empty()
             || self.resume_copy.is_some()
             || ((self.host_copies.is_some() || self.host_transfers.is_some())
                 && !self.has_host_copy_recipe()) {

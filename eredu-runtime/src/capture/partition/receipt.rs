@@ -1,6 +1,5 @@
 //! Expected-producer receipt admission and bounded host-record encoding/decoding.
 use super::*;
-use crate::capture::CapturePlanSource;
 use eredu_core::checkpoint::TensorDtype;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use construction::PreparedReceiptStorage;
 pub(in crate::capture::partition) use construction::component_adapter_error;
 pub(in crate::capture::partition) use construction::{copy_routed_ownership,Cause as ReceiptConstructionCause};
 pub(in crate::capture::partition) use construction::copy_context;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 pub use writer::{PartitionCaptureEncodingError, PartitionCaptureRecordEncoding};
 
 /// One retained producer projection for an exact global selection and forward.
@@ -48,7 +47,7 @@ pub struct PartitionCaptureReceiptLimits {
 #[derive(Debug)]
 pub struct PartitionCaptureReceiptPlan {
     pub(super) combination: PartitionCaptureCombination,
-    pub(super) plan: CapturePlanSource,
+    pub(super) plan: SharedCapturePlan,
     pub(super) context: PartitionCaptureContext,
     producers: BTreeMap<usize, CaptureSlicePartition>,
     // Original receipts retain their prepaid canonical Vec without tree nodes.
@@ -64,7 +63,7 @@ pub struct PartitionCaptureReceiptPlan {
     world_size: usize,
     evidence_budget: Option<EvidenceBudgetSource>,
     // Every owned geometry/context/identity destination retires before its account.
-    _metadata: Option<WorkspaceMetadataFunding>,
+    _metadata: Option<HostMetadataFunding>,
 }
 
 fn invalid(message: &str) -> CaptureError {
@@ -77,33 +76,10 @@ fn reserve(ledger: &mut dyn CaptureReservation, usage: CaptureUsage) -> Result<(
 }
 
 impl PartitionCaptureReceiptPlan {
-    /// Validates complete, disjoint ownership before any capture work. Producers
-    /// with zero overlap are retained so their explicit receipt cannot be confused
-    /// with a missing peer. Empty global selections still require a producer.
-    /// `ledger` prices cold host admission/storage; native work uses its separately
-    /// admitted producer quotas, not an untrusted receipt's charged field.
+    /// Validates complete, disjoint ownership while retaining the exact source.
+    /// Empty overlaps remain explicit producers. Source attachment, receipt
+    /// construction quota and native execution admission are separate obligations.
     pub fn new(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
-        context: PartitionCaptureContext,
-        producers: Vec<PartitionCaptureProducer>,
-        world_size: usize,
-        limits: PartitionCaptureReceiptLimits,
-        ledger: &mut dyn CaptureReservation,
-    ) -> Result<Self, PartitionCaptureMergeError> {
-        Self::new_source(
-            CapturePlanSource::Legacy(plan.into()),
-            context,
-            producers,
-            world_size,
-            limits,
-            ledger,
-        )
-    }
-
-    /// Retain the exact shared admission source without copying or re-admitting
-    /// its payload. Its existing attachment covers source storage only; receipt
-    /// construction/quota and native execution remain separate obligations.
-    pub fn new_shared(
         plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
@@ -111,42 +87,13 @@ impl PartitionCaptureReceiptPlan {
         limits: PartitionCaptureReceiptLimits,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
-        Self::new_source(
-            CapturePlanSource::Shared(plan),
-            context,
-            producers,
-            world_size,
-            limits,
-            ledger,
-        )
+        Self::new_source(plan, context, producers, world_size, limits, ledger)
     }
 
-    /// Admits complete selected floating terms from every named producer. Unlike
-    /// disjoint assembly, missing terms can never be filled by another producer's
-    /// overlapping coverage. Raw selected values are priced before native work;
-    /// nonlinear transforms follow bounded, compensated host summation.
+    /// Admits complete selected floating terms from every named producer.
+    /// Raw selected values are priced before native work; nonlinear transforms
+    /// follow bounded compensated host summation.
     pub fn new_sum(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
-        context: PartitionCaptureContext,
-        producers: Vec<PartitionCaptureProducer>,
-        world_size: usize,
-        limits: PartitionCaptureReceiptLimits,
-        ledger: &mut dyn CaptureReservation,
-    ) -> Result<Self, PartitionCaptureMergeError> {
-        Self::new_sum_source(
-            CapturePlanSource::Legacy(plan.into()),
-            context,
-            producers,
-            world_size,
-            limits,
-            ledger,
-        )
-    }
-
-    /// Retain the exact shared admission source without copying or re-admitting
-    /// its payload. Its existing attachment covers source storage only; receipt
-    /// construction/quota and native execution remain separate obligations.
-    pub fn new_sum_shared(
         plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
@@ -154,47 +101,12 @@ impl PartitionCaptureReceiptPlan {
         limits: PartitionCaptureReceiptLimits,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
-        Self::new_sum_source(
-            CapturePlanSource::Shared(plan),
-            context,
-            producers,
-            world_size,
-            limits,
-            ledger,
-        )
+        Self::new_sum_source(plan, context, producers, world_size, limits, ledger)
     }
 
-    /// Admits dynamic routed rows against exact expert/unit ownership. This uses
-    /// the ordinary receipt transport and completion protocol; no native work or
-    /// publication is authorized by this host declaration alone.
+    /// Admits dynamic routed rows against exact expert/unit ownership using
+    /// the same receipt transport and completion protocol.
     pub fn new_routed(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
-        context: PartitionCaptureContext,
-        producers: Vec<PartitionRoutedCaptureProducer>,
-        world_size: usize,
-        limits: PartitionCaptureReceiptLimits,
-        ledger: &mut dyn CaptureReservation,
-    ) -> Result<Self, PartitionCaptureMergeError> {
-        // Preserve legacy conversion timing: a rejected producer/ownership
-        // preparation does not construct an Arc or invoke the caller's Into.
-        let (projections, ownership) = Self::prepare_routed_producers(producers, limits, ledger)?;
-        Self::new_with_ownership(
-            CapturePlanSource::Legacy(plan.into()),
-            context,
-            projections,
-            ownership.into(),
-            PartitionCaptureCombination::Disjoint,
-            world_size,
-            limits,
-            ledger,
-            None,
-        )
-    }
-
-    /// Retain the exact shared admission source without copying or re-admitting
-    /// its payload. Its existing attachment covers source storage only; receipt
-    /// construction/quota and native execution remain separate obligations.
-    pub fn new_routed_shared(
         plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionRoutedCaptureProducer>,
@@ -202,20 +114,12 @@ impl PartitionCaptureReceiptPlan {
         limits: PartitionCaptureReceiptLimits,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
-        Self::new_routed_source(
-            CapturePlanSource::Shared(plan),
-            context,
-            producers,
-            world_size,
-            limits,
-            ledger,
-        )
+        Self::new_routed_source(plan, context, producers, world_size, limits, ledger)
     }
 
-    /// Borrow the original shared source, when this is a shared-source receipt.
-    /// A legacy raw Arc is never promoted into a registered shared owner.
-    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
-        self.plan.shared()
+    /// Borrow the exact immutable source retained by this receipt.
+    pub fn shared_plan_source(&self) -> &SharedCapturePlan {
+        &self.plan
     }
 
     /// Cold host storage bound before retaining these already bounded declarations.
@@ -278,7 +182,7 @@ impl PartitionCaptureReceiptPlan {
     /// `ledger` prices cold host admission/storage; native work uses its separately
     /// admitted producer quotas, not an untrusted receipt's charged field.
     pub(in crate::capture) fn new_source(
-        plan: CapturePlanSource,
+        plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
         world_size: usize,
@@ -303,7 +207,7 @@ impl PartitionCaptureReceiptPlan {
     /// overlapping coverage. Raw selected values are priced before native work;
     /// nonlinear transforms follow bounded, compensated host summation.
     pub(in crate::capture) fn new_sum_source(
-        plan: CapturePlanSource,
+        plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
         world_size: usize,
@@ -327,7 +231,7 @@ impl PartitionCaptureReceiptPlan {
     /// the ordinary receipt transport and completion protocol; no native work or
     /// publication is authorized by this host declaration alone.
     pub(in crate::capture) fn new_routed_source(
-        plan: CapturePlanSource,
+        plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         producers: Vec<PartitionRoutedCaptureProducer>,
         world_size: usize,
@@ -382,7 +286,7 @@ impl PartitionCaptureReceiptPlan {
     }
 
     fn new_with_ownership(
-        plan: CapturePlanSource,
+        plan: SharedCapturePlan,
         context: PartitionCaptureContext,
         mut producers: Vec<PartitionCaptureProducer>,
         routed: RoutedOwnership,
@@ -572,7 +476,7 @@ impl PartitionCaptureReceiptPlan {
         let parts=[std::mem::size_of_val(&self.producers()).checked_mul(2)?,
             std::mem::size_of_val(&self.routed.iter()).checked_mul(2)?,
             std::mem::size_of::<(&Self,&Self)>(),std::mem::size_of::<(&PartitionCaptureContext,&PartitionCaptureContext)>(),
-            std::mem::size_of::<Option<(&SharedCapturePlan,&SharedCapturePlan)>>(),std::mem::size_of::<bool>()*4];
+            std::mem::size_of::<(&SharedCapturePlan,&SharedCapturePlan)>(),std::mem::size_of::<bool>()*4];
         parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
     }
     /// Same immutable fragment source across the later original run/forward
@@ -580,8 +484,7 @@ impl PartitionCaptureReceiptPlan {
     /// still supplies and authenticates its own run identity and forward epoch.
     pub(crate) fn same_fragment_host_source(&self, other:&Self)->bool {
         let (a,b)=(&self.context,&other.context);
-        self.shared_plan_source().zip(other.shared_plan_source())
-            .is_some_and(|(a,b)|a.same_storage(b))
+        self.shared_plan_source().same_storage(other.shared_plan_source())
             && a.artifact_identity==b.artifact_identity && a.execution_identity==b.execution_identity
             && a.overlay_identity==b.overlay_identity && a.capture_plan_identity==b.capture_plan_identity
             && a.selection_index==b.selection_index && a.phase==b.phase && a.prediction==b.prediction

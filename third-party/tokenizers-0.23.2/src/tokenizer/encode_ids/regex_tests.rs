@@ -1,8 +1,6 @@
 use super::*;
 use crate::{pre_tokenizers::byte_level::ByteLevel, TokenizerCompilePlan};
-use fancy_regex::workspace::{
-    construction, Buffer, DelegateBuffer, PrepareFailure,
-};
+use fancy_regex::workspace::{construction, Buffer, DelegateBuffer, PrepareFailure};
 use serde_json::{json, Value};
 use std::error::Error as _;
 
@@ -42,13 +40,11 @@ fn has_reserve(mut cause: Option<&(dyn std::error::Error + 'static)>) -> bool {
     false
 }
 #[test]
-fn full_regex_pipeline_and_original_ids_match_ordinary_spelling_offsets_and_special_policy(
-) {
+fn full_regex_pipeline_and_original_ids_match_ordinary_spelling_offsets_and_special_policy() {
     for ignore in [false, true] {
         let value = source(ignore);
         let mut actual = packed(&value);
-        let mut legacy =
-            Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
+        let mut legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
         for encode_special in [false, true] {
             actual.set_encode_special_tokens(encode_special);
             legacy.set_encode_special_tokens(encode_special);
@@ -69,17 +65,13 @@ fn full_regex_pipeline_and_original_ids_match_ordinary_spelling_offsets_and_spec
                     assert_eq!(a.get_ids(), b.get_ids(), "{text:?}");
                     assert_eq!(a.get_tokens(), b.get_tokens());
                     assert_eq!(a.get_offsets(), b.get_offsets());
-                    let plan = EncodeIdsPlan::prepare(&actual, text, special)
-                        .unwrap();
+                    let plan = EncodeIdsPlan::prepare(&actual, text, special).unwrap();
                     let limits = plan.requirements();
                     assert_eq!(limits.mapped_capacity(), 2 * text.len());
-                    assert!(limits.regex_delegate_count() > 0);
+                    assert_eq!(limits.regex_delegate_count(), 0);
                     let ids = plan.encode().unwrap();
                     assert_eq!(ids.ids(), b.get_ids(), "{text:?}");
-                    assert_eq!(
-                        ids.mapped_capacity(),
-                        limits.mapped_capacity()
-                    );
+                    assert_eq!(ids.mapped_capacity(), limits.mapped_capacity());
                     assert_eq!(
                         ids.capacities(),
                         [
@@ -96,31 +88,30 @@ fn full_regex_pipeline_and_original_ids_match_ordinary_spelling_offsets_and_spec
             .encode()
             .unwrap();
         assert_eq!(ids.ids() == [257], ignore);
-        let restored = Tokenizer::from_bytes(
+        let restored = Tokenizer::from_bytes_with_cache_policy(
             serde_json::to_string(&actual).unwrap().as_bytes(),
+            crate::ModelCachePolicy::disabled(),
         )
         .unwrap();
         assert_eq!(
             restored.encode("Hello hi", false).unwrap().get_ids(),
             legacy.encode("Hello hi", false).unwrap().get_ids()
         );
-        assert!(matches!(
-            EncodeIdsPlan::prepare(&restored, "Hello", false),
-            Err(EncodeIdsError::PipelineProfile)
-        ));
+        let restored_ids = EncodeIdsPlan::prepare(&restored, "Hello", false)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(restored_ids.ids(), ids.ids());
     }
 }
 #[test]
-fn decoded_pattern_and_component_settings_are_checked_before_model_construction(
-) {
+fn decoded_pattern_and_component_settings_are_checked_before_model_construction() {
     use crate::TokenizerCompileErrorKind as K;
     for change in 0..7 {
         let mut value = source(true);
         let pre = &mut value["pre_tokenizer"]["pretokenizers"];
         match change {
-            0 => {
-                pre[0]["pattern"]["Regex"] = json!("not the admitted pattern")
-            }
+            0 => pre[0]["pattern"]["Regex"] = json!("not the admitted pattern"),
             1 => pre[0]["invert"] = json!(true),
             2 => {
                 pre[0].as_object_mut().unwrap().remove("invert");
@@ -166,18 +157,9 @@ fn decoded_pattern_and_component_settings_are_checked_before_model_construction(
     ));
 }
 #[test]
-fn real_cold_regex_failures_retain_completed_model_and_original_nested_cause()
-{
-    use construction::{ConstructionFailure as F, ScratchFailureBuffer as S};
-    for target in [
-        F::Pattern,
-        F::Instructions,
-        F::LastDelegate,
-        F::Scratch(S::Stack),
-        F::Scratch(S::Dense),
-        F::Scratch(S::Sparse),
-        F::Completed,
-    ] {
+fn real_cold_regex_failures_retain_completed_model_and_original_nested_cause() {
+    use construction::ConstructionFailure as F;
+    for target in [F::Pattern, F::Instructions, F::LastDelegate, F::Completed] {
         let json = source(true).to_string();
         let failure = TokenizerCompilePlan::prepare_json(json.as_bytes())
             .unwrap()
@@ -199,8 +181,7 @@ fn real_cold_regex_failures_retain_completed_model_and_original_nested_cause()
     }
 }
 #[test]
-fn mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes(
-) {
+fn mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes() {
     let actual = packed(&source(true));
     let input = "Hello hi<S>xé";
     let failure = EncodeIdsPlan::prepare(&actual, input, false)
@@ -215,13 +196,7 @@ fn mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes(
         .unwrap()
         .requirements()
         .regex_delegate_count();
-    let outer = [
-        Buffer::Delegates,
-        Buffer::Saves,
-        Buffer::Branches,
-        Buffer::Undo,
-        Buffer::Slots,
-    ];
+    let outer = [Buffer::Saves, Buffer::Branches, Buffer::Undo];
     let inner = [
         DelegateBuffer::Epsilon,
         DelegateBuffer::CurrentDense,
@@ -231,14 +206,16 @@ fn mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes(
         DelegateBuffer::CurrentSlots,
         DelegateBuffer::NextSlots,
     ];
-    let targets =
-        outer.iter().copied().map(PrepareFailure::Outer).chain(
-            (0..delegates).flat_map(|ordinal| {
-                inner.iter().copied().map(move |buffer| {
-                    PrepareFailure::Delegate { ordinal, buffer }
-                })
-            }),
-        );
+    let targets = outer
+        .iter()
+        .copied()
+        .map(PrepareFailure::Outer)
+        .chain((0..delegates).flat_map(|ordinal| {
+            inner
+                .iter()
+                .copied()
+                .map(move |buffer| PrepareFailure::Delegate { ordinal, buffer })
+        }));
     for target in targets {
         let failure = EncodeIdsPlan::prepare(&actual, input, false)
             .unwrap()
@@ -269,13 +246,11 @@ fn mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes(
     }
 }
 #[test]
-fn independent_workspaces_share_only_immutable_source_and_reuse_no_model_cache(
-) {
+fn independent_workspaces_share_only_immutable_source_and_reuse_no_model_cache() {
     let worker = std::thread::spawn(|| {
         let value = source(true);
         let actual = packed(&value);
-        let legacy =
-            Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
+        let legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
         let before = crate::models::bpe::BPE::tls_cache_population();
         legacy.encode("hihi hihi", false).unwrap();
         let positive = crate::models::bpe::BPE::tls_cache_population();
@@ -291,10 +266,7 @@ fn independent_workspaces_share_only_immutable_source_and_reuse_no_model_cache(
                 .unwrap();
             assert_eq!(a.ids(), b.ids());
             assert_ne!(a.ids().as_ptr(), b.ids().as_ptr());
-            assert_eq!(
-                crate::models::bpe::BPE::tls_cache_population(),
-                positive
-            );
+            assert_eq!(crate::models::bpe::BPE::tls_cache_population(), positive);
         }
     });
     worker.join().unwrap();

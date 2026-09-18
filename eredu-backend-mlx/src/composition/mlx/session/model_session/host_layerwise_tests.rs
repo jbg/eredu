@@ -90,7 +90,7 @@ fn geometry() -> InferenceGeometry {
     }
 }
 
-fn artifact(model_type: &str) -> tempfile::TempDir {
+pub(super) fn artifact(model_type: &str) -> tempfile::TempDir {
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact(model_type, true);

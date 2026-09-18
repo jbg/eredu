@@ -112,7 +112,7 @@ fn nfc_actual_seven_frontiers_and_later_regex_failure_preserve_original_c_e_and_
                         p.fail_normalization_reservation(targets[stage - 4])
                             .unwrap()
                     } else {
-                        p.fail_regex_reservation(F::Outer(B::Slots)).unwrap()
+                        p.fail_regex_reservation(F::Outer(B::Undo)).unwrap()
                     }
                 },
                 || {},
@@ -156,9 +156,11 @@ fn nfc_actual_seven_frontiers_and_later_regex_failure_preserve_original_c_e_and_
                 .unwrap_err()
         })
         .collect();
-    assert!(rejects
-        .iter()
-        .all(|e| e.retained_bytes() == 0 && !e.matches_source(&source)));
+    assert!(
+        rejects
+            .iter()
+            .all(|e| e.retained_bytes() == 0 && !e.matches_source(&source))
+    );
     let error = pool
         .encode_tokenizer_ids_with(
             &source,

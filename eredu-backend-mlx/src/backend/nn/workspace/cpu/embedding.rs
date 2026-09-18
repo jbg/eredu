@@ -81,6 +81,80 @@ fn token_validation_population(index_dtype:Dtype,rank:usize,count:usize,sentinel
     Some(source)
 }
 
+/// The existing tensor take-axis predicate differs from token normalization:
+/// it preserves signed negative indices and does not cast the borrowed input
+/// before its two comparisons. Its safe index output is retained by Gather.
+pub(super) fn checked_take_indices(rank:usize,count:usize,mechanism:MlxCpuWorkspaceMechanisms)
+    ->facts::FactResult<Option<OperationPlan>> {
+    if rank!=1||count==0||count>i32::MAX as usize{return Ok(None);}
+    let source=(|| {
+        let mut source=Population::default();
+        for (kind,dtype,scalar) in [
+            (CpuBinaryOperation::GreaterEqual,Dtype::Int32,true),
+            (CpuBinaryOperation::Less,Dtype::Int32,true),
+            (CpuBinaryOperation::LogicalAnd,Dtype::Bool,false),
+        ] {
+            // Same-dtype casts and the indices' same-shape broadcast are
+            // frontend candidates only. Each comparison really broadcasts its
+            // scalar before the binary Eval; the mask conjunction does not.
+            if scalar {source.alias(0,rank)?;}
+            let binary=OperationEvent::cpu_binary_layout(kind,dtype,rank,count,false)?;
+            source.births(Some(Buffer::Mask),binary.backing_births())?;
+            source.native.binary(binary)?;
+        }
+        let inverse=OperationEvent::cpu_unary_layout(CpuUnaryOperation::LogicalNot,Dtype::Bool,rank,false)?;
+        source.births(Some(Buffer::Mask),inverse.backing_births())?;
+        source.native.unary(inverse)?;
+        // any_owned elides its Reduce for a singleton axis, but always
+        // squeezes the selected axis when keepdims is false.
+        if count!=1 {
+            source.copy(OperationEvent::cpu_boolean_reduce_layout(false,rank,count,false)?,1,Some(Buffer::Scalar))?;
+        }
+        source.copy(OperationEvent::cpu_squeeze_layout(rank,false)?,1,None)?;
+        // zeros_like is one eager I32 seed followed by Broadcast and Full;
+        // where's same-dtype casts/broadcasts leave only its Select Eval.
+        source.alias(0,rank)?;
+        source.copy(OperationEvent::cpu_scalar_full_layout(Dtype::Int32,rank,count,false)?,1,Some(Buffer::Index))?;
+        source.copy(OperationEvent::cpu_select_layout(Dtype::Int32,rank,count,false)?,3,Some(Buffer::Index))?;
+        // Three binary frontends each have two casts, two broadcasts and the
+        // binary constructor. LogicalNot has cast+unary, any has Reduce (or
+        // identity cast)+Squeeze, zeros has Broadcast+cast+Full, and Select has
+        // three casts+three broadcasts+Select. Graph storage counts candidates;
+        // CPU tape, edges and backing births above count only actual Evals.
+        source.native.construction_entries=3*5+2+2+3+7;
+        Some(source)
+    })();
+    let Some(mut source)=source else{return Ok(None)};
+    let index=mechanism.allocation.fixed_buffer_capacity((count as u64).checked_mul(4)
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?;
+    let mask=mechanism.allocation.fixed_buffer_capacity(count as u64)?;
+    let scalar=mechanism.allocation.fixed_buffer_capacity(4)?;
+    let scratch_bytes=facts::add(facts::add(
+        facts::mul(index,u64::try_from(source.index_births.checked_sub(1)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?)?,
+        facts::mul(mask,u64::try_from(source.mask_births)?)?)?,
+        facts::mul(scalar,u64::try_from(source.scalar_births.checked_add(3)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?)?)?;
+    let frames=[size_of::<(usize,usize,MlxCpuWorkspaceMechanisms)>(),size_of::<Population>(),
+        size_of::<Option<Population>>(),size_of::<Option<CpuCopyEvalLayout>>(),size_of::<CpuCopyEvalLayout>(),
+        size_of::<OperationPlan>(),size_of::<facts::FactResult<Option<OperationPlan>>>(),
+        size_of::<[u64;4]>(),size_of::<Dtype>(),size_of::<bool>(),size_of::<CpuBinaryOperation>(),
+        size_of::<safemlx::CpuBinaryEvalLayout>(),size_of::<Option<safemlx::CpuBinaryEvalLayout>>(),
+        size_of::<safemlx::CpuUnaryEvalLayout>(),size_of::<Option<safemlx::CpuUnaryEvalLayout>>(),
+        size_of::<[(CpuBinaryOperation,Dtype,bool);3]>(),
+        size_of::<std::array::IntoIter<(CpuBinaryOperation,Dtype,bool),3>>(),
+        size_of::<(&mut Population,CpuCopyEvalLayout,usize,Option<Buffer>)>(),
+        size_of::<(&mut Population,Option<Buffer>,usize)>(),
+        size_of::<(&mut Population,usize,usize)>(),size_of::<&mut usize>(),
+        size_of::<Option<Buffer>>(),size_of::<Option<()>>(),
+        super::super::zero_fill::control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?];
+    source.native.controls=frames.into_iter().try_fold(source.native.controls.checked_add(size_of_val(&frames))
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,usize::checked_add)
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+    Ok(Some(OperationPlan {dtype:WorkspaceFloatingType::Float32,population:source.native,
+        alias_input:None,output_bytes:index,scratch_bytes,rank,parameter_shells:0,seeds:3,validations:1}))
+}
+
 pub(super) fn inspect_token_validation(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
     if !matches!(operation.kind,WorkspaceOperationKindView::Sampling(WorkspaceSamplingOperation::ValidateToken { .. })) {
@@ -114,6 +188,44 @@ pub(super) fn inspect_token_validation(operation:WorkspaceOperationView<'_>,mech
     Ok(Some(OperationPlan{dtype:WorkspaceFloatingType::Float32,population:source.native,
         alias_input:if output_birth==0{Some(0)}else{None},output_bytes:if output_birth==0{0}else{index_capacity},
         scratch_bytes,rank,parameter_shells:0,seeds,validations:usize::from(count!=0)}))
+}
+
+/// The actual original grouped-ID prefix shares the validation predicate with
+/// lookup, but reuses that predicate for its zeros_like/Select safe output.
+pub(super) fn group_indices(index_dtype:Dtype,rank:usize,count:usize,
+    mechanism:MlxCpuWorkspaceMechanisms)->facts::FactResult<Option<OperationPlan>> {
+    if rank>2 || count==0 || count>i32::MAX as usize {return Ok(None);}
+    let source=(|| {
+        let mut source=token_validation_population(index_dtype,rank,count,false)?;
+        source.alias(rank,rank)?;source.alias(0,rank)?;
+        source.cast(Dtype::Int32,Dtype::Int32,rank,count,Buffer::Index)?;
+        source.copy(OperationEvent::cpu_scalar_full_layout(Dtype::Int32,rank,count,false)?,1,Some(Buffer::Index))?;
+        source.cast(Dtype::Bool,Dtype::Bool,rank,count,Buffer::Mask)?;
+        source.cast(Dtype::Int32,Dtype::Int32,rank,count,Buffer::Index)?;
+        source.cast(Dtype::Int32,Dtype::Int32,rank,count,Buffer::Index)?;
+        for _ in 0..3 {source.alias(rank,rank)?;}
+        source.copy(OperationEvent::cpu_select_layout(Dtype::Int32,rank,count,false)?,3,Some(Buffer::Index))?;
+        Some(source)
+    })();
+    let Some(mut source)=source else{return Ok(None)};
+    let index=mechanism.allocation.fixed_buffer_capacity((count as u64).checked_mul(4)
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?;
+    let mask=mechanism.allocation.fixed_buffer_capacity(count as u64)?;
+    let scalar=mechanism.allocation.fixed_buffer_capacity(4)?;
+    let scratch_bytes=facts::add(facts::add(
+        facts::mul(index,u64::try_from(source.index_births.checked_sub(1)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?)?,
+        facts::mul(mask,u64::try_from(source.mask_births)?)?)?,
+        facts::mul(scalar,u64::try_from(source.scalar_births.checked_add(3)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?)?)?)?;
+    let frames=[size_of::<(Dtype,usize,usize,MlxCpuWorkspaceMechanisms)>(),
+        size_of::<Population>(),size_of::<Option<Population>>(),size_of::<OperationPlan>(),
+        size_of::<facts::FactResult<Option<OperationPlan>>>(),size_of::<[u64;4]>()];
+    source.native.controls=frames.into_iter().try_fold(source.native.controls.checked_add(size_of_val(&frames))
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,usize::checked_add)
+        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+    Ok(Some(OperationPlan {dtype:WorkspaceFloatingType::Float32,population:source.native,
+        alias_input:None,output_bytes:index,scratch_bytes,rank,parameter_shells:0,seeds:3,validations:1}))
 }
 
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)

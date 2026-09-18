@@ -21,7 +21,10 @@ pub(super) fn prepare(
         )));
     }
     FACTORIES.set(FACTORIES.get() + 1);
-    Ok(SharedControllerBytes::new(factory()))
+    Ok(SharedControllerBytes::new(
+        factory(),
+        eredu_core::HostPreparationAuthority::unmanaged(),
+    ))
 }
 
 struct RejectVocabulary;
@@ -32,7 +35,7 @@ impl Drop for RejectVocabulary {
 }
 
 #[test]
-fn controlled_semantic_setup_preserves_vocabulary_rejection_before_factory() {
+fn controlled_semantic_setup_uses_original_receipt_and_refuses_mismatched_capacity() {
     for choice in [ToolChoice::None, ToolChoice::Auto] {
         let vocabulary: tokenizers::models::bpe::Vocab = ByteLevel::alphabet()
             .into_iter()
@@ -51,7 +54,7 @@ fn controlled_semantic_setup_preserves_vocabulary_rejection_before_factory() {
             .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
             .unwrap();
         let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-        let mut model = LoadedModel::from_runtime(
+        let mut model = original_sources::Fixture::from_runtime(
             ModelRuntime::prepare(MockBackend, ()).unwrap(),
             ChatTokenizer::from_tokenizer(tokenizer),
             LoadedTextModelConfig {
@@ -64,16 +67,27 @@ fn controlled_semantic_setup_preserves_vocabulary_rejection_before_factory() {
             },
         )
         .unwrap();
-        let chat = model.prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role": "user", "content": "Say hello."})],
-            tools: vec![serde_json::json!({"type": "function", "function": {
-                "name": "ping", "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
-            }})],
-            tool_choice: choice,
-            parallel_tool_calls: ParallelToolCallPolicy::Disabled,
-            add_generation_prompt: true,
-            ..Default::default()
-        }).unwrap();
+        let chat = {
+            let request = ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role": "user", "content": "Say hello."})],
+                tools: vec![serde_json::json!({"type": "function", "function": {
+                    "name": "ping", "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+                }})],
+                tool_choice: choice,
+                parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+                add_generation_prompt: true,
+                ..Default::default()
+            };
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancellation)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .unwrap()
+                .unwrap()
+        };
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(1),
@@ -81,40 +95,47 @@ fn controlled_semantic_setup_preserves_vocabulary_rejection_before_factory() {
             },
             ..Default::default()
         };
-        let prepared = model
-            .prepare_observed_token_ids(
-                &chat,
-                vec![0],
-                settings,
-                CapturePlan::none(),
+        let pool = model.original_pool().clone();
+        let before = pool.used_bytes().unwrap();
+        let mut configured = original_sources::settings(settings);
+        configured.inference.managed_memory_capacity_bytes = Some(1);
+        let mut request = eredu::api::PreparedChatRequest::new(&chat, configured);
+        request.input = eredu::api::PreparedChatPrompt::TokenIds(&[0]);
+        let error = model
+            .start_controlled_chat(
+                request,
                 TraceLimits {
                     per_record_bytes: 65536,
                     total_bytes: 1048576,
                 },
+                Default::default(),
+                |_| panic!("unadmitted controller delivery"),
             )
-            .unwrap();
-        let attempts = ATTEMPTS.get();
-        let factories = FACTORIES.get();
-        REJECT.set(true);
-        let guard = RejectVocabulary;
-        let error = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| -> ControlFlow<()> {
-                panic!("rejected shared vocabulary must not emit controlled records")
-            })
             .err()
-            .expect("controlled host preparation must preserve backend rejection");
-        assert_eq!(ATTEMPTS.get(), attempts + 1);
-        assert_eq!(FACTORIES.get(), factories);
-        let mut cause: &(dyn std::error::Error + 'static) = &error;
-        loop {
-            if let Some(MockError::Capture(message)) = cause.downcast_ref::<MockError>() {
-                assert_eq!(message, "shared vocabulary rejected before packing");
-                break;
-            }
-            cause = cause
-                .source()
-                .expect("original backend source must survive controlled mapping");
-        }
-        drop(guard);
+            .unwrap();
+        assert!(error.session_failure().unwrap().input_rejection().is_some());
+        drop(error);
+        // Attempted cold controls spend their original account until its source retires.
+        assert!(pool.used_bytes().unwrap() >= before);
+        let mut request =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        request.input = eredu::api::PreparedChatPrompt::TokenIds(&[0]);
+        let run = model
+            .start_controlled_chat(
+                request,
+                TraceLimits {
+                    per_record_bytes: 65536,
+                    total_bytes: 1048576,
+                },
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(run.token_ids().is_empty());
+        drop(run);
+        drop(chat);
+        drop(model);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 }

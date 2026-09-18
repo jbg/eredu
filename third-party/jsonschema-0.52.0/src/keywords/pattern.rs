@@ -24,18 +24,28 @@ pub(crate) struct PrefixPatternValidator {
 }
 
 impl<F: Json> Validate<F> for PrefixPatternValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.string(&self.prefix)?;
         source.string(&self.pattern)?;
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<(Cow<'_, str>, &str, &str, usize, bool)>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            Cow<'_, str>,
+            &str,
+            &str,
+            usize,
+            bool,
+        )>()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
             item.starts_with(&self.prefix)
@@ -44,25 +54,21 @@ impl<F: Json> Validate<F> for PrefixPatternValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if !item.starts_with(&self.prefix) {
-                return Err(ValidationError::pattern(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.pattern.clone(),
-                ));
-            }
+        if <Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return Ok(());
         }
-        Ok(())
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(crate::error::ValidationErrorKind::Pattern {
+                pattern: funding.copy_str(&self.pattern)?,
+            })
+        })
     }
 }
 
@@ -74,18 +80,28 @@ pub(crate) struct ExactPatternValidator {
 }
 
 impl<F: Json> Validate<F> for ExactPatternValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.string(&self.exact)?;
         source.string(&self.pattern)?;
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<(Cow<'_, str>, &str, &str, usize, bool)>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            Cow<'_, str>,
+            &str,
+            &str,
+            usize,
+            bool,
+        )>()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
             item.as_ref() == self.exact
@@ -94,25 +110,21 @@ impl<F: Json> Validate<F> for ExactPatternValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if item.as_ref() != self.exact {
-                return Err(ValidationError::pattern(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.pattern.clone(),
-                ));
-            }
+        if <Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return Ok(());
         }
-        Ok(())
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(crate::error::ValidationErrorKind::Pattern {
+                pattern: funding.copy_str(&self.pattern)?,
+            })
+        })
     }
 }
 
@@ -124,9 +136,14 @@ pub(crate) struct AlternationPatternValidator {
 }
 
 impl<F: Json> Validate<F> for AlternationPatternValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.vector(&self.alternatives)?;
-        for alternative in &self.alternatives { source.string(alternative)?; }
+        for alternative in &self.alternatives {
+            source.string(alternative)?;
+        }
         source.string(&self.pattern)?;
         source.location(&self.location)
     }
@@ -138,6 +155,9 @@ impl<F: Json> Validate<F> for AlternationPatternValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
             self.alternatives
@@ -148,29 +168,21 @@ impl<F: Json> Validate<F> for AlternationPatternValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if !self
-                .alternatives
-                .iter()
-                .any(|a| a.as_str() == item.as_ref())
-            {
-                return Err(ValidationError::pattern(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.pattern.clone(),
-                ));
-            }
+        if <Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return Ok(());
         }
-        Ok(())
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(crate::error::ValidationErrorKind::Pattern {
+                pattern: funding.copy_str(&self.pattern)?,
+            })
+        })
     }
 }
 
@@ -181,7 +193,10 @@ pub(crate) struct NoWhitespacePatternValidator {
 }
 
 impl<F: Json> Validate<F> for NoWhitespacePatternValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.string(&self.pattern)?;
         source.location(&self.location)
     }
@@ -193,6 +208,9 @@ impl<F: Json> Validate<F> for NoWhitespacePatternValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
             !item.chars().any(is_ecma_whitespace)
@@ -201,30 +219,26 @@ impl<F: Json> Validate<F> for NoWhitespacePatternValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            if item.chars().any(is_ecma_whitespace) {
-                return Err(ValidationError::pattern(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.pattern.clone(),
-                ));
-            }
+        if <Self as Validate<F>>::is_valid(self, instance, ctx) {
+            return Ok(());
         }
-        Ok(())
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(crate::error::ValidationErrorKind::Pattern {
+                pattern: funding.copy_str(&self.pattern)?,
+            })
+        })
     }
 }
 
 pub(crate) struct PatternValidator<R> {
-    regex: Arc<R>,
+    regex: R,
     /// Original schema pattern, kept for error messages. The compiled `regex` stores the
     /// ECMA->Rust translated form (e.g. `\S` expanded into a verbose class), which is unreadable.
     pattern: String,
@@ -232,54 +246,67 @@ pub(crate) struct PatternValidator<R> {
 }
 
 impl<R: RegexEngine, F: Json> Validate<F> for PatternValidator<R> {
-    fn validate<'i>(
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.regex.original_source(source)?;
+        source.string(&self.pattern)?;
+        source.location(&self.location)
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            self.regex.original_controls()?,
+            std::mem::size_of::<(Cow<'_, str>, Result<bool, R::Error>)>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(item) = instance.as_string() {
-            match self.regex.is_match(&item) {
-                Ok(is_match) => {
-                    if !is_match {
-                        return Err(ValidationError::pattern(
-                            self.location.clone(),
-                            crate::paths::capture_evaluation_path(tracker, &self.location),
-                            location.into(),
-                            instance.to_value(),
-                            self.pattern.clone(),
-                        ));
+        let Some(item) = instance.as_string() else {
+            return Ok(());
+        };
+        let reason = match self.regex.is_match(&item, ctx) {
+            Ok(true) => return Ok(()),
+            Ok(false) => None,
+            Err(error) => Some(error.into_failure_reason()),
+        };
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(match reason {
+                None => crate::error::ValidationErrorKind::Pattern {
+                    pattern: funding.copy_str(&self.pattern)?,
+                },
+                Some(RegexFailureReason::FancyRegex(error)) => {
+                    crate::error::ValidationErrorKind::BacktrackLimitExceeded { error }
+                }
+                Some(reason @ (RegexFailureReason::Panicked | RegexFailureReason::Delegate(_))) => {
+                    let error = match reason {
+                        RegexFailureReason::Delegate(error) => Some(error),
+                        _ => None,
+                    };
+                    crate::error::ValidationErrorKind::RegexEngineFailure {
+                        error,
+                        message: funding.format(format_args!(
+                            "Regex engine failed to evaluate pattern '{}'",
+                            self.pattern
+                        ))?,
                     }
                 }
-                Err(e) => {
-                    let pattern = &self.pattern;
-                    let tracker = crate::paths::capture_evaluation_path(tracker, &self.location);
-                    return Err(match e.into_failure_reason() {
-                        RegexFailureReason::FancyRegex(error) => ValidationError::backtrack_limit(
-                            self.location.clone(),
-                            tracker,
-                            location.into(),
-                            instance.to_value(),
-                            error,
-                        ),
-                        RegexFailureReason::Panicked => ValidationError::regex_engine_failure(
-                            self.location.clone(),
-                            tracker,
-                            location.into(),
-                            instance.to_value(),
-                            format!("Regex engine failed to evaluate pattern '{pattern}'"),
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
+            })
+        })
     }
 
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
-            return self.regex.is_match(&item).unwrap_or(false);
+            return self.regex.is_match(&item, ctx).unwrap_or(false);
         }
         true
     }
@@ -293,82 +320,138 @@ pub(crate) fn compile<'a, F: Json>(
 ) -> Option<CompilationResult<'a, F>> {
     if let Value::String(item) = schema {
         // Try literal optimizations before compiling a full regex.
-        match analyze_pattern(item) {
+        match crate::keywords::try_compile!(crate::regex::analyze_pattern_with_funding(
+            item,
+            ctx.funding()
+        )) {
             Some(PatternOptimization::Exact(exact)) => {
-                return Some(Ok(Box::new(ExactPatternValidator {
-                    exact,
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })));
+                return Some(Ok(
+                    match ctx.funding().boxed(ExactPatternValidator {
+                        exact,
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ));
             }
             Some(PatternOptimization::Prefix(prefix)) => {
-                return Some(Ok(Box::new(PrefixPatternValidator {
-                    prefix,
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })));
+                return Some(Ok(
+                    match ctx.funding().boxed(PrefixPatternValidator {
+                        prefix,
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ));
             }
             Some(PatternOptimization::Alternation(alternatives)) => {
-                return Some(Ok(Box::new(AlternationPatternValidator {
-                    alternatives,
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })));
+                return Some(Ok(
+                    match ctx.funding().boxed(AlternationPatternValidator {
+                        alternatives,
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ));
             }
             Some(PatternOptimization::NoWhitespace) => {
-                return Some(Ok(Box::new(NoWhitespacePatternValidator {
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })));
+                return Some(Ok(
+                    match ctx.funding().boxed(NoWhitespacePatternValidator {
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ));
             }
             None => {}
         }
         // Fall back to regex compilation
         match ctx.config().pattern_options() {
             PatternEngineOptions::FancyRegex { .. } => {
-                let Ok(regex) = ctx.get_or_compile_regex(item) else {
-                    return Some(Err(invalid_regex(ctx, schema)));
+                let regex = match ctx.get_or_compile_regex(item) {
+                    Ok(regex) => regex,
+                    Err(crate::compilation::PatternError::Storage(error)) => {
+                        return Some(Err(error.into()))
+                    }
+                    Err(error) => {
+                        let location = crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding()));
+                        return Some(Err(error.diagnostic(ctx.funding(), &location, schema)));
+                    }
                 };
-                Some(Ok(Box::new(PatternValidator {
-                    regex,
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })))
+                Some(Ok(
+                    match ctx.funding().boxed(PatternValidator {
+                        regex,
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ))
             }
             PatternEngineOptions::Regex { .. } => {
-                let Ok(regex) = ctx.get_or_compile_standard_regex(item) else {
-                    return Some(Err(invalid_regex(ctx, schema)));
+                let regex = match ctx.get_or_compile_standard_regex(item) {
+                    Ok(regex) => regex,
+                    Err(crate::compilation::PatternError::Storage(error)) => {
+                        return Some(Err(error.into()))
+                    }
+                    Err(error) => {
+                        let location = crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding()));
+                        return Some(Err(error.diagnostic(ctx.funding(), &location, schema)));
+                    }
                 };
-                Some(Ok(Box::new(PatternValidator {
-                    regex,
-                    pattern: item.clone(),
-                    location: ctx.location().join("pattern"),
-                })))
+                Some(Ok(
+                    match ctx.funding().boxed(PatternValidator {
+                        regex,
+                        pattern: crate::keywords::try_compile!(ctx.funding().copy_str(item)),
+                        location: crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("pattern", ctx.funding())),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error.into())),
+                    },
+                ))
             }
         }
     } else {
-        let location = ctx.location().join("pattern");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::String,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("pattern", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::String,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
-}
-
-fn invalid_regex<'a, F: Json>(
-    ctx: &compiler::Context<F>,
-    schema: &'a Value,
-) -> ValidationError<'a> {
-    ValidationError::format(
-        ctx.location().join("pattern"),
-        LazyEvaluationPath::SameAsSchemaPath,
-        Location::new(),
-        Cow::Borrowed(schema),
-        "regex",
-    )
 }
 
 #[cfg(test)]

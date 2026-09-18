@@ -203,14 +203,37 @@ fn divides_exactly(value: f64, multiple: f64) -> Option<bool> {
 }
 
 pub fn is_multiple_of_float<N: crate::JsonNumber>(value: &N, multiple: f64) -> bool {
+    is_multiple_of_float_with_allocations(value, multiple, &fraction::operations::Unenforced)
+        .expect("ordinary numeric allocation")
+}
+/// The same decimal-fast-path and original fraction fallback with an explicit loan.
+pub fn is_multiple_of_float_with_allocations<N: crate::JsonNumber>(
+    value: &N,
+    multiple: f64,
+    source: &dyn fraction::operations::Allocation,
+) -> Result<bool, fraction::operations::AllocationError> {
+    if cfg!(feature = "arbitrary-precision") && source.is_enforced() {
+        return Err(fraction::operations::AllocationError::Unqualified(
+            "arbitrary-precision numeric source",
+        ));
+    }
+    source.reserve(std::mem::size_of::<(
+        &N,
+        f64,
+        Option<f64>,
+        Option<bool>,
+        BigFraction,
+        fraction::operations::BigUintOperations<'_>,
+        Result<bool, fraction::operations::AllocationError>,
+    )>())?;
     if let Some(value_f64) = value.as_f64() {
         // Zero is a multiple of any non-zero number
         // This check must come first to avoid division-related edge cases
         if value_f64.is_zero() {
-            return true;
+            return Ok(true);
         }
         if value_f64.abs() < multiple {
-            return false;
+            return Ok(false);
         }
         // From the JSON Schema spec
         //
@@ -220,15 +243,19 @@ pub fn is_multiple_of_float<N: crate::JsonNumber>(value: &N, multiple: f64) -> b
         //
         // Ref: https://json-schema.org/draft/2020-12/json-schema-validation#section-6.2.1
         if let Some(answer) = divides_exactly(value_f64, multiple) {
-            return answer;
+            return Ok(answer);
         }
-        (BigFraction::from(value_f64) / BigFraction::from(multiple))
+        let operations = fraction::operations::BigUintOperations(source);
+        let value = BigFraction::from_f64_with_operations(value_f64, &operations)?;
+        let divisor = BigFraction::from_f64_with_operations(multiple, &operations)?;
+        Ok(value
+            .div_with_operations(divisor, &operations)?
             .denom()
-            .is_none_or(One::is_one)
+            .is_none_or(One::is_one))
     } else {
         // This branch is only possible for large floats in scientific notation, we don't really
         // support it
-        false
+        Ok(false)
     }
 }
 
@@ -251,7 +278,9 @@ pub fn original_integer_multiple_control_bytes<N: crate::JsonNumber>() -> Option
         std::mem::size_of::<(Option<f64>, f64, f64, bool)>(),
         std::mem::size_of::<(u64, i64, bool)>(),
     ];
-    parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    parts
+        .into_iter()
+        .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
 }
 
 pub fn is_multiple_of_integer<N: crate::JsonNumber>(value: &N, multiple: f64) -> bool {
@@ -934,16 +963,32 @@ mod exact_multiple_of_tests {
 #[must_use]
 pub fn original_comparison_control_bytes<N, T>() -> Option<usize> {
     #[cfg(feature = "arbitrary-precision")]
-    { None }
+    {
+        None
+    }
     #[cfg(not(feature = "arbitrary-precision"))]
     {
         use std::mem::{size_of, size_of_val};
-        let parts = [size_of::<(&N, T)>(), size_of::<N>(), size_of::<T>(),
-            size_of::<Option<u64>>(), size_of::<Option<i64>>(), size_of::<Option<f64>>(),
-            size_of::<(u64, T)>(), size_of::<(i64, T)>(), size_of::<(f64, T)>(),
-            size_of::<(f64, f64)>(), size_of::<(u64, u64)>(), size_of::<(i64, i64)>(),
-            size_of::<std::cmp::Ordering>(), size_of::<Option<std::cmp::Ordering>>(),
-            size_of::<(f64, bool)>(), size_of::<bool>()];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        let parts = [
+            size_of::<(&N, T)>(),
+            size_of::<N>(),
+            size_of::<T>(),
+            size_of::<Option<u64>>(),
+            size_of::<Option<i64>>(),
+            size_of::<Option<f64>>(),
+            size_of::<(u64, T)>(),
+            size_of::<(i64, T)>(),
+            size_of::<(f64, T)>(),
+            size_of::<(f64, f64)>(),
+            size_of::<(u64, u64)>(),
+            size_of::<(i64, i64)>(),
+            size_of::<std::cmp::Ordering>(),
+            size_of::<Option<std::cmp::Ordering>>(),
+            size_of::<(f64, bool)>(),
+            size_of::<bool>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 }

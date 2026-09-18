@@ -38,38 +38,37 @@ impl Drop for OriginalTokenTrieSource {
     }
 }
 impl OriginalTokenTrieSource {
-    /// Authenticates this originally compiled trie and the actual registered
-    /// immutable grammar inputs. Mutable funding is checked separately against
-    /// the caller's retained admitted owner; no controller callback runs here.
+    /// Authenticate the original trie and immutable compilation outputs.
+    /// Mutable state funding is checked separately against its retained payer.
     pub fn validate_grammar_source(&self, source: eredu_core::speculative::PreparedGrammarSource<'_>, pool: &WorkingMemoryPool)
         -> Result<(), WorkingMemoryError> {
         let supplied = source.tokenizer().downcast_ref::<Self>().ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let compilation = source.compilation().downcast_ref::<super::OriginalControllerCompilation>()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if !self.same_source(supplied) { return Err(WorkingMemoryError::IdentityMismatch); }
-        self.validate_grammar_inputs(source.validity(), source.recipe(), source.declaration(), pool)
+        self.validate_grammar_inputs(source.validity(), source.recipe(), source.declaration(), compilation, pool)
     }
     pub(super) fn validate_grammar_inputs(
         &self, validity: &eredu_core::SharedTokenFilter, recipe: &eredu_core::SharedControllerBytes,
-        declaration: &eredu_core::SharedControllerDeclaration, pool: &WorkingMemoryPool,
+        declaration: &eredu_core::SharedControllerDeclaration,
+        compilation: &super::OriginalControllerCompilation, pool: &WorkingMemoryPool,
     ) -> Result<(), WorkingMemoryError> {
         self.payload().account.validate(pool)?;
         self.payload().tokenizer.validate_pool(pool)?;
-        use eredu_core::SharedControllerSource;
-        for input in [SharedControllerSource::Filter(validity),
-            SharedControllerSource::Bytes(recipe), SharedControllerSource::Declaration(declaration)] {
-            pool.validate_shared_controller_source(input)?;
-        }
-        Ok(())
+        pool.validate_shared_controller_source(eredu_core::SharedControllerSource::Filter(validity))?;
+        compilation.validate_grammar_sources(recipe, declaration, self)
     }
     /// Exact read-only original grammar/source authentication frames.
     pub fn grammar_validation_control_bytes() -> Option<usize> {
         let parts = [Self::validation_control_bytes()?,
             WorkingMemoryPool::shared_controller_source_validation_control_bytes()?,
+            super::OriginalControllerCompilation::validation_control_bytes()?,
             eredu_core::speculative::PreparedGrammarSource::control_bytes()?,
             size_of::<(&Self, eredu_core::speculative::PreparedGrammarSource<'_>, &WorkingMemoryPool)>(),
             size_of::<(&Self, &eredu_core::SharedTokenFilter, &eredu_core::SharedControllerBytes,
-                &eredu_core::SharedControllerDeclaration, &WorkingMemoryPool)>(),
-            size_of::<Option<&Self>>(), size_of::<[eredu_core::SharedControllerSource<'_>; 3]>(),
-            size_of::<std::array::IntoIter<eredu_core::SharedControllerSource<'_>, 3>>(),
+                &eredu_core::SharedControllerDeclaration, &super::OriginalControllerCompilation, &WorkingMemoryPool)>(),
+            size_of::<Option<&Self>>(), size_of::<Option<&super::OriginalControllerCompilation>>(),
+            size_of::<eredu_core::SharedControllerSource<'_>>(),
             size_of::<Result<(), WorkingMemoryError>>()];
         parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
     }
@@ -88,6 +87,16 @@ impl OriginalTokenTrieSource {
     /// Exact original E source comparison, independent of equal token IDs.
     pub fn matches_encoded_source(&self, ids: &super::OriginalEncodedTokenIds) -> bool {
         ids.matches_source(&self.payload().tokenizer)
+    }
+    /// Accepts the exact original tokenizer or its directly constructed checked
+    /// input-prefix derivative. Equal vocabularies or independently constructed
+    /// sources grant no relationship, and encoding still uses the exact source.
+    pub fn matches_semantic_tokenizer(&self, tokenizer: &OriginalTokenizer) -> bool {
+        self.payload().tokenizer.matches_semantic_root(tokenizer)
+    }
+    /// Reads the deterministic tokenization fact from the retained actual source.
+    pub fn tokenization_is_canonical(&self) -> bool {
+        self.payload().tokenizer.tokenization_is_canonical()
     }
     fn payload(&self) -> &Payload {
         self.0.as_deref().expect("live trie source")
@@ -132,6 +141,10 @@ impl OriginalTokenTrieSource {
             Account::control_bytes()?,
             size_of::<Self>(),
             size_of::<&Payload>(),
+            size_of::<(&Self, &OriginalTokenizer)>(),
+            size_of::<[&OriginalTokenizer; 2]>(),
+            size_of::<Option<&OriginalTokenizer>>(),
+            size_of::<bool>(),
             size_of::<(
                 &Self,
                 &WorkingMemoryPool,

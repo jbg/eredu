@@ -4556,11 +4556,11 @@ fn collect_uncheckable_string_facets(
 }
 
 fn is_known_content_media_type(media_type: &str) -> bool {
-    crate::content_media_type::DEFAULT_CONTENT_MEDIA_TYPE_CHECKS.contains_key(media_type)
+    crate::content_media_type::default_content_media_type(media_type).is_some()
 }
 
 fn is_known_content_encoding(encoding: &str) -> bool {
-    crate::content_encoding::DEFAULT_CONTENT_ENCODING_CHECKS_AND_CONVERTERS.contains_key(encoding)
+    crate::content_encoding::default_content_encoding(encoding).is_some()
 }
 
 /// Keep the objects both leaves accept: the narrower window, and every key either demands.
@@ -5405,15 +5405,13 @@ fn string_leaf_admits_text(
             )
             .chain(leaf.content_media_types.iter().map(|media_type| {
                 demanded(
-                    crate::content_media_type::DEFAULT_CONTENT_MEDIA_TYPE_CHECKS
-                        .get(media_type.as_ref())
+                    crate::content_media_type::default_content_media_type(media_type.as_ref())
                         .map(|check| check(text)),
                 )
             }))
             .chain(leaf.content_encodings.iter().map(|encoding| {
                 demanded(
-                    crate::content_encoding::DEFAULT_CONTENT_ENCODING_CHECKS_AND_CONVERTERS
-                        .get(encoding.as_ref())
+                    crate::content_encoding::default_content_encoding(encoding.as_ref())
                         .map(|(check, _)| check(text)),
                 )
             })),

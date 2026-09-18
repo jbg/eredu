@@ -51,7 +51,7 @@ fn failure<T>(error: impl std::error::Error + 'static) -> T {
     }
     panic!("original capture source chain above");
 }
-fn frame(delivery: CapturedStepDelivery, prediction: u64) -> CapturedStepDelivery {
+fn frame(delivery: SharedCapturedStep, prediction: u64) -> SharedCapturedStep {
     let frame = delivery.as_step();
     assert_eq!(frame.prediction_index, prediction);
     assert_eq!(
@@ -221,7 +221,7 @@ fn run(mode: &str) -> serde_json::Value {
         })
         .collect();
     if mode != "ordinary" {
-        assert!(frames.iter().all(|frame| frame.shared().is_some()));
+        assert!(frames.iter().all(|frame| !frame.records().is_empty()));
         assert!(
             pool.used_bytes().unwrap() > 0,
             "escaped frames retain original custody"

@@ -496,7 +496,7 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
                 state.rotary.into_array(),
                 context,
             )
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         if self.is_paged() {
             Ok(CompressedAttentionView::Paged { appended })
         } else {
@@ -522,15 +522,15 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
             .paged
             .as_deref_mut()
             .ok_or_else(|| ComputeError::backend("compressed block scan requires paged state"))?;
-        let block_ids = paged.block_ids().map_err(ComputeError::backend_source)?;
+        let block_ids = paged.block_ids().map_err(ComputeError::backend_retained_source)?;
         let manager = paged.manager.clone();
         let global_layer = paged.global_layer;
         let tail = paged.tail_block();
         let mut scan = CompressedAttentionScan::default();
         let mut blocks = manager
             .prefetch_blocks(block_ids, context)
-            .map_err(ComputeError::backend_source)?;
-        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend_source)? {
+            .map_err(ComputeError::backend_retained_source)?;
+        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend_retained_source)? {
             let id = lease.id();
             let state = match lease.arrays() {
                 CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
@@ -578,7 +578,7 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
                 scan.bytes,
                 scan.reconstruction_scratch_bytes,
             )
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         Ok(scan)
     }
 
@@ -592,15 +592,15 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
         context: &Stream,
     ) -> Result<(), ComputeError> {
         self.restore_checkpoint(checkpoint, context)
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn finalize(&mut self) -> Result<(), ComputeError> {
-        CompressedLatentCache::finalize(self).map_err(ComputeError::backend_source)
+        CompressedLatentCache::finalize(self).map_err(ComputeError::backend_retained_source)
     }
 
     fn clear(&mut self) -> Result<(), ComputeError> {
-        CompressedLatentCache::clear(self).map_err(ComputeError::backend_source)
+        CompressedLatentCache::clear(self).map_err(ComputeError::backend_retained_source)
     }
 }
 

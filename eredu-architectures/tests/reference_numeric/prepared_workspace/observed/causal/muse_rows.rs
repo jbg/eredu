@@ -157,7 +157,7 @@ fn make_model(
 ) {
     let architecture = MuseModel::new(config.clone(), context).unwrap();
     let declarations = <MuseModel as LayeredArchitecture<NumericBackend, MuseState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(
         declarations.len(),
         10 + 4 * config.num_hidden_layers as usize
@@ -165,8 +165,7 @@ fn make_model(
     assert_eq!(
         <MuseModel as LayeredArchitecture<NumericBackend, MuseState>>::group_unit_count(
             &architecture,
-            0
-        )
+            0, None)
         .unwrap(),
         1
     );
@@ -177,8 +176,7 @@ fn make_model(
         let path = <MuseModel as LayeredArchitecture<NumericBackend, MuseState>>::unit_path(
             &architecture,
             1,
-            index,
-        )
+            index, None)
         .unwrap();
         for suffix in ["input", "input.effective", "output", "output.effective"] {
             assert!(declarations
@@ -188,7 +186,7 @@ fn make_model(
     }
     let prepared = PreparedCompositeArchitecture::new(architecture);
     assert_eq!(<PreparedMuse as LayeredArchitecture<NumericBackend, MuseState>>::
-        prefill_observation_declarations(&prepared).unwrap(), declarations);
+        prefill_observation_declarations(&prepared, None).unwrap(), declarations);
     let runtime = ResidentRuntime::new(prepared, context).unwrap();
     let paths = runtime.prepare_observation_paths().unwrap();
     for declaration in &declarations {

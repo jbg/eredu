@@ -23,7 +23,7 @@ pub(super) struct OwnedCaptureDelivery {
     pub(super) buffers: Vec<RecordBuffers>,
     pub(super) intervention_buffers: Vec<Vec<u8>>,
     pub(super) prefill: Option<crate::working_memory::capture_tensor::prefill::PrefillTargets>,
-    pub(super) partition_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(super) partition_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
     pub(super) custody: CaptureTensorCustody,
 }
 impl fmt::Debug for OwnedCaptureDelivery {

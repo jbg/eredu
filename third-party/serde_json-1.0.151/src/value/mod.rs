@@ -112,7 +112,7 @@ pub use crate::raw::{to_raw_value, RawValue};
 /// Represents any valid JSON value.
 ///
 /// See the [`serde_json::value` module documentation](self) for usage examples.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Eq, PartialEq, Hash)]
 pub enum Value {
     /// Represents a JSON null value.
     ///
@@ -777,21 +777,69 @@ impl Value {
     /// assert_eq!(data.pointer("/a/b/c"), None);
     /// ```
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
+        self.pointer_with_allocations(pointer, &crate::allocation::Unenforced)
+            .expect("ordinary JSON pointer allocation")
+    }
+
+    /// Looks up a JSON Pointer, reserving each escaped component's backing
+    /// before decoding it. Unescaped components borrow the pointer directly.
+    /// The caller retains the allocation owner through this borrowed lookup.
+    pub fn pointer_with_allocations(
+        &self,
+        pointer: &str,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> Result<Option<&Value>, crate::allocation::AllocationError> {
+        use crate::allocation::Allocator;
         if pointer.is_empty() {
-            return Some(self);
+            return Ok(Some(self));
         }
         if !pointer.starts_with('/') {
-            return None;
+            return Ok(None);
         }
-        pointer
-            .split('/')
-            .skip(1)
-            .map(|x| x.replace("~1", "/").replace("~0", "~"))
-            .try_fold(self, |target, token| match target {
-                Value::Object(map) => map.get(&token),
-                Value::Array(list) => parse_index(&token).and_then(|x| list.get(x)),
-                _ => None,
-            })
+        let allocation = Allocator::new(allocation);
+        let mut target = self;
+        for component in pointer.split('/').skip(1) {
+            let mut decoded = Vec::new();
+            let token = if component.as_bytes().contains(&b'~') {
+                // Each replacement consumes two ASCII bytes and emits one.
+                // All other UTF-8 bytes remain unchanged, so this bound is
+                // exact for the allocated destination and never expands.
+                allocation.grow(&mut decoded, component.len())?;
+                let mut bytes = component.bytes().peekable();
+                while let Some(byte) = bytes.next() {
+                    if byte == b'~' {
+                        match bytes.peek() {
+                            Some(b'0') => {
+                                bytes.next();
+                                decoded.push(b'~');
+                            }
+                            Some(b'1') => {
+                                bytes.next();
+                                decoded.push(b'/');
+                            }
+                            _ => decoded.push(byte),
+                        }
+                    } else {
+                        decoded.push(byte);
+                    }
+                }
+                core::str::from_utf8(&decoded).expect("pointer unescaping preserves UTF-8")
+            } else {
+                component
+            };
+            target = match target {
+                Value::Object(map) => match map.get(token) {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+                Value::Array(list) => match parse_index(token).and_then(|index| list.get(index)) {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+        }
+        Ok(Some(target))
     }
 
     /// Looks up a value by a JSON Pointer and returns a mutable reference to
@@ -931,11 +979,13 @@ impl Default for &Value {
     }
 }
 
+mod allocation;
 mod de;
 mod from;
 mod index;
 mod partial_eq;
 mod ser;
+pub use self::ser::ValueWriteError;
 
 /// Convert a `T` into `serde_json::Value` which is an enum that can represent
 /// any valid JSON data.

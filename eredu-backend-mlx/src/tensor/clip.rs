@@ -5,7 +5,7 @@ use std::mem::{size_of, size_of_val};
 
 fn error(cause: Exception) -> Error {
     match OriginalScopeObserver::try_current() {
-        Ok(None) => Error::backend_source(cause),
+        Ok(None) => Error::backend_retained_source(cause),
         _ => Error::backend_retained_source(cause),
     }
 }
@@ -36,7 +36,7 @@ pub(crate) fn control_bytes() -> Option<usize> {
         size_of::<[(&Array, &Array, &Stream); 2]>(), // borrowed binary wrappers
         size_of::<Result<Option<OriginalScopeObserver>, Exception>>(),
         OriginalScopeObserver::control_bytes()?,
-        Error::retained_source_control_bytes::<Exception>()?,
+        Error::retained_source_construction_bytes::<Exception>()?,
     ];
     sizes
         .into_iter()

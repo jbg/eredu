@@ -56,10 +56,7 @@ macro_rules! parameterized_groups {
             fn retained_value_slot_bound(&self) -> Option<usize> {
                 crate::Parameterized::retained_value_slot_bound(&self.parameters)
             }
-            fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-            where V: crate::ParameterVisitor<'a, WorkspaceTensor> {
-                crate::Parameterized::visit_parameters(&self.parameters, visitor);
-            }
+
             fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
             where V: crate::ParameterVisitorMut<'a, WorkspaceTensor> {
                 crate::Parameterized::visit_parameters_mut(&mut self.parameters, visitor);
@@ -67,9 +64,7 @@ macro_rules! parameterized_groups {
             fn set_trainable(&mut self, trainable: bool) {
                 crate::Parameterized::set_trainable(&mut self.parameters, trainable);
             }
-            fn visit_retained_values(&self, visitor: &mut dyn FnMut(&WorkspaceTensor)) -> bool {
-                crate::Parameterized::visit_retained_values(&self.parameters, visitor)
-            }
+
         }
     )+};
 }

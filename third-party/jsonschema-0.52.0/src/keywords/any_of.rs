@@ -13,6 +13,24 @@ use serde_json::{Map, Value};
 
 use super::CompilationResult;
 
+fn any_of_failure<'i, F: Json>(
+    schemas: &[SchemaNode<F>],
+    schema_path: &Location,
+    instance: &F::Node<'i>,
+    location: &LazyLocation,
+    tracker: Option<&RefTracker>,
+    ctx: &mut ValidationContext,
+) -> Result<(), ValidationError<'i>> {
+    let Some(branches) = ctx.branch_errors(schemas, instance, location, tracker) else {
+        return Ok(());
+    };
+    ctx.diagnostic::<F>(instance, location, tracker, schema_path, |funding| {
+        Ok(crate::error::ValidationErrorKind::AnyOf {
+            context: funding.error_context(branches)?,
+        })
+    })
+}
+
 pub(crate) struct AnyOfValidator<F: Json> {
     schemas: Vec<SchemaNode<F>>,
     location: Location,
@@ -25,33 +43,40 @@ impl AnyOfValidator<SerdeJson> {
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
         if let Value::Array(items) = schema {
-            let ctx = ctx.new_at_location("anyOf");
-            let mut schemas = Vec::with_capacity(items.len());
+            let ctx = ctx.new_at_location("anyOf")?;
+            let mut schemas = Vec::new();
+            ctx.funding().grow(&mut schemas, items.len())?;
             for (idx, item) in items.iter().enumerate() {
-                let ctx = ctx.new_at_location(idx);
+                let ctx = ctx.new_at_location(idx)?;
                 let node = compiler::compile(&ctx, ctx.as_resource_ref(item))?;
                 schemas.push(node);
             }
-            Ok(Box::new(AnyOfValidator {
+            Ok(ctx.funding().boxed(AnyOfValidator {
                 schemas,
                 location: ctx.location().clone(),
-            }))
+            })?)
         } else {
-            let location = ctx.location().join("anyOf");
-            Err(ValidationError::single_type_error(
+            let location = ctx.location().join_with_funding("anyOf", ctx.funding())?;
+            Err(ValidationError::single_type_error_with_funding(
                 location.clone(),
                 location,
-                Location::new(),
+                Location::new_with_funding(ctx.funding())?,
                 Cow::Borrowed(schema),
                 JsonType::Array,
-            ))
+                ctx.funding(),
+            )?
+            .into())
         }
     }
 }
 
 impl<F: Json> Validate<F> for AnyOfValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.nodes(&self.schemas)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.nodes(&self.schemas)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -62,11 +87,20 @@ impl<F: Json> Validate<F> for AnyOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<(
+            Vec<Vec<ValidationError<'_>>>,
+            Vec<ValidationError<'_>>,
+            &SchemaNode<F>,
+        )>())
+        .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.schemas.iter().any(|s| s.is_valid(instance, ctx))
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -74,49 +108,16 @@ impl<F: Json> Validate<F> for AnyOfValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if self.is_valid(instance, ctx) {
-            Ok(())
-        } else {
-            Err(ValidationError::any_of(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                self.schemas
-                    .iter()
-                    .map(|schema| {
-                        let mut branch = Vec::new();
-                        schema.collect_errors(instance, location, tracker, ctx, &mut branch);
-                        branch
-                    })
-                    .collect(),
-            ))
+            return Ok(());
         }
-    }
-
-    fn collect_errors<'i>(
-        &self,
-        instance: &F::Node<'i>,
-        location: &LazyLocation,
-        tracker: Option<&RefTracker>,
-        ctx: &mut ValidationContext,
-        errors: &mut Vec<ValidationError<'i>>,
-    ) {
-        if self.is_valid(instance, ctx) {
-            return;
-        }
-        let mut branches = Vec::with_capacity(self.schemas.len());
-        for schema in &self.schemas {
-            let mut branch = Vec::new();
-            schema.collect_errors(instance, location, tracker, ctx, &mut branch);
-            branches.push(branch);
-        }
-        errors.push(ValidationError::any_of(
-            self.location.clone(),
-            crate::paths::capture_evaluation_path(tracker, &self.location),
-            location.into(),
-            instance.to_value(),
-            branches,
-        ));
+        any_of_failure(
+            &self.schemas,
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+        )
     }
 
     fn evaluate(
@@ -166,19 +167,23 @@ impl SingleAnyOfValidator<SerdeJson> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let any_of_ctx = ctx.new_at_location("anyOf");
-        let item_ctx = any_of_ctx.new_at_location(0);
+        let any_of_ctx = ctx.new_at_location("anyOf")?;
+        let item_ctx = any_of_ctx.new_at_location(0)?;
         let node = compiler::compile(&item_ctx, item_ctx.as_resource_ref(schema))?;
-        Ok(Box::new(SingleAnyOfValidator {
+        Ok(ctx.funding().boxed(SingleAnyOfValidator {
             node,
             location: any_of_ctx.location().clone(),
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for SingleAnyOfValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.node)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.node)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -189,56 +194,37 @@ impl<F: Json> Validate<F> for SingleAnyOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<(
+            Vec<Vec<ValidationError<'_>>>,
+            Vec<ValidationError<'_>>,
+            &SchemaNode<F>,
+        )>())
+        .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.node.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if self.node.is_valid(instance, ctx) {
-            Ok(())
-        } else {
-            Err(ValidationError::any_of(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                vec![{
-                    let mut branch = Vec::new();
-                    self.node
-                        .collect_errors(instance, location, tracker, ctx, &mut branch);
-                    branch
-                }],
-            ))
+        if self.is_valid(instance, ctx) {
+            return Ok(());
         }
-    }
-
-    fn collect_errors<'i>(
-        &self,
-        instance: &F::Node<'i>,
-        location: &LazyLocation,
-        tracker: Option<&RefTracker>,
-        ctx: &mut ValidationContext,
-        errors: &mut Vec<ValidationError<'i>>,
-    ) {
-        if self.node.is_valid(instance, ctx) {
-            return;
-        }
-        let mut branch = Vec::new();
-        self.node
-            .collect_errors(instance, location, tracker, ctx, &mut branch);
-        errors.push(ValidationError::any_of(
-            self.location.clone(),
-            crate::paths::capture_evaluation_path(tracker, &self.location),
-            location.into(),
-            instance.to_value(),
-            vec![branch],
-        ));
+        any_of_failure(
+            std::slice::from_ref(&self.node),
+            &self.location,
+            instance,
+            location,
+            tracker,
+            ctx,
+        )
     }
 
     fn evaluate(
@@ -267,14 +253,19 @@ pub(crate) fn compile<'a, F: Json>(
             _ => Some(AnyOfValidator::compile(ctx, schema)),
         }
     } else {
-        let location = ctx.location().join("anyOf");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::Array,
-        )))
+        let location =
+            crate::keywords::try_compile!(ctx.location().join_with_funding("anyOf", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::Array,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 

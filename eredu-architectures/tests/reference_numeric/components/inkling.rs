@@ -259,8 +259,8 @@ impl eredu_runtime::RoutedUnitObserver<NumericTensor> for Observer {
 
 struct Initialize;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         value.data = deterministic_values(
             &ParameterSpec::trainable(name).unwrap(),
             value.data.len(),
@@ -280,8 +280,8 @@ impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
 #[derive(Default)]
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-        self.0.insert(metadata.id.as_str().into(), value.clone());
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+        self.0.insert(metadata.id().as_str().into(), value.clone());
     }
 }
 

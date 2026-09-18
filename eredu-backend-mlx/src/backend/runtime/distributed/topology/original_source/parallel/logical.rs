@@ -7,7 +7,7 @@ use crate::backend::{
 #[derive(Clone)]
 pub(crate) struct RetainedLogicalCollective {
     value: Option<Rc<LogicalCollectiveQuote>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl RetainedLogicalCollective {
     pub(crate) fn value(&self) -> &LogicalCollectiveQuote {
@@ -167,7 +167,7 @@ impl OriginalParallelInvocation {
         run: F,
     ) -> Result<Result<T, E>, Error>
     where
-        F: FnOnce(&mut Group, &WorkspaceMetadataFunding) -> Result<T, E>,
+        F: FnOnce(&mut Group, &HostMetadataFunding) -> Result<T, E>,
     {
         reserve(
             &self.funding,
@@ -200,3 +200,5 @@ impl OriginalParallelInvocation {
         self.with_context_control(observer, compute, control, run)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

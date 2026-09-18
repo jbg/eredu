@@ -1,27 +1,27 @@
 use super::*;
 use eredu_core::capture::SharedCapturePlan;
 use crate::capture::partition::PartitionCaptureRoutedProducerSource;
-use eredu_nn::workspace::{WorkspaceMetadataAccount,WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount,HostMetadataFunding,HostMetadataFundingError};
 use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
 #[derive(Debug)]
 struct Account {used:Arc<AtomicUsize>,refuse:Arc<AtomicBool>,retired:Arc<AtomicBool>}
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,bytes:usize)->Result<(),WorkspaceMetadataFundingError> {
-        if self.refuse.load(Ordering::SeqCst) {return Err(WorkspaceMetadataFundingError::Overflow);}
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError> {
+        if self.refuse.load(Ordering::SeqCst) {return Err(HostMetadataFundingError::Overflow);}
         self.used.fetch_add(bytes,Ordering::SeqCst);Ok(())
     }
 }
 impl Drop for Account {fn drop(&mut self){self.retired.store(true,Ordering::SeqCst);}}
-fn funding()->(WorkspaceMetadataFunding,Arc<AtomicUsize>,Arc<AtomicBool>,Arc<AtomicBool>) {
+fn funding()->(HostMetadataFunding,Arc<AtomicUsize>,Arc<AtomicBool>,Arc<AtomicBool>) {
     let used=Arc::new(AtomicUsize::new(0));let refuse=Arc::new(AtomicBool::new(false));let retired=Arc::new(AtomicBool::new(false));
-    (WorkspaceMetadataFunding::new(Account{used:used.clone(),refuse:refuse.clone(),retired:retired.clone()}).unwrap(),used,refuse,retired)
+    (HostMetadataFunding::new(Account{used:used.clone(),refuse:refuse.clone(),retired:retired.clone()}).unwrap(),used,refuse,retired)
 }
 #[test]
 fn funded_routed_receipts_preserve_ordinary_permuted_ownership_identity_records_and_custody() {
     for empty in [false,true] {for exchange in [false,true] {
         let source=SharedCapturePlan::new(plan(empty));
         let mut ordinary_ledger=CaptureLedger::new(source.admission());ordinary_ledger.begin_step();
-        let ordinary=PartitionCaptureReceiptPlan::new_routed_shared(source.clone(),context(source.admission()),
+        let ordinary=PartitionCaptureReceiptPlan::new_routed(source.clone(),context(source.admission()),
             producers(source.admission(),exchange),8,limits(),&mut ordinary_ledger).unwrap();
         let mut declarations=producers(source.admission(),exchange);declarations.reverse();
         let rows:Vec<_>=declarations.iter().map(|row|PartitionCaptureRoutedProducerSource{rank:row.rank,ownership:&row.ownership}).collect();

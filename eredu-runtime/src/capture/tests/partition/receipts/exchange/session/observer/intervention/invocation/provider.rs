@@ -84,7 +84,7 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
                         }),
                     );
                     let catalog = discovery(&capture);
-                    let mut session = CaptureSession::new(capture);
+                    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
                     session
                         .enable_interventions(plan, Arc::new(Estimates))
                         .unwrap();

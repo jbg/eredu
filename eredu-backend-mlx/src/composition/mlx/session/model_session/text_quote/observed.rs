@@ -8,33 +8,29 @@ use eredu_runtime::working_memory::{
     RegisteredWorkspaceStorage, SamplingWorkspaceReport,
 };
 
-/// Context-specific diagnostics preserve the actual native cause and its
-/// classification. Ordinary/token quotation keeps its existing error path.
+/// Quote-stage diagnostics preserve the actual native cause, classification,
+/// and planning-account custody for both token and completed-media sources.
 #[derive(Debug, thiserror::Error)]
-#[error("completed media quote {stage}: {cause}")]
-struct CompletedQuoteFailure {
+#[error("workspace quote {stage}: {cause}; missing equation {equation:?}")]
+struct WorkspaceQuoteFailure {
     stage: &'static str,
     #[source]
     cause: Error,
+    equation: Option<(usize, usize, Option<String>)>,
 }
-fn completed_quote_failure(
+fn workspace_quote_failure(
     context: Option<&WorkspaceContext>,
-    completed: bool,
     stage: &'static str,
     cause: Error,
+    equation: Option<(usize, usize, Option<String>)>,
 ) -> Error {
-    #[cfg(any(test, debug_assertions))]
-    if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-        eprintln!("ORIGINAL_QUOTE_FAILURE stage={stage} cause={cause:?}");
-    }
-    if !completed
-        || matches!(
-            cause,
-            Error::PrefillControl(
-                WorkingMemoryError::SubmissionTrackingCapacity { .. }
-                    | WorkingMemoryError::GraphMetadataCapacity { .. }
-            )
+    if matches!(
+        cause,
+        Error::PrefillControl(
+            WorkingMemoryError::SubmissionTrackingCapacity { .. }
+                | WorkingMemoryError::GraphMetadataCapacity { .. }
         )
+    )
     {
         return cause;
     }
@@ -46,7 +42,7 @@ fn completed_quote_failure(
         .unwrap_or(BackendFailureKind::Other);
     let preserved = cause.model_state_preserved();
     crate::composition::mlx::model::retain_planning_error_with_kind(
-        CompletedQuoteFailure { stage, cause },
+        WorkspaceQuoteFailure { stage, cause, equation },
         funding,
         kind,
         preserved,
@@ -103,8 +99,7 @@ pub(super) fn quote_observed_with_sequence(
         state_input,
     } = observed;
     let completed_source = storage.completed_source();
-    let at =
-        |stage, cause| completed_quote_failure(context, completed_source.is_some(), stage, cause);
+    let at = |stage, cause| workspace_quote_failure(context, stage, cause, None);
     if state_input.model_positions != geometry.cached_positions + geometry.input_positions {
         return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
     }
@@ -125,6 +120,13 @@ pub(super) fn quote_observed_with_sequence(
             Option<eredu_runtime::working_memory::TextPrefillScopeFacts>,
         )>()
         .map_err(report_error)?;
+    report_metadata.admit::<(
+        crate::backend::error::WorkspaceQuoteComponents,
+        Option<crate::backend::error::WorkspaceQuoteComponents>,
+        crate::backend::error::WorkspaceCandidateRefusal,
+        Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
+    )>().map_err(report_error)?;
+    let mut components = crate::backend::error::WorkspaceQuoteComponents::default();
     if let Some(recipe) = native_recipe.as_mut() {
         session
             .payload
@@ -144,29 +146,29 @@ pub(super) fn quote_observed_with_sequence(
                 .map_err(|cause| at("host copy recipe", cause))?;
         }
     }
-    #[cfg(any(test, debug_assertions))]
-    if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-        eprintln!("ORIGINAL_QUOTE_EQUATIONS transient={:?} residual={:?}", equations.transient(), equations.residual_workspace());
-        if let Some(recipe) = native_recipe.as_ref() {
-            for (index, row) in recipe.records().iter().enumerate() {
-                eprintln!("ORIGINAL_QUOTE_NATIVE_ROW index={index} row={row:?}");
-            }
-            for (index, row) in recipe.sampling_records().iter().enumerate() {
-                eprintln!("ORIGINAL_QUOTE_SAMPLING_ROW index={index} row={row:?}");
-            }
-        }
-    }
     let requested_tracking = config.inference_policy().submission_tracking_capacity_bytes;
-    let selected_tracking = match native_recipe.as_ref() {
-        Some(recipe) => Some(
-            recipe
-                .record_storage_requirement()
-                .map_err(|cause| at("submission records", cause))?
-                .select_for_policy(requested_tracking)
-                .map_err(|cause| at("submission record capacity", Error::PrefillControl(cause)))?,
-        ),
+    let selected_tracking = match native_recipe.as_mut() {
+        Some(recipe) => {
+            let requirement = recipe.record_storage_requirement().map_err(|cause| {
+                match recipe.take_first_missing_equation() {
+                    Ok(equation) => workspace_quote_failure(context, "submission records", cause, equation),
+                    Err(refusal) => refusal,
+                }
+            })?;
+            Some(requirement.select_for_policy(requested_tracking).map_err(|cause| {
+                // A configured-capacity refusal keeps its direct public form.
+                if !matches!(cause, WorkingMemoryError::UnknownBound) {
+                    return at("submission record capacity", Error::PrefillControl(cause));
+                }
+                match recipe.take_first_missing_equation() {
+                    Ok(equation) => workspace_quote_failure(context, "submission record capacity", Error::PrefillControl(cause), equation),
+                    Err(refusal) => refusal,
+                }
+            })?)
+        }
         None => requested_tracking,
     };
+    components.tracking = selected_tracking.map(|bytes| bytes.get());
     let input_layout = sequence_claim
         .and_then(|c| c.request().token_input())
         .map(eredu_runtime::working_memory::OriginalTokenInputLayout::prepare)
@@ -227,10 +229,12 @@ pub(super) fn quote_observed_with_sequence(
             let controls = recipe
                 .control_bytes()
                 .map_err(|cause| at("native recipe controls", Error::Neural(cause)))?;
+            components.recipe = Some(controls);
             match crate::backend::nn::tensor::token_validation_control_bytes(recipe)
                 .map_err(|cause| at("token validation controls", cause))?
             {
                 Some(validation_controls) => {
+                    components.validation = Some(validation_controls);
                     let controls = controls
                         .checked_add(validation_controls)
                         .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
@@ -265,7 +269,6 @@ pub(super) fn quote_observed_with_sequence(
         session
             .payload
             .model
-            .erased()
             .native_storage_mechanism()
             .map_err(|cause| at("selected native storage mechanism", cause))?
     } else {
@@ -274,6 +277,7 @@ pub(super) fn quote_observed_with_sequence(
     if let (Some(recipe), Some(_)) = (&native_recipe, &native_mechanism) {
         match pipeline_cache::control_bytes(recipe).map_err(|cause| at("pipeline cache controls", cause))? {
         Some(controls) => {
+            components.pipeline = Some(controls);
             if let WorkspaceBound::Bounded { bytes, assumptions } = &mut outside.retained {
                 *bytes = bytes.checked_add(controls)
                     .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
@@ -360,18 +364,25 @@ pub(super) fn quote_observed_with_sequence(
             };
             match completed_source {
                 Some(source) => mechanism
-                    .completed_input_program(recipe, source, sampling, opening_rows)
+                    .completed_input_program(recipe, source, sampling, opening_rows, paged_sources.is_some())
                     .map_err(|cause| at("completed input native population", cause))?,
                 None => mechanism.resident_program(
                     recipe,
                     prompt.as_ref().ok_or_else(unknown)?,
                     sampling,
                     opening_rows,
-                )?,
+                    paged_sources.is_some(),
+                ).map_err(|cause| at("token input native population", cause))?,
             }
         }
         _ => None,
     };
+    components.graph = selected_graph.map(|bytes| bytes.get());
+    if let Some(program) = &native_program {
+        components.native_capacity = Some(program.capacity_bytes());
+        components.publication_attempts = Some(program.attempts());
+        components.publication_rows = Some(program.rows());
+    }
     let mut outside = sampling
         .enclosing_workspace_metadata(
             match &prompt {
@@ -384,28 +395,8 @@ pub(super) fn quote_observed_with_sequence(
         )
         .map_err(report_error)?;
     if let Some(program) = &native_program {
-        program.replace_enclosing_metadata(&mut outside, report_metadata)?;
-    }
-    #[cfg(any(test, debug_assertions))]
-    if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-        for (component, bound) in [
-            ("activations", &outside.activations), ("attention", &outside.attention),
-            ("vocabulary", &outside.vocabulary), ("state_update", &outside.state_update),
-            ("materialization", &outside.materialization), ("retained", &outside.retained),
-        ] {
-            match bound {
-                WorkspaceBound::Unknown { reason } =>
-                    eprintln!("ORIGINAL_QUOTE_ENCLOSING_UNKNOWN component={component} reason={reason}"),
-                WorkspaceBound::Bounded { bytes, .. } =>
-                    eprintln!("ORIGINAL_QUOTE_ENCLOSING_BOUND component={component} bytes={bytes} chunk={}",
-                        geometry.prefill_chunk_positions),
-            }
-        }
-        eprintln!("ORIGINAL_QUOTE_SAMPLING_BOUND tensor={:?} host={:?} first_gap={:?} native_program={}",
-            sampling.tensor_peak_bytes, sampling.host_peak_bytes, sampling.first_gap, native_program.is_some());
-        if let WorkspaceBound::Unknown { reason } = &sampling.peak {
-            eprintln!("ORIGINAL_QUOTE_SAMPLING_UNKNOWN reason={reason}");
-        }
+        program.replace_enclosing_metadata(&mut outside, report_metadata)
+            .map_err(|cause| at("native enclosing storage replacement", cause))?;
     }
     let tracking = tracking::selected_facts(requested_tracking, selected_tracking)?;
     let graph = graph::selected_facts(requested_graph, selected_graph, graph_fit_controls)?;
@@ -424,7 +415,7 @@ pub(super) fn quote_observed_with_sequence(
                     graph.capacity(),
                     native_recipe
                         .as_ref()
-                        .map(|recipe| recipe.maximum_roots())
+                        .map(|recipe| recipe.maximum_roots().map_err(|cause| at("native root population", cause)))
                         .transpose()?,
                     retained_sources,
                     native_recipe.as_ref(),
@@ -442,7 +433,8 @@ pub(super) fn quote_observed_with_sequence(
         Some(prefill)=>{
             let target=prefill.source_construction_facts();
             let compound=match native_recipe.as_ref(){
-                Some(recipe)=>match report_metadata.funding(){Some(funding)=>recipe.prepare_addressable_source_program(target,paged,&funding)?,
+                Some(recipe)=>match report_metadata.funding(){Some(funding)=>recipe.prepare_addressable_source_program(target,paged,&funding)
+                    .map_err(|cause| at("addressable source program", cause))?,
                     None=>{if recipe.records().iter().any(|row|row.addressable().is_some()){return Err(memory(WorkingMemoryError::IdentityMismatch));}None}},
                 None=>None,
             };
@@ -460,14 +452,16 @@ pub(super) fn quote_observed_with_sequence(
         },None=>None,
     };
     if let Some(recipe)=native_recipe.as_ref(){
-        let controls=recipe.addressable_request_control_bytes()?;
+        let controls=recipe.addressable_request_control_bytes()
+            .map_err(|cause| at("addressable request controls", cause))?;
         if let WorkspaceBound::Bounded{bytes,assumptions}=&mut outside.retained{
             *bytes=bytes.checked_add(controls).ok_or_else(||memory(WorkingMemoryError::Overflow))?;
             if controls!=0{report_metadata.append(assumptions,"; exact addressable request source program and independent native graph/record roles").map_err(report_error)?;}
         }
     }
     let prefill = match (prefill, native_recipe.as_ref().map(|recipe|
-        recipe.initialized_input_source_facts(geometry.max_output_tokens)).transpose()?.flatten()) {
+        recipe.initialized_input_source_facts(geometry.max_output_tokens)
+            .map_err(|cause| at("initialized parallel input sources", cause))).transpose()?.flatten()) {
         (Some(prefill), Some(facts)) => Some(prefill.with_output_source_constructions(facts)),
         (prefill, _) => prefill,
     };
@@ -508,6 +502,7 @@ pub(super) fn quote_observed_with_sequence(
     };
     let quote = match quote {
         Ok(quote) => {
+            components.before_seal = Some(quote.incremental_bytes());
             // This is request quotation after native model selection, not
             // portable artifact inspection. Only payload-free selected facts
             // enter the neutral plan. Missing provider decomposition stays
@@ -524,9 +519,13 @@ pub(super) fn quote_observed_with_sequence(
                     })
                     .transpose()?
                     .flatten();
+                components.collector_controls = collector;
                 native_mechanism
                     .as_ref()
                     .map(|mechanism| {
+                        components.direct_controls = native_program.as_ref()
+                            .map(|program| program.direct_control_bytes(mechanism, report_metadata))
+                            .transpose()?.flatten();
                         mechanism
                             .selected_plan(
                                 quote.span_workspace(),
@@ -540,6 +539,7 @@ pub(super) fn quote_observed_with_sequence(
             } else {
                 None
             };
+            components.native_controls = native.as_ref().and_then(|plan| plan.control_bytes());
             Ok(match capture {
                 Some(capture) => capture.seal_controls_with_sequence(
                     quote,
@@ -568,6 +568,18 @@ pub(super) fn quote_observed_with_sequence(
         )) => Err(incomplete),
         Err(error) => return Err(Error::Neural(error.into_workspace(report_metadata))),
     };
+    if let Ok(quote) = &quote {
+        components.after_seal = Some(quote.incremental_bytes());
+        components.state = Some(quote.state().requested_state_bytes);
+        if let Some(workspace) = &quote.state().execution_workspace {
+            components.activations = workspace.activations.bytes();
+            components.vocabulary = workspace.vocabulary.bytes();
+            components.retained = workspace.retained.bytes();
+        }
+        if let Some(recipe) = native_recipe {
+            recipe.record_quote_components(components)?;
+        }
+    }
     Ok(quote)
 }
 

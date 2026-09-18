@@ -2,15 +2,15 @@
 use super::*;
 
 pub(super) fn selected(receipt:&PartitionCaptureReceiptPlan)->bool {
-    receipt.combination()==PartitionCaptureCombination::Disjoint && receipt.shared_plan_source().is_some_and(|source|
-        matches!(source.admission().plan().selections[receipt.context().selection_index].transform,
-            CaptureTransform::Summary|CaptureTransform::Histogram{..}))
+    receipt.combination()==PartitionCaptureCombination::Disjoint &&
+        matches!(receipt.shared_plan_source().admission().plan().selections[receipt.context().selection_index].transform,
+            CaptureTransform::Summary|CaptureTransform::Histogram{..})
 }
 pub(super) fn source<'a>(receipt:&'a PartitionCaptureReceiptPlan,producer:usize,fragment:usize,inference:InferenceGeometry)
     ->Result<CapturePrefillTransformPlan<'a>,CaptureRunHostError> {
     if !selected(receipt)||receipt.context().phase!=CapturePhase::Prefill||receipt.context().prediction!=0
         ||receipt.context().invocation.is_some(){return Err(CaptureRunHostError::ReceiptMismatch);}
-    CapturePrefillTransformPlan::prepare_partition(receipt.shared_plan_source().expect("checked source").admission(),
+    CapturePrefillTransformPlan::prepare_partition(receipt.shared_plan_source().admission(),
         receipt.context().selection_index,inference,receipt.producer(producer).ok_or(CaptureRunHostError::ReceiptMismatch)?,
         fragment,PartitionCaptureCombination::Disjoint).map_err(CapturePrefillHostError::from).map_err(Into::into)
 }
@@ -45,7 +45,7 @@ impl PreparedPartitionFragmentDestinations {
         self.rows[index].prefill.as_mut().expect("checked target").pending=true;
         let identity=ReceiptIdentity{phase:CapturePhase::Prefill,prediction:0,index:receipt.context().selection_index,
             custody:self.rows[index].custody.share_scheduled()};
-        let source=receipt.shared_plan_source().expect("checked source").admission();
+        let source=receipt.shared_plan_source().admission();
         let projection=receipt.producer(producer).expect("checked producer");
         match source.plan().selections[receipt.context().selection_index].transform {
             CaptureTransform::Summary=>{
@@ -140,7 +140,7 @@ impl PreparedPartitionFragmentDestinations {
     }
 }
 pub(super) fn control_bytes(receipt:&PartitionCaptureReceiptPlan)->Option<usize> {
-    let histogram=matches!(receipt.shared_plan_source()?.admission().plan().selections[receipt.context().selection_index].transform,
+    let histogram=matches!(receipt.shared_plan_source().admission().plan().selections[receipt.context().selection_index].transform,
         CaptureTransform::Histogram{..});
     let typed=if histogram {
         CaptureHistogramGeometry::preparation_control_bytes()?.checked_add(size_of::<CaptureHistogramHostPlan<'_>>() *2)?

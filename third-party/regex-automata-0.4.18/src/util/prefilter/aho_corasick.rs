@@ -1,3 +1,5 @@
+#[cfg(feature = "alloc")]
+use crate::util::allocation::{Allocation, AllocationError, Unenforced};
 use crate::util::{
     prefilter::PrefilterI,
     search::{MatchKind, Span},
@@ -12,13 +14,27 @@ pub(crate) struct AhoCorasick {
 }
 
 impl AhoCorasick {
-    pub(crate) fn new<B: AsRef<[u8]>>(
-        kind: MatchKind,
-        needles: &[B],
-    ) -> Option<AhoCorasick> {
-        #[cfg(not(feature = "perf-literal-multisubstring"))]
+    pub(crate) fn new<B: AsRef<[u8]>>(kind: MatchKind, needles: &[B]) -> Option<AhoCorasick> {
+        #[cfg(feature = "alloc")]
+        {
+            AhoCorasick::new_with_allocations(kind, needles, &Unenforced)
+                .expect("ordinary prefilter construction allocation failed")
+        }
+        #[cfg(not(feature = "alloc"))]
         {
             None
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(crate) fn new_with_allocations<B: AsRef<[u8]>>(
+        kind: MatchKind,
+        needles: &[B],
+        funding: &dyn Allocation,
+    ) -> Result<Option<AhoCorasick>, AllocationError> {
+        #[cfg(not(feature = "perf-literal-multisubstring"))]
+        {
+            Ok(None)
         }
         #[cfg(feature = "perf-literal-multisubstring")]
         {
@@ -33,9 +49,7 @@ impl AhoCorasick {
             // we have leftmost-first or 'all' semantics. Namely, we always
             // want the leftmost match.
             let ac_match_kind = match kind {
-                MatchKind::LeftmostFirst | MatchKind::All => {
-                    aho_corasick::MatchKind::LeftmostFirst
-                }
+                MatchKind::LeftmostFirst | MatchKind::All => aho_corasick::MatchKind::LeftmostFirst,
             };
             // This is kind of just an arbitrary number, but basically, if we
             // have a small enough set of literals, then we try to use the VERY
@@ -47,6 +61,8 @@ impl AhoCorasick {
             } else {
                 aho_corasick::AhoCorasickKind::ContiguousNFA
             };
+            crate::util::allocation::Allocator::new(funding)
+                .reserve(core::mem::size_of::<aho_corasick::AhoCorasickBuilder>())?;
             let result = aho_corasick::AhoCorasick::builder()
                 .kind(Some(ac_kind))
                 .match_kind(ac_match_kind)
@@ -66,20 +82,34 @@ impl AhoCorasick {
                 // layered on top of prefilter, and that might have unintended
                 // consequences.
                 .prefilter(false)
-                .build(needles);
+                .build_with_allocations(needles, &super::funding::Funding(funding));
             let ac = match result {
                 Ok(ac) => ac,
                 Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(super::funding::aho(error));
+                    }
                     debug!("aho-corasick prefilter failed to build: {_err}");
-                    return None;
+                    return Ok(None);
                 }
             };
-            Some(AhoCorasick { ac })
+            Ok(Some(AhoCorasick { ac }))
         }
     }
 }
 
 impl PrefilterI for AhoCorasick {
+    #[cfg(feature = "alloc")]
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "perf-literal-multisubstring")]
+        self.ac
+            .visit_source_storage(&mut |id, bytes| visitor.visit(id, bytes));
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "aho-corasick"
     }
@@ -91,11 +121,11 @@ impl PrefilterI for AhoCorasick {
         }
         #[cfg(feature = "perf-literal-multisubstring")]
         {
-            let input =
-                aho_corasick::Input::new(haystack).span(span.start..span.end);
-            self.ac
-                .find(input)
-                .map(|m| Span { start: m.start(), end: m.end() })
+            let input = aho_corasick::Input::new(haystack).span(span.start..span.end);
+            self.ac.find(input).map(|m| Span {
+                start: m.start(),
+                end: m.end(),
+            })
         }
     }
 
@@ -109,9 +139,10 @@ impl PrefilterI for AhoCorasick {
             let input = aho_corasick::Input::new(haystack)
                 .anchored(aho_corasick::Anchored::Yes)
                 .span(span.start..span.end);
-            self.ac
-                .find(input)
-                .map(|m| Span { start: m.start(), end: m.end() })
+            self.ac.find(input).map(|m| Span {
+                start: m.start(),
+                end: m.end(),
+            })
         }
     }
 

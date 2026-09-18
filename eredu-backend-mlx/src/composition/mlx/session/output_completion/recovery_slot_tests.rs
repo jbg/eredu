@@ -51,7 +51,7 @@ fn actual_completion_extractor_releases_its_loan_before_finish_or_drop_callbacks
         // branches; the callback reenters its precise original slot.
         let owner = take_recovery(&slot);
         if finish {
-            let status = owner.map(Recovery::finish).unwrap();
+            let status = owner.map(Recovery::finish).unwrap().unwrap();
             assert!(status.settled && !status.failed && !status.blocked);
         } else {
             drop(owner);

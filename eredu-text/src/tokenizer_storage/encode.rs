@@ -21,7 +21,7 @@ impl<'a> EncodeIdsPlan<'a> {
         add_special_tokens: bool,
     ) -> Result<Self, EncodeIdsError> {
         let inner =
-            tokenizers::EncodeIdsPlan::prepare(&source.tokenizer, input, add_special_tokens)?;
+            tokenizers::EncodeIdsPlan::prepare(source.input_view(), input, add_special_tokens)?;
         let required = [
             inner.requirements().required_bytes(),
             size_of::<Self>(),
@@ -83,6 +83,18 @@ impl<'a> EncodeIdsPlan<'a> {
         self.inner = self.inner.fail_regex_reservation(target)?;
         Ok(self)
     }
+    #[cfg(feature = "tokenizer-compiler-test-support")]
+    #[doc(hidden)]
+    /// Development-only actual workspace reserve in an ordered regex source.
+    pub fn fail_regex_reservation_at(
+        mut self,
+        ordinal: usize,
+        target: super::RegexWorkspaceFailure,
+    ) -> Result<Self, EncodeIdsError> {
+        self.inner = self.inner.fail_regex_reservation_at(ordinal, target)?;
+        Ok(self)
+    }
+
     #[cfg(feature = "tokenizer-compiler-test-support")]
     #[doc(hidden)]
     /// Development-only overflow of one actual target reserve, never a surrogate allocation.

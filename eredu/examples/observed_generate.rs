@@ -1,14 +1,15 @@
 //! Complete facade workflow: cold discovery, bounded admission, ordinary sampling,
 //! attributed streaming, and cancellation. No native tensors or custom generation loop.
 use eredu::api::{
-    inspect_architecture, local_device_plan, LoadedModel, LocalDevice, ObservedGenerationEvent,
-    PreparedChatGenerationSettings, TraceLimits,
+    ChatSourceInput, LoadedModel, LocalDevice, ObservedGenerationEvent,
+    PreparedChatGenerationSettings, PreparedChatRequest, TokenizerSourceInput, TraceLimits,
+    inspect_architecture, local_device_plan,
 };
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    capture::*, ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides,
-    ObservationSupportStatus, SessionCapabilities,
+    ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides,
+    ObservationSupportStatus, SessionCapabilities, capture::*,
 };
 use std::ops::ControlFlow;
 
@@ -90,12 +91,27 @@ fn main() -> anyhow::Result<()> {
             on_limit: CaptureLimitPolicy::Skip,
         },
     };
-    let chat = model.prepare_chat(ChatTemplateRequest {
+    const CAPACITY: u64 = 64 << 30;
+    let cancellation = GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before chat source"))?;
+    let policy = ChatTemplateRequest {
         messages: vec![serde_json::json!({"role": "user", "content": prompt})],
         add_generation_prompt: true,
         ..Default::default()
-    })?;
-    let prepared = model.prepare_observed_chat(
+    };
+    let chat = model
+        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before chat preparation"))?;
+    let mut request = PreparedChatRequest::new(
         &chat,
         PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
@@ -103,34 +119,44 @@ fn main() -> anyhow::Result<()> {
                 max_new_tokens: Some(32),
                 ..Default::default()
             },
+            inference: eredu_core::TextInferencePolicy {
+                managed_memory_capacity_bytes: Some(CAPACITY),
+                ..Default::default()
+            },
             seed: 42,
             ..Default::default()
         },
-        plan,
-        TraceLimits {
-            per_record_bytes: 2 * 1024 * 1024,
-            total_bytes: 16 * 1024 * 1024,
-        },
-    )?;
-    eprintln!(
-        "Admitted {} for {} prompt tokens",
-        prepared.capture_plan().identity(),
-        prepared.prompt_token_ids().len()
     );
-    let cancellation = GenerationCancellationToken::new();
-    let outcome = model.generate_observed_chat(prepared, &[], cancellation.clone(), |record| {
-        println!("{}", serde_json::to_string(&record).expect("versioned host record"));
-        if matches!(record.event, ObservedGenerationEvent::Token { prediction_index, .. } if prediction_index + 1 >= cancel_after) {
-            // Equivalently, return ControlFlow::Break(()). Delivery is synchronous
-            // and the ordinary generator settles work before returning.
-            cancellation.cancel();
+    request.capture = Some(&plan);
+    let trace = TraceLimits {
+        per_record_bytes: 2 * 1024 * 1024,
+        total_bytes: 16 * 1024 * 1024,
+    };
+    let control = eredu_core::execution_control::GenerationControlHandle::default();
+    let cancel = control.clone();
+    let mut emit = |record: eredu::api::ControlledGenerationRecord| {
+        println!(
+            "{}",
+            serde_json::to_string(&record).expect("versioned host record")
+        );
+        if matches!(record.event.progress(), Some(ObservedGenerationEvent::Token { prediction_index, .. }) if prediction_index + 1 >= cancel_after)
+        {
+            cancel.cancel();
         }
         ControlFlow::Continue(())
-    })?;
+    };
+    let mut session = model
+        .start_controlled_chat(request, trace, control, &mut emit)?
+        .ok_or_else(|| anyhow::anyhow!("cancelled before generation"))?;
+    eprintln!(
+        "Admitted {} prompt positions",
+        session.prompt_attribution().decoder_positions
+    );
+    session.run(&mut emit)?;
     eprintln!(
         "Stopped: {:?}; {} generated tokens",
-        outcome.finish_reason,
-        outcome.token_ids.len()
+        session.finish_reason(),
+        session.token_ids().len()
     );
     Ok(())
 }

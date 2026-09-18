@@ -327,43 +327,35 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
 
-    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+    fn state_layout(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
         -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
         match &self.parallel_geometry {
             Some(geometry) => geometry.state_layout().clone_workspace(context),
             None => super::state_layout_with_metadata(&self.args, context),
         }
-    }
-    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+    }, None => {
+        self.state_layout_impl()
+    } }
+}
+    fn state_identity(&self, state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
         super::state_identity_with_metadata(&self.args, state.layout(), state.global_layer_offset(), topology, context)
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+    }, None => {
         super::state_identity(
             &self.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
         )
-    }
+    } }
+}
 
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
-    }
+
 
     fn static_parameter_recipes(
         &self,
@@ -375,7 +367,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         super::static_recipes(source, &self.args, None)
     }
 
-    fn parameter_description_with_metadata(&self,
+    fn parameter_description(&self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
         match &self.construction_parameters {
@@ -387,7 +379,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
                 Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
             }
-            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+            None => (|| {
+        self.parameter_description_impl(context)
+    })().map(std::borrow::Cow::Owned),
         }
     }
 
@@ -560,7 +554,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.groups.execution_graph()?;
+        let graph = self.groups.execution_graph()?.into_owned();
         let counts = std::iter::once(self.target_units)
             .chain(std::iter::repeat_n(
                 self.prediction_pattern,
@@ -1099,11 +1093,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     fn validate_group(&self, group: usize) -> Result<usize, Error> {
-        self.groups.unit_count(group)
+        self.groups.unit_count(group, None)
     }
 
     fn unit_path_inner(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.groups.unit_path(group, index)
+        self.groups.unit_path(group, index, None)
     }
 
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
@@ -1257,22 +1251,23 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // Only the ordinary target group: causal convolution/scan and causal
         // attention carry their complete prefix state; dense/routed/shared
         // ReLU-squared operators act per row. Prediction groups and invocation
         // availability remain governed by their existing separate contracts.
-        let units = self.groups.unit_count(0)?;
+        let units = self.groups.unit_count(0, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
             (0..units).map(|index| self.unit_path_inner(0, index)),
-            true,
-        )?;
+            true, metadata_context)?;
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
             let path = self.unit_path_inner(0, index)?;
             if self.args.layer_schedule.get(index).is_some_and(|policy| *policy == crate::nemotron_h::LayerPolicy::SparseMoe) {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.routing"));
+                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.routing"))?, metadata_context)?;
             }
         }
         Ok(declarations)
@@ -1319,22 +1314,21 @@ where
         crate::transport::pipeline_with_output_state(0, self.target_units, layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.groups.execution_graph()
     }
-    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.groups.execution_graph_with_metadata(context)
+
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        self.groups.unit_count(group, metadata_context)
     }
-    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
-        -> Result<usize, Self::Error> {
-        self.groups.unit_count_with_metadata(group, context)
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.validate_group(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.unit_path_inner(group, index)
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        self.groups.unit_path(group, index, metadata_context)
     }
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
@@ -1755,7 +1749,14 @@ where
 {
     type Boundary = TargetBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(TargetBoundarySchema::from_args(self.args()))
     }
 

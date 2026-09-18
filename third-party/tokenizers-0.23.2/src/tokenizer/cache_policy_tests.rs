@@ -43,12 +43,12 @@ fn policy_precedes_tagged_and_legacy_model_construction_and_preserves_values() {
             let count = cache_constructions();
             let absent = Tokenizer::from_bytes_with_cache_policy(
                 bytes.as_bytes(),
-                ModelCachePolicy::NoModelCaches,
+                ModelCachePolicy::disabled(),
             )
             .unwrap();
             assert_eq!(cache_constructions(), count);
-            assert_eq!(absent.model_cache_policy(), ModelCachePolicy::NoModelCaches);
-            assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::Legacy);
+            assert_eq!(absent.model_cache_policy(), ModelCachePolicy::disabled());
+            assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::default());
             parity(&legacy, &absent);
             let alias = absent.clone();
             assert_eq!(cache_constructions(), count);
@@ -56,7 +56,7 @@ fn policy_precedes_tagged_and_legacy_model_construction_and_preserves_values() {
             let serialized = serde_json::to_vec(&absent).unwrap();
             let restored = Tokenizer::from_bytes_with_cache_policy(
                 &serialized,
-                ModelCachePolicy::NoModelCaches,
+                ModelCachePolicy::disabled(),
             )
             .unwrap();
             assert_eq!(cache_constructions(), count);
@@ -66,7 +66,7 @@ fn policy_precedes_tagged_and_legacy_model_construction_and_preserves_values() {
                 Tokenizer::from_bytes(&serialized)
                     .unwrap()
                     .model_cache_policy(),
-                ModelCachePolicy::Legacy
+                ModelCachePolicy::default()
             );
         }
     }
@@ -89,7 +89,7 @@ fn persistent_workers_keep_legacy_tls_but_no_model_cache_appears_for_absent_sour
                 for model in [BPE_JSON, UNIGRAM] {
                     let source = Tokenizer::from_bytes_with_cache_policy(
                         json(model).as_bytes(),
-                        ModelCachePolicy::NoModelCaches,
+                        ModelCachePolicy::disabled(),
                     )
                     .unwrap();
                     let copy = source.clone();
@@ -124,7 +124,7 @@ fn absent_models_keep_absence_under_clear_resize_and_constructor_failure() {
     for model in [BPE_JSON, UNIGRAM] {
         let mut tokenizer = Tokenizer::from_bytes_with_cache_policy(
             json(model).as_bytes(),
-            ModelCachePolicy::NoModelCaches,
+            ModelCachePolicy::disabled(),
         )
         .unwrap();
         let count = cache_constructions();
@@ -143,7 +143,7 @@ fn absent_models_keep_absence_under_clear_resize_and_constructor_failure() {
         tokenizer.with_model(model);
         assert_eq!(
             tokenizer.model_cache_policy(),
-            ModelCachePolicy::NoModelCaches
+            ModelCachePolicy::disabled()
         );
         assert!(!tokenizer
             .encode("abab", false)
@@ -156,7 +156,7 @@ fn absent_models_keep_absence_under_clear_resize_and_constructor_failure() {
     let count = cache_constructions();
     assert!(Tokenizer::from_bytes_with_cache_policy(
         json(missing_merge).as_bytes(),
-        ModelCachePolicy::NoModelCaches
+        ModelCachePolicy::disabled()
     )
     .is_err());
     assert_eq!(cache_constructions(), count);
@@ -170,7 +170,7 @@ fn absent_models_keep_absence_under_clear_resize_and_constructor_failure() {
         let count = cache_constructions();
         assert!(Tokenizer::from_bytes_with_cache_policy(
             bad.as_bytes(),
-            ModelCachePolicy::NoModelCaches
+            ModelCachePolicy::disabled()
         )
         .is_err());
         assert_eq!(cache_constructions(), count);
@@ -191,7 +191,7 @@ fn seeded_dispatch_preserves_word_models_and_trailing_input_rejection() {
             let a = Tokenizer::from_bytes(bytes.as_bytes()).unwrap();
             let b = Tokenizer::from_bytes_with_cache_policy(
                 bytes.as_bytes(),
-                ModelCachePolicy::NoModelCaches,
+                ModelCachePolicy::disabled(),
             )
             .unwrap();
             assert_eq!(
@@ -204,9 +204,40 @@ fn seeded_dispatch_preserves_word_models_and_trailing_input_rejection() {
             );
             assert!(Tokenizer::from_bytes_with_cache_policy(
                 format!("{bytes} false").as_bytes(),
-                ModelCachePolicy::NoModelCaches
+                ModelCachePolicy::disabled()
             )
             .is_err());
         }
+    }
+}
+
+#[test]
+fn explicit_capacity_is_applied_and_reported_before_model_construction() {
+    for capacity in [0, 1, 37] {
+        let policy = ModelCachePolicy { capacity };
+        for source in [
+            r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#,
+            r#"{"model":{"type":"Unigram","vocab":[["a",0.0]],"unk_id":0}}"#,
+            r#"{"model":{"vocab":{"a":0},"merges":[]}}"#,
+        ] {
+            let tokenizer = Tokenizer::from_bytes_with_cache_policy(source, policy).unwrap();
+            assert_eq!(tokenizer.model_cache_policy(), policy);
+            assert_eq!(tokenizer.clone().model_cache_policy(), policy);
+            assert_eq!(tokenizer.encode("a", false).unwrap().get_ids(), [0]);
+        }
+    }
+}
+
+#[test]
+fn zero_resize_removes_the_model_cache_instead_of_reporting_false_absence() {
+    for source in [BPE_JSON, UNIGRAM] {
+        let mut tokenizer = Tokenizer::from_bytes(json(source)).unwrap();
+        tokenizer.encode("abab", false).unwrap();
+        match &mut tokenizer.model {
+            ModelWrapper::BPE(model) => { model.resize_cache(0); assert!(!model.cache_is_enabled()); }
+            ModelWrapper::Unigram(model) => { model.resize_cache(0); assert!(!model.cache_is_enabled()); }
+            _ => unreachable!(),
+        }
+        assert_eq!(tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
     }
 }

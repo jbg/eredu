@@ -80,8 +80,7 @@ impl Plan<'_> {
             memo: Vec::new(),
         };
         let (_, nodes, _) = source
-            .prepared_extents()
-            .map_err(|_| failure(InitCause::Source))?;
+            .storage_extents();
         let mapping = source
             .mapping_workspace_plan()
             .map_err(|e| failure(InitCause::Mapping(e)))?
@@ -582,25 +581,25 @@ mod tests {
     }
     #[test]
     fn owning_symbolic_worker_preserves_shared_rows_memo_copy_funding_and_failed_prefix() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let ab = source.mk_byte_set_or(&[a, b]);
-        let bc = source.mk_byte_set_or(&[b, c]);
-        let x = source.mk_byte(b'x');
-        let y = source.mk_byte(b'y');
-        let ax = source.mk_concat(ab, x);
-        let by = source.mk_concat(bc, y);
-        let either = source.mk_or(&mut vec![ax, by]);
-        let root = source.mk_not(either);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let ab = source.mk_byte_set_or(&[a, b]).unwrap();
+        let bc = source.mk_byte_set_or(&[b, c]).unwrap();
+        let x = source.mk_byte(b'x').unwrap();
+        let y = source.mk_byte(b'y').unwrap();
+        let ax = source.mk_concat(ab, x).unwrap();
+        let by = source.mk_concat(bc, y).unwrap();
+        let either = source.mk_or(&mut vec![ax, by]).unwrap();
+        let root = source.mk_not(either).unwrap();
         // Retained structural declaration, not an inferred/default expression arena.
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[either; 128]));
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[root, declaration]);
-        source.reserve(96);
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[either; 128])).unwrap();
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[root, declaration]).unwrap();
+        source.reserve(96).unwrap();
         let mut ordinary = source.clone();
         let mut ordinary_cache = RelevanceCache::new();
-        let expected = ordinary_cache.deriv(&mut ordinary, root);
+        let expected = ordinary_cache.deriv(&mut ordinary, root).unwrap();
         let prepared = source.prepared_source_plan().unwrap().compile().unwrap();
         drop(source);
         let mut machine = super::super::PreparedExpressionPlan::prepare(prepared)

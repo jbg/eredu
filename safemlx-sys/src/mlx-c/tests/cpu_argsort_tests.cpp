@@ -24,7 +24,7 @@ namespace {
 void check_worker(const std::vector<float>& values) {
   const auto expected = oracle::ordinary(values.data(), 1, values.size());
   std::vector<uint32_t> output(values.size() * 3 + 1, 0xf00dcafe);
-  cpu::detail::argsort_f32_row(values.data(), 1, output.data(), 3, values.size());
+  cpu::detail::argsort_row(values.data(), 1, output.data(), 3, values.size());
   std::vector<uint32_t> actual(values.size());
   bool guards = output.back() == 0xf00dcafe;
   for (size_t i = 0; i < values.size(); ++i) {
@@ -183,7 +183,7 @@ TEST_CASE("CPU argsort empty row is safe and singleton keeps its original ID") {
     check_native(array({value}), {value}, stream);
   }
   // Null pointers are valid for the private worker's zero-element case.
-  cpu::detail::argsort_f32_row(nullptr, -1, nullptr, 1, 0);
+  cpu::detail::argsort_row<float>(nullptr, -1, nullptr, 1, 0);
 }
 
 TEST_CASE("CPU argsort worker uses no auxiliary new allocations with active positive control") {
@@ -192,7 +192,7 @@ TEST_CASE("CPU argsort worker uses no auxiliary new allocations with active posi
   struct Call { const float* values; uint32_t* output; size_t length; } call{values.data(), output.data(), values.size()};
   const auto attempts = native_recovery_without_allocations([](void* p) {
     const auto& call = *static_cast<Call*>(p);
-    cpu::detail::argsort_f32_row(call.values, 1, call.output, 1, call.length);
+    cpu::detail::argsort_row(call.values, 1, call.output, 1, call.length);
   }, &call);
   CHECK(attempts == 0);
   CHECK(output == oracle::ordinary(values.data(), 1, values.size()));
@@ -329,4 +329,22 @@ TEST_CASE("CPU argsort actual graph and record quota refusals preserve source") 
     CHECK(source.data<float>()[1] == -1.0f);
   }
   records->release();
+}
+
+TEST_CASE("CPU I32 stable argsort worker uses no auxiliary allocation") {
+  for(const size_t count:{size_t{1},size_t{2},size_t{17},size_t{4097}}) {
+    std::vector<int32_t> values(count);
+    for(size_t i=0;i<count;++i)values[i]=int32_t(i%13)-6;
+    values[0]=INT32_MIN;if(count>1)values[1]=INT32_MAX;
+    std::vector<uint32_t> expected(count),output(count*2+1,0xf00dcafe);
+    std::iota(expected.begin(),expected.end(),0);
+    std::stable_sort(expected.begin(),expected.end(),[&](uint32_t a,uint32_t b){return values[a]<values[b];});
+    struct Call{const int32_t* values;uint32_t* output;size_t count;} call{values.data(),output.data(),count};
+    const auto attempts=native_recovery_without_allocations([](void*p){
+      const auto& c=*static_cast<Call*>(p);cpu::detail::argsort_row(c.values,1,c.output,2,c.count);
+    },&call);
+    CHECK(attempts==0);
+    for(size_t i=0;i<count;++i){CHECK(output[2*i]==expected[i]);CHECK(output[2*i+1]==0xf00dcafe);}
+    CHECK(output.back()==0xf00dcafe);
+  }
 }

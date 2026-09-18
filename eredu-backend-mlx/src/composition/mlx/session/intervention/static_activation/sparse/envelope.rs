@@ -12,7 +12,7 @@ pub(crate) struct SparseScalarEnvelope {
     index_count: usize,
     action: Option<InterventionAction>,
     slice: ResolvedCaptureSlice,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl SparseScalarEnvelope {
     pub(crate) fn prepare(action: &InterventionAction, shape: [i32; 2], index_count: usize, context: &WorkspaceContext)
@@ -89,3 +89,5 @@ impl SparseScalarEnvelope {
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

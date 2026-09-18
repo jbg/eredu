@@ -112,7 +112,7 @@ pub(crate) fn initialize<T>(
     scalar: impl FnMut(usize) -> f32,
     realize: impl FnOnce(&[f32]) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let plan = F32InitializationPlan::new(shape).map_err(Error::backend_source)?;
+    let plan = F32InitializationPlan::new(shape).map_err(Error::backend_retained_source)?;
     let values = plan.values(scalar);
     // The exact host buffer remains live throughout the native seed/copy call,
     // then retires on either result. The original backend error is unchanged.

@@ -37,8 +37,11 @@ pub use observation_paths::PreparedSessionObservationError;
 mod media_prefill;
 mod prediction;
 pub use prediction::PublishedPredictionPrefill;
+mod prediction_loan;
+pub use prediction_loan::PredictionStateLoanError;
 mod prefill;
 pub use control::{
+    ControlBranchSource, ControlBranchPlacement, ControlExchangeResult,
     PreparedControlBindingError, PreparedControlExchangeError, ReplicatedTextControlOrigin,
     ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms,
 };
@@ -84,7 +87,7 @@ where
     fn with_execution_parallel<T,E,F>(
         &self, context:&<B::Tensor as Tensor>::Context, run:F,
     )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    where F:FnOnce(Option<(&mut B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
     {
         let _=context;
         Ok(run(None))
@@ -94,7 +97,7 @@ where
     /// publication after forward. This does not rebind or reopen the invocation.
     fn with_execution_parallel_publication<T,E,F>(&self,context:&<B::Tensor as Tensor>::Context,run:F)
         ->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+    where F:FnOnce(Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
         let _=context;Ok(run(None))
     }
 
@@ -105,7 +108,7 @@ where
         &self, context: &<B::Tensor as Tensor>::Context, run: F,
     ) -> Result<Result<T, E>, Self::Error>
     where F: FnOnce(Option<(&mut Option<Box<B::ParallelContext>>,
-        &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         let _ = context;
         Ok(run(None))
@@ -118,7 +121,7 @@ where
     fn with_execution_parallel_control<T, E, F>(
         &self, event: ParallelControlEvent, context: &<B::Tensor as Tensor>::Context, run: F,
     ) -> Result<Result<T, E>, eredu_core::BackendFailure>
-    where F: FnOnce(Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    where F: FnOnce(Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         let _ = (event, context);
         Ok(run(None))
@@ -849,7 +852,7 @@ where
     /// both values on return, failure or unwind. This creates no source grant.
     fn with_borrowed_parallel_context<T,F>(
         runtime:&mut Self::Runtime,context:&mut B::ParallelContext,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,run:F,
+        funding:&eredu_nn::workspace::HostMetadataFunding,run:F,
     )->Result<T,PreparedParallelContextCause>
     where F:FnOnce(&mut Self::Runtime)->T {
         parallel_context::with_borrowed_runtime(runtime,context,funding,Self::exchange_parallel_context,run)
@@ -864,7 +867,7 @@ where
     /// Reuses the scoped restoration worker for a separate control-only loan.
     fn with_borrowed_parallel_control_context<T, F>(
         runtime: &mut Self::Runtime, context: &mut Option<Box<B::ParallelContext>>,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding, run: F,
+        funding: &eredu_nn::workspace::HostMetadataFunding, run: F,
     ) -> Result<T, PreparedParallelContextCause>
     where F: FnOnce(&mut Self::Runtime) -> T,
     {
@@ -885,7 +888,7 @@ where
     /// this shared worker guarantees restoration on return, error or unwind.
     fn with_prepared_parallel_context<T,F>(
         runtime:&mut Self::Runtime, context:B::ParallelContext,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding, run:F,
+        funding:&eredu_nn::workspace::HostMetadataFunding, run:F,
     )->Result<T,PreparedParallelContextFailure<B::ParallelContext>>
     where B::ParallelContext:Sized, F:FnOnce(&mut Self::Runtime)->T,
     {
@@ -994,6 +997,10 @@ where
         None
     }
 
+    /// Actual forward worker's group protocol, independent of the borrowed
+    /// residency owner and its mechanism-specific final completion.
+    fn group_submission_mechanism(runtime: &Self::Runtime) -> crate::GroupSubmissionMechanism;
+
     /// Returns bounded residency state for the shared session report.
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P>;
 
@@ -1019,7 +1026,7 @@ where
     fn bind_observation_paths(
         _runtime: &Self::Runtime,
         _source: &crate::SharedLayeredObservationPaths,
-    ) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
@@ -1110,7 +1117,7 @@ where
     /// Strategies without that producer refuse an explicitly prepared context.
     fn publish_observed_output_with_parallel(runtime:&mut Self::Runtime,output:B::Tensor,
         context:&<B::Tensor as Tensor>::Context,
-        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
+        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
         ->Result<B::Tensor,ReplicatedTextSessionError<A::Error,R::Error,std::convert::Infallible>> {
         if prepared.is_some(){return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));}
         Self::publish_observed_output(runtime,output,context)
@@ -1179,7 +1186,7 @@ where
     fn commit_after_completion_with_parallel(
         runtime: &mut Self::Runtime, epoch: DistributedCommitEpoch,
         context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
     ) -> Result<DistributedCommitOutcome, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
         if prepared.is_some() {
             return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
@@ -1191,7 +1198,7 @@ where
     fn agree_distributed_phase_with_parallel(
         runtime: &mut Self::Runtime, phase: crate::DistributedExecutionPhase,
         local_success: bool, context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
         if prepared.is_some() {
             return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
@@ -1244,6 +1251,10 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn group_submission_mechanism(_runtime: &Self::Runtime) -> crate::GroupSubmissionMechanism {
+        crate::GroupSubmissionMechanism::LayeredGraph
+    }
+
     fn mark_terminal_failure(_runtime: &Self::Runtime, _phase: crate::DistributedExecutionPhase) {}
 
     const ORDINARY_UNIT_EQUATIONS: bool = true;
@@ -1253,11 +1264,11 @@ where
     fn bind_observation_paths(
         runtime: &Self::Runtime,
         source: &crate::SharedLayeredObservationPaths,
-    ) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
-        runtime.bind_observation_paths(source)
+        runtime.bind_observation_paths(source, metadata)
     }
 
     fn validate_observation_paths(
@@ -1437,6 +1448,10 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn group_submission_mechanism(_runtime: &Self::Runtime) -> crate::GroupSubmissionMechanism {
+        crate::GroupSubmissionMechanism::LayeredGraph
+    }
+
     fn mark_terminal_failure(_runtime: &Self::Runtime, _phase: crate::DistributedExecutionPhase) {}
 
     // The retained provider type supplies this descriptive fact. Addressable
@@ -1451,11 +1466,11 @@ where
     fn bind_observation_paths(
         runtime: &Self::Runtime,
         source: &crate::SharedLayeredObservationPaths,
-    ) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
-        runtime.bind_observation_paths(source)
+        runtime.bind_observation_paths(source, metadata)
     }
 
     fn validate_observation_paths(
@@ -1966,6 +1981,9 @@ pub fn partitioned_materialization_unit_layout(
 /// Failure while consuming architecture authority into a rank-local runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum PartitionedSessionPreparationError<E> {
+    /// Retaining an owned architecture declaration failed in its metadata destination.
+    #[error("partitioned session metadata construction failed: {0}")]
+    Metadata(#[source] eredu_nn::Error),
     /// Architecture, partition, selection, or payload authority disagreed.
     #[error("partitioned session authority mismatch: {0}")]
     Contract(String),
@@ -2050,6 +2068,8 @@ where
     let parameters = architecture
         .parameter_description(context)
         .map_err(|error| PartitionedSessionPreparationError::Contract(error.to_string()))?;
+    let parameters = crate::ArchitectureParameterDescription::into_owned(parameters,B::construction_metadata(context))
+        .map_err(PartitionedSessionPreparationError::Metadata)?;
     let mut tasks =
         partitioned_replicated_text_materialization_tasks(&selected, &parameters, &partition)
             .map_err(|error| PartitionedSessionPreparationError::Contract(error.to_string()))?;
@@ -2765,11 +2785,11 @@ where
         let state = PartitionState::new(selected.state().layout().clone_workspace(context)?, 0)
             .map_err(|error| metadata.message(format_args!("{error}")))?;
         // The architecture still supplies its actual validated configuration identity.
-        let identity = <A as crate::ArchitectureParameters<B>>::state_identity_with_metadata(
+        let identity = <A as crate::ArchitectureParameters<B>>::state_identity(
             architecture,
             &state,
             Default::default(),
-            context,
+            Some(context),
         )
         .map_err(|error| {
             metadata.architecture_error(error, "neutral architecture state is invalid: ")
@@ -3356,11 +3376,11 @@ where
         demand: eredu_core::OutputDemand,
         context: &<B::Tensor as Tensor>::Context,
         checkpoint: M::StateCheckpoint,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         complete: F,
     ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
-        M::Error: From<eredu_nn::workspace::WorkspaceMetadataFundingError>,
+        M::Error: From<eredu_nn::workspace::HostMetadataFundingError>,
         F: FnOnce(
             Option<&B::Tensor>,
             &M::State,
@@ -3373,12 +3393,12 @@ where
             std::mem::size_of::<Option<B::Tensor>>(),
             std::mem::size_of::<Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
             std::mem::size_of::<Result<(Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
-            std::mem::size_of::<(&mut Self, A::Input<'a>, eredu_core::OutputDemand, &<B::Tensor as Tensor>::Context, M::StateCheckpoint, &eredu_nn::workspace::WorkspaceMetadataFunding, F)>(),
+            std::mem::size_of::<(&mut Self, A::Input<'a>, eredu_core::OutputDemand, &<B::Tensor as Tensor>::Context, M::StateCheckpoint, &eredu_nn::workspace::HostMetadataFunding, F)>(),
         ];
         let bytes = controls.into_iter()
             .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
             .ok_or_else(|| ReplicatedTextSessionError::Mechanism(
-                eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow.into(),
+                eredu_nn::workspace::HostMetadataFundingError::Overflow.into(),
             ))?;
         funding.reserve_metadata(bytes).map_err(|cause| ReplicatedTextSessionError::Mechanism(cause.into()))?;
         self.output_with_optional_checkpoint_and_completion(
@@ -4140,10 +4160,10 @@ where
 
     /// Exchanges the canonical target state with one prediction-lane state after all-rank proof.
     ///
-    /// The returned state is the previously installed target state. A speculative adapter uses
-    /// this operation before and after a target pass so lane-local caches never become a second
-    /// owner of target execution. Validation or agreement failure leaves the canonical state
-    /// untouched.
+    /// The returned state is the previously installed target state. This is a
+    /// persistent replacement and invalidates prior bindings on both states.
+    /// Scoped lane execution uses `with_prediction_target_state` instead.
+    /// Validation or agreement failure leaves the canonical state untouched.
     pub fn exchange_prediction_target_state(
         &mut self,
         replacement: &mut M::State,
@@ -5281,54 +5301,16 @@ where
             demand,
             checkpoint,
             A::inference_input_shape,
-            |session, input, observer, demand, prepared_traversal| {
-                session.mechanisms.with_execution_parallel_control_context(context, |control| {
-                    let execute = |execution: &mut D::Runtime| {
-                session.mechanisms.with_execution_parallel(context,|parallel| {
-                    let run = |runtime: &mut D::Runtime| {
-                if prepared_traversal {
-                    session.driver.forward_with_prepared_observer(
-                        runtime,
-                        input,
-                        &mut session.state,
-                        pass,
-                        context,
-                        observer,
-                        session
-                            .observation_paths
-                            .as_ref()
-                            .expect("binding checked before input agreement"),
-                        demand,
-                    )
-                } else {
-                    session.driver.forward_with_observer(
-                        runtime,
-                        input,
-                        &mut session.state,
-                        pass,
-                        context,
-                        observer,
-                        demand,
-                    )
+            |driver, runtime, state, paths, input, observer, demand| {
+                match paths {
+                    Some(paths) => driver.forward_with_prepared_observer(
+                        runtime, input, state, pass, context, observer, paths, demand,
+                    ),
+                    None => driver.forward_with_observer(
+                        runtime, input, state, pass, context, observer, demand,
+                    ),
                 }
                 .map_err(widen_infallible)
-                    };
-                    match parallel {
-                        Some((parallel,funding)) => D::with_borrowed_parallel_context(
-                            execution,parallel,funding,run,
-                        ).map_err(ReplicatedTextSessionError::ParallelContext)?,
-                        None => run(execution),
-                    }
-                }).map_err(ReplicatedTextSessionError::Mechanism)?
-                    };
-                    match control {
-                        Some((control, funding)) =>
-                            D::with_borrowed_parallel_control_context(
-                                &mut session.execution, control, funding, execute,
-                            ).map_err(ReplicatedTextSessionError::ParallelContext)?,
-                        None => execute(&mut session.execution),
-                    }
-                }).map_err(ReplicatedTextSessionError::Mechanism)?
             },
         )
     }
@@ -5350,11 +5332,13 @@ where
     where
         Shape: FnOnce(&I) -> Result<Option<[u64; 2]>, A::Error>,
         Execute: FnOnce(
-            &mut Self,
+            &mut D,
+            &mut D::Runtime,
+            &mut M::State,
+            Option<&crate::PreparedLayeredObservationPaths>,
             I,
             &mut O,
             eredu_core::OutputDemand,
-            bool,
         ) -> Result<
             (Option<B::Tensor>, A::ForwardContext),
             ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
@@ -5492,7 +5476,34 @@ where
         };
         self.prepare_observation_transaction(observer, epoch, pass, context)?;
         let checkpoint = self.checkpoint_observed_state_with_prepared(context, checkpoint)?;
-        let execution = execute(self, input, observer, demand, prepared_traversal).and_then(
+        // Text and retained media borrow the same admitted model and control
+        // contexts. Their callbacks select only the input equation; partition
+        // boundaries, one-use source claims and context restoration stay here.
+        let paths = prepared_traversal.then(|| self.observation_paths.as_ref()
+            .expect("binding checked before input agreement"));
+        let execution = self.mechanisms.with_execution_parallel_control_context(context, |control| {
+            let execute_context = |execution: &mut D::Runtime| {
+                self.mechanisms.with_execution_parallel(context, |parallel| {
+                    let run = |runtime: &mut D::Runtime| {
+                        execute(&mut self.driver, runtime, &mut self.state, paths,
+                            input, observer, demand)
+                    };
+                    match parallel {
+                        Some((parallel, funding)) => D::with_borrowed_parallel_context(
+                            execution, parallel, funding, run,
+                        ).map_err(ReplicatedTextSessionError::ParallelContext)?,
+                        None => run(execution),
+                    }
+                }).map_err(ReplicatedTextSessionError::Mechanism)?
+            };
+            match control {
+                Some((control, funding)) => D::with_borrowed_parallel_control_context(
+                    &mut self.execution, control, funding, execute_context,
+                ).map_err(ReplicatedTextSessionError::ParallelContext)?,
+                None => execute_context(&mut self.execution),
+            }
+        }).map_err(ReplicatedTextSessionError::Mechanism).and_then(|result| result);
+        let execution = execution.and_then(
             |(output, forward)| {
                 if let Some(expected) = span_end {
                     if let Some(actual) = self
@@ -6263,12 +6274,7 @@ where
         usize,
         bool,
     )>()?;
-    let graph = match metadata.context() {
-        Some(context) => architecture.execution_graph_with_metadata(context),
-        None => architecture
-            .execution_graph()
-            .map(crate::ArchitectureExecutionGraph::owned),
-    }
+    let graph = architecture.execution_graph()
     .map_err(|error| metadata.architecture_error(error, ""))?;
     if !graph.matches(requirements.execution_graph()) {
         return Err(metadata.message(format_args!(
@@ -6282,8 +6288,8 @@ where
     }
     for group in 0..graph.group_count() {
         let actual = match metadata.context() {
-            Some(context) => architecture.group_unit_count_with_metadata(group, context),
-            None => architecture.group_unit_count(group),
+            Some(context) => architecture.group_unit_count(group, Some(context)),
+            None => architecture.group_unit_count(group, None),
         }
         .map_err(|error| metadata.architecture_error(error, ""))?;
         let expected = requirements
@@ -6299,10 +6305,7 @@ where
             )));
         }
     }
-    let layout = match metadata.context() {
-        Some(context) => architecture.state_layout_with_metadata(context),
-        None => architecture.state_layout(),
-    }
+    let layout = architecture.state_layout(metadata.context())
     .map_err(|error| metadata.architecture_error(error, ""))?;
     if &layout != selected.state().layout() {
         return Err(metadata.message(format_args!(
@@ -6327,7 +6330,7 @@ where
 {
     let requirements = selected.requirements();
     let description = architecture
-        .parameter_description_with_metadata(context)
+        .parameter_description(context)
         .map_err(|error| metadata.architecture_error(error, ""))?;
     type Row<'a> = (&'a str, &'a [usize], &'a ParameterGroupOwner);
     type Companion<'a> = (

@@ -2,7 +2,7 @@ use super::*;
 use eredu_core::HostPreparationAuthority;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Weak,
+    Arc,
 };
 
 struct Drops(Arc<AtomicUsize>);
@@ -107,14 +107,14 @@ fn failed_child_estimation_keeps_original_checkpoint_and_custody_without_publish
 }
 
 struct ReentrantRetirement {
-    plan: Weak<AdmittedCapturePlan>,
+    plan: crate::capture::tests::PlanRetirementProbe,
     target: Arc<crate::capture::CaptureHostOwner>,
     drops: Arc<AtomicUsize>,
 }
 impl Drop for ReentrantRetirement {
     fn drop(&mut self) {
         assert!(
-            self.plan.upgrade().is_none(),
+            self.plan.is_retired(),
             "plan payload must retire before its authority"
         );
         self.target
@@ -130,7 +130,7 @@ fn final_authority_destructor_runs_after_plan_payload_and_can_reenter_another_ow
     let (target, _) = setup();
     let drops = Arc::new(AtomicUsize::new(0));
     let authority = HostPreparationAuthority::retain(ReentrantRetirement {
-        plan: Arc::downgrade(session.plan.legacy_arc().expect("legacy session source")),
+        plan: crate::capture::tests::plan_retirement_probe(&session.plan),
         target: target.owner.clone(),
         drops: drops.clone(),
     });

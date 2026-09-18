@@ -49,7 +49,7 @@ fn admitted_fresh_vec_keeps_exact_hold_through_prefix_error_and_final_storage() 
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
         .into_funded_text_span_workspace(&run, &reservation)

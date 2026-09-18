@@ -51,7 +51,7 @@ fn external_assistant_operation_preserves_nonzero_proposals_and_failed_state() {
     // real parameter visitor before cloning the two equivalent equation paths.
     struct Populate(usize);
     impl<'a> eredu_nn::ParameterVisitorMut<'a, NumericTensor> for Populate {
-        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             self.0 += 1;
             for (index, scalar) in value.data.iter_mut().enumerate() {
                 *scalar = 0.03 * ((index as f32 + self.0 as f32 * 3.0) * 0.31).sin();

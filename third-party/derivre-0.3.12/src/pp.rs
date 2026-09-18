@@ -27,6 +27,10 @@ mod source_copy;
 pub(crate) use source_copy::{PrinterCopyFailure, PrinterCopyPlan};
 
 impl PrettyPrinter {
+    pub(crate) fn retained_capacity_bytes(&self) -> usize {
+        self.alphabet_mapping.capacity()
+    }
+
     pub fn expr_to_string(&self, exprset: &ExprSet, id: ExprRef, max_len: usize) -> String {
         let mut s = String::new(); // format!("|{}| ", exprset.get_weight(id));
         self.write_expr(exprset, id, &mut s, max_len).unwrap();
@@ -49,12 +53,11 @@ impl PrettyPrinter {
         }
     }
 
-    pub fn new_simple(alphabet_size: usize) -> Self {
-        PrettyPrinter {
-            alphabet_mapping: (0..=(alphabet_size - 1) as u8).collect(),
-            alphabet_size,
-            has_mapping: false,
-        }
+    pub fn new_simple(alphabet_size: usize, funding: &crate::ParserAllocationFunding) -> Result<Self, crate::ParserStorageError> {
+        let mut alphabet_mapping = Vec::new();
+        funding.try_grow_vec(&mut alphabet_mapping, alphabet_size)?;
+        for value in 0..alphabet_size { alphabet_mapping.push(value as u8); }
+        Ok(PrettyPrinter { alphabet_mapping, alphabet_size, has_mapping: false })
     }
 
     pub fn new(alphabet_mapping: Vec<u8>, alphabet_size: usize) -> Self {

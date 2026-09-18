@@ -11,7 +11,7 @@ pub(crate) struct StoredCacheHostSource {
     generation: u64,
     custody: eredu_runtime::working_memory::OriginalHostSourceCustody,
     context: WorkspaceContext,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedCacheHostDemotion {
     pub(crate) fn stored_source(&self) -> Option<StoredCacheHostSource> {

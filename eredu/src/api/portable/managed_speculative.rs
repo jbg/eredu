@@ -1,7 +1,5 @@
 //! Source-explicit plain speculation through the existing ordinary/controlled drivers.
-use super::speculative_semantic::{
-    OriginalSpeculativeStops, PreparedPlainSpeculativeSemanticError,
-};
+use super::prepared_semantic::{PreparedChatSessionError, PreparedStops};
 use super::{LoadedModel, ManagedPlainTextRequest, ManagedPlainTextSource};
 use crate::{
     api::{PreparedChatSpeculativeConstraint, PreparedChatSpeculativeGenerationOptions},
@@ -14,7 +12,7 @@ use eredu_core::{
     SpeculativeGenerationOutput, SpeculativeGenerationVisitor, TokenInputRejection,
     generation::SemanticEvent,
 };
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
     speculative::{
         ControlledSpeculativeOptions, ControlledSpeculativeSession, DriveControlledSpeculation,
@@ -25,7 +23,10 @@ use std::mem::size_of;
 
 mod chat;
 mod preparation;
-pub use chat::{ManagedPreparedChatSpeculativeError, ManagedPreparedChatSpeculativeRequest};
+pub use chat::{
+    PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
+    PreparedChatSpeculativeError, PreparedChatSpeculativeRequest,
+};
 mod batch;
 pub use batch::{ManagedPlainTextSpeculativeBatchLane, ManagedPlainTextSpeculativeBatchRequest};
 
@@ -52,6 +53,8 @@ impl<D, F> std::fmt::Debug for ManagedPlainTextSpeculativeRequest<'_, D, F> {
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
+    #[error(transparent)]
+    Capture(#[from] eredu_core::capture::CaptureError),
     #[error("{0}")]
     Input(#[from] TokenInputRejection),
     #[error("{0}")]
@@ -59,7 +62,7 @@ enum Cause {
     #[error("{0}")]
     Host(#[from] HostMetadataFundingError),
     #[error("{0}")]
-    Preparation(#[from] PreparedPlainSpeculativeSemanticError),
+    Preparation(#[from] PreparedChatSessionError),
     #[error("{0}")]
     Source(#[from] OriginalTextSourceError),
     #[error("{0}")]
@@ -78,20 +81,22 @@ enum Cause {
 pub struct ManagedPlainTextSpeculativeError {
     #[source]
     cause: Cause,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl ManagedPlainTextSpeculativeError {
     /// Fixed source, policy or unsupported-profile rejection when applicable.
     pub fn input_rejection(&self) -> Option<TokenInputRejection> {
-        match self.cause {
-            Cause::Input(error) => Some(error),
+        match &self.cause {
+            Cause::Input(error) => Some(*error),
+            Cause::Preparation(error) => error.input_rejection(),
             _ => None,
         }
     }
     /// The selected backend failure with its original retained source chain.
     pub fn backend_failure(&self) -> Option<&BackendFailure> {
         match &self.cause {
-            Cause::Backend(error) => Some(error),
+            Cause::Backend(error) | Cause::Control(SpeculativeControlError::Backend(error)) => Some(error),
+            Cause::Preparation(error) => error.backend_failure(),
             _ => None,
         }
     }
@@ -102,11 +107,54 @@ fn sum(parts: &[usize]) -> Option<usize> {
         .copied()
         .try_fold(std::mem::size_of_val(parts), usize::checked_add)
 }
-fn reserve(funding: &WorkspaceMetadataFunding, bytes: Option<usize>) -> Result<(), Cause> {
+fn reserve(funding: &HostMetadataFunding, bytes: Option<usize>) -> Result<(), Cause> {
     funding.reserve_metadata(bytes.ok_or(HostMetadataFundingError::Overflow)?)?;
     Ok(())
 }
 impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> {
+    fn validate_controlled_speculative_options(
+        &self,
+        settings: crate::api::PreparedChatGenerationSettings,
+        options: &ControlledSpeculativeOptions,
+    ) -> Result<(), Cause> {
+        let validation = (|| {
+            let (_, maximum) = self.resolve_text_generation_settings(settings)?;
+            if let Some(plan) = options.activations.as_ref() {
+                B::validate_speculative_activations(&self.runtime, plan)?;
+                if plan.captures().invocation_bounds().is_none_or(|bounds| {
+                    bounds.batch != 1 || bounds.max_predictions < maximum.get() as u64
+                }) {
+                    return Err(SpeculativeControlError::Invalid(
+                        "activation admission does not cover this speculative request",
+                    )
+                    .into());
+                }
+            }
+            if let Some(plan) = options.capture.as_ref() {
+                let geometry = plan.request();
+                if geometry.prompt_tokens != 1 || geometry.batch != 1 {
+                    return Err(SpeculativeControlError::Invalid(
+                        "speculative prediction captures require one-row admission",
+                    )
+                    .into());
+                }
+                if geometry.max_predictions < maximum.get() as u64 {
+                    return Err(SpeculativeControlError::Invalid(
+                        "capture admission does not cover this speculative token limit",
+                    )
+                    .into());
+                }
+                B::validate_speculative_capture(&self.runtime, plan)?;
+            }
+            Ok(())
+        })();
+        self.runtime.finish_text_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Instrumentation,
+            validation,
+            Cause::Backend,
+        )
+    }
+
     /// Generates plain text from an original tokenizer/input source through the
     /// existing speculative scheduler. The request must name a managed capacity;
     /// missing selected native producers refuse without an ordinary fallback.
@@ -147,6 +195,11 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
                 funding: None,
             });
         }
+        self.validate_controlled_speculative_options(request.text.settings, &options)
+            .map_err(|cause| ManagedPlainTextSpeculativeError {
+                cause,
+                funding: None,
+            })?;
         // The original source lends IDs; no ordinary tokenizer vocabulary map is cloned.
         let vocabulary = source
             .original()
@@ -205,7 +258,7 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
         source: &ManagedPlainTextSource,
         request: ManagedPlainTextSpeculativeRequest<'a, B::Drafter, F>,
         driver: V,
-        retained: &mut Option<WorkspaceMetadataFunding>,
+        retained: &mut Option<HostMetadataFunding>,
     ) -> Result<SpeculativeGenerationOutput, Cause>
     where
         F: FnMut(SemanticEvent) + 'a,
@@ -226,7 +279,7 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
             PreparedChatSpeculativeConstraint,
         >,
         driver: V,
-        retained: &Option<WorkspaceMetadataFunding>,
+        retained: &Option<HostMetadataFunding>,
     ) -> Result<SpeculativeGenerationOutput, Cause> {
         let funding = retained
             .as_ref()
@@ -253,7 +306,7 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
         &self,
         source: &ManagedPlainTextSource,
         request: ManagedPlainTextSpeculativeRequest<'a, B::Drafter, F>,
-        retained: &mut Option<WorkspaceMetadataFunding>,
+        retained: &mut Option<HostMetadataFunding>,
     ) -> Result<
         eredu_core::SpeculativeGenerationBatchRequest<
             'a,
@@ -273,54 +326,23 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
             cancellation,
             on_event,
         } = request;
-        options.scheduler.validate()?;
-        let prepared = self.prepare_managed_speculative_host(
-            source,
-            text,
-            options.max_draft_tokens,
-            cancellation,
-            on_event,
-            retained,
-        )?;
-        let funding = prepared.funding().clone();
-        reserve(
-            &funding,
-            sum(&[
-                size_of::<ManagedPlainTextSpeculativeRequest<'a, B::Drafter, F>>(),
-                size_of::<
-                    eredu_core::SpeculativeGenerationBatchRequest<
-                        'a,
-                        B,
-                        B::Drafter,
-                        PreparedChatSpeculativeConstraint,
-                    >,
-                >(),
-                size_of::<
-                    Result<
-                        eredu_core::SpeculativeGenerationBatchRequest<
-                            'a,
-                            B,
-                            B::Drafter,
-                            PreparedChatSpeculativeConstraint,
-                        >,
-                        Cause,
-                    >,
-                >(),
-                size_of::<(
-                    &Self,
-                    &ManagedPlainTextSource,
-                    &mut Option<WorkspaceMetadataFunding>,
-                )>(),
-            ]),
-        )?;
-        let lane = prepared.finish(self)?;
-        let mut lanes = preparation::buffer(1, &funding)?;
-        lanes.try_push(lane)?;
-        let request = eredu_core::SpeculativeGenerationBatchRequest::new(
+        let request = self.prepare_speculative_batch(
             drafting,
-            lanes,
-            self.tokenizer_fingerprint,
-        );
-        Ok(request)
+            std::iter::once((text, cancellation, on_event)),
+            Ok(()),
+            options.scheduler,
+            retained,
+            |(text, cancellation, on_event), retained| {
+                self.prepare_managed_speculative_host(
+                    source,
+                    text,
+                    options.max_draft_tokens,
+                    cancellation,
+                    on_event,
+                    retained,
+                )
+            },
+        )?;
+        Ok(request.expect("single prepared lane"))
     }
 }

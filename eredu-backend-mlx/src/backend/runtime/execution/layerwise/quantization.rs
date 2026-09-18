@@ -29,15 +29,15 @@ where
     }
 
     impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
             if self.error.is_some() {
                 return;
             }
-            let name = metadata.id.as_str().to_owned();
+            let name = metadata.id().as_str().to_owned();
             self.parameters
                 .insert(name.clone(), value.as_array().dtype());
-            if let Some(role) = metadata.linear_companion {
-                let Some(weight) = metadata.linear_companion_of else {
+            if let Some(role) = metadata.linear_companion() {
+                let Some(weight) = metadata.linear_companion_of() else {
                     self.error = Some(Error::Quantization(format!(
                         "linear quantization companion {name:?} has no primary weight identity"
                     )));
@@ -65,7 +65,7 @@ where
         companions: BTreeMap::new(),
         error: None,
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     if let Some(error) = collector.error {
         return Err(error);
     }
@@ -151,15 +151,15 @@ where
         parameters: BTreeMap<String, Dtype>,
     }
     impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
             self.parameters
-                .insert(metadata.id.as_str().to_owned(), value.as_array().dtype());
+                .insert(metadata.id().as_str().to_owned(), value.as_array().dtype());
         }
     }
     let mut collector = Collector {
         parameters: BTreeMap::new(),
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     let mut selected = BTreeMap::new();
     for task in tasks {
         let Some(weight_dtype) = collector.parameters.get(task.name()) else {
@@ -284,7 +284,7 @@ where
         parameters: BTreeMap<String, (Vec<usize>, Dtype)>,
     }
     impl<'a> ParameterVisitor<'a, crate::MlxTensor> for SourceCollector {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
             let shape = value
                 .as_array()
                 .shape()
@@ -293,7 +293,7 @@ where
                 .collect::<Result<Vec<_>, _>>();
             if let Ok(shape) = shape {
                 self.parameters.insert(
-                    metadata.id.as_str().to_owned(),
+                    metadata.id().as_str().to_owned(),
                     (shape, value.as_array().dtype()),
                 );
             }
@@ -302,7 +302,7 @@ where
     let mut source_parameters = SourceCollector {
         parameters: BTreeMap::new(),
     };
-    source.visit_parameters(&mut source_parameters);
+    source.visit_parameters(&mut source_parameters)?;
     for name in selected.keys() {
         let task = requested.get(name.as_str()).copied().ok_or_else(|| {
             Error::Quantization(format!(

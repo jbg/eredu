@@ -3,7 +3,7 @@ use super::OriginalChatTemplate;
 use crate::working_memory::OriginalTokenizer;
 use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
 use eredu_core::{HostPreparationAuthority, TokenInputRejection};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Fixed refusal before a probe source or render is constructed.
@@ -14,7 +14,7 @@ pub enum OriginalChatProfileError {
     Domain(#[from] TokenInputRejection),
     /// The actual cumulative host account refused the next producer.
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
 }
 
 /// Actual original J/C sources and one cumulative preparation account. This
@@ -23,7 +23,8 @@ pub enum OriginalChatProfileError {
 pub struct OriginalChatProfilePreparation {
     template: OriginalChatTemplate,
     tokenizer: OriginalTokenizer,
-    funding: WorkspaceMetadataFunding,
+    execution: InferenceExecutionIdentity,
+    funding: HostMetadataFunding,
 }
 impl OriginalChatProfilePreparation {
     /// Start the existing host account for the backend's actual selected
@@ -50,17 +51,19 @@ impl OriginalChatProfilePreparation {
                 &InferenceExecutionIdentity,
                 u64,
             )>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
+            size_of::<InferenceExecutionIdentity>(),
         ];
         funding.reserve_metadata(
             parts
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(WorkspaceMetadataFundingError::Overflow)?,
+                .ok_or(HostMetadataFundingError::Overflow)?,
         )?;
         Ok(Self {
             template: template.clone(),
             tokenizer: tokenizer.clone(),
+            execution: execution.clone(),
             funding,
         })
     }
@@ -79,6 +82,25 @@ impl OriginalChatProfilePreparation {
             .and_then(|()| self.tokenizer.validate_pool(pool))
             .map_err(|_| TokenInputRejection::IdentityMismatch)
     }
+    pub(super) fn validate_semantic_preparation(
+        &self,
+        preparation: &crate::working_memory::PreparedSemanticSource,
+    ) -> Result<(), crate::working_memory::WorkingMemoryError> {
+        if !self.tokenizer.same_source(preparation.tokenizer()) {
+            return Err(crate::working_memory::WorkingMemoryError::IdentityMismatch);
+        }
+        preparation.validate(self.tokenizer.pool(), &self.execution)
+    }
+    /// Source-qualified account for facade declaration and grammar producers.
+    /// Retained products must keep this account through their own retirement.
+    /// It grants no native allocation or submission authority.
+    pub fn metadata_funding(&self) -> &HostMetadataFunding {
+        &self.funding
+    }
+    /// The exact tokenizer authenticated when this preparation was created.
+    pub fn tokenizer(&self) -> &OriginalTokenizer {
+        &self.tokenizer
+    }
     /// Reserve named source/control producers before birth. Every returned host
     /// owner retains this exact account through its actual payload retirement.
     /// The reservation supplies no tensor, submission or arbitrary-object grant.
@@ -92,13 +114,13 @@ impl OriginalChatProfilePreparation {
             size_of::<HostPreparationAuthority>(),
             size_of::<Result<HostPreparationAuthority, OriginalChatProfileError>>(),
             HostPreparationAuthority::retention_bytes::<Self>()
-                .ok_or(WorkspaceMetadataFundingError::Overflow)?,
+                .ok_or(HostMetadataFundingError::Overflow)?,
         ];
         self.funding.reserve_metadata(
             parts
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(WorkspaceMetadataFundingError::Overflow)?,
+                .ok_or(HostMetadataFundingError::Overflow)?,
         )?;
         Ok(HostPreparationAuthority::retain(self.clone()))
     }

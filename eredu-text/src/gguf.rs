@@ -42,7 +42,7 @@ pub struct GgufTokenizer {
 pub fn from_metadata(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<Option<GgufTokenizer>, Error> {
-    from_metadata_with_cache_policy(metadata, tokenizers::ModelCachePolicy::Legacy)
+    from_metadata_with_cache_policy(metadata, tokenizers::ModelCachePolicy::default())
 }
 
 /// Reconstructs with model-cache policy selected before every JSON/model builder.
@@ -641,7 +641,7 @@ mod tests {
         let tokenizer = build_gpt(
             &["x".into()],
             &metadata,
-            tokenizers::ModelCachePolicy::Legacy,
+            tokenizers::ModelCachePolicy::default(),
         )
         .unwrap();
         let input = "a\u{301}b x\u{200c}y\u{200d}z 1234567";
@@ -816,6 +816,25 @@ mod tests {
     }
 
     #[test]
+    fn reconstructed_gemma_uses_the_original_source_and_id_workers() {
+        for family in ["gemma2", "gemma4"] { for prefix in [false, true] {
+            let mut metadata = sentencepiece_metadata(family);
+            metadata.insert("tokenizer.ggml.add_space_prefix".into(), GgufMetadataValue::Bool(prefix));
+            let selected = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+            let bytes = selected.to_string(false).unwrap();
+            let original = crate::tokenizer_storage::TokenizerPlan::prepare_json(bytes.as_bytes()).unwrap().compile().unwrap();
+            let selected_config = crate::tokenizer::Tokenizer::from_bytes(bytes.as_bytes()).unwrap();
+            assert!(original.matches_configuration(&selected_config));
+            assert!(original.input_prefix_removal_is_identity() == !prefix);
+            for text in ["hi", " hi", "hi hi", "hi\nhi", "hi\t hi", "<unk>hi", ""] {
+                let expected = selected.encode(text, false).unwrap();
+                let ids = crate::tokenizer_storage::EncodeIdsPlan::prepare(&original, text, false).unwrap().encode().unwrap();
+                assert_eq!(ids.ids(), expected.get_ids(), "{family} {prefix} {text:?}");
+            }
+        }}
+    }
+
+    #[test]
     fn builds_gemma_assistant_unigram_tokenizers() {
         for architecture in ["gemma4_assistant", "gemma4-assistant"] {
             let metadata = sentencepiece_metadata(architecture);
@@ -885,15 +904,15 @@ mod tests {
     }
     #[test]
     fn model_cache_policy_reaches_gguf_bpe_unigram_and_embedded_json() {
-        use tokenizers::ModelCachePolicy::{Legacy, NoModelCaches};
+        use tokenizers::ModelCachePolicy;
         for family in ["llama", "gemma2", "gemma4"] {
             let metadata = sentencepiece_metadata(family);
             let legacy = from_metadata(&metadata).unwrap().unwrap();
-            let absent = from_metadata_with_cache_policy(&metadata, NoModelCaches)
+            let absent = from_metadata_with_cache_policy(&metadata, ModelCachePolicy::disabled())
                 .unwrap()
                 .unwrap();
-            assert_eq!(legacy.tokenizer.model_cache_policy(), Legacy);
-            assert_eq!(absent.tokenizer.model_cache_policy(), NoModelCaches);
+            assert_eq!(legacy.tokenizer.model_cache_policy(), ModelCachePolicy::default());
+            assert_eq!(absent.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
             for input in ["hi", "hi hi", "hi\nhi"] {
                 let a = legacy.tokenizer.encode(input, true).unwrap();
                 let b = absent.tokenizer.encode(input, true).unwrap();
@@ -911,10 +930,10 @@ mod tests {
                 "tokenizer.huggingface.json".into(),
                 GgufMetadataValue::String(legacy.tokenizer.to_string(false).unwrap()),
             );
-            let restored = from_metadata_with_cache_policy(&embedded, NoModelCaches)
+            let restored = from_metadata_with_cache_policy(&embedded, ModelCachePolicy::disabled())
                 .unwrap()
                 .unwrap();
-            assert_eq!(restored.tokenizer.model_cache_policy(), NoModelCaches);
+            assert_eq!(restored.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
             assert_eq!(
                 restored.tokenizer.encode("hi", false).unwrap().get_ids(),
                 absent.tokenizer.encode("hi", false).unwrap().get_ids()
@@ -944,13 +963,13 @@ mod tests {
         ]);
         let legacy = from_metadata(&metadata).unwrap().unwrap().tokenizer;
         let absent =
-            from_metadata_with_cache_policy(&metadata, tokenizers::ModelCachePolicy::NoModelCaches)
+            from_metadata_with_cache_policy(&metadata, tokenizers::ModelCachePolicy::disabled())
                 .unwrap()
                 .unwrap()
                 .tokenizer;
         assert_eq!(
             absent.model_cache_policy(),
-            tokenizers::ModelCachePolicy::NoModelCaches
+            tokenizers::ModelCachePolicy::disabled()
         );
         assert_eq!(absent.encode("abab", false).unwrap().get_ids(), &[2, 2]);
         assert_eq!(

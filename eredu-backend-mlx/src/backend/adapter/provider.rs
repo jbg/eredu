@@ -89,6 +89,13 @@ impl<'a> MlxBackend<'a> {
             memory_pool: crate::backend::managed_memory::domain(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn retiring_stream_wrapper_control_bytes(&self) -> u64 {
+        match &self.streams {
+            BackendStreams::Prepared(streams) => streams.retiring_wrapper_control_bytes(),
+            BackendStreams::Ordinary { .. } => 0,
+        }
+    }
     pub(crate) fn stream(&self) -> &Stream {
         match &self.streams {
             BackendStreams::Ordinary { stream, .. } => stream,

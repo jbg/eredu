@@ -89,7 +89,7 @@ pub(super) fn run<C: Context>(
 ) -> Result<(), C::Error> {
     // This is only an immutable alias of the actual chart's retained declaration.
     // Keeping it separate permits destination mutation without cloning symbols.
-    let grammar = Arc::clone(&context.scratch().grammar);
+    let grammar = context.scratch().grammar.clone();
     let mut pointer = context.scratch().row_start;
     let scanned_end = if pointer == 0 {
         0

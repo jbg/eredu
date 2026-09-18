@@ -292,6 +292,12 @@ pub struct DenseTransferWindow {
 }
 
 impl DenseTransferWindow {
+    /// Whether every transfer has been handed to its consumer. The caller
+    /// still has to complete that consumer before retiring the group.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.schedule.is_exhausted()
+    }
+
     fn background(&self) -> Option<&BackgroundLayerPrefetch> {
         self.background.as_ref().or(self.controller.background.as_ref())
     }
@@ -340,6 +346,10 @@ impl DenseTransferWindow {
             .protect_group_window(&host_window, &host_units, MemoryTier::Host)?;
         self.manager
             .protect_group_window(&device_window, &device_units, MemoryTier::Device)?;
+        // A roomy byte budget does not widen the selected device-unit window.
+        // The caller has settled its previous consumer; replace protection
+        // before trimming so the old window cannot pin an obsolete unit.
+        self.manager.trim_device_units(&self.units, &device_units)?;
         if let Some(background) = self.background() {
             for id in &host_units {
                 background.submit(id)?;

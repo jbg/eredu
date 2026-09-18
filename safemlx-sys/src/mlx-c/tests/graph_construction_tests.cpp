@@ -1,5 +1,7 @@
 #include "prepared_metal_fixture.h"
 #include "mlx/backend/cpu/sampling_storage.h"
+#include "mlx/backend/cpu/alias_storage.h"
+#include "mlx/c/original_buffer.h"
 #include <numeric>
 // Included after the prepared Eval fixtures. Only changed host construction and
 // its transition into the existing real Eval/worker path are exercised here.
@@ -40,7 +42,7 @@ struct GraphHoles {
     for (const auto& b : blocks) if (b.pointer) quota->deallocate(b.pointer, b.bytes, b.alignment);
   }
 };
-void numerical(Device device) {
+void numerical(Device device, bool expect_cpu_source_refusal = false) {
   const auto stream = new_stream(device);
   prepare(stream, stream);
   // Rank 11/12 exercises real exact copies and grow-to-20 buffers; the cold
@@ -53,7 +55,26 @@ void numerical(Device device) {
   array left(a_values.begin(), a_shape, float16);
   array right(b_values.begin(), b_shape, float32);
   array scale(c_values.begin(), c_shape, float32);
+  unsigned physical_retired = 0;
+  struct Budget {
+    mlx_original_buffer_budget value{};
+    ~Budget() { mlx_original_buffer_budget_release(value); }
+  } budget;
+  if (expect_cpu_source_refusal) {
+    mlx_prepared_input_runtime runtime{};
+    REQUIRE(mlx_prepared_input_runtime_prepare(&runtime) == 0);
+    mlx_original_buffer_population_layout physical{};
+    // The actual cast and two binary outputs need at most three positive
+    // births. A missing physical source must not mask the CPU Eval refusal.
+    const size_t bytes = (a_values.size() + 2 * c_values.size()) * sizeof(float);
+    REQUIRE(mlx_original_buffer_metal_population_layout_for(&physical, runtime, bytes, 3) == 0);
+    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime,
+        physical.capacity, &physical_retired,
+        [](void* owner) { ++*static_cast<unsigned*>(owner); }) == 0);
+  }
   Role role;
+  if (expect_cpu_source_refusal)
+    REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);
   Observer observer;
   Bank bank;
   REQUIRE(mlx_operation_event_prepare_pointwise_graph(&bank.value, observer.value, 2, 21) == 0);
@@ -72,6 +93,37 @@ void numerical(Device device) {
   Operation operation;
   operation.append(value);
   const mlx_operation_eval_traversal_limits limits{1, 14, 11, 13, 11, 1, 8};
+  if (expect_cpu_source_refusal) {
+    // Inspect the actual first cast and following Broadcast. The rank-21 cold
+    // constructor envelope does not qualify every CPU Eval in this graph.
+    const auto& addition = value.inputs()[0];
+    const auto& broadcast = addition.inputs()[0];
+    const auto& cast = broadcast.inputs()[0];
+    REQUIRE(typeid(cast.primitive()) == typeid(AsType));
+    REQUIRE(typeid(broadcast.primitive()) == typeid(Broadcast));
+    cpu::CopyEvalStorage source;
+    REQUIRE(cpu::copy_eval_storage(cast, source));
+    CHECK_FALSE(cpu::alias_eval_layout(cpu::AliasOperation::Broadcast,
+        cast.ndim(), broadcast.ndim(), false, source));
+    CHECK_FALSE(cpu::alias_eval_storage(broadcast, source));
+    REQUIRE(eval_traversal_tests::submit(operation, stream, limits) ==
+        static_cast<unsigned>(ScopedEvaluation::failed));
+    // Submission failure alone does not prove that the earlier cast's queued
+    // task has released its borrowed source. Observe and retire its Record.
+    settle(role);
+    CHECK(role.scope->query_records().pending == 0);
+    CHECK(role.records->occupied_bytes() == 0);
+    REQUIRE(role.error.get()->borrow());
+    const auto* failure = role.error.get()->borrow();
+    REQUIRE(failure->exception_type == &typeid(submission::GraphQuotaError));
+    try {
+      std::rethrow_exception(failure->exception);
+      FAIL("CPU source refusal must preserve its original typed cause");
+    } catch (const submission::GraphQuotaError& error) {
+      CHECK(error.cause() == submission::GraphFailure::invalid_layout);
+    }
+    return;
+  }
   REQUIRE(eval_traversal_tests::submit(operation, stream, limits) == 0);
   eval_traversal_tests::complete(role, operation, value);
   const float expected[] = {6.f, 10.f, 10.f, 14.f, 14.f, 18.f};
@@ -186,9 +238,9 @@ TEST_CASE("pointwise Graph bank refuses nested foreign and spent requests withou
   CHECK(role.graph->occupied_bytes() == baseline);
 }
 
-TEST_CASE("pointwise Graph high rank cast broadcast owns prefix through CPU completion"
+TEST_CASE("pointwise Graph high rank constructor does not authorize unsupported CPU Broadcast"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
-  pointwise_graph_tests::numerical(Device::cpu);
+  pointwise_graph_tests::numerical(Device::cpu, true);
 }
 #ifdef MLX_C_PATCH_TEST_METAL
 TEST_CASE("pointwise Graph high rank cast broadcast owns prefix through Metal completion"
@@ -1121,15 +1173,15 @@ TEST_CASE("CPU Slice source preserves fixed range geometry and refuses unqualifi
   const int values[]={7,-11,23,13,17,-19};array source(values,Shape{2,3},int32);
   auto value=slice(source,Shape{0,1},Shape{2,3},Shape{1,1},stream);
   cpu::CopyEvalStorage cold,actual;
-  REQUIRE(cpu::slice_eval_layout(2,false,cold));
+  REQUIRE(cpu::slice_eval_layout(2,false,false,cold));
   REQUIRE(cpu::slice_eval_storage(value,actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);
   CHECK(actual.backing_births==0);CHECK(actual.worker_graph_extents==0);
   CHECK(actual.request_counts[3]==0);CHECK(actual.request_counts[6]==0);
   std::array<unsigned char,sizeof(actual)> saved;
   std::memcpy(saved.data(),&actual,sizeof(actual));
-  CHECK_FALSE(cpu::slice_eval_layout(0,false,actual));
-  CHECK_FALSE(cpu::slice_eval_layout(5,false,actual));
+  CHECK_FALSE(cpu::slice_eval_layout(0,false,false,actual));
+  CHECK_FALSE(cpu::slice_eval_layout(5,false,false,actual));
   auto strided=slice(source,Shape{0,0},Shape{2,3},Shape{1,2},stream);
   CHECK(cpu::slice_eval_storage(strided,actual));
   auto wrong_step=array(Shape{2,3},int32,std::make_shared<Slice>(stream,Shape{0,0},Shape{2,3},Shape{1,2}),{source});
@@ -1138,17 +1190,17 @@ TEST_CASE("CPU Slice source preserves fixed range geometry and refuses unqualifi
   CHECK_FALSE(cpu::slice_eval_storage(zero_step,actual));
   auto wrong=array(Shape{2,1},int32,std::make_shared<Slice>(stream,Shape{0,1},Shape{2,3},Shape{1,1}),{source});
   CHECK_FALSE(cpu::slice_eval_storage(wrong,actual));
-  auto empty=array(Shape{2,0},int32,std::make_shared<Slice>(stream,Shape{0,1},Shape{2,1},Shape{1,1}),{source});
-  CHECK_FALSE(cpu::slice_eval_storage(empty,actual));
+  auto wrong_empty=array(Shape{2,0},int32,std::make_shared<Slice>(stream,Shape{0,1},Shape{2,2},Shape{1,1}),{source});
+  CHECK_FALSE(cpu::slice_eval_storage(wrong_empty,actual));
   struct Derived final : Slice { using Slice::Slice; };
   auto subclass=array(Shape{2,2},int32,std::make_shared<Derived>(stream,Shape{0,1},Shape{2,3},Shape{1,1}),{source});
   CHECK_FALSE(cpu::slice_eval_storage(subclass,actual));
   CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
   mlx_cpu_copy_eval_layout raw{};
-  REQUIRE(mlx_operation_event_cpu_slice_eval_layout(&raw,2,false));
+  REQUIRE(mlx_operation_event_cpu_slice_eval_layout(&raw,2,false,false));
   CHECK(raw.graph_extents==cold.allocation_extents);CHECK(raw.backing_births==0);
   CHECK(raw.signal_graph_extents==0);auto prior=raw;
-  CHECK_FALSE(mlx_operation_event_cpu_slice_eval_layout(&raw,SIZE_MAX,false));
+  CHECK_FALSE(mlx_operation_event_cpu_slice_eval_layout(&raw,SIZE_MAX,false,false));
   CHECK(std::memcmp(&raw,&prior,sizeof(raw))==0);
 }
 TEST_CASE("CPU Slice aliases exact original backing through escaped view retirement"
@@ -1264,6 +1316,7 @@ TEST_CASE("CPU greedy source preserves reduction and squeeze geometry and reject
   REQUIRE(cpu::arg_reduce_eval_layout(3,5,1,false,cold));REQUIRE(cpu::greedy_eval_storage(reduction,actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);CHECK(actual.backing_births==1);
   CHECK(actual.request_counts[4]==2);CHECK(actual.request_counts[6]==1);
+  eval(reduction); // The alias source authenticates an actual completed backing.
   REQUIRE(cpu::squeeze_eval_layout(3,false,alias));REQUIRE(cpu::greedy_eval_storage(value,actual));
   CHECK(actual.allocation_extents==alias.allocation_extents);CHECK(actual.backing_births==0);
   CHECK(actual.worker_graph_extents==0);CHECK(actual.request_counts[3]==0);CHECK(actual.request_counts[6]==0);
@@ -1273,7 +1326,7 @@ TEST_CASE("CPU greedy source preserves reduction and squeeze geometry and reject
   CHECK_FALSE(cpu::arg_reduce_eval_layout(3,5,size_t(UINT32_MAX)+1,false,actual));
   CHECK_FALSE(cpu::arg_reduce_eval_layout(5,5,1,false,actual));
   CHECK_FALSE(cpu::arg_reduce_eval_layout(3,size_t(INT_MAX),size_t(UINT32_MAX),false,actual));
-  CHECK_FALSE(cpu::squeeze_eval_layout(0,false,actual));CHECK_FALSE(cpu::squeeze_eval_layout(5,false,actual));
+  CHECK_FALSE(cpu::squeeze_eval_layout(0,false,actual));CHECK_FALSE(cpu::squeeze_eval_layout(6,false,actual));
   auto wrong=array(Shape{1,1,2},uint32,std::make_shared<ArgReduce>(stream,ArgReduce::ArgMax,2),{source});
   auto axis=array(Shape{1,1,1},uint32,std::make_shared<ArgReduce>(stream,ArgReduce::ArgMax,3),{source});
   auto dtype=array(Shape{1,1,1},int32,std::make_shared<ArgReduce>(stream,ArgReduce::ArgMax,2),{source});
@@ -1846,6 +1899,10 @@ TEST_CASE("CPU Gather source validates exact one-index geometry counts and failu
   CHECK(actual.worker_graph_extents>0);CHECK(actual.backing_births==1);
   CHECK(actual.request_counts[3]==4);CHECK(actual.request_counts[4]==3);
   CHECK(actual.request_counts[5]==3);CHECK(actual.request_counts[9]==1);
+  cpu::CopyEvalStorage empty;
+  REQUIRE(cpu::gather_eval_layout(float32,int32,2,2,12,0,3,false,empty));
+  CHECK(empty.backing_births==0);CHECK(empty.request_counts[3]==4);
+  CHECK(empty.request_counts[6]==1);CHECK(empty.request_counts[7]==0);CHECK(empty.request_counts[9]==1);
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
   CHECK_FALSE(cpu::gather_eval_layout(float64,int32,2,2,12,4,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,uint64,2,2,12,4,3,false,actual));
@@ -1853,7 +1910,6 @@ TEST_CASE("CPU Gather source validates exact one-index geometry counts and failu
   CHECK_FALSE(cpu::gather_eval_layout(float32,int32,0,2,12,4,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,int32,2,0,12,4,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,int32,2,2,12,4,0,false,actual));
-  CHECK_FALSE(cpu::gather_eval_layout(float32,int32,2,2,12,0,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,int32,2,2,SIZE_MAX,4,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,int32,2,2,12,size_t(INT_MAX),3,false,actual));
   auto shape_mismatch=array(Shape{2,2,1,2},float32,std::make_shared<Gather>(stream,std::vector<int>{0},Shape{1,3}),{source,index});
@@ -1944,12 +2000,12 @@ TEST_CASE("CPU reduction source authenticates boolean whole-axis and F32 row geo
   CHECK_FALSE(cpu::reduction_eval_layout(cpu::ReductionEvalKind::Float32Rows,2,SIZE_MAX,2,false,actual));
   CHECK_FALSE(cpu::reduction_eval_layout(cpu::ReductionEvalKind::Float32Rows,2,size_t(INT_MAX),2,false,actual));
   CHECK_FALSE(cpu::reduction_eval_layout(static_cast<cpu::ReductionEvalKind>(99),2,6,1,false,actual));
-  auto partial=any(mask,0,true,stream);auto other_sum=sum(input,0,true,stream);
+  auto partial=any(mask,0,true,stream);
   auto wrong_shape=array(Shape{2,2},float32,std::make_shared<Reduce>(stream,Reduce::Sum,std::vector<int>{1}),{input});
   auto wrong_axes=array(Shape{1,1},bool_,std::make_shared<Reduce>(stream,Reduce::Or,std::vector<int>{0,0}),{mask});
   struct Derived final:Reduce{using Reduce::Reduce;};
   auto subclass=array(Shape{2,1},float32,std::make_shared<Derived>(stream,Reduce::Sum,std::vector<int>{1}),{input});
-  for(const auto* invalid:{&partial,&other_sum,&wrong_shape,&wrong_axes,&subclass})
+  for(const auto* invalid:{&partial,&wrong_shape,&wrong_axes,&subclass})
     CHECK_FALSE(cpu::reduction_eval_storage(*invalid,actual));
   auto strided=slice(mask,Shape{0,0},Shape{2,3},Shape{1,2},stream);eval(strided);
   auto sparse=any(strided,true,stream);CHECK_FALSE(cpu::reduction_eval_storage(sparse,actual));
@@ -2295,17 +2351,28 @@ TEST_CASE("CPU concatenation source counts actual slices weak copies and queued 
   CHECK(actual.allocation_extents==cold.allocation_extents);CHECK(actual.named_control_bytes==cold.named_control_bytes);
   CHECK(actual.backing_births==1);CHECK(actual.request_counts[3]==5);
   CHECK(actual.request_counts[4]==6);CHECK(actual.request_counts[5]==6);CHECK(actual.request_counts[6]==2);
+  cpu::CopyEvalStorage supported;
+  REQUIRE(cpu::concatenate_eval_layout(float16,2,6,4,false,supported));
+  CHECK(supported.backing_births==1);CHECK(supported.request_counts[6]==2);
+  REQUIRE(cpu::concatenate_eval_layout(float32,2,0,4,false,supported));
+  CHECK(supported.backing_births==1);CHECK(supported.request_counts[3]==5);
+  CHECK(supported.request_counts[6]==2);
+  auto arity=concatenate({a,a,a},1,stream);
+  REQUIRE(cpu::concatenate_many_eval_layout(float32,2,3,18,false,cold));
+  REQUIRE(cpu::concatenate_eval_storage(arity,supported));
+  CHECK(supported.allocation_extents==cold.allocation_extents);
+  CHECK(supported.named_control_bytes==cold.named_control_bytes);
+  CHECK(supported.backing_births==1);CHECK(supported.request_counts[3]==7);
+  CHECK(supported.request_counts[6]==3);
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
-  CHECK_FALSE(cpu::concatenate_eval_layout(float16,2,6,4,false,actual));
+  CHECK_FALSE(cpu::concatenate_eval_layout(float64,2,6,4,false,actual));
   CHECK_FALSE(cpu::concatenate_eval_layout(float32,0,6,4,false,actual));
   CHECK_FALSE(cpu::concatenate_eval_layout(float32,5,6,4,false,actual));
-  CHECK_FALSE(cpu::concatenate_eval_layout(float32,2,0,4,false,actual));
   CHECK_FALSE(cpu::concatenate_eval_layout(float32,2,size_t(INT_MAX),1,false,actual));
   auto wrong=array(Shape{2,4},float32,std::make_shared<Concatenate>(stream,1),{a,b});
   auto axis=array(Shape{2,5},float32,std::make_shared<Concatenate>(stream,2),{a,b});
-  auto arity=concatenate({a,a,a},1,stream);
   CHECK_FALSE(cpu::concatenate_eval_storage(wrong,actual));CHECK_FALSE(cpu::concatenate_eval_storage(axis,actual));
-  CHECK_FALSE(cpu::concatenate_eval_storage(arity,actual));CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
+  CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
 }
 TEST_CASE("CPU Gemma entrance concatenation preserves row order and escaped backing"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
@@ -2363,7 +2430,12 @@ TEST_CASE("CPU rotary range source matches finite primitive geometry and immutab
     CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
   }
   size_t controls=0;REQUIRE(fast::cpu_rope_fallback_control_bytes(4,8,32,controls));
-  const auto saved=controls;CHECK_FALSE(fast::cpu_rope_fallback_control_bytes(4,7,32,controls));CHECK(controls==saved);
+  const auto saved=controls;
+  REQUIRE(fast::cpu_rope_fallback_control_bytes(3,8,32,controls));CHECK(controls==saved);
+  CHECK_FALSE(fast::cpu_rope_fallback_control_bytes(4,7,32,controls));CHECK(controls==saved);
+  CHECK_FALSE(fast::cpu_rope_fallback_control_bytes(2,8,32,controls));CHECK(controls==saved);
+  CHECK_FALSE(fast::cpu_rope_fallback_control_bytes(5,8,32,controls));CHECK(controls==saved);
+  CHECK_FALSE(fast::cpu_rope_fallback_control_bytes(3,8,0,controls));CHECK(controls==saved);
 }
 TEST_CASE("CPU Gemma rotary fallback preserves nonzero offsets ranges and escaped backing"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
@@ -2392,6 +2464,45 @@ TEST_CASE("CPU Gemma rotary fallback preserves nonzero offsets ranges and escape
   CHECK(mlx_original_buffer_budget_occupied(budget.value)>0);
   mlx_original_buffer_budget_release(budget.value);budget.value={};CHECK(retired==0);
   escaped.reset();CHECK(retired==1);
+}
+
+TEST_CASE("CPU supplied rotary frequencies preserve rank three values and independent source custody"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  std::vector<float> data(24);for(size_t i=0;i<data.size();++i)data[i]=(int(i%17)-8)*0.125f;
+  const float denominators[]={1.0f,3.0f,11.0f,31.0f};
+  array input(data.data(),Shape{1,3,8},float32),freqs(denominators,Shape{4},float32);
+  const auto frequency_backing=freqs.data_shared_ptr();
+  auto ordinary=fast::rope(input,8,false,{},1.0f,5,freqs,stream);eval(ordinary);
+  mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
+  struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
+  unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
+      [](void*p){++*static_cast<unsigned*>(p);})==0);
+  std::optional<array> escaped;
+  {
+    Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
+    Observer observer;Bank bank;REQUIRE(mlx_operation_event_prepare_resident_graph(&bank.value,observer.value,80,3,4)==0);
+    auto value=fast::rope(input,8,false,{},1.0f,5,freqs,stream);
+    bank.reset();Operation operation;operation.append(value);
+    const mlx_operation_eval_traversal_limits limits{1,100,81,160,81,1,400};
+    REQUIRE(eval_traversal_tests::submit(operation,stream,limits)==0);eval_traversal_tests::complete(role,operation,value);
+    CHECK(value.shape()==input.shape());CHECK(value.dtype()==float32);
+    for(size_t row=0;row<3;++row)for(size_t col=0;col<4;++col) {
+      const float angle=float(row+5)/denominators[col];
+      const float left=data[row*8+col],right=data[row*8+col+4];
+      CHECK(value.data<float>()[row*8+col]==doctest::Approx(left*std::cos(angle)-right*std::sin(angle)).epsilon(2e-6));
+      CHECK(value.data<float>()[row*8+col+4]==doctest::Approx(right*std::cos(angle)+left*std::sin(angle)).epsilon(2e-6));
+    }
+    for(size_t i=0;i<data.size();++i)CHECK(value.data<float>()[i]==ordinary.data<float>()[i]);
+    CHECK(freqs.data_shared_ptr()==frequency_backing);
+    mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&value},budget.value)==0);CHECK(info.known);
+    escaped.emplace(value);
+  }
+  CHECK(mlx_original_buffer_budget_occupied(budget.value)>0);
+  mlx_original_buffer_budget_release(budget.value);budget.value={};CHECK(retired==0);
+  escaped.reset();CHECK(retired==1);
+  CHECK(freqs.data_shared_ptr()==frequency_backing);
 }
 
 TEST_CASE("CPU Gemma grouped attention uses rank five source and unchanged selected equations"
@@ -2862,7 +2973,7 @@ TEST_CASE("CPU I32 coordinate source checks exact endpoints and final increment"
   for(int offset:{0,16777217,INT_MAX-7}) {
     auto value=arange(double(offset),double(offset)+7.0,1.0,int32,stream);
     cpu::CopyEvalStorage cold,actual;
-    REQUIRE(cpu::arange_int_eval_layout(7,false,cold));REQUIRE(cpu::arange_int_eval_storage(value,actual));
+    REQUIRE(cpu::arange_int_eval_layout(int32,7,false,cold));REQUIRE(cpu::arange_int_eval_storage(value,actual));
     CHECK(actual.allocation_extents==cold.allocation_extents);CHECK(actual.named_control_bytes==cold.named_control_bytes);
     CHECK(actual.inputs==0);CHECK(actual.backing_births==1);CHECK(actual.worker_graph_extents==0);
     std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
@@ -2875,8 +2986,8 @@ TEST_CASE("CPU I32 coordinate source checks exact endpoints and final increment"
     }
     auto wrong=array(Shape{8},int32,std::make_shared<Arange>(stream,double(offset),double(offset)+7.0,1.0),{});
     CHECK_FALSE(cpu::arange_int_eval_storage(wrong,actual));
-    CHECK_FALSE(cpu::arange_int_eval_layout(0,false,actual));
-    CHECK_FALSE(cpu::arange_int_eval_layout(size_t(INT_MAX)+1,false,actual));
+    CHECK_FALSE(cpu::arange_int_eval_layout(int32,0,false,actual));
+    CHECK_FALSE(cpu::arange_int_eval_layout(int32,size_t(INT_MAX)+1,false,actual));
     CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
   }
 }
@@ -3403,7 +3514,7 @@ TEST_CASE("CPU preview reuses exact rank-one Slice and retains original flattene
   array flat_source(data,Shape{16},float32);
   auto prefix=slice(flat_source,Shape{2},Shape{5},Shape{1},stream);
   cpu::CopyEvalStorage cold,actual;
-  REQUIRE(cpu::slice_eval_layout(1,false,cold));
+  REQUIRE(cpu::slice_eval_layout(1,false,false,cold));
   REQUIRE(cpu::slice_eval_storage(prefix,actual));
   CHECK(actual.rank==1);CHECK(actual.backing_births==0);
   CHECK(actual.worker_graph_extents==0);CHECK(actual.allocation_extents==cold.allocation_extents);
@@ -3615,11 +3726,11 @@ TEST_CASE("CPU candidate ArgSort source authenticates F32 rows and one U32 outpu
   const float values[]={-2.0f,99,3.0f,99,3.0f,99,1.0f,99};
   array base(values,Shape{8},float32);auto input=slice(base,Shape{0},Shape{8},Shape{2},stream);eval(input);
   auto output=argsort(input,stream);cpu::CopyEvalStorage cold,actual;
-  REQUIRE(cpu::argsort_eval_layout(4,false,cold));REQUIRE(cpu::argsort_eval_storage(output,actual));
+  REQUIRE(cpu::argsort_eval_layout(float32,1,4,1,false,cold));REQUIRE(cpu::argsort_eval_storage(output,actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);CHECK(actual.backing_births==1);
   CHECK(actual.request_counts[4]==2);CHECK(actual.request_counts[6]==1);CHECK(actual.worker_graph_extents==0);
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
-  CHECK_FALSE(cpu::argsort_eval_layout(0,false,actual));CHECK_FALSE(cpu::argsort_eval_layout(size_t(INT_MAX)+1,false,actual));
+  CHECK_FALSE(cpu::argsort_eval_layout(float32,1,0,1,false,actual));CHECK_FALSE(cpu::argsort_eval_layout(float32,1,size_t(INT_MAX)+1,1,false,actual));
   auto wrong_axis=array(Shape{4},uint32,std::make_shared<ArgSort>(stream,1),{input});
   auto wrong_dtype=array(Shape{4},int32,std::make_shared<ArgSort>(stream,0),{input});
   auto wrong_shape=array(Shape{3},uint32,std::make_shared<ArgSort>(stream,0),{input});
@@ -3628,9 +3739,9 @@ TEST_CASE("CPU candidate ArgSort source authenticates F32 rows and one U32 outpu
   CHECK_FALSE(cpu::argsort_eval_storage(wrong_axis,actual));CHECK_FALSE(cpu::argsort_eval_storage(wrong_dtype,actual));
   CHECK_FALSE(cpu::argsort_eval_storage(wrong_shape,actual));CHECK_FALSE(cpu::argsort_eval_storage(derived,actual));
   CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
-  mlx_cpu_copy_eval_layout raw{};REQUIRE(mlx_operation_event_cpu_argsort_eval_layout(&raw,4,false));
+  mlx_cpu_copy_eval_layout raw{};REQUIRE(mlx_operation_event_cpu_argsort_eval_layout(&raw,MLX_FLOAT32,1,4,1,false));
   CHECK(raw.graph_extents==cold.allocation_extents);CHECK(raw.backing_births==1);
-  auto prior=raw;CHECK_FALSE(mlx_operation_event_cpu_argsort_eval_layout(&raw,0,false));
+  auto prior=raw;CHECK_FALSE(mlx_operation_event_cpu_argsort_eval_layout(&raw,MLX_FLOAT32,1,0,1,false));
   CHECK(std::memcmp(&prior,&raw,sizeof(raw))==0);
 }
 TEST_CASE("CPU candidate ArgSort preserves stable ties NaNs and escaped original ordering"
@@ -4647,7 +4758,7 @@ TEST_CASE("CPU sampler leaf sources authenticate complete single rows and exact 
   auto sorted=argsort(input,-1,stream),partitioned=partition(input,3,-1,stream);
   auto scanned=cumsum(input,-1,false,true,stream),maximum=max(input,-1,true,stream);
   cpu::CopyEvalStorage cold,actual;
-  REQUIRE(cpu::argsort_row_eval_layout(3,7,false,cold));
+  REQUIRE(cpu::argsort_eval_layout(float32,3,7,1,false,cold));
   REQUIRE(cpu::argsort_eval_storage(sorted,actual));CHECK(actual.allocation_extents==cold.allocation_extents);
   REQUIRE(cpu::argsort_eval_storage(argsort(input,2,stream),actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);
@@ -4669,7 +4780,7 @@ TEST_CASE("CPU sampler leaf sources authenticate complete single rows and exact 
   CHECK_FALSE(cpu::partition_row_eval_storage(partition(input,0,0,stream),actual));
   CHECK(std::memcmp(&before,&actual,sizeof(actual))==0);
   mlx_cpu_copy_eval_layout raw{};
-  REQUIRE(mlx_operation_event_cpu_argsort_row_eval_layout(&raw,3,7,false));
+  REQUIRE(mlx_operation_event_cpu_argsort_eval_layout(&raw,MLX_FLOAT32,3,7,1,false));
   REQUIRE(mlx_operation_event_cpu_partition_row_eval_layout(&raw,3,7,false));CHECK(raw.backing_births==1);
   REQUIRE(mlx_operation_event_cpu_scan_sum_row_eval_layout(&raw,3,7,false));CHECK(raw.backing_births==1);
   REQUIRE(mlx_operation_event_cpu_maximum_row_eval_layout(&raw,3,7,false));CHECK(raw.backing_births==1);
@@ -4738,7 +4849,11 @@ TEST_CASE("CPU sampling GatherAxis retains exact ordering indices and escaped sc
     REQUIRE(cpu::gather_axis_row_eval_layout(3,width,false,cold));
     REQUIRE(cpu::gather_axis_row_eval_storage(ordinary,actual));
     CHECK(actual.allocation_extents==cold.allocation_extents);CHECK(actual.backing_births==1);
-    auto before=actual;CHECK_FALSE(cpu::gather_axis_row_eval_storage(take_along_axis(input,indices,0,stream),actual));
+    auto signed_indices=astype(indices,int32,stream);eval(signed_indices);
+    REQUIRE(cpu::gather_axis_row_eval_storage(take_along_axis(input,signed_indices,-1,stream),actual));
+    CHECK(actual.allocation_extents==cold.allocation_extents);
+    auto wide_indices=astype(indices,int64,stream);eval(wide_indices);
+    auto before=actual;CHECK_FALSE(cpu::gather_axis_row_eval_storage(take_along_axis(input,wide_indices,-1,stream),actual));
     CHECK(std::memcmp(&before,&actual,sizeof(actual))==0);
     mlx_cpu_copy_eval_layout raw{};REQUIRE(mlx_operation_event_cpu_gather_axis_row_eval_layout(&raw,3,width,false));
     CHECK(raw.graph_extents==cold.allocation_extents);eval(ordinary);
@@ -5040,7 +5155,7 @@ TEST_CASE("CPU flat Scatter source binds general overwrite and preserves invalid
   array source(data,Shape{13},float32),index(picks,Shape{5},int32),updates(changes,Shape{5,1},float32);
   auto value=scatter(source,index,updates,0,stream);
   cpu::CopyEvalStorage cold,actual;
-  REQUIRE(cpu::flat_scatter_eval_layout(int32,13,5,false,cold));
+  REQUIRE(cpu::scatter_eval_layout(float32,int32,1,13,5,false,cold));
   REQUIRE(cpu::flat_scatter_eval_storage(value,actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);
   CHECK(actual.worker_graph_extents==cold.worker_graph_extents);
@@ -5048,15 +5163,15 @@ TEST_CASE("CPU flat Scatter source binds general overwrite and preserves invalid
   CHECK(actual.backing_births==1);CHECK(actual.request_counts[6]==2);
   CHECK(actual.request_counts[8]==1);
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
-  CHECK_FALSE(cpu::flat_scatter_eval_layout(int64,13,5,false,actual));
-  CHECK_FALSE(cpu::flat_scatter_eval_layout(int32,13,0,false,actual));
-  CHECK_FALSE(cpu::flat_scatter_eval_layout(int32,SIZE_MAX,5,false,actual));
+  CHECK_FALSE(cpu::scatter_eval_layout(float32,int64,1,13,5,false,actual));
+  CHECK_FALSE(cpu::scatter_eval_layout(float32,int32,1,13,0,false,actual));
+  CHECK_FALSE(cpu::scatter_eval_layout(float32,int32,1,SIZE_MAX,5,false,actual));
   auto sum=array(Shape{13},float32,std::make_shared<Scatter>(stream,Scatter::Sum,std::vector<int>{0}),{source,index,updates});
   auto wrong=array(Shape{12},float32,std::make_shared<Scatter>(stream,Scatter::None,std::vector<int>{0}),{source,index,updates});
   for(const auto* invalid:{&sum,&wrong})CHECK_FALSE(cpu::flat_scatter_eval_storage(*invalid,actual));
   CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
   mlx_cpu_copy_eval_layout raw{};
-  REQUIRE(mlx_operation_event_cpu_flat_scatter_eval_layout(&raw,MLX_INT32,13,5,false));
+  REQUIRE(mlx_operation_event_cpu_scatter_eval_layout(&raw,MLX_FLOAT32,MLX_INT32,1,13,5,false));
   CHECK(raw.graph_extents==cold.allocation_extents);CHECK(raw.worker_graph_extents==cold.worker_graph_extents);
 }
 TEST_CASE("CPU flat Scatter preserves ordinary row order and escaped original copy custody"
@@ -5109,3 +5224,172 @@ TEST_CASE("CPU flat Scatter preserves ordinary row order and escaped original co
   CHECK(escaped->data<float>()[2]==changes[2]);CHECK(escaped->data<float>()[12]==changes[0]);
   escaped.reset();CHECK(retired==1);
 }
+
+TEST_CASE("CPU paged row maximum source preserves exact geometry and query refusal"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  std::array<float,168> data;for(size_t i=0;i!=data.size();++i)data[i]=float(int(i%23)-11)*0.125f;
+  array input(data.data(),Shape{2,3,4,7},float32);
+  auto output=max(input,-1,true,stream);
+  cpu::CopyEvalStorage cold,actual;
+  REQUIRE(cpu::reduction_eval_layout(cpu::ReductionEvalKind::Float32MaximumRows,4,7,24,false,cold));
+  REQUIRE(cpu::reduction_eval_storage(output,actual));
+  CHECK(cold.allocation_extents==actual.allocation_extents);
+  CHECK(cold.named_control_bytes==actual.named_control_bytes);
+  CHECK(actual.backing_births==1);CHECK(actual.worker_graph_extents==0);
+  std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
+  for(const auto& geometry:std::array<std::array<size_t,3>,5>{{{0,7,24},{5,7,24},{4,1,24},{4,7,0},{4,SIZE_MAX,24}}}) {
+    CHECK_FALSE(cpu::reduction_eval_layout(cpu::ReductionEvalKind::Float32MaximumRows,
+        geometry[0],geometry[1],geometry[2],false,actual));
+    CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
+  }
+  auto wrong_axis=max(input,1,true,stream);CHECK_FALSE(cpu::reduction_eval_storage(wrong_axis,actual));
+  CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
+  mlx_cpu_copy_eval_layout raw{};
+  REQUIRE(mlx_operation_event_cpu_reduction_eval_layout(&raw,9,4,7,24,false));
+  auto prior=raw;CHECK_FALSE(mlx_operation_event_cpu_reduction_eval_layout(&raw,9,4,SIZE_MAX,24,false));
+  CHECK(std::memcmp(&raw,&prior,sizeof(raw))==0);
+}
+TEST_CASE("CPU paged row maxima retain ordinary SIMD values and escaped source custody"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  std::array<float,168> data;for(size_t i=0;i!=data.size();++i)data[i]=float(int((i*7)%23)-11)*0.125f;
+  data[17]=std::numeric_limits<float>::quiet_NaN();
+  for(const auto& shape:{Shape{2,3,4,7},Shape{1,1,1,7}}) {
+  array input(data.data(),shape,float32);
+  const auto rows=input.size()/7;
+  auto ordinary=max(input,-1,true,stream);eval(ordinary);
+  mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
+  struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
+  unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
+      [](void*p){++*static_cast<unsigned*>(p);})==0);
+  std::optional<array> escaped;
+  {
+    Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
+    Observer observer;Bank bank;REQUIRE(mlx_operation_event_prepare_resident_graph(&bank.value,observer.value,1,0,4)==0);
+    auto value=max(input,-1,true,stream);bank.reset();Operation operation;operation.append(value);
+    const mlx_operation_eval_traversal_limits limits{1,4,3,3,3,1,16};
+    REQUIRE(eval_traversal_tests::submit(operation,stream,limits)==0);eval_traversal_tests::complete(role,operation,value);
+    for(size_t row=0;row!=rows;++row) {
+      float expected=-std::numeric_limits<float>::infinity();bool has_nan=false;
+      for(size_t col=0;col!=7;++col){const auto x=data[row*7+col];has_nan|=std::isnan(x);expected=std::max(expected,x);}
+      const auto actual=value.data<float>()[row],reference=ordinary.data<float>()[row];
+      CHECK(((std::isnan(actual)&&std::isnan(reference))||actual==reference));
+      if(!has_nan)CHECK(actual==expected);
+    }
+    mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&value},budget.value)==0);
+    CHECK(info.known);escaped.emplace(value);
+  }
+  CHECK(mlx_original_buffer_budget_occupied(budget.value)>0);CHECK(retired==0);
+  mlx_original_buffer_budget_release(budget.value);budget.value={};CHECK(retired==0);
+  CHECK(escaped->data<float>()[0]==ordinary.data<float>()[0]);
+  escaped.reset();CHECK(retired==1);CHECK(input.data<float>()[0]==data[0]);
+  }
+}
+TEST_CASE("CPU paged score rows preserve singleton transposed query copies and original custody"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  const Stream selected(stream.index,stream.device,CpuMatmulKernel::Float32Tiles);
+  constexpr int heads=3,queries=1,keys=5,width=4;
+  std::array<float,heads*queries*width> qv;
+  std::array<float,heads*keys*width> kv;
+  for(size_t i=0;i<qv.size();++i)qv[i]=(int(i%11)-5)*0.125f;
+  for(size_t i=0;i<kv.size();++i)kv[i]=(int((i*7)%17)-8)*0.0625f;
+  array q_source(qv.data(),Shape{1,queries,heads,width},float32),k_source(kv.data(),Shape{1,heads,keys,width},float32);
+  auto q=transpose(q_source,{0,2,1,3},selected),k=swapaxes(k_source,-1,-2,selected);eval(q,k);
+  REQUIRE(q.flags().row_contiguous);CHECK(q.strides()[2]!=width);
+  auto score=matmul(q,k,selected);cpu::CopyEvalStorage cold,actual;
+  REQUIRE(cpu::tiled_matmul_copy_eval_layout(4,queries,keys,width,heads,1,false,cold));
+  REQUIRE(cpu::tiled_matmul_eval_storage(score,actual));
+  CHECK(actual.backing_births==cold.backing_births);CHECK(actual.backing_births==2);
+  CHECK(actual.named_control_bytes==cold.named_control_bytes);
+  auto ordinary=max(score,-1,true,selected);eval(ordinary);
+  mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
+  struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
+  unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
+      [](void*p){++*static_cast<unsigned*>(p);})==0);
+  std::optional<array> escaped;
+  {
+    Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
+    Observer observer;Bank bank;REQUIRE(mlx_operation_event_prepare_resident_graph(&bank.value,observer.value,4,0,4)==0);
+    auto value=max(matmul(q,k,selected),-1,true,selected);bank.reset();Operation operation;operation.append(value);
+    const mlx_operation_eval_traversal_limits limits{1,9,5,10,5,1,32};
+    REQUIRE(eval_traversal_tests::submit(operation,selected,limits)==0);eval_traversal_tests::complete(role,operation,value);
+    for(int h=0;h<heads;++h) {
+      float expected=-std::numeric_limits<float>::infinity();
+      for(int pos=0;pos<keys;++pos){float product=0;for(int d=0;d<width;++d)product+=qv[h*width+d]*kv[(h*keys+pos)*width+d];expected=std::max(expected,product);}
+      CHECK(value.data<float>()[h]==ordinary.data<float>()[h]);CHECK(value.data<float>()[h]==expected);
+    }
+    mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&value},budget.value)==0);
+    CHECK(info.known);escaped.emplace(value);
+  }
+  mlx_original_buffer_budget_release(budget.value);budget.value={};CHECK(retired==0);
+  CHECK(escaped->data<float>()[0]==ordinary.data<float>()[0]);escaped.reset();CHECK(retired==1);
+  CHECK(q_source.data<float>()[0]==qv[0]);CHECK(k_source.data<float>()[0]==kv[0]);
+}
+
+#include "mlx/host_transfer.h"
+TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects foreign backing"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  for(const auto dtype:{float16,bfloat16,float32}) {
+    for(size_t rank=1;rank<=4;++rank) {
+      for(bool store:{false,true}) {
+        cpu::CopyEvalStorage cold;
+        REQUIRE(cpu::host_transfer_eval_layout(dtype,rank,store,false,cold));
+        CHECK(cold.backing_births==size_t(!store));
+        CHECK(cold.allocation_extents>0);CHECK(cold.named_control_bytes>0);
+        const auto before=cold;
+        CHECK_FALSE(cpu::host_transfer_eval_layout(dtype,0,store,false,cold));
+        CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
+        CHECK_FALSE(cpu::host_transfer_eval_layout(dtype,5,store,false,cold));
+        CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
+        CHECK_FALSE(cpu::host_transfer_eval_layout(int32,rank,store,false,cold));
+        CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
+      }
+    }
+  }
+  const float data[]={2,-3,7,11,-5,13};
+  array input(data,Shape{2,3},float32);
+  HostTransferBuffer host(Shape{2,3},float32,HostTransferPolicy::transfer);
+  auto stored=array(input.shape(),input.dtype(),std::make_shared<CopyToHostTransfer>(stream,host),{input});
+  cpu::CopyEvalStorage actual;
+  REQUIRE(cpu::copy_eval_storage(stored,actual));CHECK(actual.backing_births==0);
+  eval(stored);
+  for(size_t i=0;i<6;++i)CHECK(static_cast<const float*>(host.data())[i]==data[i]);
+  auto leaf=stored; // actual completed Host-backed output, without fabricating a source
+  auto loaded=array(Shape{2,3},float32,std::make_shared<CopyFromHostTransfer>(stream),{leaf});
+  REQUIRE(cpu::copy_eval_storage(loaded,actual));CHECK(actual.backing_births==1);
+  eval(loaded);
+  for(size_t i=0;i<6;++i)CHECK(loaded.data<float>()[i]==data[i]);
+  const auto before=actual;
+  auto foreign=array(Shape{2,3},float32,std::make_shared<CopyFromHostTransfer>(stream),{input});
+  CHECK_FALSE(cpu::copy_eval_storage(foreign,actual));CHECK(std::memcmp(&before,&actual,sizeof(actual))==0);
+  auto malformed=array(Shape{6},float32,std::make_shared<CopyFromHostTransfer>(stream),{leaf});
+  CHECK_FALSE(cpu::copy_eval_storage(malformed,actual));CHECK(std::memcmp(&before,&actual,sizeof(actual))==0);
+  mlx_cpu_copy_eval_layout query{};
+  REQUIRE(mlx_operation_event_cpu_host_transfer_eval_layout(&query,MLX_FLOAT32,2,false,false));
+  CHECK(query.backing_births==1);const auto unchanged=query;
+  CHECK_FALSE(mlx_operation_event_cpu_host_transfer_eval_layout(&query,MLX_FLOAT32,SIZE_MAX,false,false));
+  CHECK(std::memcmp(&unchanged,&query,sizeof(query))==0);
+}
+
+#include "cpu_broadcast_reshape_tests.cpp"
+#include "cpu_strided_sum_tests.cpp"
+
+#include "cpu_grouped_index_tests.cpp"
+
+#include "cpu_tiled_gather_mm_tests.cpp"
+#include "cpu_grouped_gather_axis_tests.cpp"
+#include "cpu_empty_typed_join_tests.cpp"
+
+#include "cpu_row_movement_tests.cpp"
+
+#include "cpu_empty_structural_alias_tests.cpp"
+
+#include "cpu_routing_selection_tests.cpp"
+#include "cpu_empty_slice_tests.cpp"

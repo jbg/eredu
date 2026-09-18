@@ -7,8 +7,8 @@
 use std::sync::{Arc, OnceLock};
 
 pub(crate) mod bf16_projection_kernel;
-pub(crate) mod fp8_kernel;
 pub(crate) mod input_allocator;
+pub(crate) mod kernel_family;
 pub(crate) mod metal_device;
 pub(crate) mod pointwise_kernel;
 pub(crate) mod recurrent_kernel;
@@ -46,7 +46,7 @@ impl StaticDomain {
             .and_then(|bytes| bytes.checked_add(row_kernels::static_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(recurrent_kernel::static_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(bf16_projection_kernel::static_storage_bytes()))
-            .and_then(|bytes| bytes.checked_add(fp8_kernel::static_storage_bytes()))
+            .and_then(|bytes| bytes.checked_add(crate::backend::nn::fp8::kernel::static_storage_bytes()))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(WorkingMemoryError::Overflow)?;
         if facts.fixed_storage_bytes().is_some() {

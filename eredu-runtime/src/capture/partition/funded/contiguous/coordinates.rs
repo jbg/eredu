@@ -16,7 +16,7 @@ impl Sources<'_> {
     pub(super) fn is_empty(self)->bool {self.len()==0}
     pub(super) fn contiguous(self)->bool {matches!(self,Self::Contiguous(_))}
     pub(super) fn rank(self,index:usize)->usize {match self {Self::Contiguous(rows)=>rows[index].rank,Self::Coordinates(rows)=>rows[index].rank}}
-    pub(super) fn copy(self,metadata:&WorkspaceMetadataFunding)->Result<Owned,Cause> {match self {
+    pub(super) fn copy(self,metadata:&HostMetadataFunding)->Result<Owned,Cause> {match self {
         Self::Contiguous(rows)=>{
             let mut owned=metadata.metadata_vec(rows.len())?;
             for row in rows {
@@ -28,10 +28,7 @@ impl Sources<'_> {
         Self::Coordinates(rows)=>{
             let mut owned=metadata.metadata_vec(rows.len())?;
             for row in rows {
-                metadata.reserve_metadata(ComponentCoordinateMap::copy_control_bytes().ok_or(Cause::Source("component copy controls overflow"))?)?;
-                let count=row.coordinates.copy_storage_elements();
-                let map=row.coordinates.copy_with_storage(metadata.metadata_vec(count)?,metadata.metadata_vec(count)?)
-                    .map_err(|_|Cause::Source("paid component coordinate destination differs"))?;
+                let map=row.coordinates.try_clone_with_funding(metadata)?;
                 owned.push((row.rank,map));
             }
             Ok(Owned::Coordinates(owned))
@@ -45,7 +42,7 @@ impl Owned {
     }}
     pub(super) fn receipt(&self,source:&SharedCapturePlan,context:&PartitionCaptureContext,axis:usize,
         combination:PartitionCaptureCombination,world:usize,limits:PartitionCaptureReceiptLimits,
-        metadata:&WorkspaceMetadataFunding,ledger:&mut dyn CaptureReservation)
+        metadata:&HostMetadataFunding,ledger:&mut dyn CaptureReservation)
         ->Result<PartitionCaptureReceiptPlan,PartitionCaptureReceiptConstructionError> {
         match self {
             Self::Contiguous(rows)=>PartitionCaptureReceiptPlan::new_contiguous_shared_funded(source,context,
@@ -68,7 +65,7 @@ impl PreparedPartitionContiguousSource {
     pub fn new_local_coordinates(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureCoordinateProducer<'_>],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        inference:InferenceGeometry,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        inference:InferenceGeometry,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::coordinates(source,index,axis,producers,native,local,combination,Coordinate::Prefill(inference),metadata)
     }
     /// One actual complete invocation, including a terminal prefill hook. This
@@ -76,13 +73,13 @@ impl PreparedPartitionContiguousSource {
     pub fn new_local_coordinates_invocation(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureCoordinateProducer<'_>],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        phase:CapturePhase,prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        phase:CapturePhase,prediction:u64,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::coordinates(source,index,axis,producers,native,local,combination,Coordinate::Invocation(phase,prediction),metadata)
     }
     fn coordinates(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureCoordinateProducer<'_>],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        coordinate:Coordinate,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        coordinate:Coordinate,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         let error=|cause|PartitionCaptureProgramError{cause,_source:source.clone(),_metadata:metadata.clone()};
         metadata.reserve_metadata(control_bytes().ok_or_else(||error(Cause::Source("component constructor controls overflow")))?)
             .map_err(|cause|error(cause.into()))?;
@@ -98,11 +95,13 @@ pub(super) fn control_bytes()->Option<usize> {
         size_of::<PartitionCaptureCoordinateProducer<'_>>()*2,size_of::<Vec<PartitionCaptureCoordinateProducer<'_>>>(),
         size_of::<Result<Vec<PartitionCaptureCoordinateProducer<'_>>,eredu_nn::Error>>(),
         size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureCoordinateProducer<'_>],&[PartitionCaptureFragmentGeometry<'_>],
-            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,Coordinate,&WorkspaceMetadataFunding)>(),
+            Option<PartitionCaptureLocalSource<'_>>,PartitionCaptureCombination,Coordinate,&HostMetadataFunding)>(),
         size_of::<(&Owned,&SharedCapturePlan,&PartitionCaptureContext,usize,PartitionCaptureCombination,usize,
-            PartitionCaptureReceiptLimits,&WorkspaceMetadataFunding,&mut dyn CaptureReservation)>(),
+            PartitionCaptureReceiptLimits,&HostMetadataFunding,&mut dyn CaptureReservation)>(),
         size_of::<std::slice::Iter<'_,(usize,ComponentCoordinateMap)>>(),
         size_of::<std::slice::Iter<'_,PartitionCaptureCoordinateProducer<'_>>>(),
         ComponentCoordinateMap::copy_control_bytes()?];
     frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

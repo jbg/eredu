@@ -1,14 +1,11 @@
 use super::*;
-use eredu::api::{
-    PreparedChatError, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatInput,
-};
+use eredu::api::{PreparedChatGenerationSettings, PreparedChatRequest};
 use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
 use serde_json::json;
 use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE};
 
 #[test]
-fn grammar_vocabulary_factory_is_admitted_before_prompt_sampler_and_controller_work() {
+fn grammar_source_is_reused_without_registration_or_prompt_work_before_admission() {
     for choice in [ToolChoice::None, ToolChoice::Auto] {
         let vocabulary: tokenizers::models::bpe::Vocab = ByteLevel::alphabet()
             .into_iter()
@@ -31,7 +28,7 @@ fn grammar_vocabulary_factory_is_admitted_before_prompt_sampler_and_controller_w
         let backend = MockBackend::default();
         let calls = backend.calls.clone();
         calls.borrow_mut().scripted_tokens = answer.iter().copied().chain([eos]).collect();
-        let mut model = LoadedModel::from_runtime(
+        let mut model = original_sources::Fixture::from_runtime(
             ModelRuntime::prepare(backend, ()).unwrap(),
             ChatTokenizer::from_tokenizer(tokenizer),
             LoadedTextModelConfig {
@@ -47,7 +44,7 @@ fn grammar_vocabulary_factory_is_admitted_before_prompt_sampler_and_controller_w
             },
         )
         .unwrap();
-        let prepared = model.prepare_chat(ChatTemplateRequest {
+        let request = ChatTemplateRequest {
             messages: vec![json!({"role": "user", "content": "Say okay."})],
             tools: vec![json!({"type": "function", "function": {
                 "name": "ping", "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
@@ -56,69 +53,49 @@ fn grammar_vocabulary_factory_is_admitted_before_prompt_sampler_and_controller_w
             parallel_tool_calls: ParallelToolCallPolicy::Disabled,
             add_generation_prompt: true,
             ..Default::default()
-        }).unwrap();
-        let (attempts, factories, payload) = {
-            let calls = calls.borrow();
-            (
-                calls.shared_bytes_attempts,
-                calls.shared_bytes_factories,
-                calls.shared_bytes_payload,
-            )
         };
-        calls.borrow_mut().reject_shared_bytes = true;
-        let settings = PreparedChatGenerationSettings {
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let source = model.chat_source(true, &cancel).unwrap().unwrap();
+        let prepared = model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.borrow().prompts, 0);
+        assert!(calls.borrow().configs.is_empty());
+        assert!(calls.borrow().filters.is_empty());
+        let settings = original_sources::settings(PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(16),
                 ..Default::default()
             },
             ..Default::default()
-        };
+        });
+        let mut stale = settings;
+        stale.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY - 1);
         let error = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::token_ids(&prepared, vec![answer[0]]),
-                settings,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| panic!("rejected vocabulary must not emit an event"),
-            })
-            .unwrap_err();
-        let PreparedChatError::Backend(backend) = error else {
-            panic!("source preparation must retain its typed backend error: {error:?}");
-        };
-        assert!(std::error::Error::source(&backend)
-            .unwrap()
-            .is::<MockError>());
-        {
-            let calls = calls.borrow();
-            assert_eq!(calls.shared_bytes_attempts, attempts + 1);
-            assert_eq!(calls.shared_bytes_factories, factories);
-            assert_eq!(calls.shared_bytes_payload, payload);
-            assert_eq!(calls.prompts, 0);
-            assert!(calls.configs.is_empty());
-            assert!(calls.filters.is_empty());
-            assert_eq!(calls.scripted_tokens.len(), answer.len() + 1);
-        }
-        calls.borrow_mut().reject_shared_bytes = false;
+            .start_prepared_chat(PreparedChatRequest::new(&prepared, stale), &cancel)
+            .err()
+            .expect("different accepted capacity must refuse");
+        assert_eq!(
+            error.input_rejection(),
+            Some(eredu_core::TokenInputRejection::IdentityMismatch)
+        );
+        assert_eq!(calls.borrow().prompts, 0);
+        assert!(calls.borrow().configs.is_empty());
+        assert_eq!(calls.borrow().scripted_tokens.len(), answer.len() + 1);
         let output = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::token_ids(&prepared, vec![answer[0]]),
-                settings,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| {},
-            })
+            .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancel)
+            .unwrap()
+            .unwrap()
+            .run(&cancel, &mut |_| {})
             .unwrap();
         assert_eq!(
-            output.token_ids,
+            output.token_ids.as_ref(),
             answer.iter().copied().chain([eos]).collect::<Vec<_>>()
         );
-        let calls = calls.borrow();
-        assert_eq!(calls.shared_bytes_attempts, attempts + 2);
-        assert_eq!(calls.shared_bytes_factories, factories + 1);
-        // Offsets and all 257 token entries live in the same owned buffer.
-        assert!(calls.shared_bytes_payload - payload > (257 + 1) * 8);
-        assert_eq!(calls.prompts, 1);
-        assert_eq!(calls.configs.len(), 1);
-        assert!(!calls.filters.is_empty());
+        assert_eq!(calls.borrow().shared_bytes_attempts, 0);
+        assert_eq!(calls.borrow().shared_bytes_factories, 0);
+        assert_eq!(calls.borrow().prompts, 1);
+        assert_eq!(calls.borrow().configs.len(), 1);
     }
 }

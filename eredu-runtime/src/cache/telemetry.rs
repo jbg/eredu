@@ -253,7 +253,7 @@ pub struct CacheResidencyTelemetry {
     /// Aggregate current and cumulative report fields.
     pub report: CacheResidencyReport,
     layer_activity: CacheTelemetryRows,
-    metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
     layer_activity_overflow: CacheLayerResidencyStats,
 }
 

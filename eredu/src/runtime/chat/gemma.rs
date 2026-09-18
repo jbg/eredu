@@ -1,6 +1,8 @@
 //! Structurally recognized Gemma channel protocol.
 
-use llguidance::api::TopLevelGrammar;
+use super::grammar_text::{Error as GrammarError};
+use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::tool_schema::ToolDefinition;
 use serde_json::Value;
 
 use super::{
@@ -60,17 +62,19 @@ impl FormatDialect for GemmaToolDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
         DECLARATIVE_DIALECT.constraint_configuration(
             parameters,
             tools,
             tool_choice,
             parallel_tool_calls,
             resolved_structural_token_ids,
+            funding,
         )
     }
 
@@ -118,11 +122,12 @@ impl FormatDialect for GemmaChannelDialect {
     fn constraint_configuration(
         &self,
         _parameters: DialectParameters,
-        _tools: &[Value],
+        _tools: &[ToolDefinition<'_>],
         _tool_choice: ToolChoice,
         _parallel_tool_calls: ParallelToolCallPolicy,
         _resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
         Err("Gemma channel semantics do not imply constrained tool generation".into())
     }
 
@@ -131,27 +136,23 @@ impl FormatDialect for GemmaChannelDialect {
         _parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
         if resolved_structural_token_ids.len() < 2 {
-            return Err(format!(
+            return Err(funding.try_format(format_args!(
                 "Gemma channels require at least 2 structural tokens but {} tokenizer IDs were resolved",
                 resolved_structural_token_ids.len()
-            ));
+            ))?.into());
         }
-        let terminal_ids = resolved_structural_token_ids[2..]
+        let terminals = super::grammar_text::Terminals::new(resolved_structural_token_ids[2..]
             .iter()
             .chain(eos_token_ids)
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        if terminal_ids.is_empty() {
+            .copied(), funding)?;
+        if terminals.is_empty() {
             return Err("Gemma channel generation requires at least one EOS token".into());
         }
-        let terminals = terminal_ids
-            .into_iter()
-            .map(|id| format!("<[{}]>", id))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let grammar = format!(
+
+        let grammar = funding.try_format(format_args!(
             "start: reasoning? visible terminal\n\
              reasoning: <[{}]> \"thought\\n\" channel_text <[{}]>\n\
              visible: channel_text\n\
@@ -159,9 +160,9 @@ impl FormatDialect for GemmaChannelDialect {
              GEMMA_TEXT: /[^<]|<[^|]/\n\
              terminal: {terminals}\n",
             resolved_structural_token_ids[0], resolved_structural_token_ids[1]
-        );
+        ))?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(grammar),
+            grammar: crate::runtime::chat::grammar_text::lark(grammar, funding)?,
         })
     }
 

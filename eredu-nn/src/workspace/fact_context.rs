@@ -11,7 +11,7 @@ pub enum WorkspaceMetadataError {
     Capacity { required: usize, available: usize },
     /// The actual retained account refused the next metadata constructor.
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     /// A concrete population or layout cannot be represented.
     #[error("workspace metadata construction layout overflow")]
     Overflow,
@@ -42,7 +42,7 @@ impl From<WorkspaceMetadataError> for Error {
 impl Error {
     /// Moves only the exact inline host-funding refusal. Every other error is
     /// returned unchanged, preserving its concrete source and retention owner.
-    pub fn into_metadata_funding_error(self) -> Result<WorkspaceMetadataFundingError, Self> {
+    pub fn into_metadata_funding_error(self) -> Result<HostMetadataFundingError, Self> {
         match self.storage {
             crate::ErrorStorage::WorkspaceMetadata(WorkspaceMetadataError::Funding(cause)) => {
                 Ok(cause)
@@ -129,7 +129,7 @@ impl WorkspaceContext {
     /// funding alias with every such result, including constructor failures.
     pub fn new_with_metadata_funding<M>(
         mechanism: M,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, WorkspaceMetadataError>
     where
         M: WorkspaceMechanisms + WorkspaceFactMechanisms + 'static,
@@ -151,7 +151,7 @@ impl WorkspaceContext {
 
     /// Retains the same closed account for a result that can outlive Context.
     /// This creates no allowance, execution grant, raw owner or weak reference.
-    pub fn metadata_funding(&self) -> Option<WorkspaceMetadataFunding> {
+    pub fn metadata_funding(&self) -> Option<HostMetadataFunding> {
         self.funding.clone()
     }
 

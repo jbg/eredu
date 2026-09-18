@@ -5,14 +5,15 @@ emits protocol-neutral semantic events. Applications do not need to build a
 grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
 format.
 
-The sole model-level chat-rendering entry point is `LoadedModel::prepare_chat`,
-including for chats without tools. It renders the selected checkpoint template,
-validates the request, and returns the prompt and its generation metadata.
-Applications can encode `PreparedChat::rendered_prompt()` for raw token
-generation or pass the prepared chat to one of the `generate_prepared_chat*`
-methods. Backend authors can use the generic `LoadedModel<B>` surface instead.
-The complete semantic-generation example is
+`LoadedModel::prepare_chat` renders and validates the selected retained template
+for chats with or without tools. It returns a source-owned `PreparedChat` carrying
+the prompt and executable semantic policy. Ordinary generation passes it through
+`PreparedChatRequest` to `start_prepared_chat`; manual advancement and `run` share
+one driver. Ordinary tools require no drafter or speculative backend capability.
+The complete source-compilation and enforced-admission example is
 [`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
+Authenticated image/audio input uses `prepare_chat_input` and
+`PreparedChatPrompt::Media` with that same prepared chat and request.
 
 ## Capability gating
 
@@ -70,7 +71,7 @@ validators and keep independent argument buffers.
 
 Choose one cohesive generation call:
 
-- `generate_prepared_chat` for ordinary constrained generation;
+- `start_prepared_chat(...).run(...)` for ordinary constrained generation;
 - `generate_prepared_chat_speculative` with `drafting.as_speculative_draft()`
   from the `RealizedDrafting<D>` loaded by the same execution plan; or
 - `generate_prepared_chat_speculative_batch` for independently scheduled requests.
@@ -106,14 +107,13 @@ call index. An incomplete or malformed call never receives a synthetic end
 event.
 
 ```rust,ignore
+// `prepared` and `settings` use the same enforced memory capacity.
+// The application owns storage it chooses to collect from the callback.
 let mut events = Vec::new();
-let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
-    input: PreparedChatInput::rendered_prompt(&prepared),
-    settings: PreparedChatGenerationSettings::default(),
-    caller_stop_sequences: &[],
-    cancellation: GenerationCancellationToken::new(),
-    on_event: |event| events.push(event),
-})?;
+let session = model
+    .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)?
+    .ok_or("cancelled before generation")?;
+let output = session.run(&cancellation, &mut |event| events.push(event))?;
 ```
 
 Finish reasons distinguish decoded stop sequences, grammar completion,

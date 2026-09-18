@@ -62,3 +62,6 @@ mod reverse_suffix;
 mod stopat;
 mod strategy;
 mod wrappers;
+
+#[cfg(test)]
+mod allocation_tests;

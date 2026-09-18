@@ -1,6 +1,6 @@
 //! Construct the accepted owner only after its recursive cold quote returns.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 
 pub(super) fn control_bytes<C: TokenFilterController>() -> Option<usize> {
     [
@@ -14,12 +14,13 @@ pub(super) fn control_bytes<C: TokenFilterController>() -> Option<usize> {
             &TextStepContext,
             Option<&eredu_core::HostPreparationAuthority>,
             eredu_core::OriginalTextResumeKind,
+            Option<eredu_runtime::execution_control::ValidatedSamplingOverride>,
             TextControllerWorkspace<'_>,
             ControllerStorageContract,
             Option<super::super::super::control_slot::PreparedControlExchange>,
             u64,
             u64,
-            &Option<WorkspaceMetadataFunding>,
+            &Option<HostMetadataFunding>,
         )>(),
     ]
     .into_iter()
@@ -35,20 +36,23 @@ pub(super) fn admit<C: TokenFilterController>(
     context: &TextStepContext,
     host: Option<&eredu_core::HostPreparationAuthority>,
     kind: eredu_core::OriginalTextResumeKind,
+    sampling_change: Option<eredu_runtime::execution_control::ValidatedSamplingOverride>,
     mut diagnostic: PreparedSavedTextResumeQuote<'_>,
     workspace: TextControllerWorkspace<'_>,
     storage_contract: ControllerStorageContract,
     original_exchange: Option<super::super::super::control_slot::PreparedControlExchange>,
     capacity: u64,
     outputs: u64,
-    planning_metadata: &Option<WorkspaceMetadataFunding>,
+    planning_metadata: &Option<HostMetadataFunding>,
 ) -> Result<PendingSavedTextAdmission, Error> {
     let original = host.is_some();
     let session = runtime.session();
     let geometry = diagnostic.geometry();
+    let rows = diagnostic.take_text_interventions();
+    let child_capture = diagnostic.take_child_capture();
     let capture = match (
-        source.capture_checkpoint(),
-        source.capture_selection(),
+        child_capture.as_ref().map(ResumeCapture::checkpoint).or_else(|| source.capture_checkpoint()),
+        child_capture.as_ref().map(ResumeCapture::selection).or_else(|| source.capture_selection()),
         source.capture_witness(),
     ) {
         (Some(checkpoint), Some(selection), Some(witness)) => {
@@ -61,10 +65,10 @@ pub(super) fn admit<C: TokenFilterController>(
                 eredu_runtime::working_memory::WorkspaceReportMetadata::with_funding(
                     planning_metadata.as_ref().ok_or_else(|| unknown())?,
                 ),
-            )?.with_saved_interventions(diagnostic.take_text_interventions(),geometry)?)
+            )?.with_saved_interventions(rows,geometry)?)
         }
         (None, None, None) => {
-            if diagnostic.take_text_interventions().is_some(){return Err(memory(WorkingMemoryError::IdentityMismatch));}
+            if rows.is_some(){return Err(memory(WorkingMemoryError::IdentityMismatch));}
             None
         },
         _ => return Err(memory(WorkingMemoryError::IdentityMismatch)),
@@ -309,7 +313,6 @@ pub(super) fn admit<C: TokenFilterController>(
         let mechanism = session
             .payload
             .model
-            .erased()
             .native_storage_mechanism()?
             .ok_or_else(|| unknown())?;
         let mut bank = if let Some(capture) = &capture {
@@ -431,6 +434,7 @@ pub(super) fn admit<C: TokenFilterController>(
         // saved-source manager authority is never installed for its copy.
         addressable: RefCell::new(None),
         paged_sources: RefCell::new(None),
+        sampling_revision: RefCell::new(None),
         native_recipe,
         native_storage,
         parallel_control,
@@ -468,6 +472,8 @@ pub(super) fn admit<C: TokenFilterController>(
         funding: RefCell::new(Some(funding)),
     });
     Ok(PendingSavedTextAdmission {
+        child_capture,
+        sampling_change,
         paged_source_metadata,
         paged_host_facts,
         source: source.clone(),

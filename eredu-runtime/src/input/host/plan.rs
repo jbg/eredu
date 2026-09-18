@@ -133,6 +133,14 @@ impl<'a> PreparedHostInputPlan<'a> {
                         digest.update([1]);
                         word(&mut digest, *n)?;
                     }
+                    InputExtent::VideoFrame { group, index, count, first_source_frame, last_source_frame, source_fps_bits } => {
+                        let fps = f64::from_bits(*source_fps_bits);
+                        if *count == 0 || index >= count || first_source_frame > last_source_frame
+                            || !fps.is_finite() || fps <= 0.0 { return Err(bad); }
+                        digest.update([2]);
+                        for value in [group, index, count, first_source_frame, last_source_frame] { word(&mut digest, *value)?; }
+                        digest.update(source_fps_bits.to_le_bytes());
+                    }
                     _ => return Err(bad),
                 }
             }

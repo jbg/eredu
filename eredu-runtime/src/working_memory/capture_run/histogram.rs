@@ -60,7 +60,7 @@ impl<'a, 'c> CaptureHistogramClaim<'a, 'c> {
     /// Decode into this claim's fixed paid edges/bins using the canonical
     /// partition reader. Failed input retains its partial payload and account.
     pub fn decode_partition_receipt(self, bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<ClaimedCaptureHistogram, PartitionCaptureTensorDecodeError> {
         let custody=self.identity.custody.share_scheduled();
         claims::prepare_histogram_decoder(&custody,funding)?;

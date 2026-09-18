@@ -128,7 +128,7 @@ fn original_single_hold_prices_finite_publication_rows_once_and_c_remains_separa
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let native = run.scope().unwrap();
     let pending = accepted

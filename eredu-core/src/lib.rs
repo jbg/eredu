@@ -98,7 +98,9 @@ pub use automatic::{
     realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
     select_execution_plan_target, speculative_decoding_telemetry,
 };
+pub use execution_control::{SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend};
 pub use backend::{
+    ProspectiveTokenController, TextTokenChoiceBoundary, TextSamplingBoundary,
     BackendDescriptor, BackendError, BackendFailure, BackendFailureKind, BackendProvider,
     BackendSession, BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
     BoundedCompletionWaitError, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
@@ -114,7 +116,7 @@ pub use backend::{
     GenerationSequencePreparation, GenerationSequenceRequest, HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
     HostPreparationAuthority, InspectableBackendSession, ModelCapabilityBackend, ModelLoadError,
     ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure,
-    OriginalTextResumeKind, OriginalTokenDomainWitness, PREPARED_PROMPT_ATTRIBUTION_VERSION,
+    OriginalTextResumeKind, OriginalTextResumeOptions, TextResumeFacts, TextResumeSourceFacts, OriginalSourceWitness, PreparedControllerSource, PREPARED_PROMPT_ATTRIBUTION_VERSION,
     PackedTokenFilter, PackedTokenFilterError, PendingTextInput, PreparedControlInput, PreparedControlInputBackend, PreparedControlInputError,
     PreparedModel, PreparedPromptAttribution, PreparedPromptSegment, PreparedPromptSegmentPlan,
     PreparedRequestRejection, PreparedSessionReset, PromptTokenAttribution,
@@ -123,9 +125,9 @@ pub use backend::{
     SharedControllerBytes, SharedControllerDeclaration, SharedControllerSource,
     SharedPromptAttribution, SharedStorageAttachmentError, SharedStorageDomain,
     SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement, SharedTokenFilter,
-    SharedTokenFilterIdentity, SpeculativeTokenFilterController, Submission, TextContextError,
+    SpeculativeTokenFilterController, Submission, TextContextError,
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity,
-    TextControllerContract, TextControllerContractError, TextControllerStorage, TextDriverIdentity,
+    TextControllerContract, TextControllerContractError, TextControllerStorage, TextDriverIdentity, TextBranchSource, TextGenerationBranch, TextBranchFenced,
     TextGeneration, TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation,
     TextGenerationDriver, TextGenerationInput, TextPolicyIdentity, TextPreparationInput,
     TextPreparationOptions, TextResumeBackend, TextRunIdentity, TextSamplingStrategy,
@@ -226,7 +228,7 @@ pub use speculative::{
     SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeRequest,
     SpeculativeRequestIdentity, SpeculativeRequestTable, SpeculativeSampling, SpeculativeSchedule,
     SpeculativeScheduleState, SpeculativeSchedulerStats, SpeculativeSemanticConstraint,
-    SpeculativeSemanticOwner, SpeculativeSemanticState, SpeculativeSequence,
+    SpeculativeSequence,
     SpeculativeSequenceAllocationError, SpeculativeSequenceRef, SpeculativeStats,
     SpeculativeStatsCounters, SpeculativeTelemetry, SpeculativeTokenIds,
     SpeculativeTokenIdsIntoIter, SpeculativeValues, SpeculativeValuesIntoIter,
@@ -246,3 +248,5 @@ pub use session_reset::{
 
 // Semantic payloads preserve their actual host owner through caller retention.
 pub use generation::{SemanticText, SemanticTextAllocationError};
+
+pub use generation::{SemanticState, SemanticStateOwner};

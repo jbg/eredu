@@ -76,7 +76,7 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                             max_predictions: 1,
                         };
                         let (capture, plan) = admission_at(rank, false, Some(bounds));
-                        let mut session = CaptureSession::new(capture);
+                        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
                         session
                             .enable_interventions(plan, Arc::new(Estimates))
                             .unwrap();

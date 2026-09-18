@@ -1,0 +1,172 @@
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -80,30 +80,7 @@
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+   value.named_control_bytes+=controls;
+   if(operation==AliasOperation::EmptyBroadcast) {
+-    // broadcast's zero-element branch calls allocate_data(0): one Data owner,
+-    // no task, no copied descriptor and no physical backing birth.
+-    WeakCopyStorage descriptor;
+-    size_t allocation_controls=0;
+-    if(!PreparedInputLeaf::weak_copy_storage(0,descriptor)||descriptor.count!=3||
+-        !allocator::original_buffer_allocation_control_bytes(allocation_controls))return false;
+-    value.request_counts[3]=1;
+-    value.request_bytes[3]=descriptor.requests[2].bytes;
+-    value.request_alignments[3]=descriptor.requests[2].alignment;
+-    const auto adoption=array::buffer_adoption_layout();
+-    const size_t empty_controls[]={sizeof(descriptor),sizeof(allocation_controls),sizeof(adoption),
+-        sizeof(allocator::Buffer),sizeof(Deleter),sizeof(std::shared_ptr<array::Data>),
+-        sizeof(submission::GraphAllocator<array::Data>),sizeof(submission::CaptureSlot),adoption.incoming_bytes,
+-        adoption.scratch_owner_bytes,adoption.deleter_bytes,adoption.allocator_callable_bytes,
+-        adoption.prepared_strides_bytes,allocation_controls};
+-    if(sizeof(empty_controls)>SIZE_MAX-value.named_control_bytes)return false;
+-    value.named_control_bytes+=sizeof(empty_controls);
+-    for(size_t bytes:empty_controls) {
+-      if(bytes>SIZE_MAX-value.named_control_bytes)return false;
+-      value.named_control_bytes+=bytes;
+-    }
+-    if(sizeof(size_t)>SIZE_MAX-value.named_control_bytes)return false;
+-    value.named_control_bytes+=sizeof(size_t);
+-    if(!submission::GraphConstruction::complete_layout(value))return false;
++    if(!append_empty_data_layout(value))return false;
+   }
+   out=value;return true;
+ }
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -67,6 +67,34 @@
+       sizeof(submission::GraphConstructionContext) + sizeof(submission::GraphFailure);
+ }
+ } // namespace
++// Shared allocate_data(0) branch: one Data owner, no physical backing or task.
++bool append_empty_data_layout(CopyEvalStorage& value) noexcept {
++  if(value.request_counts[3] || value.backing_births || value.copy)return false;
++  WeakCopyStorage descriptor;
++  size_t allocation_controls=0;
++  if(!PreparedInputLeaf::weak_copy_storage(0,descriptor)||descriptor.count!=3||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls))return false;
++  value.request_counts[3]=1;
++  value.request_bytes[3]=descriptor.requests[2].bytes;
++  value.request_alignments[3]=descriptor.requests[2].alignment;
++  const auto adoption=array::buffer_adoption_layout();
++  const size_t empty_controls[]={sizeof(descriptor),sizeof(allocation_controls),sizeof(adoption),
++      sizeof(allocator::Buffer),sizeof(Deleter),sizeof(std::shared_ptr<array::Data>),
++      sizeof(submission::GraphAllocator<array::Data>),sizeof(submission::CaptureSlot),adoption.incoming_bytes,
++      adoption.scratch_owner_bytes,adoption.deleter_bytes,adoption.allocator_callable_bytes,
++      adoption.prepared_strides_bytes,allocation_controls};
++  if(sizeof(empty_controls)>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=sizeof(empty_controls);
++  for(size_t bytes:empty_controls) {
++    if(bytes>SIZE_MAX-value.named_control_bytes)return false;
++    value.named_control_bytes+=bytes;
++  }
++  if(sizeof(size_t)>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=sizeof(size_t);
++  if(!submission::GraphConstruction::complete_layout(value))return false;
++  if(!add(value.named_control_bytes,sizeof(CopyEvalStorage&)))return false;
++  return true;
++}
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+       (exact_contiguous(output) || exact_cast(output) || exact_static_update(output) ||
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -11,6 +11,8 @@
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
++// Shared zero-byte allocate_data constructor within one existing Eval.
++MLX_API bool append_empty_data_layout(CopyEvalStorage&) noexcept;
+ // Existing immutable Host transfer through the same General copy worker.
+ MLX_API bool host_transfer_eval_layout(Dtype,size_t rank,bool store,bool tracer,CopyEvalStorage&) noexcept;
+ // Actual View reinterpretation: an alias or one ordinary General-copy temporary.
+diff --git a/mlx/backend/cpu/slice_storage.cpp b/mlx/backend/cpu/slice_storage.cpp
+--- a/mlx/backend/cpu/slice_storage.cpp
++++ b/mlx/backend/cpu/slice_storage.cpp
+@@ -17,7 +17,7 @@
+   return output.has_primitive() && output.primitive().stream().device==Device::cpu &&
+       typeid(output.primitive())==typeid(Slice);
+ }
+-bool slice_eval_layout(size_t rank,bool tracer,CopyEvalStorage& out) noexcept {
++bool slice_eval_layout(size_t rank,bool empty,bool tracer,CopyEvalStorage& out) noexcept {
+   if(rank<1||rank>4)return false;
+   CopyEvalStorage value;
+   // The common one-output cleanup/outputs bank is sufficient: prepare_slice's
+@@ -25,42 +25,47 @@
+   // rank-matched stride capacity. This neither allocates Data nor dispatches.
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+-  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(tracer)+sizeof(out)+
++  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(empty)+sizeof(tracer)+sizeof(out)+
+       sizeof(std::tuple<const Shape&,const Shape&,const Shape&>)+
+       sizeof(std::tuple<int64_t,Strides>)+sizeof(std::tuple<size_t,bool,bool>)+
+       sizeof(Strides)*2+sizeof(array::Flags)+sizeof(int64_t)*8+sizeof(size_t)*12+
+       sizeof(int)*4+sizeof(bool)*4+sizeof(const array*)*3+sizeof(const Slice*)+
+-      sizeof(size_t)*2+
++      sizeof(size_t)*2+sizeof(bool)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+
+       sizeof(submission::GraphFailure);
+   if(!add(value.named_control_bytes,controls))return false;
++  if(empty&&!append_empty_data_layout(value))return false;
+   out=value;return true;
+ }
+ bool slice_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_slice_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];
+   const size_t rank=input.ndim();
+-  if(rank<1||rank>4||output.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||!output.size())return false;
++  if(rank<1||rank>4||output.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize())return false;
+   const auto& primitive=static_cast<const Slice&>(output.primitive());
+   const auto [starts,ends,steps]=primitive.state_refs();
+   if(starts.size()!=rank||ends.size()!=rank||steps.size()!=rank||input.strides().size()!=rank)return false;
++  const bool empty=output.size()==0;
+   size_t elements=1,offset=0,span=1;
+   for(size_t i=0;i!=rank;++i) {
+-    if(input.shape(i)<=0||steps[i]<=0||starts[i]<0||ends[i]<=starts[i]||
++    if(input.shape(i)<0||output.shape(i)<0||steps[i]<=0||starts[i]<0||ends[i]<starts[i]||
+         ends[i]>input.shape(i)||input.strides()[i]<0)return false;
+-    const size_t count=size_t((ends[i]-starts[i]-1)/steps[i]+1);
++    const size_t count=ends[i]==starts[i]?0:size_t((ends[i]-starts[i]-1)/steps[i]+1);
+     if(count!=size_t(output.shape(i)))return false;
+     size_t start=0,delta=0,step_stride=0;
+-    if(!product(size_t(output.shape(i)),elements,elements)||
+-        !product(size_t(starts[i]),size_t(input.strides()[i]),start)||!add(offset,start)||
++    if(!product(size_t(output.shape(i)),elements,elements))return false;
++    // Empty Slice returns before reading the source or calculating offsets.
++    if(empty)continue;
++    if(!product(size_t(starts[i]),size_t(input.strides()[i]),start)||!add(offset,start)||
+         !product(size_t(input.strides()[i]),size_t(steps[i]),step_stride)||
+         !product(count-1,step_stride,delta)||!add(span,delta))return false;
+   }
+   size_t end=offset,bytes=0;
+-  if(elements!=output.size()||!add(end,span)||end>input.data_size()||
+-      !product(end,size_t(input.itemsize()),bytes))return false;
+-  return slice_eval_layout(rank,output.is_tracer(),out);
++  if(elements!=output.size())return false;
++  if(!empty&&(!add(end,span)||end>input.data_size()||
++      !product(end,size_t(input.itemsize()),bytes)))return false;
++  return slice_eval_layout(rank,empty,output.is_tracer(),out);
+ }
+ }
+ namespace mlx::core::submission {
+diff --git a/mlx/backend/cpu/slice_storage.h b/mlx/backend/cpu/slice_storage.h
+--- a/mlx/backend/cpu/slice_storage.h
++++ b/mlx/backend/cpu/slice_storage.h
+@@ -1,9 +1,10 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-// Nonempty, normalized unit-step Slice over the existing fixed-rank indexing
+-// path. No backing or worker task is created by this alias operation.
+-MLX_API bool slice_eval_layout(size_t rank, bool tracer, CopyEvalStorage&) noexcept;
++// Normalized positive-step Slice over the existing fixed-rank indexing path.
++// Nonempty output aliases; empty output creates one zero Data owner. Neither
++// branch creates a physical backing or worker task.
++MLX_API bool slice_eval_layout(size_t rank, bool empty, bool tracer, CopyEvalStorage&) noexcept;
+ MLX_API bool is_slice_eval_primitive(const array&) noexcept;
+ MLX_API bool slice_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ }

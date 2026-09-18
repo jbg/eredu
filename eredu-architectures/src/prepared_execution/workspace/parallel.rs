@@ -1,4 +1,5 @@
 //! Exact initial partition construction reused by the ordinary parallel quote.
+use crate::prepared_execution::workspace::layerwise::QuoteError;
 use super::*;
 use crate::decoder::{BlockFactory, PartitionedConfig, PartitionedLayeredModel, PartitionModelSource, TensorParallelProjectionOperator};
 use eredu_runtime::{ArchitectureParameters, LayeredArchitecture, LayerwiseRuntime, ResidentUnitWindow};
@@ -22,6 +23,10 @@ type Unit<C,P> = crate::decoder::TransformerBlock<WorkspaceBackend,
 #[derive(Clone)]
 pub(crate) struct PreparedDirectPartitionSource(Arc<dyn DirectPartitionSource + Send + Sync>);
 trait DirectPartitionSource {
+    fn routed_addressable_source(&self, _selected: &crate::SelectedPreparation,
+        _rank: eredu_core::ParallelRankTopology)
+        -> Result<Option<(crate::routed_text::RetainedRoutedBanks,
+            crate::partitioned_execution::PreparedRoutedExecutionHandoff)>, String> { Ok(None) }
     fn composite_executor(&self, _selected: &crate::SelectedPreparation,
         _rank: eredu_core::ParallelRankTopology)
         -> Result<Option<crate::composite_partitioned::PreparedCompositeExecutorPlan>, String> { Ok(None) }
@@ -50,6 +55,18 @@ struct PipelineSource {
     tensor_waves: Option<Arc<crate::partitioned_execution::TensorPipelineCollectiveWaves>>,
 }
 impl PreparedDirectPartitionSource {
+    pub(crate) fn routed_addressable_source(&self, selected: &crate::SelectedPreparation,
+        rank: eredu_core::ParallelRankTopology)
+        -> Result<(crate::routed_text::RetainedRoutedBanks,
+            crate::partitioned_execution::PreparedRoutedExecutionHandoff), String> {
+        self.0.routed_addressable_source(selected, rank)?.ok_or_else(||
+            "retained partition source is not the selected addressable constructor".into())
+    }
+    pub(super) fn quote_media(&self, source: &PreparedModelSources,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>, visitor: EquationVisitor<'_, '_, '_>,
+    ) -> Result<EquationQuote, Error> {
+        self.0.quote(source, communication, visitor)
+    }
     pub(crate) fn composite_executor(&self, selected: &crate::SelectedPreparation,
         rank: eredu_core::ParallelRankTopology)
         -> Result<crate::composite_partitioned::PreparedCompositeExecutorPlan, String> {
@@ -130,7 +147,7 @@ where C: PartitionedConfig + Send + Sync,
             PartitionedLayeredModel::<Backend,C,P>::from_retained_partition_source(source.clone(),context)
         ).transpose()?;
         let architecture=PartitionedLayeredModel::<Backend,C,P>::from_retained_partition_source(self.target.clone(),context)?;
-        let layout=architecture.state_layout_with_metadata(context)?;
+        let layout=architecture.state_layout(Some(context))?;
         if visitor.state.layout()!=&layout {
             return Err(context.metadata_error(format_args!("parallel state projection differs from its exact local constructor")));
         }
@@ -171,8 +188,8 @@ where C:PartitionedConfig+Send+Sync,
             Result<eredu_runtime::PreparedLayeredObservationPaths,
                 eredu_runtime::PreparedLayeredObservationError<Error>>, u64,
         )>())?;
-        let paths = visitor.observation.map(|observation| runtime.bind_observation_paths(observation.paths))
-            .transpose().map_err(|cause| context.metadata_source(cause))?;
+        let paths = visitor.observation.map(|observation| runtime.bind_observation_paths(observation.paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
+            .transpose().map_err(|cause| cause.into_quote_error(context))?;
         direct_publication_spans(&source.selected, visitor, paths,
             |tokens,state,demand,observer,paths,_span| {
             let (scores,_forward)=match (observer, paths) {

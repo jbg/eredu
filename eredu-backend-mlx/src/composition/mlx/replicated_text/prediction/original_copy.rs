@@ -26,11 +26,11 @@ use eredu_architectures::prediction_extension::{
     MaterializedPredictionExecutor, PredictionStateCopyFactory,
 };
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
     replicated_session::ReplicatedTextControlOrigin,
     working_memory::{
-        OriginalSpeculativeSemanticPreparation, WorkingMemoryError, WorkingMemoryPool,
+        PreparedSemanticSource, WorkingMemoryError, WorkingMemoryPool,
     },
 };
 use safemlx::PrefillRootsRuntime;
@@ -57,7 +57,7 @@ pub(crate) struct OriginalPredictionCopyContext {
     roots: PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     origin: ReplicatedTextControlOrigin,
-    preparation: OriginalSpeculativeSemanticPreparation,
+    preparation: PreparedSemanticSource,
     host: HostPreparationAuthority,
 }
 impl std::fmt::Debug for OriginalPredictionCopyContext {
@@ -73,7 +73,7 @@ impl OriginalPredictionCopyContext {
             size_of::<Result<Self, StartupCause>>(),
             size_of::<PreparedOriginalCopyEnvironment>(),
             size_of::<Result<PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError>>(),
-            size_of::<(&OriginalCopyEnvironment<'_>, &HostPreparationAuthority, &WorkspaceMetadataFunding)>(),
+            size_of::<(&OriginalCopyEnvironment<'_>, &HostPreparationAuthority, &HostMetadataFunding)>(),
             OriginalCopyEnvironment::control_bytes()?,
         ];
         parts
@@ -84,7 +84,7 @@ impl OriginalPredictionCopyContext {
         environment: &OriginalCopyEnvironment<'_>,
         roots: &PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
         host: &HostPreparationAuthority,
     ) -> Result<Self, StartupCause> {
@@ -122,7 +122,7 @@ impl OriginalPredictionCopyContext {
     }
     pub(super) fn validate(
         &self,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<(), StartupCause> {
         let parts = [
@@ -239,7 +239,7 @@ struct CopyFactory<'a> {
 }
 struct LeafCustody {
     _members: Vec<HostPreparationAuthority>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl CopyFactory<'_> {
     fn members<C>(
@@ -251,7 +251,7 @@ impl CopyFactory<'_> {
             &OriginalCopyEnvironment<'_>,
             &PrefillRootsRuntime,
             MlxMetalWorkspaceMechanisms,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
             u64,
         ) -> Result<PreparedPredictionCacheCopy<C>, Error>,
     ) -> Result<PreparedLane<Vec<OwnedPredictionCache<C>>>, StartupCause> {
@@ -433,7 +433,7 @@ impl OriginalPredictionLane {
     /// No new Box, native handle, invocation, or copy account is created.
     pub(crate) fn state_mut<L: 'static>(
         &mut self,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<&mut L, StartupCause> {
         self.copy.validate(preparation, origin)?;

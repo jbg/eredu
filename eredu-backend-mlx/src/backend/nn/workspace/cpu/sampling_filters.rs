@@ -101,7 +101,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
             S::TopK{keep} if *keep!=0&&(*keep as usize)<width=>{
                 let keep=*keep as usize;
                 p.copy(OperationEvent::cpu_partition_row_layout(rank,width,false)?,1,width)?;
-                p.copy(OperationEvent::cpu_slice_layout(rank,false)?,1,0)?;
+                p.copy(OperationEvent::cpu_slice_layout(rank, false, false)?,1,0)?;
                 if keep>1 {p.copy(OperationEvent::cpu_row_min_layout(rank,keep,1,false)?,1,1)?;}
                 p.alias(rank,rank)?;
                 p.binary(CpuBinaryOperation::Less,rank,width,true)?;
@@ -110,7 +110,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
             S::TopP=>{
                 let negative=OperationEvent::cpu_unary_layout(CpuUnaryOperation::Negative,Dtype::Float32,rank,false)?;
                 p.storage(width,4,negative.backing_births())?;p.population.unary(negative)?;
-                p.copy(OperationEvent::cpu_argsort_row_layout(rank,width,false)?,1,width)?;
+                p.copy(OperationEvent::cpu_argsort_layout(Dtype::Float32,rank,width,1,false)?,1,width)?;
                 // take_along_axis's equal-shape inputs are borrowed unchanged;
                 // the real CPU primitive is GatherAxis, not Gather+Squeeze.
                 p.copy(OperationEvent::cpu_gather_axis_row_layout(rank,width,false)?,2,width)?;

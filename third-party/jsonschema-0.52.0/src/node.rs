@@ -142,10 +142,10 @@ struct ArrayValidatorEntry<F: Json> {
 }
 
 impl<F: Json> PendingSchemaNode<F> {
-    pub(crate) fn new() -> Self {
-        PendingSchemaNode {
-            cell: Arc::new(OnceLock::new()),
-        }
+    pub(crate) fn new(funding: &crate::compilation::Funding) -> Result<Self, crate::CompilationError> {
+        Ok(PendingSchemaNode {
+            cell: funding.arc(OnceLock::new())?,
+        })
     }
 
     pub(crate) fn initialize(&self, node: &SchemaNode<F>) {
@@ -213,6 +213,9 @@ impl<F: Json> Validate<F> for PendingSchemaNode<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         let node_id = self.node_id();
         let identity = instance.identity();
@@ -235,7 +238,7 @@ impl<F: Json> Validate<F> for PendingSchemaNode<F> {
         result
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -251,7 +254,7 @@ impl<F: Json> Validate<F> for PendingSchemaNode<F> {
         result
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -286,87 +289,73 @@ impl<F: Json> Validate<F> for PendingSchemaNode<F> {
 
 impl<F: Json> SchemaNode<F> {
     pub(crate) fn from_boolean(
-        ctx: &Context<'_, F>,
-        validator: Option<BoxedValidator<F>>,
-    ) -> SchemaNode<F> {
-        let location = ctx.location().clone();
-        let absolute_path = ctx.base_uri();
-        SchemaNode {
-            inner: Arc::new(SchemaNodeInner {
+        ctx: &Context<'_, F>, validator: Option<BoxedValidator<F>>,
+    ) -> Result<SchemaNode<F>, crate::CompilationError> {
+        Ok(SchemaNode {
+            inner: ctx.funding().arc(SchemaNodeInner {
                 validators: NodeValidators::Boolean { validator },
                 formatted_schema_location: OnceLock::new(),
-            }),
-            location,
-            absolute_path,
-        }
+            })?,
+            location: ctx.location().clone(),
+            absolute_path: ctx.base_uri(),
+        })
     }
 
     pub(crate) fn from_keywords(
-        ctx: &Context<'_, F>,
-        mut validators: Vec<(Keyword, BoxedValidator<F>)>,
+        ctx: &Context<'_, F>, validators: Vec<(Keyword, BoxedValidator<F>)>,
         unmatched_keywords: Option<Arc<Value>>,
-    ) -> SchemaNode<F> {
-        // Sort validators by priority (lower = execute first).
-        // This enables "fail fast" by running cheap validators (type, const)
-        // before expensive ones (allOf, $ref).
-        validators.sort_by_key(|(keyword, _)| crate::keywords::keyword_priority(keyword));
-
-        let location = ctx.location().clone();
-        let absolute_path = ctx.base_uri();
-        let validators = validators
-            .into_iter()
-            .map(|(keyword, validator)| {
-                let location = ctx.location().join(&keyword);
-                let absolute_location = ctx.absolute_location(&location);
-                KeywordValidatorEntry {
-                    validator,
-                    location,
-                    absolute_location,
-                    formatted_schema_location: OnceLock::new(),
-                }
-            })
-            .collect();
-        SchemaNode {
-            inner: Arc::new(SchemaNodeInner {
+    ) -> Result<SchemaNode<F>, crate::CompilationError> {
+        // The ordinal preserves the ordinary stable priority order while
+        // unstable sorting itself requires no hidden scratch allocation.
+        let mut ordered = Vec::new();
+        ctx.funding().grow(&mut ordered, validators.len())?;
+        ordered.extend(validators.into_iter().enumerate());
+        ordered.sort_unstable_by_key(|(ordinal, (keyword, _))| {
+            (crate::keywords::keyword_priority(keyword), *ordinal)
+        });
+        let mut entries = Vec::new();
+        ctx.funding().grow(&mut entries, ordered.len())?;
+        for (_, (keyword, validator)) in ordered {
+            let location = ctx.location().join_with_funding(&keyword, ctx.funding())?;
+            let absolute_location = ctx.absolute_location(&location)?;
+            entries.push(KeywordValidatorEntry {
+                validator, location, absolute_location,
+                formatted_schema_location: OnceLock::new(),
+            });
+        }
+        Ok(SchemaNode {
+            inner: ctx.funding().arc(SchemaNodeInner {
                 validators: NodeValidators::Keyword(KeywordValidators {
-                    unmatched_keywords,
-                    validators,
+                    unmatched_keywords, validators: entries,
                 }),
                 formatted_schema_location: OnceLock::new(),
-            }),
-            location,
-            absolute_path,
-        }
+            })?,
+            location: ctx.location().clone(),
+            absolute_path: ctx.base_uri(),
+        })
     }
 
     pub(crate) fn from_array(
-        ctx: &Context<'_, F>,
-        validators: Vec<BoxedValidator<F>>,
-    ) -> SchemaNode<F> {
-        let location = ctx.location().clone();
-        let absolute_path = ctx.base_uri();
-        let validators = validators
-            .into_iter()
-            .enumerate()
-            .map(|(index, validator)| {
-                let location = ctx.location().join(index);
-                let absolute_location = ctx.absolute_location(&location);
-                ArrayValidatorEntry {
-                    validator,
-                    location,
-                    absolute_location,
-                    formatted_schema_location: OnceLock::new(),
-                }
-            })
-            .collect();
-        SchemaNode {
-            inner: Arc::new(SchemaNodeInner {
-                validators: NodeValidators::Array { validators },
+        ctx: &Context<'_, F>, validators: Vec<BoxedValidator<F>>,
+    ) -> Result<SchemaNode<F>, crate::CompilationError> {
+        let mut entries = Vec::new();
+        ctx.funding().grow(&mut entries, validators.len())?;
+        for (index, validator) in validators.into_iter().enumerate() {
+            let location = ctx.location().join_with_funding(index, ctx.funding())?;
+            let absolute_location = ctx.absolute_location(&location)?;
+            entries.push(ArrayValidatorEntry {
+                validator, location, absolute_location,
                 formatted_schema_location: OnceLock::new(),
-            }),
-            location,
-            absolute_path,
+            });
         }
+        Ok(SchemaNode {
+            inner: ctx.funding().arc(SchemaNodeInner {
+                validators: NodeValidators::Array { validators: entries },
+                formatted_schema_location: OnceLock::new(),
+            })?,
+            location: ctx.location().clone(),
+            absolute_path: ctx.base_uri(),
+        })
     }
 
     pub(crate) fn validators(&self) -> impl ExactSizeIterator<Item = &BoxedValidator<F>> {
@@ -567,6 +556,9 @@ impl<F: Json> Validate<F> for SchemaNode<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         match &self.inner.validators {
             // Single validator fast path
@@ -589,7 +581,7 @@ impl<F: Json> Validate<F> for SchemaNode<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -627,20 +619,15 @@ impl<F: Json> Validate<F> for SchemaNode<F> {
                 }
             }
             NodeValidators::Boolean { validator: Some(_) } => {
-                return Err(ValidationError::false_schema(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                )
-                .with_absolute_keyword_location(self.absolute_path.clone()));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| Ok(crate::error::ValidationErrorKind::FalseSchema))
+                    .map_err(|error| error.with_absolute_keyword_location(self.absolute_path.clone()));
             }
             NodeValidators::Boolean { validator: None } => return Ok(()),
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,

@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, ParameterSpec, Parameterized, Tensor,
+    NormalizationOperator, NormalizationScale, Parameterized, Tensor,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
 
@@ -161,12 +161,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
     pub(crate) fn observation_points(
         &self,
         depth: usize,
-    ) -> eredu_runtime::RoutedObservationPoints {
+    ) -> Result<eredu_runtime::RoutedObservationPoints,Error> {
         eredu_runtime::RoutedObservationPoints::new(
             eredu_runtime::RoutedBankId::new(0),
-            format!("mtp.layers.{depth}.mlp"),
-            self.experts,
-        )
+            format_args!("mtp.layers.{depth}.mlp"),
+            self.experts, None)
     }
 
     /// Executes with resident experts.

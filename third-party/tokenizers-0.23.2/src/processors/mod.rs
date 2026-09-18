@@ -23,8 +23,6 @@ pub enum PostProcessorWrapper {
     Bert(BertProcessing),
     ByteLevel(ByteLevel),
     Template(TemplateProcessing),
-    #[serde(skip_deserializing)]
-    CompiledTemplate(template::compiled::CompiledTemplate),
     Sequence(Sequence),
 }
 
@@ -35,7 +33,6 @@ impl PostProcessor for PostProcessorWrapper {
             Self::ByteLevel(bl) => bl.added_tokens(is_pair),
             Self::Roberta(roberta) => roberta.added_tokens(is_pair),
             Self::Template(template) => template.added_tokens(is_pair),
-            Self::CompiledTemplate(template) => template.added_tokens(is_pair),
             Self::Sequence(bl) => bl.added_tokens(is_pair),
         }
     }
@@ -46,24 +43,11 @@ impl PostProcessor for PostProcessorWrapper {
         add_special_tokens: bool,
     ) -> Result<Vec<Encoding>> {
         match self {
-            Self::Bert(bert) => {
-                bert.process_encodings(encodings, add_special_tokens)
-            }
-            Self::ByteLevel(bl) => {
-                bl.process_encodings(encodings, add_special_tokens)
-            }
-            Self::Roberta(roberta) => {
-                roberta.process_encodings(encodings, add_special_tokens)
-            }
-            Self::Template(template) => {
-                template.process_encodings(encodings, add_special_tokens)
-            }
-            Self::CompiledTemplate(template) => {
-                template.process_encodings(encodings, add_special_tokens)
-            }
-            Self::Sequence(bl) => {
-                bl.process_encodings(encodings, add_special_tokens)
-            }
+            Self::Bert(bert) => bert.process_encodings(encodings, add_special_tokens),
+            Self::ByteLevel(bl) => bl.process_encodings(encodings, add_special_tokens),
+            Self::Roberta(roberta) => roberta.process_encodings(encodings, add_special_tokens),
+            Self::Template(template) => template.process_encodings(encodings, add_special_tokens),
+            Self::Sequence(bl) => bl.process_encodings(encodings, add_special_tokens),
         }
     }
 }
@@ -123,7 +107,8 @@ mod tests {
             PostProcessorWrapper::Bert(_)
         ));
 
-        let json = r#"{"sep":["</s>",2], "cls":["<s>",0], "trim_offsets":true, "add_prefix_space":true}"#;
+        let json =
+            r#"{"sep":["</s>",2], "cls":["<s>",0], "trim_offsets":true, "add_prefix_space":true}"#;
         let reconstructed = serde_json::from_str::<PostProcessorWrapper>(json);
         assert!(matches!(
             reconstructed.unwrap(),

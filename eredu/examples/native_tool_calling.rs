@@ -1,22 +1,23 @@
 //! Native tool calling through the public semantic API.
 //!
 //! Run with a target checkpoint and, optionally, an external Gemma 4 assistant:
-//! `cargo run -p eredu --example native_tool_calling -- TARGET [DRAFTER]`.
+//! `cargo run -p eredu --example native_tool_calling -- TARGET CAPACITY_BYTES [DRAFTER]`.
 
 use eredu_backend_mlx::MlxBackendFactory;
 use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LoadedModel, LocalDevice,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
+        ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
+        PreparedChatRequest, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeRequest, TokenizerSourceInput, default_local_device,
+        local_device_plan,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
 use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
-    GenerationConfigOverrides, SemanticEvent, SpeculativeSchedulerOptions,
+    GenerationConfigOverrides, SemanticEvent, SpeculativeSchedulerOptions, TextInferencePolicy,
 };
 use serde_json::json;
 
@@ -24,7 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     let target_path = arguments
         .next()
-        .ok_or("usage: native_tool_calling TARGET [DRAFTER]")?;
+        .ok_or("usage: native_tool_calling TARGET CAPACITY_BYTES [DRAFTER]")?;
+    let capacity: u64 = arguments.next().ok_or("missing CAPACITY_BYTES")?.parse()?;
     let drafter_path = arguments.next();
 
     let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
@@ -42,29 +44,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_path, &plan)?;
     let (mut model, mut drafting) = planned.into_parts();
-    let prepared = model.prepare_chat(ChatTemplateRequest {
-        messages: vec![json!({
-            "role": "user",
-            "content": "What is the weather in Bogotá?"
-        })],
-        tools: vec![json!({
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Return current weather for one city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                    "additionalProperties": false
-                }
-            }
-        })],
-        tool_choice: ToolChoice::Auto,
-        parallel_tool_calls: ParallelToolCallPolicy::Disabled,
-        add_generation_prompt: true,
-        ..ChatTemplateRequest::default()
-    })?;
+    let cancellation = GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            true,
+            &cancellation,
+        )?
+        .ok_or("cancelled before source compilation")?;
+    let prepared = model
+        .prepare_chat(
+            &source,
+            &ChatTemplateRequest {
+                messages: vec![json!({
+                    "role": "user",
+                    "content": "What is the weather in Bogotá?"
+                })],
+                tools: vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Return current weather for one city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                            "additionalProperties": false
+                        }
+                    }
+                })],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+            capacity,
+            &cancellation,
+        )?
+        .ok_or("cancelled before chat preparation")?;
 
     match prepared.native_tool_support() {
         NativeToolSupport::Supported => {
@@ -83,6 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_new_tokens: Some(256),
             ..Default::default()
         },
+        inference: TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(capacity),
+            ..Default::default()
+        },
         ..PreparedChatGenerationSettings::default()
     };
     let scheduler = SpeculativeSchedulerOptions {
@@ -98,8 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("external drafting plan was not realized".into());
         }
         model
-            .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&prepared),
+            .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                chat: &prepared,
+                input: eredu::api::PreparedChatPrompt::Rendered,
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: drafting
                     .as_speculative_draft()
                     .expect("drafting is enabled"),
@@ -109,19 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scheduler,
                 },
                 caller_stop_sequences: &[],
-                cancellation: GenerationCancellationToken::new(),
+                cancellation: cancellation.clone(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason()
     } else {
         model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                settings,
-                caller_stop_sequences: &[],
-                cancellation: GenerationCancellationToken::new(),
-                on_event: |event| events.push(event),
-            })?
+            .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)?
+            .ok_or("cancelled before generation")?
+            .run(&cancellation, &mut |event| events.push(event))?
             .finish_reason
     };
 

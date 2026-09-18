@@ -23,7 +23,7 @@ impl MlxSpeculativeDistribution {
         value: numerical::OriginalNumericalValue,
         sources: &crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
     ) -> Result<Self, Error> {
-        use eredu_nn::workspace::WorkspaceMetadataFundingError;
+        use eredu_nn::workspace::HostMetadataFundingError;
         use std::mem::{size_of, size_of_val};
         let funding = value.validate_consumer(sources)?;
         // The inner value/Rc/native owners were paid by their producer. Only
@@ -34,13 +34,13 @@ impl MlxSpeculativeDistribution {
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
             size_of::<&crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources>(),
-            size_of::<Result<&eredu_nn::workspace::WorkspaceMetadataFunding, Error>>(),
+            size_of::<Result<&eredu_nn::workspace::HostMetadataFunding, Error>>(),
         ];
         let bytes = parts
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)

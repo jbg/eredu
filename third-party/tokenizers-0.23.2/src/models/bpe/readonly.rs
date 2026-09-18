@@ -4,7 +4,7 @@ use super::storage::Storage;
 /// Readonly view of the existing BPE's concrete vocabulary storage.
 ///
 /// The view does not own a model and never initializes its tokenization cache.
-/// ID order is unspecified; ambiguous Legacy IDs remain duplicated in iteration.
+/// ID order is unspecified; ambiguous IDs remain duplicated in iteration.
 pub struct BpeVocabulary<'a> {
     storage: &'a Storage,
 }

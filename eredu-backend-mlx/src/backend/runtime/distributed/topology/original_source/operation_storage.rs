@@ -8,11 +8,11 @@ pub(crate) struct OriginalCommunicationOperation<'a> {
     native:GroupCpuOperationStorage<'a>,
     persistent:OriginalCommunicatorPersistent<'a>,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl<'input> OriginalCommunicationOperation<'input> {
     pub(super) fn from_layout_binding(native:GroupCpuOperationStorage<'input>,persistent:OriginalCommunicatorPersistent<'input>,
-        source:RetainedCommunicationSource,funding:WorkspaceMetadataFunding)->Self {
+        source:RetainedCommunicationSource,funding:HostMetadataFunding)->Self {
         Self{native,persistent,source,funding}
     }
     pub(crate) fn native(&self)->&GroupCpuOperationStorage<'_>{&self.native}
@@ -21,11 +21,11 @@ impl<'input> OriginalCommunicationOperation<'input> {
         let frames=[size_of::<OriginalCommunicationBacking<'source,'input>>(),
             size_of::<Result<OriginalCommunicationBacking<'source,'input>,Error>>(),
             size_of::<(&Self,&safemlx::PreparedInputRuntime)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             self.native.backing_storage_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let native=self.native.backing_storage(runtime)
             .map_err(|cause|failure(Cause::Buffer(cause),&self.source,&self.funding))?;
         Ok(OriginalCommunicationBacking{native,source:self.source.clone(),_funding:self.funding.clone()})
@@ -37,11 +37,11 @@ impl<'input> OriginalCommunicationOperation<'input> {
         let frames=[size_of::<Self>(),size_of::<OriginalCommunicationConstructed>(),
             size_of::<Result<OriginalCommunicationConstructed,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&OriginalScopeObserver,&Stream)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             self.native.constructor().construction_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         if !self.source.same_source(source.source()){
             return Err(failure(Cause::Identity,&self.source,&self.funding));
         }
@@ -58,20 +58,20 @@ impl<'a> OriginalCommunicationSource<'a> {
         let frames=[size_of::<Option<(&Group,&CommunicationGroupDescriptor,bool)>>(),
             size_of::<Result<OriginalCommunicationOperation<'_>,Error>>(),size_of::<usize>(),
             size_of::<(&Self,&Array,GroupWorkerOperation)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)
     }
     fn operation_storage<'b>(&'b self,group:&'b Group,input:&'b Array,operation:GroupWorkerOperation,
         persistent:OriginalCommunicatorPersistent<'b>)->Result<OriginalCommunicationOperation<'b>,Error>{
         let frames=[size_of::<OriginalCommunicationOperation<'b>>(),size_of::<OriginalCommunicatorPersistent<'b>>(),
             size_of::<Result<OriginalCommunicationOperation<'b>,Error>>(),
             size_of::<(&Self,&Group,&Array,GroupWorkerOperation)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             group.native_group().cpu_operation_storage_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         // Native full-group equations must never stand in for the existing
         // logical subgroup/world-wave/route driver. Its additional producers
@@ -121,12 +121,12 @@ impl<'a> OriginalCommunicationSource<'a> {
             size_of::<crate::backend::runtime::distributed::group::LogicalVariableWorldPlan<'_>>(),
             size_of::<Option<crate::backend::runtime::distributed::group::LogicalVariableWorldPlan<'_>>>(),
             size_of::<Result<OriginalCommunicationOperation<'b>, Error>>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             group.native_group().variable_cpu_operation_storage_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         if group.is_logical() || persistent.native().has_unqualified_storage()
@@ -146,9 +146,9 @@ impl<'a> OriginalCommunicationSource<'a> {
         let frames=[size_of::<crate::backend::runtime::distributed::group::StatusPlan<'_>>(),
             size_of::<(&Self,usize,&Array,GroupWorkerOperation)>(),size_of::<OriginalCommunicatorPersistent<'b>>(),
             size_of::<Result<OriginalCommunicationOperation<'b>,Error>>(),CommunicationManifest::group_operation_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.operation_lookup_controls()?;self.validate()?;
         let (group,descriptor,_)=self.group(order).ok_or_else(||failure(Cause::Resource,&self.source,&self.funding))?;
         let selected=self.source.manifest().select_group_operation(descriptor.id(),CommunicationOperation::FailureAgreement)
@@ -158,7 +158,7 @@ impl<'a> OriginalCommunicationSource<'a> {
             ||!plan.accepts(operation)||input.shape()!=[1]||input.dtype()!=safemlx::Dtype::Int32
             ||persistent.native().has_unqualified_storage()||!persistent.native().is_for(group.native_group())
             ||!persistent.source().same_source(&self.source){return Err(failure(Cause::Resource,&self.source,&self.funding));}
-        self.funding.reserve_metadata(group.native_group().cpu_operation_storage_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        self.funding.reserve_metadata(group.native_group().cpu_operation_storage_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let native=group.native_group().cpu_operation_storage(input,operation).map_err(|_|failure(Cause::Resource,&self.source,&self.funding))?;
         Ok(OriginalCommunicationOperation{native,persistent,source:self.source.clone(),funding:self.funding.clone()})
@@ -180,7 +180,7 @@ impl<'a> OriginalCommunicationSource<'a> {
 pub(crate) struct OriginalCommunicationBacking<'source,'input>{
     native:safemlx::distributed::GroupCpuBackingStorage<'source,'input>,
     source:RetainedCommunicationSource,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 impl OriginalCommunicationBacking<'_,'_>{
     pub(crate) fn capacity(&self)->usize{self.native.capacity()}
@@ -193,16 +193,16 @@ pub(crate) struct OriginalCommunicationCompletedOperation<'a> {
     native:safemlx::distributed::GroupCpuCompletionStorage<'a>,
     persistent:OriginalCommunicatorPersistent<'a>,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl<'a> OriginalCommunicationOperation<'a> {
     pub(crate) fn with_completion(self)->Result<OriginalCommunicationCompletedOperation<'a>,Error> {
         let parts=[size_of::<OriginalCommunicationCompletedOperation<'a>>(),
             size_of::<Result<OriginalCommunicationCompletedOperation<'a>,Error>>(),size_of::<Self>(),
-            self.native.completion_storage_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.completion_storage_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let Self{native,persistent,source,funding}=self;
         let native=native.with_completion_storage().map_err(|_|failure(Cause::Resource,&source,&funding))?;
         Ok(OriginalCommunicationCompletedOperation{native,persistent,source,funding})
@@ -210,7 +210,7 @@ impl<'a> OriginalCommunicationOperation<'a> {
 }
 impl<'a> OriginalCommunicationCompletedOperation<'a> {
     pub(super) fn from_retained_layout(native:safemlx::distributed::GroupCpuCompletionStorage<'a>,
-        persistent:OriginalCommunicatorPersistent<'a>,source:RetainedCommunicationSource,funding:WorkspaceMetadataFunding)->Self {
+        persistent:OriginalCommunicatorPersistent<'a>,source:RetainedCommunicationSource,funding:HostMetadataFunding)->Self {
         Self{native,persistent,source,funding}
     }
 
@@ -228,9 +228,9 @@ impl<'a> OriginalCommunicationCompletedOperation<'a> {
         let parts=[size_of::<(&Self,&OriginalCommunicationSource<'_>,Option<usize>)>(),
             size_of::<Option<(&Group,&CommunicationGroupDescriptor,bool)>>(),
             size_of::<ReadyCompletionResources>(),size_of::<Result<ReadyCompletionResources,Error>>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         let actual=match group {None=>source.world(),Some(order)=>source.group(order)
             .ok_or_else(||failure(Cause::Resource,&self.source,&self.funding))?.0};
@@ -250,10 +250,10 @@ impl<'a> OriginalCommunicationCompletedOperation<'a> {
         let parts=[size_of::<Self>(),size_of::<OriginalCommunicationConstructed>(),
             size_of::<Result<OriginalCommunicationConstructed,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&OriginalScopeObserver,&Stream)>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            self.native.control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            self.native.control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         if !self.source.same_source(source.source()) {return Err(failure(Cause::Identity,&self.source,&self.funding));}
         source.validate()?;
         let value=self.native.construct_original(observer,stream)

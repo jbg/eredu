@@ -163,4 +163,4 @@ pub use context::{RenderContext, ScalarBinding, ScalarBindingValue};
 #[cfg(feature = "json")]
 pub(in crate::bounded) mod record;
 #[cfg(feature = "json")]
-pub use record::{RecordField, RecordFields, RecordValue};
+pub use record::{InputArray, RecordField, RecordFields, RecordValue};

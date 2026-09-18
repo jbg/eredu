@@ -19,6 +19,7 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
     state: eredu_core::RuntimeStateEstimate,
     mut outside: eredu_core::ExecutionWorkspaceEstimate,
     opening_rows: Option<usize>,
+    paged_sources: bool,
     paged_host_facts: Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
     capture: Option<(
         &eredu_runtime::capture::FundedCaptureCheckpoint,
@@ -38,7 +39,6 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
     let mechanism = session
         .payload
         .model
-        .erased()
         .native_storage_mechanism()?
         .ok_or_else(|| unknown())?;
     if recipe.resume_copy().is_none() || (layerwise.is_some() && !recipe.has_host_copy_recipe()) {
@@ -127,6 +127,7 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
             pending_copy,
             &generation.sampling,
             opening_rows,
+            paged_sources,
         )?
         .ok_or_else(|| unknown())?;
     program.replace_enclosing_metadata(&mut outside, metadata)?;

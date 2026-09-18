@@ -17,13 +17,15 @@ use std::{
 enum Cause {
     Source(SlicerSourceError),
     Allocation(TryReserveError),
+    Storage(derivre::ParserStorageError),
+    Funding(derivre::ParserAllocationFailure),
     TrieSource(TokTrieSourceError),
     Trie(TokTrieConstructionFailure),
     MaskSource(TokenMaskSourceError),
     Mask(TokenMaskConstructionFailure),
     // Only ordinary regex recognition can create this variant. The recorded
     // constructor never enters Regex::new or a formatting path.
-    Recognition(anyhow::Error),
+    Recognition(derivre::ParserError),
 }
 impl From<SlicerSourceError> for Cause {
     fn from(e: SlicerSourceError) -> Self {
@@ -35,6 +37,8 @@ impl fmt::Display for Cause {
         match self {
             Self::Source(e) => fmt::Display::fmt(e, f),
             Self::Allocation(e) => fmt::Display::fmt(e, f),
+            Self::Storage(e) => fmt::Display::fmt(e, f),
+            Self::Funding(e) => fmt::Display::fmt(e, f),
             Self::TrieSource(e) => fmt::Display::fmt(e, f),
             Self::Trie(e) => fmt::Display::fmt(e, f),
             Self::MaskSource(e) => fmt::Display::fmt(e, f),
@@ -48,11 +52,13 @@ impl std::error::Error for Cause {
         Some(match self {
             Self::Source(e) => e,
             Self::Allocation(e) => e,
+            Self::Storage(e) => e,
+            Self::Funding(e) => e,
             Self::TrieSource(e) => e,
             Self::Trie(e) => e,
             Self::MaskSource(e) => e,
             Self::Mask(e) => e,
-            Self::Recognition(e) => e.as_ref(),
+            Self::Recognition(e) => e,
         })
     }
 }
@@ -182,6 +188,7 @@ struct Allowance {
 struct Context {
     allowance: Option<Allowance>,
     partials: Vec<Partial>,
+    funding: derivre::ParserAllocationFunding,
 }
 impl Context {
     fn mask(&mut self, plan: TokenMaskConstructionPlan<'_>) -> Result<SimpleVob, Cause> {
@@ -191,6 +198,9 @@ impl Context {
             }
             a.masks -= 1;
         }
+        self.funding
+            .reserve(plan.requirements().required_bytes())
+            .map_err(Cause::Funding)?;
         plan.compile().map_err(Cause::Mask)
     }
     fn empty_mask(&mut self, trie: &TokTrie) -> Result<SimpleVob, Cause> {
@@ -208,6 +218,9 @@ impl Context {
             }
             a.filters -= 1;
         }
+        self.funding
+            .reserve(plan.requirements().required_bytes())
+            .map_err(Cause::Funding)?;
         plan.compile().map_err(Cause::Trie)
     }
     fn string(&mut self, output: &mut String, value: &str) -> Result<(), Cause> {
@@ -217,13 +230,7 @@ impl Context {
                 .checked_sub(value.len())
                 .ok_or(SlicerSourceError::Destination)?;
         }
-        output
-            .try_reserve_exact(value.len())
-            .map_err(Cause::Allocation)?;
-        if output.capacity() > value.len() {
-            return Err(SlicerSourceError::Destination.into());
-        }
-        output.push_str(value);
+        *output = self.funding.try_copy_str(value).map_err(Cause::Storage)?;
         Ok(())
     }
     fn child_slots(&mut self, partial: &mut Partial, n: usize) -> Result<(), Cause> {
@@ -233,13 +240,17 @@ impl Context {
                 .checked_sub(n)
                 .ok_or(SlicerSourceError::Destination)?;
         }
-        reserve(&mut partial.children, n)?;
-        reserve(&mut partial.child_tries, n)
+        self.funding
+            .try_grow_vec(&mut partial.children, n)
+            .map_err(Cause::Storage)?;
+        self.funding
+            .try_grow_vec(&mut partial.child_tries, n)
+            .map_err(Cause::Storage)
     }
     fn keep(&mut self, partial: Partial) {
-        // Paid callers reserve one failure frame per actual tree depth before
-        // any child construction. Ordinary failures may grow their host vector.
-        assert!(self.allowance.is_none() || self.partials.len() < self.partials.capacity());
+        // Every caller reserves one failure frame per actual tree depth before
+        // construction. Unwinding never grows a new failure destination.
+        assert!(self.partials.len() < self.partials.capacity());
         self.partials.push(partial);
     }
 }
@@ -267,16 +278,10 @@ fn build(context: &mut Context, trie: &TokTrie, input: Input<'_>) -> Result<Toke
                 if partial.regex.is_empty() {
                     mask.set_all(true);
                 } else {
-                    let mut regex = crate::derivre::Regex::new(&partial.regex).map_err(|e| {
-                        Cause::Recognition(anyhow::anyhow!(
-                            "invalid regex: {:?}: {}",
-                            partial.regex,
-                            e
-                        ))
-                    })?;
+                    let mut regex = crate::derivre::Regex::new(&partial.regex, context.funding.clone()).map_err(Cause::Recognition)?;
                     for id in 0..trie.vocab_size() as u32 {
                         let bytes = trie.token(id);
-                        if !bytes.is_empty() && regex.is_match_bytes(bytes) {
+                        if !bytes.is_empty() && regex.is_match_bytes(bytes).map_err(Cause::Recognition)? {
                             mask.allow_token(id);
                         }
                     }
@@ -349,19 +354,28 @@ pub(in crate::earley::slicer) fn ordinary_from_topo(
     node: &TopoNode,
     trie: &TokTrie,
     regexes: &[String],
-) -> anyhow::Result<TokenizerSlice> {
+    funding: &derivre::ParserAllocationFunding,
+) -> derivre::ParserResult<TokenizerSlice> {
+    fn depth(node: &TopoNode) -> Option<usize> {
+        node.children
+            .iter()
+            .try_fold(0, |n, child| Some(n.max(depth(child)?)))?
+            .checked_add(1)
+    }
+    let depth = depth(node).ok_or_else(|| funding.storage_overflow())?;
     let mut context = Context {
         allowance: None,
         partials: Vec::new(),
+        funding: funding.clone(),
     };
+    funding.try_grow_vec(&mut context.partials, depth)?;
     build(&mut context, trie, Input::Ordinary { node, regexes }).map_err(|cause| {
-        SlicerConstructionFailure {
+        derivre::ParserError::cause(SlicerConstructionFailure {
             cause,
             partials: context.partials,
             root: None,
             patterns: Vec::new(),
-        }
-        .into()
+        }, funding)
     })
 }
 pub(in crate::earley::slicer) fn ordinary_from_record(
@@ -372,7 +386,11 @@ pub(in crate::earley::slicer) fn ordinary_from_record(
     let mut context = Context {
         allowance: None,
         partials: Vec::new(),
+        funding: derivre::ParserAllocationFunding::unenforced(),
     };
+    context
+        .funding
+        .try_grow_vec(&mut context.partials, source.layout.depth)?;
     build(&mut context, trie, Input::Recorded { node, source }).map_err(|cause| {
         SlicerConstructionFailure {
             cause,
@@ -649,6 +667,8 @@ impl<'a> SlicerConstructionPlan<'a> {
         let mut context = Context {
             allowance: Some(self.requirements.allowance),
             partials: Vec::new(),
+            // This complete destination was admitted through the source plan.
+            funding: derivre::ParserAllocationFunding::unenforced(),
         };
         let mut root = None;
         let mut patterns = Vec::new();

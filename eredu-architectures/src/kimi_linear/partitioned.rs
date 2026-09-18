@@ -5,7 +5,7 @@ use eredu_nn::{
     EmbeddingSpec, Error, LinearSpec, NormalizationConstructionSpec, ParameterSpec, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
+    ArchitectureParameterDescription, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, ParallelLayeredArchitecture,
     ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
@@ -287,29 +287,38 @@ where
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.geometry.complete_state_layout().clone())
-    }
 
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
+    fn state_layout(&self, context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
+        self.geometry.complete_state_layout().clone_workspace(context)
+    }, None => {
+        Ok(self.geometry.complete_state_layout().clone())
+    } }
+}
+    fn state_identity(&self, state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology, context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
+        super::state_identity_with_metadata(&self.args,state.layout(),state.global_layer_offset(),topology,context)
+    }, None => {
         super::state_identity(
             &self.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
         )
+    } }
+}
+    fn parameter_description(&self, context: &<B::Tensor as Tensor>::Context)
+        -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
+            &Self, &<B::Tensor as Tensor>::Context, std::borrow::Cow<'_, ArchitectureParameterDescription>,
+        )>()?;
+        Ok(std::borrow::Cow::Borrowed(&self.parameters))
     }
 
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.parameters.clone())
-    }
+
 
     fn retained_static_value_slot_bound(&self) -> Option<usize> {
         eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
@@ -390,24 +399,32 @@ where
         crate::transport::pipeline_state(0, layout)
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.parameters.graph().clone())
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            self.parameters.graph(),
+        ))
     }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         if group != 0 {
-            return Err(Error::backend("Kimi group is outside the target decoder"));
+            return Err(metadata.error(format_args!("{}", "Kimi group is outside the target decoder")));
         }
-        usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)
+        usize::try_from(self.args.num_hidden_layers).map_err(|cause| metadata.source(cause))
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         if group != 0
-            || index >= usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+            || index >= usize::try_from(self.args.num_hidden_layers).map_err(|cause| metadata.source(cause))?
         {
-            return Err(Error::backend("Kimi unit is outside the target decoder"));
+            return Err(metadata.error(format_args!("{}", "Kimi unit is outside the target decoder")));
         }
-        Ok(format!("model.layers.{index}"))
+        metadata.text(format_args!("model.layers.{index}"))
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -755,8 +772,8 @@ where
         group: usize,
         index: usize,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_points(&path, index))
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
+        Ok(self.args.routed_observation_points(&path, index, None)?)
     }
 
     fn forward_unit_with_provider<P>(
@@ -816,8 +833,8 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let points = self.args.routed_observation_points(&path, index);
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
+        let points = self.args.routed_observation_points(&path, index, None)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_partition_instrumented_with_feed_forward(
             hidden,
@@ -910,9 +927,9 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
         let ordinal = self.local_state_ordinal(index)?;
-        let points = self.args.routed_observation_points(&path, index);
+        let points = self.args.routed_observation_points(&path, index, None)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_partition_instrumented_with_feed_forward(
             hidden,
@@ -946,7 +963,14 @@ where
 {
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
             self.args.hidden_size,
         ))

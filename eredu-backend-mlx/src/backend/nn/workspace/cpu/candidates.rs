@@ -50,12 +50,12 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism: MlxCpuWo
     let source=(|| {
         // Batch/terminal row is a unit-step rectangle followed by reshape.
         // The entire input rectangle elides Slice when there is only one row.
-        if geometry.rows>1 {p.copy(OperationEvent::cpu_slice_layout(3,false)?,1,0)?;}
+        if geometry.rows>1 {p.copy(OperationEvent::cpu_slice_layout(3, false, false)?,1,0)?;}
         p.copy(OperationEvent::cpu_reshape_alias_layout(3,1,false)?,1,0)?;
         // F32 AsType is identity, so no conversion backing/task is invented.
         p.child(finite)?;p.child(cast)?;p.child(sum)?;
-        p.copy(OperationEvent::cpu_argsort_layout(width,false)?,1,sorted_bytes)?;
-        if count<width {p.copy(OperationEvent::cpu_slice_layout(1,false)?,1,0)?;}
+        p.copy(OperationEvent::cpu_argsort_layout(Dtype::Float32,1,width,1,false)?,1,sorted_bytes)?;
+        if count<width {p.copy(OperationEvent::cpu_slice_layout(1, false, false)?,1,0)?;}
         // Contiguous may keep the full sort buffer or copy K entries, based
         // on that actual backing's byte size. Keep both physical envelopes.
         p.copy(OperationEvent::cpu_contiguous_layout(1,false)?,1,selected_bytes)?;

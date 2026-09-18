@@ -23,37 +23,34 @@ intervention dtype (`f32`, `f16` or `bf16`). No downloads are performed.
 
 ## Prepare and discover support
 
-Prepare a normal `ChatTemplateRequest`, then call `prepare_observed_chat` with a
-bounded `CapturePlan`, or `prepare_intervened_chat` with a validated intervention
-request. `CapturePlan::none()` selects ordinary delivery. Pass the result to
-`start_controlled_chat(prepared, stops, control, callback)`.
+Compile retained tokenizer/template sources and call
+`prepare_chat(&source, &policy, capacity, &cancellation)`. Build a
+`PreparedChatRequest` with the same enforced capacity. Attach borrowed `capture`
+and `intervention` declarations; startup admits them against exact prompt
+geometry. `CapturePlan::none()` selects ordinary delivery.
 
-For an unrecognized template, explicitly select
-`start_controlled_text(prepared, stops, control, callback)`. `LoadedModel<B>`
-exposes it with the same arguments and session return type as its chat entry
-point. `start_controlled_chat` remains strict.
+Semantic and eligible literal output are explicit policies on that same request.
+Use `PreparedChatOutputMode::Text` when the retained template's text capability
+permits it. The runnable example above contains source compilation and error
+handling; its controlled startup is:
 
-```rust
-// model: LoadedModel<B>
-let chat = model.prepare_chat(request)?;
-let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
-// A UI can show chat.text_generation_support().unsupported_reason() before starting.
-let prepared = match intervention {
-    Some(plan) => model.prepare_intervened_chat(&chat, settings, capture, plan, trace_limits)?,
-    None => model.prepare_observed_chat(&chat, settings, capture, trace_limits)?,
+```rust,ignore
+let mut request = PreparedChatRequest::new(&chat, settings);
+request.capture = Some(&capture);
+request.intervention = intervention.as_ref();
+request.output_mode = output_mode;
+request.stop_sequences = &stops;
+let Some(mut session) = model.start_controlled_chat(
+    request, trace_limits, control, &mut emit,
+)? else {
+    return Ok(()); // Cancelled before startup.
 };
-let mut session = if semantic {
-    model.start_controlled_chat(prepared, &stops, control, &mut emit)?
-} else {
-    model.start_controlled_text(prepared, &stops, control, &mut emit)?
-};
-session.step(&mut emit)?; // Existing session handling stays unchanged.
+session.step(&mut emit)?;
 ```
 
-Import `SemanticSupport` from `eredu::runtime::chat`. The
-[`LoadedModel::start_controlled_text` rustdoc](../eredu/src/api/control.rs) contains
-a complete generic example. Capture, intervention, trace and control types retain
-their existing public paths.
+Read capability reasons from the prepared chat before selecting output policy.
+Capture, intervention and trace plans do not replace the request's original
+source identity or enforced memory admission.
 
 Text mode consumes the prepared prompt IDs exactly, including the rendered
 generation prefix. It retains checkpoint sampling defaults, overrides, seed and
@@ -93,21 +90,21 @@ has a recognized reasoning parser. Template defaults remain unchanged. Admission
 fails through the existing prepared-chat error convention before native startup.
 
 Check `session.capabilities()`. Stepping and pausing describe the actual loaded
-configuration. Configure `enable_snapshots(SnapshotLimits { ... })` once before
+configuration. Configure `enable_snapshots(limits, capacity, copy_limits)` once before
 retaining state. This rejects unknown native, grammar or semantic costs. Creating
 a snapshot additionally establishes whether complete continuation growth is known
 for branching; `capabilities().fork` then reports that result. Every fork still
 validates its own plans and budgets.
 
-Complete facade snapshots support text mode and the forbidden-tool constraint
-mode on a supported tool profile. The runnable example declares a tool and sets
-`ToolChoice::None`. Active and automatic llguidance constraints have independent
-copying but no complete storage estimate and reject snapshots. A no-tools request
-may still use an active semantic grammar. Show the returned support reason in the
-UI; do not interpret native KV-copy support as full generation-snapshot support.
-Text snapshots retain partial Unicode, caller-stop lookbehind, pending forced
-choices and decoder state. Snapshot compatibility includes text versus semantic
-mode. Native support and bounded retention/copying admission still apply.
+Snapshot support requires complete native, controller and semantic copy bounds
+at the actual boundary. Active and automatic grammars use the same admitted copy
+workers as ordinary prepared-chat continuation; a missing bound remains a typed
+refusal. Show the returned support reason instead of inferring full snapshot
+support from a native KV-copy primitive. Snapshots retain partial Unicode,
+caller-stop lookbehind, pending forced choices, decoder state and cumulative
+spending. Compatibility includes text versus semantic output policy. See
+[execution control](execution-control.md#snapshot-restore-and-fork) for current
+capability limits and validation coverage.
 
 ## Drive one logical run
 
@@ -224,8 +221,8 @@ counts the first committed token even when decoding buffers it; `None` means no
 commitment. Restoration does not reset it.
 
 Keep speculative resources on the same owning worker, using
-`model.with_controlled_chat_speculative(request, options, |session| { ... })`
-(or `with_controlled_text_speculative` for literal text). Inside that closure,
+`model.with_controlled_prepared_chat_speculative(request, options, |session| { ... })`
+(or `with_controlled_managed_plain_text_speculative` for literal text). Inside that closure,
 wait for worker commands and call `session.step()` once per requested scheduler
 action. Iterate until `None` for uninterrupted completion; returning early cancels
 and settles the native work. The existing request's semantic callback still emits

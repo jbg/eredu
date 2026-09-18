@@ -2,10 +2,7 @@ use super::{
     normalizer::Range, Model, NormalizedString, Normalizer, Offsets,
     PreTokenizedString, Result, Token,
 };
-use ahash::{AHashMap, AHashSet};
-use daachorse::{
-    DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind,
-};
+use ahash::AHashMap;
 use regex::Regex;
 use serde::{ser::SerializeSeq, Deserialize, Serialize, Serializer};
 use std::sync::LazyLock;
@@ -96,7 +93,7 @@ impl std::hash::Hash for AddedToken {
     }
 }
 
-type MatchingSet = Option<DoubleArrayAhoCorasick<u32>>;
+mod matcher;
 mod access;
 mod identity;
 pub(crate) use identity::IdentityMatching;
@@ -106,19 +103,14 @@ pub(crate) use packed::AddedVocabularyRecipe;
 pub use packed::{
     AddedVocabularyCompileError, AddedVocabularyCompileErrorKind,
     AddedVocabularyCompileFailure, AddedVocabularyCompilePlan,
-    AddedVocabularyCompileRequirements,
+    AddedVocabularyCompileRequirements, AddedVocabularyRefreshPlan,
 };
 #[derive(Clone)]
 pub struct AddedVocabulary {
-    storage: Storage,
-}
-#[derive(Clone)]
-enum Storage {
-    Legacy(LegacyAddedVocabulary),
-    Packed(packed::Packed),
+    storage: packed::Packed,
 }
 impl AddedVocabulary {
-    /// Find any AddedToken in the given sentence, using the provided MatchingSet.
+    /// Find any AddedToken in the given sentence, using the selected normalization phase.
     /// This method returns a list "splits", each of them being a pair of Offsets
     /// and an optional ID if it is an AddedToken.
     /// The list of splits cover the entire input string.
@@ -148,9 +140,8 @@ impl AddedVocabulary {
             .checked_add(std::mem::size_of::<(Option<u32>, Offsets)>())?
             .checked_add(std::mem::size_of::<AddedTokenRef<'_>>())
     }
-    pub(crate) fn raw_packed_literals(&self) -> bool {
-        matches!(&self.storage, Storage::Packed(_))
-            && self.tokens().all(|(_, t)| {
+    pub(crate) fn raw_literals(&self) -> bool {
+        self.tokens().all(|(_, t)| {
                 !t.normalized && !t.single_word && !t.lstrip && !t.rstrip
             })
     }
@@ -367,346 +358,11 @@ fn space_rightmost_at_start(sentence: &str) -> usize {
 /// were to add new tokens after this training process, we couldn't make sure the merges pairs
 /// exist as required.
 ///
-#[derive(Clone)]
-struct LegacyAddedVocabulary {
-    /// Contains the mapping from String (token content) to ID. This map contains both special
-    /// tokens and classic added tokens that were added to the this vocabulary.
-    added_tokens_map: AHashMap<String, u32>,
-    /// Contains the mapping from ID to AddedToken for all the added tokens, both special
-    /// and classic.
-    added_tokens_map_r: AHashMap<u32, AddedToken>,
-
-    /// A Set, containing all the special token for easy access while decoding. This let's
-    /// us remove them easily with an O(1) complexity.
-    special_tokens_set: AHashSet<String>,
-
-    /// Cache of the normalizer output for tokens that have `normalized = true`.
-    /// Keyed by token ID. Not serialized — rebuilt by `add_tokens` and
-    /// `refresh_normalized_tokens` whenever the normalizer changes.
-    /// Kept separate from `AddedToken` so the token struct stays lean.
-    normalized_cache: AHashMap<u32, String>,
-
-    /// A RegexSet containing all the non-normalized patterns used to split on AddedTokens
-    split_trie: MatchingSet,
-    /// A RegexSet containing all the normalized patterns used to split on AddedTokens
-    split_normalized_trie: MatchingSet,
-
-    /// Whether or not special tokens should be splitted when encoding. This is equivalent to ignoring them
-    encode_special_tokens: bool,
-}
-
-impl std::fmt::Debug for LegacyAddedVocabulary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AddedVocabulary")
-            .field("added_tokens_map", &self.added_tokens_map)
-            .field("added_tokens_map_r", &self.added_tokens_map_r)
-            .field("special_tokens_set", &self.special_tokens_set)
-            .field("encode_special_tokens", &self.encode_special_tokens)
-            .finish_non_exhaustive()
-    }
-}
-
-impl LegacyAddedVocabulary {
-    pub fn new() -> Self {
-        Self {
-            added_tokens_map: AHashMap::new(),
-            added_tokens_map_r: AHashMap::new(),
-            special_tokens_set: AHashSet::new(),
-            normalized_cache: AHashMap::new(),
-            split_trie: None,
-            split_normalized_trie: None,
-            encode_special_tokens: false,
-        }
-    }
-    /// Size of the additional vocabulary
-    #[allow(dead_code)] // Suppress the "method is never used" warning
-    pub fn len(&self) -> usize {
-        self.added_tokens_map.len()
-    }
-
-    /// Whether or not this vocabulary is empty
-    pub fn is_empty(&self) -> bool {
-        self.added_tokens_map.is_empty()
-    }
-
-    /// Get the additional vocabulary
-    pub fn get_vocab(&self) -> &AHashMap<String, u32> {
-        &self.added_tokens_map
-    }
-
-    /// Get the additional vocabulary with the AddedTokens
-    pub fn get_added_tokens_decoder(&self) -> &AHashMap<u32, AddedToken> {
-        &self.added_tokens_map_r
-    }
-
-    /// Get the id matching one of our token if it exists
-    pub fn token_to_id(&self, token: &str, model: &impl Model) -> Option<u32> {
-        self.added_tokens_map
-            .get(token)
-            .copied()
-            .or_else(|| model.token_to_id(token))
-    }
-
-    /// Get the token matching the given id if it exists
-    #[deprecated(
-        since = "0.19.0",
-        note = "please use `added_vocabulary.simple_id_to_token(id).or_else(|| model.id_to_token(id)` instead"
-    )]
-    pub fn id_to_token(&self, id: u32, model: &impl Model) -> Option<String> {
-        self.added_tokens_map_r
-            .get(&id)
-            .map(|t| t.content.clone())
-            .or_else(|| model.id_to_token(id))
-    }
-
-    pub(crate) fn decode_token_ref(&self, id: u32) -> Option<&str> {
-        self.added_tokens_map_r.get(&id).map(|token| {
-            self.normalized_cache
-                .get(&id)
-                .map(String::as_str)
-                .unwrap_or(token.content.as_str())
-        })
-    }
-
-    /// Return the string form of an added token used during **decoding**.
-    ///
-    /// For tokens that were normalized on the way *in* (e.g. byte-level encoding),
-    /// this returns the cached normalized form so that the configured `Decoder` can
-    /// invert the transformation correctly. For all other tokens, the original
-    /// `content` is returned.
-    pub fn simple_id_to_token(&self, id: u32) -> Option<String> {
-        self.added_tokens_map_r.get(&id).map(|t| {
-            self.normalized_cache
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| t.content.clone())
-        })
-    }
-
-    //
-    pub fn set_encode_special_tokens(&mut self, value: bool) {
-        self.encode_special_tokens = value;
-    }
-
-    pub fn get_encode_special_tokens(&self) -> bool {
-        self.encode_special_tokens
-    }
-
-    /// Check if a token is a special token
-    pub fn is_special_token(&self, token: &str) -> bool {
-        self.special_tokens_set.contains(token)
-    }
-
-    /// Add some special tokens to the vocabulary
-    pub fn add_special_tokens<N: Normalizer>(
-        &mut self,
-        tokens: impl IntoIterator<Item = AddedToken>,
-        model: &impl Model,
-        normalizer: Option<&N>,
-    ) -> Result<usize> {
-        self.add_tokens(tokens, model, normalizer)
-    }
-
-    /// Add some tokens to the vocabulary
-    pub fn add_tokens<N: Normalizer>(
-        &mut self,
-        tokens: impl IntoIterator<Item = AddedToken>,
-        model: &impl Model,
-        normalizer: Option<&N>,
-    ) -> Result<usize> {
-        let mut ignored = 0;
-        let mut total = 0;
-
-        let mut next_id = self.added_tokens_map_r.keys().max().map_or(
-            model.get_vocab_size() as u32,
-            |max| {
-                if *max >= model.get_vocab_size() as u32
-                    || model.get_vocab_size() == 0
-                {
-                    max + 1
-                } else {
-                    model.get_vocab_size() as u32
-                }
-            },
-        );
-
-        for token in tokens {
-            total += 1;
-            if token.content.is_empty() {
-                ignored += 1;
-                continue;
-            }
-            // Fast path: skip if this content is already in the map with identical properties.
-            if let Some(id) = self.added_tokens_map.get(&token.content) {
-                if self.added_tokens_map_r.get(id) == Some(&token) {
-                    ignored += 1;
-                    continue;
-                }
-            }
-
-            let new_id = if let Some(new_id) =
-                self.token_to_id(&token.content, model)
-            {
-                new_id
-            } else {
-                let id = next_id;
-                next_id += 1;
-                id
-            };
-
-            if token.normalized {
-                if let Some(n) = normalizer {
-                    let mut s = NormalizedString::from(token.content.as_ref());
-                    n.normalize(&mut s)?;
-                    let normed = s.get().to_string();
-                    if normed != token.content {
-                        self.normalized_cache.insert(new_id, normed);
-                    }
-                }
-            }
-
-            *self
-                .added_tokens_map
-                .entry(token.content.clone())
-                .or_default() = new_id;
-
-            let is_new_special = token.special
-                && !token.content.is_empty()
-                && !self.special_tokens_set.contains(&token.content);
-            if is_new_special {
-                self.special_tokens_set.insert(token.content.clone());
-            }
-            self.added_tokens_map_r.insert(new_id, token);
-        }
-
-        self.refresh_added_tokens()?;
-
-        // Return the number of added tokens
-        Ok(total - ignored)
-    }
-
-    /// Re-apply normalization to every added token that has `normalized = true`, then
-    /// rebuild the matching tries.
-    ///
-    /// This is called automatically by [`TokenizerImpl::with_normalizer`] when the
-    /// normalizer is replaced. For tokenizers with many added tokens the trie rebuild
-    /// can be slow; prefer setting the normalizer *before* calling `add_tokens` when
-    /// constructing a tokenizer programmatically. During deserialization this is never
-    /// triggered because the normalizer is set via the builder before tokens are added.
-    pub fn refresh_normalized_tokens<N: Normalizer>(
-        &mut self,
-        normalizer: Option<&N>,
-    ) -> Result<()> {
-        self.normalized_cache.clear();
-        for (id, token) in &self.added_tokens_map_r {
-            if token.normalized {
-                if let Some(n) = normalizer {
-                    let mut s = NormalizedString::from(token.content.as_ref());
-                    n.normalize(&mut s)?;
-                    let normed = s.get().to_string();
-                    if normed != token.content {
-                        self.normalized_cache.insert(*id, normed);
-                    }
-                }
-            }
-        }
-        self.refresh_added_tokens()
-    }
-
-    /// Reconstruct our internal RegexSet when new tokens are added to the vocabulary.
-    /// # TODO @ArthurZucker we should probably make this async? rebuilding the regex takes a long time.
-    /// We keep two different RegexSet, one that will take care of matching against the
-    /// non-normalized string, and one matching against the normalized one.
-    fn refresh_added_tokens(&mut self) -> Result<()> {
-        // Build two lists: patterns for the normalized trie and for the non-normalized trie.
-        // For normalized tokens we use the cached normalized form when available, falling back
-        // to the original content (no normalizer set yet).  A for loop is used instead of an
-        // iterator + closure so the borrow checker can see that `added_tokens_map_r` and
-        // `normalized_cache` are disjoint fields, allowing both to be borrowed immutably while
-        // `split_trie` / `split_normalized_trie` are assigned afterwards.
-        let mut normalized_pairs: Vec<(&str, u32)> = Vec::new();
-        let mut non_normalized_pairs: Vec<(&str, u32)> = Vec::new();
-        for (id, token) in &self.added_tokens_map_r {
-            if token.normalized {
-                let pattern = self
-                    .normalized_cache
-                    .get(id)
-                    .map(String::as_str)
-                    .unwrap_or(token.content.as_str());
-                normalized_pairs.push((pattern, *id));
-            } else {
-                non_normalized_pairs.push((token.content.as_str(), *id));
-            }
-        }
-
-        self.split_trie = if non_normalized_pairs.is_empty() {
-            None
-        } else {
-            Some(
-                DoubleArrayAhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
-                    .build_with_values(non_normalized_pairs)
-                    .map_err(|e| e.to_string())?,
-            )
-        };
-
-        self.split_normalized_trie = if normalized_pairs.is_empty() {
-            None
-        } else {
-            Some(
-                DoubleArrayAhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
-                    .build_with_values(normalized_pairs)
-                    .map_err(|e| e.to_string())?,
-            )
-        };
-
-        Ok(())
-    }
-}
-
-impl Default for LegacyAddedVocabulary {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct AddedTokenWithId {
-    /// The id assigned to this token
     pub id: u32,
     #[serde(flatten)]
-    /// The target AddedToken
     pub token: AddedToken,
-}
-
-impl Serialize for LegacyAddedVocabulary {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut added_tokens = self
-            .added_tokens_map_r
-            .iter()
-            .map(|(id, token)| AddedTokenWithId {
-                id: *id,
-                token: token.clone(),
-            })
-            .collect::<Vec<_>>();
-        // We need to have these added tokens ordered by ascending ID
-        added_tokens.sort_unstable_by_key(|o| o.id);
-
-        let mut vocabulary =
-            serializer.serialize_seq(Some(added_tokens.len()))?;
-        for token in added_tokens {
-            vocabulary.serialize_element(&token)?;
-        }
-
-        vocabulary.end()
-    }
 }
 
 #[cfg(test)]
@@ -907,7 +563,7 @@ mod tests {
         assert_eq!(vocab.len(), 3); // New token was added
         assert!(vocab.is_special_token("test"));
         assert_eq!(
-            *vocab.get_added_tokens_decoder(),
+            vocab.get_added_tokens_decoder(),
             AHashMap::from([
                 (0, AddedToken::from("test", true)),
                 (2, AddedToken::from("added_token_1", true)),
@@ -1325,3 +981,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benchmark;

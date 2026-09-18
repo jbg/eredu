@@ -175,3 +175,6 @@ pub mod nemotron_h;
 
 /// Qwen2, Qwen3, and Qwen3-MoE text decoder architecture.
 pub mod qwen;
+
+#[cfg(test)]
+mod architecture_parameter_metadata_tests;

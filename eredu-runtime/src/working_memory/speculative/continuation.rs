@@ -2,7 +2,7 @@
 use super::*;
 use crate::speculative::autoregressive::AutoregressiveContinuation;
 use eredu_core::SpeculativeBufferAllocationError;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 
 /// A failed extension cannot change the issuance limit or rewind attempts.
 #[derive(Debug, thiserror::Error)]
@@ -12,7 +12,7 @@ pub enum SpeculativeContinuationError {
     Request(#[from] WorkingMemoryError),
     /// Exact debit refused before allocation.
     #[error(transparent)]
-    Metadata(#[from] WorkspaceMetadataFundingError),
+    Metadata(#[from] HostMetadataFundingError),
     /// Destination allocation failed while retaining its actual paying account.
     #[error(transparent)]
     Allocation(#[from] SpeculativeBufferAllocationError),
@@ -24,7 +24,7 @@ impl OriginalSpeculativeRequest {
     pub fn prepare_continuation(
         &self,
         continuation: &AutoregressiveContinuation,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), SpeculativeContinuationError> {
         self.prepare_continuation_slots(
             ScheduleIdentity::Autoregressive(continuation.identity()),
@@ -34,7 +34,7 @@ impl OriginalSpeculativeRequest {
                 n.checked_add(size_of::<(
                     &Self,
                     &AutoregressiveContinuation,
-                    &WorkspaceMetadataFunding,
+                    &HostMetadataFunding,
                 )>())
             }),
             funding,
@@ -45,7 +45,7 @@ impl OriginalSpeculativeRequest {
     pub fn prepare_embedded_continuation(
         &self,
         continuation: &crate::speculative::embedded_occurrence::EmbeddedContinuation,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), SpeculativeContinuationError> {
         use crate::speculative::embedded_occurrence::EmbeddedContinuation;
         self.prepare_continuation_slots(
@@ -56,7 +56,7 @@ impl OriginalSpeculativeRequest {
                 n.checked_add(size_of::<(
                     &Self,
                     &EmbeddedContinuation,
-                    &WorkspaceMetadataFunding,
+                    &HostMetadataFunding,
                 )>())
             }),
             funding,
@@ -68,7 +68,7 @@ impl OriginalSpeculativeRequest {
         previous_slots: usize,
         next_slots: usize,
         caller_controls: Option<usize>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), SpeculativeContinuationError> {
         let mut slots = self
             .slots
@@ -93,7 +93,7 @@ impl OriginalSpeculativeRequest {
                 usize,
                 usize,
                 Option<usize>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>()),
         ];
         let bytes = parts

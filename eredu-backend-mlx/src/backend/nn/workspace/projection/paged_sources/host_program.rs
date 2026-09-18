@@ -114,7 +114,7 @@ pub(super) struct PreparedPagedHostProgram {
     facts: Option<HostSourceConstructionFacts>,
     constructed: bool,
     context: WorkspaceContext,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 fn dtype(value: eredu_nn::workspace::WorkspaceFloatingType) -> Dtype {
     match value {
@@ -802,3 +802,5 @@ impl ProjectedPagedSources {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

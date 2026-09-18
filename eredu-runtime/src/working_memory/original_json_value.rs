@@ -1,6 +1,6 @@
 //! Source-bound full JSON validation through the existing paid serde event parser.
 use eredu_core::{HostPreparationAuthority, SemanticText, SemanticTextAllocationError};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use serde_json::bounded_events::{Event, Plan, PlanError, Sink};
 use std::mem::{size_of, size_of_val};
 
@@ -12,7 +12,7 @@ enum Cause {
     #[error(transparent)]
     Syntax(#[from] serde_json::Error),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Text(#[from] SemanticTextAllocationError),
     #[error("original JSON field source has no root value")]
@@ -29,7 +29,7 @@ pub struct OriginalJsonValueError {
     cause: Cause,
     event_failure: Option<Cause>,
     partial: Option<SemanticText>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Validated root and exact borrowed input. An object certificate cannot be
 /// detached from the JSON bytes consumed by the actual parser.
@@ -38,21 +38,21 @@ pub struct OriginalJsonValue<'a> {
     input: &'a str,
     kind: OriginalJsonValueKind,
     text: Option<SemanticText>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug)]
 struct Probe {
     kind: Option<OriginalJsonValueKind>,
     text: Option<SemanticText>,
     failure: Option<Cause>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Probe {
     fn copy_text(&mut self, value: &str) -> Result<(), Cause> {
         let bytes = SemanticText::retained_control_bytes(value.len())
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .ok_or(Cause::Overflow)?;
@@ -65,6 +65,9 @@ impl Probe {
     }
 }
 impl Sink for Probe {
+    fn stopped(&self) -> bool {
+        self.failure.is_some()
+    }
     fn event(&mut self, event: Event<'_>) {
         if self.kind.is_some() || self.failure.is_some() {
             return;
@@ -78,7 +81,9 @@ impl Sink for Probe {
                 }
                 OriginalJsonValueKind::String
             }
-            Event::I64(_) | Event::U64(_) | Event::F64(_) => OriginalJsonValueKind::Number,
+            Event::I64(_) | Event::U64(_) | Event::F64(_) | Event::Number(_) => {
+                OriginalJsonValueKind::Number
+            }
             Event::Bool(_) => OriginalJsonValueKind::Bool,
             Event::Null => OriginalJsonValueKind::Null,
             Event::Key(_) | Event::EndObject | Event::EndArray => {
@@ -97,20 +102,20 @@ impl<'a> OriginalJsonValue<'a> {
             size_of::<OriginalJsonValueError>(),
             size_of::<Cause>(),
             size_of::<Option<Cause>>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Option<SemanticText>>(),
             size_of::<Option<OriginalJsonValueKind>>(),
             size_of::<Event<'_>>(),
             size_of::<Result<Self, OriginalJsonValueError>>(),
             size_of::<Result<(), Cause>>(),
             size_of::<Result<(), serde_json::Error>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<Result<SemanticText, SemanticTextAllocationError>>(),
             size_of::<Result<Plan<'_>, PlanError>>(),
             size_of::<Plan<'_>>(),
             size_of::<serde_json::bounded_events::Requirements>(),
             size_of::<Result<serde_json::bounded_events::Requirements, PlanError>>(),
-            size_of::<(&str, &WorkspaceMetadataFunding)>(),
+            size_of::<(&str, &HostMetadataFunding)>(),
             size_of::<(&mut Probe, &str)>(),
             size_of::<HostPreparationAuthority>(),
         ];
@@ -123,7 +128,7 @@ impl<'a> OriginalJsonValue<'a> {
     /// Root strings additionally pay their own immutable output destination.
     pub fn parse(
         input: &'a str,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalJsonValueError> {
         let retain = |cause| OriginalJsonValueError {
             cause,
@@ -147,17 +152,23 @@ impl<'a> OriginalJsonValue<'a> {
             failure: None,
             funding: funding.clone(),
         };
-        if let Err(cause) = plan.parse(&mut probe) {
-            return Err(OriginalJsonValueError {
-                cause: cause.into(),
-                event_failure: probe.failure,
-                partial: probe.text,
-                funding: probe.funding,
-            });
+        let allocation = super::original_json_allocation::JsonAllocation::new(funding)
+            .map_err(|cause| retain(cause.into()))?;
+        let parsed = plan.parse(&mut probe, &allocation);
+        if let Some(cause) = allocation.failure() {
+            return Err(retain(cause.into()));
         }
         if let Some(cause) = probe.failure {
             return Err(OriginalJsonValueError {
                 cause,
+                event_failure: None,
+                partial: probe.text,
+                funding: probe.funding,
+            });
+        }
+        if let Err(cause) = parsed {
+            return Err(OriginalJsonValueError {
+                cause: cause.into(),
                 event_failure: None,
                 partial: probe.text,
                 funding: probe.funding,

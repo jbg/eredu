@@ -36,7 +36,7 @@ struct PagedSourceBank {
     sources: Vec<crate::backend::runtime::cache::kv::ProjectedPagedSource>,
     roles: RefCell<roles::RoleState>,
     context: WorkspaceContext,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl std::fmt::Debug for ProjectedPagedSources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

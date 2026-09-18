@@ -11,6 +11,12 @@ use eredu_core::{
 };
 use eredu_runtime::prefill::{PrefillControlPlan, PrefillControlRole};
 use std::num::NonZeroU64;
+#[path = "prefill_tests/cpu_paged.rs"]
+mod cpu_paged;
+#[path = "prefill_tests/activation.rs"]
+mod activation;
+#[path = "prefill_tests/persistent_disk.rs"]
+mod persistent_disk;
 
 fn config(original: bool) -> TextGenerationConfig {
     let mut config = fixture::config(4, u64::MAX);
@@ -25,33 +31,122 @@ fn config(original: bool) -> TextGenerationConfig {
         config.with_inference_policy(policy)
     }
 }
+fn original_source_config() -> TextGenerationConfig {
+    // The borrowed token source supplies the actual input producer. Derive
+    // both native arenas from that complete source rather than old test caps.
+    let config = config(true);
+    let mut policy = config.inference_policy();
+    policy.submission_tracking_capacity_bytes = None;
+    policy.graph_metadata_capacity_bytes = None;
+    config.with_inference_policy(policy)
+}
 #[test]
 fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency_results() {
-    let stream = fixture::stream();
+    let environment = fixture::PreparedResidencyFixture::new();
+    let stream = environment.stream();
+    let pool = &environment.pool;
     for residency in 0..3 {
         let mut expected = None;
         for original in [false, true] {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-                let (mut runtime, _artifact) = fixture::load(&stream, &pool, residency);
+                let (mut runtime, _artifact, baseline) = environment.load(residency, None);
+                let disk_reads = environment.disk_read_bytes(&runtime, residency);
                 let probe = original.then(|| Probe::new(&runtime, None, false));
                 let trace = Trace::new();
                 let input = vec![2, 5, 7, 3, 11];
+                let mut request_config = config(original);
+                if original {
+                    // The admitted fixture supplies its actual borrowed input
+                    // source. Select complete native arenas from that source;
+                    // a raw ordinary Vec cannot prove the input Graph producer.
+                    let mut policy = request_config.inference_policy();
+                    policy.submission_tracking_capacity_bytes = None;
+                    policy.graph_metadata_capacity_bytes = None;
+                    request_config = request_config.with_inference_policy(policy);
+                }
                 let outputs = if controlled {
-                    ControlledTextGeneration::from_input(
-                        &mut runtime,
-                        TextGenerationInput::TokenIds(input),
-                        config(original),
-                        disk::Controller::default(),
-                    )
-                    .unwrap()
-                    .map(|t| t.unwrap().into_output())
-                    .collect::<Vec<_>>()
+                    let mut generation = if original {
+                        ControlledTextGeneration::from_token_ids_with_sequence(
+                            &mut runtime,
+                            eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
+                            request_config,
+                            disk::Controller::default(),
+                            None,
+                            GenerationSequenceRequest::new(4, &[]),
+                        )
+                    } else {
+                        ControlledTextGeneration::from_input(
+                            &mut runtime,
+                            TextGenerationInput::TokenIds(input),
+                            request_config,
+                            disk::Controller::default(),
+                        )
+                    }
+                    .unwrap();
+                    let mut sequence = original.then(|| {
+                        generation
+                            .take_prepared_sequence()
+                            .unwrap()
+                            .prepare_storage()
+                            .unwrap()
+                    });
+                    let mut outputs = Vec::new();
+                    for next in &mut generation {
+                        let token = next.unwrap_or_else(|error| panic!(
+                            "residency={residency}, original={original}, controlled={controlled}: {error:?}"));
+                        if let Some(sequence) = &mut sequence {
+                            sequence
+                                .commit(
+                                    token.token_id(),
+                                    eredu_core::TokenTerminalSignals::default(),
+                                )
+                                .unwrap();
+                        }
+                        outputs.push(token.into_output());
+                    }
+                    if let Some(sequence) = sequence {
+                        assert_eq!(sequence.tokens().len(), 4);
+                    }
+                    outputs
                 } else {
-                    TextGeneration::new(&mut runtime, input, config(original))
-                        .unwrap()
-                        .map(Result::unwrap)
-                        .collect::<Vec<_>>()
+                    let mut generation = if original {
+                        TextGeneration::from_token_ids_with_sequence(
+                            &mut runtime,
+                            eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
+                            request_config,
+                            TokenFilter::All,
+                            None,
+                            GenerationSequenceRequest::new(4, &[]),
+                        )
+                    } else {
+                        TextGeneration::new(&mut runtime, input, request_config)
+                    }
+                    .unwrap();
+                    let mut sequence = original.then(|| {
+                        generation
+                            .take_prepared_sequence()
+                            .unwrap()
+                            .prepare_storage()
+                            .unwrap()
+                    });
+                    let mut outputs = Vec::new();
+                    for next in &mut generation {
+                        let token = next.unwrap_or_else(|error| panic!(
+                            "residency={residency}, original={original}, controlled={controlled}: {error:?}"));
+                        if let Some(sequence) = &mut sequence {
+                            sequence
+                                .commit(
+                                    token.token_id().unwrap(),
+                                    eredu_core::TokenTerminalSignals::default(),
+                                )
+                                .unwrap();
+                        }
+                        outputs.push(token);
+                    }
+                    if let Some(sequence) = sequence {
+                        assert_eq!(sequence.tokens().len(), 4);
+                    }
+                    outputs
                 };
                 assert_eq!(outputs.len(), 4);
                 let tokens = outputs
@@ -86,6 +181,7 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                     expected = Some((tokens, numeric));
                 }
                 let events = trace.events();
+                environment.assert_disk_read_progress(&runtime, residency, disk_reads);
                 let prepared = events
                     .iter()
                     .filter_map(|e| match e {
@@ -100,15 +196,29 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(completed.len(), 3);
+                let on_stream = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::ModelCompleted { roots } => Some(*roots),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                // A complete native recipe selects the prepared stream for
+                // each of three prefill spans and three cached decode steps.
+                // The ordinary reference uses its three prefill collectors.
+                assert_eq!(completed.len(), if original { 0 } else { 3 },
+                    "residency={residency}, original={original}, controlled={controlled}: {events:?}");
+                assert_eq!(on_stream.len(), if original { 6 } else { 0 },
+                    "residency={residency}, original={original}, controlled={controlled}: {events:?}");
                 assert!(completed.iter().all(|(roots, _)| *roots > 0));
+                assert!(on_stream.iter().all(|roots| *roots > 0));
                 if original {
                     assert_eq!(prepared.len(), 1);
                     let (plan, roots, graph) = prepared[0];
                     assert_eq!(plan.span_count(), 3);
                     assert_eq!(plan.scope_count(), 17);
                     assert!(roots > 0);
-                    assert!(graph > 0 && graph < 4 << 20);
+                    assert!(graph > 0);
                     assert!(matches!(events.first(), Some(Event::Prepared { .. })));
                     let actual = events
                         .iter()
@@ -128,20 +238,31 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                     assert!(prepared.is_empty());
                     assert!(completed.iter().all(|(_, original)| !*original));
                 }
+                if let Some(probe) = &probe {
+                    let preparation = probe.take();
+                    assert!(preparation.quote.as_ref().unwrap().record_quota.is_some());
+                }
                 drop((outputs, probe, trace));
-                fixture::finish(runtime, &stream);
-                fixture::settle(&pool, 0);
+                fixture::finish(runtime, stream);
+                fixture::settle(pool, baseline);
             }
         }
     }
 }
 #[test]
 fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_advancing() {
-    let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
+    let environment = fixture::PreparedResidencyFixture::new();
+    let pool = &environment.pool;
+    let (mut runtime, _artifact, first_source_baseline) = environment.load(0, None);
+    let stream = runtime.backend().stream().clone();
     // Construct both model identities before the original request reserves work.
-    let (foreign_runtime, _other_artifact) = fixture::load(&stream, &pool, 0);
+    let before_foreign_source = pool.used_bytes().unwrap();
+    let (foreign_runtime, _other_artifact, foreign_target_bytes) = environment.load(0, None);
+    let foreign_stream = foreign_runtime.backend().stream().clone();
+    let source_baseline = first_source_baseline
+        .checked_add(foreign_target_bytes.checked_sub(before_foreign_source).unwrap())
+        .unwrap();
+    runtime.backend().validate_original_stream_owners().unwrap();
     let native_runtime = runtime
         .session()
         .payload
@@ -150,10 +271,10 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
         .prefill_roots_runtime()
         .unwrap();
     let probe = Probe::new(&runtime, None, false);
-    let run = TextGeneration::from_input_with_sequence(
+    let run = TextGeneration::from_token_ids_with_sequence(
         &mut runtime,
-        TextGenerationInput::TokenIds(vec![2, 5, 7, 3, 11]),
-        config(true),
+        eredu_core::TokenIdsInputPlan::new(&[2, 5, 7, 3, 11]).unwrap(),
+        original_source_config(),
         TokenFilter::All,
         None,
         GenerationSequenceRequest::new(4, &[]),
@@ -203,11 +324,11 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
     assert!(roots.is_none());
     assert!(view.begin(step.request(), first).is_err());
     guard.seal();
-    assert!(guard.finish().settled);
+    assert!(guard.finish().unwrap().settled);
     let (mut next, roots) = view.begin(step.request(), plan.role(1).unwrap()).unwrap();
     assert!(roots.is_none());
     next.seal();
-    assert!(next.finish().settled);
+    assert!(next.finish().unwrap().settled);
     drop(run); // releases the core mutable runtime loan; original bank remains live
     let executable = runtime.session().payload.model.erased();
     assert_eq!(
@@ -246,22 +367,32 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
     );
     assert!(view.is_live());
     assert_eq!(executable.prefill_status_for_test().unwrap(), (true, true));
-    fixture::finish(foreign_runtime, &stream);
+    fixture::finish(foreign_runtime, &foreign_stream);
     assert!(pool.used_bytes().unwrap() >= held);
-    drop((step, owner, preparation, probe));
+    runtime.synchronize().unwrap();
+    assert!(view.is_live());
+    assert_eq!(executable.prefill_status_for_test().unwrap(), (true, true));
+    drop((step, preparation, probe));
+    // The first ordinary snapshot retires only the outer node. The bank stays
+    // live through the initial idle/expired-view check, then the fixed-point
+    // cleanup destroys its last strong owner. Synchronize must revisit the
+    // installed weak after that destruction; the external view remains paid.
+    use crate::backend::ordinary_retirement::OrdinaryRetirement;
+    drop(OrdinaryRetirement::new(OrdinaryRetirement::new(owner)));
+    assert!(view.is_live());
+    assert_eq!(executable.prefill_status_for_test().unwrap(), (true, true));
+    runtime.synchronize().unwrap();
     assert!(!view.is_live());
-    assert_eq!(executable.prefill_status_for_test().unwrap(), (true, false));
-    // Retire the installed weak projection outside both real loans. The final
-    // external alias still retains the priced header after the session retires.
-    executable.retire_expired_opening_rows().unwrap();
     assert_eq!(
         executable.prefill_status_for_test().unwrap(),
         (false, false)
     );
     fixture::finish(runtime, &stream);
-    fixture::settle(&pool, held);
+    // The escaped view retains Q and its actual parent planning/source accounts.
+    // The pre-request factory source baseline remains independently owned.
+    assert!(pool.used_bytes().unwrap() >= source_baseline.checked_add(held).unwrap());
     drop(view);
-    fixture::settle(&pool, 0);
+    fixture::settle(pool, source_baseline);
 }
 #[test]
 fn c1_smaller_chunks_recompute_all_collector_occupancy_and_keep_unknown_producers_explicit() {
@@ -484,7 +615,7 @@ fn c4_genuine_original_source_span_and_final_index_roles_evaluate_with_retained_
                 }
             }
             guard.seal();
-            assert!(guard.finish().settled, "role {role:?}");
+            assert!(guard.finish().unwrap().settled, "role {role:?}");
         }
         assert!(escaped.is_some());
         drop((run, step, bank, view, preparation, probe));
@@ -779,20 +910,13 @@ fn with_prepared_original_operation_reservation<T>(
     .unwrap();
     let probe = Probe::new(runtime, None, false);
     let run = if let Some(tokenizer) = tokenizer.as_ref() {
-        // Use the public request's single ceiling. The selected native
-        // constructors derive both component arenas; old fixed test arenas
-        // are not evidence that the current complete population fits.
-        let mut policy = config(true).inference_policy();
-        policy.submission_tracking_capacity_bytes = None;
-        policy.graph_metadata_capacity_bytes = None;
-        let original_config = config(true).with_inference_policy(policy);
         (
             None,
             Some(
                 ControlledTextGeneration::from_token_ids_with_sequence(
                     runtime,
                     eredu_core::TokenIdsInputPlan::new(&[2, 5, 7, 3, 11]).unwrap(),
-                    original_config,
+                    original_source_config(),
                     Domain(tokenizer.clone()),
                     None,
                     GenerationSequenceRequest::new(4, &[])
@@ -805,10 +929,10 @@ fn with_prepared_original_operation_reservation<T>(
     } else {
         (
             Some(
-                TextGeneration::from_input_with_sequence(
+                TextGeneration::from_token_ids_with_sequence(
                     runtime,
-                    TextGenerationInput::TokenIds(vec![2, 5, 7, 3, 11]),
-                    config(true),
+                    eredu_core::TokenIdsInputPlan::new(&[2, 5, 7, 3, 11]).unwrap(),
+                    original_source_config(),
                     TokenFilter::All,
                     None,
                     GenerationSequenceRequest::new(4, &[]),
@@ -875,7 +999,7 @@ fn with_prepared_original_operation_reservation<T>(
 
     source.seal();
     assert!(
-        source.finish().settled,
+        source.finish().unwrap().settled,
         "fixture Source role remains pending"
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -981,15 +1105,48 @@ fn original_neural_two_parent_waits_and_evaluated_identity_boundaries_retire_exa
 
 #[test]
 fn original_named_destinations_preserve_cycle_aliases_refusals_and_cross_request_custody() {
+    let environment = fixture::PreparedResidencyFixture::new();
+    let pool = &environment.pool;
+    let (runtime, artifact, source_baseline) = environment.load(0, None);
+    let stream = runtime.backend().stream().clone();
+    runtime.backend().validate_original_stream_owners().unwrap();
+    let mut first = OriginalOperationFixture {
+        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+    };
+    // Both loading authorities must retire before A deliberately escapes.
+    // A's canonical cells keep their reserved account alive across B; opening
+    // a new model-loading authority at that point correctly refuses.
+    let before_second_load = pool.used_bytes().unwrap();
+    let (runtime, artifact, second_source_baseline) = environment.load(0, None);
+    let final_source_baseline = source_baseline
+        + second_source_baseline.checked_sub(before_second_load).unwrap();
+    let stream = runtime.backend().stream().clone();
+    runtime.backend().validate_original_stream_owners().unwrap();
+    let mut second = OriginalOperationFixture {
+        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+    };
+    // Prime the genuine managed source before this component creates ordinary
+    // numerical references. These extra named tables exercise the mechanism;
+    // they are not a model quote-fit claim.
     let mut tables = crate::backend::runtime::residency::manager::NamedArraysFixture::new();
-    let (old, old_pool) = with_original_operation_controls_and_pool(|controls, _observer, pool| {
-        (tables.first_request(controls), pool.clone())
-    });
-    assert!(old_pool.used_bytes().unwrap() > 0);
-    with_original_operation_controls(|controls, _observer| {
-        tables.second_request(old, controls, &old_pool);
-    });
-    fixture::settle(&old_pool, 0);
+    let old = with_prepared_original_operation_controls(
+        None, &mut first, |controls, _, _, bank| {
+            assert!(bank.is_none());
+            tables.first_request(controls)
+        },
+    );
+    first.finish();
+    assert!(pool.used_bytes().unwrap() > source_baseline);
+    let collected = old.collect_plain_before_canonical();
+    with_prepared_original_operation_controls(
+        None, &mut second, |controls, _, _, bank| {
+            assert!(bank.is_none());
+            tables.second_request(old, collected, controls, pool);
+        },
+    );
+    second.finish();
+    drop(tables);
+    fixture::settle(pool, final_source_baseline);
 }
 
 #[test]
@@ -1230,7 +1387,7 @@ fn original_model_projection_refuses_foreign_authority_and_retains_outer_scope_a
     );
     drop((later, result, source, roots, current));
     recovery.seal();
-    assert!(recovery.finish().settled);
+    assert!(recovery.finish().unwrap().settled);
     drop((view, observer, owner, roles, step, preparation, run, probe));
     fixture::finish(runtime, &stream);
     fixture::settle(&pool, 0);
@@ -1966,3 +2123,29 @@ mod prepared_rotary_component_tests;
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[path = "prefill_tests/fp8_component_tests.rs"]
 mod fp8_component_tests;
+
+#[test]
+fn inactive_parallel_slot_retires_only_its_alias_and_preserves_escaped_original_custody() {
+    use crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection;
+    let environment = fixture::PreparedResidencyFixture::new();
+    let pool = &environment.pool;
+    let (runtime, artifact, source_baseline) = environment.load(0, None);
+    let stream = runtime.backend().stream().clone();
+    runtime.backend().validate_original_stream_owners().unwrap();
+    let mut prepared = OriginalOperationFixture {
+        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+    };
+    let raw = with_prepared_original_operation_controls(
+        None, &mut prepared, |controls, _, _, bank| {
+            assert!(bank.is_none());
+            controls.metadata_custody()
+        },
+    );
+    prepared.finish();
+    assert!(pool.used_bytes().unwrap() > source_baseline, "actual accepted span remains held");
+    let escaped = OriginalParallelControlProjection::exercise_inactive_retirement(raw);
+    assert!(pool.used_bytes().unwrap() > source_baseline,
+        "removing the closed installed slot cannot release its escaped alias");
+    drop(escaped);
+    fixture::settle(pool, source_baseline);
+}

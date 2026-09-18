@@ -7,7 +7,7 @@ fn setup() -> (CaptureSession, CaptureDiscovery) {
     support.capture = capabilities.clone();
     let admitted = admit(plan, &catalog, &support, &capabilities).unwrap();
     (
-        CaptureSession::new(admitted),
+        CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admitted)),
         CaptureDiscovery {
             artifact_identity: "source".into(),
             catalog,
@@ -43,11 +43,6 @@ fn aborted_forward_keeps_measurements_and_usage_without_claiming_a_committed_pre
     session.restore(&initial).unwrap();
     assert_eq!(session.cumulative_usage(), charged);
     assert_eq!(backend.copies.get(), 1);
-    // Legacy records do not gain fabricated transaction evidence when decoded.
-    let mut legacy = serde_json::to_value(&step).unwrap();
-    legacy.as_object_mut().unwrap().remove("outcome");
-    let legacy: CapturedStep = serde_json::from_value(legacy).unwrap();
-    assert_eq!(legacy.outcome, CaptureStepOutcome::Untracked);
 }
 
 fn run(session: &mut CaptureSession, prediction: u64) -> CapturedStep {

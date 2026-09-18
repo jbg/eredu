@@ -91,11 +91,11 @@ fn model(config: &serde_json::Value, context: &NumericContext) -> (Model, vl::Mo
     let mut model = ResidentRuntime::new(architecture, context).unwrap();
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>, usize);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             let original = self
                 .0
-                .get(metadata.id.as_str())
-                .unwrap_or_else(|| panic!("missing actual {}", metadata.id.as_str()));
+                .get(metadata.id().as_str())
+                .unwrap_or_else(|| panic!("missing actual {}", metadata.id().as_str()));
             assert_eq!(value.shape, original.shape);
             value.data.clone_from(&original.data);
             assert!(value.data.iter().all(|v| v.is_finite()));

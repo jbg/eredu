@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::runtime::residency::manager::{SupplementaryResidencySource,ForegroundDiskSourceCapacity,OriginalResidencySlots};
 use eredu_runtime::working_memory::{OriginalHostSourceBank,OriginalHostSourceCustody,WorkingMemoryPool,WorkingMemoryReservation};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 
 #[derive(Clone)]
 enum Source {
@@ -20,7 +20,7 @@ struct NestedScope {parent:safemlx::OriginalScopeObserver,child:safemlx::Origina
 pub(crate) struct PreparedSelectedResidencyAccess {
     access:OriginalSelectedResidencyAccess,
     parent:safemlx::OriginalScopeObserver,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl PreparedSelectedResidencyAccess {
     pub(crate) fn bind_control_bytes()->Option<usize> {
@@ -72,7 +72,7 @@ impl OriginalSelectedResidencyAccess {
             safemlx::OriginalScopeObserver::control_bytes()?];
         frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
     }
-    pub(crate) fn prepare_native_role(&self,funding:&WorkspaceMetadataFunding)->Result<PreparedSelectedResidencyAccess,Error> {
+    pub(crate) fn prepare_native_role(&self,funding:&HostMetadataFunding)->Result<PreparedSelectedResidencyAccess,Error> {
         funding.reserve_metadata(Self::native_role_control_bytes().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         if self.nested.is_some(){return Err(identity());}
@@ -157,7 +157,7 @@ impl OriginalSelectedResidencyAccess {
     }
     pub(crate) fn prepare(&self,manager:&ResidencyManager,source:&SupplementaryResidencySource,
         roots:&[OffloadUnitId],bank:&mut OriginalHostSourceBank,
-        disk:Option<(&WorkingMemoryPool,&ForegroundDiskSourceCapacity,&WorkspaceMetadataFunding)>,
+        disk:Option<(&WorkingMemoryPool,&ForegroundDiskSourceCapacity,&HostMetadataFunding)>,
     )->Result<OriginalSelectedResidencyAttempt,Error> {
         self.validate_bank(bank)?;
         let value=storage::PreparedSelectedResidency::prepare_with_disk(manager,source,roots,bank,

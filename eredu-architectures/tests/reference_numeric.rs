@@ -6,6 +6,9 @@ mod bounded_readout;
 #[path = "reference_numeric/static_construction.rs"]
 mod static_construction;
 
+#[path = "reference_numeric/deepseek_observation.rs"]
+mod deepseek_observation;
+
 include!("support/numeric/imports.rs");
 
 #[path = "reference_numeric/k2_horizon.rs"]
@@ -2968,7 +2971,7 @@ fn gemma4_tp2_text_matches_replicated_composite_graph() {
         groups.extend(gemma4::layer_parameter_groups(&family.text, layer).unwrap());
     }
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -3148,13 +3151,13 @@ fn gemma4_tp2_ordered_vision_audio_text_matches_replicated_multimodal_graph() {
         gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap();
     let groups = architecture
         .parameter_description(&context)
-        .unwrap()
+        .unwrap().into_owned()
         .groups()
         .iter()
         .map(|owned| owned.group().clone())
         .collect::<Vec<_>>();
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -4084,7 +4087,7 @@ fn deepseek_v3_dense_tp2_matches_replicated_with_uneven_vocabulary() {
         })
         .collect::<Vec<_>>();
     let mut expected_state =
-        DeviceState::<NumericBackend, _>::create(architecture.state_layout().unwrap(), |_, _| {
+        DeviceState::<NumericBackend, _>::create(architecture.state_layout(None).unwrap(), |_, _| {
             Ok::<_, Error>(NumericCompressedCache::resident())
         })
         .unwrap();
@@ -4265,7 +4268,7 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
     >>::build_unit(&architecture, 0, 0, &context)
     .unwrap();
     let mut expected_state =
-        DeviceState::<NumericBackend, _>::create(architecture.state_layout().unwrap(), |_, _| {
+        DeviceState::<NumericBackend, _>::create(architecture.state_layout(None).unwrap(), |_, _| {
             Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[]))
         })
         .unwrap();
@@ -4494,7 +4497,7 @@ fn gpt_oss_tp2_matches_replicated_with_biased_packed_experts() {
     .unwrap();
     groups.extend(gpt_oss::layer_parallel_parameter_groups(&unit, &args, 0).unwrap());
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -4746,7 +4749,7 @@ fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
     };
     groups.extend(qwen::routed_layer_parallel_parameter_groups(text_block, &args.text, 0).unwrap());
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -4957,7 +4960,7 @@ fn qwen_hybrid_constructed_graph_owns_embedded_prediction_depth() {
     assert_eq!(architecture.unit_layout().unwrap().group_count(), 3);
     let description = architecture
         .parameter_description(&NumericContext::default())
-        .unwrap();
+        .unwrap().into_owned();
     for target in [
         "mtp.pre_fc_norm_hidden.weight",
         "mtp.pre_fc_norm_embedding.weight",
@@ -5068,7 +5071,7 @@ fn qwen35_conditional_tp2_runs_full_vision_and_text_lifecycle() {
         qwen::hybrid::unit_parallel_parameter_groups(&wrapped, &parsed.text, 0, 0).unwrap(),
     );
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.state_layout().unwrap(),
+        architecture.state_layout(None).unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -5836,7 +5839,7 @@ fn inkling_embedded_mtp_traversal_and_rollback_are_backend_neutral() {
         .expect("Inkling MTP state layout");
     let mut model = inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
     let ingress_layout = model.ingress_state_layout().unwrap();
-    let persistence_layout = ArchitectureParameters::state_layout(&model).unwrap();
+    let persistence_layout = ArchitectureParameters::state_layout(&model, None).unwrap();
     assert_eq!(ingress_layout.len(), 2);
     assert_eq!(persistence_layout.len(), 4);
     assert_ne!(ingress_layout, persistence_layout);
@@ -6328,7 +6331,7 @@ fn partial_rotary_preserves_non_rotary_head_dimensions() {
 fn hyper_connection_sinkhorn_and_head_match_reference_semantics() {
     struct ZeroParameters;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for ZeroParameters {
-        fn visit_mut(&mut self, _: ParameterMetadata, value: &'a mut NumericTensor) {
+        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
             value.data.fill(0.0);
         }
     }
@@ -6901,8 +6904,8 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            value.data = match metadata.id.as_str() {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            value.data = match metadata.id().as_str() {
                 "low_rank.first.weight" => vec![1.0, 0.0, 0.0, 1.0],
                 "low_rank.norm.weight" => vec![1.0, 1.0],
                 "low_rank.second.weight" => vec![2.0, -1.0],
@@ -6938,8 +6941,8 @@ fn causal_depthwise_convolution_matches_prefill_and_incremental_reference() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            value.data = match metadata.id.as_str() {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            value.data = match metadata.id().as_str() {
                 "conv.weight" => vec![1.0, 2.0, 1.0, 1.0, 0.0, -1.0],
                 "conv.bias" => vec![0.5, -0.5],
                 unexpected => panic!("unexpected convolution parameter {unexpected}"),
@@ -7013,8 +7016,8 @@ fn gated_short_convolution_matches_chunked_state_continuation() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            value.data = match metadata.id.as_str() {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            value.data = match metadata.id().as_str() {
                 // B=x, C swaps the two channels, and the final projection is identity.
                 "short.in.weight" => {
                     vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]
@@ -7156,7 +7159,7 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
     let args = lfm2::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let architecture = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let description = architecture.parameter_description(&context).unwrap();
+    let description = architecture.parameter_description(&context).unwrap().into_owned();
     let mut groups = lfm2::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
     for layer in 0..2 {
         let unit = <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7419,7 +7422,7 @@ fn routed_lfm2_partitioned_pure_pp_uses_ordinary_provider_path() {
         lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
     let description = reference_architecture
         .parameter_description(&context)
-        .unwrap();
+        .unwrap().into_owned();
     let reference_units = (0..2)
         .map(|index| {
             <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7646,7 +7649,7 @@ fn dense_lfm2_partitioned_tp2_pp2_matches_replicated_prefill_and_decode() {
         lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap();
+        .unwrap().into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7906,7 +7909,7 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
         kimi_linear::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap();
+        .unwrap().into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -8266,7 +8269,7 @@ fn dense_nemotron_h_partitioned_tp2_pp2_matches_prefill_and_repeated_decode() {
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap();
+        .unwrap().into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -8585,7 +8588,7 @@ fn routed_nemotron_h_partitioned_relu2_tp2_matches_replicated_prefill_and_decode
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap();
+        .unwrap().into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -9486,10 +9489,10 @@ fn replace_numeric_parameters<U: Parameterized<NumericTensor>>(
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Replace<'_> {
         fn visit_mut(
             &mut self,
-            metadata: eredu_nn::ParameterMetadata,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
             value: &'a mut NumericTensor,
         ) {
-            if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+            if let Some(replacement) = self.0.get(metadata.id().as_str()) {
                 *value = replacement.clone();
             }
         }
@@ -10953,12 +10956,12 @@ where
         impl eredu_nn::ParameterSlotVisitor<NumericTensor> for Read {
             fn visit_slot(
                 &mut self,
-                metadata: eredu_nn::ParameterMetadata,
+                metadata: eredu_nn::ParameterMetadataView<'_>,
                 value: &mut NumericTensor,
             ) {
                 assert!(self
                     .0
-                    .insert(metadata.id.as_str().into(), value.clone())
+                    .insert(metadata.id().as_str().into(), value.clone())
                     .is_none());
             }
         }
@@ -11022,7 +11025,7 @@ where
         } else {
             self.decode_with_observer(tokens, context, observer)
         }
-        .map_err(Error::backend_source)
+        .map_err(Error::backend_retained_source)
     }
 
     fn numeric_reset(self, context: &NumericContext) -> Result<(), Error> {
@@ -11079,7 +11082,7 @@ where
         let mut values = Vec::new();
         let complete = self
             .visit_retained_values(&mut |value| values.push(value.clone()))
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         if !complete {
             return Err(Error::backend("retained parameter inventory unavailable"));
         }
@@ -11215,6 +11218,7 @@ where
     fn participate_inactive_pipeline_wave<G, R, I, F>(
         &mut self,
         wave: usize,
+        demand: eredu_core::OutputDemand,
         communication: &PartitionCommunication<NumericBackend, G, R, I>,
         communication_executor: &NumericContext,
         allocator: &mut F,
@@ -11240,6 +11244,7 @@ where
         }
         self.inner.participate_inactive_pipeline_wave(
             wave,
+            demand,
             communication,
             communication_executor,
             allocator,
@@ -12065,7 +12070,7 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
             llama::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
         let description = reference_architecture
             .parameter_description(&reference_context)
-            .unwrap();
+            .unwrap().into_owned();
         let units = (0..4)
             .map(|layer| {
                 <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -12773,11 +12778,11 @@ fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
         qwen::RoutedLayeredModel::<NumericBackend>::new(qwen_args.clone(), &context)
             .unwrap()
             .parameter_description(&context)
-            .unwrap();
+            .unwrap().into_owned();
     let gpt_description = gpt_oss::LayeredModel::<NumericBackend>::new(gpt_args.clone(), &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap();
+        .unwrap().into_owned();
     let qwen_operations = [
         Operation::CountConsensus,
         Operation::ForwardGlobalExpertIds,
@@ -13387,7 +13392,7 @@ fn authoritative_qwen_routed_numeric_sessions_match_partitioned_reference() {
     let description = qwen::RoutedLayeredModel::<NumericBackend>::new(args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap();
+        .unwrap().into_owned();
     assert_authoritative_routed_numeric_sessions(
         "qwen3-moe",
         config,
@@ -13437,12 +13442,12 @@ pub(crate) fn prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_sta
     let v3_description = deepseek::v3::Model::<NumericBackend>::new(v3_args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap();
+        .unwrap().into_owned();
     let v4_args = deepseek::parse_v4_config(&v4).unwrap();
     let v4_description = deepseek::v4::Model::<NumericBackend>::new(v4_args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap();
+        .unwrap().into_owned();
     let topologies = [
         ParallelTopology::new(2, 1, 1, 1).unwrap(),
         ParallelTopology::new(1, 2, 1, 1).unwrap(),
@@ -15047,7 +15052,7 @@ pub(crate) fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_dec
         >>::build_unit(&architecture, 1, 0, &context)
         .unwrap(),
     ];
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15179,7 +15184,7 @@ fn non_mlx_composite_preserves_video_and_projected_part_order() {
 
     let args = qwen::vl::model_args_from_config_value(&config).unwrap();
     let architecture = qwen::vl::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15303,7 +15308,7 @@ pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
 
     let args = qwen::vl::model_args_from_config_value(&config).unwrap();
     let architecture = qwen::vl::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15430,7 +15435,7 @@ fn non_mlx_inkling_composite_with_shared_banks(shared: i32) {
 
     let args = inkling::ModelArgs::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
     let architecture = inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15603,7 +15608,7 @@ pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_tex
 
     let args = muse_glimmer::DecoderConfig::from_hf_value(&config).unwrap();
     let architecture = muse_glimmer::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15731,7 +15736,7 @@ pub(crate) fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth()
     let parsed = qwen::hybrid::model_args_from_config_value(&config).unwrap();
     let architecture =
         qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -15886,7 +15891,7 @@ pub(crate) fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_de
         gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
     family.audio.as_mut().unwrap().output_projection_bias = false;
     let architecture = gemma4::LayeredModel::<NumericBackend>::new(family, &context).unwrap();
-    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+    let mut state = DeviceState::create(architecture.state_layout(None).unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
     .unwrap();
@@ -16290,7 +16295,7 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
         macro_rules! reference_case {
             ($architecture:expr, |$step_tokens:ident| $input:expr) => {{
                 let architecture = $architecture;
-                let description = architecture.parameter_description(&context).unwrap();
+                let description = architecture.parameter_description(&context).unwrap().into_owned();
                 let parameters = description
                     .groups()
                     .iter()
@@ -17333,7 +17338,7 @@ fn nemotron_tp2_target_mtp_matches_replicated_and_rolls_back_draft_state() {
     let context = NumericContext::default();
     let architecture =
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let parameter_description = architecture.parameter_description(&context).unwrap();
+    let parameter_description = architecture.parameter_description(&context).unwrap().into_owned();
     let groups = parameter_description
         .groups()
         .iter()
@@ -19191,7 +19196,7 @@ fn gemma4_composite_partition_preserves_tasks_boundary_values_and_prepared_ident
         text_transport.merge_destination,
         eredu_runtime::ArchitectureMergeDestination::LastOwner
     );
-    let parameters = architecture.parameter_description(&context).unwrap();
+    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -19464,7 +19469,7 @@ fn numeric_composite_parameter_description(
             gemma4::LayeredModel::<NumericBackend>::new(family, &context)
                 .unwrap()
                 .parameter_description(&context)
-                .unwrap()
+                .unwrap().into_owned()
         }
         "muse_glimmer" => muse_glimmer::LayeredModel::<NumericBackend>::new(
             muse_glimmer::DecoderConfig::from_hf_value(config).unwrap(),
@@ -19472,28 +19477,28 @@ fn numeric_composite_parameter_description(
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap(),
+        .unwrap().into_owned(),
         "inkling_mm_model" => inkling::LayeredModel::<NumericBackend>::new(
             inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config).unwrap()).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap(),
+        .unwrap().into_owned(),
         "qwen3_5" | "qwen3_5_moe" => qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(
             qwen::hybrid::model_args_from_config_value(config).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap(),
+        .unwrap().into_owned(),
         "qwen3_vl" | "qwen3_vl_moe" => qwen::vl::LayeredModel::<NumericBackend>::new(
             qwen::vl::model_args_from_config_value(config).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap(),
+        .unwrap().into_owned(),
         other => panic!("unsupported numeric composite partition fixture {other}"),
     }
 }
@@ -20451,7 +20456,7 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         vision_transport.merge_destination,
         eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner
     );
-    let parameters = architecture.parameter_description(&context).unwrap();
+    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -20663,7 +20668,7 @@ fn qwen_vl_moe_partition_binds_exact_routed_expert_authority() {
     let args = qwen::vl::model_args_from_config_value(&qwen_vl_partition_config(true)).unwrap();
     let context = NumericContext::default();
     let seed = qwen::vl::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let parameters = seed.parameter_description(&context).unwrap();
+    let parameters = seed.parameter_description(&context).unwrap().into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -20813,7 +20818,7 @@ fn inkling_dense_partition_prepared_multimodal_identity_is_causal() {
         eredu_architectures::composite_execution::CompositeArchitecture<
             NumericBackend,
             DeviceState<NumericBackend, NumericHybridLayerState>,
-        >>::prepared_primary_ingress_collectives(&architecture, prepared, 2)
+        >>::prepared_primary_ingress_collectives(&architecture, prepared, 2, None)
     .unwrap()
     .unwrap();
     assert_eq!(
@@ -20881,7 +20886,7 @@ fn conditional_qwen_dense_partition_preserves_deepstack_state_targets_and_identi
     let architecture =
         qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed.clone(), &context)
             .unwrap();
-    let parameters = architecture.parameter_description(&context).unwrap();
+    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -21117,7 +21122,7 @@ fn deepseek_prediction_free_boundaries_preserve_exact_roles_and_values() {
         "num_nextn_predict_layers": 0
     }))
     .unwrap();
-    let v4_schema = deepseek::v4::TargetBoundarySchema::from_args(&v4).unwrap();
+    let v4_schema = deepseek::v4::TargetBoundarySchema::from_args(&v4, None).unwrap();
     assert_eq!(v4_schema.activation_hidden_size(), 16);
     let v4_values = eredu_runtime::ArchitectureBoundary::encode(
         &v4_schema,

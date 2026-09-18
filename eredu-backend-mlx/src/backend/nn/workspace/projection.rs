@@ -131,7 +131,7 @@ impl ProjectionInventoryLayout {
             size_of::<std::vec::IntoIter<ProjectionRow<&Array>>>(),
             size_of::<ProjectionRow<&Array>>(),
             size_of::<ProjectionRow<ProjectionNativeSource>>(),
-            Error::retained_source_control_bytes::<ProjectionInventoryError>()?,
+            Error::retained_source_construction_bytes::<ProjectionInventoryError>()?,
             size_of::<Result<ProjectionRow<ProjectionNativeSource>, std::convert::Infallible>>(),
             size_of::<Result<ProjectionRow<ProjectionNativeSource>, Error>>(),
         ];
@@ -180,7 +180,7 @@ pub struct ProjectedNativeStorage {
     paged_sources: Vec<crate::backend::runtime::cache::kv::ProjectedPagedSource>,
     copy_sources: Vec<crate::backend::runtime::cache::residency::PinnedCacheSource>,
     // Native handles and metadata rows retire before their actual paying H.
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
     _host_preparation: Option<eredu_core::HostPreparationAuthority>,
 }
 impl std::fmt::Debug for ProjectedNativeStorage {
@@ -756,3 +756,5 @@ mod tests {
         );
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

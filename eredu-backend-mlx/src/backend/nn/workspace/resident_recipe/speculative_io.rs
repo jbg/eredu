@@ -270,7 +270,7 @@ pub(super) fn bind_prefill_input(
 ) -> Result<(), crate::backend::error::Error> {
     let invalid = || context.metadata_error(format_args!("speculative prefill input trace is incomplete"));
     if report.operations.len() != 1 || !matches!(report.operations[0].kind,
-        WorkspaceOperationKind::Index { selected_axes: 0 }) {
+        WorkspaceOperationKind::StaticSlice { .. }) {
         return Err(invalid().into());
     }
     let recorder = ResidentRecipeRecorder::with_context(geometry, mechanism, context)?;

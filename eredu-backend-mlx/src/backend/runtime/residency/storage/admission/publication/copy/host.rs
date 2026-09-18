@@ -34,13 +34,7 @@ pub(super) fn observe<'a>(
     let witness = array
         .inspect_host_transfer_alias()
         .map_err(buffer_error)?
-        .ok_or_else(|| {
-            if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-                eprintln!("HOST_SAVED_PUBLICATION_ARRAY no-budget-or-host-witness source_count={} allocation={:?}",
-                    sources.len(), array.try_allocation_info());
-            }
-            Error::PrefillControl(WorkingMemoryError::UnknownBound)
-        })?;
+        .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
     // These owners entered solely through a completed same-budget Copy token.
     // Match native identity and full capacity, never logical byte equality.
     for source in sources {

@@ -65,7 +65,6 @@ fn packed_nonzero_extraction_and_encoding_share_the_actual_pipeline() {
     ]);
     let expected = legacy(&input, &model, None);
     let actual = packed(&input, &model, None);
-    assert!(matches!(actual.storage, Storage::Packed(_)));
     let mut first = Tokenizer::new(model.clone());
     first.with_added_vocabulary(expected);
     let mut second = Tokenizer::new(model);
@@ -185,7 +184,7 @@ fn actual_normalizer_borrow_controls_profiles_and_nfc_unmatched_text() {
         AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), &model, Some(&normalizer))
             .unwrap();
     assert!(std::ptr::eq(plan.normalizer.unwrap(), &normalizer));
-    assert!(std::ptr::eq(plan.model, &model));
+    assert!(std::ptr::addr_eq(plan.model, &model));
     let actual = plan.compile().unwrap();
     let expected = legacy(&input, &model, Some(&normalizer));
     assert_eq!(
@@ -193,20 +192,17 @@ fn actual_normalizer_borrow_controls_profiles_and_nfc_unmatched_text() {
         extraction(&actual, Some(&normalizer), "e\u{301} hi é")
     );
     let normalized = source(vec![value("hi", true, false)]);
-    assert_eq!(
-        AddedVocabularyCompilePlan::prepare_json(normalized.as_bytes(), &model, Some(&normalizer))
-            .unwrap_err()
-            .kind,
-        Kind::NormalizationProfile
-    );
+    let actual = packed(&normalized, &model, Some(&normalizer));
+    let expected = legacy(&normalized, &model, Some(&normalizer));
+    assert_eq!(extraction(&actual, Some(&normalizer), "hi e\u{301}"), extraction(&expected, Some(&normalizer), "hi e\u{301}"));
     let actual = packed(&normalized, &model, None);
     assert_eq!(actual.decode_token_ref(2), Some("hi"));
 }
 #[test]
-fn four_real_capacity_frontiers_retain_every_allocated_prefix_after_input_drop() {
+fn five_real_capacity_frontiers_retain_every_allocated_prefix_after_input_drop() {
     let model = model();
     let mut previous = 0;
-    for stage in 0..4 {
+    for stage in 0..5 {
         let input = source(vec![
             value("<first>", false, true),
             value("😃hi", true, false),
@@ -255,16 +251,11 @@ fn late_reverse_id_collision_keeps_completed_raw_destination_without_retry() {
     assert_eq!(error.partial.content(1), "b");
 }
 #[test]
-fn borrowed_and_explicit_map_compatibility_clone_serde_and_mutation_keep_values() {
+fn borrowed_and_explicit_owned_maps_clone_serde_and_mutation_keep_values() {
     let model = model();
     let input = source(vec![value("HI", true, false), value("<s>", false, true)]);
     let actual = packed(&input, &model, None);
-    assert!(matches!(actual.get_vocab(), std::borrow::Cow::Owned(_)));
     let expected = legacy(&input, &model, None);
-    assert!(matches!(
-        expected.get_vocab(),
-        std::borrow::Cow::Borrowed(_)
-    ));
     let alias = actual.clone();
     let hi = actual.token_to_id("HI", &model).unwrap();
     assert_eq!(actual.decode_token_ref(hi), Some("HI"));
@@ -278,7 +269,6 @@ fn borrowed_and_explicit_map_compatibility_clone_serde_and_mutation_keep_values(
     changed
         .refresh_normalized_tokens(Some(&normalizer))
         .unwrap();
-    assert!(matches!(changed.storage, Storage::Legacy(_)));
     assert_eq!(changed.decode_token_ref(hi), Some("hi"));
     assert_eq!(alias.decode_token_ref(hi), Some("HI"));
     changed
@@ -312,11 +302,11 @@ fn escaped_content_empty_input_and_complete_schema_validation_precede_reserves()
     assert!(empty.is_empty());
     assert_eq!(empty.find_matches("hi", false), vec![(None, (0, 2))]);
     assert_eq!(
-        requirements(usize::MAX, 1).unwrap_err().kind,
+        requirements(usize::MAX, 1, PatternBounds::default()).unwrap_err().kind,
         Kind::Overflow
     );
     assert_eq!(
-        requirements(1, usize::MAX).unwrap_err().kind,
+        requirements(1, usize::MAX, PatternBounds::default()).unwrap_err().kind,
         Kind::Overflow
     );
 }
@@ -373,5 +363,30 @@ fn overlapping_unicode_and_phase_prefixes_match_legacy_on_exhaustive_short_input
                 "special={encode_special}, input={text:?}"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "release storage measurement companion to added_matcher_throughput"]
+fn added_matcher_memory() {
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("chat", (0..256).map(|i| format!("<|special_{i}|>")).collect()),
+        ("shared_prefix_absent", (32..64).map(|n| format!("{}b", "a".repeat(n))).collect()),
+        ("shared_prefix_matches", (1..64).map(|n| "a".repeat(n)).collect()),
+        ("delayed_short_match", vec!["a".into(), format!("{}b", "a".repeat(255))]),
+        ("unicode", vec!["é".into(), "é🦀".into(), "東京".into(), "京".into()]),
+    ];
+    for (name, patterns) in cases {
+        let source = serde_json::to_vec(&patterns.iter().enumerate().map(|(id, content)| serde_json::json!({
+            "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true
+        })).collect::<Vec<_>>()).unwrap();
+        let model = BPE::default();
+        let plan = AddedVocabularyCompilePlan::prepare_json(&source, &model, None).unwrap();
+        let bounds = plan.requirements();
+        let compiled = plan.compile().unwrap();
+        let mut ordinary = AddedVocabulary::new();
+        ordinary.add_tokens(patterns.iter().map(|s| crate::AddedToken::from(s.as_str(), true)), &model, None::<&NormalizerWrapper>).unwrap();
+        assert!(compiled.storage.buffer_bytes().unwrap() <= bounds.buffer_bytes());
+        eprintln!("{name}: ordinary_buffer_bytes={} compiled_buffer_bytes={} quoted_buffer_bytes={} control_bytes={} node_bytes={} nodes={} iterator_bytes={}", ordinary.storage.buffer_bytes().unwrap(), compiled.storage.buffer_bytes().unwrap(), bounds.buffer_bytes(), bounds.control_bytes(), size_of::<Node>(), compiled.storage.matcher.nodes.len(), std::mem::size_of_val(&compiled.raw_matches("", false)));
     }
 }

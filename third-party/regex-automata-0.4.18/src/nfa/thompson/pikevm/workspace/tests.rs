@@ -4,7 +4,53 @@ use super::*;
 mod enabled {
     use super::*;
     use crate::{Anchored, MatchKind};
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn half_search_preserves_leftmost_utf8_and_capture_reuse() {
+        for pattern in [r"(?:a|)", r"(?P<word>\pL+)|[0-9]+", r"a+?", r"\s+$"] {
+            let source = PikeVM::new(pattern).unwrap();
+            let mut workspace =
+                source.workspace_plan().unwrap().prepare().unwrap();
+            let before = workspace.capacities();
+            let mut ordinary = source.create_cache();
+            let mut expected =
+                vec![None; workspace.requirements().maximum_slots()];
+            let mut actual = expected.clone();
+            for text in ["", "αβ aa 123", "🙂a", "aa ", "xxxx"] {
+                for start in 0..=text.len() {
+                    for anchored in [Anchored::No, Anchored::Yes] {
+                        let input = Input::new(text)
+                            .span(start..text.len())
+                            .anchored(anchored);
+                        let matched = source.search_slots(
+                            &mut ordinary,
+                            &input,
+                            &mut expected,
+                        );
+                        let half = workspace.search_half(&input);
+                        assert_eq!(half.map(|m| m.pattern()), matched);
+                        if let Some(half) = half {
+                            assert_eq!(
+                                half.offset(),
+                                expected[1].unwrap().get()
+                            );
+                        }
+                        assert_eq!(
+                            workspace
+                                .search_slots(&input, &mut actual)
+                                .unwrap(),
+                            matched
+                        );
+                        if matched.is_some() {
+                            assert_eq!(actual, expected);
+                        }
+                        assert_eq!(workspace.capacities(), before);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn repeated_unicode_captures_share_existing_worker_without_growth() {

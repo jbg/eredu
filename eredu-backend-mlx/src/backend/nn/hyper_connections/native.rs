@@ -203,7 +203,7 @@ pub(crate) fn control_bytes(handles: usize, aliases: usize) -> Option<usize> {
         size_of::<eredu_nn::HyperConnectionState<crate::MlxTensor>>(),
         size_of::<Result<eredu_nn::HyperConnectionState<crate::MlxTensor>, eredu_nn::Error>>(),
         size_of::<Result<crate::MlxTensor, eredu_nn::Error>>(),
-        eredu_nn::Error::retained_source_control_bytes::<Exception>()?,
+        eredu_nn::Error::retained_source_construction_bytes::<Exception>()?,
         Exception::retained_source_control_bytes::<Refusal<Validation>>()?,
         Exception::retained_source_control_bytes::<
             Refusal<crate::backend::array_copy::CaptureTensorNativeError>,

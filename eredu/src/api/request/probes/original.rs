@@ -1,12 +1,10 @@
 //! Actual original J/C operations beneath the shared behavioral recognizer.
 use super::{Operations, Probe, ifm, inkling, records};
 use crate::api::request::ChatTemplateRequest;
-use eredu_core::{
-    GenerationSequenceConsumerLayout, HostPreparationAuthority, ModelRuntime, TokenInputRejection,
-};
+use eredu_core::{HostPreparationAuthority, ModelRuntime, TokenInputRejection};
 use eredu_runtime::working_memory::{
-    OriginalChatBackend, OriginalChatOperationError, OriginalChatProfileError,
-    OriginalChatProfilePreparation, OriginalChatTemplate, OriginalEncodedTokenIds,
+    OriginalChatBackend, OriginalChatProfileError, OriginalChatProfilePreparation,
+    OriginalChatRenderOperationError, OriginalChatTemplate, OriginalEncodedTokenIds,
     OriginalRenderedChat, OriginalTextSourceError, OriginalTokenizer,
 };
 use eredu_text::chat_storage::{ChatMessageError, ChatMessages, ChatRenderContext};
@@ -19,7 +17,7 @@ use std::mem::{size_of, size_of_val};
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error(transparent)]
-    Policy(#[from] crate::api::request::profile::selected::Failure),
+    Policy(#[from] crate::api::request::profile::ProfileRequestFailure),
     #[error(transparent)]
     History(#[from] crate::api::request::profile::tagged::Failure),
     #[error(transparent)]
@@ -31,7 +29,7 @@ enum Cause {
     #[error(transparent)]
     Messages(#[from] ChatMessageError),
     #[error(transparent)]
-    Render(#[from] OriginalChatOperationError),
+    Render(#[from] OriginalChatRenderOperationError),
     #[error(transparent)]
     Encode(#[from] OriginalTextSourceError),
 }
@@ -46,7 +44,7 @@ pub(crate) struct Failure {
 }
 impl Failure {
     fn is_probe_nonmatch(&self) -> bool {
-        matches!(&self.cause, Cause::Render(OriginalChatOperationError::Render(cause)) if cause.is_unknown_function())
+        matches!(&self.cause, Cause::Render(OriginalChatRenderOperationError::Render(cause)) if cause.is_template_rejection())
     }
     fn before(cause: impl Into<Cause>) -> Self {
         Self {
@@ -64,9 +62,14 @@ impl Failure {
     }
 }
 
-struct Tokens<'a, B: OriginalChatBackend> {
+pub(crate) struct Tokens<'a, B: OriginalChatBackend> {
     runtime: &'a ModelRuntime<B>,
     tokenizer: &'a OriginalTokenizer,
+}
+impl<'a, B: OriginalChatBackend> Tokens<'a, B> {
+    pub(crate) fn new(runtime: &'a ModelRuntime<B>, tokenizer: &'a OriginalTokenizer) -> Self {
+        Self { runtime, tokenizer }
+    }
 }
 impl<B: OriginalChatBackend> StructuralTokenSource for Tokens<'_, B> {
     type Encoded = OriginalEncodedTokenIds;
@@ -104,7 +107,6 @@ pub(crate) struct Original<'a, B: OriginalChatBackend> {
     template: &'a OriginalChatTemplate,
     tokenizer: &'a OriginalTokenizer,
     defaults: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    consumer: GenerationSequenceConsumerLayout,
     preparation: OriginalChatProfilePreparation,
     host: HostPreparationAuthority,
 }
@@ -115,7 +117,6 @@ impl<'a, B: OriginalChatBackend> Original<'a, B> {
         tokenizer: &'a OriginalTokenizer,
         defaults: Option<&'a serde_json::Map<String, serde_json::Value>>,
         capacity: u64,
-        consumer: GenerationSequenceConsumerLayout,
     ) -> Result<Self, Failure> {
         B::validate_original_chat_sources(runtime, template, tokenizer).map_err(Failure::before)?;
         let preparation = B::prepare_original_chat_profile(runtime, template, tokenizer, capacity)
@@ -135,7 +136,6 @@ impl<'a, B: OriginalChatBackend> Original<'a, B> {
                 &OriginalTokenizer,
                 Option<&serde_json::Map<String, serde_json::Value>>,
                 u64,
-                GenerationSequenceConsumerLayout,
             )>(),
             super::control_bytes::<Failure>()
                 .ok_or_else(|| Failure::before(TokenInputRejection::Overflow))?,
@@ -152,7 +152,6 @@ impl<'a, B: OriginalChatBackend> Original<'a, B> {
             template,
             tokenizer,
             defaults,
-            consumer,
             preparation,
             host,
         })
@@ -272,7 +271,7 @@ impl<B: OriginalChatBackend> Original<'_, B> {
                 ChatMessages<'_>,
                 OriginalRenderedChat,
             )>(),
-            size_of::<Result<OriginalRenderedChat, OriginalChatOperationError>>(),
+            size_of::<Result<OriginalRenderedChat, OriginalChatRenderOperationError>>(),
             size_of::<Result<ChatRenderContext<'_>, ChatMessageError>>(),
             size_of::<(&Self, F)>(),
             size_of::<T>(),
@@ -293,7 +292,9 @@ impl<B: OriginalChatBackend> Original<'_, B> {
                 ChatMessages::from_records(input.messages)
                     .map_err(|cause| Failure::held(cause, &host))?,
             )
-            .with_record_tools(input.tools)
+            .with_tools(eredu_text::chat_storage::ChatInputArray::Record(
+                input.tools,
+            ))
             .with_variables(
                 self.defaults,
                 request.map(|request| &request.extra_template_kwargs),
@@ -305,21 +306,18 @@ impl<B: OriginalChatBackend> Original<'_, B> {
                     .map_or(input.kwargs, ifm::Overrides::as_slice),
             )
             .with_clock(eredu_text::chat_storage::chat_clock_snapshot());
-            let rendered = B::render_original_chat_with_context(
-                self.runtime,
-                self.template,
-                self.tokenizer,
-                context,
-                self.consumer,
-            )
-            .map_err(|cause| Failure::held(cause, &host))?;
-            if !rendered.has_sources(self.template, self.tokenizer)
-                || !rendered.accepts_consumer(&self.consumer)
-            {
+            let rendered =
+                B::render_original_chat(self.runtime, self.template, self.tokenizer, context)
+                    .map_err(|cause| Failure::held(cause, &host))?;
+            if !rendered.has_sources(self.template, self.tokenizer) {
                 let mut failure = Failure::held(TokenInputRejection::IdentityMismatch, &host);
                 failure.completed = Some(rendered);
                 return Err(failure);
             }
+            B::validate_original_chat_render(self.runtime, &rendered)
+                .map_err(|cause| Failure::held(cause, &host))?;
+            // The host account above funds this concrete inspection closure and
+            // its result. It does not construct an execution consumer.
             Ok(inspect(rendered.prompt(input.generation)))
         })
     }
@@ -365,13 +363,22 @@ impl<B: OriginalChatBackend> Original<'_, B> {
 /// No constructor admits caller-provided selection facts or profile identities.
 #[derive(Debug)]
 pub(crate) struct PolicyOwner {
-    policy: crate::api::request::profile::selected::Policy,
+    profile: crate::runtime::chat::PreparedFormatProfile,
     source: OriginalChatProfilePreparation,
     host: HostPreparationAuthority,
 }
 impl PolicyOwner {
+    pub(crate) fn preparation(&self) -> &OriginalChatProfilePreparation {
+        &self.source
+    }
+    pub(crate) fn profile(&self) -> &crate::runtime::chat::PreparedFormatProfile {
+        &self.profile
+    }
+    pub(crate) fn metadata_funding(&self) -> &eredu_core::HostMetadataFunding {
+        self.source.metadata_funding()
+    }
     pub(crate) fn generation(&self, requested: bool) -> bool {
-        self.policy.generation(requested)
+        self.profile.generation_prompt_behavior.resolve(requested)
     }
     pub(crate) fn has_sources(
         &self,
@@ -387,6 +394,12 @@ pub(crate) struct PreparedPolicy<'request> {
     owner: PolicyOwner,
 }
 impl<'request> PreparedPolicy<'request> {
+    pub(crate) fn owner(&self) -> &PolicyOwner {
+        &self.owner
+    }
+    pub(crate) fn metadata_funding(&self) -> &eredu_core::HostMetadataFunding {
+        self.owner.metadata_funding()
+    }
     pub(crate) fn bindings(&self) -> &[eredu_text::chat_storage::ChatScalarBinding<'request>] {
         self.bindings.as_slice()
     }
@@ -400,7 +413,7 @@ impl<B: OriginalChatBackend> Original<'_, B> {
         request: &'request ChatTemplateRequest,
     ) -> Result<PreparedPolicy<'request>, Failure> {
         let parts = [
-            crate::api::request::profile::selected::Policy::control_bytes()
+            crate::runtime::chat::PreparedFormatProfile::control_bytes()
                 .ok_or_else(|| Failure::held(TokenInputRejection::Overflow, &self.host))?,
             size_of::<PolicyOwner>(),
             size_of::<PreparedPolicy<'request>>(),
@@ -414,14 +427,14 @@ impl<B: OriginalChatBackend> Original<'_, B> {
                 .try_fold(size_of_val(&parts), usize::checked_add),
         )?;
         let selection = self.select(request)?;
-        let policy = crate::api::request::profile::selected::Policy::from_selected(selection);
-        let bindings = policy
-            .bindings(request)
+        let profile = crate::api::request::selected_profile(selection, request);
+        let bindings = profile
+            .request_bindings(request)
             .map_err(|cause| Failure::held(cause, &host))?;
         Ok(PreparedPolicy {
             bindings,
             owner: PolicyOwner {
-                policy,
+                profile,
                 source: self.preparation.clone(),
                 host,
             },

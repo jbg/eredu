@@ -61,7 +61,7 @@ pub fn install_session(
     {
         return Ok(());
     }
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     if let Some((plan, estimator)) = intervention {
         session.enable_interventions(plan, estimator)?;
     }
@@ -341,7 +341,7 @@ where
                         global_groups: batch.global_groups,
                     },
                 )
-                .map_err(eredu_nn::Error::backend_source)
+                .map_err(eredu_nn::Error::backend_retained_source)
         })();
         self.routed_result(result)
     }
@@ -404,6 +404,6 @@ where
                     global_groups: batch.global_groups,
                 },
             )
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 }

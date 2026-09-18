@@ -44,8 +44,8 @@ pub trait CommunicationTensorMetadata<B: NeuralBackend> {
     /// Compare the actual dimensions with a resolved boundary without creating
     /// an owning shape vector. None leaves this original producer unqualified.
     fn matches_shape_with_funding(&self,tensor:&B::Tensor,shape:&[i32],
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
-        ->Result<Option<bool>,eredu_nn::workspace::WorkspaceMetadataFundingError>{
+        funding:&eredu_nn::workspace::HostMetadataFunding)
+        ->Result<Option<bool>,eredu_nn::workspace::HostMetadataFundingError>{
         let _=(tensor,shape,funding);Ok(None)
     }
 
@@ -53,8 +53,8 @@ pub trait CommunicationTensorMetadata<B: NeuralBackend> {
     /// returns None when it has no such producer; the caller must then refuse.
     /// The dtype must be a built-in scalar, with no allocated encoded label.
     fn fixed_metadata_with_funding(&self,tensor:&B::Tensor,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
-        ->Result<Option<(TensorDtype,usize,Option<usize>)>,eredu_nn::workspace::WorkspaceMetadataFundingError> {
+        funding:&eredu_nn::workspace::HostMetadataFunding)
+        ->Result<Option<(TensorDtype,usize,Option<usize>)>,eredu_nn::workspace::HostMetadataFundingError> {
         let _=(tensor,funding);Ok(None)
     }
 }
@@ -584,7 +584,7 @@ where
         group: CollectiveGroupId,
         operation: CommunicationOperation,
         event: crate::replicated_session::ParallelControlEvent,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
         executor: &B::Executor,
         run: F,
     ) -> Result<T, PartitionExecutionError>
@@ -633,7 +633,7 @@ where
                 return Ok(completed);
             }
         }
-        let mut run = |prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>| self.with_control_group(
+        let mut run = |prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>| self.with_control_group(
             group, CommunicationOperation::FailureAgreement,
             crate::replicated_session::ParallelControlEvent::Phase(phase),
             prepared, context,
@@ -801,57 +801,98 @@ where
         Ok(output)
     }
 
-    /// Submits one globally ordered wave of exact sum reductions before
-    /// waiting for any member of the wave.
-    ///
-    /// This is required for zero-work pipeline participants: an active peer
-    /// may retain a lazy chain containing the entire wave, so waiting after
-    /// the first zero-work submission would prevent later matching
-    /// submissions from ever entering the native executor.
+    /// Submits one exact sum wave before waiting for any member. A selected
+    /// source lends its actual payer to shared validation before constructing
+    /// every occurrence; ordinary execution uses the same group and limits.
     pub fn all_reduce_sum_wave(
-        &self,
-        values: impl IntoIterator<Item = B::Tensor>,
-        group: CollectiveGroupId,
-        executor: &B::Executor,
+        &self, values: Vec<B::Tensor>, group: CollectiveGroupId,
+        executor: &B::Executor, context: Option<&B::ParallelContext>,
     ) -> Result<Vec<B::Tensor>, PartitionExecutionError>
-    where
-        B: SumReductionBackend,
+    where B: SumReductionBackend,
     {
-        let (descriptor, native) = self.group(group, CommunicationOperation::AllReduceSum)?;
+        self.ensure_active()?;
+        // This selector has fixed typed failure and allocates no diagnostic.
+        let selected = self.manifest.select_group_operation(group, CommunicationOperation::AllReduceSum)
+            .map_err(PartitionExecutionError::PreparedGroup)?;
+        let descriptor = selected.descriptor();
+        let native = self.groups[selected.order()].resource.borrow();
         let requirement = Self::group_requirement(descriptor, CommunicationOperation::AllReduceSum);
-        let mut submissions = Vec::new();
+        if let Some(context) = context {
+            let mut controls = None;
+            let mut validated_input = false;
+            let mut validated_output = false;
+            let validate = |actual: &[B::Tensor], funding: &eredu_nn::workspace::HostMetadataFunding, completed: bool| {
+                if controls.is_none() {
+                    let frames = std::mem::size_of::<(
+                        &Self, Vec<B::Tensor>, CollectiveGroupId, &B::Executor,
+                        Option<&B::ParallelContext>, &CommunicationGroupDescriptor,
+                        &B::CommunicationGroup, &CommunicationOperationRequirement,
+                        std::slice::Iter<'_, B::Tensor>, Result<(), PartitionExecutionError>,
+                        Vec<B::Tensor>, Result<Option<Vec<B::Tensor>>, eredu_core::BackendFailure>,
+                        Result<Vec<B::Tensor>, PartitionExecutionError>, usize, bool, bool,
+                    )>();
+                    controls = Some(publication::Controls::<publication::WaveCause>::prepare::<Vec<B::Tensor>>(
+                        funding, CommunicationOperation::AllReduceSum, frames)?);
+                }
+                let controls = controls.as_ref().expect("prepared source controls");
+                if !controls.same_account(funding) || actual.len() != values.len()
+                    || if completed { !validated_input || validated_output } else { validated_input } {
+                    return Err(PartitionExecutionError::CommunicationPolicyMismatch);
+                }
+                for value in actual { controls.validate::<B, I>(&self.inspector, value, requirement, completed)?; }
+                if completed { validated_output = true; } else { validated_input = true; }
+                Ok(())
+            };
+            let result = B::complete_model_sum_wave(&values, native, context, executor, validate);
+            match result {
+                Ok(Some(outputs)) => {
+                    if !validated_input || !validated_output || outputs.len() != values.len() {
+                        return Err(match controls {
+                            Some(controls) => controls.failure(&self.authority,
+                                publication::WaveCause::Contract(PartitionExecutionError::CommunicationPolicyMismatch),
+                                DistributedExecutionPhase::Execution, false),
+                            None => self.output_contract_error(PartitionExecutionError::CommunicationPolicyMismatch,
+                                CommunicationOperation::AllReduceSum, DistributedExecutionPhase::Execution, None),
+                        });
+                    }
+                    return Ok(outputs);
+                }
+                Ok(None) if controls.is_none() => {},
+                Ok(None) => return Err(controls.expect("selected source controls").failure(&self.authority,
+                    publication::WaveCause::Contract(PartitionExecutionError::CommunicationPolicyMismatch),
+                    DistributedExecutionPhase::Execution, false)),
+                Err(cause) => {
+                    return Err(match controls {
+                        Some(controls) => controls.failure(&self.authority, publication::WaveCause::Native(cause), DistributedExecutionPhase::Execution, false),
+                        None => {
+                            self.authority.fence_protocol_failure(CommunicationOperation::AllReduceSum,
+                                DistributedExecutionPhase::Execution, None);
+                            PartitionExecutionError::PreparedCommunication {
+                                operation: CommunicationOperation::AllReduceSum, phase: DistributedExecutionPhase::Execution,
+                                completion: false, source: cause,
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        // Ordinary worker: all submissions precede every wait. No retained
+        // source has been selected or consumed on this branch.
+        let mut submissions = Vec::with_capacity(values.len());
         for value in values {
             self.validate_tensor(&value, requirement, false)?;
-            submissions.push(B::all_reduce_sum(value, native, executor).map_err(|error| {
-                self.submission_error(
-                    error,
-                    CommunicationOperation::AllReduceSum,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )
-            })?);
+            submissions.push(B::all_reduce_sum(value, native, executor).map_err(|cause|
+                self.submission_error(cause, CommunicationOperation::AllReduceSum,
+                    DistributedExecutionPhase::Execution, None))?);
         }
-        submissions
-            .into_iter()
-            .map(|submission| {
-                let output = self.wait(
-                    submission,
-                    CommunicationOperation::AllReduceSum,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )?;
-                self.validate_tensor(&output, requirement, true)
-                    .map_err(|error| {
-                        self.output_contract_error(
-                            error,
-                            CommunicationOperation::AllReduceSum,
-                            DistributedExecutionPhase::Execution,
-                            None,
-                        )
-                    })?;
-                Ok(output)
-            })
-            .collect()
+        submissions.into_iter().map(|submission| {
+            let output = self.wait(submission, CommunicationOperation::AllReduceSum,
+                DistributedExecutionPhase::Execution, None)?;
+            self.validate_tensor(&output, requirement, true).map_err(|cause|
+                self.output_contract_error(cause, CommunicationOperation::AllReduceSum,
+                    DistributedExecutionPhase::Execution, None))?;
+            Ok(output)
+        }).collect()
     }
 
     /// Lends the actual completed I32 matrix of one selected peer-row gather.
@@ -862,7 +903,7 @@ where
         context: &B::ParallelContext, executor: &B::Executor, run: F,
     ) -> Result<Result<T, E>, PartitionExecutionError>
     where F: for<'loan> FnOnce(Option<(&'loan [i32],
-        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+        &'loan eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
     {
         self.with_prepared_peer_count_source(local, group, context, executor, |loan| {
             run(loan.map(|loan| { let (matrix, funding, _source) = loan.into_parts(); (matrix, funding) }))
@@ -1269,9 +1310,15 @@ where
 
     fn broadcast_output_with_parallel(&self,value:B::Tensor,publication:PartitionOutputPublication,
         phase:DistributedExecutionPhase,executor:&B::Executor,
-        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
+        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
         ->Result<B::Tensor,PartitionExecutionError> where B:BroadcastBackend {
-        let controls=prepared.map(|(_,funding)|publication::Controls::<B::CommunicationError>::prepare::<B::Tensor,B::CommunicationCompletion>(funding)).transpose()?;
+        let controls=prepared.map(|(_,funding)|publication::Controls::<B::CommunicationError>::prepare::<B::Tensor>(funding,
+            CommunicationOperation::Broadcast, std::mem::size_of::<(
+                PartitionOutputPublication, DistributedExecutionPhase,
+                eredu_core::Submission<B::Tensor, B::CommunicationCompletion>,
+                Result<eredu_core::Submission<B::Tensor, B::CommunicationCompletion>, B::CommunicationError>,
+                BoundedSubmissionOutcome<B::Tensor>, Result<BoundedSubmissionOutcome<B::Tensor>, B::CommunicationError>,
+            )>())).transpose()?;
         self.ensure_active()?;
         // Same selected-group validator; prepared errors retain its finite
         // typed cause instead of allocating an ordinary diagnostic label.
@@ -2054,6 +2101,10 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
 {
+    /// Declares this executor's actual group-completion worker independently
+    /// of its parameter owner. Custom executors must classify it explicitly.
+    fn group_submission_mechanism(&self) -> crate::GroupSubmissionMechanism;
+
     /// Internal hook coverage of this exact architecture/executor pairing.
     /// The shared partition session adds its final-publication seam separately.
     fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
@@ -2066,7 +2117,7 @@ where
         crate::PreparedLayeredObservationError<A::Error>> { Ok(None) }
 
     /// Rebind the same immutable source after authorized semantic validation.
-    fn bind_observation_paths(&self, _source: &crate::SharedLayeredObservationPaths)
+    fn bind_observation_paths(&self, _source: &crate::SharedLayeredObservationPaths, metadata: Option<crate::layered::LayeredMetadata<A::Error>>)
         -> Result<crate::PreparedLayeredObservationPaths, crate::PreparedLayeredObservationError<A::Error>> {
         Err(crate::PreparedLayeredObservationError::BindingMismatch)
     }
@@ -2416,7 +2467,7 @@ where
     /// Same policy with an explicit source-bound publication occurrence.
     fn publish_with_parallel(&mut self,communication:&PartitionCommunication<B,G,R,I>,
         value:B::Tensor,publication:PartitionOutputPublication,phase:DistributedExecutionPhase,
-        executor:&B::Executor,prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
+        executor:&B::Executor,prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
         ->Result<B::Tensor,PartitionExecutionError> {
         if prepared.is_some(){return Err(PartitionExecutionError::CommunicationPolicyMismatch);}
         self.publish(communication,value,publication,phase,executor)
@@ -2448,7 +2499,7 @@ where
     }
     fn publish_with_parallel(&mut self,communication:&PartitionCommunication<B,G,R,I>,
         value:B::Tensor,publication:PartitionOutputPublication,phase:DistributedExecutionPhase,
-        executor:&B::Executor,prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
+        executor:&B::Executor,prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
         ->Result<B::Tensor,PartitionExecutionError> {
         communication.broadcast_output_with_parallel(value,publication,phase,executor,prepared)
     }
@@ -3273,18 +3324,16 @@ impl<E, G, R, I, T, U, V> Default for PartitionedTextExecution<E, G, R, I, T, U,
     }
 }
 
-impl<A, B, S, Resident, Bounded, E, G, R, I, T, U, V>
-    ReplicatedTextExecutionStrategy<A, B, S, Resident, Bounded>
+impl<A, B, S, Bounded, E, G, R, I, T, U, V>
+    ReplicatedTextExecutionStrategy<A, B, S, E::Policy, Bounded>
     for PartitionedTextExecution<E, G, R, I, T, U, V>
 where
     B: CommunicationBackend + crate::TerminalCommunicationBackend,
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
-    Resident: LayerwisePolicy<B, A::Unit>,
-    Bounded: LayerwisePolicy<B, A::Unit, Error = Resident::Error>,
+    Bounded: LayerwisePolicy<B, A::Unit, Error = <E::Policy as LayerwisePolicy<B, A::Unit>>::Error>,
     E: PartitionedGroupExecutor<A, B, S, G, R, I>
         + crate::parameter_operations::LayeredParameterOwner<B, S, Architecture = A>,
-    E::Policy: LayerwisePolicy<B, A::Unit, Error = Resident::Error>,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
@@ -3292,7 +3341,7 @@ where
     U: PartitionOutputPublisher<B, G, R, I>,
     V: PartitionCommitAgreement<B, G, R, I>,
     A::Error: std::fmt::Display,
-    Resident::Error: std::fmt::Display,
+    <E::Policy as LayerwisePolicy<B, A::Unit>>::Error: std::fmt::Display,
 {
     fn mark_terminal_failure(runtime: &Self::Runtime, _phase: DistributedExecutionPhase) {
         runtime.communication.mark_terminal_failure();
@@ -3308,22 +3357,22 @@ where
     }
     fn prepare_observation_paths(runtime: &Self::Runtime)
         -> Result<Option<crate::PreparedLayeredObservationPaths>,
-            ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>> {
+            ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>> {
         runtime.executor.prepare_observation_paths().map_err(|cause|
             crate::replicated_session::observation_paths::map_prepared(cause,
                 ReplicatedTextSessionError::Architecture))
     }
 
-    fn bind_observation_paths(runtime: &Self::Runtime, source: &crate::SharedLayeredObservationPaths)
+    fn bind_observation_paths(runtime: &Self::Runtime, source: &crate::SharedLayeredObservationPaths, metadata: Option<crate::layered::LayeredMetadata<A::Error>>)
         -> Result<crate::PreparedLayeredObservationPaths,
-            ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>> {
-        runtime.executor.bind_observation_paths(source).map_err(|cause|
+            ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>> {
+        runtime.executor.bind_observation_paths(source, metadata).map_err(|cause|
             crate::replicated_session::observation_paths::map_prepared(cause,
                 ReplicatedTextSessionError::Architecture))
     }
 
     fn validate_observation_paths(runtime: &Self::Runtime, paths: &crate::PreparedLayeredObservationPaths)
-        -> Result<(), ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>> {
+        -> Result<(), ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>> {
         runtime.executor.validate_observation_paths(paths).map_err(|cause|
             crate::replicated_session::observation_paths::map_prepared(cause, |never| match never {}))
     }
@@ -3334,14 +3383,14 @@ where
         observer: &mut O, paths: &crate::PreparedLayeredObservationPaths,
         demand: eredu_core::OutputDemand,
     ) -> Result<(Option<B::Tensor>, A::ForwardContext),
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>>
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>>
     where O: ActivationObserver<B::Tensor, A::Error> + ?Sized {
         runtime.execution_rejection_agreed = false;
         let pass = runtime.executor.begin_with_prepared_observer(
             input, state, pass_kind, demand, context, paths,
         ).map_err(|cause| crate::replicated_session::observation_paths::map_prepared(cause,
             ReplicatedTextSessionError::Architecture))?;
-        run_partition_pass::<A, B, S, Resident, Bounded, E, G, R, I, T, U, V, O>(
+        run_partition_pass::<A, B, S, E::Policy, Bounded, E, G, R, I, T, U, V, O>(
             runtime, pass, state, context, observer,
         )
     }
@@ -3411,10 +3460,10 @@ where
         operation: &mut crate::parameter_operations::ParameterSlotOperation<
             '_,
             B::Tensor,
-            Resident::Error,
+            <E::Policy as LayerwisePolicy<B, A::Unit>>::Error,
         >,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, Resident::Error>> {
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error>> {
         runtime
             .executor
             .with_parameter_slots(location, operation, context)
@@ -3424,10 +3473,24 @@ where
         runtime: &mut Self::Runtime,
         values: &std::collections::BTreeMap<String, B::Tensor>,
         active: bool,
-    ) -> Result<bool, Resident::Error> {
+    ) -> Result<bool, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error> {
         runtime
             .executor
             .publish_parameter_replacements(values, active)
+    }
+
+    fn resident_policy(runtime: &Self::Runtime) -> Option<&E::Policy> {
+        if !matches!(runtime.residency, ExecutionResidency::FullyResident) {
+            return None;
+        }
+        // The executor owns the selected policy. Lending it here lets cold
+        // inspection and original operation installation use that same owner;
+        // a bounded policy is never promoted to resident by its concrete type.
+        runtime.executor.parameter_parts_ref().map(|(_, policy)| policy)
+    }
+
+    fn group_submission_mechanism(runtime: &Self::Runtime) -> crate::GroupSubmissionMechanism {
+        runtime.executor.group_submission_mechanism()
     }
 
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&Bounded> {
@@ -3452,17 +3515,17 @@ where
         demand: eredu_core::OutputDemand,
     ) -> Result<
         (Option<B::Tensor>, A::ForwardContext),
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         runtime.execution_rejection_agreed = false;
-        let mut pass = runtime
+        let pass = runtime
             .executor
             .begin(input, state, pass_kind, demand, context)
             .map_err(ReplicatedTextSessionError::Architecture)?;
-        run_partition_pass::<A, B, S, Resident, Bounded, E, G, R, I, T, U, V, O>(
+        run_partition_pass::<A, B, S, E::Policy, Bounded, E, G, R, I, T, U, V, O>(
             runtime, pass, state, context, observer,
         )
     }
@@ -3474,7 +3537,7 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
         B::Tensor,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
@@ -3515,7 +3578,7 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
         B::Tensor,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     > {
         match runtime.plan.publication {
             Some(publication) => runtime
@@ -3534,8 +3597,8 @@ where
 
     fn publish_observed_output_with_parallel(runtime:&mut Self::Runtime,output:B::Tensor,
         _context:&<B::Tensor as Tensor>::Context,
-        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
-        ->Result<B::Tensor,ReplicatedTextSessionError<A::Error,Resident::Error,std::convert::Infallible>> {
+        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
+        ->Result<B::Tensor,ReplicatedTextSessionError<A::Error,<E::Policy as LayerwisePolicy<B, A::Unit>>::Error,std::convert::Infallible>> {
         match runtime.plan.publication {
             Some(publication)=>runtime.output_publisher.publish_with_parallel(&runtime.communication,output,
                 publication,DistributedExecutionPhase::OutputPublication,runtime.communication_executor.borrow(),prepared)
@@ -3551,7 +3614,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
         Option<B::Tensor>,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     > {
         runtime
             .executor
@@ -3565,7 +3628,7 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
         B::Tensor,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     > {
         match runtime.plan.publication {
             Some(publication) => runtime
@@ -3589,7 +3652,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
         Option<O::Output>,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>,
     >
     where
         O: crate::PredictionTargetOperation<A, B, S>,
@@ -3616,7 +3679,7 @@ where
         runtime: &mut Self::Runtime, epoch: DistributedCommitEpoch,
         context: &<B::Tensor as Tensor>::Context,
     ) -> DistributedCommitOutcome {
-        match <Self as ReplicatedTextExecutionStrategy<A, B, S, Resident, Bounded>>::commit_after_completion_with_parallel(runtime, epoch, context, None) {
+        match <Self as ReplicatedTextExecutionStrategy<A, B, S, E::Policy, Bounded>>::commit_after_completion_with_parallel(runtime, epoch, context, None) {
             Ok(outcome) => outcome,
             Err(ReplicatedTextSessionError::Partition(error)) => indeterminate_commit(epoch, &error),
             Err(_) => DistributedCommitOutcome::Indeterminate {
@@ -3628,9 +3691,9 @@ where
     fn commit_after_completion_with_parallel(
         runtime: &mut Self::Runtime, epoch: DistributedCommitEpoch,
         _context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
     ) -> Result<DistributedCommitOutcome,
-        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>>
+        ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>>
     {
         let Some(group) = runtime.plan.commit_barrier else {
             return Ok(DistributedCommitOutcome::Committed(epoch));
@@ -3647,9 +3710,9 @@ where
     fn agree_distributed_phase(
         runtime: &mut Self::Runtime, phase: DistributedExecutionPhase, local_success: bool,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<bool, ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>>
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>>
     {
-        <Self as ReplicatedTextExecutionStrategy<A, B, S, Resident, Bounded>>::agree_distributed_phase_with_parallel(runtime, phase, local_success, context, None)
+        <Self as ReplicatedTextExecutionStrategy<A, B, S, E::Policy, Bounded>>::agree_distributed_phase_with_parallel(runtime, phase, local_success, context, None)
     }
 
     fn agree_distributed_phase_with_parallel(
@@ -3657,8 +3720,8 @@ where
         phase: DistributedExecutionPhase,
         local_success: bool,
         _context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
-    ) -> Result<bool, ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>>
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, <E::Policy as LayerwisePolicy<B, A::Unit>>::Error, std::convert::Infallible>>
     {
         let cross_stage_failure = phase == DistributedExecutionPhase::Execution
             && runtime.executor.has_cross_stage_collective_waves();
@@ -4067,7 +4130,7 @@ pub enum PartitionExecutionError {
     PreparedBoundary(#[from] crate::PreparedBoundaryFrameError),
     /// Prepared publication metadata could not be retained under its source.
     #[error("prepared publication metadata failed: {0}")]
-    PublicationMetadata(#[source] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    PublicationMetadata(#[source] eredu_nn::workspace::HostMetadataFundingError),
     /// The selected backend has no bounded actual tensor metadata producer.
     #[error("prepared publication tensor metadata is unavailable")]
     PreparedTensorMetadataUnavailable,

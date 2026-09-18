@@ -160,8 +160,8 @@ unsupported/unverified reasons. Pass the selected path to
 `inspect_decode` calls. Do not use an empty selector list as “capture none”:
 the existing observation API treats it as capture-all. Missing returned values
 must remain missing, not become numerical zero. For ordinary instrumented text
-generation, use `capture_discovery`, `prepare_observed_chat`, and
-`generate_observed_chat`; `CapturePlan::none()` and empty new-plan selections both
+generation, use `capture_discovery`, attach a capture declaration to
+`PreparedChatRequest`, and run the session from `start_controlled_chat`; `CapturePlan::none()` and empty new-plan selections both
 mean capture none. The complete [`observed_generate`](../eredu/examples/observed_generate.rs)
 example includes prompt alignment, ordinary sampling, bounded capture and cancellation.
 

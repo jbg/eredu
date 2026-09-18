@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 mod authority_tests;
 mod cursor_storage;
 use cursor_storage::CursorStorage;
-pub(crate) use cursor_storage::RetainedConsumerCursor;
+pub(crate) use cursor_storage::{RetainedConsumerCursor, RetainedCursorFailure};
 pub(crate) mod prepared_channels;
 mod snapshot;
 
@@ -1323,7 +1323,7 @@ impl<S: CursorStorage> CommittedGenerationCursor<S> {
                 cancellation.cancel();
                 if self.finish_reason.is_none() {
                     self.sequence.as_mut().expect("ready sequence").cancel();
-                    pipeline.cancel(emit);
+                    pipeline.cancel(emit).map_err(CommittedGenerationError::Pipeline)?;
                     self.finish_reason = Some(FinishReason::Cancelled);
                 }
                 // A peer cancellation can itself publish a terminal callback.
@@ -1383,7 +1383,7 @@ impl<S: CursorStorage> CommittedGenerationCursor<S> {
     {
         let sequence = self.sequence.as_mut().expect("ready sequence");
         if sequence.observe_cancellation(cancellation) {
-            pipeline.cancel(emit);
+            pipeline.cancel(emit).map_err(CommittedGenerationError::Pipeline)?;
             self.finish_reason = Some(FinishReason::Cancelled);
             return Ok(());
         }
@@ -1403,7 +1403,7 @@ impl<S: CursorStorage> CommittedGenerationCursor<S> {
         {
             Some(token) => token,
             None if sequence.observe_cancellation(cancellation) => {
-                pipeline.cancel(emit);
+                pipeline.cancel(emit).map_err(CommittedGenerationError::Pipeline)?;
                 self.finish_reason = Some(FinishReason::Cancelled);
                 return Ok(());
             }
@@ -1418,7 +1418,7 @@ impl<S: CursorStorage> CommittedGenerationCursor<S> {
                 .commit(token_id, TokenTerminalSignals::default())
                 .map_err(CommittedGenerationError::Lifecycle)?;
             sequence.cancel();
-            pipeline.cancel(emit);
+            pipeline.cancel(emit).map_err(CommittedGenerationError::Pipeline)?;
             // Preserve the established callback-cancellation outcome even when
             // the simultaneously committed token also exhausted the budget.
             self.finish_reason = Some(FinishReason::Cancelled);

@@ -1,33 +1,52 @@
 use super::*;
-use eredu::api::GenerationOutput;
+use eredu::api::{GenerationOutput, PreparedChatPrompt, PreparedChatRequest};
 use eredu_core::GenerationCancellationToken;
 use std::time::{Duration, Instant};
 
 // Both public output aliases support the same consumer without mode-specific
 // forwarding methods or a second terminal-output representation.
-fn terminal<S, T: TerminalTokenStorage>(output: GenerationOutput<S, T>) -> (eredu_core::SpeculativeTokenIds, FinishReason, Option<Duration>) {
+fn terminal<S, T: TerminalTokenStorage>(
+    output: GenerationOutput<S, T>,
+) -> (
+    eredu_core::SpeculativeTokenIds,
+    FinishReason,
+    Option<Duration>,
+) {
     let ttft = output.timing().time_to_first_token();
-    (output.token_ids.into_terminal_tokens(), output.finish_reason, ttft)
+    (
+        output.token_ids.into_terminal_tokens(),
+        output.finish_reason,
+        ttft,
+    )
 }
 
-fn chat(model: &mut LoadedModel<MockBackend>) -> PreparedChat {
-    model
-        .prepare_chat(ChatTemplateRequest {
+fn chat(model: &mut original_sources::Fixture<MockBackend>) -> PreparedChat {
+    {
+        let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
             add_generation_prompt: true,
             ..Default::default()
-        })
-        .unwrap()
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    }
 }
 
 fn settings() -> PreparedChatGenerationSettings {
-    PreparedChatGenerationSettings {
+    original_sources::settings(PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(3),
             ..Default::default()
         },
         ..Default::default()
-    }
+    })
 }
 
 #[test]
@@ -50,11 +69,14 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
                 first_delivery.get_or_insert_with(|| started.elapsed());
                 events.push(event);
             };
-            let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
+            let prefix = [0; 7];
             let (ids, reason, ttft) = if speculative {
                 let output = model
-                    .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                        input,
+                    .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                        chat: &chat,
+                        input: PreparedChatPrompt::TokenIds(&prefix),
+                        output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                        skip_special_tokens: true,
                         drafting: SpeculativeDraft::Embedded,
                         settings: settings(),
                         options: Default::default(),
@@ -65,16 +87,18 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
                     .unwrap();
                 terminal(output)
             } else {
-                let output = model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
-                        input,
-                        settings: settings(),
-                        caller_stop_sequences: &stops,
-                        cancellation: Default::default(),
-                        on_event,
-                    })
+                let cancellation = GenerationCancellationToken::new();
+                let mut settings = settings();
+                settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+                let mut request = PreparedChatRequest::new(&chat, settings);
+                let prefix = [0; 7];
+                request.input = PreparedChatPrompt::TokenIds(&prefix);
+                request.stop_sequences = &stops;
+                let session = model
+                    .start_prepared_chat(request, &cancellation)
+                    .unwrap()
                     .unwrap();
-                terminal(output)
+                terminal(session.run(&cancellation, &mut { on_event }).unwrap())
             };
             assert_eq!(ids, [7]);
             assert!(matches!(
@@ -101,11 +125,14 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
             }
             let cancel_on_event = cancellation.clone();
             let on_event = move |_| cancel_on_event.cancel();
-            let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
+            let prefix = [0; 7];
             let (ids, reason, ttft) = if speculative {
                 let output = model
-                    .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                        input,
+                    .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+                        chat: &chat,
+                        input: PreparedChatPrompt::TokenIds(&prefix),
+                        output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                        skip_special_tokens: true,
                         drafting: SpeculativeDraft::Embedded,
                         settings: settings(),
                         options: Default::default(),
@@ -116,16 +143,21 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
                     .unwrap();
                 terminal(output)
             } else {
-                let output = model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
-                        input,
-                        settings: settings(),
-                        caller_stop_sequences: &[],
-                        cancellation,
-                        on_event,
-                    })
-                    .unwrap();
-                terminal(output)
+                let mut settings = settings();
+                settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+                let mut request = PreparedChatRequest::new(&chat, settings);
+                let prefix = [0; 7];
+                request.input = PreparedChatPrompt::TokenIds(&prefix);
+                match model.start_prepared_chat(request, &cancellation).unwrap() {
+                    Some(session) => {
+                        terminal(session.run(&cancellation, &mut { on_event }).unwrap())
+                    }
+                    None => (
+                        Vec::<u32>::new().into_terminal_tokens(),
+                        FinishReason::Cancelled,
+                        None,
+                    ),
+                }
             };
             assert_eq!(reason, FinishReason::Cancelled);
             assert_eq!(ids.len(), usize::from(!pre_cancel));
@@ -151,7 +183,10 @@ fn speculative_batch_ttft_uses_a_shared_origin_and_excludes_cancelled_lanes() {
             ]
             .into_iter()
             .map(|cancellation| PreparedChatSpeculativeBatchLane {
-                input: PreparedChatInput::rendered_prompt(&chat),
+                chat: &chat,
+                input: PreparedChatPrompt::Rendered,
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 settings: settings(),
                 max_draft_tokens: NonZeroUsize::new(2).unwrap(),
                 caller_stop_sequences: &[],
@@ -192,15 +227,21 @@ fn speculative_ttft_counts_a_buffered_unicode_token_cancelled_before_text() {
             drafting: SpeculativeDraft::Embedded,
             lanes: vec![
                 PreparedChatSpeculativeBatchLane {
-                    input: PreparedChatInput::rendered_prompt(&chat),
+                    chat: &chat,
+                    input: PreparedChatPrompt::Rendered,
+                    output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                    skip_special_tokens: true,
                     settings: settings(),
                     max_draft_tokens: NonZeroUsize::new(2).unwrap(),
                     caller_stop_sequences: &[],
                     cancellation: cancellation.clone(),
-                    on_event: Box::new(|event| events.push(event)),
+                    on_event: Box::new(|event| events.push(event)) as Box<dyn FnMut(SemanticEvent)>,
                 },
                 PreparedChatSpeculativeBatchLane {
-                    input: PreparedChatInput::rendered_prompt(&chat),
+                    chat: &chat,
+                    input: PreparedChatPrompt::Rendered,
+                    output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                    skip_special_tokens: true,
                     settings: settings(),
                     max_draft_tokens: NonZeroUsize::new(2).unwrap(),
                     caller_stop_sequences: &[],
@@ -217,10 +258,12 @@ fn speculative_ttft_counts_a_buffered_unicode_token_cancelled_before_text() {
         output.requests()[0].finish_reason(),
         FinishReason::Cancelled
     );
-    assert!(output.requests()[0]
-        .timing()
-        .time_to_first_token()
-        .is_some());
+    assert!(
+        output.requests()[0]
+            .timing()
+            .time_to_first_token()
+            .is_some()
+    );
     assert_eq!(output.requests()[1].timing().time_to_first_token(), None);
     assert_eq!(
         events,
@@ -243,38 +286,38 @@ fn observed_ttft_counts_a_buffered_unicode_token_before_record_delivery() {
         .len() as u32;
     let mut model = unicode_model(Some(first));
     let chat = chat(&mut model);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings(),
-            eredu_core::capture::CapturePlan::none(),
-            eredu::api::TraceLimits {
-                per_record_bytes: 65536,
-                total_bytes: 1024 * 1024,
-            },
-        )
-        .unwrap();
+    let mut settings = settings();
+    settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+    let request = PreparedChatRequest::new(&chat, settings);
+    let trace = eredu::api::TraceLimits {
+        per_record_bytes: 65536,
+        total_bytes: 1024 * 1024,
+    };
     let started = Instant::now();
     let mut token_delivered = None;
-    let output = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            match record.event {
-                ObservedGenerationEvent::Token { token_id, .. } => {
-                    assert_eq!(token_id, first);
-                    token_delivered = Some(started.elapsed());
-                    ControlFlow::Break(())
-                }
-                ObservedGenerationEvent::Semantic {
-                    event: SemanticEvent::TextDelta(_),
-                    ..
-                } => {
-                    panic!("a byte fragment must not produce visible text")
-                }
-                _ => ControlFlow::Continue(()),
-            }
-        })
+    let mut ttft = None;
+    let mut collect = |record: eredu::api::ControlledGenerationRecord| match record.event.progress()
+    {
+        Some(ObservedGenerationEvent::Token { token_id, .. }) => {
+            assert_eq!(*token_id, first);
+            ttft = record.timing.time_to_first_token();
+            token_delivered = Some(started.elapsed());
+            ControlFlow::Break(())
+        }
+        Some(ObservedGenerationEvent::Semantic {
+            event: SemanticEvent::TextDelta(_),
+            ..
+        }) => {
+            panic!("a byte fragment must not produce visible text")
+        }
+        _ => ControlFlow::Continue(()),
+    };
+    let mut run = model
+        .start_controlled_chat(request, trace, Default::default(), &mut collect)
+        .unwrap()
         .unwrap();
-    assert_eq!(output.token_ids, [first]);
-    assert_eq!(output.finish_reason, FinishReason::Cancelled);
-    assert!(output.timing().time_to_first_token().unwrap() <= token_delivered.unwrap());
+    run.run(&mut collect).unwrap();
+    assert_eq!(run.token_ids(), [first]);
+    assert_eq!(run.finish_reason(), Some(FinishReason::Cancelled));
+    assert!(ttft.unwrap() <= token_delivered.unwrap());
 }

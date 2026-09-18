@@ -1,6 +1,35 @@
-use super::super::plain::{start_original_plain_string, OriginalPlainStartError};
+use super::super::plain::{
+    start_original_plain_string_with_options_for, OriginalPlainSession, OriginalPlainStartError,
+};
 use super::*;
 use std::io::Write as _;
+
+/// Test shorthand preserving the fixture's concrete consumer error transport.
+fn start_original_plain_string<'a, B: OriginalTokenizerBackend>(
+    runtime: &'a mut ModelRuntime<B>,
+    source: &OriginalTokenizer,
+    input: &str,
+    config: TextGenerationConfig,
+    eos: &[u32],
+    stops: &[&str],
+    add_special_tokens: bool,
+    skip_special_tokens: bool,
+    cancellation: &GenerationCancellationToken,
+) -> Result<Option<OriginalPlainSession<'a, B>>, OriginalPlainStartError<B::Error>> {
+    start_original_plain_string_with_options_for::<B, OriginalPlainStartError<B::Error>>(
+        runtime,
+        source,
+        input,
+        config,
+        eos,
+        stops,
+        add_special_tokens,
+        skip_special_tokens,
+        cancellation,
+        None,
+    )
+}
+
 // The supported regex profile needs about 56 MB of encoding workspace. Positive
 // string fixtures reserve 64 MiB; exact short-admission cases below derive their
 // limits from the actual C/S/E requirements and keep those limits unchanged.
@@ -294,7 +323,7 @@ impl TokenFilterController for CheckedController {
         })
     }
     fn inference_storage(&self) -> TextControllerStorage<'_> {
-        TextControllerStorage::RunOwnedWithOriginalTokenDomain(OriginalTokenDomainWitness::new(
+        TextControllerStorage::RunOwnedWithOriginalTokenDomain(OriginalSourceWitness::new(
             &self.source,
         ))
     }
@@ -324,9 +353,9 @@ impl TokenFilterController for CheckedController {
                 self.source.generation_domain().unwrap()
             };
             let witness = if matches!(self.fault, Fault::WrongTypeWitness) {
-                OriginalTokenDomainWitness::new(&self.fault)
+                OriginalSourceWitness::new(&self.fault)
             } else {
-                OriginalTokenDomainWitness::new(witness)
+                OriginalSourceWitness::new(witness)
             };
             decision = decision.with_original_tokenizer_validity(mask, witness);
         }
@@ -715,8 +744,8 @@ fn original_text_source_rejections_stay_by_value_before_their_actual_allowance()
     let i = WorkingMemoryPool::tokenizer_file_required_bytes(&read).unwrap();
     let (runtime, facts, pool) = bare_runtime_with_capacity(i - 1);
     let error =
-        Backend::compile_original_tokenizer_file_for_generation(&runtime, read).unwrap_err();
-    let OriginalTextSourceError::File(cause) = &error else {
+        Backend::compile_original_tokenizer_source_for_generation(&runtime, eredu_runtime::working_memory::OriginalTokenizerInput::File(read)).unwrap_err();
+    let OriginalTokenizerSourceError::Input(cause) = &error else {
         panic!("actual file admission cause")
     };
     assert_eq!(cause.input_bytes(), 0);
@@ -951,4 +980,24 @@ fn original_plain_readiness_source_is_explicit_through_shared_startup_and_advanc
     assert!(facts.borrow().order.is_empty(),"failed source cannot enter model admission or ordinary consensus");
     assert!(facts.borrow().preparation_control_calls.is_empty());
     assert_eq!(facts.borrow().total_agreements,0);
+}
+
+#[test]
+fn peer_startup_refusal_uses_the_source_authenticated_plain_driver() {
+    for stage in [Stage::Admission, Stage::Prompt, Stage::Sampling] {
+        let (mut runtime, facts, pool) = bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
+        facts.borrow_mut().shared_admission_capacity = Some(STRING_FIXTURE_CAPACITY);
+        let tokenizer = source(&runtime, true);
+        let baseline = pool.used_bytes().unwrap();
+        facts.borrow_mut().reject = Some(stage);
+        let failure = start_original_plain_string(&mut runtime, &tokenizer, "hi hi<S>",
+            config(), &[], &[], true, true, &GenerationCancellationToken::new());
+        assert!(failure.is_err());
+        assert!(!facts.borrow().order.contains(&"submit"));
+        assert_eq!(facts.borrow().ids.len(), if stage == Stage::Admission { 0 } else { 3 });
+        drop(failure);
+        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        drop((tokenizer, runtime));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
 }

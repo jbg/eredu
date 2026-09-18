@@ -111,7 +111,7 @@ use crate::{
 };
 
 pub(crate) mod index_impl;
-pub use index_impl::inline_basic_index_control_bytes;
+pub use index_impl::{inline_basic_index_control_bytes, basic_range_index_control_bytes};
 pub(crate) mod indexmut_impl;
 pub use indexmut_impl::inline_scalar_index_update_control_bytes;
 

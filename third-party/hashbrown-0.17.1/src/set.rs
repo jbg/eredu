@@ -1214,6 +1214,13 @@ where
     pub fn allocation_size(&self) -> usize {
         self.map.allocation_size()
     }
+
+    /// Exact complete allocation requested by the next `try_reserve` on this
+    /// current set. It shares the map's ordinary resize and rehash decision.
+    #[inline]
+    pub fn try_reserve_layout(&self, additional: usize) -> Result<Option<core::alloc::Layout>, TryReserveError> {
+        self.map.try_reserve_layout(additional)
+    }
 }
 
 impl<T, S, A> PartialEq for HashSet<T, S, A>

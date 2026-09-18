@@ -82,6 +82,8 @@ mod metal {
         definition: DEFINITION,
         specializations: signatures(),
     };
+    use crate::backend::managed_memory::kernel_family::UnenforcedFamilyCache;
+    static UNENFORCED: [UnenforcedFamilyCache; 1] = [const { UnenforcedFamilyCache::new() }; 1];
     static INITIALIZED: OnceLock<InitializedSharedNative<Family>> = OnceLock::new();
     static INITIALIZING: AtomicBool = AtomicBool::new(false);
     struct Winner;
@@ -95,13 +97,13 @@ mod metal {
     // device state and of the separately admitted initialized family.
     static SOURCE_QUALIFIED: OnceLock<bool> = OnceLock::new();
     pub(crate) fn source_qualified() -> bool {
-        *SOURCE_QUALIFIED
-            .get_or_init(|| PLAN.layout::<SharedNativeInitializationCustody>().is_ok())
+        *SOURCE_QUALIFIED.get_or_init(|| PLAN.layout::<SharedNativeInitializationCustody>().is_ok())
     }
     pub(crate) fn static_storage_bytes() -> usize {
         // The common generator preamble and retirement queue are already owned
         // by the pointwise family's process baseline in this same domain.
         size_of::<OnceLock<InitializedSharedNative<Family>>>()
+            + std::mem::size_of_val(&UNENFORCED)
             + std::mem::size_of_val(&SOURCE_QUALIFIED)
             + size_of::<AtomicBool>()
             + size_of::<MetalKernelFamilyPlan<'static, 3, 1, 32>>()
@@ -146,62 +148,41 @@ mod metal {
         grouped: bool,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        use safemlx::fast::{CustomKernelConfig, MetalKernel};
-        use std::cell::RefCell;
-        thread_local! { static ORDINARY: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        let observer = OriginalScopeObserver::try_current()?;
         let shape = [rows, outputs];
         let output = [BorrowedKernelOutput {
             shape: &shape,
             dtype: Dtype::Bfloat16,
         }];
         let templates = templates(columns, grouped);
-        if let Some(observer) = OriginalScopeObserver::try_current()? {
-            let family = INITIALIZED.get().ok_or_else(|| observer.capacity_error())?;
-            let [value] = family.output().apply_fixed_device(
+        let apply = |family: &Family| {
+            family.apply_fixed_device(
                 inputs,
                 output,
                 &templates,
                 [32, outputs, rows],
                 [32, 1, 1],
                 stream,
-            )?;
-            return Ok(value);
-        }
-        ORDINARY.with(|cell| {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(MetalKernel::new(
-                    DEFINITION.name,
-                    DEFINITION.inputs,
-                    DEFINITION.outputs,
-                    DEFINITION.source,
-                    DEFINITION.header,
-                    DEFINITION.ensure_row_contiguous,
-                    DEFINITION.atomic_outputs,
-                )?);
+            )
+        };
+        let values = if let Some(family) = INITIALIZED.get() {
+            apply(family.output())?
+        } else {
+            if let Some(observer) = observer {
+                return Err(observer.capacity_error());
             }
-            let loan = cell.borrow();
-            let kernel = loan.as_ref().expect("BF16 kernel initialized");
-            if MetalKernel::fixed_control_bytes::<3, 1>(2, 2).is_some() {
-                let [value] = kernel.apply_fixed_device(
-                    inputs,
-                    output,
-                    &templates,
-                    [32, outputs, rows],
-                    [32, 1, 1],
-                    stream,
-                )?;
-                Ok(value)
-            } else {
-                let config = CustomKernelConfig::new()
-                    .with_template_arg_int("COLUMNS", i32::from(columns))
-                    .with_template_arg_int("GROUPED", i32::from(grouped))
-                    .with_grid([32, outputs, rows])
-                    .with_thread_group([32, 1, 1])
-                    .with_output_arg(shape, Dtype::Bfloat16);
-                let mut values = kernel.apply_device(inputs, &config, stream)?;
-                Ok(values.pop().expect("one declared BF16 output"))
-            }
-        })
+            let family = UNENFORCED[0].get_or_try_init(|owner| PLAN.realize(owner))?;
+            family.apply_fixed_device(
+                inputs,
+                output,
+                &templates,
+                [32, outputs, rows],
+                [32, 1, 1],
+                stream,
+            )?
+        };
+        let [value] = values;
+        Ok(value)
     }
     #[derive(Debug)]
     pub(crate) struct Initializer;

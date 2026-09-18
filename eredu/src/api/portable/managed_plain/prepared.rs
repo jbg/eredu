@@ -10,7 +10,7 @@ pub struct ManagedPreparedInputRequest<'a, P> {
     pub settings: PreparedChatGenerationSettings,
     pub stop_sequences: &'a [&'a str],
     pub skip_special_tokens: bool,
-    preparation: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    preparation: Option<eredu_runtime::input::OriginalModelInputCustody>,
 }
 impl<P> ManagedPreparedInputRequest<'_, P> {
     pub fn new(input: P, settings: PreparedChatGenerationSettings) -> Self {
@@ -53,6 +53,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
             .map_err(|error| ManagedPlainTextError::new(Cause::Generation(error)))?;
         let source_budget = B::prepare_original_text_source_budget(&self.runtime, &source.0, capacity)
             .map_err(|error| ManagedPlainTextError::new(Cause::Source(error)))?;
+        let mut input_custody = request.preparation;
         start_original_prepared_input_with_options_for::<B, (
             ManagedPreparedInputRequest<'_, B::Prompt>, Option<B::Prompt>,
             ManagedPlainTextError, OriginalPlainStartError<B::Error>,
@@ -60,10 +61,13 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         )>(
             &mut self.runtime, &source.0, request.input, config, &self.eos_token_ids,
             request.stop_sequences, request.skip_special_tokens, cancellation, options,
-        ).map(|session| session.map(ManagedPlainTextSession)).map_err(|error| {
+        ).map(|session| session.map(|mut session| {
+            session.retain_input_custody(input_custody.take());
+            ManagedPlainTextSession(session)
+        })).map_err(|error| {
             let mut error = ManagedPlainTextError::startup::<B>(error);
             error.source_budget = Some(source_budget);
-            error.input_preparation = request.preparation;
+            error.input_preparation = input_custody;
             error
         })
     }
@@ -77,8 +81,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
     ) -> Result<Option<GenerationPlainTextOutput>, ManagedPlainTextError> {
         self.start_managed_prepared_input(source, request, cancellation)?
-            .map(|session| session.run(cancellation, emit)
-                .map_err(|error| ManagedPlainTextError::new(Cause::Backend(error))))
+            .map(|session| session.run(cancellation, emit))
             .transpose()
     }
 }

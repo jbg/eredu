@@ -260,7 +260,7 @@ impl<'r, 'a, 'c> TensorReader<'r, 'a, 'c> {
         let context = self.expected.context;
         let selection = &self.source.plan().selections[self.index];
         let point = &self.source.points()[self.index];
-        let number = |value:u64| match event { Event::U64(n) => n == value, Event::I64(n) => u64::try_from(n).ok() == Some(value), _ => false };
+        let number = |value:u64| match event { Event::U64(n) => n == value, Event::I64(n) => u64::try_from(n).ok() == Some(value), Event::Number(n)=>n.as_u64()==Some(value), _ => false };
         let text = |value:&str|matches!(event, Event::String(s) if s == value);
         let valid = match (frame.node, frame.key) {
             (Node::Root, 0) => number(u64::from(PARTITION_CAPTURE_SCHEMA_VERSION)),
@@ -320,13 +320,13 @@ impl<'r, 'a, 'c> TensorReader<'r, 'a, 'c> {
             (Node::Edges, _) => {
                 let Output::Histogram(output) = &self.output else { self.invalid=true; return; };
                 let value=match event {Event::U64(n)=>Some(n as f32), Event::I64(n)=>Some(n as f32),
-                    Event::F64(n)=>Some(n as f32), _=>None};
+                    Event::Number(n)=>n.as_f64().map(|n|n as f32), Event::F64(n)=>Some(n as f32), _=>None};
                 output.edges.get(frame.count).zip(value).is_some_and(|(expected,actual)|
                     actual.is_finite() && actual.to_bits()==expected.to_bits())
             }
             (Node::Counts, _) | (Node::Histogram, 2..=4) => {
                 let Output::Histogram(output) = &mut self.output else { self.invalid=true; return; };
-                let value=match event {Event::U64(n)=>Some(n), Event::I64(n)=>u64::try_from(n).ok(), _=>None};
+                let value=match event {Event::U64(n)=>Some(n), Event::I64(n)=>u64::try_from(n).ok(), Event::Number(n)=>n.as_u64(), _=>None};
                 if let Some(value)=value {
                     let destination=match frame.node {Node::Counts=>output.counts.get_mut(frame.count),
                         _=>match frame.key {2=>Some(&mut output.below),3=>Some(&mut output.above),4=>Some(&mut output.non_finite),_=>None}};
@@ -337,7 +337,7 @@ impl<'r, 'a, 'c> TensorReader<'r, 'a, 'c> {
                 let Output::Summary(output) = &mut self.output else { self.invalid = true; return; };
                 if field < 6 {
                     let value = match event { Event::U64(n) => Some(n),
-                        Event::I64(n) => u64::try_from(n).ok(), _ => None };
+                        Event::I64(n) => u64::try_from(n).ok(), Event::Number(n)=>n.as_u64(), _ => None };
                     if let Some(value) = value {
                         match field { 0 => output.elements = value, 1 => output.finite = value,
                             2 => output.non_finite = value, 3 => output.nan = value,
@@ -348,7 +348,7 @@ impl<'r, 'a, 'c> TensorReader<'r, 'a, 'c> {
                 } else {
                     let value = match event { Event::Null => Some(None),
                         Event::U64(n) => Some(Some(n as f64)), Event::I64(n) => Some(Some(n as f64)),
-                        Event::F64(n) if n.is_finite() => Some(Some(n)), _ => None };
+                        Event::Number(n)=>n.as_f64().filter(|n|n.is_finite()).map(Some), Event::F64(n) if n.is_finite() => Some(Some(n)), _ => None };
                     if let Some(value) = value {
                         match field { 6 => output.min = value, 7 => output.max = value,
                             8 => output.mean = value, 9 => output.rms = value, _ => return }
@@ -359,6 +359,7 @@ impl<'r, 'a, 'c> TensorReader<'r, 'a, 'c> {
             (Node::Values, _) => {
                 let value = match event {
                     Event::U64(n) => Some(n as f32), Event::I64(n) => Some(n as f32),
+                    Event::Number(n)=>n.as_f64().map(|n|n as f32).filter(|n|n.is_finite()),
                     Event::F64(n) => { let value = n as f32; value.is_finite().then_some(value) },
                     Event::String("nan") => Some(f32::NAN),
                     Event::String("+inf") => Some(f32::INFINITY),
@@ -393,5 +394,5 @@ impl Sink for TensorReader<'_, '_, '_> {
 
 fn candidate()->CaptureCandidate {CaptureCandidate {token_id:0,score:0.0,allowed:true}}
 fn score()->CaptureTokenScore {CaptureTokenScore {target:candidate(),log_probability:0.0,rank:0,strongest_alternative:None}}
-fn integer(event:&Event<'_>)->Option<u64> {match event {Event::U64(n)=>Some(*n),Event::I64(n)=>u64::try_from(*n).ok(),_=>None}}
-fn finite_f64(event:&Event<'_>)->Option<f64> {match event {Event::U64(n)=>Some(*n as f64),Event::I64(n)=>Some(*n as f64),Event::F64(n)=>Some(*n),_=>None}.filter(|n|n.is_finite())}
+fn integer(event:&Event<'_>)->Option<u64> {match event {Event::U64(n)=>Some(*n),Event::I64(n)=>u64::try_from(*n).ok(),Event::Number(n)=>n.as_u64(),_=>None}}
+fn finite_f64(event:&Event<'_>)->Option<f64> {match event {Event::U64(n)=>Some(*n as f64),Event::I64(n)=>Some(*n as f64),Event::F64(n)=>Some(*n),Event::Number(n)=>n.as_f64(),_=>None}.filter(|n|n.is_finite())}

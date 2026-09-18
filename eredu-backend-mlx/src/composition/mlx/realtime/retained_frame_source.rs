@@ -5,7 +5,7 @@ use crate::{composition::moshi::{RealtimeOperationPlan,RealtimeOperationRecipe,R
         ResidentExecutionMechanisms,SpeculativeNumericalRecipe,MlxParallelWorkspace,MlxParallelWorkspaceMechanisms},
         runtime::execution::generic::LayerwiseWorkspace}};
 use eredu_core::{RealtimeFrameScheduleState,RealtimeSampling};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceTensor,WorkspaceMetadataFunding,WorkspaceMetadataError};
+use eredu_nn::workspace::{WorkspaceContext,WorkspaceTensor,HostMetadataFunding,WorkspaceMetadataError};
 use eredu_runtime::{RealtimeIngressSource,RealtimePayloadHistory,RealtimePayloadContract,
     working_memory::{HostSourceConstructionFacts,WorkspaceSamplingRandomState}};
 use safemlx::{PreparedInputRuntime,Stream};
@@ -61,7 +61,7 @@ pub(crate) struct CompiledRealtimeFrameSource {
     pub(crate) shape:FrameShape,
     _state:ProjectedNativeStorage,
     _payloads:ProjectedNativeStorage,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 /// Descriptive branch-selection facts. Token values remain borrowed from the
 /// actual scheduler frame by the initialized-input constructor; they are never
@@ -90,10 +90,10 @@ impl FrameShape {
 }
 pub(super) struct RetainedFrameSources {
     pub(super) parallel:Option<OriginalParallelInvocation>,
-    _state:ProjectedNativeStorage,_payloads:ProjectedNativeStorage,_funding:WorkspaceMetadataFunding,
+    _state:ProjectedNativeStorage,_payloads:ProjectedNativeStorage,_funding:HostMetadataFunding,
 }
 impl CompiledRealtimeFrameSource {
-    pub(super) fn funding(&self)->&WorkspaceMetadataFunding {&self._funding}
+    pub(super) fn funding(&self)->&HostMetadataFunding {&self._funding}
     pub(super) fn into_parts(self)->(RealtimeOperationRecipe,super::original_observation::RealtimeHostReadPlan,
         RetainedFrameSources,eredu_runtime::RealtimeIngressContract,FrameShape) {
         (self.operations,self.host,RetainedFrameSources{parallel:self.parallel,_state:self._state,_payloads:self._payloads,_funding:self._funding},
@@ -228,3 +228,5 @@ pub(crate) fn compile_frame_source(model:&MlxRealtimeExecution,native:RealtimeNa
     visitor.result.ok_or_else(||Error::Neural(context.metadata_error(format_args!(
         "selected realtime source did not execute its complete cold visit"))))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

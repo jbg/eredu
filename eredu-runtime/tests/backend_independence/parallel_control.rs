@@ -21,7 +21,7 @@ pub(super) fn with_loan<T, E, F>(
     run: F,
 ) -> Result<Result<T, E>, eredu_core::BackendFailure>
 where
-    F: FnOnce(Option<(&(), &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    F: FnOnce(Option<(&(), &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
 {
     let reject = TRACE.with(|trace| {
         let mut trace = trace.borrow_mut();

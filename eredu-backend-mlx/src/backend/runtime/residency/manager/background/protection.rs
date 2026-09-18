@@ -9,7 +9,7 @@ pub(crate) struct PreparedHostProtection {
     active: Vec<OffloadUnitId>,
     source: ForegroundDiskDescriptors,
     custody: OriginalHostSourceCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedHostProtection {
     pub(crate) fn host_bytes(group: &str, active: &[OffloadUnitId]) -> Option<usize> {
@@ -41,7 +41,7 @@ impl PreparedHostProtection {
                 &str,
                 &[OffloadUnitId],
                 &OriginalHostSourceCustody,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<(
                 &mut eredu_runtime::ResidencyController,
@@ -62,7 +62,7 @@ impl PreparedHostProtection {
         group: &str,
         active: &[OffloadUnitId],
         custody: OriginalHostSourceCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, BackgroundHostReadFailure> {
         let fail = |cause| BackgroundHostReadFailure::Source {
             cause,

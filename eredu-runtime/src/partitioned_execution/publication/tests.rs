@@ -1,4 +1,5 @@
 use super::*;
+use eredu_core::Submission;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
@@ -9,15 +10,15 @@ struct Account {
     used: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
 }
-impl eredu_nn::workspace::WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl eredu_nn::workspace::HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.used
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_add(bytes)
                     .filter(|&next| next <= self.limit.load(Ordering::SeqCst))
             })
             .map(|_| ())
-            .map_err(|_| WorkspaceMetadataFundingError::Unavailable)
+            .map_err(|_| HostMetadataFundingError::Unavailable)
     }
 }
 impl Drop for Account {
@@ -73,7 +74,7 @@ fn prepared_publication_uses_shared_wait_and_retains_unformatted_failure_custody
     let limit = Arc::new(AtomicUsize::new(usize::MAX));
     let drops = Arc::new(AtomicUsize::new(0));
     let formats = Arc::new(AtomicUsize::new(0));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         live: live.clone(),
         used: used.clone(),
         limit: limit.clone(),
@@ -81,7 +82,8 @@ fn prepared_publication_uses_shared_wait_and_retains_unformatted_failure_custody
     .unwrap();
     let before = used.load(Ordering::SeqCst);
     let controls =
-        Controls::<NativeFailure>::prepare::<[u32; 3], FailedCompletion>(&funding).unwrap();
+        Controls::<NativeFailure>::prepare::<[u32; 3]>(&funding, CommunicationOperation::Broadcast,
+            size_of::<(Submission<[u32;3],FailedCompletion>,Result<BoundedSubmissionOutcome<[u32;3]>,NativeFailure>)>()).unwrap();
     assert!(used.load(Ordering::SeqCst) > before);
     let policy = crate::CommunicationCompletionPolicy::new(
         std::time::Duration::from_secs(1),
@@ -127,7 +129,8 @@ fn prepared_publication_uses_shared_wait_and_retains_unformatted_failure_custody
     let spent = used.load(Ordering::SeqCst);
     limit.store(spent, Ordering::SeqCst);
     assert!(matches!(
-        Controls::<NativeFailure>::prepare::<[u32; 3], FailedCompletion>(&funding),
+        Controls::<NativeFailure>::prepare::<[u32; 3]>(&funding, CommunicationOperation::Broadcast,
+            size_of::<(Submission<[u32;3],FailedCompletion>,Result<BoundedSubmissionOutcome<[u32;3]>,NativeFailure>)>()),
         Err(PartitionExecutionError::PublicationMetadata(_))
     ));
     assert_eq!(used.load(Ordering::SeqCst), spent);

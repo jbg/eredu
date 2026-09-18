@@ -85,6 +85,13 @@ where
     }
     /// Exact prepared content binding for this speculative lane.
     fn identity(&self) -> Option<&PreparedInputCacheIdentity>;
+    /// Visits the architecture's actual admitted semantic token sequence before
+    /// source creation. No tensor is copied and no native authority is granted.
+    fn visit_token_parts(&self,
+        _visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+    ) -> Result<(), A::Error> where A::Error: From<Error> {
+        Err(Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified).into())
+    }
     /// Creates the source inside the existing source preparation guard.
     fn into_source(self, geometry: InferenceGeometry) -> Result<Option<Self::Source>, A::Error>;
 }
@@ -94,7 +101,7 @@ pub struct TextPredictionPrefill<T> {
     tokens: PredictionTokens<T>,
     identity: Option<SharedPreparedInputCacheIdentity>,
     chunk: Option<NonZeroU64>,
-    metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 enum PredictionTokens<T> {
     Owned(Vec<T>),
@@ -120,7 +127,7 @@ impl<T> TextPredictionPrefill<T> {
         input: eredu_runtime::input::PreparedModelInputOwner<T>,
         identity: Option<SharedPreparedInputCacheIdentity>,
         chunk: Option<NonZeroU64>,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         let metadata = crate::prefill::Metadata::funded(Some(funding));
         metadata.controls::<(Self, eredu_runtime::input::PreparedModelInputOwner<T>)>()?;
@@ -164,6 +171,20 @@ where
     /// Exact prepared content binding for this speculative lane.
     fn identity(&self) -> Option<&PreparedInputCacheIdentity> {
         self.identity.as_ref().map(AsRef::as_ref)
+    }
+    fn visit_token_parts(&self,
+        visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        use crate::composite_execution::PredictionTokenPart;
+        match &self.tokens {
+            PredictionTokens::Owned(tokens) => {
+                for token in tokens { visitor(PredictionTokenPart::Tokens(token))?; }
+            }
+            PredictionTokens::Prepared(input) => {
+                for part in input.parts() { visitor(PredictionTokenPart::Tokens(part.payload().value()))?; }
+            }
+        }
+        Ok(())
     }
     /// Creates the source inside the existing source preparation guard.
     fn into_source(self, geometry: InferenceGeometry) -> Result<Option<Self::Source>, Error> {

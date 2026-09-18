@@ -305,7 +305,7 @@ fn capture_units(device: LocalDevice) {
             );
         }
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user","content":"left"})],
                 add_generation_prompt: true,
                 ..Default::default()
@@ -359,25 +359,34 @@ fn capture_units(device: LocalDevice) {
         let mut baseline = None;
         for controlled in [false, true] {
             model.reset().unwrap();
-            let prepared = model
-                .prepare_observed_token_ids(&chat, prefix.clone(), settings, capture.clone(), trace)
-                .unwrap();
+            let prepared_prefix = prefix.clone();
+            let prepared_capture = capture.clone();
+            let prepared_trace = trace;
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+            prepared.output_mode = PreparedChatOutputMode::Text;
+            prepared.capture = Some(&prepared_capture);
             let mut events = vec![];
             if controlled {
                 let mut emit = |r: ControlledGenerationRecord| {
-                    events.push(r.generation);
+                    events.push(r);
                     ControlFlow::Continue(())
                 };
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), &mut emit)
+                    .start_controlled_chat(prepared, prepared_trace, Default::default(), &mut emit)
+                    .unwrap()
                     .unwrap();
-                run.enable_snapshots(SnapshotLimits {
-                    max_snapshots: 2,
-                    max_branches: 1,
-                    // Fork admission includes worst-case trace delivery storage.
-                    retained_bytes: 512 << 20,
-                    cumulative_copy_bytes: 2 << 30,
-                })
+                run.enable_snapshots(
+                    SnapshotLimits {
+                        max_snapshots: 2,
+                        max_branches: 1,
+                        // Fork admission includes worst-case trace delivery storage.
+                        retained_bytes: 512 << 20,
+                        cumulative_copy_bytes: 2 << 30,
+                    },
+                    ORIGINAL_CAPACITY,
+                    copy_limits(),
+                )
                 .unwrap();
                 let initial = run.snapshot(&mut emit).unwrap();
                 run.run(&mut emit).unwrap();
@@ -402,21 +411,31 @@ fn capture_units(device: LocalDevice) {
                 run.run(&mut emit).unwrap();
                 run.exchange(&mut child, &mut emit).unwrap();
             } else {
-                model
-                    .generate_observed_text(prepared, &[], Default::default(), |r| {
+                (|| -> Result<_, ControlledGenerationError> {
+                    let mut emit = |r| {
                         events.push(r);
                         ControlFlow::Continue(())
-                    })
-                    .unwrap();
+                    };
+                    let mut run = model
+                        .start_controlled_chat(
+                            prepared,
+                            prepared_trace,
+                            GenerationControlHandle::new(Default::default()),
+                            &mut emit,
+                        )?
+                        .expect("live fixture control");
+                    run.run(&mut emit)
+                })()
+                .unwrap();
             }
             let steps: Vec<_> = events
-                .into_iter()
-                .filter_map(|r| match r.event {
-                    ObservedGenerationEvent::Token {
+                .iter()
+                .filter_map(|r| match r.event.progress() {
+                    Some(ObservedGenerationEvent::Token {
                         forced,
                         captures: Some(step),
                         ..
-                    } => {
+                    }) => {
                         assert!(!forced);
                         Some(step)
                     }
@@ -518,22 +537,36 @@ fn capture_units(device: LocalDevice) {
                     stride: 2,
                 },
             ];
-            let prepared = model
-                .prepare_observed_token_ids(&chat, prefix.clone(), settings, sliced, trace)
-                .unwrap();
+            let prepared_prefix = prefix.clone();
+            let prepared_capture = sliced;
+            let prepared_trace = trace;
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+            prepared.output_mode = PreparedChatOutputMode::Text;
+            prepared.capture = Some(&prepared_capture);
             let mut events = vec![];
-            model
-                .generate_observed_text(prepared, &[], Default::default(), |r| {
+            (|| -> Result<_, ControlledGenerationError> {
+                let mut emit = |r| {
                     events.push(r);
                     ControlFlow::Continue(())
-                })
-                .unwrap();
+                };
+                let mut run = model
+                    .start_controlled_chat(
+                        prepared,
+                        prepared_trace,
+                        GenerationControlHandle::new(Default::default()),
+                        &mut emit,
+                    )?
+                    .expect("live fixture control");
+                run.run(&mut emit)
+            })()
+            .unwrap();
             let steps: Vec<_> = events
-                .into_iter()
-                .filter_map(|r| match r.event {
-                    ObservedGenerationEvent::Token {
+                .iter()
+                .filter_map(|r| match r.event.progress() {
+                    Some(ObservedGenerationEvent::Token {
                         captures: Some(s), ..
-                    } => Some(s),
+                    }) => Some(s),
                     _ => None,
                 })
                 .collect();

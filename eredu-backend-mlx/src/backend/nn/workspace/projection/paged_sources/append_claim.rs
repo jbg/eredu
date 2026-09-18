@@ -53,12 +53,12 @@ struct Failure {
     #[source]
     cause: PagedMutationCause,
     _custody: Exception,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 pub(super) fn failure(
     cause: impl Into<PagedMutationCause>,
     observer: &OriginalScopeObserver,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 ) -> Exception {
     Exception::from_retained_source(Failure {
         cause: cause.into(),
@@ -734,6 +734,6 @@ pub(super) fn failure_control_bytes() -> Option<usize> {
         .checked_add(Exception::retained_source_control_bytes::<Failure>()?)?
         .checked_add(size_of::<(
             &OriginalScopeObserver,
-            Option<WorkspaceMetadataFunding>,
+            Option<HostMetadataFunding>,
         )>())
 }

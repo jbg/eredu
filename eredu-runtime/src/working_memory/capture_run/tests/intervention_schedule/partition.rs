@@ -2,11 +2,11 @@ use super::*;
 use crate::capture::partition::*;
 use crate::intervention::PreparedPartitionInterventionProjection;
 use eredu_core::consensus::{ConsensusTransport,BoundedConsensusTransport};
-use eredu_nn::workspace::{WorkspaceMetadataFunding,WorkspaceMetadataAccount,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding,HostMetadataAccount,HostMetadataFundingError};
 #[derive(Debug)]
 struct Account;
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self,_bytes:usize)->Result<(),WorkspaceMetadataFundingError> {Ok(())}
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self,_bytes:usize)->Result<(),HostMetadataFundingError> {Ok(())}
 }
 struct Settled;
 impl Completion for Settled {
@@ -70,7 +70,7 @@ fn partition_outcome_requires_original_member_completion_and_never_refunds_local
         let initial=finish(bank.begin_step(CapturePhase::Prefill,0).unwrap().prepare().unwrap());
         let mut frame=bank.begin_step(CapturePhase::Decode,1).unwrap().prepare().unwrap();
         let baseline=frame.interventions()[0].charged;
-        let funding=WorkspaceMetadataFunding::new(Account).unwrap();
+        let funding=HostMetadataFunding::new(Account).unwrap();
         let projection=PreparedPartitionInterventionProjection::prepare(&original,0,CapturePhase::Decode,1,None,
             &[1,4],1,&eredu_core::component::ComponentCoordinateMap::range(4,0..4).unwrap(),None,4,funding.clone()).unwrap();
         let usage=CaptureUsage {retained_bytes:32,host_bytes:16,..Default::default()};

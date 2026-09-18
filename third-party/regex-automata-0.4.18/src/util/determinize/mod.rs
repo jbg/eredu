@@ -44,6 +44,7 @@ pub(crate) use self::state::{
 use crate::{
     nfa::thompson,
     util::{
+        allocation::{Allocation, AllocationError, Allocator},
         alphabet,
         look::{Look, LookSet},
         primitives::StateID,
@@ -89,7 +90,7 @@ mod state;
 /// cached), then it can be cleared and reused without needing to create a new
 /// `State`. The `StateBuilderNFA` state returned is final and ready to be
 /// turned into a `State` if necessary.
-pub(crate) fn next(
+pub(crate) fn next_with_allocations(
     nfa: &thompson::NFA,
     match_kind: MatchKind,
     sparses: &mut SparseSets,
@@ -97,7 +98,8 @@ pub(crate) fn next(
     state: &State,
     unit: alphabet::Unit,
     empty_builder: StateBuilderEmpty,
-) -> StateBuilderNFA {
+    funding: &dyn Allocation,
+) -> Result<StateBuilderNFA, AllocationError> {
     sparses.clear();
 
     // Whether the NFA is matched in reverse or not. We use this in some
@@ -198,13 +200,14 @@ pub(crate) fn next(
             .is_empty()
         {
             for nfa_id in sparses.set1.iter() {
-                epsilon_closure(
+                epsilon_closure_with_allocations(
                     nfa,
                     nfa_id,
                     look_have,
                     stack,
                     &mut sparses.set2,
-                );
+                    funding,
+                )?;
             }
             sparses.swap();
             sparses.set2.clear();
@@ -213,7 +216,7 @@ pub(crate) fn next(
 
     // Convert our empty builder into one that can record assertions and match
     // pattern IDs.
-    let mut builder = empty_builder.into_matches();
+    let mut builder = empty_builder.into_matches_with_allocations(funding)?;
     // Set whether the StartLF look-behind assertion is true for this
     // transition or not. The look-behind assertion for ASCII word boundaries
     // is handled below.
@@ -280,42 +283,45 @@ pub(crate) fn next(
                 // EOI sentinel at the end of every search. This final EOI
                 // transition is necessary to report matches found at the end
                 // of a haystack.
-                builder.add_match_pattern_id(pattern_id);
+                builder.add_match_pattern_id_with_allocations(pattern_id, funding)?;
                 if !match_kind.continue_past_first_match() {
                     break;
                 }
             }
             thompson::State::ByteRange { ref trans } => {
                 if trans.matches_unit(unit) {
-                    epsilon_closure(
+                    epsilon_closure_with_allocations(
                         nfa,
                         trans.next,
                         builder.look_have(),
                         stack,
                         &mut sparses.set2,
-                    );
+                        funding,
+                    )?;
                 }
             }
             thompson::State::Sparse(ref sparse) => {
                 if let Some(next) = sparse.matches_unit(unit) {
-                    epsilon_closure(
+                    epsilon_closure_with_allocations(
                         nfa,
                         next,
                         builder.look_have(),
                         stack,
                         &mut sparses.set2,
-                    );
+                        funding,
+                    )?;
                 }
             }
             thompson::State::Dense(ref dense) => {
                 if let Some(next) = dense.matches_unit(unit) {
-                    epsilon_closure(
+                    epsilon_closure_with_allocations(
                         nfa,
                         next,
                         builder.look_have(),
                         stack,
                         &mut sparses.set2,
-                    );
+                        funding,
+                    )?;
                 }
             }
         }
@@ -348,8 +354,8 @@ pub(crate) fn next(
         }
     }
     let mut builder_nfa = builder.into_nfa();
-    add_nfa_states(nfa, &sparses.set2, &mut builder_nfa);
-    builder_nfa
+    add_nfa_states_with_allocations(nfa, &sparses.set2, &mut builder_nfa, funding)?;
+    Ok(builder_nfa)
 }
 
 /// Compute the epsilon closure for the given NFA state. The epsilon closure
@@ -366,22 +372,25 @@ pub(crate) fn next(
 /// `stack` must have length 0. It is used as scratch space for depth first
 /// traversal. After returning, it is guaranteed that `stack` will have length
 /// 0.
-pub(crate) fn epsilon_closure(
+pub(crate) fn epsilon_closure_with_allocations(
     nfa: &thompson::NFA,
     start_nfa_id: StateID,
     look_have: LookSet,
     stack: &mut Vec<StateID>,
     set: &mut SparseSet,
-) {
+    funding: &dyn Allocation,
+) -> Result<(), AllocationError> {
+    let allocation = Allocator::new(funding);
+    let result = (|| {
     assert!(stack.is_empty());
     // If this isn't an epsilon state, then the epsilon closure is always just
     // itself, so there's no need to spin up the machinery below to handle it.
     if !nfa.state(start_nfa_id).is_epsilon() {
         set.insert(start_nfa_id);
-        return;
+        return Ok(());
     }
 
-    stack.push(start_nfa_id);
+    allocation.push(stack, start_nfa_id)?;
     while let Some(mut id) = stack.pop() {
         // In many cases, we can avoid stack operations when an NFA state only
         // adds one new state to visit. In that case, we just set our ID to
@@ -413,11 +422,12 @@ pub(crate) fn epsilon_closure(
                     // We need to process our alternates in order to preserve
                     // match preferences, so put the earliest alternates closer
                     // to the top of the stack.
+                    allocation.grow(stack, alternates.len() - 1)?;
                     stack.extend(alternates[1..].iter().rev());
                 }
                 thompson::State::BinaryUnion { alt1, alt2 } => {
                     id = alt1;
-                    stack.push(alt2);
+                    allocation.push(stack, alt2)?;
                 }
                 thompson::State::Capture { next, .. } => {
                     id = next;
@@ -425,6 +435,10 @@ pub(crate) fn epsilon_closure(
             }
         }
     }
+    Ok(())
+    })();
+    if result.is_err() { stack.clear(); }
+    result
 }
 
 /// Add the NFA state IDs in the given `set` to the given DFA builder state.
@@ -445,24 +459,25 @@ pub(crate) fn epsilon_closure(
 /// The given NFA should be able to resolve all identifiers in `set` to a
 /// particular NFA state. Additionally, `set` must have capacity equivalent
 /// to `nfa.len()`.
-pub(crate) fn add_nfa_states(
+pub(crate) fn add_nfa_states_with_allocations(
     nfa: &thompson::NFA,
     set: &SparseSet,
     builder: &mut StateBuilderNFA,
-) {
+    funding: &dyn Allocation,
+) -> Result<(), AllocationError> {
     for nfa_id in set.iter() {
         match *nfa.state(nfa_id) {
             thompson::State::ByteRange { .. } => {
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
             thompson::State::Sparse { .. } => {
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
             thompson::State::Dense { .. } => {
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
             thompson::State::Look { look, .. } => {
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
                 builder.set_look_need(|need| need.insert(look));
             }
             thompson::State::Union { .. }
@@ -548,7 +563,7 @@ pub(crate) fn add_nfa_states(
                 // inductively over the entire pattern. If it happens anywhere,
                 // which is probably pretty rare, then we record union states.
                 // Otherwise we don't.
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
             // Capture states we definitely do not need to record, since they
             // are unconditional epsilon transitions with no branching.
@@ -557,7 +572,7 @@ pub(crate) fn add_nfa_states(
             // not, but we do so out of an abundance of caution. Since they are
             // quite rare in practice, there isn't much cost to recording them.
             thompson::State::Fail => {
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
             thompson::State::Match { .. } => {
                 // Normally, the NFA match state doesn't actually need to
@@ -566,7 +581,7 @@ pub(crate) fn add_nfa_states(
                 // that transition from the one we're building here. And
                 // the way we detect those cases is by looking for an NFA
                 // match state. See 'next' for how this is handled.
-                builder.add_nfa_state_id(nfa_id);
+                builder.add_nfa_state_id_with_allocations(nfa_id, funding)?;
             }
         }
     }
@@ -576,6 +591,7 @@ pub(crate) fn add_nfa_states(
     if builder.look_need().is_empty() {
         builder.set_look_have(|_| LookSet::empty());
     }
+    Ok(())
 }
 
 /// Sets the appropriate look-behind assertions on the given state based on

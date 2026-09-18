@@ -1,10 +1,12 @@
 //! Filesystem-backed artifact content fingerprinting.
 
 pub(crate) mod file;
+mod fingerprint;
 use file::FileVersion as StableFileMetadata;
 pub use file::{
     ArtifactFileReadError, ArtifactFileReadFailure, ArtifactFileVersion, PreparedArtifactFileRead,
 };
+pub use fingerprint::{ArtifactFingerprintAllocation, ArtifactFingerprintPreparationError};
 
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -49,6 +51,10 @@ pub struct ArtifactMemberFingerprint {
 }
 
 impl ArtifactMemberFingerprint {
+    /// Moves the original role backing into the canonical identity reducer.
+    pub fn into_parts(self) -> (String, u64, [u8; 32]) {
+        (self.logical_role, self.length, self.digest)
+    }
     /// Stable logical role of the member.
     pub fn logical_role(&self) -> &str {
         &self.logical_role
@@ -74,6 +80,15 @@ pub(crate) struct FileContentFingerprint {
 /// Filesystem-backed artifact fingerprinting failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactFingerprintError {
+    /// A source destination size cannot be represented.
+    #[error("artifact fingerprint storage size overflow")]
+    StorageOverflow,
+    /// The actual host allocation was refused.
+    #[error("artifact fingerprint allocation failed: {0}")]
+    Allocation(#[source] std::collections::TryReserveError),
+    /// The allocator returned a different destination capacity.
+    #[error("artifact fingerprint destination capacity differs from its request")]
+    Capacity,
     /// Opening, inspecting, or reading one member failed.
     #[error("failed to {action} artifact file {path}: {source}", path = .path.display())]
     Io {
@@ -125,20 +140,18 @@ impl ArtifactFingerprintSource {
 
     /// Reads each complete file once, rejecting changes since admission.
     pub fn fingerprint(&self) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintError> {
-        self.files
-            .iter()
-            .map(|pinned| {
-                let path = pinned.member.path();
-                let file = File::open(path).map_err(|source| io_error("open", path, source))?;
-                let fingerprint =
-                    fingerprint_open_file_with_hook(path, &file, pinned.admitted, || {})?;
-                Ok(ArtifactMemberFingerprint {
-                    logical_role: pinned.member.logical_role.clone(),
-                    length: fingerprint.length,
-                    digest: fingerprint.digest,
-                })
-            })
-            .collect()
+        fingerprint::source(self, &fingerprint::Unenforced).map_err(fingerprint::ordinary)
+    }
+    /// Runs the same file/version/hash worker with prospective destinations.
+    /// The source was already admitted by `new`; this neither adopts another
+    /// file nor changes its original observable-version checks. The enclosing
+    /// caller retains allocation custody in every result and escaping error.
+    #[cfg(unix)]
+    pub fn fingerprint_with_allocations<A: ArtifactFingerprintAllocation>(
+        &self,
+        allocation: &A,
+    ) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintPreparationError<A::Error>> {
+        fingerprint::source(self, allocation)
     }
 }
 
@@ -156,22 +169,8 @@ fn fingerprint_open_file_with_hook(
     admitted: StableFileMetadata,
     after_pass: impl FnOnce(),
 ) -> Result<FileContentFingerprint, ArtifactFingerprintError> {
-    let before = StableFileMetadata::read(path, file)?;
-    if before != admitted {
-        return Err(ArtifactFingerprintError::Changed {
-            path: path.to_owned(),
-        });
-    }
-    let mut reader = file;
-    let fingerprint = digest_pass(path, &mut reader)?;
-    after_pass();
-    let after = StableFileMetadata::read(path, file)?;
-    if before != after || fingerprint.length != before.length {
-        return Err(ArtifactFingerprintError::Changed {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(fingerprint)
+    fingerprint::open_file(path, file, admitted, after_pass, &fingerprint::Unenforced)
+        .map_err(fingerprint::ordinary)
 }
 
 impl StableFileMetadata {
@@ -187,30 +186,7 @@ fn digest_pass(
     path: &Path,
     file: &mut (impl Read + Seek),
 ) -> Result<FileContentFingerprint, ArtifactFingerprintError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("seek", path, source))?;
-    let mut hasher = Sha256::new();
-    let mut length = 0_u64;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| io_error("read", path, source))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        length =
-            length
-                .checked_add(read as u64)
-                .ok_or_else(|| ArtifactFingerprintError::Changed {
-                    path: path.to_path_buf(),
-                })?;
-    }
-    Ok(FileContentFingerprint {
-        length,
-        digest: hasher.finalize().into(),
-    })
+    fingerprint::digest(path, file, &fingerprint::Unenforced).map_err(fingerprint::ordinary)
 }
 
 fn io_error(action: &'static str, path: &Path, source: std::io::Error) -> ArtifactFingerprintError {

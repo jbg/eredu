@@ -44,19 +44,10 @@ where
     ) -> Result<Self::Chunk, A::Error>;
     /// Forms the architecture input from the prepared chunk.
     fn input<'a>(&'a self, chunk: &'a Self::Chunk) -> A::Input<'a>;
-    /// Full prompt identity installed only after its final chunk commits.
-    fn cache_identity(&self) -> Option<PreparedInputCacheIdentity> {
-        None
-    }
-
     /// Actual shared prompt identity installed after the final chunk commits.
-    ///
-    /// Sources with existing shared metadata override this method to clone that
-    /// owner. The default wraps the legacy owned result and may allocate; it is
-    /// a compatibility adapter, not evidence of finite host-work admission.
+    /// A source retains its existing owner; absence performs no allocation.
     fn shared_cache_identity(&self) -> Option<SharedPreparedInputCacheIdentity> {
-        self.cache_identity()
-            .map(SharedPreparedInputCacheIdentity::new)
+        None
     }
 }
 
@@ -224,7 +215,7 @@ where
     fn agree_cancellation_at_boundary(
         &mut self,
         reservation: InferenceRequest,
-        boundary: Option<PrefillBoundary>,
+        boundary: PrefillBoundary,
         locally_cancelled: impl FnOnce() -> bool,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.with_terminal_unwind(
@@ -238,7 +229,7 @@ where
     fn agree_cancellation_retained(
         &mut self,
         reservation: InferenceRequest,
-        boundary: Option<PrefillBoundary>,
+        boundary: PrefillBoundary,
         locally_cancelled: impl FnOnce() -> bool,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.session.ensure_control_unfenced()?;
@@ -248,20 +239,13 @@ where
         reservation
             .validate(self.session.inference_execution_identity(), self.geometry)
             .map_err(ReplicatedTextSessionError::WorkingMemory)?;
-        let retained = match boundary {
-            Some(boundary) => {
-                let role = self.controls.boundary_role(boundary).ok_or(
-                    ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch),
-                )?;
-                self.session
-                    .mechanisms
-                    .coordinate_prefill_entry(reservation.clone(), Some(role))
-            }
-            None => self
-                .session
-                .mechanisms
-                .coordinate_prefill_entry(reservation.clone(), None),
-        };
+        let role = self.controls.boundary_role(boundary).ok_or(
+            ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch),
+        )?;
+        let retained = self
+            .session
+            .mechanisms
+            .coordinate_prefill_entry(reservation.clone(), Some(role));
         let guard = match retained {
             Ok(guard) => guard,
             Err(error) => {
@@ -352,31 +336,13 @@ where
     type Completion = SettledPrefillCompletion;
     type Error = ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>;
 
-    fn agree_cancellation(
-        &mut self,
-        locally_cancelled: bool,
-        reservation: InferenceRequest,
-    ) -> Result<bool, Self::Error> {
-        self.agree_cancellation_at_boundary(reservation, None, || locally_cancelled)
-    }
-
-    fn agree_cancellation_with_token(
-        &mut self,
-        cancellation: &GenerationCancellationToken,
-        reservation: InferenceRequest,
-    ) -> Result<bool, Self::Error> {
-        self.agree_cancellation_at_boundary(reservation, None, || cancellation.is_cancelled())
-    }
-
     fn agree_cancellation_at(
         &mut self,
         boundary: PrefillBoundary,
         cancellation: &GenerationCancellationToken,
         reservation: InferenceRequest,
     ) -> Result<bool, Self::Error> {
-        self.agree_cancellation_at_boundary(reservation, Some(boundary), || {
-            cancellation.is_cancelled()
-        })
+        self.agree_cancellation_at_boundary(reservation, boundary, || cancellation.is_cancelled())
     }
 
     fn submit_chunk(
@@ -711,75 +677,12 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
-    /// Uses shared scheduling for an ordinary source whose semantic ingress is
-    /// available. No memory enforcement is claimed by this explicit unbudgeted
-    /// adapter. `None` preserves the existing whole-request protocol for sources
-    /// and sequence observers whose ingress/attribution has not yet migrated.
-    /// All ranks agree that choice before entering either protocol.
-    pub fn try_prefill_unbudgeted_source<P, O>(
-        &mut self,
-        shape: Option<[u64; 2]>,
-        max_chunk_positions: Option<std::num::NonZeroU64>,
-        make_source: impl FnOnce(InferenceGeometry) -> Result<Option<P>, A::Error>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where
-        P: PreparedPrefillSource<A, B, M::State>,
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-    {
-        match self.try_prefill_unbudgeted_source_cancellable(
-            shape,
-            max_chunk_positions,
-            make_source,
-            &eredu_core::GenerationCancellationToken::new(),
-            context,
-            observer,
-        )? {
-            PrefillSourceOutcome::Unavailable => Ok(None),
-            PrefillSourceOutcome::Complete(output) => Ok(Some(output)),
-            PrefillSourceOutcome::Cancelled => Err(ReplicatedTextSessionError::Contract(
-                "uncancellable caller participated in cancelled prefill".into(),
-            )),
-        }
-    }
-
-    /// Uses the same source selection and scheduler with a live cancellation
-    /// token. Cancellation is a successful, safely settled outcome, not a model
-    /// failure or an output that could accidentally be sampled.
-    pub fn try_prefill_unbudgeted_source_cancellable<P, O>(
-        &mut self,
-        shape: Option<[u64; 2]>,
-        max_chunk_positions: Option<std::num::NonZeroU64>,
-        make_source: impl FnOnce(InferenceGeometry) -> Result<Option<P>, A::Error>,
-        cancellation: &eredu_core::GenerationCancellationToken,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<
-        PrefillSourceOutcome<B::Tensor>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    >
-    where
-        P: PreparedPrefillSource<A, B, M::State>,
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-    {
-        self.try_prefill_source_cancellable(
-            None,
-            shape,
-            max_chunk_positions,
-            make_source,
-            cancellation,
-            context,
-            observer,
-        )
-    }
-
     /// Selects semantic ingress under the caller's exact request authority.
     /// A supplied request is never replaced with unbudgeted authority or a
     /// whole-input fallback. Its geometry and opening state are checked before
     /// source construction; the same charge remains with committed state and
-    /// governs later decode. `None` explicitly selects the legacy unbudgeted
-    /// ingress policy used by the compatibility wrappers above.
+    /// governs later decode. `None` explicitly selects unbudgeted ingress
+    /// through the same source preparation and lifecycle worker.
     ///
     /// This gateway returns ordinary final-position scores. Physical Sequence
     /// capture also requires its original accepted span/path view and current

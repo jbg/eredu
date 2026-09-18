@@ -53,7 +53,7 @@ fn source_component_is_reserved_before_debit_and_retains_the_actual_accepted_hol
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, accepted) = sealed_plan(&pool, &quote, total).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, total).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let protected = span.protected_host_bytes();
@@ -346,7 +346,7 @@ fn metadata_retention_preserves_admitted_backing_and_only_the_original_host_hold
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, reservation, accepted) = sealed_plan(&pool, &quote, total).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &quote, total).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
         .into_funded_text_span_workspace(&run, &reservation)
@@ -379,3 +379,29 @@ fn metadata_retention_preserves_admitted_backing_and_only_the_original_host_hold
 }
 
 mod program;
+
+#[test]
+fn retained_text_origin_accepts_closed_source_and_refuses_foreign_or_quarantined_account() {
+    for quarantine in [false, true] {
+        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+        let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let Some(quote) = source_request(&pool, 24, 1, 0) else { return; };
+        let (reservation, run, accepted) = accept(&pool, quote);
+        let (span, _) = accepted.into_funded_text_span_workspace(&run, &reservation).unwrap();
+        let custody: crate::working_memory::OriginalOperationMetadataCustody =
+            span.control_guard().metadata_custody().into();
+        custody.validate_retained_origin(&pool).unwrap();
+        assert_eq!(custody.validate_retained_origin(&foreign), Err(WorkingMemoryError::IdentityMismatch));
+        let native = run.scope().unwrap();
+        if quarantine { drop(native); } else { native.certify().unwrap(); }
+        drop((span, reservation, run, root));
+        let held = pool.used_bytes().unwrap();
+        assert!(held > 0);
+        assert_eq!(custody.validate_retained_origin(&pool),
+            if quarantine { Err(WorkingMemoryError::ExecutionFenced) } else { Ok(()) });
+        assert_eq!(pool.used_bytes().unwrap(), held, "validation grants no credit or refund");
+        drop(custody);
+        assert_eq!(pool.used_bytes().unwrap(), if quarantine { held } else { 0 });
+    }
+}

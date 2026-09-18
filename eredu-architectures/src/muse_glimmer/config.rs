@@ -259,66 +259,27 @@ fn default_silu() -> String {
 impl DecoderConfig {
     /// Stable schedule, geometry, and modality identity for persisted state.
     pub fn architecture_fingerprint(&self) -> String {
-        eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-            "muse-glimmer",
-            [
-                ("model_type", self.model_type.clone()),
-                ("hidden", self.hidden_size.to_string()),
-                ("vocab", self.vocab_size.to_string()),
-                (
-                    "schedule",
-                    self.attention_schedule
-                        .iter()
-                        .map(|policy| format!("{policy:?}"))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-                (
-                    "vision",
-                    self.vision_config.as_ref().map_or_else(
-                        || "none".into(),
-                        |vision| {
-                            format!(
-                                "{}:{}:{}:{}:{}",
-                                vision.hidden_size,
-                                vision.layer_count(),
-                                vision.patch_size,
-                                vision.temporal_patch_size,
-                                vision.merge_size
-                            )
-                        },
-                    ),
-                ),
-                (
-                    "tokens",
-                    format!("{}:{}", self.image_token_id, self.video_token_id),
-                ),
-                ("quantization", format!("{:?}", self.quantization)),
-                (
-                    "quantized_weights",
-                    crate::cache_identity::string_set(self.quantized_weights.as_ref()),
-                ),
-                (
-                    "quantized_weight_configs",
-                    crate::cache_identity::debug_map(self.quantized_weight_configs.as_ref()),
-                ),
-                (
-                    "vision_quantization",
-                    self.vision_config.as_ref().map_or_else(
-                        || "none".into(),
-                        |vision| {
-                            format!(
-                                "default={:?};overrides={}",
-                                vision.weight_quantization,
-                                crate::cache_identity::debug_map(Some(
-                                    &vision.quantized_weight_configs
-                                ))
-                            )
-                        },
-                    ),
-                ),
-            ],
-        )
+        self.architecture_fingerprint_in(crate::decoder::identity::Metadata::new(None))
+            .expect("ordinary fingerprint formatting is infallible")
+    }
+    /// Constructs the same exact fingerprint through the request's metadata owner.
+    pub fn architecture_fingerprint_with_metadata(&self, context:&eredu_nn::workspace::WorkspaceContext)->Result<String,eredu_nn::Error>{
+        self.architecture_fingerprint_in(crate::decoder::identity::Metadata::new(Some(context)))
+    }
+    pub(crate) fn architecture_fingerprint_in(&self, metadata:crate::decoder::identity::Metadata<'_>)->Result<String,eredu_nn::Error>{
+        metadata.controls::<(&Self,String,Option<&VisionConfig>)>()?;
+        metadata.fingerprint("muse-glimmer", || Ok([
+            ("model_type",metadata.text(&self.model_type)?),
+            ("hidden",metadata.format(format_args!("{}",self.hidden_size))?),
+            ("vocab",metadata.format(format_args!("{}",self.vocab_size))?),
+            ("schedule",metadata.format(format_args!("{}",crate::cache_identity::Joined(|| self.attention_schedule.iter().map(crate::cache_identity::DebugValue),",")))?),
+            ("vision",match &self.vision_config {None=>metadata.text("none")?,Some(vision)=>metadata.format(format_args!("{}:{}:{}:{}:{}",vision.hidden_size,vision.layer_count(),vision.patch_size,vision.temporal_patch_size,vision.merge_size))?}),
+            ("tokens",metadata.format(format_args!("{}:{}",self.image_token_id,self.video_token_id))?),
+            ("quantization",metadata.format(format_args!("{:?}",self.quantization))?),
+            ("quantized_weights",crate::cache_identity::string_set_with_metadata(self.quantized_weights.as_ref(),metadata)?),
+            ("quantized_weight_configs",crate::cache_identity::debug_map_with_metadata(self.quantized_weight_configs.as_ref(),metadata)?),
+            ("vision_quantization",match &self.vision_config {None=>metadata.text("none")?,Some(vision)=>metadata.format(format_args!("default={:?};overrides={}",vision.weight_quantization,crate::cache_identity::debug_map_with_metadata(Some(&vision.quantized_weight_configs),metadata)?))?}),
+        ]))
     }
 
     /// Parses and strictly validates one released Hugging Face family config.
@@ -628,8 +589,11 @@ impl DecoderConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(|args| invalid(args.to_string()))
+    }
+    pub(crate) fn validate_with<E>(&self, invalid:impl Fn(std::fmt::Arguments<'_>)->E + Copy)->Result<(),E>{
         if self.model_type != "muse_glimmer_text" {
-            return Err(invalid("text model_type must be muse_glimmer_text"));
+            return Err(invalid(format_args!("text model_type must be muse_glimmer_text")));
         }
         for (name, value) in [
             ("hidden_size", self.hidden_size),
@@ -641,7 +605,7 @@ impl DecoderConfig {
             ("max_position_embeddings", self.max_position_embeddings),
         ] {
             if value <= 0 {
-                return Err(invalid(format!("{name} must be positive, got {value}")));
+                return Err(invalid(format_args!("{name} must be positive, got {value}")));
             }
         }
         if self.is_moe() {
@@ -650,16 +614,14 @@ impl DecoderConfig {
                 || self.num_experts_per_tok > self.num_experts
                 || self.intermediate_size < 0
             {
-                return Err(invalid("Muse-Glimmer MoE geometry is invalid"));
+                return Err(invalid(format_args!("Muse-Glimmer MoE geometry is invalid")));
             }
         } else if self.intermediate_size <= 0
             || self.moe_intermediate_size != 0
             || self.num_experts_per_tok != 0
             || self.norm_topk_prob
         {
-            return Err(invalid(
-                "Muse-Glimmer dense feed-forward geometry is invalid",
-            ));
+            return Err(invalid(format_args!("Muse-Glimmer dense feed-forward geometry is invalid")));
         }
         if self.num_attention_heads % self.num_key_value_heads != 0
             || self.hidden_act != "silu"
@@ -667,9 +629,7 @@ impl DecoderConfig {
             || self.attention_bias == Some(true)
             || self.mlp_bias == Some(true)
         {
-            return Err(invalid(
-                "Muse-Glimmer text attention, activation, bias, or dropout policy is unsupported",
-            ));
+            return Err(invalid(format_args!("Muse-Glimmer text attention, activation, bias, or dropout policy is unsupported")));
         }
         for (name, value) in [
             ("rms_norm_eps", self.rms_norm_eps),
@@ -680,23 +640,21 @@ impl DecoderConfig {
             ("final_logit_softcapping", self.final_logit_softcapping),
         ] {
             if !value.is_finite() || value <= 0.0 {
-                return Err(invalid(format!("{name} must be finite and positive")));
+                return Err(invalid(format_args!("{name} must be finite and positive")));
             }
         }
         if let Some(vision) = &self.vision_config {
             if self.vision_out_hidden_size != vision.hidden_size * 4 {
-                return Err(invalid(
-                    "out_hidden_size must be four times the vision hidden width",
-                ));
+                return Err(invalid(format_args!("out_hidden_size must be four times the vision hidden width")));
             }
         }
         if self.image_token_id >= self.vocab_size as u32
             || self.video_token_id >= self.vocab_size as u32
             || self.image_token_id == self.video_token_id
         {
-            return Err(invalid("image/video placeholder tokens are invalid"));
+            return Err(invalid(format_args!("image/video placeholder tokens are invalid")));
         }
-        validate_rope_scaling(self.rope_scaling.as_ref())
+        validate_rope_scaling_with(self.rope_scaling.as_ref(),invalid)
     }
 }
 
@@ -1042,6 +1000,9 @@ fn reject_execution_overrides(value: &Value) -> Result<(), ConfigError> {
 }
 
 fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result<(), ConfigError> {
+    validate_rope_scaling_with(scaling,|args| invalid(args.to_string()))
+}
+fn validate_rope_scaling_with<E>(scaling:Option<&HashMap<String,RopeValue>>,invalid:impl Fn(std::fmt::Arguments<'_>)->E + Copy)->Result<(),E>{
     let Some(scaling) = scaling else {
         return Ok(());
     };
@@ -1052,7 +1013,7 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
             RopeValue::String(value) => Some(value.as_str()),
             _ => None,
         })
-        .ok_or_else(|| invalid("rope_scaling requires a string type"))?;
+        .ok_or_else(|| invalid(format_args!("rope_scaling requires a string type")))?;
     let allowed: &[&str] = match kind {
         "default" => &["type", "rope_type"],
         "linear" => &["type", "rope_type", "factor"],
@@ -1067,10 +1028,10 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
             "mscale_all_dim",
             "truncate",
         ],
-        _ => return Err(invalid(format!("unsupported RoPE scaling type {kind:?}"))),
+        _ => return Err(invalid(format_args!("unsupported RoPE scaling type {kind:?}"))),
     };
     if let Some(key) = scaling.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "RoPE scaling field {key:?} affects unsupported execution semantics"
         )));
     }
@@ -1082,18 +1043,14 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
         })
     };
     if matches!(kind, "linear" | "yarn") && numeric("factor").is_none_or(|factor| factor <= 0.0) {
-        return Err(invalid("scaled RoPE requires a finite positive factor"));
+        return Err(invalid(format_args!("scaled RoPE requires a finite positive factor")));
     }
     if kind == "yarn"
         && numeric("original_max_position_embeddings").is_none_or(|value| value <= 0.0)
     {
-        return Err(invalid(
-            "YaRN requires positive original_max_position_embeddings",
-        ));
+        return Err(invalid(format_args!("YaRN requires positive original_max_position_embeddings")));
     }
-    crate::rotary::normalize_algorithm(Some(scaling))
-        .map(|_| ())
-        .map_err(invalid)
+    crate::rotary::normalize_algorithm_with(Some(scaling),invalid).map(|_| ())
 }
 
 fn positive_i32(value: &Value, name: &str) -> Result<i32, ConfigError> {

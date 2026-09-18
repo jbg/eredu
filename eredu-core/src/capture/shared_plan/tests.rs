@@ -132,6 +132,32 @@ fn admitted() -> AdmittedCapturePlan {
     .unwrap()
 }
 
+#[test]
+fn child_limit_copy_preserves_declarations_and_uses_canonical_identity() {
+    let source = SharedCapturePlan::new(admitted());
+    let mut limits = source.plan().limits.clone();
+    limits.cumulative.captures = 41;
+    let capabilities = CaptureCapabilities {
+        transformations: vec![], max_histogram_bins: 0,
+        physical_native_limit: false, conditions: vec![],
+    };
+    let copy = PreparedCapturePlanCopy::inspect_limit_revision(&source, limits.clone(), &capabilities).unwrap()
+        .copy(HostPreparationAuthority::unmanaged()).unwrap();
+    assert_eq!(copy.plan().limits, limits);
+    assert_eq!(copy.plan().selections, source.plan().selections);
+    assert_eq!(copy.admission().request(), source.request());
+    assert_eq!(copy.admission().text_origin(), source.text_origin());
+    assert_ne!(copy.admission().identity(), source.identity());
+    assert!(copy.is_limit_revision_of(&source));
+    assert!(!copy.is_limit_revision_of(&SharedCapturePlan::new(source.admission().clone())));
+    let bytes = serde_json::to_vec(&(copy.plan(), &source.points, source.request())).unwrap();
+    let reference: String = Sha256::digest(bytes).iter().map(|n| format!("{n:02x}")).collect();
+    assert_eq!(copy.admission().identity(), reference);
+    limits.physical_native_bytes = Some(1);
+    assert!(matches!(PreparedCapturePlanCopy::inspect_limit_revision(&source, limits, &capabilities),
+        Err(CapturePlanCopyError::Capability)));
+}
+
 fn grow<T>(values: &mut Vec<T>) -> u64 {
     let before = values.capacity();
     values.reserve_exact(before + 7);
@@ -250,6 +276,7 @@ fn owner() -> (SharedCapturePlan, Arc<AtomicBool>, Arc<AtomicUsize>) {
     let retired = Arc::new(AtomicBool::new(false));
     let count = Arc::new(AtomicUsize::new(0));
     let shared = SharedCapturePlan(PlanOwner(Some(Arc::new(Inner {
+        predecessor: None,
         plan: admitted(),
         retired: Some(PayloadRetired(retired.clone())),
         custody: SharedStorageCustody::new(),
@@ -379,6 +406,7 @@ fn escaped_source_and_concurrent_final_aliases_retire_shell_and_attachment_alloc
     let custody = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
     let source = SharedCapturePlan(PlanOwner(Some(Arc::new(Inner {
+        predecessor: None,
         plan: admitted(),
         retired: None,
         custody: SharedStorageCustody::new(),

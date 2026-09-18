@@ -34,7 +34,7 @@ use eredu_architectures::prediction_extension::{
 use eredu_nn::{
     Parameterized,
     workspace::{
-        WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceTensor,
+        WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor,
     },
 };
 use eredu_runtime::{
@@ -72,7 +72,7 @@ pub(in crate::composition::mlx::replicated_text) struct PredictionEquationQuoteP
     pub context: WorkspaceContext,
     pub bindings: SourceBindings,
     // Inspection clones, reports, containers and their Context retire first.
-    pub funding: WorkspaceMetadataFunding,
+    pub funding: HostMetadataFunding,
 }
 impl<'source> PreparedPredictionEquationQuote<'source> {
     #[allow(clippy::too_many_arguments)]
@@ -89,7 +89,7 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
         workspace: EmbeddedInvocationWorkspace,
         sources: &'source OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         observation: Option<super::capture::CaptureWorkspaceInput<'_, '_>>,
         bind_sources: impl FnOnce(&WorkspaceContext, &[&ProjectedNativeStorage]) -> Result<SourceBindings, Error>,
     ) -> Result<Self, Error>
@@ -110,7 +110,7 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
     {
         let controls = [
             size_of_val(&bind_sources),
-            size_of::<&WorkspaceMetadataFunding>(),
+            size_of::<&HostMetadataFunding>(),
             size_of::<[&ProjectedNativeStorage; 4]>(),
             size_of::<Option<SourceBindings>>(),
             size_of::<Result<SourceBindings, Error>>(),
@@ -315,3 +315,5 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
         self.parts
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -371,7 +371,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     },
                     context,
                 )
-                .map_err(Error::backend_source)
+                .map_err(Error::backend_retained_source)
             }
         }
     }
@@ -475,7 +475,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                         B::parallel_size(parallel),
                         context,
                     )
-                    .map_err(Error::backend_source)?;
+                    .map_err(Error::backend_retained_source)?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }

@@ -24,7 +24,7 @@ use crate::{
     validator::{EvaluationResult, Validate, ValidationContext},
     Json, Node, Object, SerdeJson,
 };
-use ahash::AHashMap;
+type PatternIndices = hashbrown::HashMap<String, Vec<usize>, ahash::RandomState>;
 use referencing::Uri;
 use serde_json::{Map, Value};
 use std::{borrow::Cow, sync::Arc};
@@ -53,24 +53,31 @@ impl AdditionalPropertiesValidator {
         schema: &'a Value,
         ctx: &compiler::Context<F>,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("additionalProperties");
-        Ok(Box::new(AdditionalPropertiesValidator {
+        let ctx = ctx.new_at_location("additionalProperties")?;
+        Ok(ctx.funding().boxed(AdditionalPropertiesValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 impl<F: Json> Validate<F> for AdditionalPropertiesValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<(&str, &crate::node::SchemaNode<F>)>(),
-            std::mem::size_of::<(usize, bool, bool)>(), std::mem::size_of::<ahash::AHasher>(),
+            std::mem::size_of::<(usize, bool, bool)>(),
+            std::mem::size_of::<ahash::AHasher>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             object
@@ -81,7 +88,7 @@ impl<F: Json> Validate<F> for AdditionalPropertiesValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -97,7 +104,7 @@ impl<F: Json> Validate<F> for AdditionalPropertiesValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -162,22 +169,36 @@ pub(crate) struct AdditionalPropertiesFalseValidator {
 }
 impl AdditionalPropertiesFalseValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(AdditionalPropertiesFalseValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalPropertiesFalseValidator { location })?)
     }
 }
 impl<F: Json> Validate<F> for AdditionalPropertiesFalseValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<(&str, &crate::node::SchemaNode<F>)>(),
-            std::mem::size_of::<(usize, bool, bool)>(), std::mem::size_of::<ahash::AHasher>(),
+            std::mem::size_of::<(usize, bool, bool)>(),
+            std::mem::size_of::<ahash::AHasher>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             object.members().next().is_none()
@@ -186,21 +207,18 @@ impl<F: Json> Validate<F> for AdditionalPropertiesFalseValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(object) = instance.as_object() {
             if let Some((_, value)) = object.members().next() {
-                return Err(ValidationError::false_schema(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    value.to_value(),
-                ));
+                return ctx.diagnostic::<F>(&value, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::FalseSchema)
+                });
             }
         }
         Ok(())
@@ -235,10 +253,14 @@ impl<F: Json> AdditionalPropertiesNotEmptyFalseValidator<SmallValidatorsMap<F>> 
         map: &'a Map<String, Value>,
         ctx: &compiler::Context<F>,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(AdditionalPropertiesNotEmptyFalseValidator {
-            properties: compile_small_map(ctx, map)?,
-            location: ctx.location().join("additionalProperties"),
-        }))
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalPropertiesNotEmptyFalseValidator {
+                properties: compile_small_map(ctx, map)?,
+                location: ctx
+                    .location()
+                    .join_with_funding("additionalProperties", ctx.funding())?,
+            })?)
     }
 }
 impl<F: Json> AdditionalPropertiesNotEmptyFalseValidator<BigValidatorsMap<F>> {
@@ -247,27 +269,43 @@ impl<F: Json> AdditionalPropertiesNotEmptyFalseValidator<BigValidatorsMap<F>> {
         map: &'a Map<String, Value>,
         ctx: &compiler::Context<F>,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(AdditionalPropertiesNotEmptyFalseValidator {
-            properties: compile_big_map(ctx, map)?,
-            location: ctx.location().join("additionalProperties"),
-        }))
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalPropertiesNotEmptyFalseValidator {
+                properties: compile_big_map(ctx, map)?,
+                location: ctx
+                    .location()
+                    .join_with_funding("additionalProperties", ctx.funding())?,
+            })?)
     }
 }
 impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
     for AdditionalPropertiesNotEmptyFalseValidator<M>
 {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        self.properties.original_source(source)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.properties.original_source(source)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            self.properties.original_lookup_controls().ok_or(crate::validator::workspace::Error::Overflow)?,
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
             std::mem::size_of::<(&str, &crate::node::SchemaNode<F>)>(),
-            std::mem::size_of::<(usize, bool, bool)>(), std::mem::size_of::<ahash::AHasher>(),
+            std::mem::size_of::<(usize, bool, bool)>(),
+            std::mem::size_of::<ahash::AHasher>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             are_properties_valid(&self.properties, &object, ctx, |_, _| false)
@@ -276,7 +314,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -288,20 +326,26 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
                 if let Some((name, node)) = self.properties.get_key_validator(property.as_ref()) {
                     node.validate(&value, &location.push(name), tracker, ctx)?;
                 } else {
-                    return Err(ValidationError::additional_properties(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        location.into(),
-                        instance.to_value(),
-                        vec![property.as_ref().to_owned()],
-                    ));
+                    return ctx.diagnostic::<F>(
+                        instance,
+                        location,
+                        tracker,
+                        &self.location,
+                        |funding| {
+                            Ok(crate::error::ValidationErrorKind::AdditionalProperties {
+                                unexpected: funding.copy_vec(&[property.as_ref()], |name| {
+                                    funding.copy_str(name)
+                                })?,
+                            })
+                        },
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -317,17 +361,24 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
             if let Some((name, node)) = self.properties.get_key_validator(property.as_ref()) {
                 node.collect_errors(&value, &location.push(name), tracker, ctx, errors);
             } else {
-                unexpected.push(property.as_ref().to_owned());
+                let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref())) else {
+                    return;
+                };
+                if !ctx.workspace.push(&mut unexpected, name) {
+                    return;
+                }
             }
         }
         if !unexpected.is_empty() {
-            errors.push(ValidationError::additional_properties(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                unexpected,
-            ));
+            if let Err(error) =
+                ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::AdditionalProperties { unexpected })
+                })
+            {
+                if !ctx.workspace.push(errors, error) {
+                    return;
+                }
+            }
         }
     }
 
@@ -388,14 +439,18 @@ impl<F: Json> AdditionalPropertiesNotEmptyFalseWithRequired1Validator<SmallValid
         ctx: &compiler::Context<F>,
         required: String,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(
-            AdditionalPropertiesNotEmptyFalseWithRequired1Validator {
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalPropertiesNotEmptyFalseWithRequired1Validator {
                 properties: compile_small_map(ctx, map)?,
                 required,
-                location: ctx.location().join("additionalProperties"),
-                required_location: ctx.location().join("required"),
-            },
-        ))
+                location: ctx
+                    .location()
+                    .join_with_funding("additionalProperties", ctx.funding())?,
+                required_location: ctx
+                    .location()
+                    .join_with_funding("required", ctx.funding())?,
+            })?)
     }
 }
 impl<F: Json> AdditionalPropertiesNotEmptyFalseWithRequired1Validator<BigValidatorsMap<F>> {
@@ -405,31 +460,49 @@ impl<F: Json> AdditionalPropertiesNotEmptyFalseWithRequired1Validator<BigValidat
         ctx: &compiler::Context<F>,
         required: String,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(
-            AdditionalPropertiesNotEmptyFalseWithRequired1Validator {
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalPropertiesNotEmptyFalseWithRequired1Validator {
                 properties: compile_big_map(ctx, map)?,
                 required,
-                location: ctx.location().join("additionalProperties"),
-                required_location: ctx.location().join("required"),
-            },
-        ))
+                location: ctx
+                    .location()
+                    .join_with_funding("additionalProperties", ctx.funding())?,
+                required_location: ctx
+                    .location()
+                    .join_with_funding("required", ctx.funding())?,
+            })?)
     }
 }
 impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
     for AdditionalPropertiesNotEmptyFalseWithRequired1Validator<M>
 {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        self.properties.original_source(source)?; source.string(&self.required)?; source.location(&self.required_location)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.properties.original_source(source)?;
+        source.string(&self.required)?;
+        source.location(&self.required_location)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            self.properties.original_lookup_controls().ok_or(crate::validator::workspace::Error::Overflow)?,
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
             std::mem::size_of::<(&str, &crate::node::SchemaNode<F>)>(),
-            std::mem::size_of::<(usize, bool, bool)>(), std::mem::size_of::<ahash::AHasher>(),
+            std::mem::size_of::<(usize, bool, bool)>(),
+            std::mem::size_of::<ahash::AHasher>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             if object.is_empty() {
@@ -454,7 +527,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -470,29 +543,39 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
                         found_required = true;
                     }
                 } else {
-                    return Err(ValidationError::additional_properties(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        location.into(),
-                        instance.to_value(),
-                        vec![property.as_ref().to_owned()],
-                    ));
+                    return ctx.diagnostic::<F>(
+                        instance,
+                        location,
+                        tracker,
+                        &self.location,
+                        |funding| {
+                            Ok(crate::error::ValidationErrorKind::AdditionalProperties {
+                                unexpected: funding.copy_vec(&[property.as_ref()], |name| {
+                                    funding.copy_str(name)
+                                })?,
+                            })
+                        },
+                    );
                 }
             }
             if !found_required {
-                return Err(ValidationError::required(
-                    self.required_location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.required_location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.required.clone()),
-                ));
+                return ctx.diagnostic::<F>(
+                    instance,
+                    location,
+                    tracker,
+                    &self.required_location,
+                    |funding| {
+                        Ok(crate::error::ValidationErrorKind::Required {
+                            property: Value::String(funding.copy_str(&self.required)?),
+                        })
+                    },
+                );
             }
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -512,26 +595,39 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
                     found_required = true;
                 }
             } else {
-                unexpected.push(property.as_ref().to_owned());
+                let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref())) else {
+                    return;
+                };
+                if !ctx.workspace.push(&mut unexpected, name) {
+                    return;
+                }
             }
         }
         if !unexpected.is_empty() {
-            errors.push(ValidationError::additional_properties(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                unexpected,
-            ));
+            if let Err(error) =
+                ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::AdditionalProperties { unexpected })
+                })
+            {
+                if !ctx.workspace.push(errors, error) {
+                    return;
+                }
+            }
         }
         if !found_required {
-            errors.push(ValidationError::required(
-                self.required_location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.required_location),
-                location.into(),
-                instance.to_value(),
-                Value::String(self.required.clone()),
-            ));
+            if let Err(error) = ctx.diagnostic::<F>(
+                instance,
+                location,
+                tracker,
+                &self.required_location,
+                |funding| {
+                    Ok(crate::error::ValidationErrorKind::Required {
+                        property: Value::String(funding.copy_str(&self.required)?),
+                    })
+                },
+            ) {
+                ctx.workspace.push(errors, error);
+            }
         }
     }
 
@@ -624,11 +720,11 @@ impl<F: Json> AdditionalPropertiesNotEmptyValidator<SmallValidatorsMap<F>> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let kctx = ctx.new_at_location("additionalProperties");
-        Ok(Box::new(AdditionalPropertiesNotEmptyValidator {
+        let kctx = ctx.new_at_location("additionalProperties")?;
+        Ok(ctx.funding().boxed(AdditionalPropertiesNotEmptyValidator {
             properties: compile_small_map(ctx, map)?,
             node: compiler::compile(&kctx, kctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 impl<F: Json> AdditionalPropertiesNotEmptyValidator<BigValidatorsMap<F>> {
@@ -638,28 +734,38 @@ impl<F: Json> AdditionalPropertiesNotEmptyValidator<BigValidatorsMap<F>> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let kctx = ctx.new_at_location("additionalProperties");
-        Ok(Box::new(AdditionalPropertiesNotEmptyValidator {
+        let kctx = ctx.new_at_location("additionalProperties")?;
+        Ok(ctx.funding().boxed(AdditionalPropertiesNotEmptyValidator {
             properties: compile_big_map(ctx, map)?,
             node: compiler::compile(&kctx, kctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
     for AdditionalPropertiesNotEmptyValidator<M, F>
 {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        self.properties.original_source(source)?; source.node(&self.node)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        self.properties.original_source(source)?;
+        source.node(&self.node)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            self.properties.original_lookup_controls().ok_or(crate::validator::workspace::Error::Overflow)?,
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
             std::mem::size_of::<(&str, &crate::node::SchemaNode<F>)>(),
-            std::mem::size_of::<(usize, bool, bool)>(), std::mem::size_of::<ahash::AHasher>(),
+            std::mem::size_of::<(usize, bool, bool)>(),
+            std::mem::size_of::<ahash::AHasher>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             are_properties_valid(&self.properties, &object, ctx, |instance, ctx| {
@@ -670,7 +776,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -691,7 +797,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>> Validate<F>
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -791,12 +897,52 @@ pub(crate) struct AdditionalPropertiesWithPatternsValidator<R, F: Json = SerdeJs
 }
 
 impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsValidator<R, F> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.patterns)?;
+        for (pattern, node) in &self.patterns {
+            pattern.original_source(source)?;
+            source.node(node)?;
+        }
+        source.node(&self.node)?;
+        source.location(&self.pattern_keyword_path)?;
+        source.uri(&self.pattern_keyword_absolute_location)?;
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let regex = self
+            .patterns
+            .iter()
+            .try_fold(0usize, |peak, (pattern, _)| {
+                pattern.original_controls().map(|bytes| peak.max(bytes))
+            })?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            regex,
+            std::mem::size_of::<(
+                &str,
+                bool,
+                usize,
+                &SchemaNode<F>,
+                std::slice::Iter<'_, (R, SchemaNode<F>)>,
+                std::slice::Iter<'_, usize>,
+                ahash::AHasher,
+            )>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             for (property, value) in object.members() {
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         if !node.is_valid(&value, ctx) {
                             return false;
@@ -811,7 +957,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsVa
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -823,7 +969,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsVa
                 let property_location = location.push(property.as_ref());
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         node.validate(&value, &property_location, tracker, ctx)?;
                     }
@@ -837,7 +983,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsVa
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -851,7 +997,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsVa
         for (property, value) in object.members() {
             let mut has_match = false;
             for (re, node) in &self.patterns {
-                if re.is_match(property.as_ref()).unwrap_or(false) {
+                if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                     has_match = true;
                     node.collect_errors(
                         &value,
@@ -889,7 +1035,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsVa
                 let path = location.push(property.as_ref());
                 let mut has_match = false;
                 for (pattern, node) in &self.patterns {
-                    if pattern.is_match(property.as_ref()).unwrap_or(false) {
+                    if pattern.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         pattern_matched_propnames.push(property.as_ref().to_owned());
                         children.push(node.evaluate_instance(&value, &path, tracker, ctx));
@@ -955,12 +1101,52 @@ pub(crate) struct AdditionalPropertiesWithPatternsFalseValidator<R, F: Json = Se
 }
 
 impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFalseValidator<R, F> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.patterns)?;
+        for (pattern, node) in &self.patterns {
+            pattern.original_source(source)?;
+            source.node(node)?;
+        }
+        source.location(&self.location)?;
+        source.location(&self.pattern_keyword_path)?;
+        source.uri(&self.pattern_keyword_absolute_location)?;
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let regex = self
+            .patterns
+            .iter()
+            .try_fold(0usize, |peak, (pattern, _)| {
+                pattern.original_controls().map(|bytes| peak.max(bytes))
+            })?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            regex,
+            std::mem::size_of::<(
+                &str,
+                bool,
+                usize,
+                &SchemaNode<F>,
+                std::slice::Iter<'_, (R, SchemaNode<F>)>,
+                std::slice::Iter<'_, usize>,
+                ahash::AHasher,
+            )>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             for (property, value) in object.members() {
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         if !node.is_valid(&value, ctx) {
                             return false;
@@ -975,7 +1161,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFa
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -987,26 +1173,32 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFa
                 let property_location = location.push(property.as_ref());
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         node.validate(&value, &property_location, tracker, ctx)?;
                     }
                 }
                 if !has_match {
-                    return Err(ValidationError::additional_properties(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        location.into(),
-                        instance.to_value(),
-                        vec![property.as_ref().to_owned()],
-                    ));
+                    return ctx.diagnostic::<F>(
+                        instance,
+                        location,
+                        tracker,
+                        &self.location,
+                        |funding| {
+                            Ok(crate::error::ValidationErrorKind::AdditionalProperties {
+                                unexpected: funding.copy_vec(&[property.as_ref()], |name| {
+                                    funding.copy_str(name)
+                                })?,
+                            })
+                        },
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1021,7 +1213,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFa
         for (property, value) in object.members() {
             let mut has_match = false;
             for (re, node) in &self.patterns {
-                if re.is_match(property.as_ref()).unwrap_or(false) {
+                if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                     has_match = true;
                     node.collect_errors(
                         &value,
@@ -1033,17 +1225,24 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFa
                 }
             }
             if !has_match {
-                unexpected.push(property.as_ref().to_owned());
+                let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref())) else {
+                    return;
+                };
+                if !ctx.workspace.push(&mut unexpected, name) {
+                    return;
+                }
             }
         }
         if !unexpected.is_empty() {
-            errors.push(ValidationError::additional_properties(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                unexpected,
-            ));
+            if let Err(error) =
+                ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::AdditionalProperties { unexpected })
+                })
+            {
+                if !ctx.workspace.push(errors, error) {
+                    return;
+                }
+            }
         }
     }
 
@@ -1062,7 +1261,7 @@ impl<F: Json, R: RegexEngine> Validate<F> for AdditionalPropertiesWithPatternsFa
                 let path = location.push(property.as_ref());
                 let mut has_match = false;
                 for (pattern, node) in &self.patterns {
-                    if pattern.is_match(property.as_ref()).unwrap_or(false) {
+                    if pattern.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         pattern_matched_props.push(property.as_ref().to_owned());
                         children.push(node.evaluate_instance(&value, &path, tracker, ctx));
@@ -1140,12 +1339,59 @@ pub(crate) struct AdditionalPropertiesWithPatternsNotEmptyValidator<M, R, F: Jso
     /// Pre-computed pattern indices for properties defined in `properties`.
     /// Maps property name -> indices into `patterns` Vec for patterns that match.
     /// Eliminates regex matching at validation time for known properties.
-    property_pattern_indices: AHashMap<String, Box<[usize]>>,
+    property_pattern_indices: PatternIndices,
 }
 
 impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
     for AdditionalPropertiesWithPatternsNotEmptyValidator<M, R, F>
 {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.patterns)?;
+        for (pattern, node) in &self.patterns {
+            pattern.original_source(source)?;
+            source.node(node)?;
+        }
+        self.properties.original_source(source)?;
+        source.add(self.property_pattern_indices.allocation_size())?;
+        for (name, indices) in &self.property_pattern_indices {
+            source.string(name)?;
+            source.vector(indices)?;
+        }
+        source.node(&self.node)?;
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let regex = self
+            .patterns
+            .iter()
+            .try_fold(0usize, |peak, (pattern, _)| {
+                pattern.original_controls().map(|bytes| peak.max(bytes))
+            })?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            regex,
+            std::mem::size_of::<(
+                &str,
+                bool,
+                usize,
+                &SchemaNode<F>,
+                std::slice::Iter<'_, (R, SchemaNode<F>)>,
+                std::slice::Iter<'_, usize>,
+                ahash::AHasher,
+            )>(),
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             for (property, value) in object.members() {
@@ -1167,7 +1413,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     // Unknown property - need runtime regex matching
                     let mut has_match = false;
                     for (re, node) in &self.patterns {
-                        if re.is_match(property.as_ref()).unwrap_or(false) {
+                        if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             if !node.is_valid(&value, ctx) {
                                 return false;
@@ -1185,7 +1431,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1212,7 +1458,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     let property_location = location.push(property.as_ref());
                     let mut has_match = false;
                     for (re, node) in &self.patterns {
-                        if re.is_match(property.as_ref()).unwrap_or(false) {
+                        if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             node.validate(&value, &property_location, tracker, ctx)?;
                         }
@@ -1227,7 +1473,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1259,7 +1505,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                 // Unknown property - need runtime regex matching
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         node.collect_errors(
                             &value,
@@ -1313,7 +1559,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     // Unknown property - need runtime regex matching
                     let mut has_match = false;
                     for (pattern, node) in &self.patterns {
-                        if pattern.is_match(property.as_ref()).unwrap_or(false) {
+                        if pattern.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             children.push(node.evaluate_instance(&value, &path, tracker, ctx));
                         }
@@ -1365,13 +1611,60 @@ pub(crate) struct AdditionalPropertiesWithPatternsNotEmptyFalseValidator<M, R, F
     /// Pre-computed pattern indices for properties defined in `properties`.
     /// Maps property name -> indices into `patterns` Vec for patterns that match.
     /// Eliminates regex matching at validation time for known properties.
-    property_pattern_indices: AHashMap<String, Box<[usize]>>,
+    property_pattern_indices: PatternIndices,
     location: Location,
 }
 
 impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
     for AdditionalPropertiesWithPatternsNotEmptyFalseValidator<M, R, F>
 {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.patterns)?;
+        for (pattern, node) in &self.patterns {
+            pattern.original_source(source)?;
+            source.node(node)?;
+        }
+        self.properties.original_source(source)?;
+        source.add(self.property_pattern_indices.allocation_size())?;
+        for (name, indices) in &self.property_pattern_indices {
+            source.string(name)?;
+            source.vector(indices)?;
+        }
+        source.location(&self.location)?;
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let regex = self
+            .patterns
+            .iter()
+            .try_fold(0usize, |peak, (pattern, _)| {
+                pattern.original_controls().map(|bytes| peak.max(bytes))
+            })?;
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            regex,
+            std::mem::size_of::<(
+                &str,
+                bool,
+                usize,
+                &SchemaNode<F>,
+                std::slice::Iter<'_, (R, SchemaNode<F>)>,
+                std::slice::Iter<'_, usize>,
+                ahash::AHasher,
+            )>(),
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             for (property, value) in object.members() {
@@ -1393,7 +1686,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     // Unknown property - need runtime regex matching
                     let mut has_match = false;
                     for (re, node) in &self.patterns {
-                        if re.is_match(property.as_ref()).unwrap_or(false) {
+                        if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             if !node.is_valid(&value, ctx) {
                                 return false;
@@ -1409,7 +1702,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1436,19 +1729,25 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     let property_location = location.push(property.as_ref());
                     let mut has_match = false;
                     for (re, node) in &self.patterns {
-                        if re.is_match(property.as_ref()).unwrap_or(false) {
+                        if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             node.validate(&value, &property_location, tracker, ctx)?;
                         }
                     }
                     if !has_match {
-                        return Err(ValidationError::additional_properties(
-                            self.location.clone(),
-                            crate::paths::capture_evaluation_path(tracker, &self.location),
-                            location.into(),
-                            instance.to_value(),
-                            vec![property.as_ref().to_owned()],
-                        ));
+                        return ctx.diagnostic::<F>(
+                            instance,
+                            location,
+                            tracker,
+                            &self.location,
+                            |funding| {
+                                Ok(crate::error::ValidationErrorKind::AdditionalProperties {
+                                    unexpected: funding.copy_vec(&[property.as_ref()], |name| {
+                                        funding.copy_str(name)
+                                    })?,
+                                })
+                            },
+                        );
                     }
                 }
             }
@@ -1456,7 +1755,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1489,7 +1788,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                 // Unknown property - need runtime regex matching
                 let mut has_match = false;
                 for (re, node) in &self.patterns {
-                    if re.is_match(property.as_ref()).unwrap_or(false) {
+                    if re.is_match(property.as_ref(), ctx).unwrap_or(false) {
                         has_match = true;
                         node.collect_errors(
                             &value,
@@ -1501,18 +1800,26 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     }
                 }
                 if !has_match {
-                    unexpected.push(property.as_ref().to_owned());
+                    let Some(name) = ctx.produce(|funding| funding.copy_str(property.as_ref()))
+                    else {
+                        return;
+                    };
+                    if !ctx.workspace.push(&mut unexpected, name) {
+                        return;
+                    }
                 }
             }
         }
         if !unexpected.is_empty() {
-            errors.push(ValidationError::additional_properties(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                unexpected,
-            ));
+            if let Err(error) =
+                ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::AdditionalProperties { unexpected })
+                })
+            {
+                if !ctx.workspace.push(errors, error) {
+                    return;
+                }
+            }
         }
     }
 
@@ -1546,7 +1853,7 @@ impl<F: Json, M: PropertiesValidatorsMap<F>, R: RegexEngine> Validate<F>
                     // Unknown property - need runtime regex matching
                     let mut has_match = false;
                     for (pattern, node) in &self.patterns {
-                        if pattern.is_match(property.as_ref()).unwrap_or(false) {
+                        if pattern.is_match(property.as_ref(), ctx).unwrap_or(false) {
                             has_match = true;
                             children.push(node.evaluate_instance(&value, &path, tracker, ctx));
                         }
@@ -1588,22 +1895,26 @@ macro_rules! try_compile {
 /// Pre-compute which `patternProperties` patterns match each property name from `properties`.
 /// This eliminates regex matching at validation time for known properties.
 fn precompute_property_pattern_indices<R: RegexEngine, F: Json>(
-    property_names: impl Iterator<Item = impl AsRef<str> + Clone + Into<String>>,
+    property_names: impl Iterator<Item = impl AsRef<str>>,
     patterns: &[(R, SchemaNode<F>)],
-) -> AHashMap<String, Box<[usize]>> {
-    let mut result = AHashMap::new();
+    funding: &crate::compilation::Funding,
+) -> Result<PatternIndices, crate::CompilationError> {
+    let mut result = PatternIndices::with_hasher(funding.random_state()?);
     for prop_name in property_names {
-        let matching_indices: Vec<usize> = patterns
-            .iter()
-            .enumerate()
-            .filter(|(_, (re, _))| re.is_match(prop_name.as_ref()).unwrap_or(false))
-            .map(|(i, _)| i)
-            .collect();
+        let mut matching_indices = Vec::new();
+        for (index, (regex, _)) in patterns.iter().enumerate() {
+            if funding.with_validation_context::<crate::SerdeJson, _>(|context| {
+                regex.is_match(prop_name.as_ref(), context).unwrap_or(false)
+            })? {
+                funding.push(&mut matching_indices, index)?;
+            }
+        }
         if !matching_indices.is_empty() {
-            result.insert(prop_name.into(), matching_indices.into_boxed_slice());
+            let name = funding.copy_str(prop_name.as_ref())?;
+            funding.insert(&mut result, name, matching_indices)?;
         }
     }
-    result
+    Ok(result)
 }
 
 fn compile_pattern_non_empty<'a, R, F: Json>(
@@ -1615,27 +1926,50 @@ fn compile_pattern_non_empty<'a, R, F: Json>(
 where
     R: RegexEngine + 'static,
 {
-    let kctx = ctx.new_at_location("additionalProperties");
-    let property_pattern_indices = precompute_property_pattern_indices(map.keys(), &patterns);
+    let kctx = (match ctx.new_at_location("additionalProperties") {
+        Ok(context) => context,
+        Err(error) => return Some(Err(error.into())),
+    });
+    let property_pattern_indices = crate::keywords::try_compile!(
+        precompute_property_pattern_indices(map.keys(), &patterns, ctx.funding())
+    );
 
     if map.len() < HASHMAP_THRESHOLD {
-        Some(Ok(Box::new(
-            AdditionalPropertiesWithPatternsNotEmptyValidator::<SmallValidatorsMap<F>, R, F> {
-                node: try_compile!(compiler::compile(&kctx, kctx.as_resource_ref(schema))),
-                properties: try_compile!(compile_small_map(ctx, map)),
-                patterns,
-                property_pattern_indices,
+        Some(Ok(
+            match ctx
+                .funding()
+                .boxed(AdditionalPropertiesWithPatternsNotEmptyValidator::<
+                    SmallValidatorsMap<F>,
+                    R,
+                    F,
+                > {
+                    node: try_compile!(compiler::compile(&kctx, kctx.as_resource_ref(schema))),
+                    properties: try_compile!(compile_small_map(ctx, map)),
+                    patterns,
+                    property_pattern_indices,
+                }) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
             },
-        )))
+        ))
     } else {
-        Some(Ok(Box::new(
-            AdditionalPropertiesWithPatternsNotEmptyValidator::<BigValidatorsMap<F>, R, F> {
-                node: try_compile!(compiler::compile(&kctx, kctx.as_resource_ref(schema))),
-                properties: try_compile!(compile_big_map(ctx, map)),
-                patterns,
-                property_pattern_indices,
+        Some(Ok(
+            match ctx
+                .funding()
+                .boxed(AdditionalPropertiesWithPatternsNotEmptyValidator::<
+                    BigValidatorsMap<F>,
+                    R,
+                    F,
+                > {
+                    node: try_compile!(compiler::compile(&kctx, kctx.as_resource_ref(schema))),
+                    properties: try_compile!(compile_big_map(ctx, map)),
+                    patterns,
+                    property_pattern_indices,
+                }) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
             },
-        )))
+        ))
     }
 }
 
@@ -1647,27 +1981,50 @@ fn compile_pattern_non_empty_false<'a, R, F: Json>(
 where
     R: RegexEngine + 'static,
 {
-    let kctx = ctx.new_at_location("additionalProperties");
-    let property_pattern_indices = precompute_property_pattern_indices(map.keys(), &patterns);
+    let kctx = (match ctx.new_at_location("additionalProperties") {
+        Ok(context) => context,
+        Err(error) => return Some(Err(error.into())),
+    });
+    let property_pattern_indices = crate::keywords::try_compile!(
+        precompute_property_pattern_indices(map.keys(), &patterns, ctx.funding())
+    );
 
     if map.len() < HASHMAP_THRESHOLD {
-        Some(Ok(Box::new(
-            AdditionalPropertiesWithPatternsNotEmptyFalseValidator::<SmallValidatorsMap<F>, R, F> {
-                properties: try_compile!(compile_small_map(ctx, map)),
-                patterns,
-                property_pattern_indices,
-                location: kctx.location().clone(),
+        Some(Ok(
+            match ctx
+                .funding()
+                .boxed(AdditionalPropertiesWithPatternsNotEmptyFalseValidator::<
+                    SmallValidatorsMap<F>,
+                    R,
+                    F,
+                > {
+                    properties: try_compile!(compile_small_map(ctx, map)),
+                    patterns,
+                    property_pattern_indices,
+                    location: kctx.location().clone(),
+                }) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
             },
-        )))
+        ))
     } else {
-        Some(Ok(Box::new(
-            AdditionalPropertiesWithPatternsNotEmptyFalseValidator::<BigValidatorsMap<F>, R, F> {
-                properties: try_compile!(compile_big_map(ctx, map)),
-                patterns,
-                property_pattern_indices,
-                location: kctx.location().clone(),
+        Some(Ok(
+            match ctx
+                .funding()
+                .boxed(AdditionalPropertiesWithPatternsNotEmptyFalseValidator::<
+                    BigValidatorsMap<F>,
+                    R,
+                    F,
+                > {
+                    properties: try_compile!(compile_big_map(ctx, map)),
+                    patterns,
+                    property_pattern_indices,
+                    location: kctx.location().clone(),
+                }) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error.into())),
             },
-        )))
+        ))
     }
 }
 
@@ -1685,7 +2042,7 @@ pub(crate) fn compile<'a, F: Json>(
                 PatternEngineOptions::FancyRegex { .. } => {
                     let patterns = match compile_fancy_regex_patterns(ctx, obj) {
                         Ok(patterns) => patterns,
-                        Err(error) => return Some(Err(error)),
+                        Err(error) => return Some(Err(error.into())),
                     };
                     match schema {
                         Value::Bool(true) => None, // "additionalProperties" are "true" by default
@@ -1693,64 +2050,98 @@ pub(crate) fn compile<'a, F: Json>(
                             if let Some(properties) = properties {
                                 if let Value::Object(map) = properties {
                                     compile_pattern_non_empty_false::<
-                                        CompiledPattern<fancy_regex::Regex>,
+                                        CompiledPattern<Arc<fancy_regex::Regex>>,
                                         F,
                                     >(ctx, map, patterns)
                                 } else {
-                                    let location = ctx.location().join("properties");
+                                    let location = crate::keywords::try_compile!(ctx
+                                        .location()
+                                        .join_with_funding("properties", ctx.funding()));
                                     Some(Err(ValidationError::compile_error(
                                         location.clone(),
                                         location,
-                                        Location::new(),
+                                        crate::keywords::try_compile!(Location::new_with_funding(
+                                            ctx.funding()
+                                        )),
                                         Cow::Borrowed(properties),
                                         "Unexpected type",
-                                    )))
+                                    )
+                                    .into()))
                                 }
                             } else {
-                                Some(Ok(Box::new(
-                                    AdditionalPropertiesWithPatternsFalseValidator {
-                                        patterns,
-                                        location: ctx.location().join("additionalProperties"),
-                                        pattern_keyword_path: ctx
-                                            .location()
-                                            .join("patternProperties"),
-                                        pattern_keyword_absolute_location: ctx
-                                            .new_at_location("patternProperties")
-                                            .base_uri(),
+                                Some(Ok(
+                                    match ctx.funding().boxed(
+                                        AdditionalPropertiesWithPatternsFalseValidator {
+                                            patterns,
+                                            location: crate::keywords::try_compile!(ctx
+                                                .location()
+                                                .join_with_funding(
+                                                    "additionalProperties",
+                                                    ctx.funding()
+                                                )),
+                                            pattern_keyword_path: crate::keywords::try_compile!(
+                                                ctx.location().join_with_funding(
+                                                    "patternProperties",
+                                                    ctx.funding()
+                                                )
+                                            ),
+                                            pattern_keyword_absolute_location: ctx.base_uri(),
+                                        },
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return Some(Err(error.into())),
                                     },
-                                )))
+                                ))
                             }
                         }
                         _ => {
                             if let Some(properties) = properties {
                                 if let Value::Object(map) = properties {
                                     compile_pattern_non_empty::<
-                                        CompiledPattern<fancy_regex::Regex>,
+                                        CompiledPattern<Arc<fancy_regex::Regex>>,
                                         F,
                                     >(ctx, map, patterns, schema)
                                 } else {
-                                    let location = ctx.location().join("properties");
+                                    let location = crate::keywords::try_compile!(ctx
+                                        .location()
+                                        .join_with_funding("properties", ctx.funding()));
                                     Some(Err(ValidationError::compile_error(
                                         location.clone(),
                                         location,
-                                        Location::new(),
+                                        crate::keywords::try_compile!(Location::new_with_funding(
+                                            ctx.funding()
+                                        )),
                                         Cow::Borrowed(properties),
                                         "Unexpected type",
-                                    )))
+                                    )
+                                    .into()))
                                 }
                             } else {
-                                let kctx = ctx.new_at_location("additionalProperties");
-                                Some(Ok(Box::new(AdditionalPropertiesWithPatternsValidator {
-                                    node: try_compile!(compiler::compile(
-                                        &kctx,
-                                        kctx.as_resource_ref(schema),
-                                    )),
-                                    patterns,
-                                    pattern_keyword_path: ctx.location().join("patternProperties"),
-                                    pattern_keyword_absolute_location: ctx
-                                        .new_at_location("patternProperties")
-                                        .base_uri(),
-                                })))
+                                let kctx = (match ctx.new_at_location("additionalProperties") {
+                                    Ok(context) => context,
+                                    Err(error) => return Some(Err(error.into())),
+                                });
+                                Some(Ok(
+                                    match ctx.funding().boxed(
+                                        AdditionalPropertiesWithPatternsValidator {
+                                            node: try_compile!(compiler::compile(
+                                                &kctx,
+                                                kctx.as_resource_ref(schema),
+                                            )),
+                                            patterns,
+                                            pattern_keyword_path: crate::keywords::try_compile!(
+                                                ctx.location().join_with_funding(
+                                                    "patternProperties",
+                                                    ctx.funding()
+                                                )
+                                            ),
+                                            pattern_keyword_absolute_location: ctx.base_uri(),
+                                        },
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return Some(Err(error.into())),
+                                    },
+                                ))
                             }
                         }
                     }
@@ -1758,7 +2149,7 @@ pub(crate) fn compile<'a, F: Json>(
                 PatternEngineOptions::Regex { .. } => {
                     let patterns = match compile_regex_patterns(ctx, obj) {
                         Ok(patterns) => patterns,
-                        Err(error) => return Some(Err(error)),
+                        Err(error) => return Some(Err(error.into())),
                     };
                     match schema {
                         Value::Bool(true) => None, // "additionalProperties" are "true" by default
@@ -1766,77 +2157,117 @@ pub(crate) fn compile<'a, F: Json>(
                             if let Some(properties) = properties {
                                 if let Value::Object(map) = properties {
                                     compile_pattern_non_empty_false::<
-                                        CompiledPattern<regex::Regex>,
+                                        CompiledPattern<Arc<regex::Regex>>,
                                         F,
                                     >(ctx, map, patterns)
                                 } else {
-                                    let location = ctx.location().join("properties");
+                                    let location = crate::keywords::try_compile!(ctx
+                                        .location()
+                                        .join_with_funding("properties", ctx.funding()));
                                     Some(Err(ValidationError::compile_error(
                                         location.clone(),
                                         location,
-                                        Location::new(),
+                                        crate::keywords::try_compile!(Location::new_with_funding(
+                                            ctx.funding()
+                                        )),
                                         Cow::Borrowed(properties),
                                         "Unexpected type",
-                                    )))
+                                    )
+                                    .into()))
                                 }
                             } else {
-                                Some(Ok(Box::new(
-                                    AdditionalPropertiesWithPatternsFalseValidator {
-                                        patterns,
-                                        location: ctx.location().join("additionalProperties"),
-                                        pattern_keyword_path: ctx
-                                            .location()
-                                            .join("patternProperties"),
-                                        pattern_keyword_absolute_location: ctx
-                                            .new_at_location("patternProperties")
-                                            .base_uri(),
+                                Some(Ok(
+                                    match ctx.funding().boxed(
+                                        AdditionalPropertiesWithPatternsFalseValidator {
+                                            patterns,
+                                            location: crate::keywords::try_compile!(ctx
+                                                .location()
+                                                .join_with_funding(
+                                                    "additionalProperties",
+                                                    ctx.funding()
+                                                )),
+                                            pattern_keyword_path: crate::keywords::try_compile!(
+                                                ctx.location().join_with_funding(
+                                                    "patternProperties",
+                                                    ctx.funding()
+                                                )
+                                            ),
+                                            pattern_keyword_absolute_location: ctx.base_uri(),
+                                        },
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return Some(Err(error.into())),
                                     },
-                                )))
+                                ))
                             }
                         }
                         _ => {
                             if let Some(properties) = properties {
                                 if let Value::Object(map) = properties {
-                                    compile_pattern_non_empty::<CompiledPattern<regex::Regex>, F>(
+                                    compile_pattern_non_empty::<CompiledPattern<Arc<regex::Regex>>, F>(
                                         ctx, map, patterns, schema,
                                     )
                                 } else {
-                                    let location = ctx.location().join("properties");
+                                    let location = crate::keywords::try_compile!(ctx
+                                        .location()
+                                        .join_with_funding("properties", ctx.funding()));
                                     Some(Err(ValidationError::compile_error(
                                         location.clone(),
                                         location,
-                                        Location::new(),
+                                        crate::keywords::try_compile!(Location::new_with_funding(
+                                            ctx.funding()
+                                        )),
                                         Cow::Borrowed(properties),
                                         "Unexpected type",
-                                    )))
+                                    )
+                                    .into()))
                                 }
                             } else {
-                                let kctx = ctx.new_at_location("additionalProperties");
-                                Some(Ok(Box::new(AdditionalPropertiesWithPatternsValidator {
-                                    node: try_compile!(compiler::compile(
-                                        &kctx,
-                                        kctx.as_resource_ref(schema),
-                                    )),
-                                    patterns,
-                                    pattern_keyword_path: ctx.location().join("patternProperties"),
-                                    pattern_keyword_absolute_location: ctx
-                                        .new_at_location("patternProperties")
-                                        .base_uri(),
-                                })))
+                                let kctx = (match ctx.new_at_location("additionalProperties") {
+                                    Ok(context) => context,
+                                    Err(error) => return Some(Err(error.into())),
+                                });
+                                Some(Ok(
+                                    match ctx.funding().boxed(
+                                        AdditionalPropertiesWithPatternsValidator {
+                                            node: try_compile!(compiler::compile(
+                                                &kctx,
+                                                kctx.as_resource_ref(schema),
+                                            )),
+                                            patterns,
+                                            pattern_keyword_path: crate::keywords::try_compile!(
+                                                ctx.location().join_with_funding(
+                                                    "patternProperties",
+                                                    ctx.funding()
+                                                )
+                                            ),
+                                            pattern_keyword_absolute_location: ctx.base_uri(),
+                                        },
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return Some(Err(error.into())),
+                                    },
+                                ))
                             }
                         }
                     }
                 }
             }
         } else {
-            let location = ctx.location().join("patternProperties");
-            Some(Err(ValidationError::single_type_error(
-                location.clone(),
-                location,
-                Location::new(),
-                Cow::Borrowed(patterns),
-                JsonType::Object,
-            )))
+            let location = crate::keywords::try_compile!(ctx
+                .location()
+                .join_with_funding("patternProperties", ctx.funding()));
+            Some(Err(crate::keywords::try_compile!(
+                ValidationError::single_type_error_with_funding(
+                    location.clone(),
+                    location,
+                    crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                    Cow::Borrowed(patterns),
+                    JsonType::Object,
+                    ctx.funding()
+                )
+            )
+            .into()))
         }
     } else {
         match schema {
@@ -1875,8 +2306,10 @@ pub(crate) fn compile<'a, F: Json>(
                         ctx,
                     )
                 } else {
-                    let location = ctx.location().join("additionalProperties");
-                    Some(AdditionalPropertiesFalseValidator::compile(location))
+                    let location = crate::keywords::try_compile!(ctx
+                        .location()
+                        .join_with_funding("additionalProperties", ctx.funding()));
+                    Some(AdditionalPropertiesFalseValidator::compile(ctx, location))
                 }
             }
             _ => {

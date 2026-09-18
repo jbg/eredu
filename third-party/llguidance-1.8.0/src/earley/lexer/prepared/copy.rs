@@ -1,7 +1,7 @@
 //! Independent lexer state, including the complete mutable lexical DFA.
 use super::PreparedLexer;
 use crate::earley::regexvec::prepared::PreparedRegexVectorCopyFailure;
-use derivre::raw::PreparedHashConsFunding;
+use derivre::raw::ParserAllocationFunding;
 use std::{fmt, mem::{size_of, size_of_val}};
 use toktrie::{SimpleVob, TokenMaskConstructionPlan, TokenMaskConstructionFailure, TokenMaskSourceError};
 #[derive(Debug)]
@@ -12,7 +12,7 @@ enum Cause<E> {
 /// Failed lexer copies retain their actual mutable destination and new backing
 /// account separately from the borrowed original source.
 pub struct PreparedLexerCopyFailure<E> {
-    cause: Cause<E>, prefix: Option<PreparedLexer>, backing: Option<PreparedHashConsFunding>,
+    cause: Cause<E>, prefix: Option<PreparedLexer>, backing: Option<ParserAllocationFunding>,
 }
 impl<E: fmt::Debug> fmt::Debug for PreparedLexerCopyFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,7 +54,7 @@ impl PreparedLexer {
                 TokenMaskConstructionPlan::inspection_control_bytes()?,
                 size_of::<Self>(), size_of::<&Self>(), size_of::<Option<Self>>(),
                 size_of::<Cause<E>>(), size_of::<PreparedLexerCopyFailure<E>>(),
-                size_of::<Option<PreparedHashConsFunding>>(),
+                size_of::<Option<ParserAllocationFunding>>(),
                 size_of::<Result<Self, PreparedLexerCopyFailure<E>>>(),
                 size_of::<Result<crate::earley::regexvec::prepared::PreparedRegexVector, PreparedRegexVectorCopyFailure<E>>>(),
                 size_of::<Result<(), Cause<E>>>(), size_of::<Result<(), E>>(),
@@ -66,7 +66,7 @@ impl PreparedLexer {
     /// exact first-byte mask. Every destination is paid before construction;
     /// only the explicitly supplied new backing account permits future growth.
     pub fn try_copy<F: Fn(usize) -> Result<(), E>, E>(
-        &self, backing: Option<PreparedHashConsFunding>, funding: &F,
+        &self, backing: Option<ParserAllocationFunding>, funding: &F,
     ) -> Result<Self, PreparedLexerCopyFailure<E>> {
         let mut prefix = None;
         let result = (|| -> Result<(), Cause<E>> {

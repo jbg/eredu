@@ -90,7 +90,6 @@ fn plan_incremental_quote(
     capacity: u64,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -164,13 +163,13 @@ fn fixed_controller_credit_preserves_full_equations_and_combines_with_decoder_id
         ))
     ));
     assert_eq!(used(&pool), (96, 96));
-    let (admission, reservation, accepted) =
+    let (reservation, accepted) =
         plan_incremental_quote(&pool, &both, request(g), 244).unwrap();
-    assert_eq!(admission.state, *full.state());
+    assert_eq!(reservation.admission().state, *full.state());
     assert_eq!(reservation.bytes(), 148);
     assert!(reservation.requires_funding_scope());
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), &admission),
+        pool.reserve(&InferenceExecutionIdentity::default(), reservation.admission()),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     assert_eq!(pool.used_bytes().unwrap(), 244);
@@ -193,7 +192,7 @@ fn combined_pins_transfer_to_run_and_scopes_without_becoming_historical_metadata
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let quote = combined(&pool, &host);
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan_incremental_quote(&pool, &quote, request(geometry()), 244).unwrap();
     drop((quote, accepted, host, original));
     assert_eq!(pool.used_bytes().unwrap(), 244);
@@ -219,7 +218,7 @@ fn abandoned_combined_work_quarantines_both_sources_after_request_metadata_drops
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let quote = combined(&pool, &host);
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan_incremental_quote(&pool, &quote, request(geometry()), 244).unwrap();
     let (metadata, run) = reservation.into_funding().unwrap();
     let work = run.scope().unwrap();
@@ -258,7 +257,7 @@ fn incremental_policy_keeps_full_completeness_geometry_and_safety_requirements()
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, reservation, accepted) = plan_incremental_quote(&pool, &quote, req, 251).unwrap();
+    let (reservation, accepted) = plan_incremental_quote(&pool, &quote, req, 251).unwrap();
     assert_eq!(reservation.bytes(), 155);
     drop((reservation, accepted));
     let foreign = WorkingMemoryPool::new(1000, 0).unwrap();
@@ -330,7 +329,7 @@ fn combined_credit_uses_the_shared_smaller_chunk_planner() {
         ..geometry()
     };
     let mut candidates = Vec::new();
-    let (_, reservation, quote) = plan_prefill_incremental_with_capacity(
+    let (reservation, quote) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         &pool,
         &capabilities(),
@@ -347,6 +346,7 @@ fn combined_credit_uses_the_shared_smaller_chunk_planner() {
             let equations = quote_inference_workspace(candidate, |span| {
                 context.begin_state_span([&old])?;
                 let count = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
                     InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
                     InferenceWorkspaceSpan::Decode { .. } => 1,
                 };
@@ -388,7 +388,7 @@ fn required_registered_inputs_preserve_the_original_controller_and_decoder_quote
     assert_eq!(joined.state(), quote.state());
     assert_eq!(joined.geometry(), quote.geometry());
     assert_eq!(joined.incremental_bytes(), 148);
-    let (_, reservation, accepted) =
+    let (reservation, accepted) =
         plan_incremental_quote(&pool, &joined, request(geometry()), 268).unwrap();
     drop((quote, joined, accepted, root, host, source));
     assert_eq!(pool.used_bytes().unwrap(), 268);

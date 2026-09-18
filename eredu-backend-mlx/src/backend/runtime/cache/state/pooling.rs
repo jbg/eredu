@@ -636,7 +636,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         let tokens = keys.dim(1);
         let keys = keys
             .try_index_device((.., NewAxis, .., ..), stream)
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         let dtype = keys.dtype();
         // Paged key-only storage accepts a zero-width logical value and
         // materializes its own one-channel persistence sentinel. Resident KV
@@ -647,13 +647,13 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             .update_and_fetch(
                 keys,
                 zeros_dtype(&[batch, 1, tokens, value_width], dtype, stream)
-                    .map_err(ComputeError::backend_source)?,
+                    .map_err(ComputeError::backend_retained_source)?,
                 stream,
             )
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         keys.try_index_device((.., 0, .., ..), stream)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn local_mask(
@@ -670,29 +670,29 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         let key_offset = offset + query_tokens - key_tokens;
         let queries = Array::arange::<i32, i32>(Some(offset), offset + query_tokens, None, stream)
             .and_then(|values| values.try_index_device((.., NewAxis), stream))
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         let keys =
             Array::arange::<i32, i32>(Some(key_offset), key_offset + key_tokens, None, stream)
                 .and_then(|values| values.try_index_device((NewAxis, ..), stream))
-                .map_err(ComputeError::backend_source)?;
+                .map_err(ComputeError::backend_retained_source)?;
         let causal = queries
             .ge(&keys, stream)
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         let recent = keys
             .gt(
                 queries
                     .subtract(
-                        Array::try_from_int(window).map_err(ComputeError::backend_source)?,
+                        Array::try_from_int(window).map_err(ComputeError::backend_retained_source)?,
                         stream,
                     )
-                    .map_err(ComputeError::backend_source)?,
+                    .map_err(ComputeError::backend_retained_source)?,
                 stream,
             )
-            .map_err(ComputeError::backend_source)?;
+            .map_err(ComputeError::backend_retained_source)?;
         causal
             .logical_and(&recent, stream)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn accumulate_pooling_windows(
@@ -715,7 +715,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
                 gates: MlxTensor::from_array(windows.gates),
                 base_position: windows.base_position,
             })
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn replace_pooling_overlap(
@@ -742,7 +742,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         self.pool_mut(stream)?
             .update_and_fetch(values.into_array(), context)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn pooling_mask(
@@ -760,7 +760,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
 
     fn checkpoint(&self) -> Result<Self::Checkpoint, ComputeError> {
         self.checkpoint_clone_state()
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn restore(
@@ -771,7 +771,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         match (self, checkpoint) {
             (Self::Local(local), Self::Local(previous)) => local
                 .restore_checkpoint(previous, stream)
-                .map_err(ComputeError::backend_source),
+                .map_err(ComputeError::backend_retained_source),
             (
                 Self::Compressed { local, pool },
                 Self::Compressed {
@@ -781,7 +781,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             ) => {
                 local
                     .restore_checkpoint(previous_local, stream)
-                    .map_err(ComputeError::backend_source)?;
+                    .map_err(ComputeError::backend_retained_source)?;
                 pool.clone_from(previous_pool);
                 Ok(())
             }
@@ -799,7 +799,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             ) => {
                 local
                     .restore_checkpoint(previous_local, stream)
-                    .map_err(ComputeError::backend_source)?;
+                    .map_err(ComputeError::backend_retained_source)?;
                 pool.clone_from(previous_pool);
                 index_pool.clone_from(previous_index_pool);
                 Ok(())
@@ -813,11 +813,11 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
     fn finalize(&mut self) -> Result<(), ComputeError> {
         self.local_mut()
             .finalize()
-            .map_err(ComputeError::backend_source)
+            .map_err(ComputeError::backend_retained_source)
     }
 
     fn clear(&mut self) -> Result<(), ComputeError> {
-        self.clear().map_err(ComputeError::backend_source)
+        self.clear().map_err(ComputeError::backend_retained_source)
     }
 }
 

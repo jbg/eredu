@@ -7,6 +7,37 @@ use std::{
     },
 };
 
+#[test]
+fn registered_storage_equality_requires_live_exact_same_pool_population() {
+    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let retained = pool.register_storage([(1u32, 20)]).unwrap();
+    let alias = pool.register_storage([(1u32, 20)]).unwrap();
+    let added = pool.register_storage([(2u32, 20)]).unwrap();
+    let grouped = pool.register_storage([(1u32, 20), (2, 20)]).unwrap();
+    let foreign = WorkingMemoryPool::new(100, 0).unwrap();
+    let foreign_same = foreign.register_storage([(1u32, 20)]).unwrap();
+    let foreign_larger = WorkingMemoryPool::new(100, 0).unwrap()
+        .register_storage([(1u32, 21)]).unwrap();
+    let pending = WorkingMemoryStorage::pending(vec![1u32], 20);
+    let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+    assert!(alias.same_registered_storage(&retained));
+    assert!(retained.same_registered_storage(&alias));
+    for distinct in [&added, &grouped, &foreign_same, &foreign_larger, &pending] {
+        assert!(!distinct.same_registered_storage(&retained));
+        assert!(!retained.same_registered_storage(distinct));
+    }
+    assert!(!pending.same_registered_storage(&pending));
+    assert_eq!((pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()), before);
+    assert!(matches!(pool.register_storage([(1u32, 21)]),
+        Err(WorkingMemoryError::StorageCapacityMismatch { .. })));
+    drop((alias, added, grouped));
+    assert_eq!(pool.used_bytes().unwrap(), 20, "retained owner covers the same live key");
+    drop(retained);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    drop(foreign_same);
+    assert_eq!(foreign.used_bytes().unwrap(), 0);
+}
+
 struct ProviderKey {
     id: u32,
     pool: WorkingMemoryPool,

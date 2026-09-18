@@ -1,8 +1,8 @@
 //! The caller's ceiling is live before stop compilation and prompt encoding.
 use super::{OriginalTextSourceError, OriginalTokenizer};
 use crate::working_memory::{
-    funding::{AccountNode, AccountTicket, PendingAccount, PendingOriginal},
     InferenceExecutionIdentity, PreparedAccountCommit, WorkingMemoryError,
+    funding::{AccountNode, AccountTicket, PendingAccount, PendingOriginal},
 };
 use std::mem::size_of;
 

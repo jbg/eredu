@@ -48,7 +48,7 @@ pub struct ScalarBinding<'a> {
 pub struct RenderContext<'a> {
     scalars: &'a [ScalarBinding<'a>],
     #[cfg(feature = "json")]
-    tools: Option<&'a [RecordValue<'a>]>,
+    tools: Option<record::InputArray<'a>>,
     #[cfg(feature = "chat-clock")]
     clock: Option<crate::bounded::clock::Snapshot>,
     messages: Messages<'a>,
@@ -103,7 +103,7 @@ impl<'a> RenderContext<'a> {
     /// Borrow the exact tool declarations supplied by a source producer.
     /// Default/caller variable replacement keeps ordinary precedence.
     #[cfg(feature = "json")]
-    pub fn with_record_tools(mut self, tools: &'a [RecordValue<'a>]) -> Self {
+    pub fn with_tools(mut self, tools: record::InputArray<'a>) -> Self {
         self.tools = Some(tools);
         self
     }
@@ -224,7 +224,7 @@ impl<'a> RenderContext<'a> {
                 let values = self.tools.expect("checked source");
                 ContextValue::Records(
                     values.len(),
-                    record::ReadValue::Record(RecordValue::Array(values)),
+                    record::ReadValue::Array(values),
                 )
             }
             "tools" | "documents" => ContextValue::EmptySequence,

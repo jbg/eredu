@@ -87,7 +87,6 @@ fn fail(cause: Cause) -> Failure {
     }
 }
 fn validate(source: &ExprSet, input: &SymRes) -> Result<(), PreparedExprError> {
-    source.require_prepared()?;
     for &(selector, value) in input {
         if !source.is_valid(selector) || !source.is_valid(value) {
             return Err(PreparedExprError::Source);
@@ -136,8 +135,7 @@ impl ExprSet {
         let source = self;
         validate(source, input).map_err(|e| fail(Cause::Source(e)))?;
         let (_, nodes, encoded) = source
-            .prepared_extents()
-            .map_err(|e| fail(Cause::Source(e)))?;
+            .storage_extents();
         let per_arg = encoded
             .checked_sub(1)
             .ok_or_else(|| fail(Cause::Geometry))?;
@@ -415,26 +413,26 @@ mod tests {
     };
     #[test]
     fn prepared_symbolic_grouping_preserves_both_passes_and_failed_source_prefix() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let v1 = source.mk_byte_literal(b"ab");
-        let v2 = source.mk_byte_literal(b"ac");
-        let v3 = source.mk_byte_literal(b"bb");
-        let literal = source.mk_byte_literal(&[b'q'; 256]);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let v1 = source.mk_byte_literal(b"ab").unwrap();
+        let v2 = source.mk_byte_literal(b"ac").unwrap();
+        let v3 = source.mk_byte_literal(b"bb").unwrap();
+        let literal = source.mk_byte_literal(&[b'q'; 256]).unwrap();
         let (_, mut source, _) =
-            AlphabetInfo::from_exprset(source, &[a, b, c, v1, v2, v3, literal]);
-        let combined = source.mk_or(&mut vec![v1, v2]);
+            AlphabetInfo::from_exprset(source, &[a, b, c, v1, v2, v3, literal]).unwrap();
+        let combined = source.mk_or(&mut vec![v1, v2]).unwrap();
         // Table reserve alone does not create initialized expression words.
         // Retain a real encoded declaration which supplies both that source
         // backing and the source-derived maximum encoding size.
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[combined; 128]));
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[combined; 128])).unwrap();
         assert!(source.is_valid(declaration));
-        source.reserve(48);
+        source.reserve(48).unwrap();
         let input = vec![(a, v1), (b, combined), (a, v2), (c, v1), (c, v2)];
         let mut ordinary = source.clone();
-        let expected = super::super::ordinary_simplify(&mut ordinary, input.clone());
+        let expected = super::super::ordinary_simplify(&mut ordinary, input.clone()).unwrap();
         assert_eq!(expected.len(), 1);
         assert_eq!(expected[0].1, combined);
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();

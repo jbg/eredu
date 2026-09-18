@@ -105,7 +105,7 @@ fn original_outer_source_preserves_scope_occurrence_and_shared_role_delivery() {
     outer.finish(false);
     let delivered = outer.take().unwrap();
     assert!(delivered.completed);
-    assert!(delivered.captures.shared().unwrap().same_storage(&alias));
+    assert!(delivered.captures.same_storage(&alias));
     assert!(outer.take().is_none());
     request.close().unwrap();
     drop(outer);
@@ -398,8 +398,6 @@ fn window_aggregate(checkpoints: bool) {
     let report = final_frame
         .prefill_reductions
         .as_ref()
-        .unwrap()
-        .shared()
         .unwrap()
         .clone();
     let entry = &report.as_reductions().records[0];

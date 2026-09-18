@@ -11,15 +11,15 @@ pub(super) struct Helper {
     pub(super) complete: bool,
 }
 impl Parameterized<FakeTensor> for Helper {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, FakeTensor>>(&'a self, _: &mut V) {}
-    fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, FakeTensor>>(&'a mut self, _: &mut V) {}
-    fn set_trainable(&mut self, _: bool) {}
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&FakeTensor)) -> bool {
-        self.visits.set(self.visits.get() + 1);
-        visitor(&self.value);
-        self.complete
+    fn visit_parameter_sources<'a,V:eredu_nn::ParameterSourceVisitor<'a,FakeTensor>>(&'a self, visitor:&mut V)->Result<(),eredu_nn::ParameterSourceError>{
+        self.visits.set(self.visits.get()+1);
+        visitor.retained(&self.value);
+        if self.complete { Ok(()) } else { Err(eredu_nn::ParameterSourceError::UnclassifiedRetainedField) }
     }
+    fn visit_parameters_mut<'a,V:ParameterVisitorMut<'a,FakeTensor>>(&'a mut self,_:&mut V){}
+    fn set_trainable(&mut self,_:bool){}
 }
+
 impl ArchitectureParameters<FakeBackend> for Chunked {
     type DefinitionError = Error;
     fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&FakeTensor)) -> bool {
@@ -27,17 +27,18 @@ impl ArchitectureParameters<FakeBackend> for Chunked {
         self.helper.visit_retained_values(visitor)
     }
 
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.inner.state_layout()
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+        self.inner.state_layout(metadata)
     }
     fn state_identity(
         &self,
         s: &eredu_runtime::PartitionState,
         t: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.inner.state_identity(s, t)
+        self.inner.state_identity(s, t, metadata)
     }
-    fn parameter_description(&self, c: &()) -> Result<ArchitectureParameterDescription, Error> {
+    fn parameter_description(&self, c: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.inner.parameter_description(c)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -75,14 +76,14 @@ impl LayeredArchitecture<FakeBackend, State> for Chunked {
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         self.inner.state_partition_plan(s)
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.inner.execution_graph()
     }
-    fn group_unit_count(&self, g: usize) -> Result<usize, Error> {
-        self.inner.group_unit_count(g)
+    fn group_unit_count(&self, g: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+        self.inner.group_unit_count(g, metadata_context)
     }
-    fn unit_path(&self, g: usize, i: usize) -> Result<String, Error> {
-        self.inner.unit_path(g, i)
+    fn unit_path(&self, g: usize, i: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+        self.inner.unit_path(g, i, metadata_context)
     }
     fn static_modules(&self) -> &Helper {
         &self.helper

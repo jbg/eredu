@@ -13,7 +13,7 @@ enum DeliveryCause {
     #[error("scheduled partition source: {0}")]
     Source(&'static str),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Exchange(#[from] PartitionCaptureExchangeError),
 }
@@ -24,9 +24,9 @@ enum DeliveryCause {
 pub struct PartitionCaptureTensorDeliveryError {
     #[source]
     cause:DeliveryCause,
-    _source:Option<SharedCapturePlan>,
+    _source:SharedCapturePlan,
     _custody:Option<CaptureTensorCustody>,
-    _metadata:WorkspaceMetadataFunding,
+    _metadata:HostMetadataFunding,
 }
 
 /// One prepared complete-global tensor delivery through the ordinary protocol.
@@ -42,7 +42,7 @@ pub struct PreparedPartitionTensorDelivery<'t,T:PartitionCaptureTransport> {
     dtype:Option<TensorDtype>,
     kind:PayloadKind,
     charged:CaptureUsage,
-    metadata:WorkspaceMetadataFunding,
+    metadata:HostMetadataFunding,
 }
 impl<T:PartitionCaptureTransport> fmt::Debug for PreparedPartitionTensorDelivery<'_,T> {
     fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
@@ -54,22 +54,22 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
     /// Prepare only an actual single complete producer with the exact shared
     /// plan. Call on all ranks before the enclosing forward admission agreement.
     pub fn prepare(exchange:PartitionCaptureExchange<'t,T>, dtype:TensorDtype,
-        charged:CaptureUsage, metadata:&WorkspaceMetadataFunding)
+        charged:CaptureUsage, metadata:&HostMetadataFunding)
         -> Result<Self,PartitionCaptureTensorDeliveryError> {
         Self::prepare_with_source(exchange, Some(dtype), charged, metadata)
     }
 
     pub(crate) fn prepare_with_source(exchange:PartitionCaptureExchange<'t,T>, dtype:Option<TensorDtype>,
-        charged:CaptureUsage, metadata:&WorkspaceMetadataFunding)
+        charged:CaptureUsage, metadata:&HostMetadataFunding)
         -> Result<Self,PartitionCaptureTensorDeliveryError> {
         let receipt=exchange.receipt_plan();
-        let source=receipt.shared_plan_source().cloned();
+        let source=receipt.shared_plan_source().clone();
         let error=|cause|PartitionCaptureTensorDeliveryError { cause,
             _source:source.clone(), _custody:None, _metadata:metadata.clone() };
         let controls=[size_of::<Self>(),size_of::<PartitionCaptureTensorDeliveryError>(),
             size_of::<DeliveryCause>(),size_of::<Result<Self,PartitionCaptureTensorDeliveryError>>(),
             size_of::<Result<(),PartitionCaptureTensorDeliveryError>>(),
-            size_of::<Option<CaptureTensorCustody>>(),size_of::<Option<SharedCapturePlan>>(),
+            size_of::<Option<CaptureTensorCustody>>(),size_of::<SharedCapturePlan>(),
             size_of::<(&PartitionCaptureReceiptPlan,usize,bool)>(),
             size_of::<CaptureTensorGeometry<'_>>(), size_of::<CaptureSummaryGeometry<'_>>(),
             size_of::<PayloadKind>() * 2,
@@ -89,7 +89,7 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
         let bytes=controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
             .ok_or_else(||error(DeliveryCause::Source("delivery controls overflow")))?;
         metadata.reserve_metadata(bytes).map_err(|cause|error(cause.into()))?;
-        let admitted=source.as_ref().ok_or_else(||error(DeliveryCause::Source("receipt has no original shared admission")))?;
+        let admitted=&source;
         let mut producers=receipt.producers();
         let (producer,projection)=producers.next().ok_or_else(||error(DeliveryCause::Source("receipt has no producer")))?;
         if producers.next().is_some() || receipt.combination()!=PartitionCaptureCombination::Disjoint
@@ -145,7 +145,6 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
             else if vocabulary {PayloadKind::Scores}else { PayloadKind::Tensor };
         drop(producers);
         drop((tensor_geometry, summary_geometry, histogram_geometry, vocabulary_geometry));
-        let source=source.expect("validated original source");
         Ok(Self {evidence:None,exchange,source,producer,dtype,kind,charged,metadata:metadata.clone()})
     }
 
@@ -155,7 +154,7 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
         if !matches!(dtype, TensorDtype::F16 | TensorDtype::F32 | TensorDtype::Bf16)
             || self.dtype.as_ref().is_some_and(|current| current != &dtype) {
             return Err(PartitionCaptureTensorDeliveryError { cause:DeliveryCause::Source("resolved producer scalar differs"),
-                _source:Some(self.source.clone()),_custody:None,_metadata:self.metadata.clone() });
+                _source:self.source.clone(),_custody:None,_metadata:self.metadata.clone() });
         }
         self.dtype = Some(dtype);
         Ok(())
@@ -174,7 +173,7 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
             Some(dtype) => dtype,
             None => return Err(PartitionCaptureTensorDeliveryError {
                 cause:DeliveryCause::Source("producer scalar was not resolved before delivery"),
-                _source:Some(self.source.clone()),_custody:Some(custody),_metadata:self.metadata.clone(),
+                _source:self.source.clone(),_custody:Some(custody),_metadata:self.metadata.clone(),
             }),
         };
         let receipt=self.exchange.receipt_plan();
@@ -205,14 +204,14 @@ where T::Error:Send+Sync+'static, <T::Completion as Completion>::Error:Send+Sync
         let decoder=TensorDecoder {frame,rank,producer:self.producer,dtype,
             kind:self.kind,charged:self.charged,metadata:&self.metadata,evidence:self.evidence};
         self.exchange.exchange_into(local,decoder).map_err(|cause|PartitionCaptureTensorDeliveryError {
-            cause:cause.into(),_source:Some(self.source),_custody:Some(custody),_metadata:self.metadata,
+            cause:cause.into(),_source:self.source,_custody:Some(custody),_metadata:self.metadata,
         })
     }
 }
 
 struct TensorDecoder<'f,'a> {
     frame:&'f mut ScheduledCaptureStep<'a>,rank:usize,producer:usize,dtype:TensorDtype,
-    kind:PayloadKind,charged:CaptureUsage,metadata:&'f WorkspaceMetadataFunding,
+    kind:PayloadKind,charged:CaptureUsage,metadata:&'f HostMetadataFunding,
     evidence:Option<crate::capture::partition::PreparedPartitionCaptureEvidence>,
 }
 impl<T:PartitionCaptureTransport> PartitionCaptureDecoder<T> for TensorDecoder<'_, '_> {

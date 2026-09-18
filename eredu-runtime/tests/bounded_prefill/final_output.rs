@@ -40,12 +40,13 @@ impl PrefillExecutor for Tracked {
     type Output = Rc<Scores>;
     type Completion = NativeCompletion;
     type Error = std::io::Error;
-    fn agree_cancellation(
+    fn agree_cancellation_at(
         &mut self,
-        cancelled: bool,
+        _: eredu_runtime::prefill::PrefillBoundary,
+        cancellation: &GenerationCancellationToken,
         _: InferenceRequest,
     ) -> Result<bool, Self::Error> {
-        Ok(cancelled || (self.cancel_after_first && !self.inner.submitted.is_empty()))
+        Ok(cancellation.is_cancelled() || (self.cancel_after_first && !self.inner.submitted.is_empty()))
     }
     fn submit_chunk(
         &mut self,

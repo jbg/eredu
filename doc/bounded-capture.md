@@ -14,13 +14,13 @@ unverified sites remain inadmissible.
 1. Prepare a chat using the loaded model's ordinary `prepare_chat` API.
 2. Build a `CapturePlan` with exact catalog paths, unique selection IDs, phase and
    prediction schedules, transforms, and explicit per-step/cumulative limits.
-3. Call `prepare_observed_chat`. It owns prompt token alignment, resolved settings,
-   the chat's ordinary EOS/semantic policy, and immutable capture admission.
-4. Call `generate_observed_chat` and consume ordered `ObservedGenerationRecord`s.
-   The callback receives prepared alignment, committed token IDs and captures,
-   ordinary semantic text events, and completion. JSON records carry run/session,
-   exact artifact-source and plan identities.
-5. Cancel the shared `GenerationCancellationToken` or return `ControlFlow::Break`.
+3. Attach the borrowed plan to `PreparedChatRequest::capture`. Startup admits it
+   after the paid prompt producer supplies exact token/media geometry.
+4. Call `start_controlled_chat(request, trace_limits, control, callback)` and
+   advance or run the returned session. Ordered `ControlledGenerationRecord`s
+   carry prepared alignment, committed token IDs/captures, semantic events and
+   completion, with run/session, artifact-source and plan identities.
+5. Cancel through the shared control handle or return `ControlFlow::Break`.
 
 The implementation composes `ControlledTextGeneration` and the existing
 committed-token driver. It does not resample tokens or create a second EOS,
@@ -28,9 +28,9 @@ tokenizer, or text-decoding loop. `CapturePlan::none()` means none; an empty
 selection list also means none. The older `ObservationRequest` retains its
 capture-all interpretation of empty selectors for compatibility.
 
-Use `intervention_discovery` and `prepare_intervened_chat` to admit prospective
-activation/routing controls together with capture, then call the same
-`generate_observed_chat`. Intervention outcomes and before/after evidence share
+Use `intervention_discovery` and the request's borrowed `intervention` declaration
+to admit prospective activation/routing controls together with capture. Both use
+the same controlled startup and ordinary committed driver. Intervention outcomes and before/after evidence share
 capture budgets and native completion ownership. Shared session validation and
 observer forwarding serve capture-only and combined runs. Additional original
 routing-decision resources use backend estimates at admission and runtime, while
@@ -293,8 +293,8 @@ are wall-clock categories, not independent accelerator profiler measurements.
 Capture time can include evaluation of the source's lazy dependencies, so these
 timings overlap and must not be added as independent costs.
 
-LM Inspector can replace its tokenizer/EOS/sampling loop with preparation and one
-`generate_observed_chat` call. Render semantic text events directly; associate
+LM Inspector can use prepared-chat startup and the controlled session's `run`
+method for tokenizer, EOS, sampling and semantic delivery. Render semantic text events directly; associate
 captures with the token event's prediction index and retained catalog point.
 Replace post-copy preview/statistics with the corresponding admitted native
 transform. Forward only already size-checked records, preserve structured missing
@@ -689,7 +689,8 @@ cancellation. Each returned envelope spends the same trace allowance as steps;
 transport exhaustion consumes the rejected record and never refunds capture work.
 Successful step records already include their internal evidence.
 
-`generate_observed_chat_speculative` and `generate_observed_text_speculative` drive
+`generate_observed_prepared_chat_speculative` and
+`generate_observed_managed_plain_text_speculative` drive
 the controlled loop continuously with the same options and immediate per-step
 delivery. Returning `ControlFlow::Break` cancels and settles the scheduler. The
 scoped controlled form additionally exposes failure/cancellation evidence draining.

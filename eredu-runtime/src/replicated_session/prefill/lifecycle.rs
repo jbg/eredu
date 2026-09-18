@@ -256,7 +256,7 @@ where
         request: &InferenceRequest,
     ) -> Result<(), WorkingMemoryError> {
         let source = source.media();
-        source.request().validate_same_request(request)?;
+        source.request()?.validate_same_request(request)?;
         source.validate_revision(retained.revision())
     }
     fn admit(
@@ -276,7 +276,7 @@ where
         source
             .media()
             .validate_span(span)
-            .map_err(A::ingress_error)?;
+            .map_err(|cause| A::ingress_error(cause, B::construction_metadata(_context)))?;
         Ok(span.clone())
     }
     fn execute(
@@ -313,7 +313,7 @@ where
         source
             .media_mut()
             .committed(session.state.inference_retention().revision())
-            .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e)))
+            .map_err(|e| ReplicatedTextSessionError::Architecture(A::ingress_error(e, None)))
     }
 }
 
@@ -346,7 +346,7 @@ where
         context: &'a <<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &'a mut O,
     ) -> Result<Self, WorkingMemoryError> {
-        let request = source.request().clone();
+        let request = source.request()?.clone();
         request.validate(session.inference_execution_identity(), source.geometry())?;
         source.validate_revision(session.state.inference_retention().revision())?;
         if !session.mechanisms.supports_media_ingress_completion() {

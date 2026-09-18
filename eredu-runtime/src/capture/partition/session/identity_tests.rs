@@ -40,8 +40,8 @@ fn first_attempt_identity_survives_failure_restore_and_later_steps() {
         schema_version: 1,
         selections: vec![],
         limits: CaptureLimits {
-            per_step: CaptureUsage::default(),
-            cumulative: CaptureUsage::default(),
+            per_step: crate::capture::policy::frame_usage().unwrap(),
+            cumulative: crate::capture::policy::frame_usage().unwrap().checked_mul(2).unwrap(),
             physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
@@ -58,7 +58,7 @@ fn first_attempt_identity_survives_failure_restore_and_later_steps() {
     )
     .unwrap();
     let new_run = || {
-        let mut run = CaptureSession::new(plan.clone());
+        let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
         run.configure_partition_capture(
             PartitionCaptureIdentity::for_session(
                 discovery.artifact_identity.clone(),

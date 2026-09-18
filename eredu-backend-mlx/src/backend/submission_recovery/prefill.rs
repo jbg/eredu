@@ -98,16 +98,15 @@ pub(crate) fn finish(mut guard: PrefillGuard) -> Result<Status, Error> {
     let registration = guard.retention_mut().registration.take();
     let retirement = guard.retention_mut().retirement.take();
     guard.seal();
-    let status = guard.finish();
-    if status.settled && !status.failed && !status.blocked {
+    let status = guard.finish()?;
+    if let Some(registration) = registration {
+        registration.finish(status)?;
+    } else if status.settled && !status.failed && !status.blocked {
         if let Some(observer) = &retirement {
             // Root/payload destruction above can expose the final native
             // wrappers. Keep this exact observer/Q live through their drain.
             super::retirement::complete(observer)?;
         }
-    }
-    if let Some(registration) = registration {
-        registration.finish(status);
     }
     Ok(status)
 }

@@ -217,7 +217,7 @@ fn original_estimates_are_used_at_admission_and_reserved_before_routing() {
         let facts = Arc::new(Facts::new(bytes));
         validate_session(&capture, &plan, &discovery(&plan), facts.as_ref()).unwrap();
         assert_eq!(*facts.calls.lock().unwrap(), [2, 1]);
-        let mut session = CaptureSession::new(capture.clone());
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
         session
             .enable_interventions(plan.clone(), facts.clone())
             .unwrap();
@@ -275,7 +275,7 @@ fn unavailable_overflowing_and_over_budget_estimates_fail_before_extra_work() {
         assert!(preflight(&capture, &plan, facts.as_ref()).is_err());
         // Even a direct caller bypassing cold preflight receives a hard failure
         // before a selector can obtain an executable routing control.
-        let mut session = CaptureSession::new(capture.clone());
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
         session.enable_interventions(plan.clone(), facts).unwrap();
         session.begin_step(CapturePhase::Prefill, 0).unwrap();
         assert!(session.routing_control("router", 2).is_err());
@@ -297,7 +297,7 @@ fn no_original_evidence_never_requests_an_estimate_or_original_decision() {
     unavailable.unavailable = true;
     let facts = Arc::new(unavailable);
     preflight(&capture, &plan, facts.as_ref()).unwrap();
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session.enable_interventions(plan, facts.clone()).unwrap();
     session.begin_step(CapturePhase::Prefill, 0).unwrap();
     assert!(
@@ -332,7 +332,7 @@ fn no_original_evidence_never_requests_an_estimate_or_original_decision() {
 #[test]
 fn shared_observer_attributes_routing_failures_and_missing_targets() {
     let (capture, plan) = routed(false);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(plan, Arc::new(Facts::new(1)))
         .unwrap();
@@ -355,7 +355,7 @@ fn shared_observer_attributes_routing_failures_and_missing_targets() {
 fn observer_step_admission_uses_actual_forward_phase_and_defers_all_work() {
     use crate::ActivationObserver;
     let (capture, _) = plans(vec![], true);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     {
         let _observer = CaptureObserver::for_step(
             &mut session,
@@ -405,7 +405,7 @@ fn observer_step_admission_uses_actual_forward_phase_and_defers_all_work() {
 fn failed_step_admission_retains_epoch_and_cannot_complete() {
     use crate::ActivationObserver;
     let (capture, _) = plans(vec![], true);
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     // Exhaust cumulative capacity, so begin_step's envelope reservation fails.
     let capacity = session.plan().plan().limits.cumulative;
     session.ledger.reserve(capacity).unwrap();
@@ -445,7 +445,7 @@ fn runtime_activation_limits_precede_evidence_and_native_patching() {
     );
     let mut facts = Facts::new(0);
     facts.max_index = 3;
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(plan.clone(), Arc::new(facts))
         .unwrap();
@@ -474,7 +474,7 @@ fn runtime_route_limits_and_missing_original_evidence_fail_explicitly() {
     let (capture, plan) = routed(true);
     let mut facts = Facts::new(1);
     facts.max_index = 3;
-    let mut session = CaptureSession::new(capture.clone());
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
     session
         .enable_interventions(plan.clone(), Arc::new(facts))
         .unwrap();
@@ -485,7 +485,7 @@ fn runtime_route_limits_and_missing_original_evidence_fail_explicitly() {
         InterventionOutcome::Failed { .. }
     ));
 
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(plan, Arc::new(Facts::new(1)))
         .unwrap();

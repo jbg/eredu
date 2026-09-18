@@ -9,7 +9,6 @@ use crate::utils::unescape;
 pub(crate) mod literal;
 pub(crate) mod scanner;
 use literal::{parse_number, Lexeme, Number};
-pub use scanner::StartMarker;
 use scanner::{Scanner, Syntax};
 
 /// Internal config struct to control whitespace in the engine.

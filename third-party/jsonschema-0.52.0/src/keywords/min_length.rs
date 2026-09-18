@@ -24,9 +24,9 @@ impl MinLengthValidator {
         location: Location,
     ) -> CompilationResult<'a, F> {
         let Some(limit) = size_limit(ctx, schema) else {
-            return Err(fail_on_non_positive_integer(schema, location));
+            return Err(fail_on_non_positive_integer(schema, location).into());
         };
-        Ok(Box::new(MinLengthValidator { limit, location }))
+        Ok(ctx.funding().boxed(MinLengthValidator { limit, location })?)
     }
 }
 
@@ -42,6 +42,9 @@ impl<F: Json> Validate<F> for MinLengthValidator {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(length) = instance.string_length() {
             if length < self.limit {
@@ -51,22 +54,16 @@ impl<F: Json> Validate<F> for MinLengthValidator {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(length) = instance.string_length() {
             if length < self.limit {
-                return Err(ValidationError::min_length(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.limit,
-                ));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| Ok(crate::error::ValidationErrorKind::MinLength { limit: self.limit }));
             }
         }
         Ok(())
@@ -79,7 +76,7 @@ pub(crate) fn compile<'a, F: Json>(
     _: &'a Map<String, Value>,
     schema: &'a Value,
 ) -> Option<CompilationResult<'a, F>> {
-    let location = ctx.location().join("minLength");
+    let location = crate::keywords::try_compile!(ctx.location().join_with_funding("minLength", ctx.funding()));
     Some(MinLengthValidator::compile(ctx, schema, location))
 }
 

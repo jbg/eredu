@@ -3,7 +3,7 @@ use crate::backend::runtime::residency::storage::StorageIdentity;
 use eredu_runtime::working_memory::{
     HostSourcePeakSelection, NativeStorageRegistration, OriginalHostSourceConstruction,
     OriginalHostSourceFailure, OriginalHostSourceFailureCause, OriginalHostSourcePending,
-    OriginalHostSourceReceipt,
+    OriginalHostSourceReceipt, OriginalOperationMetadataCustody,
 };
 use eredu_runtime::working_memory::{
     OriginalHostSourceBank, OriginalHostSourceCustody, WorkingMemoryError,
@@ -36,6 +36,29 @@ pub(crate) struct Completed {
     filling: Option<safemlx::PreparedHostTransferWriter>,
     ready: Option<ImmutableHostTransferBuffer>,
     allocation: std::cell::Cell<Option<AllocationInfo>>,
+    custody: OriginalOperationMetadataCustody,
+}
+/// The existing source transaction creates this only after successful canonical
+/// attachment. Its scalar facts grant no birth and retain no extra native owner.
+pub(crate) struct PublishedHostSource {
+    buffer: ImmutableHostTransferBuffer,
+    allocation: AllocationInfo,
+    proof: Option<super::PublishedAllocation>,
+    custody: OriginalOperationMetadataCustody,
+}
+impl PublishedHostSource {
+    pub(crate) fn allocation(&self) -> AllocationInfo {
+        self.allocation
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ImmutableHostTransferBuffer,
+        Option<super::PublishedAllocation>,
+        OriginalOperationMetadataCustody,
+    ) {
+        (self.buffer, self.proof, self.custody)
+    }
 }
 impl Completed {
     fn into_failed_owner(self) -> Option<ImmutableHostTransferBuffer> {
@@ -154,7 +177,7 @@ struct Observation<'a> {
 impl<P: HostFillPermit> OriginalHostSourceConstruction for Copy<'_, P> {
     type Key = StorageIdentity;
     type Completed = Completed;
-    type Output = (ImmutableHostTransferBuffer, AllocationInfo);
+    type Output = PublishedHostSource;
     type Attachment = Attachment;
     type Error = SourceCause;
     type Observation<'a> = Observation<'a>;
@@ -191,6 +214,7 @@ impl<P: HostFillPermit> OriginalHostSourceConstruction for Copy<'_, P> {
             filling: Some(self.plan.construct_writer(&arena)?),
             ready: None,
             allocation: std::cell::Cell::new(None),
+            custody: self.controls.metadata_custody(),
         })
     }
     fn observe(completed: &Self::Completed) -> Result<Self::Observation<'_>, Self::Error> {
@@ -240,13 +264,14 @@ impl<P: HostFillPermit> OriginalHostSourceConstruction for Copy<'_, P> {
             })
     }
     fn into_output(completed: Self::Completed) -> Self::Output {
-        (
-            completed.ready.expect("observed completed source"),
-            completed
-                .allocation
-                .get()
-                .expect("observed completed allocation"),
-        )
+        let allocation = completed.allocation.get().expect("observed completed allocation");
+        PublishedHostSource {
+            buffer: completed.ready.expect("observed completed source"),
+            allocation,
+            // Zero-capacity sources have no canonical row or attachment.
+            proof: (allocation.bytes() != 0).then(|| super::PublishedAllocation::attached(allocation)),
+            custody: completed.custody,
+        }
     }
 }
 pub(crate) fn control_bytes<P: HostFillPermit>(
@@ -273,7 +298,7 @@ pub(crate) fn control_bytes<P: HostFillPermit>(
         size_of::<Observation<'_>>(),
         size_of::<SourceError>(),
         size_of::<SourceCause>(),
-        size_of::<Result<(ImmutableHostTransferBuffer, AllocationInfo), SourceError>>(),
+        size_of::<Result<PublishedHostSource, SourceError>>(),
         size_of::<Result<Pending, SourceError>>(),
         size_of::<Mutex<Failure>>(),
         size_of::<RetiredFailure>(),
@@ -284,6 +309,14 @@ pub(crate) fn control_bytes<P: HostFillPermit>(
         size_of::<Result<usize, safemlx::error::Exception>>(),
         size_of::<(&ImmutableHostTransferBuffer, u64, usize)>(),
         size_of::<Completed>(),
+        size_of::<PublishedHostSource>(),
+        size_of::<OriginalOperationMetadataCustody>(),
+        size_of::<(ImmutableHostTransferBuffer, Option<super::PublishedAllocation>, OriginalOperationMetadataCustody)>(),
+        size_of::<AllocationInfo>(),
+        size_of::<Option<super::PublishedAllocation>>(),
+        size_of::<&AllocationInfo>(),
+        size_of::<bool>(),
+        size_of::<&PublishedHostSource>(),
         size_of::<Option<safemlx::PreparedHostTransferWriter>>(),
         size_of::<Option<ImmutableHostTransferBuffer>>(),
         size_of::<OriginalHostSourceReceipt>(),
@@ -314,7 +347,7 @@ pub(crate) fn begin<'a, P: HostFillPermit>(
 }
 pub(crate) fn finish(
     pending: Pending,
-) -> Result<(ImmutableHostTransferBuffer, AllocationInfo), SourceError> {
+) -> Result<PublishedHostSource, SourceError> {
     // Permit identity was consumed and validated before allocation. Every
     // producer uses this exact completed/observation/attachment worker; finish
     // cannot reopen construction or acquire a fresh source grant.

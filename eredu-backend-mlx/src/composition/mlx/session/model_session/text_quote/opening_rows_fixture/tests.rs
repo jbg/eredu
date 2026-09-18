@@ -129,7 +129,7 @@ fn quoted(runtime: &Runtime, source: &SharedCapturePlan, controller: &disk::Cont
         prefill_chunk_positions: 1,
         output: OutputDemand::LastPosition,
     };
-    let capture = CaptureAdmission::new(runtime.session(), geometry, source)
+    let capture = CaptureAdmission::new(runtime.session(), geometry, source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
         .unwrap()
         .with_opening_rows();
     geometry.output = capture.physical_output(geometry.output);
@@ -324,9 +324,7 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
             );
             continue;
         }
-        let CapturedStepDelivery::Shared(frame) = delivery.unwrap() else {
-            panic!("original bank must return shared delivery");
-        };
+        let frame = delivery.unwrap();
         assert!(!driver.capture_pending(&continuation).unwrap());
         assert!(
             driver

@@ -525,7 +525,7 @@ impl GroupedUnitObserver<MlxTensor> for Reject<'_> {
     fn observe(&mut self, _: &GroupedUnitBatch<'_, MlxTensor>) -> Result<(), ComputeError> {
         self.observed += 1;
         if self.stage == 0 {
-            Err(ComputeError::backend_source(Sentinel))
+            Err(ComputeError::backend_retained_source(Sentinel))
         } else {
             Ok(())
         }
@@ -535,7 +535,7 @@ impl GroupedUnitObserver<MlxTensor> for Reject<'_> {
         b: &GroupedUnitBatch<'_, MlxTensor>,
     ) -> Result<Option<MlxTensor>, ComputeError> {
         match self.stage {
-            1 => Err(ComputeError::backend_source(Sentinel)),
+            1 => Err(ComputeError::backend_retained_source(Sentinel)),
             2 => Ok(Some(MlxTensor::from_array(Array::from_slice(
                 &[0_f32],
                 &[1],
@@ -554,7 +554,7 @@ impl GroupedUnitObserver<MlxTensor> for Reject<'_> {
         _: &GroupedUnitBatch<'_, MlxTensor>,
     ) -> Result<(), ComputeError> {
         self.effective += 1;
-        Err(ComputeError::backend_source(Sentinel))
+        Err(ComputeError::backend_retained_source(Sentinel))
     }
 }
 #[test]
@@ -677,7 +677,7 @@ fn verify_provider(device: DeviceType) {
                 let mut provider = eredu_runtime::ObservedExpertProvider::<_, _, ComputeError>::new(
                     &mut banks,
                     &mut capture,
-                    eredu_runtime::RoutedObservationPoints::new(id, "fixture.bank", GROUPS as i32),
+                    eredu_runtime::RoutedObservationPoints::new(id, format_args!("{}", "fixture.bank"), GROUPS as i32, None).unwrap(),
                 );
                 let request = eredu_runtime::RoutedExpertRequest {
                     bank: id,

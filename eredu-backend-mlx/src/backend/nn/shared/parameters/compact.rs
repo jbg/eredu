@@ -1,7 +1,7 @@
 //! Paid compact binding rows and the shared direct physical-field binder.
 use super::*;
 use eredu_nn::Parameter;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::{alloc::Layout, mem::{size_of, size_of_val}};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,7 +17,7 @@ pub(in crate::backend::nn::shared) enum CompactBindingCause {
     #[error("compact parameter binding source: {0}")]
     Source(#[source] ParameterSourceError),
     #[error("compact parameter binding funding: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
     #[error("compact parameter binding destination: {0}")]
     Allocation(#[source] std::collections::TryReserveError),
 }
@@ -25,7 +25,7 @@ pub(in crate::backend::nn::shared) enum CompactBindingCause {
 #[error("{cause}")]
 struct FundedFailure {
     #[source] cause: CompactBindingCause,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 pub(in crate::backend::nn::shared) fn binding_error(cause: CompactBindingCause) -> ComputeError {
     ComputeError::backend_retained_source(cause)
@@ -38,7 +38,7 @@ pub(crate) struct PreparedCompactBindings<'a> {
     rows: Vec<Binding<'a>>,
     limit: usize,
     attempted: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl<'a> PreparedCompactBindings<'a> {
     /// Largest exact fixed binder frame among the three selected grouped leaves.
@@ -51,11 +51,11 @@ impl<'a> PreparedCompactBindings<'a> {
         let frames = [size_of::<Self>(), size_of::<Binding<'_>>(),
             size_of::<Result<Self, ComputeError>>(), size_of::<(usize, bool, &'a str, Array)>(),
             Layout::array::<Binding<'a>>(rows).ok()?.size(),
-            ComputeError::retained_source_control_bytes::<FundedFailure>()?,
-            ComputeError::retained_source_control_bytes::<CompactBindingCause>()?];
+            ComputeError::retained_source_construction_bytes::<FundedFailure>()?,
+            ComputeError::retained_source_construction_bytes::<CompactBindingCause>()?];
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
-    pub(crate) fn new(rows: usize, funding: &WorkspaceMetadataFunding) -> Result<Self, ComputeError> {
+    pub(crate) fn new(rows: usize, funding: &HostMetadataFunding) -> Result<Self, ComputeError> {
         let failure = |cause| ComputeError::backend_retained_source(FundedFailure {
             cause, _funding: funding.clone(),
         });
@@ -74,7 +74,7 @@ impl<'a> PreparedCompactBindings<'a> {
         self.rows.push(Binding { name, value: Some(value) });
         Ok(())
     }
-    pub(in crate::backend::nn::shared) fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub(in crate::backend::nn::shared) fn funding(&self) -> &HostMetadataFunding { &self.funding }
     pub(in crate::backend::nn::shared) fn consumed(&self) -> bool {
         self.attempted && self.rows.len() == self.limit && self.rows.iter().all(|row|row.value.is_none())
     }
@@ -172,7 +172,7 @@ pub(in crate::backend::nn::shared) fn linear_control_bytes() -> Option<usize> {
         size_of::<(usize,&str,&Array,Option<Array>,Option<&[i32]>)>(),
         size_of::<Result<(),ComputeError>>(),size_of::<CompactBindingCause>(),
         Array::descriptor_comparison_control_bytes()?.checked_mul(8)?,
-        ComputeError::retained_source_control_bytes::<FundedFailure>()?];
+        ComputeError::retained_source_construction_bytes::<FundedFailure>()?];
     frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
 }
 pub(super) fn named_control_bytes<V: CompactBindingValues + ?Sized>(rows: usize) -> Option<usize> {
@@ -181,14 +181,14 @@ pub(super) fn named_control_bytes<V: CompactBindingValues + ?Sized>(rows: usize)
         size_of::<CompactBindingCause>(),size_of::<[(&str,[i32;3]);2]>(),
         super::sources::binding_visit_control_bytes()?,
         Array::descriptor_comparison_control_bytes()?.checked_mul(rows)?.checked_mul(2)?,
-        ComputeError::retained_source_control_bytes::<FundedFailure>()?];
+        ComputeError::retained_source_construction_bytes::<FundedFailure>()?];
     frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
 }
 pub(super) fn bind_named<M: NativeRetainedValues,V: CompactBindingValues + ?Sized>(
     module: &mut M, topology: &dyn NativeParameterTopology, values: &mut V,
     floating_shapes: &[(&str,[i32;3])]) -> Result<(),ComputeError> {
     values.begin(named_control_bytes::<V>(topology.len()))?;
-    if !values.ready() || values.len()!=topology.len() || topology.keys().any(|key|values.value(key).is_none()) {
+    if !values.ready() || values.len()!=topology.len() || (0..topology.len()).any(|index|values.value(topology.key(index).expect("immutable topology index")).is_none()) {
         return Err(values.failure(CompactBindingCause::Identity));
     }
     // Reuse the immutable source verifier, including exact field uniqueness.

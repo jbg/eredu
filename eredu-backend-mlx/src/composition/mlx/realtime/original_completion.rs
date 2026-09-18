@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::{nn::{tensor::TokenValidationIngress,workspace::{ResidentCompletionRecipe,SpeculativeNumericalRecipe}},
     submission_recovery::{native_role::realtime::RealtimeRoleContext,prefill::nested::NestedRootCompletion}};
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::{RuntimeState,working_memory::{OriginalRealtimeBudgetCustody,WorkingMemoryError}};
 use safemlx::{OriginalScopeObserver,PreparedResidentGraph,OperationEvent};
 use std::{cell::{Cell,RefCell},rc::Rc,mem::{size_of,size_of_val}};
@@ -13,7 +13,7 @@ struct State {
     validations:RefCell<Option<TokenValidationBatch>>,
     observer:RefCell<Option<OriginalScopeObserver>>,
     expected:usize,constructed:Cell<bool>,completed:Cell<bool>,
-    custody:OriginalRealtimeBudgetCustody,funding:WorkspaceMetadataFunding,
+    custody:OriginalRealtimeBudgetCustody,funding:HostMetadataFunding,
 }
 // Keep the counted allocation outside the RefCell while native completion
 // or ready-event detachment can retire native references. Every exit restores
@@ -64,7 +64,7 @@ impl OriginalRealtimeCompletion {
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
     pub(super) fn prepare(recipe:ResidentCompletionRecipe,roots:usize,
-        custody:OriginalRealtimeBudgetCustody,funding:&WorkspaceMetadataFunding)->Result<Self,Error> {
+        custody:OriginalRealtimeBudgetCustody,funding:&HostMetadataFunding)->Result<Self,Error> {
         let all=Self::control_bytes(recipe,roots).ok_or_else(overflow)?;
         let separate=WorkspaceContext::metadata_vec_bytes::<MlxTensor>(roots).ok_or_else(overflow)?
             .checked_add(NestedRootCompletion::control_bytes(roots,recipe.validation_roots).ok_or_else(overflow)?)
@@ -180,3 +180,5 @@ impl RealtimeFrameCompletionMechanism<MlxTensor,MlxKeyValueTransactionBranch,For
 }
 fn mismatch()->Error {Error::PrefillControl(WorkingMemoryError::IdentityMismatch)}
 fn overflow()->Error {Error::PrefillControl(WorkingMemoryError::Overflow)}
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

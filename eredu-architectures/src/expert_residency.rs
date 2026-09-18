@@ -29,10 +29,11 @@ impl ExpertOwnershipPolicy {
         size: usize,
         rank: usize,
     ) -> Result<std::ops::Range<usize>, ExpertRealizationPlanError> {
-        match self {
-            Self::Balanced => balanced_contiguous_range(count, size, rank, false)
-                .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string())),
-        }
+        self.range_view(count,size,rank)
+            .map_err(|error|ExpertRealizationPlanError::InvalidTopology(error.to_string()))
+    }
+    fn range_view(self,count:usize,size:usize,rank:usize)->Result<std::ops::Range<usize>,eredu_core::TopologyError>{
+        match self {Self::Balanced=>balanced_contiguous_range(count,size,rank,false)}
     }
 }
 
@@ -54,9 +55,20 @@ pub struct ExpertRealizationPlan<S> {
     collective_local_rank: usize,
     unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
     replicated_units: BTreeSet<(ExecutionGroupId, usize)>,
+    addressable: Option<std::sync::Arc<crate::routed_text::addressable_source::PartitionSource>>,
 }
 
 impl<S> ExpertRealizationPlan<S> {
+    pub(crate) fn bind_addressable_source(&mut self, source: std::sync::Arc<crate::routed_text::addressable_source::PartitionSource>) {
+        self.addressable = Some(source);
+    }
+    pub(crate) fn retained_addressable_source(&self) -> Option<&std::sync::Arc<crate::routed_text::addressable_source::PartitionSource>> {
+        self.addressable.as_ref()
+    }
+    pub(crate) fn addressable_source(&self) -> Option<&crate::routed_text::addressable_source::PartitionSource> {
+        self.addressable.as_deref()
+    }
+
     /// Creates a balanced contiguous realization for one architecture rank.
     pub fn balanced(
         global_expert_count: usize,
@@ -103,6 +115,7 @@ impl<S> ExpertRealizationPlan<S> {
             collective_local_rank: collective.rank(),
             unit_specs,
             replicated_units: BTreeSet::new(),
+            addressable: None,
         })
     }
 
@@ -112,13 +125,14 @@ impl<S> ExpertRealizationPlan<S> {
         &self,
         topology: ParallelRankTopology,
     ) -> Result<Vec<usize>, ExpertRealizationPlanError> {
-        self.ownership_policy
-            .range(
-                self.global_expert_count,
-                topology.expert_parallel_size(),
-                topology.expert_parallel_rank(),
-            )
+        self.project_local_group_range(topology)
             .map(Iterator::collect)
+            .map_err(|error|ExpertRealizationPlanError::InvalidTopology(error.to_string()))
+    }
+    /// Borrowed retained policy projection; destinations belong to the caller.
+    pub(crate) fn project_local_group_range(&self,topology:ParallelRankTopology)
+        ->Result<std::ops::Range<usize>,eredu_core::TopologyError>{
+        self.ownership_policy.range_view(self.global_expert_count,topology.expert_parallel_size(),topology.expert_parallel_rank())
     }
 
     /// Returns the checkpoint-global routed expert count used by preflight.
@@ -223,6 +237,7 @@ impl<S> ExpertRealizationPlan<S> {
             collective_local_rank: self.collective_local_rank,
             unit_specs,
             replicated_units: self.replicated_units,
+            addressable: self.addressable,
         })
     }
 
@@ -261,7 +276,7 @@ pub enum RoutedMechanismExecutionError {
 impl RoutedMechanismExecutionError {
     /// Retains a mechanism failure without erasing its typed cause.
     pub fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Source(eredu_nn::Error::backend_source(error))
+        Self::Source(eredu_nn::Error::backend_retained_source(error))
     }
 }
 
@@ -933,7 +948,7 @@ where
                 "expert route metadata received counts for the wrong direction".into(),
             ));
         }
-        let convert = |funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>| {
+        let convert = |funding: Option<&eredu_nn::workspace::HostMetadataFunding>| {
             if let Some(funding) = funding {
                 let bytes = values.len().checked_mul(std::mem::size_of::<i32>())
                     .filter(|bytes| *bytes <= isize::MAX as usize)

@@ -24,7 +24,7 @@ use eredu_architectures::{
 };
 use eredu_core::{InferenceGeometry, OutputDemand, SamplingPlacement};
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, HostMetadataFunding},
     Tensor,
 };
 use eredu_runtime::{
@@ -89,7 +89,7 @@ struct Payload {
     layerwise: Option<LayerwiseWorkspace>,
     context: WorkspaceContext,
     _bindings: SourceBindings,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
     _prior: Vec<PreparedEmbeddedEvidence>,
     _state_prior: Option<CompletedResidentSource>,
 }
@@ -129,12 +129,12 @@ where
 fn prior_sources<'a>(
     state: Option<&'a CompletedResidentSource>,
     context: SpeculativeExecutionStreams<'a>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<Vec<&'a CompletedResidentSource>, Error> {
     let (sources, environment) = context
         .original_numerical_for(SamplingPlacement::Target)
         .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-    let frames=[size_of::<(Option<&CompletedResidentSource>,SpeculativeExecutionStreams<'_>,&WorkspaceMetadataFunding)>(),
+    let frames=[size_of::<(Option<&CompletedResidentSource>,SpeculativeExecutionStreams<'_>,&HostMetadataFunding)>(),
         size_of::<Vec<&CompletedResidentSource>>(),size_of::<Result<Vec<&CompletedResidentSource>,Error>>(),
         size_of::<std::slice::Iter<'_,&PreparedEmbeddedEvidence>>(),size_of::<Option<&CompletedResidentSource>>(),
         size_of::<Result<(),Error>>()];
@@ -216,7 +216,7 @@ where
             eredu_runtime::speculative::external_occurrence::ExternalOccurrenceClaim<'_>,
             ExternalTargetEquationQuote)>(),
         size_of::<Result<Output, Error>>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
         size_of::<&crate::backend::OriginalCopyEnvironment<'_>>(),
         size_of::<Payload>(),
         size_of::<Work<'_, A, D, F>>(),
@@ -229,9 +229,9 @@ where
         size_of::<Vec<&CompletedResidentSource>>(),
         size_of::<Vec<PreparedEmbeddedEvidence>>(),
         size_of::<EmbeddedNativeLayout>(),
-        size_of::<safemlx::StreamCopyPlan<WorkspaceMetadataFunding>>(),
+        size_of::<safemlx::StreamCopyPlan<HostMetadataFunding>>(),
         size_of::<
-            Result<safemlx::StreamCopyPlan<WorkspaceMetadataFunding>, safemlx::StreamCopyCause>,
+            Result<safemlx::StreamCopyPlan<HostMetadataFunding>, safemlx::StreamCopyCause>,
         >(),
         Array::descriptor_control_bytes()
             .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::Overflow))?,
@@ -270,17 +270,18 @@ where
     let parts = ExternalTargetEquationQuote::inspect(
         session,
         tokens,
+        context.original_prefill_input(),
         invocation,
         request,
         sources,
         environment,
         funding,
-        |quote, storage| {
+        |quote, storage, prepared| {
             crate::composition::mlx::speculative::validate_registered_tensor_inputs_at(
                 context, storage[1], SamplingPlacement::Target, funding,
             ).map_err(|cause| sources.retain_error(cause))?;
             let prior = prior_sources(state_prior.as_ref(), context, funding)?;
-            SourceBindings::prepare(quote, storage, &prior, environment, funding, host)
+            SourceBindings::prepare(quote, storage, prepared, &prior, environment, funding, host)
         },
     )?;
     run_quoted(session, request, context, state_prior, execute, sources, claim, parts)
@@ -325,11 +326,6 @@ where
         .record()
         .validation_roots()
         .ok_or_else(|| {
-            if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some() {
-                eprintln!("EXTERNAL_TARGET_MISSING operation={:?} kind={:?} detail={:?}",
-                    parts.recipe.record().first_missing_operation(), invocation.kind(),
-                    parts.recipe.record().missing_operation_detail());
-            }
             sources.retain_startup_error(WorkingMemoryError::UnknownBound)
         })?;
     if request.is_some() {
@@ -345,7 +341,7 @@ where
         .with_native_recipe(|r| r.bind_external_target_completion(invocation, distribution)).map_err(|cause|sources.retain_error(cause))?;
     }
     let completion_stream =
-        safemlx::StreamCopyPlan::<WorkspaceMetadataFunding>::capture(environment.stream())
+        safemlx::StreamCopyPlan::<HostMetadataFunding>::capture(environment.stream())
             .map_err(|e| sources.retain_startup_error(e))?;
     let completion_controls = if request.is_some() { NestedCompletionOwner::control_bytes(
         completion_roots,
@@ -537,3 +533,5 @@ where
     );
     Ok(output)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -2,7 +2,7 @@
 pub(crate) mod storage;
 use super::SymRes;
 use crate::ast::{ExprRef, ExprSet};
-use std::convert::Infallible;
+use crate::ParserError as ConstructionError;
 
 pub(crate) trait Construction {
     type Error;
@@ -48,28 +48,26 @@ pub(crate) fn run<C: Construction>(
 }
 struct Ordinary<'a>(&'a mut ExprSet);
 impl Construction for Ordinary<'_> {
-    type Error = Infallible;
-    fn union(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_or(&mut vec![left, right]))
+    type Error = ConstructionError;
+    fn union(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_or_pair(left, right)?)
     }
-    fn intersection(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_byte_set_and(left, right))
+    fn intersection(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_byte_set_and(left, right)?)
     }
-    fn subtract(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.0.mk_byte_set_sub(left, right))
+    fn subtract(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.0.mk_byte_set_sub(left, right)?)
     }
-    fn push(&mut self, output: &mut SymRes, pair: (ExprRef, ExprRef)) -> Result<(), Infallible> {
-        output.push(pair);
+    fn push(&mut self, output: &mut SymRes, pair: (ExprRef, ExprRef)) -> Result<(), ConstructionError> {
+        self.0.construction_funding()?.try_push(output, pair)?;
         Ok(())
     }
-    fn invalid(&self) -> Infallible {
-        panic!("disjoint selector source cannot contain an empty remainder")
+    fn invalid(&self) -> ConstructionError {
+        crate::raw::PreparedExprError::Source.into()
     }
 }
-pub(super) fn ordinary(source: &mut ExprSet, input: &SymRes) -> SymRes {
+pub(super) fn ordinary(source: &mut ExprSet, input: &SymRes) -> crate::ParserResult<SymRes> {
     let mut output = Vec::new();
-    match run(input, &mut output, &mut Ordinary(source)) {
-        Ok(()) => output,
-        Err(never) => match never {},
-    }
+    run(input, &mut output, &mut Ordinary(source))?;
+    Ok(output)
 }

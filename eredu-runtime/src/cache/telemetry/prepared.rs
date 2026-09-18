@@ -4,7 +4,7 @@ use crate::cache::table::MetadataSource;
 use crate::cache::{CacheTableCapacityError, PreparedCacheTable};
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::mem::size_of;
 
@@ -15,7 +15,7 @@ pub struct PreparedCacheTelemetry {
     activity: PreparedCacheTable<usize, CacheLayerResidencyStats>,
     report: Vec<CacheLayerResidencyReport>,
     maximum: usize,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 
 /// Empty predecessor buffers retire only after the backend manager unlocks.
@@ -23,7 +23,7 @@ pub struct PreparedCacheTelemetry {
 pub struct RetiredCacheTelemetryStorage {
     _activity: CacheTelemetryRows,
     _report: Vec<CacheLayerResidencyReport>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl PreparedCacheTelemetry {
     /// Complete storage and shared snapshot/installation control frames.
@@ -64,7 +64,7 @@ impl PreparedCacheTelemetry {
         Self::prepare_from(maximum, MetadataSource::Context(context))
     }
     /// Same collector storage worker without constructing a recording Context.
-    pub fn prepare_with_funding(maximum: usize, funding: &WorkspaceMetadataFunding) -> Result<Self, Error> {
+    pub fn prepare_with_funding(maximum: usize, funding: &HostMetadataFunding) -> Result<Self, Error> {
         Self::prepare_from(maximum, MetadataSource::Funding(funding))
     }
     fn prepare_from(maximum: usize, source: MetadataSource<'_>) -> Result<Self, Error> {

@@ -1,7 +1,7 @@
 //! External readouts reuse the completed model source and numerical row worker.
 use super::*;
 use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
@@ -27,10 +27,10 @@ pub(super) fn selected_at(value:MlxTensor,evidence:Option<&PreparedEmbeddedEvide
             size_of::<(MlxTensor,Option<&PreparedEmbeddedEvidence>,ExternalAssistantTensorPlacement,
                 SpeculativeExecutionStreams<'_>)>(),
             size_of::<(MlxTensor,Option<&PreparedEmbeddedEvidence>,SpeculativeExecutionStreams<'_>)>(),
-            Array::descriptor_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            Array::descriptor_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         sources.metadata_funding().reserve_metadata(controls.into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if context.original_external().is_none() {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
@@ -74,7 +74,7 @@ pub(super) fn row(value: &MlxTensor, row: usize, evidence: Option<&PreparedEmbed
                 SpeculativeExecutionStreams<'_>)>(), size_of::<Result<IndependentLogits, Error>>()];
         sources.metadata_funding().reserve_metadata(controls.into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if context.original_external().is_none() || stream != environment.stream() {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));

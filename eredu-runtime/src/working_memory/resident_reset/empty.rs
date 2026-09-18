@@ -51,6 +51,8 @@ impl<'a, S: ResidentTableResetState> PreparedResidentEmptyState<'a, S> {
             size_of::<TryReserveError>(),
             size_of::<HostPreparationAuthority>(),
             size_of::<SharedStateLayout>(),
+            size_of::<S::ResetContext>(),
+            size_of::<&mut S::ResetContext>(),
             size_of::<Option<HostSlotTable<S::Child>>>(),
             6 * size_of::<usize>(),
         ];
@@ -120,6 +122,7 @@ impl<'a, S: ResidentTableResetState> PreparedResidentEmptyState<'a, S> {
         }
         let layers = finish(builder, host)?;
         Ok(S::from_resident_reset(
+            &mut S::ResetContext::default(),
             layout.clone(),
             source.resident_reset_global_start(),
             layers,

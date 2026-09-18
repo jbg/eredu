@@ -7,7 +7,7 @@ use safemlx::{
 };
 struct StreamOwner {
     _source: RetainedCommunicationSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 struct Publication { group:Group, descriptor:eredu_runtime::PartitionOutputPublication, root:usize }
 // The retained architecture selection distinguishes neural TP from a
@@ -34,11 +34,11 @@ struct Body {
     runtime: PreparedInputRuntime,
     source: RetainedCommunicationSource,
     fallback: eredu_nn::Error,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(crate) struct OriginalParallelSource {
     body: Option<Rc<Body>>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Clone for OriginalParallelSource {
     fn clone(&self) -> Self {
@@ -316,7 +316,7 @@ impl OriginalParallelSource {
         &self.body().source
     }
 
-    pub(crate) fn funding(&self) -> &WorkspaceMetadataFunding {
+    pub(crate) fn funding(&self) -> &HostMetadataFunding {
         &self.funding
     }
     pub(crate) fn same_source(&self, other: &Self) -> bool {
@@ -443,10 +443,11 @@ impl OriginalParallelSource {
         &self,
         operations: &[WorkspaceOperation],
     ) -> Result<OriginalParallelInvocation, Error> {
-        self.prepare_invocation_with_boundary(operations,None)
+        self.prepare_invocation_with_boundary(operations,None,None)
     }
     pub(crate) fn prepare_invocation_with_boundary(&self,operations:&[WorkspaceOperation],
-        mechanism:Option<crate::backend::nn::workspace::ResidentExecutionMechanisms>)
+        mechanism:Option<crate::backend::nn::workspace::ResidentExecutionMechanisms>,
+        addressable:Option<&crate::backend::nn::workspace::AddressableSources>)
         ->Result<OriginalParallelInvocation,Error>{
         let body = self.body();
         reserve(
@@ -561,7 +562,7 @@ impl OriginalParallelSource {
             }
         }
         let boundaries=self.prepare_boundary_occurrences(operations,mechanism)?;
-        let expert_regions=self.prepare_expert_occurrences(operations,mechanism)?;
+        let expert_regions=self.prepare_expert_occurrences(operations,mechanism,addressable)?;
         let actual = group
             .try_copy_for_retention()
             .map_err(|_| failure(Cause::Resource, &body.source, &self.funding))?;

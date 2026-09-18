@@ -8,7 +8,7 @@ use super::*;
 use crate::workspace::{
     metadata_funding, validate_workspace_host_assumptions, validate_workspace_output_storage,
     validate_workspace_tensor_declaration, Error, WorkspaceEffectError, WorkspaceHostBound,
-    WorkspaceMechanisms, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceMechanisms, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::{
     alloc::Layout,
@@ -43,7 +43,7 @@ pub(in crate::workspace) enum FactEmissionFailure {
     Capacity { required: usize, available: usize },
     Overflow,
     Retained(Error),
-    Funding(WorkspaceMetadataFundingError),
+    Funding(HostMetadataFundingError),
 }
 
 #[derive(Debug)]
@@ -233,7 +233,7 @@ pub(in crate::workspace) trait FiniteWorkspaceFacts: std::fmt::Debug {
         &self,
         operation: WorkspaceOperationView<'_>,
         remaining_bytes: &mut usize,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
     ) -> Result<EmittedWorkspaceFacts, FactEmissionFailure>;
 }
 
@@ -250,12 +250,12 @@ where
         &self,
         operation: WorkspaceOperationView<'_>,
         remaining_bytes: &mut usize,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
     ) -> Result<EmittedWorkspaceFacts, FactEmissionFailure> {
         let controls = control_bytes::<M::Error>().ok_or(FactEmissionFailure::Overflow)?;
         debit(remaining_bytes, controls, funding)?;
-        // A fixed mechanism error may now be erased without an uncharged
-        // allocation. Never use backend_source: its legacy path formats String.
+        // The exact canonical source owner is paid before mechanism dispatch;
+        // error erasure does not format or copy its diagnostic.
         self.with_prepared_facts(operation, funding, |mechanism| {
             let prepared = WorkspaceFactPreparation::inspect(operation, mechanism)
                 .map_err(retain::<M::Error>)?;
@@ -274,7 +274,7 @@ fn retain<E: std::error::Error + Send + Sync + 'static>(
 fn debit(
     remaining: &mut usize,
     bytes: usize,
-    funding: Option<&WorkspaceMetadataFunding>,
+    funding: Option<&HostMetadataFunding>,
 ) -> Result<(), FactEmissionFailure> {
     let next = remaining
         .checked_sub(bytes)
@@ -318,7 +318,7 @@ fn control_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize
         size_of::<Option<WorkspaceHostFacts>>(),
         size_of::<WorkspaceOperationView<'_>>(),
         size_of::<&dyn WorkspaceFactMechanisms<Error = E>>(),
-        size_of::<(&mut usize, Option<&WorkspaceMetadataFunding>)>(),
+        size_of::<(&mut usize, Option<&HostMetadataFunding>)>(),
         size_of::<Result<Result<EmittedWorkspaceFacts, FactEmissionFailure>, E>>(),
         size_of::<WorkspaceEffectDestination<'_>>(),
         size_of::<WorkspaceHostDestination<'_>>(),
@@ -344,7 +344,7 @@ fn control_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize
         size_of::<Result<Vec<u8>, FactPreparationError<E>>>(),
         size_of::<Layout>(),
         size_of::<usize>() * 4,
-        Error::retained_source_control_bytes::<FactPreparationError<E>>()?,
+        Error::retained_source_construction_bytes::<FactPreparationError<E>>()?,
         size_of::<Error>(),
     ];
     parts

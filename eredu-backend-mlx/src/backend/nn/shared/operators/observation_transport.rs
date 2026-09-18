@@ -25,7 +25,7 @@ pub(super) fn source<E: std::error::Error + Send + Sync + 'static>(cause: E) -> 
             cause,
             _custody: custody,
         }),
-        None => ComputeError::backend_source(cause),
+        None => ComputeError::backend_retained_source(cause),
     }
 }
 pub(super) fn callback(cause: ComputeError) -> ComputeError {
@@ -58,9 +58,9 @@ pub(super) type Factory<'a> = eredu_nn::MappedGeneratedTensorFactory<
 
 pub(super) fn control_bytes() -> Option<usize> {
     let controls = [
-        ComputeError::retained_source_control_bytes::<OriginalCause<ComputeError>>()?,
-        ComputeError::retained_source_control_bytes::<OriginalCause<Exception>>()?,
-        ComputeError::retained_source_control_bytes::<
+        ComputeError::retained_source_construction_bytes::<OriginalCause<ComputeError>>()?,
+        ComputeError::retained_source_construction_bytes::<OriginalCause<Exception>>()?,
+        ComputeError::retained_source_construction_bytes::<
             OriginalCause<RetainedInputFailure<Exception>>,
         >()?,
         OriginalScopeObserver::control_bytes()?,
@@ -87,8 +87,8 @@ pub(super) fn control_bytes() -> Option<usize> {
 /// are separate prepared destinations owned by the selected observer directory.
 pub(super) fn grouped_callback_control_bytes() -> Option<usize> {
     let controls = [
-        ComputeError::retained_source_control_bytes::<OriginalCause<ComputeError>>()?,
-        ComputeError::retained_source_control_bytes::<
+        ComputeError::retained_source_construction_bytes::<OriginalCause<ComputeError>>()?,
+        ComputeError::retained_source_construction_bytes::<
             OriginalCause<RetainedInputFailure<Exception>>,
         >()?,
         OriginalScopeObserver::control_bytes()?,

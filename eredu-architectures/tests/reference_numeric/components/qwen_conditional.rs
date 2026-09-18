@@ -117,11 +117,11 @@ fn trial(
     .unwrap();
     struct Populate<'a>(&'a BTreeMap<String, NumericTensor>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let source = self.0.get(metadata.id.as_str()).unwrap_or_else(|| {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let source = self.0.get(metadata.id().as_str()).unwrap_or_else(|| {
                 panic!(
                     "missing conditional reference parameter {}",
-                    metadata.id.as_str()
+                    metadata.id().as_str()
                 )
             });
             assert!(
@@ -129,7 +129,7 @@ fn trial(
                     || (value.shape.len() == 2
                         && source.shape == [value.shape[0], 1, value.shape[1]]),
                 "conditional reference geometry {}: {:?} vs {:?}",
-                metadata.id.as_str(),
+                metadata.id().as_str(),
                 source.shape,
                 value.shape
             );
@@ -147,7 +147,7 @@ fn trial(
         >>::static_modules_mut(&mut model)
         .visit_parameters_mut(&mut Populate(parameters));
     }
-    let state_layout = model.state_layout().unwrap();
+    let state_layout = model.state_layout(None).unwrap();
     let units = [(0, 0), (0, 1), (1, 0), (1, 1)]
         .into_iter()
         .map(|(group, index)| {
@@ -289,7 +289,7 @@ fn conditional_qwen_components_reconstruct_media_and_deepstack_writes_serial_and
         let model =
             qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed.clone(), &context)
                 .unwrap();
-        let parameters = model.parameter_description(&context).unwrap();
+        let parameters = model.parameter_description(&context).unwrap().into_owned();
         let groups = parameters
             .groups()
             .iter()

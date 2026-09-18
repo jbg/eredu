@@ -1,7 +1,7 @@
 //! Exact original tokenizer operations through the shared ordinary byte workers.
 use super::{GenerationRuntimePlan, OriginalGrammarVocabulary};
 use eredu_core::{HostPreparationAuthority, SpeculativeBuffer, SpeculativeBufferAllocationError};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{
     OriginalEncodedTokenIds, OriginalTokenTrieSource, OriginalTokenizerEncodeError,
 };
@@ -43,7 +43,7 @@ enum Cause {
     #[error("grammar tokenization geometry overflow")]
     Overflow,
     #[error("{0}")]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Encoding(#[from] OriginalTokenizerEncodeError),
     #[error(transparent)]
@@ -56,7 +56,7 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarTokenIds {
     fixed: usize,
     source: OriginalTokenTrieSource,
     recipe: super::super::recipe::ConstraintRecipe,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalGrammarTokenIds {
     pub(in crate::runtime::chat::constraints) fn ids(&self) -> &[u32] {
@@ -85,7 +85,7 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarTokenizationErro
     chunks: Option<SpeculativeBuffer<Chunk>>,
     source: OriginalTokenTrieSource,
     recipe: super::super::recipe::ConstraintRecipe,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 fn visit_plain<'a, F: FnMut(Leaf<'a>) -> Result<(), Cause>>(
     trie: &TokTrie,
@@ -159,7 +159,7 @@ impl OriginalGrammarVocabulary {
         &self,
         bytes: &[u8],
         mode: GrammarTokenizationMode,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<OriginalGrammarTokenIds, OriginalGrammarTokenizationError> {
         self.tokenize_with_funding(bytes, mode, funding, |source, text| {
             source.encode_tokenizer_ids(text)
@@ -183,7 +183,7 @@ impl OriginalGrammarVocabulary {
         &self,
         bytes: &[u8],
         mode: GrammarTokenizationMode,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         mut encode: F,
     ) -> Result<OriginalGrammarTokenIds, OriginalGrammarTokenizationError>
     where
@@ -198,8 +198,14 @@ impl OriginalGrammarVocabulary {
             let parts = [
                 size_of::<Self>(),
                 size_of::<&Self>(),
-                size_of::<&WorkspaceMetadataFunding>(),
-                size_of::<(&Self, &[u8], GrammarTokenizationMode, &WorkspaceMetadataFunding, F)>(),
+                size_of::<&HostMetadataFunding>(),
+                size_of::<(
+                    &Self,
+                    &[u8],
+                    GrammarTokenizationMode,
+                    &HostMetadataFunding,
+                    F,
+                )>(),
                 size_of::<Result<OriginalGrammarTokenIds, OriginalGrammarTokenizationError>>(),
                 size_of::<OriginalGrammarTokenIds>(),
                 size_of::<OriginalGrammarTokenizationError>(),
@@ -209,14 +215,14 @@ impl OriginalGrammarVocabulary {
                 size_of::<Option<SpeculativeBuffer<u32>>>(),
                 size_of::<Result<OriginalGrammarTokenIds, OriginalGrammarTokenizationError>>(),
                 size_of::<Result<OriginalEncodedTokenIds, OriginalTokenizerEncodeError>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<Result<(), eredu_core::GenerationError>>(),
                 size_of::<Result<usize, Cause>>(),
                 size_of::<F>(),
                 size_of::<(&OriginalTokenTrieSource, &str)>(),
                 size_of::<std::slice::Iter<'_, Chunk>>(),
                 size_of::<std::slice::Iter<'_, u32>>(),
-                HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+                HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                     .ok_or(Cause::Overflow)?,
             ];
             funding.reserve_metadata(

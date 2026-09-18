@@ -277,7 +277,7 @@ fn malformed_or_changed_recipe_fails_without_escaping_preparation_authority() {
             .contains("failed to restore frozen tokenizer")
     );
     let mut changed: serde_json::Value = serde_json::from_slice(&frozen.bytes).unwrap();
-    changed["version"] = serde_json::json!(3);
+    changed["version"] = serde_json::json!(RECIPE_VERSION + 1);
     assert!(
         restore(&serde_json::to_vec(&changed).unwrap(), &[1], &authority)
             .err()
@@ -305,44 +305,50 @@ fn malformed_or_changed_recipe_fails_without_escaping_preparation_authority() {
 
 #[test]
 fn cache_policy_is_selected_before_nested_recipe_model_in_any_key_order() {
-    use tokenizers::ModelCachePolicy::{Legacy, NoModelCaches};
+    use tokenizers::ModelCachePolicy;
     let legacy = byte_level();
     let json = serde_json::to_vec(&legacy).unwrap();
-    let raw = Tokenizer::from_bytes_with_cache_policy(&json, NoModelCaches).unwrap();
+    let raw = Tokenizer::from_bytes_with_cache_policy(&json, ModelCachePolicy::disabled()).unwrap();
     let authority = HostPreparationAuthority::unmanaged();
     let source = ChatTokenizer::from_tokenizer(raw);
     let frozen = freeze(&source, &[1], &authority).unwrap();
     let alias = source.snapshot();
     drop(source);
-    assert_eq!(alias.model_cache_policy(), NoModelCaches);
+    assert_eq!(alias.model_cache_policy(), ModelCachePolicy::disabled());
     for bytes in [
         frozen.bytes.clone(),
-        format!(r#"{{"tokenizer":{},"encode_special_tokens":false,"version":2,"cache_policy":"no_model_caches"}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
-        format!(r#"{{"cache_policy":"no_model_caches","version":2,"encode_special_tokens":false,"tokenizer":{}}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
+        format!(r#"{{"tokenizer":{},"encode_special_tokens":false,"version":3,"cache_policy":{{"capacity":0}}}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
+        format!(r#"{{"cache_policy":{{"capacity":0}},"version":3,"encode_special_tokens":false,"tokenizer":{}}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
     ] {
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded.model_cache_policy(), NoModelCaches);
-        assert_eq!(decoded.clone().model_cache_policy(), NoModelCaches);
+        assert_eq!(decoded.model_cache_policy(), ModelCachePolicy::disabled());
+        assert_eq!(decoded.clone().model_cache_policy(), ModelCachePolicy::disabled());
         let env = restore(&bytes, &[1], &authority).unwrap();
         assert_eq!(env.tokenize_bytes(b"ab"), vec![2]);
         assert_same_environment(&frozen.environment, &env);
     }
-    let mut v1: serde_json::Value = serde_json::from_slice(&frozen.bytes).unwrap();
-    v1["version"] = serde_json::json!(1);
-    v1.as_object_mut().unwrap().remove("cache_policy");
-    let old = serde_json::to_vec(&v1).unwrap();
-    assert_eq!(decode(&old).unwrap().model_cache_policy(), Legacy);
-    assert_eq!(
-        restore(&old, &[1], &authority)
-            .unwrap()
-            .tokenize_bytes(b"ab"),
-        vec![2]
+    // Superseded recipes are not reconstructed through a compatibility policy.
+    for version in [1, 2] {
+        let mut old: serde_json::Value = serde_json::from_slice(&frozen.bytes).unwrap();
+        old["version"] = serde_json::json!(version);
+        assert!(
+            decode(&serde_json::to_vec(&old).unwrap())
+                .unwrap_err()
+                .contains("unsupported frozen tokenizer recipe version")
+        );
+    }
+    let mut missing: serde_json::Value = serde_json::from_slice(&frozen.bytes).unwrap();
+    missing.as_object_mut().unwrap().remove("cache_policy");
+    assert!(
+        decode(&serde_json::to_vec(&missing).unwrap())
+            .unwrap_err()
+            .contains("cache_policy")
     );
 }
 
 #[test]
 fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram() {
-    use tokenizers::ModelCachePolicy::NoModelCaches;
+    use tokenizers::ModelCachePolicy;
     let raw = Tokenizer::new(
         tokenizers::models::unigram::Unigram::from_with_cache_policy(
             vec![
@@ -353,7 +359,7 @@ fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram()
             ],
             Some(0),
             false,
-            NoModelCaches,
+            ModelCachePolicy::disabled(),
         )
         .unwrap(),
     );
@@ -363,7 +369,7 @@ fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram()
     let authority = HostPreparationAuthority::unmanaged();
     let frozen = freeze(&source, &[1], &authority).unwrap();
     let decoded = decode(&frozen.bytes).unwrap();
-    assert_eq!(decoded.model_cache_policy(), NoModelCaches);
+    assert_eq!(decoded.model_cache_policy(), ModelCachePolicy::disabled());
     assert_eq!(decoded.encode("ab", false).unwrap().get_ids(), &[3]);
     assert_eq!(
         restore(&frozen.bytes, &[1], &authority)
@@ -372,16 +378,17 @@ fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram()
         vec![3]
     );
     for bad in [
-        r#"{"tokenizer":{"model":{"type":"BPE"}},"version":2,"encode_special_tokens":false}"#,
-        r#"{"tokenizer":{"model":{"type":"BPE"}},"version":1,"cache_policy":"no_model_caches","encode_special_tokens":false}"#,
-        r#"{"version":2,"cache_policy":"no_model_caches","tokenizer":{},"cache_policy":"legacy","encode_special_tokens":false}"#,
-        r#"{"version":2,"cache_policy":"unknown","tokenizer":{},"encode_special_tokens":false}"#,
+        r#"{"tokenizer":{"model":{"type":"BPE"}},"version":3,"encode_special_tokens":false}"#,
+        r#"{"tokenizer":{},"version":3,"cache_policy":{},"encode_special_tokens":false}"#,
+        r#"{"version":3,"cache_policy":{"capacity":0},"tokenizer":{},"cache_policy":{"capacity":12},"encode_special_tokens":false}"#,
+        r#"{"version":3,"cache_policy":"unknown","tokenizer":{},"encode_special_tokens":false}"#,
     ] {
         let error = decode(bad.as_bytes()).unwrap_err();
         assert!(
             error.contains("cache_policy")
                 || error.contains("cache policy")
-                || error.contains("unknown variant"),
+                || error.contains("capacity")
+                || error.contains("expected struct ModelCachePolicy"),
             "{error}"
         );
         assert!(!error.contains("Missing vocab"));

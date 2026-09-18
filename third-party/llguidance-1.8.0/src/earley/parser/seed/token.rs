@@ -1,4 +1,5 @@
 //! Paid token history using the ordinary token/numeric/EOS worker.
+use crate::earley::PreparedFunding as _;
 use super::super::{advance, speculation, token, LexemeIdx, LexemeSet, LexerResult, PreLexeme};
 use super::{advance::Context, reserve, Cause, PreparedEarleySeed, PreparedEarleySeedError};
 use crate::{api::ParserLimits, earley::PreparedLexer};
@@ -49,7 +50,7 @@ impl fmt::Display for TokenApplicationFailure {
 }
 impl std::error::Error for TokenApplicationFailure {}
 
-impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Context<'_, F> {
     pub(super) fn speculative<T>(
         &mut self,
         run: impl FnOnce(&mut Self) -> Result<T, Cause<E>>,
@@ -72,7 +73,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
         result
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> token::Context for Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> token::Context for Context<'_, F> {
     fn rows(&self) -> usize {
         self.current().row_idx as usize + 1
     }
@@ -180,7 +181,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> token::Context for Context<'_, F> {
         }
         let plan = TokenMaskConstructionPlan::zeroed(self.owner.grammar.lexer_spec().lexemes.len())
             .map_err(Cause::MaskSource)?;
-        (self.funding)(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+        self.funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
         self.owner.initial_selection = Some(LexemeSet::from_owned_vob(
             plan.compile().map_err(Cause::Mask)?,
         ));
@@ -268,7 +269,7 @@ impl PreparedEarleySeed {
         run: G,
     ) -> Result<(Self, T), PreparedEarleySeedError<E>>
     where
-        F: Fn(usize) -> Result<(), E>,
+        F: crate::earley::PreparedFunding<Error = E>,
         G: FnOnce(&mut Context<'_, F>) -> Result<T, Cause<E>>,
     {
         let result = (|| {
@@ -307,7 +308,7 @@ impl PreparedEarleySeed {
                 size_of::<toktrie::SimpleVobIter<'_>>(),
                 size_of::<super::super::GrammarStackPtr>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -326,11 +327,12 @@ impl PreparedEarleySeed {
             u32::try_from(self.token_idx.checked_add(1).ok_or(Cause::Overflow)?)
                 .map_err(|_| Cause::Overflow)?;
             self.max_items_in_row = limits.max_items_in_row;
+            let scope = derivre::prepared_funding::Scope::new(funding).map_err(Cause::frame)?;
             let result = run(&mut Context {
                 owner: &mut self,
                 lexer,
                 trie,
-                funding,
+                funding: &scope,
             });
             if advance_token {
                 self.token_idx += 1;
@@ -347,7 +349,7 @@ impl PreparedEarleySeed {
     }
     /// Applies an actual token through the shared numeric/forced-byte/hidden-stop
     /// and max-token worker. Failures retain partial token and parser history.
-    pub fn apply_token<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn apply_token<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -361,7 +363,7 @@ impl PreparedEarleySeed {
         })
     }
     /// Consumes EOS through the same pending-lexeme flush and terminal rules.
-    pub fn scan_eos<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn scan_eos<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -374,7 +376,7 @@ impl PreparedEarleySeed {
     }
     /// Checks actual completed-start-rule acceptance without committing the
     /// speculative flush or changing captures/history.
-    pub fn is_accepting<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn is_accepting<F: crate::earley::PreparedFunding<Error = E>, E>(
         self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,

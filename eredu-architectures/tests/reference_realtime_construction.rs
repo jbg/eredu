@@ -641,6 +641,7 @@ struct ConstructionVisitor {
 #[derive(Clone)]
 struct IndependentBoundModule {
     weight: ReferenceTensor,
+    metadata: ParameterMetadata,
 }
 
 fn independent_parameter_metadata() -> ParameterMetadata {
@@ -656,18 +657,22 @@ fn independent_parameter_metadata() -> ParameterMetadata {
 }
 
 impl Parameterized<ReferenceTensor> for IndependentBoundModule {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, ReferenceTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
     {
-        visitor.visit(independent_parameter_metadata(), &self.weight);
-    }
+ let mut __source_result = Ok(());
+
+        visitor.parameter(self.metadata.as_view(), &self.weight);
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
     {
-        visitor.visit_mut(independent_parameter_metadata(), &mut self.weight);
+        visitor.visit_mut(self.metadata.as_view(), &mut self.weight);
     }
 
     fn set_trainable(&mut self, _trainable: bool) {}
@@ -2278,6 +2283,7 @@ impl BoundedIndependentAdapter {
         assert_eq!(reference_trace().parameter_materializations, 1);
         self.counters.binding.fetch_add(1, Ordering::SeqCst);
         let mut bound_module = IndependentBoundModule {
+            metadata: independent_parameter_metadata(),
             weight: ReferenceTensor(vec![1]),
         };
         bind_materialized_unit::<ReferenceBackend, _>(&mut bound_module, materialized).unwrap();

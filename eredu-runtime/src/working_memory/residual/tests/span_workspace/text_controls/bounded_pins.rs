@@ -29,7 +29,7 @@ fn typed_rows_add_s_once_before_original_exact_admission_and_extract_once() {
         ))
     ));
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (_, r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (mut owner, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let held = account(&pool, &r);

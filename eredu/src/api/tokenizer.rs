@@ -78,7 +78,7 @@ pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {
-    load_tokenizer_for_kind_with_cache_policy(kind, model_dir, tokenizers::ModelCachePolicy::Legacy)
+    load_tokenizer_for_kind_with_cache_policy(kind, model_dir, tokenizers::ModelCachePolicy::default())
 }
 
 pub(super) fn load_tokenizer_for_kind_with_cache_policy(
@@ -165,7 +165,7 @@ pub(crate) fn gguf_sidecar_dir(path: &Path) -> &Path {
 }
 
 pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, TextMetadataError> {
-    load_gguf_tokenizer_with_cache_policy(gguf_file, tokenizers::ModelCachePolicy::Legacy)
+    load_gguf_tokenizer_with_cache_policy(gguf_file, tokenizers::ModelCachePolicy::default())
 }
 
 fn load_gguf_tokenizer_with_cache_policy(
@@ -194,7 +194,7 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
     load_gguf_tokenizer_from_metadata_with_cache_policy(
         gguf_file,
         metadata,
-        tokenizers::ModelCachePolicy::Legacy,
+        tokenizers::ModelCachePolicy::default(),
     )
 }
 
@@ -373,11 +373,11 @@ pub(crate) fn compile_original_text_tokenizer_file<
     file: std::fs::File,
 ) -> Result<
     eredu_runtime::working_memory::OriginalTokenizer,
-    eredu_runtime::working_memory::OriginalTextSourceError,
+    eredu_runtime::working_memory::OriginalTokenizerSourceError,
 > {
-    B::compile_original_tokenizer_file_for_generation(
+    B::compile_original_tokenizer_source_for_generation(
         runtime,
-        prepare_original_tokenizer_file_raw(file)?,
+        eredu_runtime::working_memory::OriginalTokenizerInput::File(prepare_original_tokenizer_file_raw(file)?),
     )
 }
 fn prepare_original_tokenizer_file(

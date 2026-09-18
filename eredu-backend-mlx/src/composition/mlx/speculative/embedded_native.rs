@@ -13,7 +13,7 @@ use crate::backend::{
     submission_recovery::{PreparedRecovery, Retention, Status},
     OriginalCopyEnvironment,
 };
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
     OriginalEmbeddedSpeculativeRole, OriginalSpeculativeBudgetCustody,
 };
@@ -282,7 +282,7 @@ impl EmbeddedNativeLayout {
         roots_runtime: &PrefillRootsRuntime,
         role: R,
         payload: Q,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         work: &mut W,
         handlers: (F, G, H),
     ) -> Result<T, Error>
@@ -379,7 +379,7 @@ impl EmbeddedNativeLayout {
         });
         recovery.seal();
         let output = result?;
-        let status = recovery.finish();
+        let status = recovery.finish().map_err(|cause| failure(cause.into_error().into(), &role))?;
         if !status.settled || status.failed || status.blocked {
             return Err(failure(EmbeddedNativeCause::Completion, &role));
         }
@@ -399,7 +399,7 @@ struct Retained<Q: 'static> {
     roots: OriginalSpeculativeRoots,
     domains: OriginalSpeculativeDomains,
     payload: Q,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     custody: OriginalSpeculativeBudgetCustody,
 }
 impl<Q: 'static> Retention for Retained<Q> {

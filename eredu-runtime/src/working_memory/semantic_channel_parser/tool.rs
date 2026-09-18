@@ -5,8 +5,15 @@ use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ToolCause {
+    #[error(transparent)] Tagged(channels::tagged::TaggedCallError<BackendFailure>),
+    #[error(transparent)] TaggedSyntax(channels::tagged::TaggedError),
+    #[error(transparent)] JsonAllocation(serde_json::allocation::AllocationError),
+    #[error(transparent)] Text(eredu_core::SemanticTextAllocationError),
+    #[error(transparent)] Schema(BackendFailure),
+    #[error("incomplete tagged-parameter tool call")] Incomplete,
+    #[error("original tool call event destination is full")] Capacity,
     #[error(transparent)]
-    Funding(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    Funding(#[from] eredu_nn::workspace::HostMetadataFundingError),
     #[error(transparent)]
     Call(#[from] tool_call::Failure),
     #[error(transparent)]
@@ -23,8 +30,10 @@ struct ToolFailure {
     cause: ToolCause,
     pending: SpeculativeBuffer<u8>,
     call: Option<Call>,
+    tagged: Option<TaggedCall>,
+    tagged_authority: HostPreparationAuthority,
     source: OriginalSemanticChannelSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Display for ToolFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,7 +65,7 @@ pub(super) fn control_bytes() -> Option<usize> {
             &dyn OriginalToolValidation,
             &str,
             &str,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         )>(),
         size_of::<Result<channels::JsonFrameStep, channels::JsonFrameFailure>>(),
         size_of::<(&mut OriginalSemanticChannelParser, JsonFrame)>(),
@@ -68,7 +77,7 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<Result<&str, std::str::Utf8Error>>(),
         size_of::<SharedBackendFailure>(),
         size_of::<Option<usize>>(),
-        size_of::<Result<(), eredu_nn::workspace::WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), eredu_nn::workspace::HostMetadataFundingError>>(),
     ];
     parts
         .into_iter()
@@ -79,8 +88,10 @@ pub(super) fn retained(
     cause: ToolCause,
     pending: SpeculativeBuffer<u8>,
     call: Option<Call>,
+    tagged: Option<TaggedCall>,
+    tagged_authority: HostPreparationAuthority,
     source: &OriginalSemanticChannelSource,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Cause {
     Cause::Tool(SharedBackendFailure::new(
         BackendFailureKind::InvalidInput,
@@ -88,22 +99,26 @@ pub(super) fn retained(
             cause,
             pending,
             call,
+            tagged,
+            tagged_authority,
             source: source.clone(),
             funding: funding.clone(),
         },
     ))
 }
 impl OriginalSemanticChannelParser {
-    fn consume_tool_bytes(&mut self, count: usize) {
+    pub(super) fn consume_tool_bytes(&mut self, count: usize) {
         self.pending.copy_within(count..self.used, 0);
         self.used -= count;
     }
-    fn tool_failure(&mut self, cause: ToolCause) -> Cause {
+    pub(super) fn tool_failure(&mut self, cause: ToolCause) -> Cause {
         self.used = 0;
         retained(
             cause,
             std::mem::take(&mut self.pending),
             self.call.take(),
+            self.tagged.take(),
+            self.tagged_authority.clone(),
             &self.source,
             &self.funding,
         )

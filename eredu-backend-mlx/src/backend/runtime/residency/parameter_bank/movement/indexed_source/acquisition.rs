@@ -36,7 +36,7 @@ impl OriginalIndexedChunkSource {
             OriginalScopeObserver::control_bytes().ok_or_else(||self.failure(Cause::Overflow))?,
             crate::backend::runtime::cache::value_completion_control_bytes(1).ok_or_else(||self.failure(Cause::Overflow))?,
             safemlx::OperationEvent::traversal_leaf_control_bytes().ok_or_else(||self.failure(Cause::Overflow))?,
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?,
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?,
             Layout::array::<ParameterBankKey>(entries.len()).map_err(|_|self.failure(Cause::Overflow))?.size(),
             Layout::array::<u64>(entries.len()).map_err(|_|self.failure(Cause::Overflow))?.size(),
             Layout::array::<(OffloadUnitId,u64)>(entries.len()).map_err(|_|self.failure(Cause::Overflow))?.size(),

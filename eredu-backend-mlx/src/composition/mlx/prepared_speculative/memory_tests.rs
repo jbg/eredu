@@ -136,10 +136,10 @@ impl SpeculativeTokenFilterController for WatchConstraint {
 }
 
 struct UnenteredSemantic;
-impl SpeculativeSemanticState for UnenteredSemantic {
-    fn fork_box(
+impl SemanticState for UnenteredSemantic {
+    fn fork_owned(
         &self,
-    ) -> Result<Box<dyn SpeculativeSemanticState>, eredu_core::SpeculativeOutputError> {
+    ) -> Result<eredu_core::SemanticStateOwner, eredu_core::SpeculativeOutputError> {
         panic!("semantic factory entered");
     }
     fn push_token(&mut self, _: u32) -> Result<bool, eredu_core::SpeculativeOutputError> {

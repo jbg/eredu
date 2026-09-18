@@ -7,7 +7,7 @@ enum ReceiveCause {
     Source,
     #[error(transparent)] Destination(#[from] PartitionFragmentDestinationError),
     #[error(transparent)] Decode(#[from] PartitionCaptureTensorDecodeError),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Memory(#[from] WorkingMemoryError),
     #[error(transparent)] Plan(#[from] PlanError),
     #[error(transparent)] Json(#[from] serde_json::Error),
@@ -19,7 +19,7 @@ enum ReceiveCause {
 #[error("contiguous capture receipt: {cause}")]
 pub(crate) struct PartitionFragmentReceiveError {
     #[source] cause:ReceiveCause,
-    _source:SharedCapturePlan,_custody:CaptureTensorCustody,_metadata:WorkspaceMetadataFunding,
+    _source:SharedCapturePlan,_custody:CaptureTensorCustody,_metadata:HostMetadataFunding,
 }
 impl PreparedPartitionFragmentDestinations {
     /// Decode only a real remote producer from the enclosing unique-rank exchange.
@@ -27,11 +27,11 @@ impl PreparedPartitionFragmentDestinations {
     /// the enclosing retained per-rank source supplies its actual optional dtype;
     /// no two-byte/F32 inference or dummy native fragment is made here.
     pub(crate) fn decode_contiguous_producer(&mut self,receipt:&PartitionCaptureReceiptPlan,producer:usize,
-        bytes:&[u8],empty_dtype:Option<&TensorDtype>,funding:&WorkspaceMetadataFunding)
+        bytes:&[u8],empty_dtype:Option<&TensorDtype>,funding:&HostMetadataFunding)
         ->Result<(),PartitionFragmentReceiveError> {
         let source=self.source.clone();let custody=self.custody.share_scheduled();
         let error=|cause|PartitionFragmentReceiveError{cause,_source:source.clone(),_custody:custody.share_scheduled(),_metadata:funding.clone()};
-        let parts=[size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,&[u8],Option<&TensorDtype>,&WorkspaceMetadataFunding)>(),
+        let parts=[size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,&[u8],Option<&TensorDtype>,&HostMetadataFunding)>(),
             size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>(),size_of::<PartitionCaptureTensorReceipt<'_>>(),
             size_of::<PartitionFragmentDestination<'_,'_>>(),size_of::<PartitionFragmentValue>(),
             size_of::<Option<(TensorDtype,CaptureUsage,CaptureUsage)>>(),size_of::<(TensorDtype,CaptureUsage,CaptureUsage)>(),
@@ -55,7 +55,10 @@ impl PreparedPartitionFragmentDestinations {
             let required=plan.requirements::<TensorReader<'_,'_,'_>>().map_err(|e|error(e.into()))?;
             funding.reserve_metadata(required.required_bytes()).map_err(|e|error(e.into()))?;
             let mut reader=TensorReader::new_empty(receipt.context(),receipt.identity(),producer,source.admission(),receipt.combination(),empty_dtype.cloned());
-            plan.parse(&mut reader).map_err(|e|error(e.into()))?;
+            let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|e|error(e.into()))?;
+            let parsed=plan.parse(&mut reader,&allocation);
+            if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+            parsed.map_err(|e|error(e.into()))?;
             if !reader.complete(){return Err(error(ReceiveCause::Source));}
             return Ok(());
         }
@@ -82,7 +85,7 @@ mod routed;
 pub(in crate::working_memory::capture_run::claims::partition) use routed::{RoutedReceiver,RoutedReceiveCause};
 impl PreparedPartitionFragmentDestinations {
     fn decode_routed_producer(&mut self,receipt:&PartitionCaptureReceiptPlan,producer:usize,bytes:&[u8],
-        dtype:Option<&TensorDtype>,funding:&WorkspaceMetadataFunding)->Result<(),PartitionFragmentReceiveError> {
+        dtype:Option<&TensorDtype>,funding:&HostMetadataFunding)->Result<(),PartitionFragmentReceiveError> {
         let source=self.source.clone();let custody=self.custody.share_scheduled();
         let error=|cause|PartitionFragmentReceiveError{cause,_source:source.clone(),_custody:custody.share_scheduled(),_metadata:funding.clone()};
         let parts=[RoutedReceiver::control_bytes().ok_or_else(||error(ReceiveCause::Source))?,
@@ -90,7 +93,7 @@ impl PreparedPartitionFragmentDestinations {
             size_of::<RoutedReceiver<'_>>(),size_of::<TensorReader<'_,'_,'_>>(),size_of::<Plan<'_>>(),
             size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>(),size_of::<PartitionFragmentReceiveError>(),
             size_of::<Result<(),PartitionFragmentReceiveError>>(),
-            size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,&[u8],Option<&TensorDtype>,&WorkspaceMetadataFunding)>()];
+            size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,&[u8],Option<&TensorDtype>,&HostMetadataFunding)>()];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
             .ok_or_else(||error(ReceiveCause::Source))?).map_err(|e|error(e.into()))?;
         let plan=Plan::prepare(bytes).map_err(|e|error(e.into()))?;
@@ -98,7 +101,10 @@ impl PreparedPartitionFragmentDestinations {
             .map_err(|e|error(e.into()))?;
         let mut destination=RoutedReceiver::new(self,receipt,producer,dtype).map_err(|e|error(e.into()))?;
         let mut reader=TensorReader::new_routed(&mut destination,receipt,producer,source.admission(),dtype.cloned());
-        let parsed=plan.parse(&mut reader);let complete=reader.complete();drop(reader);
+        let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|e|error(e.into()))?;
+        let parsed=plan.parse(&mut reader,&allocation);
+        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+        let complete=reader.complete();drop(reader);
         if let Some(cause)=destination.take_error(){return Err(error(cause.into()));}
         parsed.map_err(|e|error(e.into()))?;
         if !complete{return Err(error(ReceiveCause::Source));}Ok(())

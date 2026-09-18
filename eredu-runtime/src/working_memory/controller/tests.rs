@@ -641,7 +641,7 @@ fn retained_original_controller_accepts_empty_inventory_without_adopting_shared_
     let mut controller = Controller::new(vec![], 0);
     let workspace = controller.inference_workspace(2).unwrap();
     let contract =
-        ControllerStorageContract::inspect_original_retained(&controller, workspace, &pool, 2)
+        ControllerStorageContract::inspect_original_retained(&controller, workspace, &pool, &InferenceExecutionIdentity::default(), 2)
             .unwrap();
     assert!(!contract.has_original_domain());
     contract.validate(&controller).unwrap();
@@ -653,6 +653,7 @@ fn retained_original_controller_accepts_empty_inventory_without_adopting_shared_
             &controller,
             controller.inference_workspace(2).unwrap(),
             &pool,
+            &InferenceExecutionIdentity::default(),
             2,
         )
         .is_err()
@@ -665,6 +666,7 @@ fn retained_original_controller_accepts_empty_inventory_without_adopting_shared_
             &controller,
             controller.inference_workspace(2).unwrap(),
             &pool,
+            &InferenceExecutionIdentity::default(),
             2,
         )
         .is_err()

@@ -19,7 +19,7 @@ fn competing_planning_producers_reserve_before_allocation_and_keep_last_owner_ch
     let request = usize::try_from((capacity - before) / 2 + 1).unwrap();
     let start = Arc::new(Barrier::new(3));
     let produced = Arc::new(AtomicUsize::new(0));
-    let spawn = |owner: WorkspaceMetadataFunding| {
+    let spawn = |owner: HostMetadataFunding| {
         let start = start.clone();
         let produced = produced.clone();
         std::thread::spawn(move || {
@@ -44,7 +44,7 @@ fn competing_planning_producers_reserve_before_allocation_and_keep_last_owner_ch
             Ok(bytes) => assert!(bytes.iter().all(|byte| *byte == 127)),
             Err(error) => assert!(matches!(
                 error,
-                WorkspaceMetadataFundingError::Capacity { required, available }
+                HostMetadataFundingError::Capacity { required, available }
                     if *required == request as u64 && *available < *required
             )),
         }

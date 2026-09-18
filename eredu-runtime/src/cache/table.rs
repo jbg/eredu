@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, mem::size_of, ops::Index};
 
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 
 /// Two borrowed access paths to the same counted metadata helpers. This adds
@@ -11,7 +11,7 @@ use eredu_nn::{
 #[derive(Clone, Copy)]
 pub(super) enum MetadataSource<'a> {
     Context(&'a WorkspaceContext),
-    Funding(&'a WorkspaceMetadataFunding),
+    Funding(&'a HostMetadataFunding),
 }
 impl MetadataSource<'_> {
     pub(super) fn charge(self, bytes: usize) -> Result<(), Error> {
@@ -27,7 +27,7 @@ impl MetadataSource<'_> {
             Self::Funding(funding) => funding.metadata_vec(count),
         }
     }
-    pub(super) fn funding(self) -> Option<WorkspaceMetadataFunding> {
+    pub(super) fn funding(self) -> Option<HostMetadataFunding> {
         match self {
             Self::Context(context) => context.metadata_funding(),
             Self::Funding(funding) => Some(funding.clone()),
@@ -53,7 +53,7 @@ pub enum CacheTableCapacityError {
 pub struct PreparedCacheTable<K, V> {
     entries: Vec<(K, V)>,
     maximum: usize,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl<K, V> PreparedCacheTable<K, V> {
     /// Explicit maximum population, independent of allocator overcapacity.
@@ -69,7 +69,7 @@ impl<K, V> PreparedCacheTable<K, V> {
             size_of::<CacheRecordTable<K, V>>(),
             size_of::<Result<Self, Error>>(),
             size_of::<Result<CacheRecordTable<K, V>, Self>>(),
-            size_of::<Option<WorkspaceMetadataFunding>>(),
+            size_of::<Option<HostMetadataFunding>>(),
             size_of::<(K, V)>(),
             size_of::<std::collections::btree_map::IntoIter<K, V>>(),
             size_of::<std::vec::IntoIter<(K, V)>>(),
@@ -90,7 +90,7 @@ impl<K, V> PreparedCacheTable<K, V> {
         Self::prepare_from(maximum, MetadataSource::Context(context))
     }
     /// Same final destination worker against an already retained Host account.
-    pub fn prepare_with_funding(maximum: usize, funding: &WorkspaceMetadataFunding) -> Result<Self, Error> {
+    pub fn prepare_with_funding(maximum: usize, funding: &HostMetadataFunding) -> Result<Self, Error> {
         Self::prepare_from(maximum, MetadataSource::Funding(funding))
     }
     pub(super) fn prepare_from(maximum: usize, source: MetadataSource<'_>) -> Result<Self, Error> {
@@ -117,7 +117,7 @@ impl<K, V> PreparedCacheTable<K, V> {
 pub struct CacheRecordTable<K, V>(Storage<K, V>);
 #[derive(Debug)]
 enum Storage<K, V> {
-    Growing(BTreeMap<K, V>, Option<WorkspaceMetadataFunding>),
+    Growing(BTreeMap<K, V>, Option<HostMetadataFunding>),
     Prepared(PreparedCacheTable<K, V>),
 }
 impl<K, V> Default for CacheRecordTable<K, V> {
@@ -397,3 +397,5 @@ impl<K, V> Clone for CacheRecordTableIter<'_, K, V> {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

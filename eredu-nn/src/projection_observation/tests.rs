@@ -5,24 +5,27 @@ use std::{
 };
 
 #[test]
-fn checked_actual_shapes_preserve_padded_blocks_and_legacy_logical_quota() {
-    for shape in [&[2, 259][..], &[129, 1][..], &[2, 3, 256][..], &[7][..]] {
+fn checked_actual_shapes_price_reconstruction_buffers_and_padded_blocks() {
+    for (shape, creation_bytes) in [
+        (&[2, 259][..], 9288),
+        (&[129, 1][..], 67596),
+        (&[2, 3, 256][..], 24576),
+        (&[7][..], 596),
+    ] {
         let plan = BlockFp8InputReconstructionPlan::new(shape).unwrap();
-        let n = shape.iter().map(|n| *n as u64).product::<u64>();
-        let width = *shape.last().unwrap() as u64;
-        let padded = n / width * width.div_ceil(128) * 128;
         assert_eq!(
             plan.logical_capture_source().unwrap(),
             GeneratedTensorSource {
-                creation_bytes: padded * 4 + n * 12 + 4096,
+                creation_bytes,
                 element_type: Some(TensorElementType::F32),
             }
         );
         plan.validate_operands(&plan.values_shape(), &plan.scales_shape())
             .unwrap();
-        assert!(plan
-            .validate_operands(&[plan.rows(), plan.width() + 1], &plan.scales_shape())
-            .is_err());
+        assert!(
+            plan.validate_operands(&[plan.rows(), plan.width() + 1], &plan.scales_shape())
+                .is_err()
+        );
         assert_eq!(plan.shape().as_ptr(), shape.as_ptr());
     }
     for shape in [&[][..], &[0][..], &[2, -1][..]] {

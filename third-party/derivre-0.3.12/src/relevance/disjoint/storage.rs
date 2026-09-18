@@ -75,7 +75,6 @@ fn fail(cause: Cause) -> Failure {
     }
 }
 fn validate(source: &ExprSet, input: &SymRes) -> Result<(), PreparedExprError> {
-    source.require_prepared()?;
     if source.alphabet_size == 0
         || source.alphabet_size > 256
         || source.alphabet_words != source.alphabet_size.div_ceil(32)
@@ -133,8 +132,7 @@ impl ExprSet {
         let source = self;
         validate(source, input).map_err(|e| fail(Cause::Source(e)))?;
         let (_, _, encoded) = source
-            .prepared_extents()
-            .map_err(|e| fail(Cause::Source(e)))?;
+            .storage_extents();
         let arguments = encoded
             .checked_sub(1)
             .and_then(|n| n.checked_mul(2))
@@ -296,24 +294,24 @@ mod tests {
     use crate::{AlphabetInfo, ast::ExprEncodingError, raw::HashConsCapacityError};
     #[test]
     fn prepared_disjoint_rows_preserve_overlap_order_and_retained_failure_prefix() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let d = source.mk_byte(b'd');
-        let ab = source.mk_byte_set_or(&[a, b]);
-        let bc = source.mk_byte_set_or(&[b, c]);
-        let cd = source.mk_byte_set_or(&[c, d]);
-        let v1 = source.mk_byte_literal(b"one");
-        let v2 = source.mk_byte_literal(b"two");
-        let v3 = source.mk_byte_literal(b"three");
-        let literal = source.mk_byte_literal(&[b'q'; 256]);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let d = source.mk_byte(b'd').unwrap();
+        let ab = source.mk_byte_set_or(&[a, b]).unwrap();
+        let bc = source.mk_byte_set_or(&[b, c]).unwrap();
+        let cd = source.mk_byte_set_or(&[c, d]).unwrap();
+        let v1 = source.mk_byte_literal(b"one").unwrap();
+        let v2 = source.mk_byte_literal(b"two").unwrap();
+        let v3 = source.mk_byte_literal(b"three").unwrap();
+        let literal = source.mk_byte_literal(&[b'q'; 256]).unwrap();
         let (_, mut source, _) =
-            AlphabetInfo::from_exprset(source, &[ab, bc, cd, v1, v2, v3, literal]);
-        source.reserve(48);
+            AlphabetInfo::from_exprset(source, &[ab, bc, cd, v1, v2, v3, literal]).unwrap();
+        source.reserve(48).unwrap();
         let input = vec![(ab, v1), (bc, v2), (cd, v3)];
         let mut ordinary = source.clone();
-        let expected = super::super::ordinary(&mut ordinary, &input);
+        let expected = super::super::ordinary(&mut ordinary, &input).unwrap();
         assert_eq!(expected.len(), 4);
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
         drop(source);

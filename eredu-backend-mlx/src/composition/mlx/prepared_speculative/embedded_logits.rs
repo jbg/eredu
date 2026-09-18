@@ -48,7 +48,7 @@ use eredu_architectures::speculative_execution::{
     EmbeddedPredictionLogitBlock, PreparedEmbeddedEvidence,
 };
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{SpeculativeNumericalSource, WorkingMemoryError};
 use std::mem::{size_of, size_of_val};
 fn mismatch() -> Error {
@@ -124,10 +124,10 @@ pub(super) fn retain_block(
     }
     sources.validate_environment(environment)?;
     let completed = source(evidence.as_ref())?;
-    let overflow = || Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+    let overflow = || Error::WorkspacePlanning(HostMetadataFundingError::Overflow);
     let parts = [
         EmbeddedPredictionLogitBlock::<MlxTensor>::retained_control_bytes().ok_or_else(overflow)?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
             .ok_or_else(overflow)?,
         size_of::<Result<EmbeddedPredictionLogitBlock<MlxTensor>, Error>>(),
         size_of::<Option<PreparedEmbeddedEvidence>>(),
@@ -202,7 +202,7 @@ pub(super) fn observe_owned(
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     sources
         .metadata_funding()

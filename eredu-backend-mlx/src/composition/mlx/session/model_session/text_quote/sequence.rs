@@ -458,7 +458,7 @@ fn prepare_controls(
     };
     let controls = match prefill {
         Some(facts) => {
-            #[cfg(test)]
+            #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
             let facts = super::prefill_tests::pointwise_prefill_controls(facts)?;
             controls.with_prefill_scopes(facts).map_err(memory)?
         }
@@ -468,7 +468,7 @@ fn prepare_controls(
         Some(plan) => controls.with_native_storage(plan).map_err(memory)?,
         None => controls,
     };
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
     let controls = super::prefill_tests::host_destination_controls(controls)?;
     Ok(controls)
 }

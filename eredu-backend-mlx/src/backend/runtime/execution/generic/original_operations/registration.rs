@@ -16,6 +16,18 @@ impl std::fmt::Debug for OriginalOperationRegistration {
     }
 }
 impl OriginalOperationRegistration {
+    #[cfg(test)]
+    pub(crate) fn test_scope_counts(&self) -> Result<(usize, usize), Error> {
+        let registry = self.registry()?.ok_or(Error::PrefillScopeUnavailable)?;
+        let scopes = registry.scopes.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?;
+        Ok((registry.registered_scopes.get(), scopes.len()))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_with_scope_loan<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let registry = self.registry().unwrap().unwrap();
+        let _loan = registry.scopes.borrow();
+        operation()
+    }
     pub(crate) fn new(controls: OriginalTextControlGuard) -> Self {
         Self {
             slot: Rc::new(Cell::new((false, None))),
@@ -65,16 +77,6 @@ impl OriginalOperationRegistration {
             Some(None) => Err(Error::PrefillScopeUnavailable),
         }
     }
-    /// Called only after the same neutral role has accepted and configured its
-    /// actual native Scope. No current-observer lookup chooses an ordinary path.
-    pub(crate) fn register(
-        &self,
-        request: &InferenceRequest,
-        scope: &safemlx::SubmissionScope,
-    ) -> Result<(), Error> {
-        self.register_for_retirement(request, scope).map(drop)
-    }
-
     /// Same registration with an exact alias carried to the owning role's finish.
     /// Dropping this handle alone cannot remove a failed or unfinished role.
     pub(crate) fn register_for_retirement(
@@ -85,7 +87,8 @@ impl OriginalOperationRegistration {
         let Some(registry) = self.registry()? else {
             return Ok(None);
         };
-        if !registry.active.get() {
+        registry.check_retirement()?;
+        if !registry.active.get() || !registry.entered.get() {
             return Err(Error::PrefillScopeUnavailable);
         }
         registry
@@ -151,7 +154,10 @@ impl OriginalOperationRegistration {
     /// Loans the exact installed model registry, including resident execution.
     /// Deliberately absent or retired registrations cannot create an owner.
     pub(crate) fn selected_residency_access(&self)->Result<OriginalSelectedResidencyAccess,Error> {
-        let registry=self.registry()?.ok_or_else(identity)?;
+        let registry=self.registry()?.ok_or(Error::OriginalSourceContract {
+            stage: "selected residency operation registry is absent",
+            cause: WorkingMemoryError::IdentityMismatch,
+        })?;
         OriginalSelectedResidencyAccess::registered(registry,OperationControls::Text(self.controls.clone()))
     }
     pub(crate) fn control_bytes() -> Option<u64> {
@@ -192,17 +198,77 @@ pub(crate) struct RegisteredOriginalScope {
     registry: Rc<Registry>,
     _controls: OriginalTextControlGuard,
 }
+#[derive(Debug, thiserror::Error)]
+pub enum RegisteredScopeRetirementCause {
+    #[error(transparent)]
+    Native(#[from] safemlx::error::Exception),
+    #[error("original scope retirement remains {0:?}")]
+    Incomplete(safemlx::SubmissionRetirement),
+    #[error("original scope registration is borrowed during retirement")]
+    Reentrant,
+}
+impl RegisteredScopeRetirementCause {
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Native(cause) => Error::Exception(cause),
+            Self::Incomplete(_) => Error::PrefillScopeUnavailable,
+            Self::Reentrant => Error::PrefillScopeReentrant,
+        }
+    }
+}
+impl From<RegisteredScopeRetirementCause> for Error {
+    fn from(cause: RegisteredScopeRetirementCause) -> Self { cause.into_error() }
+}
+/// Private move-only delivery. The Rc never enters a public error: synchronous
+/// callers take the original typed cause; abandoned delivery retains it in the
+/// fenced bank. Only native/fixed retirement causes enter this owner.
+pub(crate) struct RegisteredScopeRetirementFailure {
+    registration: RegisteredOriginalScope,
+    cause: Option<RegisteredScopeRetirementCause>,
+}
+impl std::fmt::Debug for RegisteredScopeRetirementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredScopeRetirementFailure").field("cause", &self.cause).finish()
+    }
+}
+impl RegisteredScopeRetirementFailure {
+    pub(crate) fn into_cause(mut self) -> RegisteredScopeRetirementCause {
+        self.cause.take().expect("retained retirement cause")
+    }
+    pub(crate) fn into_error(self) -> Error { self.into_cause().into_error() }
+}
+impl Drop for RegisteredScopeRetirementFailure {
+    fn drop(&mut self) {
+        if let Some(cause) = self.cause.take() {
+            let previous = self.registration.registry.retirement_failure.take();
+            self.registration.registry.retirement_failure.set(Some(previous.unwrap_or(cause)));
+        }
+    }
+}
 impl RegisteredOriginalScope {
+    /// The same Recovery node has already destroyed its probe and actual
+    /// payload. Deferred observed payloads keep this owner in their same node.
+    /// A cleanup refusal fences the bank and preserves its first typed cause.
+    pub(crate) fn finish_after_payload(self, status: Option<crate::backend::submission_recovery::Status>) -> Result<(), RegisteredScopeRetirementFailure> {
+        let Some(status) = status else { return Ok(()); };
+        if !status.settled || status.failed || status.blocked { return Ok(()); }
+        if let Err(cause) = self.finish(status) {
+            self.registry.active.set(false);
+            return Err(RegisteredScopeRetirementFailure { registration: self, cause: Some(cause) });
+        }
+        Ok(())
+    }
+
     /// Only the existing owning Recovery finish supplies this terminal result.
     /// Failed, blocked, pending and reentrant paths retain the registry alias.
-    pub(crate) fn finish(self, status: crate::backend::submission_recovery::Status) {
+    pub(crate) fn finish(&self, status: crate::backend::submission_recovery::Status) -> Result<(), RegisteredScopeRetirementCause> {
         if !status.settled || status.failed || status.blocked {
-            return;
+            return Ok(());
         }
+        crate::backend::submission_recovery::retirement::complete(&self.observer)?;
         let removed = {
-            let Ok(mut scopes) = self.registry.scopes.try_borrow_mut() else {
-                return;
-            };
+            let mut scopes = self.registry.scopes.try_borrow_mut()
+                .map_err(|_| RegisteredScopeRetirementCause::Reentrant)?;
             let index = scopes
                 .iter()
                 .position(|scope| scope.same_scope(&self.observer));
@@ -211,6 +277,25 @@ impl RegisteredOriginalScope {
         // The last native Scope can release controls here, outside the loan.
         // The cumulative registration count deliberately remains unchanged.
         drop(removed);
+        Ok(())
+    }
+
+    pub(crate) fn payload_retirement_control_bytes() -> Option<u64> {
+        use crate::backend::submission_recovery::Status;
+        let parts = [
+            size_of::<Self>(), size_of::<Option<Self>>(), size_of::<&Self>(),
+            size_of::<&Registry>(), size_of::<Option<Status>>(), size_of::<Status>(),
+            size_of::<Result<(), Error>>(), size_of::<Error>(), size_of::<Option<Error>>(),
+            size_of::<std::cell::RefMut<'_, Vec<safemlx::OriginalScopeObserver>>>(),
+            size_of::<Option<safemlx::OriginalScopeObserver>>(), size_of::<Option<usize>>(),
+            size_of::<bool>(),
+            size_of::<RegisteredScopeRetirementFailure>(),
+            size_of::<Result<(), RegisteredScopeRetirementFailure>>(),
+            size_of::<RegisteredScopeRetirementCause>(), size_of::<Option<RegisteredScopeRetirementCause>>(),
+            size_of::<Result<(), RegisteredScopeRetirementCause>>(),
+        ];
+        let bytes = parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)?;
+        u64::try_from(bytes).ok()?.checked_add(crate::backend::submission_recovery::retirement::control_bytes()?)
     }
 
     pub(crate) fn control_bytes() -> Option<u64> {
@@ -237,15 +322,21 @@ pub(super) struct Registry {
     pub(super) scope_limit: usize,
     pub(super) registered_scopes: Cell<usize>,
     pub(super) active: Cell<bool>,
+    pub(super) entered: Cell<bool>,
+    pub(super) retirement_failure: Cell<Option<RegisteredScopeRetirementCause>>,
 }
 impl Registry {
+    pub(super) fn check_retirement(&self) -> Result<(), Error> {
+        match self.retirement_failure.take() { Some(cause) => Err(cause.into_error()), None => Ok(()) }
+    }
     pub(super) fn authenticate(&self) -> Result<safemlx::OriginalScopeObserver, Error> {
         let observer = safemlx::OriginalScopeObserver::require_current()?;
         self.authenticate_observer(&observer)?;
         Ok(observer)
     }
     pub(super) fn authenticate_observer(&self,observer:&safemlx::OriginalScopeObserver)->Result<(),Error> {
-        if !self.active.get() {
+        self.check_retirement()?;
+        if !self.active.get() || !self.entered.get() {
             return Err(Error::PrefillScopeUnavailable);
         }
         let belongs = self
@@ -255,7 +346,10 @@ impl Registry {
             .iter()
             .any(|scope| scope.same_scope(&observer));
         if !belongs {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "selected residency current scope is not registered",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         Ok(())
     }

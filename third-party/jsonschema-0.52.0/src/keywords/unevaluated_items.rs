@@ -64,7 +64,26 @@ pub(crate) struct ItemsValidators<F: Json = SerdeJson> {
 // Manual impls: derives would require `F: Clone` / `F: Debug` even though `F` is a marker type.
 impl<F: Json> Clone for ItemsValidators<F> {
     fn clone(&self) -> Self {
-        ItemsValidators {
+        self.try_clone_with_funding(&crate::compilation::Funding::default())
+            .expect("ordinary item validator copy")
+    }
+}
+impl<F: Json> ItemsValidators<F> {
+    fn try_clone_with_funding(
+        &self,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        let branches = |source: &Option<Vec<(SchemaNode<F>, ItemsValidators<F>)>>| {
+            source
+                .as_ref()
+                .map(|rows| {
+                    funding.copy_vec(rows, |(node, children)| {
+                        Ok((node.clone(), children.try_clone_with_funding(funding)?))
+                    })
+                })
+                .transpose()
+        };
+        Ok(Self {
             unevaluated: self.unevaluated.clone(),
             contains: self.contains.clone(),
             ref_: self.ref_.clone(),
@@ -73,11 +92,15 @@ impl<F: Json> Clone for ItemsValidators<F> {
             items_limit: self.items_limit,
             items_all: self.items_all,
             prefix_items: self.prefix_items,
-            conditional: self.conditional.clone(),
-            all_of: self.all_of.clone(),
-            any_of: self.any_of.clone(),
-            one_of: self.one_of.clone(),
-        }
+            conditional: self
+                .conditional
+                .as_ref()
+                .map(|value| funding.boxed(value.try_clone_with_funding(funding)?))
+                .transpose()?,
+            all_of: branches(&self.all_of)?,
+            any_of: branches(&self.any_of)?,
+            one_of: branches(&self.one_of)?,
+        })
     }
 }
 
@@ -97,12 +120,29 @@ struct ConditionalValidators<F: Json = SerdeJson> {
 
 impl<F: Json> Clone for ConditionalValidators<F> {
     fn clone(&self) -> Self {
-        ConditionalValidators {
+        self.try_clone_with_funding(&crate::compilation::Funding::default())
+            .expect("ordinary conditional item copy")
+    }
+}
+impl<F: Json> ConditionalValidators<F> {
+    fn try_clone_with_funding(
+        &self,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        Ok(Self {
             condition: self.condition.clone(),
-            if_: self.if_.clone(),
-            then_: self.then_.clone(),
-            else_: self.else_.clone(),
-        }
+            if_: self.if_.try_clone_with_funding(funding)?,
+            then_: self
+                .then_
+                .as_ref()
+                .map(|value| value.try_clone_with_funding(funding))
+                .transpose()?,
+            else_: self
+                .else_
+                .as_ref()
+                .map(|value| value.try_clone_with_funding(funding))
+                .transpose()?,
+        })
     }
 }
 
@@ -129,14 +169,28 @@ impl<F: Json> ItemsValidators<F> {
     ) {
         if ctx.workspace.original() {
             let controls = crate::validator::workspace::body_controls::<F, Self>(&[
-                std::mem::size_of::<(&Self, &F::Node<'_>, &mut Vec<bool>, &mut ValidationContext<'_>, bool)>(),
+                std::mem::size_of::<(
+                    &Self,
+                    &F::Node<'_>,
+                    &mut Vec<bool>,
+                    &mut ValidationContext<'_>,
+                    bool,
+                )>(),
                 std::mem::size_of::<(usize, bool, Option<usize>)>(),
                 std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
                 std::mem::size_of::<Option<&Self>>(),
             ]);
-            let bytes = match controls { Ok(bytes) => bytes, Err(cause) => { ctx.workspace.refuse(cause); return; } };
+            let bytes = match controls {
+                Ok(bytes) => bytes,
+                Err(cause) => {
+                    ctx.workspace.refuse(cause);
+                    return;
+                }
+            };
             let controls = bytes.checked_add(ctx.workspace.input_controls());
-            if !ctx.workspace.reserve(controls) { return; }
+            if !ctx.workspace.reserve(controls) {
+                return;
+            }
         }
         // Break cycles from self-referential `$dynamicRef`/`$recursiveRef` under
         // `unevaluatedItems`.
@@ -322,14 +376,14 @@ impl<F: Json> ConditionalValidators<F> {
 fn compile_items_validators<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<ItemsValidators<F>, ValidationError<'a>> {
+) -> Result<ItemsValidators<F>, crate::compilation::CompileError<'a>> {
     let pending = compile_pending_items_validators(ctx, parent)?;
     // Only a reference cycle through this node keeps another handle to the cell
     Ok(match Arc::try_unwrap(pending) {
         Ok(cell) => cell
             .into_inner()
             .expect("pending node is initialized before it is returned"),
-        Err(shared) => initialized(&shared).clone(),
+        Err(shared) => initialized(&shared).try_clone_with_funding(ctx.funding())?,
     })
 }
 
@@ -337,12 +391,12 @@ fn compile_items_validators<'a, F: Json>(
 fn compile_pending_items_validators<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<PendingItemsValidators<F>, ValidationError<'a>> {
+) -> Result<PendingItemsValidators<F>, crate::compilation::CompileError<'a>> {
     // Create a pending node and cache it before compiling to handle circular refs
     let cache_key = ctx.location_cache_key();
-    let pending = Arc::new(OnceLock::new());
-    ctx.cache_pending_items_validators(cache_key.clone(), pending.clone());
-    ctx.cache_pending_items_validators_for_schema(parent, pending.clone());
+    let pending = ctx.funding().arc(OnceLock::new())?;
+    ctx.cache_pending_items_validators(cache_key.clone(), pending.clone())?;
+    ctx.cache_pending_items_validators_for_schema(parent, pending.clone())?;
 
     let applicator = ctx.has_vocabulary(&Vocabulary::Applicator);
 
@@ -423,12 +477,12 @@ fn initialized<F: Json>(pending: &PendingItemsValidators<F>) -> &ItemsValidators
 fn compile_unevaluated<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<SchemaNode<F>>, ValidationError<'a>> {
+) -> Result<Option<SchemaNode<F>>, crate::compilation::CompileError<'a>> {
     if let Some(subschema) = parent.get("unevaluatedItems") {
-        let unevaluated_ctx = ctx.new_at_location("unevaluatedItems");
+        let unevaluated_ctx = ctx.new_at_location("unevaluatedItems")?;
         Ok(Some(
             compiler::compile(&unevaluated_ctx, unevaluated_ctx.as_resource_ref(subschema))
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -438,12 +492,12 @@ fn compile_unevaluated<'a, F: Json>(
 fn compile_contains<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<SchemaNode<F>>, ValidationError<'a>> {
+) -> Result<Option<SchemaNode<F>>, crate::compilation::CompileError<'a>> {
     if let Some(subschema) = parent.get("contains") {
-        let contains_ctx = ctx.new_at_location("contains");
+        let contains_ctx = ctx.new_at_location("contains")?;
         Ok(Some(
             compiler::compile(&contains_ctx, contains_ctx.as_resource_ref(subschema))
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -453,12 +507,14 @@ fn compile_contains<'a, F: Json>(
 fn compile_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<PendingItemsValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingItemsValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(Value::String(reference)) = parent.get("$ref") else {
         return Ok(None);
     };
 
-    let resolved = ctx.lookup(reference).map_err(ValidationError::from)?;
+    let resolved = ctx
+        .lookup(reference)
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     let (contents, resolver, draft) = resolved.into_inner();
     if let Value::Object(subschema) = &contents {
@@ -473,7 +529,7 @@ fn compile_ref<'a, F: Json>(
 
         Ok(Some(
             compile_pending_items_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -483,12 +539,14 @@ fn compile_ref<'a, F: Json>(
 fn compile_dynamic_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &Map<String, Value>,
-) -> Result<Option<PendingItemsValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingItemsValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(Value::String(reference)) = parent.get("$dynamicRef") else {
         return Ok(None);
     };
 
-    let resolved = ctx.lookup(reference).map_err(ValidationError::from)?;
+    let resolved = ctx
+        .lookup(reference)
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     let (contents, resolver, draft) = resolved.into_inner();
     if let Value::Object(subschema) = &contents {
@@ -503,7 +561,7 @@ fn compile_dynamic_ref<'a, F: Json>(
 
         Ok(Some(
             compile_pending_items_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -513,7 +571,7 @@ fn compile_dynamic_ref<'a, F: Json>(
 fn compile_recursive_ref<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &Map<String, Value>,
-) -> Result<Option<PendingItemsValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<PendingItemsValidators<F>>, crate::compilation::CompileError<'a>> {
     if !parent.contains_key("$recursiveRef") {
         return Ok(None);
     }
@@ -521,7 +579,7 @@ fn compile_recursive_ref<'a, F: Json>(
     // For $recursiveRef, we need to resolve the reference and check if it's already being compiled
     let resolved = ctx
         .lookup_recursive_reference()
-        .map_err(ValidationError::from)?;
+        .map_err(|error| ctx.funding().reference_error(error))?;
 
     // Create context for the resolved reference and check its cache key
     let (contents, resolver, draft) = resolved.into_inner();
@@ -544,7 +602,7 @@ fn compile_recursive_ref<'a, F: Json>(
         // Not circular, compile normally
         Ok(Some(
             compile_pending_items_validators(&ref_ctx, subschema)
-                .map_err(ValidationError::to_owned)?,
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
         ))
     } else {
         Ok(None)
@@ -554,7 +612,7 @@ fn compile_recursive_ref<'a, F: Json>(
 fn compile_items<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<(Option<usize>, bool), ValidationError<'a>> {
+) -> Result<(Option<usize>, bool), crate::compilation::CompileError<'a>> {
     if let Some(subschema) = parent.get("items") {
         if ctx.draft() == Draft::Draft201909
             || ctx.draft() == Draft::Draft7
@@ -580,7 +638,7 @@ fn compile_items<'a, F: Json>(
 fn compile_prefix_items<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<usize>, ValidationError<'a>> {
+) -> Result<Option<usize>, crate::compilation::CompileError<'a>> {
     // `prefixItems` arrived in 2020-12; an earlier draft reads it as an unknown keyword, and an
     // unknown keyword evaluates nothing.
     if !ctx.draft().is_known_keyword("prefixItems") {
@@ -599,44 +657,40 @@ fn compile_branch<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
     keyword: &'static str,
-) -> Result<Option<ItemsValidators<F>>, ValidationError<'a>> {
+) -> Result<Option<ItemsValidators<F>>, crate::compilation::CompileError<'a>> {
     let Some(value) = parent.get(keyword) else {
         return Ok(None);
     };
     let Value::Object(schema) = value else {
         return Ok(None);
     };
-    let branch_ctx = ctx.new_at_location(keyword);
-    let inner_ctx = branch_ctx
-        .in_subresource(branch_ctx.as_resource_ref(value))
-        .map_err(ValidationError::from)?;
-    Ok(Some(
-        compile_items_validators(&inner_ctx, schema).map_err(ValidationError::to_owned)?,
-    ))
+    let branch_ctx = ctx.new_at_location(keyword)?;
+    let inner_ctx = branch_ctx.in_subresource(branch_ctx.as_resource_ref(value))?;
+    Ok(Some(compile_items_validators(&inner_ctx, schema).map_err(
+        |error| error.to_owned_with_funding(ctx.funding()),
+    )?))
 }
 
 fn compile_conditional<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<Box<ConditionalValidators<F>>>, ValidationError<'a>> {
+) -> Result<Option<Box<ConditionalValidators<F>>>, crate::compilation::CompileError<'a>> {
     if let Some(subschema) = parent.get("if") {
         if let Value::Object(if_parent) = subschema {
-            let if_ctx = ctx.new_at_location("if");
+            let if_ctx = ctx.new_at_location("if")?;
             let if_resource = if_ctx.as_resource_ref(subschema);
-            let condition =
-                compiler::compile(&if_ctx, if_resource).map_err(ValidationError::to_owned)?;
-            let if_inner_ctx = if_ctx
-                .in_subresource(if_resource)
-                .map_err(ValidationError::from)?;
+            let condition = compiler::compile(&if_ctx, if_resource)
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
+            let if_inner_ctx = if_ctx.in_subresource(if_resource)?;
             let if_ = compile_items_validators(&if_inner_ctx, if_parent)
-                .map_err(ValidationError::to_owned)?;
+                .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
-            return Ok(Some(Box::new(ConditionalValidators {
+            return Ok(Some(ctx.funding().boxed(ConditionalValidators {
                 condition,
                 if_,
                 then_: compile_branch(ctx, parent, "then")?,
                 else_: compile_branch(ctx, parent, "else")?,
-            })));
+            })?));
         }
     }
     Ok(None)
@@ -647,24 +701,23 @@ type CompiledItemsSubschemas<F> = Vec<(SchemaNode<F>, ItemsValidators<F>)>;
 fn compile_all_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<CompiledItemsSubschemas<F>>, ValidationError<'a>> {
+) -> Result<Option<CompiledItemsSubschemas<F>>, crate::compilation::CompileError<'a>> {
     if let Some(Some(subschemas)) = parent.get("allOf").map(Value::as_array) {
-        let all_of_ctx = ctx.new_at_location("allOf");
-        let mut result = Vec::with_capacity(subschemas.len());
+        let all_of_ctx = ctx.new_at_location("allOf")?;
+        let mut result = Vec::new();
+        ctx.funding().grow(&mut result, subschemas.len())?;
 
         for (idx, subschema) in subschemas.iter().enumerate() {
             if let Value::Object(parent) = subschema {
-                let subschema_ctx = all_of_ctx.new_at_location(idx);
+                let subschema_ctx = all_of_ctx.new_at_location(idx)?;
                 let resource = subschema_ctx.as_resource_ref(subschema);
                 let node = compiler::compile(&subschema_ctx, resource)
-                    .map_err(ValidationError::to_owned)?;
-                let inner_ctx = subschema_ctx
-                    .in_subresource(resource)
-                    .map_err(ValidationError::from)?;
+                    .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
+                let inner_ctx = subschema_ctx.in_subresource(resource)?;
                 result.push((
                     node,
                     compile_items_validators(&inner_ctx, parent)
-                        .map_err(ValidationError::to_owned)?,
+                        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
                 ));
             }
         }
@@ -678,24 +731,23 @@ fn compile_all_of<'a, F: Json>(
 fn compile_any_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<CompiledItemsSubschemas<F>>, ValidationError<'a>> {
+) -> Result<Option<CompiledItemsSubschemas<F>>, crate::compilation::CompileError<'a>> {
     if let Some(Some(subschemas)) = parent.get("anyOf").map(Value::as_array) {
-        let any_of_ctx = ctx.new_at_location("anyOf");
-        let mut result = Vec::with_capacity(subschemas.len());
+        let any_of_ctx = ctx.new_at_location("anyOf")?;
+        let mut result = Vec::new();
+        ctx.funding().grow(&mut result, subschemas.len())?;
 
         for (idx, subschema) in subschemas.iter().enumerate() {
             if let Value::Object(parent) = subschema {
-                let subschema_ctx = any_of_ctx.new_at_location(idx);
+                let subschema_ctx = any_of_ctx.new_at_location(idx)?;
                 let resource = subschema_ctx.as_resource_ref(subschema);
                 let node = compiler::compile(&subschema_ctx, resource)
-                    .map_err(ValidationError::to_owned)?;
-                let inner_ctx = subschema_ctx
-                    .in_subresource(resource)
-                    .map_err(ValidationError::from)?;
+                    .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
+                let inner_ctx = subschema_ctx.in_subresource(resource)?;
                 result.push((
                     node,
                     compile_items_validators(&inner_ctx, parent)
-                        .map_err(ValidationError::to_owned)?,
+                        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
                 ));
             }
         }
@@ -709,24 +761,23 @@ fn compile_any_of<'a, F: Json>(
 fn compile_one_of<'a, F: Json>(
     ctx: &compiler::Context<'_, F>,
     parent: &'a Map<String, Value>,
-) -> Result<Option<CompiledItemsSubschemas<F>>, ValidationError<'a>> {
+) -> Result<Option<CompiledItemsSubschemas<F>>, crate::compilation::CompileError<'a>> {
     if let Some(Some(subschemas)) = parent.get("oneOf").map(Value::as_array) {
-        let one_of_ctx = ctx.new_at_location("oneOf");
-        let mut result = Vec::with_capacity(subschemas.len());
+        let one_of_ctx = ctx.new_at_location("oneOf")?;
+        let mut result = Vec::new();
+        ctx.funding().grow(&mut result, subschemas.len())?;
 
         for (idx, subschema) in subschemas.iter().enumerate() {
             if let Value::Object(parent) = subschema {
-                let subschema_ctx = one_of_ctx.new_at_location(idx);
+                let subschema_ctx = one_of_ctx.new_at_location(idx)?;
                 let resource = subschema_ctx.as_resource_ref(subschema);
                 let node = compiler::compile(&subschema_ctx, resource)
-                    .map_err(ValidationError::to_owned)?;
-                let inner_ctx = subschema_ctx
-                    .in_subresource(resource)
-                    .map_err(ValidationError::from)?;
+                    .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
+                let inner_ctx = subschema_ctx.in_subresource(resource)?;
                 result.push((
                     node,
                     compile_items_validators(&inner_ctx, parent)
-                        .map_err(ValidationError::to_owned)?,
+                        .map_err(|error| error.to_owned_with_funding(ctx.funding()))?,
                 ));
             }
         }
@@ -748,13 +799,15 @@ impl UnevaluatedItemsValidator {
         ctx: &'a compiler::Context<F>,
         parent: &'a Map<String, Value>,
     ) -> CompilationResult<'a, F> {
-        let validators =
-            compile_items_validators(ctx, parent).map_err(ValidationError::to_owned)?;
+        let validators = compile_items_validators(ctx, parent)
+            .map_err(|error| error.to_owned_with_funding(ctx.funding()))?;
 
-        Ok(Box::new(UnevaluatedItemsValidator {
-            location: ctx.location().join("unevaluatedItems"),
+        Ok(ctx.funding().boxed(UnevaluatedItemsValidator {
+            location: ctx
+                .location()
+                .join_with_funding("unevaluatedItems", ctx.funding())?,
             validators,
-        }))
+        })?)
     }
 }
 
@@ -793,7 +846,12 @@ impl<F: Json> Validate<F> for UnevaluatedItemsValidator<F> {
         true
     }
 
-    fn validate<'i>(
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)?
+            .checked_add(std::mem::size_of::<Vec<String>>())
+            .ok_or(crate::validator::workspace::Error::Overflow)
+    }
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -801,7 +859,9 @@ impl<F: Json> Validate<F> for UnevaluatedItemsValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(array) = instance.as_array() {
-            let mut indexes = vec![false; array.len()];
+            let Some(mut indexes) = ctx.workspace.filled(array.len(), false) else {
+                return Ok(());
+            };
             self.validators
                 .mark_evaluated_indexes(instance, &mut indexes, ctx);
             let mut unevaluated = vec![];
@@ -815,19 +875,25 @@ impl<F: Json> Validate<F> for UnevaluatedItemsValidator<F> {
                     };
 
                     if !is_valid {
-                        unevaluated.push(item.to_value().to_string());
+                        let Some(text) = ctx.produce(|funding| {
+                            let value = funding.input_value::<F>(&item)?;
+                            funding.format(format_args!("{value}"))
+                        }) else {
+                            return Ok(());
+                        };
+                        if !ctx.workspace.push(&mut unevaluated, text) {
+                            return Ok(());
+                        }
                     }
                 }
             }
 
             if !unevaluated.is_empty() {
-                return Err(ValidationError::unevaluated_items(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    unevaluated,
-                ));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::UnevaluatedItems {
+                        unexpected: unevaluated,
+                    })
+                });
             }
         }
         Ok(())

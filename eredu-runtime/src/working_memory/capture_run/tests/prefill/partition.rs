@@ -2,13 +2,13 @@
 use super::*;
 use crate::capture::{CapturePrefillHookDecision, CapturePrefillObservationPolicy};
 use crate::capture::partition::PartitionCaptureRecordEncoding;
-use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 #[derive(Debug)]
 struct Metadata(Arc<AtomicUsize>);
-impl WorkspaceMetadataAccount for Metadata {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Metadata {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0.fetch_add(bytes, Ordering::SeqCst); Ok(())
     }
 }
@@ -66,7 +66,7 @@ fn remote_prefill_receipt_reuses_original_h_after_real_chunk_progress() {
     receiver.finish_local_prefill_targets().unwrap();
     assert!(receiver.finish_prefill_targets().is_err());
     let used=Arc::new(AtomicUsize::new(0));
-    let funding=WorkspaceMetadataFunding::new(Metadata(used.clone())).unwrap();
+    let funding=HostMetadataFunding::new(Metadata(used.clone())).unwrap();
     for index in 0..2 {
         let context=context(&source,index);let record=&producer.records()[index];
         let bytes=PartitionCaptureRecordEncoding::new(&context,"exact-receipt",3,

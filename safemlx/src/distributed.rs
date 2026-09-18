@@ -809,7 +809,7 @@ mod persistent_storage;
 pub use persistent_storage::{GroupPersistentStorage,GroupBufferIdentity,RetainedGroupBuffer};
 
 mod layout_storage;
-pub use layout_storage::{GroupCpuLayoutStorage,OwnedGroupCpuLayoutStorage};
+pub use layout_storage::{GroupCpuBindingError,GroupCpuBindingPopulation,GroupCpuLayoutStorage,OwnedGroupCpuLayoutStorage};
 
 mod exchange_storage;
 pub use exchange_storage::{GroupCpuExchangeStorage,GroupCpuExchangeLayoutStorage,OwnedGroupCpuExchangeLayoutStorage};

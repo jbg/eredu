@@ -316,7 +316,7 @@ where
         }
         validate_control_capture(&plan)?;
         self.capture = Some(std::rc::Rc::new(std::cell::RefCell::new(LogitCapture {
-            session: eredu_runtime::capture::CaptureSession::new(plan),
+            session: eredu_runtime::capture::CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan)),
             records: Vec::new(),
         })));
         Ok(())
@@ -1102,7 +1102,7 @@ where
                 std::mem::size_of::<std::slice::IterMut<'_,&mut Self::Distribution>>(),
                 std::mem::size_of::<Result<(),Self::Error>>()];
             sources.metadata_funding().reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-                .ok_or_else(||E::from(L::original_error(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))))?)
+                .ok_or_else(||E::from(L::original_error(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))))?)
                 .map_err(|cause|E::from(L::original_error(Error::WorkspacePlanning(cause))))?;
             for distribution in distributions {
                 let value=distribution.original_value().ok_or_else(||E::from(L::original_error(
@@ -1177,7 +1177,7 @@ fn reserve_original_key<T, E, L: LogitsSource>(
     placement: SamplingPlacement,
     context: SpeculativeExecutionStreams<'_>,
 ) -> Result<(), Error> {
-    use eredu_nn::workspace::WorkspaceMetadataFundingError;
+    use eredu_nn::workspace::HostMetadataFundingError;
     use std::mem::{size_of, size_of_val};
     let (sources, environment) = context.original_numerical_for(placement).ok_or(Error::PrefillControl(
         eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -1217,7 +1217,7 @@ fn reserve_original_key<T, E, L: LogitsSource>(
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     sources
         .metadata_funding()
@@ -1235,7 +1235,7 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
     context: SpeculativeExecutionStreams<'_>,
     phase_calls: usize,
 ) -> Result<(), Error> {
-    use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+    use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
     use std::mem::{size_of, size_of_val};
     let stream = match placement {
         SamplingPlacement::Target => context.target(),
@@ -1264,7 +1264,7 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
         size_of::<Option<&numerical::OriginalNumericalValue>>(),
         size_of::<SpeculativeExecutionStreams<'_>>(),
         size_of::<SamplingPlacement>(),
-        size_of::<Result<&WorkspaceMetadataFunding, Error>>(),
+        size_of::<Result<&HostMetadataFunding, Error>>(),
         size_of::<Result<(), Error>>(),
         size_of::<Result<(), E>>(),
         size_of::<T>(),
@@ -1279,7 +1279,7 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
         .try_fold(size_of_val(&parts), usize::checked_add)
         .and_then(|bytes| {
             if right.is_some() {
-                bytes.checked_add(size_of::<Result<&WorkspaceMetadataFunding, Error>>())
+                bytes.checked_add(size_of::<Result<&HostMetadataFunding, Error>>())
             } else {
                 Some(bytes)
             }
@@ -1294,7 +1294,7 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
             }
         })
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     funding
         .reserve_metadata(bytes)
@@ -1432,11 +1432,11 @@ impl LogitCapture {
         self.session
             .finish_interventions()
             .map_err(Exception::from_source)?;
-        if let Some(capture) = self.session.take_step() {
+        if let Some(capture) = self.session.take_shared_step() {
             self.records.push(SpeculativePredictionCapture {
                 role,
                 position,
-                capture: eredu_core::capture::CapturedStepDelivery::Legacy(capture),
+                capture: capture,
             });
         }
         effective

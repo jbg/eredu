@@ -164,7 +164,7 @@ fn compare_equations(config: serde_json::Value) {
     let context = NumericContext::default();
     let architecture = HybridModel::new(args.clone(), &context).unwrap();
     let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 10 + 4 * args.layer_schedule.len());
     let mut model = ResidentRuntime::new(architecture, &context).unwrap();
     let paths = model.prepare_observation_paths().unwrap();
@@ -386,7 +386,7 @@ fn lfm2_actual_sources_bind_all_target_rows_and_original_physical_readout() {
         let context = NumericContext::default();
         let architecture = HybridModel::new(args, &context).unwrap();
         let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-            prefill_observation_declarations(&architecture).unwrap();
+            prefill_observation_declarations(&architecture, None).unwrap();
         assert_eq!(declarations.len(), 22);
         let runtime =
             ResidentRuntime::<_, NumericBackend, HybridState>::new(architecture, &context).unwrap();
@@ -446,7 +446,7 @@ fn lfm2_body_rows_preserve_sequence_before_state_only_or_last_position_readout()
         let context = NumericContext::default();
         let architecture = HybridModel::new(args.clone(), &context).unwrap();
         let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-            prefill_observation_declarations(&architecture).unwrap()
+            prefill_observation_declarations(&architecture, None).unwrap()
             .into_iter().filter(|d| d.readout_stage() == Stage::BeforeReadout)
             .collect::<Vec<_>>();
         assert_eq!(declarations.len(), 14);

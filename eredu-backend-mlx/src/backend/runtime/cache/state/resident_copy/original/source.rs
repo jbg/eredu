@@ -9,19 +9,36 @@ use eredu_runtime::working_memory::{
 };
 use safemlx::{AllocationIdentity, OriginalBufferBudget, OriginalBufferCause};
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BindingRows {
+    registered: usize,
+    completed: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BindingDiagnostics<'a> {
+    pub(super) stage: &'a Cell<&'static str>,
+    pub(super) rows: &'a Cell<Option<BindingRows>>,
+}
+fn binding_stage(diagnostic: Option<BindingDiagnostics<'_>>, stage: &'static str) {
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.stage.set(stage);
+    }
+}
+
 struct Entry {
     identity: AllocationIdentity,
     bytes: u64,
     budget: OriginalBufferBudget,
     account: CompletedWorkspaceSourceAccount,
 }
-/// Exact completed role births still present in this native state. It owns no
-/// array, plan or session. Existing registered roots stay on their original path.
+/// Exact completed role births held by the native state or its retained ingress.
+/// It owns no array, plan or session. Existing registered roots stay on their original path.
 /// The private state owner replaces this after each terminal successful span.
 pub(crate) struct CompletedResidentSource {
     entries: Vec<Entry>,
     completed_stream: Option<safemlx::StreamCopyPlan<()>>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 /// Fixed inspection refusal; the borrowed source and caller keep custody.
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +55,7 @@ enum CompletedArraySourceError {
 struct CompletedArraySourceFailure {
     #[source]
     cause: CompletedArraySourceError,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl CompletedResidentSource {
     /// Called only after the role's exact completion, Recovery settlement and
@@ -49,11 +66,15 @@ impl CompletedResidentSource {
         prior: Option<&Self>,
         budget: &OriginalBufferBudget,
         role: &OriginalSpeculativeRole,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
+        mut additional: impl FnMut(&mut dyn FnMut(&Array)) -> Result<(), Error>,
     ) -> Result<Self, Error> {
         let prior = prior.map(|source| [source]);
         Self::capture_accounts_fallible(
-            |visitor| visit_sources(state, visitor).map_err(|cause| paid(funding, cause)),
+            |visitor| {
+                visit_sources(state, visitor).map_err(|cause| paid(funding, cause))?;
+                additional(visitor)
+            },
             prior.as_ref().map_or(&[], |source| source.as_slice()),
             Some((
                 budget,
@@ -71,7 +92,7 @@ impl CompletedResidentSource {
         prior: Option<&Self>,
         budget: &OriginalBufferBudget,
         custody: &OriginalSpeculativeBudgetCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let prior = prior.map(|source| [source]);
         Self::capture_array_sources_with_priors(
@@ -89,7 +110,7 @@ impl CompletedResidentSource {
         prior: &[&Self],
         budget: &OriginalBufferBudget,
         custody: &OriginalSpeculativeBudgetCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::capture_accounts(
             visit,
@@ -108,7 +129,7 @@ impl CompletedResidentSource {
         prior: &[&Self],
         budget: &OriginalBufferBudget,
         custody: &OriginalSpeculativeNumericalBudgetCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::capture_accounts(
             visit,
@@ -128,7 +149,7 @@ impl CompletedResidentSource {
         prior: &[&Self],
         request: &eredu_runtime::working_memory::OriginalSpeculativeRequest,
         stream: &safemlx::Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let frames = [
             size_of_val(&visit),
@@ -136,7 +157,7 @@ impl CompletedResidentSource {
                 &[&Self],
                 &eredu_runtime::working_memory::OriginalSpeculativeRequest,
                 &safemlx::Stream,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<Result<Self, Error>>(),
         ];
@@ -154,7 +175,7 @@ impl CompletedResidentSource {
         mut visit: impl FnMut(&mut dyn FnMut(&Array)),
         prior: &[&Self],
         birth: Option<(&OriginalBufferBudget, CompletedWorkspaceSourceAccount)>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::capture_accounts_fallible(
             |visitor| {
@@ -170,7 +191,7 @@ impl CompletedResidentSource {
         mut visit: impl FnMut(&mut dyn FnMut(&Array)) -> Result<(), Error>,
         prior: &[&Self],
         birth: Option<(&OriginalBufferBudget, CompletedWorkspaceSourceAccount)>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let mut count = 0usize;
         let mut overflow = false;
@@ -299,12 +320,12 @@ impl CompletedResidentSource {
     pub(crate) fn try_clone_for_source(
         &self,
         stream: &safemlx::Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let frames = [
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
-            size_of::<(&Self, &safemlx::Stream, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &safemlx::Stream, &HostMetadataFunding)>(),
             size_of::<Entry>(),
             size_of::<Vec<Entry>>(),
             size_of::<std::slice::Iter<'_, Entry>>(),
@@ -374,8 +395,8 @@ impl CompletedResidentSource {
     /// Descriptive comparison with the actual completed publication. This does
     /// not authenticate its request/account or change that publication's stream.
     pub(crate) fn matches_completed_stream(&self, stream: &safemlx::Stream,
-        funding: &WorkspaceMetadataFunding) -> Result<bool, Error> {
-        let parts = [size_of::<(&Self, &safemlx::Stream, &WorkspaceMetadataFunding)>(),
+        funding: &HostMetadataFunding) -> Result<bool, Error> {
+        let parts = [size_of::<(&Self, &safemlx::Stream, &HostMetadataFunding)>(),
             size_of::<Result<bool, Error>>(),
             self.completed_stream.as_ref().map_or(Some(0), |source|
                 source.source_comparison_control_bytes()).ok_or_else(|| memory(WorkingMemoryError::Overflow))?];
@@ -401,7 +422,7 @@ impl CompletedResidentSource {
         &self,
         request: &eredu_runtime::working_memory::OriginalSpeculativeRequest,
         stream: &safemlx::Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         let parts = [
             size_of::<(
@@ -437,7 +458,7 @@ impl CompletedResidentSource {
             size_of::<&Array>(),
             size_of::<Option<&Entry>>(),
             size_of::<(&Self, &Array)>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<CompletedWorkspaceSourceAccount>(),
             size_of::<Result<(&OriginalBufferBudget, &CompletedWorkspaceSourceAccount), Error>>(),
             size_of::<
@@ -470,7 +491,7 @@ impl CompletedResidentSource {
     pub(crate) fn array_source(
         &self,
         array: &Array,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(&OriginalBufferBudget, &OriginalSpeculativeBudgetCustody), Error> {
         let (budget, account) = self.array_source_account(array, funding)?;
         match account {
@@ -485,7 +506,7 @@ impl CompletedResidentSource {
     pub(crate) fn array_source_account(
         &self,
         array: &Array,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(&OriginalBufferBudget, &CompletedWorkspaceSourceAccount), Error> {
         let inspect = || -> Result<_, CompletedArraySourceError> {
             let info = array
@@ -536,7 +557,7 @@ impl SourceBinding {
         plan: WorkspaceIsolatedCopyPlan,
         environment: &OriginalCopyEnvironment<'_>,
         limits: WorkspaceCopyLimits,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<AdmittedWorkspaceCopy, Error> {
         match self {
             Self::Registered(source) => environment.pool().admit_workspace_copy(
@@ -557,16 +578,20 @@ pub(super) fn bind(
     projected: &super::super::source_projection::ProjectedSnapshotInputs,
     completed: Option<&CompletedResidentSource>,
     environment: &OriginalCopyEnvironment<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
+    diagnostic: BindingDiagnostics<'_>,
 ) -> Result<SourceBinding, Error> {
-    bind_projected(
+    let completed = completed.map(|source| [source]);
+    bind_projected_with_priors_selection(
         &projected.context,
         &projected.native,
-        completed,
+        completed.as_ref().map_or(&[], |sources| sources.as_slice()),
         environment,
         funding,
         host,
+        true,
+        Some(diagnostic),
     )
 }
 
@@ -577,7 +602,7 @@ pub(crate) fn bind_projected(
     native: &crate::backend::nn::workspace::ProjectedNativeStorage,
     completed: Option<&CompletedResidentSource>,
     environment: &OriginalCopyEnvironment<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
 ) -> Result<SourceBinding, Error> {
     let completed = completed.map(|source| [source]);
@@ -598,7 +623,7 @@ pub(crate) fn bind_projected_with_priors(
     native: &crate::backend::nn::workspace::ProjectedNativeStorage,
     completed: &[&CompletedResidentSource],
     environment: &OriginalCopyEnvironment<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
 ) -> Result<SourceBinding, Error> {
     bind_projected_with_priors_selection(
@@ -609,6 +634,7 @@ pub(crate) fn bind_projected_with_priors(
         funding,
         host,
         true,
+        None,
     )
 }
 
@@ -617,7 +643,7 @@ pub(crate) fn bind_projected_unselected_with_priors(
     native: &crate::backend::nn::workspace::ProjectedNativeStorage,
     completed: &[&CompletedResidentSource],
     environment: &OriginalCopyEnvironment<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
 ) -> Result<SourceBinding, Error> {
     bind_projected_with_priors_selection(
@@ -628,6 +654,7 @@ pub(crate) fn bind_projected_unselected_with_priors(
         funding,
         host,
         false,
+        None,
     )
 }
 
@@ -636,9 +663,10 @@ fn bind_projected_with_priors_selection(
     native: &crate::backend::nn::workspace::ProjectedNativeStorage,
     completed: &[&CompletedResidentSource],
     environment: &OriginalCopyEnvironment<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
     select: bool,
+    diagnostic: Option<BindingDiagnostics<'_>>,
 ) -> Result<SourceBinding, Error> {
     if !native.is_complete() {
         return Err(memory(WorkingMemoryError::UnknownBound));
@@ -648,10 +676,21 @@ fn bind_projected_with_priors_selection(
         .iter()
         .filter(|(id, _, _)| completed.iter().any(|source| source.entry(*id).is_some()))
         .count();
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.rows.set(Some(BindingRows {
+            registered: count - accounted,
+            completed: accounted,
+        }));
+    }
     let carrier =
         OriginalStorageSourcesLayout::new(0).ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
     let frames = [
         size_of::<bool>(),
+        size_of::<Option<BindingDiagnostics<'_>>>(),
+        size_of::<BindingDiagnostics<'_>>(),
+        size_of::<BindingRows>(),
+        size_of::<Option<BindingRows>>(),
+        size_of::<&'static str>(),
         size_of::<SourceBinding>(),
         size_of::<Result<SourceBinding, Error>>(),
         size_of::<(usize, usize)>(),
@@ -669,24 +708,28 @@ fn bind_projected_with_priors_selection(
         frames.into_iter().try_fold(size_of_val(&frames), add)?,
     )?;
     if accounted == 0 {
+        binding_stage(diagnostic, "registered source layout");
         let layout =
             RegisteredWorkspaceStorageLayout::<StorageIdentity>::new(count).map_err(memory)?;
         reserve(funding, layout.requested_bytes())?;
+        binding_stage(diagnostic, "registered source carrier");
         let mut carrier = carrier
             .construct(environment.pool(), host)
             .map_err(|cause| paid(funding, cause))?;
         let rows = native
             .iter()
             .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone()));
+        binding_stage(diagnostic, "registered source rows");
         let registered = if select {
             layout.construct(environment.pool(), context, rows)
         } else {
             layout.construct_unselected(environment.pool(), context, rows)
-        }
-        .and_then(|registered| registered.with_retained_original_sources(&mut carrier))
-        .map_err(memory)?;
+        }.map_err(memory)?;
+        binding_stage(diagnostic, "registered source custody");
+        let registered = registered.with_retained_original_sources(&mut carrier).map_err(memory)?;
         return Ok(SourceBinding::Registered(registered));
     }
+    binding_stage(diagnostic, "completed source layouts");
     let source_layout = CompletedWorkspaceSourceLayout::new_accounts(accounted).map_err(memory)?;
     let layout =
         CompletedWorkspaceStorageLayout::<StorageIdentity>::new(count - accounted, accounted)
@@ -701,6 +744,7 @@ fn bind_projected_with_priors_selection(
     let mut entries = funding
         .metadata_vec::<(WorkspaceExistingStorage, CompletedWorkspaceSourceAccount)>(accounted)
         .map_err(|cause| paid(funding, cause))?;
+    binding_stage(diagnostic, "completed source witnesses");
     for (id, bytes, root) in native.iter() {
         let mut selected: Option<&Entry> = None;
         for source in completed {
@@ -731,9 +775,11 @@ fn bind_projected_with_priors_selection(
             entries.push((root.clone(), entry.account.clone()));
         }
     }
+    binding_stage(diagnostic, "completed source accounts");
     let source = source_layout
         .construct_accounts(context, entries, host)
         .map_err(memory)?;
+    binding_stage(diagnostic, "completed source carrier");
     let mut carrier = carrier
         .construct(environment.pool(), host)
         .map_err(|cause| paid(funding, cause))?;
@@ -741,6 +787,7 @@ fn bind_projected_with_priors_selection(
         .iter()
         .filter(|(id, _, _)| !completed.iter().any(|source| source.entry(*id).is_some()))
         .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone()));
+    binding_stage(diagnostic, "completed source rows");
     let registered = if select {
         layout.construct(environment.pool(), context, rows, source, &mut carrier)
     } else {
@@ -757,3 +804,5 @@ fn visit_sources(
     state.visit_operands(visitor)?;
     state.visit_retained_arrays(visitor)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -100,6 +100,8 @@ typedef struct mlx_cpu_copy_eval_layout_ {
   size_t graph_extents, worker_graph_extents, backing_births, named_control_bytes;
   size_t signal_graph_extents;
 } mlx_cpu_copy_eval_layout;
+bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_eval_layout*,
+    mlx_dtype,size_t rank,bool store,bool tracer);
 bool mlx_operation_event_cpu_greedy_eval_layout(mlx_cpu_copy_eval_layout*,
     size_t rank,size_t columns,size_t rows,bool reduction,bool tracer);
 bool mlx_operation_event_cpu_reshape_alias_eval_layout(mlx_cpu_copy_eval_layout* out,
@@ -116,7 +118,10 @@ bool mlx_operation_event_cpu_sdpa_fallback_control_bytes(size_t* out,
 bool mlx_operation_event_cpu_arange_float_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t elements,bool tracer);
 bool mlx_operation_event_cpu_arange_int_eval_layout(mlx_cpu_copy_eval_layout* out,
-    size_t elements,bool tracer);
+    mlx_dtype dtype,size_t elements,bool tracer);
+bool mlx_operation_event_cpu_tiled_gather_mm_eval_layout(mlx_cpu_copy_eval_layout* out,
+    size_t lhs_rank,size_t rhs_rank,size_t index_rank,size_t m,size_t n,size_t k,
+    size_t batches,bool tracer);
 bool mlx_operation_event_cpu_rope_fallback_control_bytes(size_t* out,
     size_t rank,size_t dimensions,size_t elements);
 bool mlx_operation_event_cpu_concatenate_many_eval_layout(mlx_cpu_copy_eval_layout* out,
@@ -135,10 +140,12 @@ bool mlx_operation_event_cpu_row_full_eval_layout(mlx_cpu_copy_eval_layout*,
     size_t rank,size_t width,size_t rows,bool tracer);
 bool mlx_operation_event_cpu_reduction_eval_layout(mlx_cpu_copy_eval_layout* out,
     unsigned operation,size_t rank,size_t width,size_t rows,bool tracer);
-bool mlx_operation_event_cpu_flat_scatter_eval_layout(mlx_cpu_copy_eval_layout*,
-    mlx_dtype index,size_t output_elements,size_t update_elements,bool tracer);
+bool mlx_operation_event_cpu_scatter_eval_layout(mlx_cpu_copy_eval_layout*,
+    mlx_dtype source,mlx_dtype index,size_t rank,size_t output_elements,size_t update_elements,bool tracer);
 bool mlx_operation_event_cpu_scatter_axis_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype index,size_t rank,size_t output_elements,size_t update_elements,bool tracer);
+bool mlx_operation_event_cpu_scatter_add_rows_eval_layout(mlx_cpu_copy_eval_layout*,
+    mlx_dtype,size_t,size_t,bool);
 bool mlx_operation_event_cpu_gather_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype source, mlx_dtype index, size_t source_rank, size_t index_rank,
     size_t source_elements, size_t index_elements, size_t slice_elements, bool tracer);
@@ -162,14 +169,13 @@ bool mlx_operation_event_cpu_typed_softmax_eval_layout(mlx_cpu_copy_eval_layout*
     mlx_dtype dtype,bool precise,size_t rank,size_t columns,size_t rows,bool tracer);
 bool mlx_operation_event_cpu_scalar_update_eval_layout(mlx_cpu_copy_eval_layout*,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_static_update_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,size_t update_elements,bool tracer);
-bool mlx_operation_event_cpu_argsort_eval_layout(mlx_cpu_copy_eval_layout*,size_t elements,bool tracer);
+bool mlx_operation_event_cpu_argsort_eval_layout(mlx_cpu_copy_eval_layout*,mlx_dtype source,size_t rank,size_t columns,size_t rows,bool tracer);
 bool mlx_operation_event_cpu_gather_axis_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
-bool mlx_operation_event_cpu_argsort_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_partition_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_scan_sum_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_maximum_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 
-bool mlx_operation_event_cpu_slice_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,bool tracer);
+bool mlx_operation_event_cpu_slice_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,bool empty,bool tracer);
 bool mlx_operation_event_cpu_cast_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype source, mlx_dtype destination, size_t rank, size_t elements, bool tracer);
 bool mlx_operation_event_cpu_byte_view_eval_layout(mlx_cpu_copy_eval_layout*,

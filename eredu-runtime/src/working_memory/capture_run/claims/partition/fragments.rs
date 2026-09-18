@@ -45,7 +45,7 @@ impl<'a> PartitionFragmentHostPlan<'a> {
     /// Price the actual projected destinations without allocating a table or
     /// native object. Empty producers acknowledge without a fabricated payload.
     pub fn prepare(receipt:&'a PartitionCaptureReceiptPlan)->Result<Self,CaptureRunHostError> {
-        if receipt.identity().len()!=64 || receipt.shared_plan_source().is_none() {return Err(CaptureRunHostError::ReceiptMismatch);}
+        if receipt.identity().len()!=64 {return Err(CaptureRunHostError::ReceiptMismatch);}
         let mut slots=0usize;let mut fragments=0u64;
         for (rank,projection) in receipt.producers() {for fragment in 0..projection.fragments().len() {
             let plan=FragmentHostPlan::prepare(receipt,rank,fragment)?;
@@ -70,7 +70,7 @@ impl<'a> PartitionFragmentHostPlan<'a> {
     /// A real additional F32 materialization only for additive nonlinear transforms.
     pub fn assembly_peak_bytes(&self)->u64 {self.assembly.map_or(0,|(_,_,bytes)|bytes)}
     fn assembly_source(receipt:&PartitionCaptureReceiptPlan)->Result<Option<(usize,usize,u64)>,CaptureRunHostError> {
-        let source=receipt.shared_plan_source().ok_or(CaptureRunHostError::ReceiptMismatch)?;
+        let source=receipt.shared_plan_source();
         if receipt.combination()!=PartitionCaptureCombination::SumF64ToF32 || !matches!(source.admission().plan().selections[receipt.context().selection_index].transform,CaptureTransform::Summary|CaptureTransform::Histogram{..}) {return Ok(None);}
         for (producer,projection) in receipt.producers(){if !projection.fragments().is_empty(){
             let plan=FragmentHostPlan::prepare(receipt,producer,0)?;
@@ -202,7 +202,7 @@ impl WorkingMemoryFundingRun {
     }
     fn prepare_fragment_host_storage(&self,reservation:&WorkingMemoryReservation,
         plan:&PartitionFragmentHostPlan<'_>)->Result<FragmentHostStorage,PartitionFragmentDestinationError> {
-        let source=plan.receipt.shared_plan_source().expect("qualified shared host plan").clone();
+        let source=plan.receipt.shared_plan_source().clone();
         let fail=|cause|PartitionFragmentDestinationError{cause,_value:None,_source:source.clone(),_custody:None};
         let custody=self.hold_partition_fragment_table(reservation,plan).map_err(|e|fail(e.into()))?;
         custody.validate().map_err(|e|fail(e.into()))?;
@@ -287,7 +287,7 @@ impl PreparedPartitionFragmentDestinations {
 
 mod receive;
 pub(crate) use receive::PartitionFragmentReceiveError;
-pub(super) use receive::{RoutedReceiver,RoutedReceiveCause};
+pub(super) use receive::RoutedReceiver;
 
 mod encode;
 pub(crate) use encode::PartitionFragmentEncodingError;

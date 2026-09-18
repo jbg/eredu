@@ -1,4 +1,4 @@
-use super::OrderedVocabIter;
+use self::serialization::OrderedVocabulary;
 use crate::tokenizer::{Model, Result, Token};
 use ahash::AHashMap;
 use serde_json::Value;
@@ -8,6 +8,9 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 mod serialization;
+pub(crate) use serialization::Serialization as WordLevelSerialization;
+mod compile;
+pub use compile::{WordLevelCompileError, WordLevelCompileFailure, WordLevelCompilePlan, WordLevelCompileRequirements};
 mod trainer;
 
 // Re-export
@@ -80,25 +83,26 @@ impl WordLevelBuilder {
             self.config.vocab = WordLevel::read_file(&vocab)?;
         }
 
-        let vocab_r = self
-            .config
-            .vocab
-            .iter()
-            .map(|(key, val)| (*val, key.to_owned()))
-            .collect();
+        let vocab: Vocabulary = self.config.vocab.into_iter().collect();
+        let mut vocab_r = ReverseVocabulary::new();
+        vocab_r.try_reserve(vocab.len())?;
+        reverse_vocabulary(&vocab, &mut vocab_r, &mut String::new(), |target, length| target.try_reserve_exact(length))?;
 
         Ok(WordLevel {
-            vocab: self.config.vocab,
+            vocab,
             vocab_r,
             unk_token: self.config.unk_token,
         })
     }
 }
 
+type Vocabulary = hashbrown::HashMap<String, u32>;
+type ReverseVocabulary = hashbrown::HashMap<u32, String>;
+
 #[derive(PartialEq, Clone, Eq)]
 pub struct WordLevel {
-    vocab: AHashMap<String, u32>,
-    vocab_r: AHashMap<u32, String>,
+    vocab: Vocabulary,
+    vocab_r: ReverseVocabulary,
     pub unk_token: String,
 }
 
@@ -111,10 +115,42 @@ impl std::fmt::Debug for WordLevel {
     }
 }
 
+fn reverse_vocabulary<E>(vocab: &Vocabulary, reverse: &mut ReverseVocabulary, pending: &mut String,
+    mut reserve: impl FnMut(&mut String, usize) -> std::result::Result<(), E>) -> std::result::Result<(), E> {
+    for (spelling, &id) in vocab {
+        reserve(pending, spelling.len())?;
+        pending.push_str(spelling);
+        reverse.insert(id, std::mem::take(pending));
+    }
+    Ok(())
+}
+
 impl WordLevel {
+    pub(crate) fn same_configuration(&self,other:&Self)->bool {
+        self.unk_token==other.unk_token && self.vocab==other.vocab && self.vocab_r==other.vocab_r
+    }
+    pub(crate) fn configuration_comparison_control_bytes()->Option<usize> {
+        use std::mem::size_of;
+        [size_of::<[&Self;2]>(),size_of::<hashbrown::hash_map::Iter<'_,String,u32>>(),
+         size_of::<hashbrown::hash_map::Iter<'_,u32,String>>(),size_of::<(&String,&u32)>(),
+         size_of::<(&u32,&String)>(),size_of::<[usize;2]>(),size_of::<bool>()]
+         .iter().copied().try_fold(0usize,usize::checked_add)
+    }
+
+    /// The original whole-span model lookup, shared by token and ID emission.
+    pub(crate) fn lookup<'a>(&'a self, token: &'a str) -> std::result::Result<(u32, &'a str), Error> {
+        if let Some(&id) = self.vocab.get(token) {
+            Ok((id, token))
+        } else if let Some(&id) = self.vocab.get(&self.unk_token) {
+            Ok((id, &self.unk_token))
+        } else {
+            Err(Error::MissingUnkToken)
+        }
+    }
+
     pub(crate) fn decode_ids(
         &self,
-    ) -> std::iter::Copied<std::collections::hash_map::Values<'_, String, u32>> {
+    ) -> std::iter::Copied<hashbrown::hash_map::Values<'_, String, u32>> {
         self.vocab.values().copied()
     }
 
@@ -165,8 +201,8 @@ impl WordLevel {
 impl Default for WordLevel {
     fn default() -> Self {
         Self {
-            vocab: AHashMap::new(),
-            vocab_r: AHashMap::new(),
+            vocab: Vocabulary::new(),
+            vocab_r: ReverseVocabulary::new(),
             unk_token: String::from("<unk>"),
         }
     }
@@ -176,21 +212,8 @@ impl Model for WordLevel {
     type Trainer = WordLevelTrainer;
 
     fn tokenize(&self, token: &str) -> Result<Vec<Token>> {
-        if let Some(&id) = self.vocab.get(token) {
-            Ok(vec![Token {
-                id,
-                value: token.to_owned(),
-                offsets: (0, token.len()),
-            }])
-        } else if let Some(&unk_id) = self.vocab.get(&self.unk_token) {
-            Ok(vec![Token {
-                id: unk_id,
-                value: self.unk_token.to_owned(),
-                offsets: (0, token.len()),
-            }])
-        } else {
-            Err(Box::new(Error::MissingUnkToken))
-        }
+        let (id, value) = self.lookup(token)?;
+        Ok(vec![Token { id, value: value.to_owned(), offsets: (0, token.len()) }])
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
@@ -202,7 +225,7 @@ impl Model for WordLevel {
     }
 
     fn get_vocab(&self) -> HashMap<String, u32> {
-        self.vocab.clone().into_iter().collect()
+        self.vocab.iter().map(|(spelling, &id)| (spelling.clone(), id)).collect()
     }
 
     fn get_vocab_size(&self) -> usize {
@@ -220,7 +243,7 @@ impl Model for WordLevel {
             .iter()
             .collect();
         let mut vocab_file = File::create(&vocab_path)?;
-        let order_vocab_iter = OrderedVocabIter::new(&self.vocab_r);
+        let order_vocab_iter = OrderedVocabulary(&self.vocab_r);
         let serialized = serde_json::to_string(&order_vocab_iter)?;
         vocab_file.write_all(serialized.as_bytes())?;
 

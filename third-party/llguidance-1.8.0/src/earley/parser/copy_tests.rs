@@ -75,7 +75,7 @@ fn populated_parser() -> TokenParser {
     let mut factory = ParserFactory::new_simple(&ApproximateTokEnv::single_byte_env()).unwrap();
     factory.quiet();
     factory.limits_mut().precompute_large_lexemes = false;
-    let mut builder = GrammarBuilder::new(None, factory.limits().clone());
+    let mut builder = GrammarBuilder::new(None, factory.limits().clone(), derivre::ParserAllocationFunding::unenforced()).unwrap();
     builder
         .add_grammar(LLGuidanceOptions::default(), RegexAst::NoMatch)
         .unwrap();
@@ -87,8 +87,8 @@ fn populated_parser() -> TokenParser {
             capture_name: Some("name".to_owned()),
             ..NodeProps::default()
         },
-    );
-    let separator = builder.string(":");
+    ).unwrap();
+    let separator = builder.string(":").unwrap();
     let value_rx = builder.regex.regex("[0-9]{2}").unwrap();
     let value = builder.lexeme_ext(
         value_rx,
@@ -97,10 +97,10 @@ fn populated_parser() -> TokenParser {
             capture_name: Some("value".to_owned()),
             ..NodeProps::default()
         },
-    );
-    let end = builder.string("\n");
-    let sequence = builder.join(&[name, separator, value, end]);
-    builder.set_start_node(sequence);
+    ).unwrap();
+    let end = builder.string("\n").unwrap();
+    let sequence = builder.join(&[name, separator, value, end]).unwrap();
+    builder.set_start_node(sequence).unwrap();
     let mut parser = factory
         .create_parser_from_init_default(GrammarInit::Internal(builder.grammar, builder.regex.spec))
         .unwrap();
@@ -133,10 +133,7 @@ fn assert_one_copy_and_independent_payload(deep: bool) {
         Arc::ptr_eq(&source.parser.shared, &copy.parser.shared),
         !deep
     );
-    assert!(Arc::ptr_eq(
-        &source.parser.state.grammar,
-        &copy.parser.state.grammar
-    ));
+    assert!(source.parser.state.grammar.same_grammar(&copy.parser.state.grammar));
     assert_eq!(source.parser.get_bytes(), copy.parser.get_bytes());
     assert_ne!(
         source.parser.state.bytes.as_ptr(),

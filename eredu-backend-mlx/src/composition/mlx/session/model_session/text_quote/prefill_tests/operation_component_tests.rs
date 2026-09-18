@@ -213,8 +213,8 @@ struct Bind<'a> {
     bias: &'a MlxTensor,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut MlxTensor) {
-        *value = match metadata.id.as_str() {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+        *value = match metadata.id().as_str() {
             "matrix.weight" => self.weight,
             "matrix.scales" => self.scales,
             "matrix.biases" => self.affine.unwrap(),

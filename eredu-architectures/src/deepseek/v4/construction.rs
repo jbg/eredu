@@ -91,7 +91,7 @@ impl V4PredictionUnitSpec {
 }
 impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend> Model<B> {
     pub(crate) fn prediction_unit_spec(&self, depth: usize) -> Result<V4PredictionUnitSpec, Error> {
-        self.groups.unit_count(depth + 1)?;
+        self.groups.unit_count(depth + 1, None)?;
         let args = self
             .parallel_geometry
             .as_ref()

@@ -22,7 +22,7 @@ pub use qwen::MediaSemanticError;
 
 use crate::qwen::{
     hybrid::{HybridConfig, ParsedHybridConfig},
-    vision::{VisionAttentionPolicy, VisionConfig},
+    vision::VisionConfig,
     vl::ModelArgs as QwenVlModelArgs,
 };
 
@@ -1031,6 +1031,7 @@ pub fn text_only_input_part<Tensor>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen::vision::VisionAttentionPolicy;
     use eredu_core::{checkpoint::TensorDtype, PreparedInputError};
     use eredu_runtime::PreparedInputPayload as RuntimePayload;
     use serde_json::json;

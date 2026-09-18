@@ -85,6 +85,7 @@ impl MlxNativeTextState {
     ) -> Self {
         Self {
             state: Box::new(state),
+            displaced_placement: None,
             memory_retention: NativeMemoryRetention::default(),
             host_preparation: Some(host.clone()),
         }
@@ -96,6 +97,7 @@ impl MlxNativeTextState {
     ) -> Self {
         Self {
             state,
+            displaced_placement: None,
             memory_retention: NativeMemoryRetention::default(),
             host_preparation: None,
         }

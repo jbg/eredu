@@ -213,7 +213,7 @@ fn escaped_tensor_alias_retains_its_own_custody_after_frame_retirement() {
 }
 
 #[test]
-fn aborted_and_empty_frames_keep_unmanaged_wire_defaults_and_cleanup() {
+fn aborted_and_empty_frames_preserve_explicit_outcomes_and_cleanup() {
     let retired = Arc::new(AtomicUsize::new(0));
     let mut raw = step(CapturePayload::Tensor(tensor()));
     raw.outcome = CaptureStepOutcome::Aborted;
@@ -230,20 +230,20 @@ fn aborted_and_empty_frames_keep_unmanaged_wire_defaults_and_cleanup() {
     assert_eq!(shared.outcome(), CaptureStepOutcome::Aborted);
     assert!(expected.get("invocation").is_none());
     assert!(expected["records"][0].get("source_dtype").is_none());
-    let mut legacy = expected;
-    legacy.as_object_mut().unwrap().remove("outcome");
-    let mut decoded: CapturedStep = serde_json::from_value(legacy).unwrap();
-    assert_eq!(decoded.outcome, CaptureStepOutcome::Untracked);
+    let mut decoded: CapturedStep = serde_json::from_value(expected.clone()).unwrap();
+    assert_eq!(decoded.outcome, CaptureStepOutcome::Aborted);
+    let mut missing_outcome = expected;
+    missing_outcome.as_object_mut().unwrap().remove("outcome");
+    assert!(serde_json::from_value::<CapturedStep>(missing_outcome.clone()).is_err());
+    assert!(serde_json::from_value::<SharedCapturedStep>(missing_outcome).is_err());
     decoded.records.clear();
+    decoded.outcome = CaptureStepOutcome::Untracked;
     let empty = SharedCapturedStep::retain(decoded, ());
     assert!(empty.records().is_empty());
-    assert_eq!(
-        serde_json::from_value::<CapturedStep>(serde_json::to_value(empty).unwrap())
-            .unwrap()
-            .records
-            .len(),
-        0
-    );
+    let decoded: CapturedStep =
+        serde_json::from_value(serde_json::to_value(empty).unwrap()).unwrap();
+    assert!(decoded.records.is_empty());
+    assert_eq!(decoded.outcome, CaptureStepOutcome::Untracked);
     drop(shared);
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

@@ -62,11 +62,11 @@ impl ActivationObserver<NumericTensor, Error> for Observe {
 // Distinct causal taps keep every selected component numerically visible.
 struct Initialize;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        if metadata.id.as_str().ends_with("global_scale") {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        if metadata.id().as_str().ends_with("global_scale") {
             value.data.fill(1.3);
         }
-        if metadata.id.as_str().contains("sconv") {
+        if metadata.id().as_str().contains("sconv") {
             for (i, value) in value.data.iter_mut().enumerate() {
                 *value = [0.11, -0.07, 0.23][i % 3] + (i / 3) as f32 * 0.002;
             }
@@ -646,10 +646,10 @@ fn inkling_prepared_prediction_depths_bind_exact_selected_formats() {
 #[derive(Default)]
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> eredu_nn::ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
         assert!(self
             .0
-            .insert(metadata.id.to_string(), value.clone())
+            .insert(metadata.id().to_string(), value.clone())
             .is_none());
     }
 }

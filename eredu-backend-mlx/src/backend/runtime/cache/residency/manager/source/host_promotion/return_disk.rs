@@ -33,7 +33,7 @@ impl PreparedCacheHostPromotion {
             &self.id,
             backing,
             arrays,
-            &mut self.reservation,
+            self.reservation.as_mut().expect("completed promotion reservation"),
             proof,
         )?;
         self.disk_replaced = Some(device);

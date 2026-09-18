@@ -1,3 +1,5 @@
+#[cfg(feature = "alloc")]
+use crate::util::allocation::{Allocation, AllocationError};
 use crate::util::{
     prefilter::PrefilterI,
     search::{MatchKind, Span},
@@ -12,27 +14,42 @@ pub(crate) struct Memmem {
 }
 
 impl Memmem {
-    pub(crate) fn new<B: AsRef<[u8]>>(
+    #[cfg(feature = "alloc")]
+    pub(crate) fn new_with_allocations<B: AsRef<[u8]>>(
         _kind: MatchKind,
         needles: &[B],
-    ) -> Option<Memmem> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Memmem>, AllocationError> {
         #[cfg(not(all(feature = "std", feature = "perf-literal-substring")))]
         {
-            None
+            Ok(None)
         }
         #[cfg(all(feature = "std", feature = "perf-literal-substring"))]
         {
             if needles.len() != 1 {
-                return None;
+                return Ok(None);
             }
             let needle = needles[0].as_ref();
-            let finder = memchr::memmem::Finder::new(needle).into_owned();
-            Some(Memmem { finder })
+            let finder = memchr::memmem::Finder::new(needle)
+                .into_owned_with_allocations(&super::funding::Funding(funding))
+                .map_err(super::funding::memchr)?;
+            Ok(Some(Memmem { finder }))
         }
     }
 }
 
 impl PrefilterI for Memmem {
+    #[cfg(feature = "alloc")]
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(all(feature = "std", feature = "perf-literal-substring"))]
+        self.finder
+            .visit_source_storage(&mut |id, bytes| visitor.visit(id, bytes));
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "memmem"
     }
@@ -61,7 +78,10 @@ impl PrefilterI for Memmem {
         {
             let needle = self.finder.needle();
             if haystack[span].starts_with(needle) {
-                Some(Span { end: span.start + needle.len(), ..span })
+                Some(Span {
+                    end: span.start + needle.len(),
+                    ..span
+                })
             } else {
                 None
             }

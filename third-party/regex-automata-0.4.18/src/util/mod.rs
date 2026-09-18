@@ -29,6 +29,10 @@ with the `regex-syntax` crate.
 
 pub mod alphabet;
 #[cfg(feature = "alloc")]
+pub mod allocation;
+#[cfg(feature = "alloc")]
+pub mod source_storage;
+#[cfg(feature = "alloc")]
 pub mod captures;
 pub mod escape;
 #[cfg(feature = "alloc")]

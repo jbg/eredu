@@ -406,9 +406,9 @@ fn half_trace_requires_explicit_nonempty_cast_fact_and_rejects_wrong_descriptors
             .collect::<Vec<_>>()
             .as_slice(),
         [
-            WorkspaceOperationKind::Index { selected_axes: 0 },
+            WorkspaceOperationKind::StaticSlice { .. },
             WorkspaceOperationKind::View("reshape"),
-            WorkspaceOperationKind::Index { selected_axes: 0 },
+            WorkspaceOperationKind::StaticSlice { .. },
             WorkspaceOperationKind::Elementwise("capture_cast_f32"),
         ]
     ));

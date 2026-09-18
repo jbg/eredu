@@ -34,6 +34,9 @@ pub enum TextModelError {
     /// A native tool definition or its generation grammar is invalid.
     #[error("native tool constraint error: {0}")]
     ToolConstraint(String),
+    /// Retained schema/grammar preparation failure, including its original payer.
+    #[error(transparent)]
+    ToolPreparation(#[from] super::ConstraintError),
 }
 
 /// Asynchronous token generation with backend-independent errors.
@@ -617,19 +620,19 @@ mod original_token_input;
 
 mod managed_plain;
 pub use managed_plain::{
-    ManagedPlainTextError, ManagedPlainTextRequest, ManagedPlainTextSession, ManagedPreparedInputRequest, ManagedModelInputError,
-    ManagedPlainTextSnapshot, ManagedPlainTextSnapshotError, ManagedPlainTextSource,
+    ManagedPlainTextError, ManagedPlainTextSourceError, ManagedPlainTextRequest, ManagedPlainTextSession, ManagedPreparedInputRequest, ManagedModelInputError,
+    ManagedPlainTextSnapshot, GenerationSnapshotError, ManagedPlainTextSource, TokenizerSourceInput,
 };
 
 mod managed_chat;
-pub use managed_chat::{ManagedChatError, ManagedChatRequest, ManagedChatSource};
-pub use original_token_input::chat::ManagedChatPolicyRejection;
+pub use managed_chat::{ChatSourceInput, ManagedChatError, ManagedChatSource, ManagedChatSourceError};
 
-mod speculative_semantic;
+mod prepared_semantic;
+pub use prepared_semantic::{PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest, PreparedChatSession, PreparedChatSessionError, PreparedChatResumeSettings, PreparedChatSnapshot, PreparedChatBranch};
 
 mod managed_speculative;
 pub use managed_speculative::{
     ManagedPlainTextSpeculativeBatchLane, ManagedPlainTextSpeculativeBatchRequest,
     ManagedPlainTextSpeculativeError, ManagedPlainTextSpeculativeRequest,
-    ManagedPreparedChatSpeculativeError, ManagedPreparedChatSpeculativeRequest,
+    PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeError, PreparedChatSpeculativeRequest,
 };

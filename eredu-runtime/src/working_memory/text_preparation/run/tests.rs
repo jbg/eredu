@@ -289,3 +289,7 @@ fn request_control_mutex_opposing_handoffs_keep_order_and_leave_active_runs_unch
     assert_eq!(pool.used_bytes().unwrap(), 0);
     assert_eq!(pool.effective_capacity().unwrap(), 1000);
 }
+
+mod sampling_extension;
+
+mod branch;

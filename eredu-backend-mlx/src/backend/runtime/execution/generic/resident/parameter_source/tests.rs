@@ -306,11 +306,9 @@ impl Parameterized<MlxTensor> for Partial {
         visitor: &mut V,
     ) -> Result<(), ParameterSourceError> {
         self.value.visit_parameter_sources(visitor)?;
-        Err(ParameterSourceError::Unavailable)
+        Err(ParameterSourceError::UnclassifiedRetainedField)
     }
-    fn visit_parameters<'a, V: ParameterVisitor<'a, MlxTensor>>(&'a self, visitor: &mut V) {
-        self.value.visit_parameters(visitor);
-    }
+
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, MlxTensor>>(
         &'a mut self,
         visitor: &mut V,
@@ -357,7 +355,7 @@ fn fixed_observer_error_precedes_independent_coverage_failure_without_success() 
             .map_err(|error| resident_error(2, error)),
         Err(ResidentSourceError::Traversal {
             unit: 2,
-            source: ParameterSourceError::Unavailable
+            source: ParameterSourceError::UnclassifiedRetainedField
         })
     );
     let error = ResidentSourceError::Descriptor {

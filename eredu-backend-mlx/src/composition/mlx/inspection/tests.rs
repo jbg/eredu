@@ -364,7 +364,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
         while let Some(token) = generator.next() {
             tokens.push(token.unwrap().token_id());
             if captured {
-                let step = generator.take_captured_step().unwrap().unwrap();
+                let step = generator.take_captured_delivery().unwrap().unwrap();
                 assert_eq!(step.prediction_index, tokens.len() as u64 - 1);
                 for record in &step.records {
                     assert_eq!(record.outcome, CaptureOutcome::Captured, "{}", record.path);
@@ -483,8 +483,8 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
     };
     assert!(error.to_string().contains("finite"), "{error}");
     let captures =
-        <crate::backend::MlxBackend as TextGenerationBackend>::take_text_capture(&mut state)
-            .unwrap();
+        <crate::backend::MlxBackend as TextGenerationBackend>::try_take_text_capture(&mut state)
+            .unwrap().unwrap();
     assert!(matches!(
         captures.records[0].outcome,
         CaptureOutcome::Failed {
@@ -682,7 +682,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         while let Some(token) = generator.next() {
             tokens.push(token.unwrap().token_id());
             if experiment != 0 {
-                let step = generator.take_captured_step().unwrap().unwrap();
+                let step = generator.take_captured_delivery().unwrap().unwrap();
                 for record in &step.interventions {
                     assert_eq!(
                         record.outcome,
@@ -746,12 +746,12 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         if prompt_mismatch {
             assert!(result.is_err());
             assert!(
-                generator.take_captured_step().unwrap().is_none(),
+                generator.take_captured_delivery().unwrap().is_none(),
                 "known prompt mismatch must fail before starting the native step"
             );
         } else if fail_dtype {
             assert!(result.is_err());
-            let step = generator.take_captured_step().unwrap().unwrap();
+            let step = generator.take_captured_delivery().unwrap().unwrap();
             assert!(matches!(
                 step.interventions[0].outcome,
                 InterventionOutcome::Failed { .. }

@@ -87,7 +87,11 @@ fn plan(preferred: usize, evidence: Evidence) -> InterventionPlan {
     }
 }
 
-fn inspect(records: &[SpeculativePredictionCapture], shared: bool, evidence: Evidence) -> serde_json::Value {
+fn inspect(
+    records: &[SpeculativePredictionCapture],
+    shared: bool,
+    evidence: Evidence,
+) -> serde_json::Value {
     let mut rows = Vec::new();
     for role in [
         SpeculativeCaptureRole::Target,
@@ -97,9 +101,7 @@ fn inspect(records: &[SpeculativePredictionCapture], shared: bool, evidence: Evi
     }
     for record in records {
         if shared {
-            let CapturedStepDelivery::Shared(frame) = &record.capture else {
-                panic!("original intervention results must retain their funded shared frame")
-            };
+            let frame = &record.capture;
             assert!(frame.clone().same_storage(frame));
         }
         let step = record.capture.as_step();
@@ -120,7 +122,11 @@ fn inspect(records: &[SpeculativePredictionCapture], shared: bool, evidence: Evi
         // Ordinary captures must still see the original, unedited output.
         assert!(values.iter().all(|v| v.abs() < 24.0));
         assert_eq!(step.interventions.len(), 6);
-        let preferred = if record.role == SpeculativeCaptureRole::Target { 12 } else { 10 };
+        let preferred = if record.role == SpeculativeCaptureRole::Target {
+            12
+        } else {
+            10
+        };
         let mut effective = values.to_vec();
         for (edit, id) in step.interventions.iter().zip([
             "replace",
@@ -213,7 +219,10 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
     let duplicate_role = vec![edits[0].clone(), edits[0].clone()];
     let drive = |session: &mut dyn ControlledSpeculativeSession| {
         session.intervene(edits)?;
-        assert!(session.intervene(duplicate_role).is_err(), "duplicate roles must reject atomically");
+        assert!(
+            session.intervene(duplicate_role).is_err(),
+            "duplicate roles must reject atomically"
+        );
         let first = session.step()?.expect("edited target prefill");
         assert_eq!(first.committed_token_ids, [12]);
         records.extend(first.captures.iter().cloned());
@@ -254,14 +263,23 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
             session.intervene(Vec::new())?;
             *visible.borrow_mut() = prefix_text.clone();
             while let Some(step) = session.step()? {
-                assert!(step.captures.iter().all(|c| c.capture.as_step().interventions.is_empty()));
+                assert!(
+                    step.captures
+                        .iter()
+                        .all(|c| c.capture.as_step().interventions.is_empty())
+                );
             }
-            assert!(session.token_ids()[1..].iter().any(|&id| id != 12), "clearing must restore ordinary sampling");
+            assert!(
+                session.token_ids()[1..].iter().any(|&id| id != 12),
+                "clearing must restore ordinary sampling"
+            );
             // Restoration must recover the saved immutable source after clear.
             session.restore(&saved)?;
             *visible.borrow_mut() = prefix_text;
             let mut recovered = Vec::new();
-            while let Some(step) = session.step()? { recovered.extend(step.captures.iter().cloned()); }
+            while let Some(step) = session.step()? {
+                recovered.extend(step.captures.iter().cloned());
+            }
             assert_eq!(session.token_ids(), &[12, 12, 12, 12]);
             assert_eq!(*visible.borrow(), expected_text);
             inspect(&recovered, true, evidence);
@@ -271,22 +289,27 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
     };
     let output = if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
-                add_generation_prompt: false,
-                tool_choice: ToolChoice::None,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
+                    add_generation_prompt: false,
+                    tool_choice: ToolChoice::None,
+                    ..Default::default()
+                },
+                8 * 1024 * 1024 * 1024,
+            )
             .unwrap();
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
-        settings.inference.managed_memory_capacity_bytes = None;
         model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::token_ids(&chat, ids),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&ids),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings,
+                    settings: chat_settings(&chat, settings),
                     options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -365,7 +388,11 @@ fn compare_modes(evidence: Evidence, case: &str) {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Evidence { None, Preview, Summary }
+enum Evidence {
+    None,
+    Preview,
+    Summary,
+}
 impl Evidence {
     fn request(self) -> InterventionEvidence {
         match self {

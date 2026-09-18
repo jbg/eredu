@@ -4,7 +4,7 @@
 //! chain; it creates no numerical work, observer or completion certificate.
 use super::*;
 use crate::backend::submission_recovery::PreparedRecovery;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
@@ -14,7 +14,7 @@ pub(super) struct FundedRetention {
     retained: DrafterRetention,
     // Recovery frees its Box and native scope before this payload; its retained
     // Rc shell and any payload alias retire before the last metadata account.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl Retention for FundedRetention {
     fn observe(&self, status: Status) {
@@ -27,7 +27,7 @@ pub(super) enum DrafterRecovery {
     Funded(Recovery<FundedRetention>),
 }
 impl DrafterRecovery {
-    pub(super) fn funding(&self) -> Option<&WorkspaceMetadataFunding> {
+    pub(super) fn funding(&self) -> Option<&HostMetadataFunding> {
         match self {
             Self::Ordinary(_) => None,
             Self::Funded(recovery) => Some(&recovery.retention().funding),
@@ -67,12 +67,12 @@ pub(super) enum Cause {
 struct Failure {
     #[source]
     cause: Cause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 
 /// Exactly one returned failure shell was reserved before the operation began.
 /// No !Send payload/native owner is placed in the public error; recovery keeps it.
-pub(super) fn failure(cause: Cause, funding: WorkspaceMetadataFunding) -> Error {
+pub(super) fn failure(cause: Cause, funding: HostMetadataFunding) -> Error {
     let kind = match &cause {
         Cause::Operation(error) | Cause::Unresolved(Some(error)) => error
             .retained_backend_failure_kind()
@@ -106,18 +106,18 @@ fn control_bytes<T>() -> Option<usize> {
         size_of::<Result<T, Error>>(),
         size_of::<Cause>(),
         size_of::<Failure>(),
-        size_of::<WorkspaceMetadataFunding>(),
+        size_of::<HostMetadataFunding>(),
         size_of::<eredu_core::BackendFailureKind>(),
         size_of::<eredu_core::BackendFailure>(),
-        size_of::<Option<&WorkspaceMetadataFunding>>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<Option<&HostMetadataFunding>>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
         size_of::<Result<(), WorkingMemoryError>>(),
         size_of::<&mut DrafterExecution>(),
-        size_of::<(&mut MlxDrafter, WorkspaceMetadataFunding)>(),
+        size_of::<(&mut MlxDrafter, HostMetadataFunding)>(),
         size_of::<Result<&crate::composition::mlx::Executable, WorkingMemoryError>>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?,
         usize::try_from(
-            PreparedRecovery::<FundedRetention, WorkspaceMetadataFunding>::control_bytes()?,
+            PreparedRecovery::<FundedRetention, HostMetadataFunding>::control_bytes()?,
         )
         .ok()?,
     ];
@@ -157,7 +157,7 @@ impl MlxDrafter {
     /// child phases own their exact quotas and native completion independently.
     pub(crate) fn with_autoregressive_funded<T>(
         &mut self,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         run: impl FnOnce(
             &mut crate::backend::MlxModel,
             &SelectedSpeculativeRealization,
@@ -180,7 +180,7 @@ impl MlxDrafter {
     /// quote and admit its exact source-backed invocation before executing it.
     pub(crate) fn visit_funded<W, T>(
         &mut self,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         visitor: W,
     ) -> Result<T, Error>
     where
@@ -203,7 +203,7 @@ impl MlxDrafter {
     /// inside the same guarded assistant operation and are never cloned here.
     pub(crate) fn visit_selected_funded<W, T>(
         &mut self,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         visitor: W,
     ) -> Result<T, Error>
     where
@@ -220,7 +220,7 @@ impl MlxDrafter {
         let controls = eredu_architectures::MaterializedExternalAssistantExecution::<
             MlxAssistantPreparationVisitor,
         >::selected_visit_control_bytes::<W>()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         funding.reserve_metadata(controls).map_err(Error::WorkspacePlanning)?;
         self.with_funded(funding, |execution| match execution {
             DrafterExecution::Assistant(assistant) => assistant.visit_selected(visitor),
@@ -240,13 +240,13 @@ impl MlxDrafter {
 
     fn with_funded<T>(
         &mut self,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         run: impl FnOnce(&mut DrafterExecution) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let controls = control_bytes::<T>()
             .and_then(|bytes| bytes.checked_add(size_of_val(&run)))
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(controls)

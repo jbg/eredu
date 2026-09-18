@@ -66,11 +66,11 @@ impl<T: Retention, C: 'static> OperationRecovery<T, C> {
             Self::Original(value) => value.wait(),
         }
     }
-    pub(crate) fn finish(self) -> Result<Observation, Exception> {
+    pub(crate) fn finish(self) -> Result<Observation, FinishRetainingError<Exception>> {
         match self {
             Self::Ordinary(value) => Ok(Observation {
                 outcome: ScopedSubmissionProgress::Observed,
-                status: value.finish(),
+                status: value.finish().map_err(FinishRetainingError::Retirement)?,
             }),
             Self::Original(value) => value.finish(),
         }
@@ -84,6 +84,7 @@ impl<T: Retention, C: 'static> OperationRecovery<T, C> {
             size_of::<Result<Self, Exception>>(),
             size_of::<Observation>(),
             size_of::<Result<Observation, Exception>>(),
+            size_of::<Result<Observation, FinishRetainingError<Exception>>>(),
             size_of::<Option<&safemlx::OriginalScopeObserver>>(),
             size_of::<&Self>(),
             size_of::<&mut Self>(),

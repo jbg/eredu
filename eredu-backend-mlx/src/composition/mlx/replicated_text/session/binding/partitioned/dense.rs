@@ -10,6 +10,7 @@ pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPredictionBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub distributed: crate::backend::distributed::MlxDistributedSession,
     pub additional_claimed_sources: std::collections::BTreeSet<String>,
@@ -63,7 +64,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
-            None,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
             PredictionReplicatedFinalizer {
                 prediction: SelectedPrediction {
                     extension,
@@ -76,6 +77,7 @@ impl
 }
 
 pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
@@ -84,6 +86,7 @@ pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPoolingRoutedDecoderBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) stream: &'a Stream,
@@ -136,6 +139,7 @@ impl
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
             self.addressable_manager,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )
     }
 }
@@ -194,8 +198,9 @@ macro_rules! impl_partitioned_prediction_binding {
                         },
                         capability: self.capability,
                     },
-            self.addressable_manager,
-        )
+                    self.addressable_manager,
+                    self.layerwise_manager.and_then(std::cell::Cell::take),
+                )
             }
         }
     };
@@ -245,6 +250,7 @@ impl
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
             self.addressable_manager,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )
     }
 }

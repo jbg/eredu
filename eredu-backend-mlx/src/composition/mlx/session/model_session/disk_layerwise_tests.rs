@@ -84,14 +84,18 @@ pub(super) fn evidence(ids: &Vec<u32>) -> TextPreparationInput<'static, MlxModel
     }
 }
 
-fn artifact() -> tempfile::TempDir {
+pub(super) fn artifact() -> tempfile::TempDir {
+    artifact_with_layers(LAYERS, true)
+}
+
+pub(super) fn artifact_with_layers(layers: usize, tied: bool) -> tempfile::TempDir {
     use safetensors::tensor::{serialize_to_file, TensorView};
 
-    let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
+    let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", tied);
     let config_path = root.path().join("config.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-    config["num_hidden_layers"] = LAYERS.into();
+    config["num_hidden_layers"] = layers.into();
     std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let path = root.path().join("model.safetensors");
     let bytes = std::fs::read(&path).unwrap();
@@ -101,7 +105,7 @@ fn artifact() -> tempfile::TempDir {
     for (name, value) in tensors.tensors() {
         if let Some(suffix) = name.strip_prefix("model.layers.0.") {
             repeated += 1;
-            for ordinal in 0..LAYERS {
+            for ordinal in 0..layers {
                 views.push((
                     format!("model.layers.{ordinal}.{suffix}"),
                     TensorView::new(value.dtype(), value.shape().to_vec(), value.data()).unwrap(),

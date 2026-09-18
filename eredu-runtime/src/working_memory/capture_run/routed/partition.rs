@@ -18,7 +18,7 @@ impl<'a> CapturePartitionRoutedHostPlan<'a> {
     /// Inspect the same original receipt without allocating ownership or row data.
     pub fn prepare(receipt: &'a PartitionCaptureReceiptPlan, producer: usize, fragment: usize)
         -> Result<Self, CaptureRunHostError> {
-        let source = receipt.shared_plan_source().ok_or(CaptureRunHostError::ReceiptMismatch)?;
+        let source = receipt.shared_plan_source();
         let context = receipt.context();
         if receipt.combination() != PartitionCaptureCombination::Disjoint
             || context.capture_plan_identity != source.admission().identity() {
@@ -102,7 +102,7 @@ impl<'a, 'c> CapturePartitionRoutedClaim<'a, 'c> {
         let mut receipt = [0; 64];
         if self.plan.receipt.identity().len() != receipt.len() { return Err(CaptureRunHostError::ReceiptMismatch); }
         receipt.copy_from_slice(self.plan.receipt.identity().as_bytes());
-        let source = self.plan.receipt.shared_plan_source().ok_or(CaptureRunHostError::ReceiptMismatch)?.clone();
+        let source = self.plan.receipt.shared_plan_source().clone();
         let source_tokens = self.plan.geometry().source_shape()[0] as u64;
         let owner = OwnedCaptureRoutedUnits::allocate(&self.plan.host, self.identity)?;
         Ok(PreparedPartitionRoutedCapture { owner, source, receipt,
@@ -186,7 +186,7 @@ impl PreparedPartitionRoutedCapture {
         -> Result<&'a RoutedUnitCaptureOwnership, CaptureRoutedHostError> {
         self.owner.check()?;
         if receipt.identity().as_bytes() != self.receipt
-            || !receipt.shared_plan_source().is_some_and(|source| self.source.same_storage(source))
+            || !self.source.same_storage(receipt.shared_plan_source())
             || receipt.producer(self.producer).and_then(|p| p.fragments().get(self.fragment)).is_none() {
             return Err(RoutedUnitValidationError::Ownership.into());
         }

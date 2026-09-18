@@ -107,7 +107,7 @@ impl
         check_inference_scope();
         self.calls.set(self.calls.get() + 1);
         if self.fail {
-            Err(Error::backend_source(InputCause(INPUT_CAUSE.with(
+            Err(Error::backend_retained_source(InputCause(INPUT_CAUSE.with(
                 |slot| slot.borrow_mut().take().expect("test cause"),
             ))))
         } else {
@@ -140,7 +140,7 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
         opening: &eredu_runtime::inspection::PrefillOpeningState<'_, FakeTensor>,
     ) -> Result<Option<eredu_runtime::inspection::PreparedPrefillChunkRetention>, Error> {
         check_inference_scope();
-        opening.visit(&mut |_| {}).map_err(Error::backend_source)?;
+        opening.visit(&mut |_| {}).map_err(Error::backend_retained_source)?;
         std::panic::panic_any(self.opening_panic.take().expect("opening panic fixture"))
     }
     fn transactional(&self) -> bool {
@@ -586,7 +586,8 @@ fn agreed_source_rejection_preserves_before_state_mutation_and_ordinary_retry() 
     let cancellation = GenerationCancellationToken::new();
     let mut observer = Observer::default();
     let error = session
-        .try_prefill_unbudgeted_source_cancellable::<Source, _>(
+        .try_prefill_source_cancellable::<Source, _>(
+            None,
             Some([1, 1]),
             None,
             |_| {
@@ -618,7 +619,8 @@ fn agreed_source_rejection_preserves_before_state_mutation_and_ordinary_retry() 
     assert_eq!(TERMINAL_SUBMISSION_MARKS.with(Cell::get), 0);
     assert!(observer.finished.is_empty());
     let output = session
-        .try_prefill_unbudgeted_source_cancellable(
+        .try_prefill_source_cancellable(
+            None,
             Some([1, 1]),
             None,
             |geometry| {

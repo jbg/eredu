@@ -2,11 +2,13 @@
 use super::*;
 use crate::execution_control::{PreparedTextHostCopy, TextHostCopyError};
 use eredu_core::{RetainedGenerationSequenceCopy, RetainedSequenceCopyMismatch};
+mod semantic;
 
 pub(in crate::working_memory) struct RetainedSequenceHostCopy<'a> {
     source: &'a Provider,
     sequence: RetainedGenerationSequenceCopy<'a>,
     bytes: u64,
+    logical_bytes: u64,
     capacity: u64,
     snapshot_controls: Option<usize>,
     native_preparation_bytes: Option<u64>,
@@ -61,20 +63,10 @@ impl WorkingMemoryPool {
         B: crate::execution_control::TextSnapshotBackend,
         D: crate::execution_control::SnapshotTokenController,
     {
-        let mut plan = self.prepare_generation_host_copy_plan::<C, E>(sequence, capacity)?;
+        let plan = self.prepare_generation_host_copy_plan::<C, E>(sequence, capacity)?;
         let controls = crate::execution_control::TextContinuationSnapshot::<B, D>::original_capture_control_bytes::<C>()
             .ok_or(WorkingMemoryError::Overflow)?;
-        plan.bytes = plan
-            .bytes
-            .checked_add(u64::try_from(controls).map_err(|_| WorkingMemoryError::Overflow)?)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        plan.bytes = plan
-            .bytes
-            .checked_add(native_preparation_bytes)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        plan.snapshot_controls = Some(controls);
-        plan.native_preparation_bytes = Some(native_preparation_bytes);
-        Ok(plan)
+        plan.with_controls(controls, native_preparation_bytes)
     }
 
     /// Same immutable provider and copy worker with fresh-resume constructor
@@ -90,16 +82,9 @@ impl WorkingMemoryPool {
         B: crate::execution_control::TextSnapshotBackend + eredu_core::TextResumeBackend<ResumeSource = <B as crate::execution_control::TextSnapshotBackend>::SavedTextComponents>,
         D: crate::execution_control::SnapshotTokenController,
     {
-        let mut plan = self.prepare_generation_host_copy_plan::<C, E>(sequence, capacity)?;
+        let plan = self.prepare_generation_host_copy_plan::<C, E>(sequence, capacity)?;
         let controls = crate::execution_control::TextContinuationSnapshot::<B,D>::original_resume_control_bytes::<C>().ok_or(WorkingMemoryError::Overflow)?;
-        plan.bytes = plan
-            .bytes
-            .checked_add(u64::try_from(controls).map_err(|_| WorkingMemoryError::Overflow)?)
-            .and_then(|n| n.checked_add(native_preparation_bytes))
-            .ok_or(WorkingMemoryError::Overflow)?;
-        plan.snapshot_controls = Some(controls);
-        plan.native_preparation_bytes = Some(native_preparation_bytes);
-        Ok(plan)
+        plan.with_controls(controls, native_preparation_bytes)
     }
 
     // Tests only the concrete provider/lease producer, without constructing a
@@ -121,6 +106,7 @@ impl WorkingMemoryPool {
             .bytes
             .checked_add(u64::try_from(controls).map_err(|_| WorkingMemoryError::Overflow)?)
             .ok_or(WorkingMemoryError::Overflow)?;
+        plan.logical_bytes = plan.bytes;
         plan.snapshot_controls = Some(controls);
         plan.native_preparation_bytes = Some(0);
         Ok(plan)
@@ -161,6 +147,7 @@ impl WorkingMemoryPool {
             source,
             sequence,
             bytes,
+            logical_bytes: bytes,
             capacity,
             snapshot_controls: None,
             native_preparation_bytes: None,
@@ -232,7 +219,7 @@ impl Provider {
 impl PreparedTextHostCopy for RetainedSequenceHostCopy<'_> {
     type Copied = RetainedGenerationSequence;
     fn storage_bytes(&self) -> Option<u64> {
-        Some(self.bytes)
+        Some(self.logical_bytes)
     }
     fn copy(self, _retained_bytes: u64) -> Result<Self::Copied, TextHostCopyError> {
         self.copy_with_custody(None).map(|(sequence, _)| sequence)
@@ -277,6 +264,16 @@ impl PreparedTextHostCopy for RetainedSequenceHostCopy<'_> {
     }
 }
 impl RetainedSequenceHostCopy<'_> {
+    fn with_controls(mut self, controls: usize, native: u64) -> Result<Self, WorkingMemoryError> {
+        self.bytes = self.bytes
+            .checked_add(u64::try_from(controls).map_err(|_| WorkingMemoryError::Overflow)?)
+            .and_then(|bytes| bytes.checked_add(native))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        self.logical_bytes = self.bytes;
+        self.snapshot_controls = Some(controls);
+        self.native_preparation_bytes = Some(native);
+        Ok(self)
+    }
     fn copy_with_custody(
         self,
         reservation: Option<crate::execution_control::PendingSnapshotResumeRetention>,

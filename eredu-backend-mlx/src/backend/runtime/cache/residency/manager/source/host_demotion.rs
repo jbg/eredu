@@ -35,13 +35,14 @@ pub(crate) struct PreparedCacheHostDemotion {
     id: CacheBlockId,
     manager: CacheResidencyManager,
     generation: u64,
-    reservation: CachePoolReservation,
+    reservation: Option<CachePoolReservation>,
+    device_retirement: super::device_retirement::DeviceRetirement,
     host_capacity: u64,
     attempted: bool,
     completed: bool,
     published: bool,
     context: WorkspaceContext,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 impl CacheBlockSourceLoan<'_> {
@@ -220,6 +221,7 @@ impl CacheBlockSourceLoan<'_> {
             .map_err(|cause| {
                 CacheSourceFailure::metadata(context.metadata_source(cause), context)
             })?;
+        let device_retirement = super::device_retirement::DeviceRetirement::prepare(context)?;
         Ok(PreparedCacheHostDemotion {
             destinations: [None, None],
             replaced: None,
@@ -235,7 +237,8 @@ impl CacheBlockSourceLoan<'_> {
             id: id.clone(),
             manager: self.manager.clone(),
             generation: self.generation,
-            reservation,
+            reservation: Some(reservation),
+            device_retirement,
             host_capacity: capacity,
             attempted: false,
             completed: false,
@@ -247,6 +250,8 @@ impl CacheBlockSourceLoan<'_> {
 }
 
 impl PreparedCacheHostDemotion {
+    pub(crate) fn reclaim_replaced_device(&mut self) { self.device_retirement.reclaim(); }
+
     pub(crate) fn host_capacity(&self) -> u64 {
         self.host_capacity
     }
@@ -348,6 +353,9 @@ impl PreparedCacheHostDemotion {
             destination
                 .synchronize()
                 .map_err(|cause| source.error(CacheSourceError::HostStore(cause)))?;
+            if let Some(root) = destination.output() {
+                proof.roots().retire_completed(root).map_err(|cause| source.error(cause))?;
+            }
             let buffer = destination
                 .take_completed()
                 .map_err(|cause| source.error(CacheSourceError::HostStore(cause)))?;
@@ -466,15 +474,19 @@ impl PreparedCacheHostDemotion {
                 rotary_key: Arc::clone(second),
             },
         };
+        self.device_retirement.attach(proof.arrays()).map_err(|cause| source.error(cause))?;
         self.replaced = Some(commit_host(
             &self.manager,
             proof,
             host,
             self.host_capacity,
-            &mut self.reservation,
+            self.reservation.as_mut().expect("unpublished reservation"),
             true,
         )?);
         self.published = true;
+        self.device_retirement.publish(&mut self.reservation);
+        self.destinations = [None, None];
+        self.replaced = None;
         Ok(())
     }
     pub(crate) fn control_bytes() -> Option<usize> {
@@ -517,3 +529,5 @@ impl PreparedCacheHostDemotion {
             .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

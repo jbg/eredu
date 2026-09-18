@@ -1,7 +1,7 @@
 //! Exact completed-ID and immutable remap sources for one addressable chunk.
 use super::*;
 use eredu_core::{SharedStorageOwner, SharedStorageRetirement};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::expert::{AddressableChunkCensus, AddressableChunkPlan, IndexedDemandSource};
 use safemlx::{OriginalScopeObserver, PreparedInputRuntime, OwnedHostCopyPlan,
     OwnedHostCopyFacts, PreparedSubmissionGraphQuota, StreamCopyPlan};
@@ -32,7 +32,7 @@ impl IndexedBankSource {
     pub(crate) fn new(bank:SharedAddressableParameterBank,options:eredu_runtime::ParameterBankLoadOptions)->Self {
         Self{bank,options,request:Rc::new(request::Channel::default())}
     }
-    pub(crate) fn with_workspace_source<T,E,F>(&self,funding:&WorkspaceMetadataFunding,inspect:F)
+    pub(crate) fn with_workspace_source<T,E,F>(&self,funding:&HostMetadataFunding,inspect:F)
         ->Result<Result<T,E>,AddressableSourceFailure>
     where F:for<'a> FnOnce(AddressableBankSourceLoan<'a>)->Result<T,E> {
         self.bank.with_workspace_source(funding,inspect)
@@ -56,7 +56,7 @@ enum Cause {
     #[error("addressable indexed source extent overflowed")]
     Overflow,
     #[error("addressable indexed source funding: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
     #[error("addressable indexed destination allocation: {0}")]
     Allocation(#[source] std::collections::TryReserveError),
     #[error("addressable indexed source bank: {0}")]
@@ -98,14 +98,14 @@ struct Failure {
     #[source] cause: Cause,
     source: Option<SharedStorageOwner<SourceIdentity>>,
     bank: SharedAddressableParameterBank,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
         f.debug_struct("AddressableIndexedFailure").field("cause",&self.cause).finish_non_exhaustive()
     }
 }
-fn failed(cause:Cause, bank:&SharedAddressableParameterBank, funding:&WorkspaceMetadataFunding,
+fn failed(cause:Cause, bank:&SharedAddressableParameterBank, funding:&HostMetadataFunding,
     source:Option<&SharedStorageOwner<SourceIdentity>>)->Error {
     Error::Neural(eredu_nn::Error::backend_retained_source(Failure {
         cause, source:source.cloned(), bank:bank.clone(), funding:funding.clone(),
@@ -123,14 +123,14 @@ pub(super) fn require_ordinary()->Result<(),Error> {
 // A remap source arena carries account custody only: no array, bank/manager,
 // observer or source object can form a native allocation backedge here.
 #[derive(Clone)]
-struct CopyCustody { funding: WorkspaceMetadataFunding }
+struct CopyCustody { funding: HostMetadataFunding }
 struct SourceIdentity {
     input:Array,
     bank:SharedAddressableParameterBank,
     census:AddressableChunkCensus,
     bulk_target_bytes:u64,
     parameter_revision:u64,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl SharedStorageRetirement for SourceIdentity {
     fn retire(self:Arc<Self>){drop(Arc::into_inner(self));}
@@ -173,7 +173,7 @@ impl IndexedChunkLayout {
                 .max(safemlx::EvaluatedArray::iteration_control_bytes::<i64>()?)
                 .max(safemlx::EvaluatedArray::iteration_control_bytes::<u64>()?),
             IndexedDemandSource::control_bytes()?,
-            eredu_nn::Error::retained_source_control_bytes::<Failure>()?,
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>()?,
             OriginalScopeObserver::control_bytes()?,
             Array::descriptor_comparison_control_bytes()?.checked_mul(3)?,
             Array::inspection_clone_handle_bytes(),safemlx::PreparedArrayClone::control_bytes()?,
@@ -222,7 +222,7 @@ struct Body {
     completed:Cell<bool>,
     residency:std::cell::RefCell<Option<Box<dyn slots::IndexedResidency>>>,
     route_copies:Cell<usize>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 #[derive(Clone)]
 pub(crate) struct OriginalIndexedChunkSource(Option<Rc<Body>>);
@@ -346,13 +346,13 @@ impl MlxIndexedMovement {
     /// this constructor funds only its exact host/source population.
     pub(crate) fn prepare_original_chunk(&self,census:AddressableChunkCensus,input:&MlxTensor,
         runtime:&PreparedInputRuntime,observer:&OriginalScopeObserver,stream:&Stream,
-        funding:&WorkspaceMetadataFunding)->Result<OriginalIndexedChunkSource,Error>{
+        funding:&HostMetadataFunding)->Result<OriginalIndexedChunkSource,Error>{
         let binding=self.binding.as_ref().ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
         let fail=|cause|failed(cause,&binding.bank,funding,None);
         let fixed=[size_of::<Result<IndexedChunkLayout,Error>>(),size_of::<IndexedChunkLayout>(),
             size_of::<(&Self,AddressableChunkCensus,&MlxTensor,&PreparedInputRuntime,&OriginalScopeObserver,&Stream)>(),
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||fail(Cause::Overflow))?,
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||fail(Cause::Overflow))?,
             OriginalScopeObserver::control_bytes().ok_or_else(||fail(Cause::Overflow))?];
         funding.reserve_metadata(fixed.into_iter().try_fold(size_of_val(&fixed),usize::checked_add)
             .ok_or_else(||fail(Cause::Overflow))?).map_err(|e|fail(Cause::Funding(e)))?;
@@ -391,7 +391,7 @@ impl MlxIndexedMovement {
         run:F)->Result<T,Error> where F:FnOnce(&mut Self)->Result<T,Error>{
         let frames=[size_of::<T>(),size_of::<F>(),size_of::<Result<T,Error>>(),
             size_of::<OriginalIndexedChunkSource>(),size_of::<Option<OriginalIndexedChunkSource>>(),
-            size_of::<&mut Self>(),eredu_nn::Error::retained_source_control_bytes::<Failure>()
+            size_of::<&mut Self>(),eredu_nn::Error::retained_source_construction_bytes::<Failure>()
                 .ok_or_else(||source.failure(Cause::Overflow))?];
         source.body().funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or_else(||source.failure(Cause::Overflow))?).map_err(|e|source.failure(Cause::Funding(e)))?;

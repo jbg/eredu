@@ -8,8 +8,8 @@ use eredu_runtime::{residency::ResidencyClosureSlot,working_memory::{WorkingMemo
     OriginalHostSourceBank,HostSourceConstructionFacts}};
 use std::cell::RefCell;
 use crate::backend::submission_recovery::{Retention,Status,observed::{PreparedObservedRecovery,ObservedRecovery}};
-type PendingInvocation=PreparedObservedRecovery<InvocationRetention,WorkspaceMetadataFunding>;
-type ActiveInvocation=ObservedRecovery<InvocationRetention,WorkspaceMetadataFunding>;
+type PendingInvocation=PreparedObservedRecovery<InvocationRetention,HostMetadataFunding>;
+type ActiveInvocation=ObservedRecovery<InvocationRetention,HostMetadataFunding>;
 
 /// One actual unit invocation. Completed demands still select each exact window.
 pub(crate) struct IndexedResidencyPlan {
@@ -23,25 +23,64 @@ pub(crate) struct IndexedResidencyPlan {
     constructor_bytes:u64,
     read:Option<ForegroundDiskSubsetCeiling>,
     pool:Option<WorkingMemoryPool>,
-    source_funding:WorkspaceMetadataFunding,
-    funding:WorkspaceMetadataFunding,
+    source_funding:HostMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Exactly one direct child of the accepted root per retained chunk.
 /// Fields are private: scalar counts cannot manufacture these authorities.
 pub(crate) struct IndexedConstructorPartitions {
     banks:Vec<OriginalHostSourceBank>,
 }
+impl IndexedConstructorPartitions {
+    /// Parent grants were all consumed before choosing a completed row count.
+    /// Unused children retire here; no allowance is returned to that parent.
+    pub(crate) fn select_count_control_bytes()->Option<usize> {
+        Some(size_of::<(Self,usize,&HostMetadataFunding,Result<Self,Error>)>())
+    }
+    pub(crate) fn select_count(mut self, count: usize, funding:&HostMetadataFunding) -> Result<Self, Error> {
+        funding.reserve_metadata(Self::select_count_control_bytes().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+            .map_err(|cause|Error::Neural(eredu_nn::workspace::WorkspaceMetadataError::Funding(cause).into()))?;
+        if count > self.banks.len() { return Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)); }
+        self.banks.truncate(count);
+        Ok(self)
+    }
+}
 impl IndexedResidencyPlan {
+    fn row_frame_bytes()->Option<usize> {
+        Some(size_of::<(&Self,usize,&HostMetadataFunding,Self,Result<Self,Error>,
+            AddressableChunkCensus,Option<AddressableChunkCensus>,AddressableChunkPlan,
+            Option<AddressableChunkPlan>)>())
+    }
+    /// Complete additional specialization work, before the separately priced
+    /// invocation clone performed when the selected native role is entered.
+    pub(crate) fn for_rows_control_bytes(&self)->Option<usize> {
+        Self::row_frame_bytes()?.checked_add(Self::clone_frame_bytes()?)?
+            .checked_add(if self.read.is_some() {ForegroundDiskSubsetCeiling::clone_control_bytes()?} else {0})
+    }
+    /// Narrows a real immutable source; issued constructor/read banks remain
+    /// separate move-only inputs and are neither created nor replenished here.
+    pub(crate) fn for_rows(&self,rows:usize,funding:&HostMetadataFunding)->Result<Self,Error> {
+        funding.reserve_metadata(Self::row_frame_bytes().ok_or_else(||self.failure(Cause::Overflow))?)
+            .map_err(|cause|self.failure(Cause::Funding(cause)))?;
+        let plan=self.first.plan().for_rows(rows).ok_or_else(||self.failure(Cause::Identity))?;
+        let first=AddressableChunkCensus::new(self.first.bank(),self.first.unit(),plan,0,self.first.access())
+            .ok_or_else(||self.failure(Cause::Identity))?;
+        let mut selected=self.clone_for_invocation(funding)?;
+        selected.first=first;
+        Ok(selected)
+    }
     pub(crate) fn with_native_copy_source<T>(&self,
         visit: impl FnOnce(&SupplementaryResidencySource, WindowPopulation, usize) -> T) -> T {
         visit(&self.source, self.native_window, self.first.plan().len())
     }
     fn clone_frame_bytes()->Option<usize> {
         let frames=[size_of::<Self>(),size_of::<Result<Self,Error>>(),
-            size_of::<(&Self,&WorkspaceMetadataFunding)>(),size_of::<IndexedBankSource>(),
+            size_of::<(&Self,&HostMetadataFunding)>(),size_of::<IndexedBankSource>(),
             size_of::<SharedAddressableParameterBank>(),size_of::<SupplementaryResidencySource>(),
             size_of::<ResidencyManager>(),size_of::<Option<ForegroundDiskSubsetCeiling>>(),
-            size_of::<Option<WorkingMemoryPool>>(),size_of::<WorkspaceMetadataFunding>()*2];
+            size_of::<Option<WorkingMemoryPool>>(),size_of::<HostMetadataFunding>()*2];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
     /// All actual descriptive clone, parent/child source loan and factory
@@ -64,7 +103,7 @@ impl IndexedResidencyPlan {
     }
     /// Reuses only the immutable source description. Accepted constructor/read
     /// banks and native occurrence state remain separate move-only inputs.
-    pub(crate) fn clone_for_invocation(&self,funding:&WorkspaceMetadataFunding)->Result<Self,Error> {
+    pub(crate) fn clone_for_invocation(&self,funding:&HostMetadataFunding)->Result<Self,Error> {
         let fail=|cause|failed(cause,&self.bank,funding,None);
         funding.reserve_metadata(Self::clone_frame_bytes().ok_or_else(||fail(Cause::Overflow))?)
             .map_err(|cause|fail(Cause::Funding(cause)))?;
@@ -197,18 +236,18 @@ impl IndexedBankSource {
     /// Work scales with the retained member declarations, never token rows or
     /// the combinatorial population of possible selected-demand subsets.
     pub(crate) fn inspect_original_residency(&self,first:AddressableChunkCensus,
-        pool:Option<&WorkingMemoryPool>,funding:&WorkspaceMetadataFunding)->Result<IndexedResidencyPlan,Error> {
+        pool:Option<&WorkingMemoryPool>,funding:&HostMetadataFunding)->Result<IndexedResidencyPlan,Error> {
         let binding=self;
         let fail=|cause|failed(cause,&binding.bank,funding,None);
         let controls=[size_of::<IndexedResidencyPlan>(),size_of::<Result<IndexedResidencyPlan,Error>>(),
-            size_of::<(AddressableChunkCensus,&Self,Option<&WorkingMemoryPool>,&WorkspaceMetadataFunding)>(),
+            size_of::<(AddressableChunkCensus,&Self,Option<&WorkingMemoryPool>,&HostMetadataFunding)>(),
             size_of::<(ResidencyManager,SupplementaryResidencySource,Vec<OffloadUnitId>,u64)>(),
             size_of::<Vec<ResidencyClosureSlot>>(),size_of::<[WindowPopulation;2]>(),
             size_of::<Option<ForegroundDiskWindowPlan>>(),size_of::<Option<ForegroundDiskSubsetCeiling>>(),
             size_of::<[usize;8]>(),size_of::<[u64;3]>(),size_of::<[u8;ParameterBankKey::unit_id_buffer_bytes()]>(),
             AddressableChunkPlan::control_bytes(),OriginalIndexedResidencyInvocation::control_bytes()
                 .ok_or_else(||fail(Cause::Overflow))?,
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||fail(Cause::Overflow))?];
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||fail(Cause::Overflow))?];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
             .ok_or_else(||fail(Cause::Overflow))?).map_err(|e|fail(Cause::Funding(e)))?;
         if first.index()!=0{return Err(fail(Cause::Identity));}
@@ -377,7 +416,7 @@ impl<P> Drop for InvocationGuard<'_,P> {
 }
 impl OriginalIndexedResidencyInvocation {
     pub(in crate::backend::runtime::residency::parameter_bank::movement) fn matches_funding(
-        &self,funding:&WorkspaceMetadataFunding)->bool {self.0.plan.funding.same_account(funding)}
+        &self,funding:&HostMetadataFunding)->bool {self.0.plan.funding.same_account(funding)}
     pub(in crate::backend::runtime::residency::parameter_bank::movement) fn run_with_owner<P,R,E,F>(
         self,owner:&mut P,movement:fn(&mut P)->&mut MlxIndexedMovement,stream:&Stream,run:F)
         ->Result<Result<R,E>,Error> where F:FnOnce(&mut P)->Result<R,E> {
@@ -432,7 +471,7 @@ impl MlxIndexedMovement {
 impl MlxIndexedMovement {
     /// Compatibility projection from this actual selected movement binding.
     pub(crate) fn inspect_original_residency(&self,first:AddressableChunkCensus,
-        pool:Option<&WorkingMemoryPool>,funding:&WorkspaceMetadataFunding)->Result<IndexedResidencyPlan,Error> {
+        pool:Option<&WorkingMemoryPool>,funding:&HostMetadataFunding)->Result<IndexedResidencyPlan,Error> {
         let binding=self.binding.as_ref().ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
         if self.original.is_some()||self.invocation.is_some(){return Err(failed(Cause::Spent,&binding.bank,funding,None));}
@@ -490,7 +529,7 @@ impl IndexedResidencyPlan {
 }
 impl OriginalIndexedResidencyFactory {
     pub(in crate::backend::runtime::residency::parameter_bank::movement) fn funding(
-        &self)->&WorkspaceMetadataFunding { &self.plan.funding }
+        &self)->&HostMetadataFunding { &self.plan.funding }
     /// Checks the reached immutable coordinates before consuming the native
     /// factory. Numerical/source-layout identity remains the outer quote's job.
     fn request_control_bytes()->usize {
@@ -535,7 +574,7 @@ impl OriginalIndexedResidencyFactory {
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
     pub(in crate::backend::runtime::residency::parameter_bank::movement) fn matches_funding(
-        &self,funding:&WorkspaceMetadataFunding)->bool {self.plan.funding.same_account(funding)}
+        &self,funding:&HostMetadataFunding)->bool {self.plan.funding.same_account(funding)}
     pub(in crate::backend::runtime::residency::parameter_bank::movement) fn prepare(
         self,movement:&MlxIndexedMovement,stream:&Stream)->Result<OriginalIndexedResidencyInvocation,Error> {
         let binding=movement.binding.as_ref().ok_or_else(||self.plan.failure(Cause::Identity))?;
@@ -557,3 +596,5 @@ impl OriginalIndexedResidencyFactory {
         self.plan.prepare_partitioned(self.access,self.constructors,self.reads,&self.runtime,&self.observer,stream)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

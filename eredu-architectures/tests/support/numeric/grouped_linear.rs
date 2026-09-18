@@ -104,12 +104,16 @@ impl NumericLinearGroups {
 }
 
 impl Parameterized<NumericTensor> for NumericLinearGroups {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, NumericTensor>>(&'a self, visitor: &mut V) {
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
         visit(&self.metadata, &self.weight, visitor);
         if let Some((metadata, bias)) = &self.bias {
             visit(metadata, bias, visitor);
         }
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, NumericTensor>>(
         &'a mut self,
         visitor: &mut V,

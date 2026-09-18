@@ -73,6 +73,6 @@ fn control_bytes<T,E:std::error::Error+Send+Sync+'static>()->Option<usize> {
         size_of::<CaptureTensorClaim<'_,'_>>(),size_of::<ClaimedCaptureTensor>(),size_of::<Result<ClaimedCaptureTensor,E>>(),
         size_of::<CaptureSummaryClaim<'_,'_>>(),size_of::<ClaimedCaptureSummary>(),size_of::<Result<ClaimedCaptureSummary,FundedCaptureError<E>>>(),
         size_of::<CaptureHistogramClaim<'_,'_>>(),size_of::<ClaimedCaptureHistogram>(),size_of::<Result<ClaimedCaptureHistogram,FundedCaptureError<E>>>(),
-        size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>(),size_of::<FundedCaptureError<E>>()];
+        size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>(),size_of::<FundedCaptureError<E>>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }

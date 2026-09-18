@@ -1,5 +1,5 @@
 //! Ordinary and prepared semantic controllers use the same borrowed byte worker.
-pub(super) use eredu_core::speculative::byte_trigger::{TriggerPrefix, find, next_prefix};
+pub(super) use eredu_core::speculative::byte_trigger::{TriggerPrefix, find};
 
 #[cfg(test)]
 mod tests {

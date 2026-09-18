@@ -34,6 +34,20 @@ impl CpuCopyEvalLayout {
     }
 }
 impl OperationEvent {
+    /// Exact immutable Host load/store Eval through the shared General-copy
+    /// worker. The accepted Host owner and stream remain independently checked
+    /// by the actual native constructor; this scalar fact grants neither.
+    pub fn cpu_host_transfer_layout(dtype:Dtype,rank:usize,store:bool,tracer:bool)->Option<CpuCopyEvalLayout>{
+        let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: scalar-only query, initialized output, no retained pointers.
+        if !unsafe{safemlx_sys::mlx_operation_event_cpu_host_transfer_eval_layout(
+            &mut native,dtype.into(),rank,store,tracer)} {return None;}
+        let parts=[size_of::<(Dtype,usize,bool,bool)>(),size_of_val(&native),size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes=native.named_control_bytes.checked_add(parts.into_iter()
+            .try_fold(size_of_val(&parts),usize::checked_add)?)?;
+        Some(CpuCopyEvalLayout{native})
+    }
+
     /// Bound the existing CPU Contiguous copy branch from its actual input rank.
     /// Alias/empty sources may consume less; no lazy flag or donation is assumed.
     pub fn cpu_contiguous_layout(rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -64,12 +78,13 @@ impl OperationEvent {
             .try_fold(size_of_val(&controls),usize::checked_add)?)?;
         Some(CpuCopyEvalLayout{native})
     }
-    /// Bound the existing nonempty unit-step CPU Slice alias at fixed rank 1..4.
+    /// Exact positive-step CPU Slice at fixed rank 1..4: nonempty alias or
+    /// empty zero-Data construction, with no physical backing birth.
     /// Native Eval validates the actual normalized source geometry before use.
-    pub fn cpu_slice_layout(rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+    pub fn cpu_slice_layout(rank: usize, empty: bool, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: the pure scalar query writes initialized output only on success.
-        unsafe { safemlx_sys::mlx_operation_event_cpu_slice_eval_layout(&mut native, rank, tracer) }
+        unsafe { safemlx_sys::mlx_operation_event_cpu_slice_eval_layout(&mut native, rank, empty, tracer) }
             .then_some(CpuCopyEvalLayout { native })
     }
     /// Exact existing rank-one F32 scalar overwrite worker. The native Eval
@@ -89,13 +104,21 @@ impl OperationEvent {
         unsafe {safemlx_sys::mlx_operation_event_cpu_static_update_eval_layout(
             &mut native,rank,elements,update_elements,tracer)}.then_some(CpuCopyEvalLayout{native})
     }
-    /// Existing rank-one F32 ArgSort worker and its actual U32 output/task.
-    /// No auxiliary sorting heap or source/completion authority is introduced.
-    pub fn cpu_argsort_layout(elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+    /// Shared stable ArgSort worker: a single F32 row or compact I32 final-axis
+    /// rows at rank one through three. Native Eval authenticates the actual
+    /// dtype, shape, strides and source backing independently of this query.
+    pub fn cpu_argsort_layout(dtype: Dtype, rank: usize, columns: usize, rows: usize,
+        tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: pure scalar query writes initialized output only on success.
-        unsafe { safemlx_sys::mlx_operation_event_cpu_argsort_eval_layout(
-            &mut native, elements, tracer) }.then_some(CpuCopyEvalLayout { native })
+        if !unsafe { safemlx_sys::mlx_operation_event_cpu_argsort_eval_layout(
+            &mut native, dtype.into(), rank, columns, rows, tracer) } { return None; }
+        let frames = [size_of::<(Dtype,usize,usize,usize,bool)>(),
+            size_of::<safemlx_sys::mlx_dtype>(), size_of_val(&native),
+            size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes = native.named_control_bytes.checked_add(frames.into_iter()
+            .try_fold(size_of_val(&frames),usize::checked_add)?)?;
+        Some(CpuCopyEvalLayout { native })
     }
     /// Bound the existing F32 last-axis CPU softmax worker and optional real
     /// contiguous copy. The query grants no input, backing or role authority.
@@ -173,6 +196,11 @@ impl OperationEvent {
     /// declaration, source strides and shared backing before using the bank.
     pub fn cpu_broadcast_alias_layout(rank: usize, output_rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_shape_alias_layout(1, rank, output_rank, tracer)
+    }
+    /// Empty Broadcast executes its existing zero-byte Data construction,
+    /// without aliasing the source or creating a physical backing owner.
+    pub fn cpu_empty_broadcast_layout(rank: usize, output_rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+        Self::cpu_shape_alias_layout(3, rank, output_rank, tracer)
     }
     /// Bound the existing fixed-rank ExpandDims alias worker. Native Eval
     /// validates actual sorted unit axes, dtype, shape and source backing.
@@ -252,11 +280,13 @@ impl OperationEvent {
         unsafe {safemlx_sys::mlx_operation_event_cpu_tiled_matmul_copy_eval_layout(&mut native,
             rank,m,n,k,batches,copies,tracer)}.then_some(CpuCopyEvalLayout {native})
     }
-    /// Bound a nonempty one-index full-axis CPU Gather using the existing
-    /// signed/unsigned index worker over F32, BF16, I32 or U32 sources. The
+    /// Bound a one-index full-axis CPU Gather using the existing
+    /// signed/unsigned index worker over F32, F16, BF16, I32 or U32 sources. The
     /// joined source/index rank is at most five, including the rank-three
     /// centroid selection of an ordered readout. Actual native geometry is
     /// checked at Eval; index validity remains the ordinary Gather precondition.
+    /// Empty indices retain the task and Data metadata without a physical
+    /// backing birth. An empty source is valid only with empty indices.
     pub fn cpu_gather_layout(source: Dtype, index: Dtype, source_rank: usize,
         index_rank: usize, source_elements: usize, index_elements: usize,
         slice_elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -271,16 +301,20 @@ impl OperationEvent {
         )?;
         Some(CpuCopyEvalLayout { native })
     }
-    /// Exact F32 rank-one general Scatter overwrite, including its initial copy,
-    /// queued sparse task and actual inline single-index iterator source.
-    pub fn cpu_flat_scatter_layout(index: Dtype, output_elements: usize,
-        update_elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+    /// Shared F32/I32 rank-one/two axis-zero Scatter overwrite, including its
+    /// initial copy, queued sparse task and inline single-index iterator.
+    /// Index values retain the ordinary operation's validity precondition.
+    pub fn cpu_scatter_layout(source: Dtype, index: Dtype, rank: usize,
+        output_elements: usize, update_elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: pure query receives initialized scalar output and no native objects.
-        if !unsafe { safemlx_sys::mlx_operation_event_cpu_flat_scatter_eval_layout(
-            &mut native,index.into(),output_elements,update_elements,tracer) } { return None; }
-        native.named_control_bytes = native.named_control_bytes.checked_add(
-            size_of::<(Dtype,usize,usize,bool)>())?;
+        if !unsafe { safemlx_sys::mlx_operation_event_cpu_scatter_eval_layout(
+            &mut native,source.into(),index.into(),rank,output_elements,update_elements,tracer) } { return None; }
+        let frames = [size_of::<(Dtype,Dtype,usize,usize,usize,bool)>(),
+            size_of::<(safemlx_sys::mlx_dtype,safemlx_sys::mlx_dtype)>(),size_of_val(&native),
+            size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes = native.named_control_bytes.checked_add(frames.into_iter()
+            .try_fold(size_of_val(&frames),usize::checked_add)?)?;
         Some(CpuCopyEvalLayout { native })
     }
     /// Bound the existing F32 final-axis overwrite scatter. One cleanup owns
@@ -295,6 +329,20 @@ impl OperationEvent {
             size_of::<(Dtype,usize,usize,usize,bool)>())?;
         Some(CpuCopyEvalLayout{native})
     }
+    /// Exact rank-two axis-zero F32 ScatterAxis::Sum, including empty update
+    /// rows. This is the additive worker; overwrite keeps its separate source.
+    pub fn cpu_scatter_add_rows_layout(index:Dtype,output_elements:usize,
+        update_elements:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
+        let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: the checked scalar query initializes output only on success.
+        if !unsafe {safemlx_sys::mlx_operation_event_cpu_scatter_add_rows_eval_layout(
+            &mut native,index.into(),output_elements,update_elements,tracer)} {return None;}
+        let frames=[size_of::<(Dtype,usize,usize,bool)>(),size_of_val(&native),
+            size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes=native.named_control_bytes.checked_add(frames.into_iter()
+            .try_fold(size_of_val(&frames),usize::checked_add)?)?;
+        Some(CpuCopyEvalLayout{native})
+    }
     /// Bound the ordinary boolean all/any worker over every dimension of a
     /// contiguous, nonempty input. Actual axes and backing are checked at Eval.
     pub fn cpu_boolean_reduce_layout(all: bool, rank: usize, elements: usize,
@@ -306,6 +354,25 @@ impl OperationEvent {
     pub fn cpu_row_sum_layout(rank: usize, width: usize, rows: usize,
         tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_reduction_layout(2, rank, width, rows, tracer)
+    }
+    /// Existing F32 sum over one nonfinal axis of compact rank-two through
+    /// rank-four input. Prefix and suffix products describe its exact geometry;
+    /// native Eval checks the real axis, dtype, strides and readable backing.
+    /// Width one elides Reduce and must use the caller's ordinary alias source.
+    pub fn cpu_strided_sum_layout(rank: usize, axis: usize, width: usize,
+        outer: usize, inner: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+        if !(2..=4).contains(&rank) || axis >= rank - 1 || width <= 1
+            || outer == 0 || inner == 0 || (axis == 0 && outer != 1) {
+            return None;
+        }
+        let rows = outer.checked_mul(inner)?;
+        let mut value = Self::cpu_reduction_layout(10, rank, width, rows, tracer)?;
+        value.native.named_control_bytes = value.native.named_control_bytes.checked_add(
+            size_of::<(usize, usize, usize, usize, usize, bool)>()
+                + size_of::<usize>() + size_of::<Option<usize>>()
+                + size_of::<CpuCopyEvalLayout>() + size_of::<Option<CpuCopyEvalLayout>>(),
+        )?;
+        Some(value)
     }
     /// Exact ordinary half-precision final-axis SIMD sum on a complete
     /// row-contiguous input. This retains the half accumulator/output rounding;
@@ -331,6 +398,13 @@ impl OperationEvent {
     pub fn cpu_row_min_layout(rank: usize, width: usize, rows: usize,
         tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_reduction_layout(3, rank, width, rows, tracer)
+    }
+    /// Bound the ordinary contiguous final-axis F32 maximum with its unchanged
+    /// SIMD, NaN and tail comparison order. Native Eval authenticates every row.
+    /// Width one is an alias, rather than a native Reduce allocation.
+    pub fn cpu_row_max_layout(rank: usize, width: usize, rows: usize,
+        tracer: bool) -> Option<CpuCopyEvalLayout> {
+        Self::cpu_reduction_layout(9, rank, width, rows, tracer)
     }
     /// Existing rank-one U32 complete-axis sum. Native Eval checks the exact
     /// contiguous input, dtype, axes and scalar output before admitting its task.
@@ -387,8 +461,8 @@ impl OperationEvent {
             .try_fold(size_of_val(&controls),usize::checked_add)?)?;
         Some(CpuCopyEvalLayout{native})
     }
-    /// Bound Full's existing scalar copy branch, with its real one-element
-    /// backing source checked before native Eval. This grants no scalar owner.
+    /// Bound Full's scalar or empty copy branch. Native Eval checks the real
+    /// one-element or zero-data source; this query grants no source owner.
     pub fn cpu_scalar_full_layout(dtype: Dtype, rank: usize, elements: usize,
         tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_selection_layout(dtype, rank, elements, true, tracer)
@@ -442,8 +516,8 @@ impl OperationEvent {
 }
 
 impl OperationEvent {
-    /// Same CPU concatenation over the exact input count: one backing and
-    /// one destination slice/copy job per input, under one shared Eval.
+    /// Same CPU concatenation over the exact input count: one destination
+    /// slice/copy job per input and a backing birth only for nonempty output.
     pub fn cpu_concatenate_many_layout(dtype:Dtype,rank:usize,inputs:usize,
         elements:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
         let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
@@ -477,15 +551,35 @@ impl OperationEvent {
         unsafe{safemlx_sys::mlx_operation_event_cpu_arange_float_eval_layout(&mut native,elements,tracer)}
             .then_some(CpuCopyEvalLayout{native})
     }
-    /// Exact nonnegative I32 unit-step coordinate source. Native validation
+    /// Exact nonnegative I32/U32 unit-step coordinate source. Native validation
     /// checks both integer endpoints and the final loop increment before Eval.
-    pub fn cpu_arange_int_layout(elements:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
+    pub fn cpu_arange_int_layout(dtype:Dtype,elements:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
         let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: pure scalar source query writes initialized output on success.
-        unsafe{safemlx_sys::mlx_operation_event_cpu_arange_int_eval_layout(&mut native,elements,tracer)}
-            .then_some(CpuCopyEvalLayout{native})
+        if !unsafe{safemlx_sys::mlx_operation_event_cpu_arange_int_eval_layout(&mut native,dtype.into(),elements,tracer)} {return None;}
+        let frames=[size_of::<(Dtype,usize,bool)>(),size_of_val(&native),size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes=native.named_control_bytes.checked_add(frames.into_iter()
+            .try_fold(size_of_val(&frames),usize::checked_add)?)?;
+        Some(CpuCopyEvalLayout{native})
     }
-    /// Named controls of the unchanged default full-width CPU RoPE fallback.
+    /// Selected F32 GatherMM through the same SIMD tile worker as selected
+    /// Matmul. Native Eval checks actual matrix spans, index geometry and stream
+    /// selection; this query supplies no arrays, index values or authority.
+    pub fn cpu_tiled_gather_mm_layout(lhs_rank:usize,rhs_rank:usize,index_rank:usize,
+        m:usize,n:usize,k:usize,batches:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
+        let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: scalar-only query writes initialized output only on success.
+        if !unsafe{safemlx_sys::mlx_operation_event_cpu_tiled_gather_mm_eval_layout(
+            &mut native,lhs_rank,rhs_rank,index_rank,m,n,k,batches,tracer)} {return None;}
+        let frames=[size_of::<(usize,usize,usize,usize,usize,usize,usize,bool)>(),
+            size_of_val(&native),size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes=native.named_control_bytes.checked_add(frames.into_iter()
+            .try_fold(size_of_val(&frames),usize::checked_add)?)?;
+        Some(CpuCopyEvalLayout{native})
+    }
+    /// Named controls of the unchanged rank-three/four full-width CPU RoPE
+    /// fallback, using default or supplied frequencies. Primitive queries
+    /// separately describe the selected frequency and reshape workers.
     pub fn cpu_rope_fallback_control_bytes(rank:usize,dimensions:usize,elements:usize)->Option<usize> {
         let mut native=0;
         // SAFETY: the pure source query retains no pointer or runtime object.
@@ -523,19 +617,6 @@ impl OperationEvent {
 }
 
 impl OperationEvent {
-    /// Exact F32 single-row argsort row source at rank one through three.
-    /// Native Eval independently authenticates source, axis, mode and backing.
-    pub fn cpu_argsort_row_layout(rank: usize, elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
-        let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
-        // SAFETY: pure query; initialized destination is published only on success.
-        if !unsafe { safemlx_sys::mlx_operation_event_cpu_argsort_row_eval_layout(
-            &mut native, rank, elements, tracer) } { return None; }
-        let parts = [size_of::<(usize,usize,bool)>(), size_of_val(&native),
-            size_of::<Option<CpuCopyEvalLayout>>()];
-        native.named_control_bytes = native.named_control_bytes.checked_add(
-            parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)?)?;
-        Some(CpuCopyEvalLayout { native })
-    }
     /// Exact F32 single-row partition row source at rank one through three.
     /// Native Eval independently authenticates source, axis, mode and backing.
     pub fn cpu_partition_row_layout(rank: usize, elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -578,7 +659,9 @@ impl OperationEvent {
 }
 
 impl OperationEvent {
-    /// Actual same-width F32/U32 single-row GatherAxis, at ranks one to three.
+    /// Existing same-shape F32 GatherAxis at ranks one to three. Native Eval
+    /// checks its compact source and readable U32 index backing, including
+    /// broadcast index axes; the queued worker checks values before each read.
     /// Retains the ordinary indexing task and both iterator sources.
     pub fn cpu_gather_axis_row_layout(rank: usize, elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();

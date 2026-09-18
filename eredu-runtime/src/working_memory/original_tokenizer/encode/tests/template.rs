@@ -10,9 +10,11 @@ pub(super) fn exact_case(input: &str, text: &str, expected_ids: &[u32]) {
     let p = TokenizerPlan::prepare_json(input.as_bytes()).unwrap();
     let c = WorkingMemoryPool::tokenizer_required_bytes(&p).unwrap();
     let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
-    assert!(short
-        .compile_tokenizer_with(p, || panic!("short C entered compiler"))
-        .is_err());
+    assert!(
+        short
+            .compile_tokenizer_with(p, || panic!("short C entered compiler"))
+            .is_err()
+    );
     assert_eq!(short.used_bytes().unwrap(), 0);
     for text in [text, ""] {
         for special in [false, true] {

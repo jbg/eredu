@@ -1,6 +1,13 @@
 //! Exhaustive source-field copy with the existing closed String/Vec worker.
 use super::*;
 type Error = CapturePlanCopyError;
+pub(in crate::intervention) fn request(w: &mut Worker, value: &InterventionPlan) -> Result<InterventionPlan, Error> {
+    let InterventionPlan { schema_version, operations } = value;
+    Ok(InterventionPlan {
+        schema_version: *schema_version,
+        operations: w.vector(operations, operation)?,
+    })
+}
 pub(super) fn plan(
     w: &mut Worker,
     value: &AdmittedInterventionPlan,
@@ -16,15 +23,8 @@ pub(super) fn plan(
         artifact_identity,
         session_id,
     } = value;
-    let InterventionPlan {
-        schema_version,
-        operations,
-    } = plan;
     Ok(AdmittedInterventionPlan {
-        plan: InterventionPlan {
-            schema_version: *schema_version,
-            operations: w.vector(operations, operation)?,
-        },
+        plan: self::request(w, plan)?,
         points: w.vector(points, point)?,
         request: *request,
         invocation_bounds: *invocation_bounds,
@@ -145,7 +145,7 @@ fn action(w: &mut Worker, value: &InterventionAction) -> Result<InterventionActi
         },
     })
 }
-fn support(
+pub(in crate::intervention) fn support(
     w: &mut Worker,
     value: &ObservationSupportStatus,
 ) -> Result<ObservationSupportStatus, Error> {
@@ -162,7 +162,7 @@ fn support(
         }
     })
 }
-fn point(w: &mut Worker, value: &InterventionPoint) -> Result<InterventionPoint, Error> {
+pub(in crate::intervention) fn point(w: &mut Worker, value: &InterventionPoint) -> Result<InterventionPoint, Error> {
     let InterventionPoint {
         path,
         node_id,

@@ -3,7 +3,7 @@ use crate::{backend::{OriginalCopyEnvironment, runtime::cache::state::CompletedR
     composition::mlx::speculative::{Error, OriginalSpeculativeNumericalSources,RegisteredTensorSource}};
 use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Array-free source evidence. Prior numerical view witnesses retain their own
@@ -36,7 +36,7 @@ pub(crate) fn retain_external_evidence_for_roots(source:CompletedResidentSource,
 pub(crate) fn retain_external_evidence_for_placement(source:CompletedResidentSource,
     visit:impl FnMut(&mut dyn FnMut(&safemlx::Array)),prior:&[&PreparedEmbeddedEvidence],
     context:super::super::SpeculativeExecutionStreams<'_>,placement:eredu_core::speculative::SamplingPlacement,
-    funding:&WorkspaceMetadataFunding,
+    funding:&HostMetadataFunding,
 )->Result<PreparedEmbeddedEvidence,Error>{
     let (sources,environment)=context.original_numerical_for(placement)
         .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
@@ -48,7 +48,7 @@ pub(crate) fn retain_external_evidence_for_placement(source:CompletedResidentSou
 fn retain_roots(source:CompletedResidentSource,
     mut visit:impl FnMut(&mut dyn FnMut(&safemlx::Array)),prior:&[&PreparedEmbeddedEvidence],
     sources:&OriginalSpeculativeNumericalSources,environment:&OriginalCopyEnvironment<'_>,
-    funding:&WorkspaceMetadataFunding,
+    funding:&HostMetadataFunding,
     inputs:Option<(super::super::SpeculativeExecutionStreams<'_>,eredu_core::speculative::SamplingPlacement)>,
 )->Result<PreparedEmbeddedEvidence,Error>{
     let parts = [
@@ -58,8 +58,8 @@ fn retain_roots(source:CompletedResidentSource,
         size_of::<Result<PreparedEmbeddedEvidence,Error>>(),
         size_of::<Option<(super::super::SpeculativeExecutionStreams<'_>,eredu_core::speculative::SamplingPlacement)>>(),
         size_of::<(&[&PreparedEmbeddedEvidence],super::super::SpeculativeExecutionStreams<'_>,
-            eredu_core::speculative::SamplingPlacement,&WorkspaceMetadataFunding)>(),
-        size_of::<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>,&WorkspaceMetadataFunding)>(),size_of_val(&visit),size_of::<RegisteredTensorSource>(),size_of::<Vec<RegisteredTensorSource>>(),size_of::<Option<Error>>(),size_of::<usize>(),size_of::<Option<usize>>(),
+            eredu_core::speculative::SamplingPlacement,&HostMetadataFunding)>(),
+        size_of::<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>,&HostMetadataFunding)>(),size_of_val(&visit),size_of::<RegisteredTensorSource>(),size_of::<Vec<RegisteredTensorSource>>(),size_of::<Option<Error>>(),size_of::<usize>(),size_of::<Option<usize>>(),
         size_of::<Result<(),Error>>(),size_of::<&mut dyn FnMut(&safemlx::Array)>(),
         size_of::<super::super::tensor_sources::RegisteredTensorSources<'_>>(),
         size_of::<std::slice::Iter<'_,RegisteredTensorSource>>(),
@@ -68,11 +68,11 @@ fn retain_roots(source:CompletedResidentSource,
         size_of::<Vec<PreparedEmbeddedEvidence>>(), size_of::<std::slice::Iter<'_, &PreparedEmbeddedEvidence>>(),
         size_of::<(&[&PreparedEmbeddedEvidence], &OriginalSpeculativeNumericalSources, &OriginalCopyEnvironment<'_>)>(),
         PreparedEmbeddedEvidence::retained_control_bytes::<ExternalCompletedSource>()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
     funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
         .map_err(Error::WorkspacePlanning)?;
     source.validate_request_source(sources.request(), environment.stream(), funding)?;
     if let Some((context,placement))=inputs {
@@ -86,7 +86,7 @@ fn retain_roots(source:CompletedResidentSource,
     let mut count_roots=|_:&safemlx::Array|count=count.and_then(|n|n.checked_add(1));
     funding.reserve_metadata(size_of_val(&count_roots)).map_err(Error::WorkspacePlanning)?;
     visit(&mut count_roots);
-    let count=count.ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+    let count=count.ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     let mut registered=funding.metadata_vec::<RegisteredTensorSource>(count).map_err(Error::Neural)?;
     let mut failure=None;
     let mut retain_root=|array:&safemlx::Array|{
@@ -111,3 +111,5 @@ fn retain_roots(source:CompletedResidentSource,
     Ok(PreparedEmbeddedEvidence::from_prepared(ExternalCompletedSource { source, registered, _prior: retained },
         HostPreparationAuthority::retain(funding.clone())))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

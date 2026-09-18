@@ -7,7 +7,7 @@ use super::*;
 pub(crate) struct PartitionLocalCaptureHook {
     bank:PreparedPartitionFragmentDestinations,
     receipt:PartitionCaptureReceiptPlan,
-    metadata:WorkspaceMetadataFunding,
+    metadata:HostMetadataFunding,
     routed:Option<routed::Invocation>,
     routed_source:Option<crate::capture::partition::PreparedPartitionRoutedLocalSource>,
 }
@@ -17,7 +17,7 @@ impl PartitionLocalCaptureHook {
         self.routed_source=Some(source);
     }
     pub(crate) fn source(&self)->&SharedCapturePlan {&self.bank.source}
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding {&self.metadata}
+    pub(crate) fn funding(&self)->&HostMetadataFunding {&self.metadata}
     pub(crate) fn parts(&mut self)->(&PartitionCaptureReceiptPlan,&mut PreparedPartitionFragmentDestinations) {
         (&self.receipt,&mut self.bank)
     }
@@ -31,7 +31,7 @@ pub(crate) struct PartitionCaptureHookContinuation<'t,T:PartitionCaptureTranspor
     dtype:TensorDtype,
     source:SharedCapturePlan,
     custody:CaptureTensorCustody,
-    metadata:WorkspaceMetadataFunding,
+    metadata:HostMetadataFunding,
 }
 impl<T:PartitionCaptureTransport> fmt::Debug for PartitionCaptureHookContinuation<'_,T> {
     fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
@@ -45,7 +45,7 @@ pub(crate) struct PartitionCaptureHookReturnError {
     _hook:PartitionLocalCaptureHook,
     _source:SharedCapturePlan,
     _expected:CaptureTensorCustody,
-    _metadata:WorkspaceMetadataFunding,
+    _metadata:HostMetadataFunding,
 }
 impl<'t,T:PartitionCaptureTransport> PreparedPartitionFragmentDelivery<'t,T>
 where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
@@ -89,16 +89,15 @@ pub(super) fn control_bytes<T:PartitionCaptureTransport>()->Option<usize> {
         size_of::<Option<PartitionCaptureReceiptPlan>>(),size_of::<(&mut PartitionLocalCaptureHook,)>(),
         size_of::<(&PartitionCaptureReceiptPlan,&mut PreparedPartitionFragmentDestinations)>(),
         size_of::<(PartitionCaptureHookContinuation<'_,T>,PartitionLocalCaptureHook)>(),
-        size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&WorkspaceMetadataFunding)>(),
+        size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&HostMetadataFunding)>(),
         size_of::<(&mut PartitionCaptureExchange<'_,T>,PartitionCaptureReceiptPlan)>(),
         size_of::<std::iter::Zip<std::slice::Iter<'_,u32>,std::slice::ChunksExact<'_,u8>>>(),
         size_of::<Option<u32>>(),size_of::<Result<u32,std::num::ParseIntError>>(),
-        size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>(),size_of::<WorkspaceMetadataFunding>()];
+        size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>(),size_of::<HostMetadataFunding>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
 
 mod observe;
-pub(crate) use observe::PartitionLocalCaptureFailure;
 
 mod invocation;
 

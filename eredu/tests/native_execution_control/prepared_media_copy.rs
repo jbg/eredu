@@ -1,57 +1,82 @@
 //! Actual public V2 pending-media snapshots; existing selected native driver only.
 use super::*;
-use eredu_backend_mlx::{backend::runtime::media::input, native::MlxModelInput};
-use eredu_core::{InputExtent, InputMetadataKey, InputModality};
-use safemlx::Array;
+use eredu_core::{InputExtent, InputMetadataKey, InputModality, InputPayloadKind};
+use eredu_runtime::input::host::{HostInputPart, HostTensorValues, HostTensorView};
 
-pub(super) fn prompt() -> MlxModelInput {
-    let image = |offset: f32| {
-        input::input_part(
-            InputModality::Image,
-            input::InputPayload::Tensor(Array::from_slice(
-                &(0..192)
-                    .map(|i| (i as f32 - 93.) / 193. + offset)
-                    .collect::<Vec<_>>(),
-                &[16, 12],
-            )),
-            [(
-                InputMetadataKey::PatchGrid,
-                Array::from_slice(&[1_i32, 4, 4], &[1, 3]),
-            )],
-            [InputExtent::PatchGrid {
-                time: 1,
-                height: 4,
-                width: 4,
-            }],
-        )
-        .unwrap()
-    };
-    let parts = [
-        input::token_ids_part(&Array::from_slice(&[1_u32, 2], &[1, 2])).unwrap(),
-        image(0.),
-        image(0.125),
-        input::input_part(
-            InputModality::Text,
-            input::InputPayload::Embeddings(Array::from_slice(
-                &(0..32).map(|i| (i as f32 - 15.) / 33.).collect::<Vec<_>>(),
-                &[1, 2, 16],
-            )),
-            [],
-            [],
-        )
-        .unwrap(),
-        input::token_ids_part(&Array::from_slice(&[3_u32], &[1, 1])).unwrap(),
-    ];
-    MlxModelInput::from(input::ModelInput::new(&parts))
-        .with_semantic_content_fingerprint("public pending multi-image and projected-text source")
-        .unwrap()
-        .with_prefill_chunk_positions(2.try_into().unwrap())
+pub(super) fn with_parts<R>(run: impl FnOnce(&[HostInputPart<'_>]) -> R) -> R {
+    let image0 = std::array::from_fn::<_, 192, _>(|i| (i as f32 - 93.) / 193.);
+    let image1 = std::array::from_fn::<_, 192, _>(|i| (i as f32 - 93.) / 193. + 0.125);
+    let projected = std::array::from_fn::<_, 32, _>(|i| (i as f32 - 15.) / 33.);
+    let metadata = [(
+        InputMetadataKey::PatchGrid,
+        HostTensorView {
+            shape: &[1, 3],
+            values: HostTensorValues::I32(&[1, 4, 4]),
+        },
+    )];
+    let extents = [InputExtent::PatchGrid {
+        time: 1,
+        height: 4,
+        width: 4,
+    }];
+    run(&[
+        HostInputPart {
+            modality: InputModality::Text,
+            kind: InputPayloadKind::TokenIds,
+            payload: HostTensorView {
+                shape: &[1, 2],
+                values: HostTensorValues::U32(&[1, 2]),
+            },
+            metadata: &[],
+            extents: &[],
+        },
+        HostInputPart {
+            modality: InputModality::Image,
+            kind: InputPayloadKind::Tensor,
+            payload: HostTensorView {
+                shape: &[16, 12],
+                values: HostTensorValues::F32(&image0),
+            },
+            metadata: &metadata,
+            extents: &extents,
+        },
+        HostInputPart {
+            modality: InputModality::Image,
+            kind: InputPayloadKind::Tensor,
+            payload: HostTensorView {
+                shape: &[16, 12],
+                values: HostTensorValues::F32(&image1),
+            },
+            metadata: &metadata,
+            extents: &extents,
+        },
+        HostInputPart {
+            modality: InputModality::Text,
+            kind: InputPayloadKind::Embeddings,
+            payload: HostTensorView {
+                shape: &[1, 2, 16],
+                values: HostTensorValues::F32(&projected),
+            },
+            metadata: &[],
+            extents: &[],
+        },
+        HostInputPart {
+            modality: InputModality::Text,
+            kind: InputPayloadKind::TokenIds,
+            payload: HostTensorView {
+                shape: &[1, 1],
+                values: HostTensorValues::U32(&[3]),
+            },
+            metadata: &[],
+            extents: &[],
+        },
+    ])
 }
-fn ranges(records: &[PreparedControlledGenerationRecord]) -> Vec<[u64; 2]> {
+fn ranges(records: &[ControlledGenerationRecord]) -> Vec<[u64; 2]> {
     records
         .iter()
         .filter_map(|record| match &record.event {
-            PreparedControlledGenerationEvent::Progress {
+            ControlledGenerationEvent::Progress {
                 event:
                     ObservedGenerationEvent::Token {
                         input_range,
@@ -76,7 +101,7 @@ fn run(residency: eredu_core::ResidencyPlan, snapshots: bool) -> Vec<u32> {
             .unwrap()
             .into_parts();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
             tools: vec![],
             tool_choice: ToolChoice::None,
@@ -97,25 +122,26 @@ fn run(residency: eredu_core::ResidencyPlan, snapshots: bool) -> Vec<u32> {
         per_record_bytes: 1 << 20,
         total_bytes: 64 << 20,
     };
-    let prepared = model
-        .prepare_controlled_input(
-            &chat,
-            prompt(),
-            settings,
-            PreparedInputInstrumentation::Unobserved,
-            trace,
-        )
-        .unwrap();
-    assert_eq!(prepared.prompt_attribution().decoder_positions, 13);
-    assert_eq!(prepared.prompt_attribution().canonical_token_ids, [1, 2, 3]);
-    let attribution = prepared.prompt_attribution().clone();
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let input = with_parts(|parts| model.prepare_chat_input(&chat, parts, &cancellation))
+        .unwrap()
+        .expect("live media preparation");
+    let mut settings = original_settings(settings);
+    settings.inference.prefill_chunk_positions = std::num::NonZeroU64::new(2);
+    let mut prepared = PreparedChatRequest::new(&chat, settings);
+    prepared.input = PreparedChatPrompt::Media(input);
+    prepared.output_mode = PreparedChatOutputMode::Text;
     let mut records = Vec::new();
     let mut session = model
-        .start_controlled_prepared_text(prepared, &[], Default::default(), |r| {
+        .start_controlled_chat(prepared, trace, Default::default(), |r| {
             records.push(r);
             ControlFlow::Continue(())
         })
-        .unwrap();
+        .unwrap()
+        .expect("live control");
+    assert_eq!(session.prompt_attribution().decoder_positions, 13);
+    assert_eq!(session.prompt_attribution().canonical_token_ids, [1, 2, 3]);
+    let attribution = session.prompt_attribution().clone();
     assert_eq!(session.status(), GenerationStatus::Prepared);
     assert!(session.token_ids().is_empty());
     if !snapshots {
@@ -139,7 +165,9 @@ fn run(residency: eredu_core::ResidencyPlan, snapshots: bool) -> Vec<u32> {
         retained_bytes: 128 << 20,
         cumulative_copy_bytes: 1 << 30,
     };
-    session.enable_snapshots(snapshot_limits).unwrap();
+    session
+        .enable_snapshots(snapshot_limits, ORIGINAL_CAPACITY, copy_limits())
+        .unwrap();
     // This is the pending-media boundary, before any encoder or decoder work.
     let initial = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(initial.prompt_attribution(), &attribution);
@@ -246,12 +274,11 @@ fn run(residency: eredu_core::ResidencyPlan, snapshots: bool) -> Vec<u32> {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     let mut retained_limit = false;
     while let Some(error) = cause {
-        if let Some(ControlledGenerationError::Snapshot(
-            eredu_runtime::execution_control::TextSnapshotError::Control(
-                ExecutionControlError::Limit("retained bytes"),
-            ),
-        )) = error.downcast_ref::<ControlledGenerationError>()
-        {
+        if error.downcast_ref::<ControlledGenerationError>().is_some_and(|error| {
+            matches!(error, ControlledGenerationError::Snapshot(snapshot)
+                if matches!(snapshot.cause(), eredu_runtime::execution_control::TextSnapshotError::Control(
+                    ExecutionControlError::Limit("retained bytes"))))
+        }) {
             retained_limit = true;
             break;
         }
@@ -285,7 +312,7 @@ fn run(residency: eredu_core::ResidencyPlan, snapshots: bool) -> Vec<u32> {
                 intervention: None,
             },
             |record| {
-                if let PreparedControlledGenerationEvent::BranchStarted {
+                if let ControlledGenerationEvent::BranchStarted {
                     prompt_attribution, ..
                 } = &record.event
                 {

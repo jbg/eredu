@@ -140,6 +140,7 @@ fn candidate_with_extra(
     let equations = quote_inference_workspace(g, |span| {
         context.begin_state_span([&old])?;
         let positions = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };
@@ -184,7 +185,6 @@ fn plan(
     quote: impl FnMut(InferenceGeometry) -> Result<IncrementalInferenceQuote, PrefillPlanningError>,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -209,7 +209,7 @@ fn incomplete_then_overbudget_candidates_commit_only_the_fitting_handoff() {
     let mut old = predecessor(&pool, &execution);
     old.close();
     let mut attempts = Vec::new();
-    let (admission, reservation, proof) = plan(
+    let (reservation, proof) = plan(
         &pool,
         &execution,
         76,
@@ -226,7 +226,7 @@ fn incomplete_then_overbudget_candidates_commit_only_the_fitting_handoff() {
     )
     .unwrap();
     assert_eq!(attempts, [4, 3, 2]);
-    assert_eq!(admission.incremental_required_bytes, 12);
+    assert_eq!(reservation.admission().incremental_required_bytes, 12);
     assert_eq!(proof.incremental_bytes(), 12);
     assert!(proof.controller_contract().is_some());
     assert_eq!(balances(&pool), (76, 76, 76));
@@ -250,7 +250,7 @@ fn legacy_planner_keeps_the_predecessor_ceiling_and_chooses_a_smaller_chunk() {
     let mut old = predecessor(&pool, &execution);
     old.close();
     let mut attempts = Vec::new();
-    let (_, reservation, proof) = plan_prefill_incremental_with_capacity(
+    let (reservation, proof) = plan_prefill_incremental_with_capacity(
         &execution,
         &pool,
         &capabilities(),
@@ -465,7 +465,7 @@ fn unrelated_same_limit_account_and_fixed_pool_capacity_are_not_relaxed() {
             ));
             assert_eq!(balances(&pool), (64, 64, 70));
         } else {
-            let (_, reservation, proof) = result.unwrap();
+            let (reservation, proof) = result.unwrap();
             assert_eq!(proof.geometry().prefill_chunk_positions, 1);
             assert_eq!(
                 balances(&pool),

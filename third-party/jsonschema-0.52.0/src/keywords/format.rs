@@ -505,34 +505,53 @@ pub fn is_valid_datetime(datetime: &str) -> bool {
     is_valid_date(date_part) && is_valid_time(&time_part[1..])
 }
 
-fn parse_email(email: &str, options: Option<&EmailAddressOptions>) -> Option<EmailAddress> {
-    if let Some(opts) = options {
-        EmailAddress::parse_with_options(email, *opts)
-    } else {
-        EmailAddress::from_str(email)
+fn parse_email_with_allocations(
+    email: &str,
+    options: Option<&EmailAddressOptions>,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<Option<EmailAddress>, serde_json::allocation::AllocationError> {
+    use email_address::ParseStorageError;
+    use serde_json::allocation::AllocationError;
+    match EmailAddress::parse_with_options_and_reservation(
+        email,
+        options.copied().unwrap_or_default(),
+        |layout| allocation.reserve(layout.size()),
+    ) {
+        Ok(address) => Ok(Some(address)),
+        Err(ParseStorageError::Syntax(_)) => Ok(None),
+        Err(ParseStorageError::Funding(error)) => Err(error),
+        Err(ParseStorageError::Overflow) => Err(AllocationError::SizeOverflow),
+        Err(ParseStorageError::Allocation(_) | ParseStorageError::Capacity) => {
+            Err(AllocationError::HostAllocation)
+        }
     }
-    .ok()
 }
 
 const IPV6_TAG: &str = "IPv6:";
 
-fn validate_email_domain<F>(domain: &str, is_valid_hostname_impl: &F) -> bool
+fn validate_email_domain<F>(
+    domain: &str,
+    is_valid_hostname_impl: &F,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(
+        &str,
+        &dyn serde_json::allocation::Allocation,
+    ) -> Result<bool, serde_json::allocation::AllocationError>,
 {
     if let Some(domain) = domain.strip_prefix('[').and_then(|d| d.strip_suffix(']')) {
-        // RFC 5321 tags are case-insensitive
         if domain
             .as_bytes()
             .get(..IPV6_TAG.len())
             .is_some_and(|tag| tag.eq_ignore_ascii_case(IPV6_TAG.as_bytes()))
         {
-            domain[IPV6_TAG.len()..].parse::<Ipv6Addr>().is_ok()
+            Ok(domain[IPV6_TAG.len()..].parse::<Ipv6Addr>().is_ok())
         } else {
-            domain.parse::<Ipv4Addr>().is_ok()
+            Ok(domain.parse::<Ipv4Addr>().is_ok())
         }
     } else {
-        is_valid_hostname_impl(domain)
+        is_valid_hostname_impl(domain, allocation)
     }
 }
 
@@ -541,53 +560,113 @@ fn is_valid_email_impl<F>(
     is_valid_hostname_impl: F,
     options: Option<&EmailAddressOptions>,
     allow_non_ascii_local_part: bool,
-) -> bool
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(
+        &str,
+        &dyn serde_json::allocation::Allocation,
+    ) -> Result<bool, serde_json::allocation::AllocationError>,
 {
-    // `email_address` 0.2.9 rejects an empty quoted local part, which RFC 5321 allows.
+    use serde_json::allocation::{AllocationError, Allocator};
+    let allocator = Allocator::new(allocation);
+    allocator.reserve(std::mem::size_of::<(
+        &str,
+        F,
+        Option<&EmailAddressOptions>,
+        bool,
+        Option<EmailAddress>,
+        Vec<u8>,
+        String,
+        std::str::Chars<'_>,
+    )>())?;
+    // Preserve the existing workaround for the dependency's empty quoted local part.
     if let Some(domain) = email.strip_prefix("\"\"@") {
+        let length = domain
+            .len()
+            .checked_add(4)
+            .ok_or(AllocationError::SizeOverflow)?;
+        let mut replacement = Vec::new();
+        allocator.grow(&mut replacement, length)?;
+        replacement.extend_from_slice(b"\"a\"@");
+        replacement.extend_from_slice(domain.as_bytes());
+        let replacement = String::from_utf8(replacement).expect("copied UTF-8 email parts");
         return is_valid_email_impl(
-            &format!("\"a\"@{domain}"),
+            &replacement,
             is_valid_hostname_impl,
             options,
             allow_non_ascii_local_part,
+            allocation,
         );
     }
-    if let Some(parsed) = parse_email(email, options) {
+    if let Some(parsed) = parse_email_with_allocations(email, options, allocation)? {
         if !allow_non_ascii_local_part && !parsed.local_part().is_ascii() {
-            return false;
+            return Ok(false);
         }
-        return validate_email_domain(parsed.domain(), &is_valid_hostname_impl);
+        return validate_email_domain(parsed.domain(), &is_valid_hostname_impl, allocation);
     }
-    // `email_address` 0.2.9 rejects non-ASCII in quoted local parts, which `idn-email`
-    // must accept. Mask non-ASCII to pass the structural check, then validate the real
-    // domain (after the last `@`, which a local part never holds unquoted).
+    // Preserve the existing IDN quoted-local-part structural check and real domain.
     if !allow_non_ascii_local_part || email.is_ascii() {
-        return false;
+        return Ok(false);
     }
-    let masked: String = email
-        .chars()
-        .map(|c| if c.is_ascii() { c } else { 'a' })
-        .collect();
-    if parse_email(&masked, options).is_none() {
-        return false;
+    let mut masked = Vec::new();
+    allocator.grow(&mut masked, email.chars().count())?;
+    masked.extend(email.chars().map(|character| {
+        if character.is_ascii() {
+            character as u8
+        } else {
+            b'a'
+        }
+    }));
+    let masked = String::from_utf8(masked).expect("masked ASCII email");
+    if parse_email_with_allocations(&masked, options, allocation)?.is_none() {
+        return Ok(false);
     }
     let mut parts = email.rsplitn(2, '@');
     let domain = parts.next().unwrap_or_default();
     if parts.next().is_none() {
-        return false;
+        return Ok(false);
     }
-    validate_email_domain(domain, &is_valid_hostname_impl)
+    validate_email_domain(domain, &is_valid_hostname_impl, allocation)
+}
+
+fn is_valid_email_with_allocations(
+    email: &str,
+    options: Option<&EmailAddressOptions>,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError> {
+    is_valid_email_impl(
+        email,
+        is_valid_hostname_with_allocations,
+        options,
+        false,
+        allocation,
+    )
 }
 
 pub(crate) fn is_valid_email(email: &str, options: Option<&EmailAddressOptions>) -> bool {
-    is_valid_email_impl(email, is_valid_hostname, options, false)
+    is_valid_email_with_allocations(email, options, &serde_json::allocation::Unenforced)
+        .expect("ordinary email allocation")
 }
 
 #[cfg(feature = "idna")]
 pub(crate) fn is_valid_idn_email(email: &str, options: Option<&EmailAddressOptions>) -> bool {
-    is_valid_email_impl(email, is_valid_idn_hostname, options, true)
+    is_valid_idn_email_with_allocations(email, options, &serde_json::allocation::Unenforced)
+        .expect("ordinary IDN email allocation")
+}
+#[cfg(feature = "idna")]
+fn is_valid_idn_email_with_allocations(
+    email: &str,
+    options: Option<&EmailAddressOptions>,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError> {
+    is_valid_email_impl(
+        email,
+        is_valid_idn_hostname_with_allocations,
+        options,
+        true,
+        allocation,
+    )
 }
 
 const VALID_HOSTNAME_CHARS: [bool; 256] = {
@@ -676,31 +755,63 @@ fn punycode_adapt(mut delta: u32, count: u32, first: bool) -> u32 {
 ///
 /// RFC 3492, section 6.2: <https://www.rfc-editor.org/rfc/rfc3492#section-6.2>
 fn decode_punycode(input: &str) -> Option<String> {
+    decode_punycode_with_allocations(input, &serde_json::allocation::Unenforced)
+        .expect("ordinary punycode allocation")
+}
+
+fn decode_punycode_with_allocations(
+    input: &str,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<Option<String>, serde_json::allocation::AllocationError> {
+    use serde_json::allocation::{AllocationError, Allocator};
+    let allocator = Allocator::new(allocation);
+    allocator.reserve(std::mem::size_of::<(
+        &str,
+        &[u8],
+        Vec<char>,
+        Vec<u8>,
+        [u8; 4],
+        u32,
+        u32,
+        u32,
+        usize,
+        u32,
+        u32,
+        u32,
+        u32,
+    )>())?;
+    macro_rules! some {
+        ($value:expr) => {
+            match $value {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
+    }
     let bytes = input.as_bytes();
-    // The delimiter is consumed only when it is preceded by basic code points; a leading
-    // `-` is part of the encoded portion and makes the label invalid.
+    // Preserve the original delimiter and insertion algorithm.
     let (basic, encoded) = match bytes.iter().rposition(|&byte| byte == b'-') {
         Some(position) if position > 0 => (&bytes[..position], &bytes[position + 1..]),
         _ => (&bytes[..0], bytes),
     };
     if !basic.is_ascii() {
-        return None;
+        return Ok(None);
     }
-    let mut output: Vec<char> = basic.iter().map(|&byte| char::from(byte)).collect();
-
+    let mut output = Vec::new();
+    allocator.grow(&mut output, basic.len())?;
+    output.extend(basic.iter().map(|&byte| char::from(byte)));
     let mut code_point = PUNYCODE_INITIAL_N;
     let mut index: u32 = 0;
     let mut bias = PUNYCODE_INITIAL_BIAS;
     let mut position = 0;
-
     while position < encoded.len() {
         let previous = index;
         let mut weight: u32 = 1;
         let mut k = PUNYCODE_BASE;
         loop {
-            let digit = punycode_digit(*encoded.get(position)?)?;
+            let digit = some!(punycode_digit(*some!(encoded.get(position))));
             position += 1;
-            index = index.checked_add(digit.checked_mul(weight)?)?;
+            index = some!(index.checked_add(some!(digit.checked_mul(weight))));
             let threshold = if k <= bias {
                 PUNYCODE_TMIN
             } else if k >= bias + PUNYCODE_TMAX {
@@ -711,19 +822,36 @@ fn decode_punycode(input: &str) -> Option<String> {
             if digit < threshold {
                 break;
             }
-            weight = weight.checked_mul(PUNYCODE_BASE - threshold)?;
+            weight = some!(weight.checked_mul(PUNYCODE_BASE - threshold));
             k += PUNYCODE_BASE;
         }
-
-        let count = u32::try_from(output.len()).ok()? + 1;
+        let count = some!(u32::try_from(output.len()).ok()) + 1;
         bias = punycode_adapt(index - previous, count, previous == 0);
-        code_point = code_point.checked_add(index / count)?;
+        code_point = some!(code_point.checked_add(index / count));
         index %= count;
-        output.insert(index as usize, char::from_u32(code_point)?);
+        let character = some!(char::from_u32(code_point));
+        let required = output
+            .len()
+            .checked_add(1)
+            .ok_or(AllocationError::SizeOverflow)?;
+        allocator.grow(&mut output, required)?;
+        output.insert(index as usize, character);
         index += 1;
     }
-
-    Some(output.into_iter().collect())
+    let length = output
+        .iter()
+        .try_fold(0usize, |length, character| {
+            length.checked_add(character.len_utf8())
+        })
+        .ok_or(AllocationError::SizeOverflow)?;
+    let mut text = Vec::new();
+    allocator.grow(&mut text, length)?;
+    for character in output {
+        text.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    Ok(Some(
+        String::from_utf8(text).expect("encoded UTF-8 scalars"),
+    ))
 }
 
 /// # Panics
@@ -732,28 +860,36 @@ fn decode_punycode(input: &str) -> Option<String> {
 /// because the label has already been validated as ASCII.
 #[must_use]
 pub fn is_valid_hostname(hostname: &str) -> bool {
+    is_valid_hostname_with_allocations(hostname, &serde_json::allocation::Unenforced)
+        .expect("ordinary hostname allocation")
+}
+fn is_valid_hostname_with_allocations(
+    hostname: &str,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError> {
+    allocation.reserve(std::mem::size_of::<(&str, &[u8], &str, Option<String>, bool)>())?;
     if !is_valid_ascii_hostname(hostname) {
-        return false;
+        return Ok(false);
     }
 
     for label in hostname.as_bytes().split(|&b| b == b'.') {
         // Per RFC 5891, labels with hyphens in 3rd & 4th positions must be valid A-labels.
         if label.len() >= 4 && label[2] == b'-' && label[3] == b'-' && !is_punycode_label(label) {
-            return false;
+            return Ok(false);
         }
 
         if is_punycode_label(label) {
             let payload = std::str::from_utf8(&label[4..]).expect("ASCII label already validated");
-            let Some(decoded) = decode_punycode(payload) else {
-                return false;
+            let Some(decoded) = decode_punycode_with_allocations(payload, allocation)? else {
+                return Ok(false);
             };
             if !validate_unicode_label(&decoded) {
-                return false;
+                return Ok(false);
             }
         }
     }
 
-    true
+    Ok(true)
 }
 
 // RFC 5892 derives the PVALID property primarily from these general categories.
@@ -916,31 +1052,71 @@ fn validate_unicode_label(label: &str) -> bool {
 #[cfg(feature = "idna")]
 #[must_use]
 pub fn is_valid_idn_hostname(hostname: &str) -> bool {
+    is_valid_idn_hostname_with_allocations(hostname, &serde_json::allocation::Unenforced)
+        .expect("ordinary IDN hostname allocation")
+}
+#[cfg(feature = "idna")]
+fn is_valid_idn_hostname_with_allocations(
+    hostname: &str,
+    allocation: &dyn serde_json::allocation::Allocation,
+) -> Result<bool, serde_json::allocation::AllocationError> {
     use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
-
-    let Ok(ascii_hostname) = Uts46::new().to_ascii(
-        hostname.as_bytes(),
-        AsciiDenyList::STD3,
-        // Prohibit hyphens in the first, third, fourth, and last position in the label
-        Hyphens::Check,
-        DnsLength::Verify,
-    ) else {
-        return false;
-    };
-
-    if !is_valid_hostname(&ascii_hostname) {
-        return false;
+    use serde_json::allocation::AllocationError;
+    struct Loan<'a>(&'a dyn serde_json::allocation::Allocation);
+    impl idna::allocation::Allocation for Loan<'_> {
+        fn reserve(&self, bytes: usize) -> Result<(), idna::allocation::AllocationError> {
+            self.0.reserve(bytes).map_err(|error| match error {
+                AllocationError::Refused => idna::allocation::AllocationError::Refused,
+                AllocationError::SizeOverflow => idna::allocation::AllocationError::SizeOverflow,
+                AllocationError::HostAllocation => {
+                    idna::allocation::AllocationError::HostAllocation
+                }
+            })
+        }
+        fn is_enforced(&self) -> bool {
+            self.0.is_enforced()
+        }
     }
-
-    let (unicode_hostname, _) = Uts46::new().to_unicode(
-        ascii_hostname.as_bytes(),
-        AsciiDenyList::EMPTY,
-        Hyphens::Allow,
-    );
-
-    unicode_hostname
+    let convert = |error| match error {
+        idna::allocation::AllocationError::Refused => AllocationError::Refused,
+        idna::allocation::AllocationError::SizeOverflow => AllocationError::SizeOverflow,
+        idna::allocation::AllocationError::HostAllocation => AllocationError::HostAllocation,
+    };
+    allocation.reserve(std::mem::size_of::<(
+        Loan<'_>,
+        Uts46,
+        std::borrow::Cow<'_, str>,
+        std::borrow::Cow<'_, str>,
+        Result<(), idna::Errors>,
+        bool,
+    )>())?;
+    let loan = Loan(allocation);
+    let Ok(ascii_hostname) = Uts46::new()
+        .to_ascii_with_allocations(
+            hostname.as_bytes(),
+            AsciiDenyList::STD3,
+            Hyphens::Check,
+            DnsLength::Verify,
+            &loan,
+        )
+        .map_err(convert)?
+    else {
+        return Ok(false);
+    };
+    if !is_valid_hostname_with_allocations(&ascii_hostname, allocation)? {
+        return Ok(false);
+    }
+    let (unicode_hostname, _) = Uts46::new()
+        .to_unicode_with_allocations(
+            ascii_hostname.as_bytes(),
+            AsciiDenyList::EMPTY,
+            Hyphens::Allow,
+            &loan,
+        )
+        .map_err(convert)?;
+    Ok(unicode_hostname
         .split('.')
-        .all(|label| !label.is_empty() && validate_unicode_label(label))
+        .all(|label| !label.is_empty() && validate_unicode_label(label)))
 }
 
 #[inline]
@@ -1143,6 +1319,26 @@ macro_rules! impl_format_evaluate {
     };
 }
 
+macro_rules! format_check {
+    (is_valid_idn_hostname, $item:expr, $ctx:expr) => {
+        $ctx.workspace
+            .with_json_allocations(|allocation| {
+                is_valid_idn_hostname_with_allocations($item, allocation)
+            })
+            .unwrap_or(false)
+    };
+    (is_valid_hostname, $item:expr, $ctx:expr) => {
+        $ctx.workspace
+            .with_json_allocations(|allocation| {
+                is_valid_hostname_with_allocations($item, allocation)
+            })
+            .unwrap_or(false)
+    };
+    ($worker:ident, $item:expr, $ctx:expr) => {
+        $worker($item)
+    };
+}
+
 macro_rules! format_validators {
     ($($(#[$meta:meta])* ($validator:ident, $format:expr, $validation_fn:ident)),+ $(,)?) => {
         $(
@@ -1155,23 +1351,46 @@ macro_rules! format_validators {
             $(#[$meta])*
             impl $validator {
                 pub(crate) fn compile<'a, F: Json>(ctx: &compiler::Context<F>) -> CompilationResult<'a, F> {
-                    let location = ctx.location().join("format");
-                    let annotation = Arc::new(Value::String($format.to_owned()));
-                    Ok(Box::new($validator { location, annotation }))
+                    let location = ctx.location().join_with_funding("format", ctx.funding())?;
+                    let annotation = ctx.funding().arc(Value::String(ctx.funding().copy_str($format)?))?;
+                    Ok(ctx.funding().boxed($validator { location, annotation })?)
                 }
             }
 
             $(#[$meta])*
             impl<F: Json> Validate<F> for $validator {
-                fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+                fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+                    source.location(&self.location)?;
+                    if source.arc(&self.annotation)? { source.value(&self.annotation)?; }
+                    Ok(())
+                }
+                fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+                    // These workers parse borrowed bytes and keep only inline results.
+                    // IDNA conversion below still requires its own producer hooks.
+                    match stringify!($validation_fn) {
+                        "is_valid_date" | "is_valid_datetime" | "is_valid_duration" | "is_valid_hostname_rfc1034" | "is_valid_hostname"
+                        | "is_valid_idn_hostname" | "is_valid_ipv4" | "is_valid_ipv6" | "is_valid_iri" | "is_valid_iri_reference"
+                        | "is_valid_json_pointer" | "is_valid_relative_json_pointer" | "is_valid_time"
+                        | "is_valid_uri" | "is_valid_uri_reference" | "is_valid_uri_template" | "is_valid_uuid" => {},
+                        _ => return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator(stringify!($validation_fn)))),
+                    }
+                    crate::validator::workspace::body_controls::<F, Self>(&[
+                        std::mem::size_of::<Option<std::borrow::Cow<'_, str>>>(),
+                        std::mem::size_of::<(&str, &[u8], std::str::Chars<'_>, usize, u64, bool)>(),
+                    ])
+                }
+                fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+                    <Self as Validate<F>>::original_controls(self)
+                }
+                fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
                     if let Some(item) = instance.as_string() {
-                        $validation_fn(&item)
+                        format_check!($validation_fn, &item, ctx)
                     } else {
                         true
                     }
                 }
 
-                fn validate<'i>(
+                fn validate_body<'i>(
                     &self,
                     instance: &F::Node<'i>,
                     location: &LazyLocation,
@@ -1180,13 +1399,9 @@ macro_rules! format_validators {
                 ) -> Result<(), ValidationError<'i>> {
                     if instance.is_string() {
                         if !Validate::<F>::is_valid(self, instance, ctx) {
-                            return Err(ValidationError::format(
-                                self.location.clone(),
-                                crate::paths::capture_evaluation_path(tracker, &self.location),
-                                location.into(),
-                                instance.to_value(),
-                                $format,
-                            ));
+                            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                                Ok(crate::error::ValidationErrorKind::Format { format: funding.copy_str($format)? })
+                            });
                         }
                     }
                     Ok(())
@@ -1242,16 +1457,37 @@ struct RegexValidator {
 
 impl RegexValidator {
     pub(crate) fn compile<'a, F: Json>(ctx: &compiler::Context<F>) -> CompilationResult<'a, F> {
-        let location = ctx.location().join("format");
-        let annotation = Arc::new(Value::String("regex".to_owned()));
-        Ok(Box::new(RegexValidator {
+        let location = ctx.location().join_with_funding("format", ctx.funding())?;
+        let annotation = ctx
+            .funding()
+            .arc(Value::String(ctx.funding().copy_str("regex")?))?;
+        Ok(ctx.funding().boxed(RegexValidator {
             location,
             annotation,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for RegexValidator {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.location(&self.location)?;
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            std::mem::size_of::<(&Self, &F::Node<'_>, &mut ValidationContext<'_>)>(),
+            std::mem::size_of::<Option<std::borrow::Cow<'_, str>>>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
             ctx.is_valid_ecma_regex(&item)
@@ -1260,7 +1496,7 @@ impl<F: Json> Validate<F> for RegexValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1268,13 +1504,11 @@ impl<F: Json> Validate<F> for RegexValidator {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if instance.is_string() && !Validate::<F>::is_valid(self, instance, ctx) {
-            return Err(ValidationError::format(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                "regex",
-            ));
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Format {
+                    format: funding.copy_str("regex")?,
+                })
+            });
         }
         Ok(())
     }
@@ -1291,27 +1525,53 @@ struct EmailValidator {
 
 impl EmailValidator {
     pub(crate) fn compile<'a, F: Json>(ctx: &compiler::Context<F>) -> CompilationResult<'a, F> {
-        let location = ctx.location().join("format");
-        let annotation = Arc::new(Value::String("email".to_owned()));
+        let location = ctx.location().join_with_funding("format", ctx.funding())?;
+        let annotation = ctx
+            .funding()
+            .arc(Value::String(ctx.funding().copy_str("email")?))?;
         let email_options = ctx.config().email_options().copied();
-        Ok(Box::new(EmailValidator {
+        Ok(ctx.funding().boxed(EmailValidator {
             location,
             annotation,
             email_options,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for EmailValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.location(&self.location)?;
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            Option<Cow<'_, str>>,
+            &Self,
+            &mut ValidationContext<'_>,
+        )>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
-            is_valid_email(&item, self.email_options.as_ref())
+            ctx.workspace
+                .with_json_allocations(|allocation| {
+                    is_valid_email_with_allocations(&item, self.email_options.as_ref(), allocation)
+                })
+                .unwrap_or(false)
         } else {
             true
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1319,13 +1579,11 @@ impl<F: Json> Validate<F> for EmailValidator {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if instance.is_string() && !Validate::<F>::is_valid(self, instance, ctx) {
-            return Err(ValidationError::format(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                "email",
-            ));
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Format {
+                    format: funding.copy_str("email")?,
+                })
+            });
         }
         Ok(())
     }
@@ -1344,28 +1602,57 @@ struct IdnEmailValidator {
 #[cfg(feature = "idna")]
 impl IdnEmailValidator {
     pub(crate) fn compile<'a, F: Json>(ctx: &compiler::Context<F>) -> CompilationResult<'a, F> {
-        let location = ctx.location().join("format");
-        let annotation = Arc::new(Value::String("idn-email".to_owned()));
+        let location = ctx.location().join_with_funding("format", ctx.funding())?;
+        let annotation = ctx
+            .funding()
+            .arc(Value::String(ctx.funding().copy_str("idn-email")?))?;
         let email_options = ctx.config().email_options().copied();
-        Ok(Box::new(IdnEmailValidator {
+        Ok(ctx.funding().boxed(IdnEmailValidator {
             location,
             annotation,
             email_options,
-        }))
+        })?)
     }
 }
 
 #[cfg(feature = "idna")]
 impl<F: Json> Validate<F> for IdnEmailValidator {
-    fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.location(&self.location)?;
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
+        Ok(())
+    }
+    fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        crate::validator::workspace::body_controls::<F, Self>(&[
+            std::mem::size_of::<Option<std::borrow::Cow<'_, str>>>(),
+            std::mem::size_of::<Option<EmailAddressOptions>>(),
+        ])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
+    fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(item) = instance.as_string() {
-            is_valid_idn_email(&item, self.email_options.as_ref())
+            ctx.workspace
+                .with_json_allocations(|allocation| {
+                    is_valid_idn_email_with_allocations(
+                        &item,
+                        self.email_options.as_ref(),
+                        allocation,
+                    )
+                })
+                .unwrap_or(false)
         } else {
             true
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1373,13 +1660,11 @@ impl<F: Json> Validate<F> for IdnEmailValidator {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if instance.is_string() && !Validate::<F>::is_valid(self, instance, ctx) {
-            return Err(ValidationError::format(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                "idn-email",
-            ));
+            return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+                Ok(crate::error::ValidationErrorKind::Format {
+                    format: funding.copy_str("idn-email")?,
+                })
+            });
         }
         Ok(())
     }
@@ -1399,19 +1684,21 @@ impl CustomFormatValidator {
         format_name: String,
         check: Arc<dyn Format>,
     ) -> CompilationResult<'a, F> {
-        let location = ctx.location().join("format");
-        let annotation = Arc::new(Value::String(format_name.clone()));
-        Ok(Box::new(CustomFormatValidator {
+        let location = ctx.location().join_with_funding("format", ctx.funding())?;
+        let annotation = ctx
+            .funding()
+            .arc(Value::String(ctx.funding().copy_str(&format_name)?))?;
+        Ok(ctx.funding().boxed(CustomFormatValidator {
             location,
             annotation,
             format_name,
             check,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for CustomFormatValidator {
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1450,20 +1737,28 @@ struct AnnotationOnlyFormatValidator {
 }
 
 impl<F: Json> Validate<F> for AnnotationOnlyFormatValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        if source.arc(&self.annotation)? { source.value(&self.annotation)?; }
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        if source.arc(&self.annotation)? {
+            source.value(&self.annotation)?;
+        }
         Ok(())
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         // The selected ordinary assertion body is the existing constant true.
         // Annotation emission belongs to the separate ordinary evaluate API.
-        crate::validator::workspace::body_controls::<F,Self>(&[std::mem::size_of::<bool>()])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<bool>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, _instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         _instance: &F::Node<'i>,
         _location: &LazyLocation,
@@ -1473,7 +1768,7 @@ impl<F: Json> Validate<F> for AnnotationOnlyFormatValidator {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         _instance: &F::Node<'i>,
         _location: &LazyLocation,
@@ -1705,7 +2000,7 @@ pub(crate) fn compile<'a, F: Json>(
             if let Some((name, func)) = ctx.get_format(format) {
                 return Some(CustomFormatValidator::compile(
                     ctx,
-                    name.clone(),
+                    crate::keywords::try_compile!(ctx.funding().copy_str(name)),
                     func.clone(),
                 ));
             }
@@ -1740,45 +2035,123 @@ pub(crate) fn compile<'a, F: Json>(
                         None
                     } else {
                         let message = if ctx.asserts_formats_by_dialect() {
-                            format!(
+                            ctx.funding().format(format_args!(
                                 "Unknown format: '{format}'. The meta-schema asserts formats, so unrecognized ones cannot be ignored. Register a check for it or disable format validation"
-                            )
+                            ))
                         } else {
-                            format!(
+                            ctx.funding().format(format_args!(
                                 "Unknown format: '{format}'. Adjust configuration to ignore unrecognized formats"
-                            )
+                            ))
                         };
-                        let location = ctx.location().join("format");
-                        Some(Err(ValidationError::compile_error(
-                            location.clone(),
-                            location,
-                            Location::new(),
-                            Cow::Borrowed(schema),
-                            message,
-                        )))
+                        let message = crate::keywords::try_compile!(message);
+                        let location = crate::keywords::try_compile!(ctx
+                            .location()
+                            .join_with_funding("format", ctx.funding()));
+                        Some(Err(crate::keywords::try_compile!(
+                            ValidationError::compile_error_with_funding(
+                                location.clone(),
+                                location,
+                                crate::keywords::try_compile!(Location::new_with_funding(
+                                    ctx.funding()
+                                )),
+                                Cow::Borrowed(schema),
+                                message,
+                                ctx.funding(),
+                            )
+                        )
+                        .into()))
                     }
                 }
             }
         } else {
             // Format validation disabled: annotation-only per spec §7.2.1
-            Some(Ok(Box::new(AnnotationOnlyFormatValidator {
-                annotation: Arc::new(Value::String(format.clone())),
-            })))
+            Some(Ok(
+                match ctx.funding().boxed(AnnotationOnlyFormatValidator {
+                    annotation: crate::keywords::try_compile!(ctx.funding().annotation(schema)),
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error.into())),
+                },
+            ))
         }
     } else {
-        let location = ctx.location().join("format");
-        Some(Err(ValidationError::single_type_error(
-            location.clone(),
-            location,
-            Location::new(),
-            Cow::Borrowed(schema),
-            JsonType::String,
-        )))
+        let location = crate::keywords::try_compile!(ctx
+            .location()
+            .join_with_funding("format", ctx.funding()));
+        Some(Err(crate::keywords::try_compile!(
+            ValidationError::single_type_error_with_funding(
+                location.clone(),
+                location,
+                crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                Cow::Borrowed(schema),
+                JsonType::String,
+                ctx.funding()
+            )
+        )
+        .into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hostname_and_email_reservations_stop_at_the_first_refusal() {
+        use serde_json::allocation::{Allocation, AllocationError};
+        use std::cell::Cell;
+        struct Funding {
+            calls: Cell<usize>,
+            refuse_at: usize,
+        }
+        impl Allocation for Funding {
+            fn reserve(&self, _: usize) -> Result<(), AllocationError> {
+                let reached = self.calls.get();
+                self.calls.set(reached + 1);
+                assert!(
+                    reached <= self.refuse_at,
+                    "producer continued after refusal"
+                );
+                if reached == self.refuse_at {
+                    Err(AllocationError::Refused)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (email, input) in [
+            (false, "xn--bcher-kva.example"),
+            (false, "xn--invalid-.example"),
+            (true, "name@xn--bcher-kva.example"),
+            (true, "\"\"@example.org"),
+            (true, "name@[IPv6:::1]"),
+            (true, "not an address"),
+        ] {
+            let run = |funding: &dyn Allocation| {
+                if email {
+                    super::is_valid_email_with_allocations(input, None, funding)
+                } else {
+                    super::is_valid_hostname_with_allocations(input, funding)
+                }
+            };
+            let expected = if email {
+                super::is_valid_email(input, None)
+            } else {
+                super::is_valid_hostname(input)
+            };
+            let funding = Funding {
+                calls: Cell::new(0),
+                refuse_at: usize::MAX,
+            };
+            assert_eq!(run(&funding).unwrap(), expected);
+            for refuse_at in 0..funding.calls.get() {
+                let funding = Funding {
+                    calls: Cell::new(0),
+                    refuse_at,
+                };
+                assert!(matches!(run(&funding), Err(AllocationError::Refused)));
+                assert_eq!(funding.calls.get(), refuse_at + 1);
+            }
+        }
+    }
     use referencing::Draft;
     use serde_json::json;
     use test_case::test_case;

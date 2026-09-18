@@ -740,6 +740,6 @@ pub(super) use partition::{VocabularyDestination,prepare_vocabulary_decoder,deco
 pub use partition::{PartitionFragmentHostPlan, PreparedPartitionFragmentDestinations, PartitionFragmentDestination, NativePartitionFragmentDestination, PartitionFragmentValue, PartitionFragmentDestinationError, PreparedPartitionFragmentHostFunding, PartitionFragmentHostBindingError, PartitionFragmentHostPreparationError};
 pub(in crate::working_memory) use partition::FragmentHostPlan;
 
-pub(crate) use partition::{PartitionCaptureRankSource, PreparedPartitionFragmentDelivery, PartitionFragmentDelivered, PartitionFragmentDeliveryError};
+pub(crate) use partition::{PartitionCaptureRankSource, PreparedPartitionFragmentDelivery, PartitionFragmentDelivered};
 
 pub(crate) use partition::{PartitionLocalCaptureHook,PartitionCaptureHookContinuation,PartitionCaptureHookReturnError};

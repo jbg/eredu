@@ -17,7 +17,7 @@ pub(crate) struct PreparedIndependentCacheManager {
     copy_reservation: Option<CachePoolReservation>,
     copy_tails: Vec<CopyTail>,
     copy_blocks: usize,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl PreparedIndependentCacheManager {
     pub(crate) fn destination(&self) -> &CacheResidencyManager {
@@ -507,3 +507,5 @@ impl PreparedIndependentCacheManager {
         >()
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

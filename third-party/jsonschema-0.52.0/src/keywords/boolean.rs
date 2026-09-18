@@ -12,8 +12,8 @@ pub(crate) struct FalseValidator {
 }
 impl FalseValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(FalseValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(ctx: &crate::compiler::Context<F>, location: Location) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(FalseValidator { location })?)
     }
 }
 impl<F: Json> Validate<F> for FalseValidator {
@@ -24,24 +24,19 @@ impl<F: Json> Validate<F> for FalseValidator {
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[])
     }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, _: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         false
     }
 
-    fn validate<'i>(
-        &self,
-        instance: &F::Node<'i>,
-        location: &LazyLocation,
-        tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+    fn validate_body<'i>(
+        &self, instance: &F::Node<'i>, location: &LazyLocation, tracker: Option<&RefTracker>, ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        Err(ValidationError::false_schema(
-            self.location.clone(),
-            crate::paths::capture_evaluation_path(tracker, &self.location),
-            location.into(),
-            instance.to_value(),
-        ))
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| Ok(crate::error::ValidationErrorKind::FalseSchema))
     }
+
 }
 
 #[cfg(test)]

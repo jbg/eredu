@@ -31,7 +31,7 @@ pub use report::{
     WorkspaceReportInputs, WorkspaceReportLayout, WorkspaceReportNode, WorkspaceReportResidual,
     WorkspaceReportScalars, WorkspaceReportWorkspace, WorkspaceStoragePopulation,
 };
-pub use shape::{WorkspaceBroadcastShape, WorkspaceMatmulShape, WorkspaceShapeError};
+pub use shape::{validate_masked_scatter_shapes, WorkspaceBroadcastShape, WorkspaceMatmulShape, WorkspaceShapeError, WorkspaceScatterShapeError};
 mod effects;
 pub use effects::{
     WorkspaceEffectError, WorkspaceOutputStorageView, validate_workspace_host_assumptions,
@@ -56,6 +56,7 @@ mod facts;
 mod metadata;
 mod metadata_funding;
 pub(crate) mod policy_clone;
+pub use policy_clone::ParameterMetadataAllocation;
 pub use fact_context::WorkspaceMetadataError;
 pub use facts::{
     WorkspaceEffectDestination, WorkspaceEffectLayout, WorkspaceFactDestinationError,
@@ -63,11 +64,11 @@ pub use facts::{
     WorkspaceHostFacts, WorkspaceOperationFacts, WorkspaceOutputEffect,
 };
 pub use metadata::{
-    WorkspaceContextMetadataBuilder, WorkspaceContextMetadataError, WorkspaceMetadataEnvelope,
+    WorkspaceContextMetadataBuilder, WorkspaceContextMetadataError, WorkspaceMetadataEnvelope, WorkspaceMetadataAllocation,
     visit_isolated_copy_operations,
 };
 pub use metadata_funding::{
-    WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
 };
 mod borrowed_storage;
 mod construction;
@@ -334,8 +335,15 @@ pub enum WorkspaceOperationKind {
     },
     /// Reduction over one validated axis, retaining numerical precision policy.
     Reduction(&'static str, i32, bool),
-    /// Final-axis normalization; name distinguishes RMS and layer normalization.
+    /// Final-axis RMS or related normalization, including optional grouping.
     Normalization(&'static str, Option<i32>),
+    /// Layer normalization with the exact optional affine operand roles.
+    LayerNorm {
+        /// A learned multiplicative weight follows the input.
+        weight: bool,
+        /// An additive bias follows the input and optional weight.
+        bias: bool,
+    },
     /// Constructed normalization, including learned-offset and grouping policy.
     ConstructedNormalization(crate::NormalizationConstructionSpec),
     /// Fused gated product with exact clipping and activation policy.
@@ -733,7 +741,7 @@ pub struct WorkspaceContext {
     parameter_representations: Rc<RefCell<Option<Vec<WorkspaceParameterRepresentation>>>>,
     tracing_started: Rc<report::Lifecycle>,
     // Last: all Context-owned shells retire before this accounting alias.
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl fmt::Debug for WorkspaceContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -889,6 +897,12 @@ impl WorkspaceContext {
         }
         *selected = Some(borrowed);
         Ok(())
+    }
+    /// Shares the exact installed metadata selection, including an explicit
+    /// empty selection. This grants neither physical storage credit nor work
+    /// authority; those require the independently retained registered owner.
+    pub fn borrowed_storage_selection(&self) -> Option<WorkspaceBorrowedStorage> {
+        self.borrowed.borrow().clone()
     }
     /// Borrows the actual ordinary prepared-text producer's integer dtype.
     /// An absent fact leaves portable caller-selected input policy unchanged.
@@ -1092,7 +1106,7 @@ impl WorkspaceContext {
 struct WorkspaceOverflow(&'static str);
 
 fn workspace_overflow(operation: &'static str) -> Error {
-    Error::backend_source(WorkspaceOverflow(operation))
+    Error::backend_retained_source(WorkspaceOverflow(operation))
 }
 
 #[cfg(test)]

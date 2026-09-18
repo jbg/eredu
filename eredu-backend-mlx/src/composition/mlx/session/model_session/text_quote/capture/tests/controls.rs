@@ -30,7 +30,7 @@ fn named_native_controls_are_bound_once_to_the_actual_candidate_on_all_routes() 
         let ids = vec![2, 5, 7];
         let controller = disk::Controller::default();
         let baseline = pool.used_bytes().unwrap();
-        let capture = CaptureAdmission::new(runtime.session(), geometry(), &source).unwrap();
+        let capture = CaptureAdmission::new(runtime.session(), geometry(), &source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
         let quote = quoted(&runtime, &source, &ids, &controller);
         let controls = quote.span_workspace().text_controls().unwrap();
         assert!(controls.plan().same_plan(quote.span_workspace().plan()));
@@ -442,7 +442,7 @@ fn closed_submission_token_aliases_retain_original_controls_after_owner_unwind()
     let value = Array::from_slice(&[7_u32], &[1]);
     safemlx::transforms::eval([&value]).unwrap();
     recovery.seal();
-    let status = recovery.finish();
+    let status = recovery.finish().unwrap();
     assert!(status.settled && !status.failed && !status.blocked);
     resources.request_release();
     assert!(authority.require_idle().is_ok());

@@ -1,104 +1,195 @@
 // `pub` only for the `__private` re-export consumed by generated code.
 #![allow(clippy::must_use_candidate, clippy::missing_errors_doc)]
 
-use crate::error::ValidationError;
-use ahash::AHashMap;
-use data_encoding::{BASE32, BASE32HEX, BASE64, BASE64URL, HEXUPPER};
-use std::sync::LazyLock;
+use crate::{
+    error::ValidationError,
+    validator::{
+        workspace::{Component, Error},
+        ValidationContext,
+    },
+};
+use data_encoding::{Encoding, BASE32, BASE32HEX, BASE64, BASE64URL, HEXUPPER};
+use serde_json::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 
 pub(crate) type ContentEncodingCheckType = fn(&str) -> bool;
 pub(crate) type ContentEncodingConverterType =
     fn(&str) -> Result<Option<String>, ValidationError<'static>>;
 
-// RFC 4648 §4: Base 64 Encoding
-// https://datatracker.ietf.org/doc/html/rfc4648#section-4
-pub fn is_base64(instance_string: &str) -> bool {
-    BASE64.decode(instance_string.as_bytes()).is_ok()
+#[derive(Clone, Copy)]
+pub(crate) enum BuiltinEncoding {
+    Base64,
+    Base64Url,
+    Base32,
+    Base32Hex,
+    Base16,
 }
-
-pub fn from_base64(instance_string: &str) -> Result<Option<String>, ValidationError<'static>> {
-    match BASE64.decode(instance_string.as_bytes()) {
-        Ok(value) => Ok(Some(String::from_utf8(value)?)),
-        Err(_) => Ok(None),
+impl BuiltinEncoding {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "base64" => Some(Self::Base64),
+            "base64url" => Some(Self::Base64Url),
+            "base32" => Some(Self::Base32),
+            "base32hex" => Some(Self::Base32Hex),
+            "base16" => Some(Self::Base16),
+            _ => None,
+        }
+    }
+    fn encoding(self) -> Encoding {
+        match self {
+            Self::Base64 => BASE64,
+            Self::Base64Url => BASE64URL,
+            Self::Base32 => BASE32,
+            Self::Base32Hex => BASE32HEX,
+            Self::Base16 => HEXUPPER,
+        }
+    }
+    fn decode(
+        self,
+        input: &str,
+        allocation: &dyn Allocation,
+    ) -> Result<Option<Vec<u8>>, AllocationError> {
+        allocation.reserve(std::mem::size_of::<(
+            Self,
+            &str,
+            Encoding,
+            Option<Vec<u8>>,
+            Vec<u8>,
+            usize,
+        )>())?;
+        let encoding = self.encoding();
+        let result = decode(&encoding, input.as_bytes(), allocation)?;
+        if result.is_some() || !matches!(self, Self::Base16) {
+            return Ok(result);
+        }
+        // Preserve the original Unicode uppercase retry for base16; uppercase
+        // maps each scalar independently, using the same Rust Unicode tables.
+        let size = input
+            .chars()
+            .flat_map(char::to_uppercase)
+            .try_fold(0usize, |size, value| size.checked_add(value.len_utf8()))
+            .ok_or(AllocationError::SizeOverflow)?;
+        let mut uppercase = Vec::new();
+        Allocator::new(allocation).grow(&mut uppercase, size)?;
+        for character in input.chars().flat_map(char::to_uppercase) {
+            uppercase.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+        }
+        decode(&encoding, &uppercase, allocation)
+    }
+    fn convert(
+        self,
+        input: &str,
+        allocation: &dyn Allocation,
+    ) -> Result<Result<Option<String>, std::string::FromUtf8Error>, AllocationError> {
+        Ok(match self.decode(input, allocation)? {
+            Some(bytes) => String::from_utf8(bytes).map(Some),
+            None => Ok(None),
+        })
+    }
+    fn functions(self) -> (ContentEncodingCheckType, ContentEncodingConverterType) {
+        match self {
+            Self::Base64 => (is_base64, from_base64),
+            Self::Base64Url => (is_base64url, from_base64url),
+            Self::Base32 => (is_base32, from_base32),
+            Self::Base32Hex => (is_base32hex, from_base32hex),
+            Self::Base16 => (is_base16, from_base16),
+        }
     }
 }
 
-// RFC 4648 §5: Base 64 Encoding with URL and Filename Safe Alphabet
-// https://datatracker.ietf.org/doc/html/rfc4648#section-5
-pub fn is_base64url(instance_string: &str) -> bool {
-    BASE64URL.decode(instance_string.as_bytes()).is_ok()
+// This is data-encoding's ordinary decode worker with its caller-owned output
+// admitted before initialization. decode_len/decode_mut allocate no destination.
+fn decode(
+    encoding: &Encoding,
+    input: &[u8],
+    allocation: &dyn Allocation,
+) -> Result<Option<Vec<u8>>, AllocationError> {
+    let Ok(length) = encoding.decode_len(input.len()) else {
+        return Ok(None);
+    };
+    let mut output = Vec::new();
+    Allocator::new(allocation).grow(&mut output, length)?;
+    output.resize(length, 0);
+    let Ok(length) = encoding.decode_mut(input, &mut output) else {
+        return Ok(None);
+    };
+    output.truncate(length);
+    Ok(Some(output))
 }
 
-pub fn from_base64url(instance_string: &str) -> Result<Option<String>, ValidationError<'static>> {
-    match BASE64URL.decode(instance_string.as_bytes()) {
-        Ok(value) => Ok(Some(String::from_utf8(value)?)),
-        Err(_) => Ok(None),
+macro_rules! encoding_functions {
+    ($($kind:ident, $check:ident, $convert:ident;)*) => {$ (
+        pub fn $check(input: &str) -> bool { BuiltinEncoding::$kind.decode(input, &Unenforced).expect("ordinary content decode allocation").is_some() }
+        pub fn $convert(input: &str) -> Result<Option<String>, ValidationError<'static>> {
+            BuiltinEncoding::$kind.convert(input, &Unenforced).expect("ordinary content decode allocation").map_err(Into::into)
+        }
+    )*};
+}
+encoding_functions! { Base64, is_base64, from_base64; Base64Url, is_base64url, from_base64url; Base32, is_base32, from_base32; Base32Hex, is_base32hex, from_base32hex; Base16, is_base16, from_base16; }
+
+pub(crate) fn default_content_encoding(
+    name: &str,
+) -> Option<(ContentEncodingCheckType, ContentEncodingConverterType)> {
+    BuiltinEncoding::from_name(name).map(BuiltinEncoding::functions)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ContentEncodingSource {
+    Builtin(BuiltinEncoding),
+    Custom {
+        check: ContentEncodingCheckType,
+        convert: ContentEncodingConverterType,
+    },
+}
+pub(crate) enum ConversionError {
+    Utf8(std::string::FromUtf8Error),
+    Schema(ValidationError<'static>),
+}
+impl ContentEncodingSource {
+    pub(crate) fn qualify(self) -> Result<(), Error> {
+        match self {
+            Self::Builtin(_) => Ok(()),
+            Self::Custom { .. } => Err(Error::Unqualified(Component::Source(
+                "custom content encoding",
+            ))),
+        }
+    }
+    pub(crate) fn check(self, input: &str, context: &mut ValidationContext) -> bool {
+        match self {
+            Self::Builtin(encoding) => context
+                .workspace
+                .with_json_allocations(|allocation| {
+                    Ok(encoding.decode(input, allocation)?.is_some())
+                })
+                .unwrap_or(false),
+            Self::Custom { check, .. } => {
+                if context.workspace.original() {
+                    return context.workspace.refuse(self.qualify().unwrap_err());
+                }
+                check(input)
+            }
+        }
+    }
+    pub(crate) fn convert(
+        self,
+        input: &str,
+        context: &mut ValidationContext,
+    ) -> Option<Result<Option<String>, ConversionError>> {
+        match self {
+            Self::Builtin(encoding) => context.workspace.with_json_allocations(|allocation| {
+                Ok(encoding
+                    .convert(input, allocation)?
+                    .map_err(ConversionError::Utf8))
+            }),
+            Self::Custom { convert, .. } => {
+                if context.workspace.original() {
+                    context.workspace.refuse(self.qualify().unwrap_err());
+                    return None;
+                }
+                Some(convert(input).map_err(ConversionError::Schema))
+            }
+        }
     }
 }
-
-// RFC 4648 §6: Base 32 Encoding
-// https://datatracker.ietf.org/doc/html/rfc4648#section-6
-pub fn is_base32(instance_string: &str) -> bool {
-    BASE32.decode(instance_string.as_bytes()).is_ok()
-}
-
-pub fn from_base32(instance_string: &str) -> Result<Option<String>, ValidationError<'static>> {
-    match BASE32.decode(instance_string.as_bytes()) {
-        Ok(value) => Ok(Some(String::from_utf8(value)?)),
-        Err(_) => Ok(None),
-    }
-}
-
-// RFC 4648 §7: Base 32 Encoding with Extended Hex Alphabet
-// https://datatracker.ietf.org/doc/html/rfc4648#section-7
-pub fn is_base32hex(instance_string: &str) -> bool {
-    BASE32HEX.decode(instance_string.as_bytes()).is_ok()
-}
-
-pub fn from_base32hex(instance_string: &str) -> Result<Option<String>, ValidationError<'static>> {
-    match BASE32HEX.decode(instance_string.as_bytes()) {
-        Ok(value) => Ok(Some(String::from_utf8(value)?)),
-        Err(_) => Ok(None),
-    }
-}
-
-// RFC 4648 §8: Base 16 Encoding
-// https://datatracker.ietf.org/doc/html/rfc4648#section-8
-pub fn is_base16(instance_string: &str) -> bool {
-    HEXUPPER.decode(instance_string.as_bytes()).is_ok()
-        || HEXUPPER
-            .decode(instance_string.to_uppercase().as_bytes())
-            .is_ok()
-}
-
-pub fn from_base16(instance_string: &str) -> Result<Option<String>, ValidationError<'static>> {
-    // Base16 is case-insensitive per RFC 4648
-    let result = HEXUPPER
-        .decode(instance_string.as_bytes())
-        .or_else(|_| HEXUPPER.decode(instance_string.to_uppercase().as_bytes()));
-    match result {
-        Ok(value) => Ok(Some(String::from_utf8(value)?)),
-        Err(_) => Ok(None),
-    }
-}
-
-// Supported in JSON Schema Draft 6, 7, 2019-09, and 2020-12
-// Per JSON Schema Validation spec §8.3, encoding values are defined in:
-// - RFC 4648 (base16, base32, base32hex, base64, base64url)
-// - RFC 2045 §6.7-6.8 (quoted-printable, 7bit, 8bit, binary)
-// We implement the RFC 4648 encodings as they are transformation encodings.
-pub(crate) static DEFAULT_CONTENT_ENCODING_CHECKS_AND_CONVERTERS: LazyLock<
-    AHashMap<&'static str, (ContentEncodingCheckType, ContentEncodingConverterType)>,
-> = LazyLock::new(|| {
-    let mut map: AHashMap<&'static str, (ContentEncodingCheckType, ContentEncodingConverterType)> =
-        AHashMap::with_capacity(5);
-    map.insert("base64", (is_base64, from_base64));
-    map.insert("base64url", (is_base64url, from_base64url));
-    map.insert("base32", (is_base32, from_base32));
-    map.insert("base32hex", (is_base32hex, from_base32hex));
-    map.insert("base16", (is_base16, from_base16));
-    map
-});
 
 #[cfg(test)]
 mod tests {

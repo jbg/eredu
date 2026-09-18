@@ -11,10 +11,15 @@ mod host_authority;
 #[path = "snapshots/policy.rs"]
 mod policy;
 
+#[path = "snapshots/original.rs"]
+mod original;
+#[path = "snapshots/resume.rs"]
+mod resume;
+
 // This semantic fixture has no persistent model tensors: all model continuation
 // state is its pending canonical input. Native storage conformance runs separately
 // against actual dense, convolution/recurrent and MoE fixtures.
-pub(crate) struct Native(String);
+pub(crate) struct Native(String, Option<eredu_core::HostMetadataFunding>);
 impl NativeTextStateBackend for MockBackend {
     type NativeTextState = Native;
     fn estimate_native_text_growth(
@@ -26,7 +31,7 @@ impl NativeTextStateBackend for MockBackend {
         Self::validate_native_text_state(runtime, saved)?;
         Ok(Some(0))
     }
-    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport {
+    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport<&'static str> {
         ControlSupport::Supported
     }
     fn estimate_native_text_state(
@@ -49,7 +54,10 @@ impl NativeTextStateBackend for MockBackend {
         super::provider_errors::check("capture")?;
         runtime.session().authority.require_idle()?;
         crate::host_authority::copy("native capture")?;
-        Ok(Native(runtime.session().intervention_identity.clone()))
+        Ok(Native(
+            runtime.session().intervention_identity.clone(),
+            None,
+        ))
     }
     fn copy_native_text_state(
         runtime: &mut ModelRuntime<Self>,
@@ -58,7 +66,7 @@ impl NativeTextStateBackend for MockBackend {
         super::provider_errors::check("copy")?;
         Self::validate_native_text_state(runtime, saved)?;
         crate::host_authority::copy("native copy")?;
-        Ok(Native(saved.0.clone()))
+        Ok(Native(saved.0.clone(), saved.1.clone()))
     }
     fn validate_native_text_state(
         runtime: &ModelRuntime<Self>,
@@ -76,6 +84,36 @@ impl NativeTextStateBackend for MockBackend {
     ) -> Result<(), MockError> {
         Self::validate_native_text_state(runtime, saved)
     }
+    fn exchange_text_branch(
+        runtime: &mut ModelRuntime<Self>,
+        installed: eredu_core::TextBranchSource<'_, Self>,
+        incoming: eredu_core::TextBranchSource<'_, Self>,
+        saved: &mut Native,
+    ) -> Result<(), MockError> {
+        if installed.state().original.is_none() && incoming.state().original.is_none() {
+            return Self::exchange_native_text_state(runtime, saved);
+        }
+        let current = installed
+            .state()
+            .original
+            .as_ref()
+            .ok_or(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)?;
+        let next = incoming
+            .state()
+            .original
+            .as_ref()
+            .ok_or(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)?;
+        let gate = current.request.request().begin_branch_exchange(
+            installed.context(),
+            next.request.request(),
+            incoming.context(),
+            current.funding(),
+        )?;
+        // The same real runs are gated, but this host equation has no mutable
+        // native placement or cache revision to swap or rebind.
+        gate.validate()?;
+        Self::exchange_native_text_state(runtime, saved)
+    }
 }
 use observed_mock::Sampling;
 // This semantic fixture has no managed component proof. Bounded copying is
@@ -83,14 +121,14 @@ use observed_mock::Sampling;
 // existing enclosing host authority through copying and installation.
 pub(crate) struct SavedSampling {
     sampling: Sampling,
-    pending: Option<PendingTextInput<Vec<u32>, MockToken>>,
+    pending: Option<PendingTextInput<Prompt, MockToken>>,
 }
 
 fn copy_sampling_parts(
     runtime: &mut ModelRuntime<MockBackend>,
     sampling: &Sampling,
-    pending: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
-) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, MockToken>>), MockError> {
+    pending: Option<PendingTextInput<&Prompt, &MockToken>>,
+) -> Result<(Sampling, Option<PendingTextInput<Prompt, MockToken>>), MockError> {
     let pending = MockBackend::copy_pending_input(runtime, pending)?;
     let sampling = MockBackend::copy_sampling_state(runtime, sampling)?;
     Ok((sampling, pending))
@@ -99,34 +137,131 @@ fn copy_sampling_parts(
 // Only backend capture/copy hooks assemble this immutable pair. No allocating
 // Clone or mutable component extraction is exposed by its associated type.
 pub(crate) struct SavedComponents {
-    native: Native,
-    sampling: SavedSampling,
+    ordinary: Option<(Native, SavedSampling)>,
+    // Present only for a copy created under the actual original pool account.
+    original: Option<original::Source>,
+}
+impl SavedComponents {
+    fn native(&self) -> &Native {
+        match &self.original {
+            Some(source) => &source.native,
+            None => &self.ordinary.as_ref().unwrap().0,
+        }
+    }
+    fn sampling(&self) -> &SavedSampling {
+        match &self.original {
+            Some(source) => &source.sampling,
+            None => &self.ordinary.as_ref().unwrap().1,
+        }
+    }
 }
 
 impl TextSnapshotBackend for MockBackend {
     type SamplingState = Sampling;
     type SavedSamplingState = SavedSampling;
     type SavedTextComponents = SavedComponents;
+    fn original_snapshot_host_pool(
+        runtime: &ModelRuntime<Self>,
+    ) -> Option<&eredu_runtime::working_memory::WorkingMemoryPool> {
+        Some(&Self::source_environment(runtime).pool)
+    }
     fn original_saved_components_preparation_bytes(
         _: &ModelRuntime<Self>,
         _: &Sampling,
-        _: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        _: Option<PendingTextInput<&Prompt, &MockToken>>,
     ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
-        // Scoped admission-refusal probe only: it constructs no native planner
-        // and never enables the unpriced paired copy hook below.
-        Ok(policy::cold_estimate::preparation_bytes())
+        if let Some(bytes) = policy::cold_estimate::preparation_bytes() {
+            return Ok(Some(bytes));
+        }
+        Ok(Some(original::preparation_bytes()?))
     }
     fn original_snapshot_estimates(
         runtime: &ModelRuntime<Self>,
         _: &Sampling,
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
     ) -> Option<[SnapshotEstimate; 3]> {
-        policy::cold_estimate::estimate(runtime, input)
+        match policy::cold_estimate::probe_estimate(
+            runtime,
+            input.as_ref().map(|value| match value {
+                PendingTextInput::Prefill(p) => PendingTextInput::Prefill(*p),
+                PendingTextInput::Decode(t) => PendingTextInput::Decode(*t),
+            }),
+        ) {
+            Some(result) => result,
+            None => original::estimates(runtime, input),
+        }
+    }
+    fn original_generation_snapshot_estimates(
+        runtime: &ModelRuntime<Self>,
+        state: &observed_mock::State,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
+    ) -> Option<[SnapshotEstimate; 3]> {
+        let mut estimates = Self::original_snapshot_estimates(runtime, &state.sampling, input)?;
+        let extra = match &state.funded {
+            Some(c) => c.prepare_checkpoint().ok()?.required_bytes().ok()?,
+            None => 0,
+        };
+        estimates[1].retained_bytes = estimates[1].retained_bytes.checked_add(extra)?;
+        estimates[1].copy_bytes = estimates[1].copy_bytes.checked_add(extra)?;
+        Some(estimates)
+    }
+    fn capture_saved_generation_components_with_host(
+        runtime: &mut ModelRuntime<Self>,
+        state: &observed_mock::State,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
+        policy: SamplingCopyPolicy,
+        host: &eredu_core::HostPreparationAuthority,
+    ) -> Result<SavedComponents, MockError> {
+        match policy {
+            SamplingCopyPolicy::Unquoted => {
+                Self::capture_saved_components(runtime, &state.sampling, input, policy)
+            }
+            SamplingCopyPolicy::Bounded(limits) => {
+                original::capture(runtime, state, input, limits, host)
+            }
+        }
+    }
+    fn original_saved_components_resume_preparation_bytes<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+        _: TextGenerationConfig,
+        _: &C,
+        _: &eredu_core::OriginalTextResumeOptions<'_>,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        if saved.original.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            (std::mem::size_of::<resume::ResumePreparation>()
+                + std::mem::size_of::<Result<resume::ResumePreparation, eredu_core::BackendFailure>>(
+                )) as u64,
+        ))
+    }
+    fn original_saved_components_resume_estimate(
+        _: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+        _: TextGenerationConfig,
+        _: &eredu_core::OriginalTextResumeOptions<'_>,
+    ) -> Option<SnapshotEstimate> {
+        let source = saved.original.as_ref()?;
+        let pending = match source.sampling.pending.as_ref() {
+            Some(PendingTextInput::Decode(_)) => Prompt::construction_bytes().checked_add(4)?,
+            Some(PendingTextInput::Prefill(_)) => std::mem::size_of::<Prompt>(),
+            None => Prompt::construction_bytes(),
+        };
+        let bytes = std::mem::size_of::<observed_mock::State>()
+            .checked_add(std::mem::size_of::<Native>())?
+            .checked_add(source.native.0.len())?
+            .checked_add(pending)? as u64;
+        Some(SnapshotEstimate {
+            retained_bytes: bytes,
+            copy_bytes: bytes,
+        })
     }
     fn capture_saved_components(
         runtime: &mut ModelRuntime<Self>,
         sampling: &Sampling,
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
         policy: SamplingCopyPolicy,
     ) -> Result<SavedComponents, MockError> {
         if !matches!(policy, SamplingCopyPolicy::Unquoted) {
@@ -138,7 +273,10 @@ impl TextSnapshotBackend for MockBackend {
         // shared driver already holds host authority through partial failure.
         let sampling = Self::capture_saved_sampling(runtime, sampling, input, policy)?;
         let native = Self::capture_native_text_state(runtime)?;
-        Ok(SavedComponents { native, sampling })
+        Ok(SavedComponents {
+            ordinary: Some((native, sampling)),
+            original: None,
+        })
     }
     fn copy_saved_components(
         runtime: &mut ModelRuntime<Self>,
@@ -151,26 +289,29 @@ impl TextSnapshotBackend for MockBackend {
             ));
         }
         Self::validate_saved_components(runtime, saved)?;
-        let sampling = Self::copy_saved_sampling(runtime, &saved.sampling, policy)?;
-        let native = Self::copy_native_text_state(runtime, &saved.native)?;
-        Ok(SavedComponents { native, sampling })
+        let sampling = Self::copy_saved_sampling(runtime, saved.sampling(), policy)?;
+        let native = Self::copy_native_text_state(runtime, saved.native())?;
+        Ok(SavedComponents {
+            ordinary: Some((native, sampling)),
+            original: None,
+        })
     }
     fn saved_sampling(saved: &SavedComponents) -> &SavedSampling {
-        &saved.sampling
+        saved.sampling()
     }
     fn validate_saved_components(
         runtime: &ModelRuntime<Self>,
         saved: &SavedComponents,
     ) -> Result<(), MockError> {
-        Self::validate_native_text_state(runtime, &saved.native)
+        Self::validate_native_text_state(runtime, saved.native())
     }
     fn estimate_saved_components(
         runtime: &ModelRuntime<Self>,
         saved: &SavedComponents,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         Self::validate_saved_components(runtime, saved)?;
-        let native = Self::estimate_native_text_state(runtime, Some(&saved.native))?;
-        let sampling = Self::estimate_saved_sampling(runtime, &saved.sampling)?;
+        let native = Self::estimate_native_text_state(runtime, Some(saved.native()))?;
+        let sampling = Self::estimate_saved_sampling(runtime, saved.sampling())?;
         Ok(native.zip(sampling).and_then(|(native, sampling)| {
             Some(SnapshotEstimate {
                 retained_bytes: native.retained_bytes.checked_add(sampling.retained_bytes)?,
@@ -184,7 +325,7 @@ impl TextSnapshotBackend for MockBackend {
         input_tokens: u64,
     ) -> Result<Option<u64>, MockError> {
         Self::validate_saved_components(runtime, saved)?;
-        Self::estimate_native_text_growth(runtime, &saved.native, input_tokens)
+        Self::estimate_native_text_growth(runtime, saved.native(), input_tokens)
     }
     fn prepare_saved_components_resume(
         runtime: &mut ModelRuntime<Self>,
@@ -193,19 +334,19 @@ impl TextSnapshotBackend for MockBackend {
         (
             Native,
             Sampling,
-            Option<PendingTextInput<Vec<u32>, MockToken>>,
+            Option<PendingTextInput<Prompt, MockToken>>,
         ),
         MockError,
     > {
         Self::validate_saved_components(runtime, saved)?;
-        let (sampling, pending) = Self::prepare_saved_sampling_resume(runtime, &saved.sampling)?;
-        let native = Self::copy_native_text_state(runtime, &saved.native)?;
+        let (sampling, pending) = Self::prepare_saved_sampling_resume(runtime, saved.sampling())?;
+        let native = Self::copy_native_text_state(runtime, saved.native())?;
         Ok((native, sampling, pending))
     }
     fn capture_saved_sampling(
         runtime: &mut ModelRuntime<Self>,
         sampling: &Sampling,
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
         policy: SamplingCopyPolicy,
     ) -> Result<SavedSampling, MockError> {
         if !matches!(policy, SamplingCopyPolicy::Unquoted) {
@@ -268,7 +409,7 @@ impl TextSnapshotBackend for MockBackend {
     fn prepare_saved_sampling_resume(
         runtime: &mut ModelRuntime<Self>,
         saved: &SavedSampling,
-    ) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, MockToken>>), MockError> {
+    ) -> Result<(Sampling, Option<PendingTextInput<Prompt, MockToken>>), MockError> {
         copy_sampling_parts(
             runtime,
             &saved.sampling,
@@ -277,7 +418,7 @@ impl TextSnapshotBackend for MockBackend {
     }
 
     fn continuation_input_tokens(
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
         predictions: u64,
     ) -> Option<u64> {
         if predictions == 0 {
@@ -305,7 +446,12 @@ impl TextSnapshotBackend for MockBackend {
         sampling: Sampling,
         capture: Option<CaptureSession>,
     ) -> observed_mock::State {
-        observed_mock::State { sampling, capture }
+        observed_mock::State {
+            sampling,
+            capture,
+            original: None,
+            ..Default::default()
+        }
     }
     fn sampling_prediction(sampling: &Sampling) -> u64 {
         sampling.prediction
@@ -329,7 +475,7 @@ impl TextSnapshotBackend for MockBackend {
     }
     fn estimate_pending_input(
         _: &ModelRuntime<Self>,
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         policy::cold_estimate::ordinary_hook();
         let bytes = match input {
@@ -344,8 +490,8 @@ impl TextSnapshotBackend for MockBackend {
     }
     fn copy_pending_input(
         _: &mut ModelRuntime<Self>,
-        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
-    ) -> Result<Option<PendingTextInput<Vec<u32>, MockToken>>, MockError> {
+        input: Option<PendingTextInput<&Prompt, &MockToken>>,
+    ) -> Result<Option<PendingTextInput<Prompt, MockToken>>, MockError> {
         crate::host_authority::copy("input copy")?;
         Ok(input.map(|input| match input {
             PendingTextInput::Prefill(ids) => PendingTextInput::Prefill(ids.clone()),
@@ -377,7 +523,17 @@ impl TextSnapshotBackend for MockBackend {
 }
 
 pub(super) fn snapshot_setup() -> (
-    LoadedModel<MockBackend>,
+    original_sources::Fixture<MockBackend>,
+    PreparedChat,
+    PreparedChatGenerationSettings,
+    u32,
+) {
+    snapshot_setup_capacity(original_sources::CAPACITY)
+}
+fn snapshot_setup_capacity(
+    capacity: u64,
+) -> (
+    original_sources::Fixture<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -392,11 +548,33 @@ pub(super) fn snapshot_setup() -> (
         ..Default::default()
     };
     let mut probe = unicode_model_with_vocabulary(None, 512);
-    let chat = probe.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = probe
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        probe
+            .prepare_chat(&source, &request, capacity, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     assert!(first + 3 < 512);
     let mut model = unicode_model_with_vocabulary(Some(first), 512);
-    let chat = model.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, capacity, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     (
         model,
         chat,
@@ -431,26 +609,36 @@ fn snapshot_configuration_identity_retains_inference_policy() {
             ..Default::default()
         },
         TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(16 << 20),
+            managed_memory_capacity_bytes: Some(original_sources::CAPACITY + (1 << 30)),
             ..Default::default()
         },
         TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(32 << 20),
+            managed_memory_capacity_bytes: Some(original_sources::CAPACITY + (2 << 30)),
             ..Default::default()
         },
         TextInferencePolicy::default(),
     ] {
-        let (mut model, chat, mut settings, _) = snapshot_setup();
+        let (mut model, chat, mut settings, _) = snapshot_setup_capacity(
+            policy
+                .managed_memory_capacity_bytes
+                .unwrap_or(original_sources::CAPACITY),
+        );
         settings.inference = policy;
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-            .unwrap();
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
         let mut session = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
-        session.enable_snapshots(snapshot_limits()).unwrap();
+        session
+            .enable_snapshots(
+                snapshot_limits(),
+                original_sources::CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+            )
+            .unwrap();
         let saved = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
         identities.push(saved.metadata().configuration_identity);
     }
@@ -466,35 +654,33 @@ fn snapshot_configuration_identity_retains_inference_policy() {
 fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulative_budgets() {
     for mode in 0..4 {
         let (mut model, chat, settings, first) = snapshot_setup();
+        let pool = model.original_pool().clone();
         let mut plan = if mode & 1 == 0 {
             CapturePlan::none()
         } else {
             observed_mock::plan()
         };
         plan.limits = observed_mock::plan().limits;
-        let prepared = if mode & 2 == 0 {
-            model
-                .prepare_observed_chat(&chat, settings, plan, limits())
-                .unwrap()
-        } else {
-            model
-                .prepare_intervened_chat(
-                    &chat,
-                    settings,
-                    plan,
-                    observed_mock::intervention_plan(1.0),
-                    limits(),
-                )
-                .unwrap()
-        };
+        let intervention = (mode & 2 != 0).then(|| observed_mock::intervention_plan(1.0));
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        prepared.capture = Some(&plan);
+        prepared.intervention = intervention.as_ref();
         let mut records = vec![];
         let mut session = model
-            .start_controlled_chat(prepared, &[], Default::default(), |r| {
+            .start_controlled_chat(prepared, limits(), Default::default(), |r| {
                 records.push(r);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
-        session.enable_snapshots(snapshot_limits()).unwrap();
+        session
+            .enable_snapshots(
+                snapshot_limits(),
+                original_sources::CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+            )
+            .unwrap();
         assert_eq!(session.capabilities().snapshot, ControlSupport::Supported);
         let initial = session
             .snapshot(|r| {
@@ -534,7 +720,7 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
                 ControlFlow::Continue(())
             })
             .unwrap();
-        assert_eq!(session.output_checkpoint().epoch, 1);
+        assert_eq!(session.output_checkpoint().unwrap().epoch, 1);
         assert_eq!(session.next_prediction(), 1);
         assert!(session.emitted_bytes() > bytes);
         assert!(
@@ -558,7 +744,13 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
         assert!(session
             .snapshot(|_| panic!("limited snapshot emitted"))
             .is_err());
-        assert!(session.enable_snapshots(snapshot_limits()).is_err());
+        assert!(session
+            .enable_snapshots(
+                snapshot_limits(),
+                original_sources::CAPACITY,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY)
+            )
+            .is_err());
         session
             .restore(&initial, |r| {
                 records.push(r);
@@ -581,32 +773,50 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence, index as u64);
         }
-        assert!(records.iter().any(|record| matches!(&record.generation.event,
-            ObservedGenerationEvent::Restored { output, .. } if output == &saved.metadata().output)));
+        assert!(records.iter().any(|record| matches!(&record.event,
+            eredu::api::ControlledGenerationEvent::Progress { event: ObservedGenerationEvent::Restored { output, .. } } if output == &saved.metadata().output)));
         drop((initial, saved, terminal));
-        assert_eq!(session.snapshot_usage().unwrap().retained_bytes, 0);
+        // The installed terminal copy and escaped records still own their
+        // independent destination and saved-source lineage.
+        assert!(session.snapshot_usage().unwrap().retained_bytes > 0);
+        drop(session);
+        drop((baseline, records, chat, model));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
-fn opaque_grammar_estimates_fail_before_snapshot_retention() {
+fn compiled_grammar_snapshots_restore_the_same_committed_output() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
-    assert!(session.enable_snapshots(snapshot_limits()).is_err());
-    assert!(session.snapshot_usage().is_none());
-    assert!(matches!(
-        session.capabilities().snapshot,
-        ControlSupport::Unsupported { .. }
-    ));
+    session
+        .enable_snapshots(
+            snapshot_limits(),
+            original_sources::CAPACITY,
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        )
+        .unwrap();
+    let saved = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.capabilities().snapshot, ControlSupport::Supported);
     session.step(|_| ControlFlow::Continue(())).unwrap();
+    let committed = session.token_ids().to_vec();
     assert_eq!(session.next_prediction(), 1);
+    session
+        .restore(&saved, |_| ControlFlow::Continue(()))
+        .unwrap();
+    assert!(session.token_ids().is_empty());
+    session.step(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(), committed);
+    // The resumed parser still retains its independently copied destination.
+    drop(saved);
+    assert!(session.snapshot_usage().unwrap().retained_bytes > 0);
 }
 
 fn collect(
@@ -629,21 +839,11 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
             observed_mock::plan()
         };
         plan.limits = observed_mock::plan().limits;
-        let prepared = if mode & 2 == 0 {
-            model
-                .prepare_observed_chat(&chat, settings, plan, limits())
-                .unwrap()
-        } else {
-            model
-                .prepare_intervened_chat(
-                    &chat,
-                    settings,
-                    plan,
-                    observed_mock::intervention_plan(1.0),
-                    limits(),
-                )
-                .unwrap()
-        };
+        let intervention = (mode & 2 != 0).then(|| observed_mock::intervention_plan(1.0));
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        prepared.capture = Some(&plan);
+        prepared.intervention = intervention.as_ref();
         let options = || GenerationBranchOptions {
             trace_limits: TraceLimits {
                 per_record_bytes: 16384,
@@ -655,15 +855,25 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
         };
         let mut records = vec![];
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+            .start_controlled_chat(
+                prepared,
+                limits(),
+                Default::default(),
+                collect(&mut records),
+            )
+            .unwrap()
             .unwrap();
-        let parent = run.output_checkpoint().run_id;
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 3,
-            max_branches: 2,
-            retained_bytes: 64_000_000,
-            cumulative_copy_bytes: 256_000_000,
-        })
+        let parent = run.output_checkpoint().unwrap().run_id.clone();
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 3,
+                max_branches: 2,
+                retained_bytes: 64_000_000,
+                cumulative_copy_bytes: 256_000_000,
+            },
+            original_sources::CAPACITY,
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        )
         .unwrap();
         let initial = run.snapshot(collect(&mut records)).unwrap();
         assert_eq!(run.capabilities().fork, ControlSupport::Supported);
@@ -692,11 +902,11 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
         let parent_bytes = run.emitted_bytes();
         run.exchange(&mut left, collect(&mut records)).unwrap();
         assert_eq!(left.run_id(), parent);
-        assert_eq!(run.output_checkpoint().run_id, left_id);
+        assert_eq!(run.output_checkpoint().unwrap().run_id, left_id);
         run.step(collect(&mut records)).unwrap();
         // Swap to the sibling while both the parent and left continuation remain stable.
         run.exchange(&mut right, collect(&mut records)).unwrap();
-        assert_eq!(run.output_checkpoint().run_id, right_id);
+        assert_eq!(run.output_checkpoint().unwrap().run_id, right_id);
         assert_eq!(run.token_ids(), [first]);
         let before = records.len();
         run.run(collect(&mut records)).unwrap();
@@ -704,7 +914,7 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
         assert_eq!(semantic(&records[before..]), baseline_text);
         assert!(run.restore(&partial, collect(&mut records)).is_err());
         run.exchange(&mut left, collect(&mut records)).unwrap();
-        assert_eq!(run.output_checkpoint().run_id, parent);
+        assert_eq!(run.output_checkpoint().unwrap().run_id, parent);
         assert_eq!(run.token_ids(), baseline_ids);
         assert!(run.emitted_bytes() > parent_bytes);
         assert_eq!(partial.token_ids(), [first]);
@@ -728,40 +938,53 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
         run.force_next_token(first + 3).unwrap();
         run.step(collect(&mut records)).unwrap();
         assert_eq!(run.token_ids(), [first + 3]);
-        assert!(records.iter().any(|r| r.generation.run_id == changed_id
+        assert!(records.iter().any(|r| r.run_id == changed_id
             && matches!(
-                r.generation.event,
-                ObservedGenerationEvent::Token { forced: true, .. }
+                &r.event,
+                eredu::api::ControlledGenerationEvent::Progress {
+                    event: ObservedGenerationEvent::Token { forced: true, .. }
+                }
             )));
         run.cancel(collect(&mut records)).unwrap();
         // Cancelling a child does not cancel or strand the parent in its slot.
         run.exchange(&mut slot, collect(&mut records)).unwrap();
-        assert_eq!(run.output_checkpoint().run_id, parent);
+        assert_eq!(run.output_checkpoint().unwrap().run_id, parent);
         assert_eq!(run.token_ids(), baseline_ids);
         drop(slot);
         assert_eq!(run.snapshot_usage().unwrap().branches, 0);
         let mut sequences = std::collections::HashMap::new();
         for record in &records {
-            let previous = sequences.insert(&record.generation.run_id, record.sequence);
+            let previous = sequences.insert(&record.run_id, record.sequence);
             assert!(previous.is_none_or(|previous| record.sequence > previous));
-            if let ObservedGenerationEvent::BranchStarted {
+            if let eredu::api::ControlledGenerationEvent::BranchStarted {
                 lineage,
-                prompt_token_ids,
+                prompt_attribution,
                 inherited_token_ids,
                 inherited_semantics,
-            } = &record.generation.event
+            } = &record.event
             {
                 assert_eq!(record.sequence, 0);
-                assert_eq!(record.generation.run_id, lineage.run_id);
+                assert_eq!(record.run_id, lineage.run_id);
                 assert_eq!(lineage.parent.output.run_id, parent);
-                assert_eq!(prompt_token_ids, initial.prompt_token_ids());
+                assert_eq!(
+                    prompt_attribution.attribution().complete_token_ids(),
+                    initial.complete_token_ids()
+                );
                 assert!(inherited_token_ids.is_empty() || inherited_token_ids == &[first]);
                 assert!(inherited_semantics.is_empty()); // Incomplete UTF-8 was never flushed.
-                if let Some(parent_plan) = &lineage.parent.intervention_plan_id {
-                    assert_ne!(
-                        record.generation.intervention_plan_id.as_ref(),
-                        Some(parent_plan)
-                    );
+                if let eredu::api::PreparedInstrumentationRecord::Intervened {
+                    intervention_plan_id: parent_plan,
+                    ..
+                } = &lineage.parent.instrumentation
+                {
+                    let eredu::api::PreparedInstrumentationRecord::Intervened {
+                        intervention_plan_id,
+                        ..
+                    } = &record.instrumentation
+                    else {
+                        panic!("intervention custody lost")
+                    };
+                    assert_ne!(intervention_plan_id, parent_plan);
                 }
             }
         }
@@ -772,19 +995,28 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
 fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_prefix() {
     use eredu::api::GenerationBranchOptions;
     let (mut model, chat, settings, first) = snapshot_setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled_chat(
+            prepared,
+            limits(),
+            Default::default(),
+            collect(&mut records),
+        )
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(SnapshotLimits {
-        max_snapshots: 3,
-        max_branches: 1,
-        retained_bytes: 32_000_000,
-        cumulative_copy_bytes: 128_000_000,
-    })
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_snapshots: 3,
+            max_branches: 1,
+            retained_bytes: 32_000_000,
+            cumulative_copy_bytes: 128_000_000,
+        },
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
     .unwrap();
     run.force_next_token(first).unwrap();
     let forced = run.snapshot(collect(&mut records)).unwrap();
@@ -815,11 +1047,11 @@ fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_p
     let inherited = records
         .iter()
         .find_map(|record| {
-            if record.generation.run_id != branch_id {
+            if record.run_id != branch_id {
                 return None;
             }
-            match &record.generation.event {
-                ObservedGenerationEvent::BranchStarted {
+            match &record.event {
+                eredu::api::ControlledGenerationEvent::BranchStarted {
                     inherited_semantics,
                     ..
                 } => Some(inherited_semantics.clone()),
@@ -845,30 +1077,39 @@ fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_p
 fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model() {
     use eredu::api::GenerationBranchOptions;
     let (mut model, chat, settings, _) = snapshot_setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let snapshot = {
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
-        run.enable_snapshots(snapshot_limits()).unwrap();
+        run.enable_snapshots(
+            snapshot_limits(),
+            original_sources::CAPACITY,
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        )
+        .unwrap();
         run.snapshot(|_| ControlFlow::Continue(())).unwrap()
     };
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+        .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
         })
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(SnapshotLimits {
-        max_branches: 1,
-        ..snapshot_limits()
-    })
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_branches: 1,
+            ..snapshot_limits()
+        },
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
     .unwrap();
     let usage = run.snapshot_usage().unwrap();
     let result = run.fork(
@@ -884,12 +1125,20 @@ fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model(
         },
         |_| ControlFlow::Continue(()),
     );
-    assert!(matches!(
-        result,
-        Err(eredu::api::ControlledGenerationError::Snapshot(
-            eredu_runtime::execution_control::TextSnapshotError::IncompatibleRun
-        ))
-    ));
+    let error = result.err().unwrap();
+    let cause = match &error {
+        eredu::api::ControlledGenerationError::Snapshot(error) => Some(error.cause()),
+        error => error
+            .session_failure()
+            .and_then(|error| error.snapshot_failure()),
+    };
+    assert!(
+        matches!(
+            cause,
+            Some(eredu_runtime::execution_control::TextSnapshotError::IncompatibleRun)
+        ),
+        "{error:?}"
+    );
     assert_eq!(run.snapshot_usage().unwrap(), usage);
     assert_eq!(run.status(), GenerationStatus::Prepared);
     run.step(|_| ControlFlow::Continue(())).unwrap();
@@ -900,14 +1149,26 @@ fn facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let alternate = first + 3;
     let stop = format!("é{}", model.decode(&[alternate], false).unwrap());
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let stops = [stop];
+    prepared.stop_sequences = &stops;
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[stop], Default::default(), collect(&mut records))
+        .start_controlled_chat(
+            prepared,
+            limits(),
+            Default::default(),
+            collect(&mut records),
+        )
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(snapshot_limits()).unwrap();
+    run.enable_snapshots(
+        snapshot_limits(),
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
+    .unwrap();
     run.step(collect(&mut records)).unwrap();
     run.step(collect(&mut records)).unwrap();
     assert!(
@@ -936,25 +1197,32 @@ fn facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary() {
 fn explicit_intervention_removal_retains_its_empty_override_provenance() {
     use eredu::api::GenerationBranchOptions;
     let (mut model, chat, settings, _) = snapshot_setup();
-    let prepared = model
-        .prepare_intervened_chat(
-            &chat,
-            settings,
-            observed_mock::plan(),
-            observed_mock::intervention_plan(1.0),
-            limits(),
-        )
-        .unwrap();
+    let capture = observed_mock::plan();
+    let intervention = observed_mock::intervention_plan(1.0);
+    let mut prepared =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    prepared.capture = Some(&capture);
+    prepared.intervention = Some(&intervention);
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled_chat(
+            prepared,
+            limits(),
+            Default::default(),
+            collect(&mut records),
+        )
+        .unwrap()
         .unwrap();
-    run.enable_snapshots(SnapshotLimits {
-        max_snapshots: 1,
-        max_branches: 1,
-        retained_bytes: 32_000_000,
-        cumulative_copy_bytes: 128_000_000,
-    })
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_snapshots: 1,
+            max_branches: 1,
+            retained_bytes: 32_000_000,
+            cumulative_copy_bytes: 128_000_000,
+        },
+        original_sources::CAPACITY,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+    )
     .unwrap();
     let saved = run.snapshot(collect(&mut records)).unwrap();
     let empty = eredu_core::intervention::InterventionPlan {
@@ -980,17 +1248,23 @@ fn explicit_intervention_removal_retains_its_empty_override_provenance() {
         .iter()
         .find(|record| {
             matches!(
-                record.generation.event,
-                ObservedGenerationEvent::BranchStarted { .. }
+                &record.event,
+                eredu::api::ControlledGenerationEvent::BranchStarted { .. }
             )
         })
         .unwrap();
-    let ObservedGenerationEvent::BranchStarted { lineage, .. } = &start.generation.event else {
+    let eredu::api::ControlledGenerationEvent::BranchStarted { lineage, .. } = &start.event else {
         unreachable!()
     };
     assert_eq!(lineage.intervention_override.as_ref(), Some(&empty));
-    assert!(lineage.parent.intervention_plan_id.is_some());
-    assert!(start.generation.intervention_plan_id.is_none());
+    assert!(matches!(
+        lineage.parent.instrumentation,
+        eredu::api::PreparedInstrumentationRecord::Intervened { .. }
+    ));
+    assert!(matches!(
+        start.instrumentation,
+        eredu::api::PreparedInstrumentationRecord::Captured { .. }
+    ));
     run.exchange(&mut branch, collect(&mut records)).unwrap();
     run.step(collect(&mut records)).unwrap();
 }

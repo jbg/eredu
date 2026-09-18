@@ -25,26 +25,29 @@ impl OneOfValidator<SerdeJson> {
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
         if let Value::Array(items) = schema {
-            let ctx = ctx.new_at_location("oneOf");
-            let mut schemas = Vec::with_capacity(items.len());
+            let ctx = ctx.new_at_location("oneOf")?;
+            let mut schemas = Vec::new();
+            ctx.funding().grow(&mut schemas, items.len())?;
             for (idx, item) in items.iter().enumerate() {
-                let ctx = ctx.new_at_location(idx);
+                let ctx = ctx.new_at_location(idx)?;
                 let node = compiler::compile(&ctx, ctx.as_resource_ref(item))?;
                 schemas.push(node);
             }
-            Ok(Box::new(OneOfValidator {
+            Ok(ctx.funding().boxed(OneOfValidator {
                 schemas,
                 location: ctx.location().clone(),
-            }))
+            })?)
         } else {
-            let location = ctx.location().join("oneOf");
-            Err(ValidationError::single_type_error(
+            let location = ctx.location().join_with_funding("oneOf", ctx.funding())?;
+            Err(ValidationError::single_type_error_with_funding(
                 location.clone(),
                 location,
-                Location::new(),
+                Location::new_with_funding(ctx.funding())?,
                 Cow::Borrowed(schema),
                 JsonType::Array,
-            ))
+                ctx.funding(),
+            )?
+            .into())
         }
     }
 }
@@ -92,19 +95,23 @@ impl SingleOneOfValidator<SerdeJson> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let one_of_ctx = ctx.new_at_location("oneOf");
-        let item_ctx = one_of_ctx.new_at_location(0);
+        let one_of_ctx = ctx.new_at_location("oneOf")?;
+        let item_ctx = one_of_ctx.new_at_location(0)?;
         let node = compiler::compile(&item_ctx, item_ctx.as_resource_ref(schema))?;
-        Ok(Box::new(SingleOneOfValidator {
+        Ok(ctx.funding().boxed(SingleOneOfValidator {
             node,
             location: one_of_ctx.location().clone(),
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for SingleOneOfValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.node)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.node)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -115,11 +122,20 @@ impl<F: Json> Validate<F> for SingleOneOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<(
+            Vec<Vec<ValidationError<'_>>>,
+            Vec<ValidationError<'_>>,
+            &SchemaNode<F>,
+        )>())
+        .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         self.node.is_valid(instance, ctx)
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -127,21 +143,21 @@ impl<F: Json> Validate<F> for SingleOneOfValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if self.node.is_valid(instance, ctx) {
-            Ok(())
-        } else {
-            Err(ValidationError::one_of_not_valid(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                vec![{
-                    let mut branch = Vec::new();
-                    self.node
-                        .collect_errors(instance, location, tracker, ctx, &mut branch);
-                    branch
-                }],
-            ))
+            return Ok(());
         }
+        let Some(branches) = ctx.branch_errors(
+            std::slice::from_ref(&self.node),
+            instance,
+            location,
+            tracker,
+        ) else {
+            return Ok(());
+        };
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            Ok(crate::error::ValidationErrorKind::OneOfNotValid {
+                context: funding.error_context(branches)?,
+            })
+        })
     }
 
     fn evaluate(
@@ -159,8 +175,12 @@ impl<F: Json> Validate<F> for SingleOneOfValidator<F> {
 }
 
 impl<F: Json> Validate<F> for OneOfValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.nodes(&self.schemas)?; source.location(&self.location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.nodes(&self.schemas)?;
+        source.location(&self.location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -171,12 +191,21 @@ impl<F: Json> Validate<F> for OneOfValidator<F> {
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        let base = <Self as Validate<F>>::original_controls(self)?;
+        base.checked_add(std::mem::size_of::<(
+            Vec<Vec<ValidationError<'_>>>,
+            Vec<ValidationError<'_>>,
+            &SchemaNode<F>,
+        )>())
+        .ok_or(crate::validator::workspace::Error::Overflow)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         let first_valid_idx = self.get_first_valid(instance, ctx);
         first_valid_idx.is_some_and(|idx| !self.are_others_valid(instance, idx, ctx))
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -184,40 +213,25 @@ impl<F: Json> Validate<F> for OneOfValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         let first_valid_idx = self.get_first_valid(instance, ctx);
-        if let Some(idx) = first_valid_idx {
-            if self.are_others_valid(instance, idx, ctx) {
-                return Err(ValidationError::one_of_multiple_valid(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.schemas
-                        .iter()
-                        .map(|schema| {
-                            let mut branch = Vec::new();
-                            schema.collect_errors(instance, location, tracker, ctx, &mut branch);
-                            branch
-                        })
-                        .collect(),
-                ));
+        let multiple = if let Some(idx) = first_valid_idx {
+            if !self.are_others_valid(instance, idx, ctx) {
+                return Ok(());
             }
-            Ok(())
+            true
         } else {
-            Err(ValidationError::one_of_not_valid(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-                self.schemas
-                    .iter()
-                    .map(|schema| {
-                        let mut branch = Vec::new();
-                        schema.collect_errors(instance, location, tracker, ctx, &mut branch);
-                        branch
-                    })
-                    .collect(),
-            ))
-        }
+            false
+        };
+        let Some(branches) = ctx.branch_errors(&self.schemas, instance, location, tracker) else {
+            return Ok(());
+        };
+        ctx.diagnostic::<F>(instance, location, tracker, &self.location, |funding| {
+            let context = funding.error_context(branches)?;
+            Ok(if multiple {
+                crate::error::ValidationErrorKind::OneOfMultipleValid { context }
+            } else {
+                crate::error::ValidationErrorKind::OneOfNotValid { context }
+            })
+        })
     }
 
     fn evaluate(

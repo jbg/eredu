@@ -191,73 +191,54 @@ fn check_histogram(
     Ok(())
 }
 
-pub(super) fn validate_schema(
-    plan: &CapturePlan,
-    catalog: &ObservationCatalog,
-    support: &ObservationSupportReport,
-    capabilities: &CaptureCapabilities,
-) -> Result<(), CaptureError> {
-    check_schema(
-        plan,
-        catalog.schema_version,
-        support.schema_version,
-        capabilities,
-    )
-    .map_err(|error| match error {
-        CaptureRevalidationError::Schema => {
-            CaptureError::Invalid("unsupported schema version".into())
-        }
-        _ => CaptureError::Unsupported("physical native allocator/workspace bound".into()),
-    })
+pub(super) fn validate_schema(plan: &CapturePlan, catalog: &ObservationCatalog,
+    support: &ObservationSupportReport, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
+    validate_schema_with(plan,catalog,support,capabilities,super::admission::allocation::Allocation(None))
 }
-
-pub(super) fn validate_transform(
-    selection: &CaptureSelection,
-    capabilities: &CaptureCapabilities,
-) -> Result<(), CaptureError> {
-    check_transform(selection, capabilities)
-        .map_err(|_| CaptureError::Unsupported(format!("{:?}", selection.transform.kind())))
+pub(super) fn validate_schema_with(plan: &CapturePlan, catalog: &ObservationCatalog,
+    support: &ObservationSupportReport, capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
+    match check_schema(plan,catalog.schema_version,support.schema_version,capabilities) {
+        Ok(()) => Ok(()),
+        Err(CaptureRevalidationError::Schema) => Err(CaptureError::Invalid(allocation.text("unsupported schema version")?)),
+        Err(_) => Err(CaptureError::Unsupported(allocation.text("physical native allocator/workspace bound")?)),
+    }
 }
-
-pub(super) fn validate_phase_support(
-    selection: &CaptureSelection,
-    support: &ObservationSupportReport,
-) -> Result<(), CaptureError> {
-    let phase_support = support
-        .points
-        .iter()
-        .find(|p| p.path == selection.path)
-        .ok_or_else(|| {
-            CaptureError::Unsupported(format!("no selected support for {}", selection.path))
-        })?;
-    for (enabled, status) in [
-        (selection.schedule.prefill, &phase_support.prefill),
-        (selection.schedule.decode, &phase_support.decode),
-    ] {
-        if enabled
-            && !matches!(
-                status,
-                ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
-            )
-        {
-            return Err(CaptureError::Unsupported(format!(
-                "{}: {status:?}",
-                selection.path
-            )));
+pub(super) fn validate_transform(selection: &CaptureSelection, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
+    validate_transform_with(selection,capabilities,super::admission::allocation::Allocation(None))
+}
+pub(super) fn validate_transform_with(selection: &CaptureSelection, capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
+    if check_transform(selection,capabilities).is_err() {
+        return Err(CaptureError::Unsupported(allocation.format(format_args!("{:?}",selection.transform.kind()))?));
+    }
+    Ok(())
+}
+pub(super) fn validate_phase_support(selection: &CaptureSelection, support: &ObservationSupportReport) -> Result<(), CaptureError> {
+    validate_phase_support_with(selection,support,super::admission::allocation::Allocation(None))
+}
+pub(super) fn validate_phase_support_with(selection: &CaptureSelection, support: &ObservationSupportReport,
+    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
+    let phase_support=match support.points.iter().find(|p|p.path==selection.path) {
+        Some(value)=>value,
+        None=>return Err(CaptureError::Unsupported(allocation.format(format_args!("no selected support for {}",selection.path))?)),
+    };
+    for(enabled,status) in [(selection.schedule.prefill,&phase_support.prefill),(selection.schedule.decode,&phase_support.decode)] {
+        if enabled && !matches!(status,ObservationSupportStatus::Supported|ObservationSupportStatus::Conditional(_)) {
+            return Err(CaptureError::Unsupported(allocation.format(format_args!("{}: {status:?}",selection.path))?));
         }
     }
     Ok(())
 }
-
-pub(super) fn validate_histogram(
-    selection: &CaptureSelection,
-    capabilities: &CaptureCapabilities,
-) -> Result<(), CaptureError> {
-    check_histogram(selection, capabilities).map_err(|_| {
-        CaptureError::Invalid(
-            "histogram edges must be finite, increasing, and within the bin limit".into(),
-        )
-    })
+pub(super) fn validate_histogram(selection: &CaptureSelection, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
+    validate_histogram_with(selection,capabilities,super::admission::allocation::Allocation(None))
+}
+pub(super) fn validate_histogram_with(selection: &CaptureSelection, capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
+    if check_histogram(selection,capabilities).is_err() {
+        return Err(CaptureError::Invalid(allocation.text("histogram edges must be finite, increasing, and within the bin limit")?));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

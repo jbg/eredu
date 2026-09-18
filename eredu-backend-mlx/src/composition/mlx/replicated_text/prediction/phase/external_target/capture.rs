@@ -106,7 +106,7 @@ impl ActivationObserver<MlxTensor, eredu_nn::Error> for Observer<'_> {
                 value
                     .as_array()
                     .try_clone_handle()
-                    .map_err(eredu_nn::Error::backend_source)?,
+                    .map_err(eredu_nn::Error::backend_retained_source)?,
             ));
         }
         Ok(())

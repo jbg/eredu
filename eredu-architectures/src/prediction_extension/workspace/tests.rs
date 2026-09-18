@@ -71,16 +71,10 @@ impl WorkspacePredictionParameterSource for ProjectedFixtureParameters {
             error: Option<Error>,
         }
         impl<'v> ParameterVisitor<'v, WorkspaceTensor> for Values<'_> {
-            fn visit(&mut self, _: ParameterMetadata, _: &'v WorkspaceTensor) {
-                panic!("borrowed fixture topology required")
-            }
-            fn requires_borrowed_metadata(&self) -> bool {
-                true
-            }
-            fn borrowed_metadata_unavailable(&mut self) {
-                self.error = Some(WorkspaceMetadataError::Unqualified.into());
-            }
-            fn visit_borrowed(
+
+
+
+            fn visit(
                 &mut self,
                 metadata: ParameterMetadataView<'_>,
                 value: &'v WorkspaceTensor,

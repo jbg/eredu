@@ -16,7 +16,7 @@ fn preparation_failures_preserve_native_causes_through_the_portable_boundary() {
         Error::Exception(native()),
     ));
     let architecture = Error::from(PartitionedRuntimeConstructionError::Architecture(
-        eredu_nn::Error::backend_source(native()),
+        eredu_nn::Error::backend_retained_source(native()),
     ));
     type SessionError = eredu_runtime::ReplicatedTextSessionError<eredu_nn::Error, Error, Error>;
     let errors = [

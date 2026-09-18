@@ -1,6 +1,6 @@
 //! A map of String to serde_json::Value.
 //!
-//! By default the map is backed by a [`BTreeMap`]. Enable the `preserve_order`
+//! By default the map is backed by an ordered AVL tree. Enable the `preserve_order`
 //! feature of serde_json to use [`IndexMap`] instead.
 //!
 //! [`BTreeMap`]: std::collections::BTreeMap
@@ -21,7 +21,9 @@ use core::ops;
 use serde::de;
 
 #[cfg(not(feature = "preserve_order"))]
-use alloc::collections::{btree_map, BTreeMap};
+use eredu_collections::ordered_map as ordered;
+#[cfg(not(feature = "preserve_order"))]
+use ordered::{self as btree_map, Map as BTreeMap};
 #[cfg(feature = "preserve_order")]
 use indexmap::IndexMap;
 
@@ -36,6 +38,9 @@ type MapImpl<K, V> = BTreeMap<K, V>;
 type MapImpl<K, V> = IndexMap<K, V>;
 
 impl Map<String, Value> {
+    /// Actual backing of the selected map representation, excluding nested keys and values.
+    pub fn allocation_size(&self) -> usize { self.map.allocation_size() }
+
     /// Makes a new empty Map.
     #[inline]
     pub fn new() -> Self {
@@ -126,6 +131,45 @@ impl Map<String, Value> {
     #[inline]
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
         self.map.insert(k, v)
+    }
+
+    /// Inserts one already constructed key/value after reserving the owning
+    /// table's actual reached backing. Nested key/value storage is separate.
+    pub fn try_insert_with_allocations(
+        &mut self, key: String, value: Value, funding: &dyn crate::allocation::Allocation,
+    ) -> Result<Option<Value>, crate::allocation::AllocationError> {
+        #[cfg(feature = "preserve_order")]
+        {
+        if !self.map.contains_key(&key) {
+            self.map.try_reserve_with(1, |layout| funding.reserve(layout.size()))
+                .map_err(|error| match error {
+                    indexmap::TryReserveWithError::Funding(error) => error,
+                    indexmap::TryReserveWithError::Allocation(_) => crate::allocation::AllocationError::HostAllocation,
+                })?;
+        }
+        Ok(self.map.insert(key, value))
+        }
+        #[cfg(not(feature = "preserve_order"))]
+        self.map.try_insert_with(key, value, |layout| funding.reserve(layout.size()))
+            .map_err(|error| match error {
+                ordered::TryInsertError::SizeOverflow => crate::allocation::AllocationError::SizeOverflow,
+                ordered::TryInsertError::Funding(error) => error,
+            })
+    }
+
+    /// Deep-copy entries through their ordinary source producers with an
+    /// explicit prospective allocation policy.
+    pub fn try_clone_with_allocations(
+        &self, funding: &dyn crate::allocation::Allocation,
+    ) -> Result<Self, crate::allocation::AllocationError> {
+        let allocator = crate::allocation::Allocator::new(funding);
+        let mut result = Self::new();
+        for (key, value) in self {
+            let key = allocator.copy_string(key)?;
+            let value = value.try_clone_with_allocations(funding)?;
+            result.try_insert_with_allocations(key, value, funding)?;
+        }
+        Ok(result)
     }
 
     /// Insert a key-value pair in the map at the given index.
@@ -276,7 +320,7 @@ impl Map<String, Value> {
         S: Into<String>,
     {
         #[cfg(not(feature = "preserve_order"))]
-        use alloc::collections::btree_map::Entry as EntryImpl;
+        use self::ordered::Entry as EntryImpl;
         #[cfg(feature = "preserve_order")]
         use indexmap::map::Entry as EntryImpl;
 
@@ -395,15 +439,11 @@ impl Default for Map<String, Value> {
 impl Clone for Map<String, Value> {
     #[inline]
     fn clone(&self) -> Self {
-        Map {
-            map: self.map.clone(),
-        }
+        self.try_clone_with_allocations(&crate::allocation::Unenforced)
+            .expect("ordinary JSON map clone")
     }
-
     #[inline]
-    fn clone_from(&mut self, source: &Self) {
-        self.map.clone_from(&source.map);
-    }
+    fn clone_from(&mut self, source: &Self) { *self = source.clone(); }
 }
 
 impl PartialEq for Map<String, Value> {
@@ -1179,3 +1219,21 @@ type IntoValuesImpl = btree_map::IntoValues<String, Value>;
 type IntoValuesImpl = indexmap::map::IntoValues<String, Value>;
 
 delegate_iterator!((IntoValues) => Value);
+
+#[cfg(test)]
+mod ordered_json_tests {
+    #[test]
+    fn nested_maps_clone_and_serialize_on_default_test_stack() {
+        let mut value = crate::Value::Null;
+        for _ in 0..100 {
+            let mut map = crate::Map::new();
+            map.insert("child".into(), value);
+            value = crate::Value::Object(map);
+        }
+        let copied = value.clone();
+        assert_eq!(
+            crate::to_vec(&value).unwrap(),
+            crate::to_vec(&copied).unwrap()
+        );
+    }
+}

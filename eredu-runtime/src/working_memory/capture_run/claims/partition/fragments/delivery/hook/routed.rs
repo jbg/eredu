@@ -137,7 +137,7 @@ impl PartitionLocalCaptureHook {
             size_of::<Option<(InferenceGeometry,u64)>>(),size_of::<(Option<u64>,bool,u64)>(),
             size_of::<(&mut PartitionLocalCaptureHook,&mut dyn ScheduledCaptureBackend<Tensor=T,Error=E>,&crate::RoutedUnitInvocation<'_,T>,Option<(InferenceGeometry,u64)>)>(),
             size_of::<(&mut PartitionLocalCaptureHook,&mut dyn ScheduledCaptureBackend<Tensor=T,Error=E>,&crate::RoutedUnitBatch<'_,T>)>(),
-            size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>()];
+            size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
 }

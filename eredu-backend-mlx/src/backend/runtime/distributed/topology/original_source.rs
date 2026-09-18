@@ -1,6 +1,6 @@
 //! Funded finite loans from the actual retained native communication source.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{PartitionCommunicationAuthority, RetainedCommunicationSource};
 use std::mem::{size_of, size_of_val};
 
@@ -42,6 +42,13 @@ pub(in crate::backend::runtime::distributed) enum Cause {
     Unavailable,
     #[error("distributed source does not contain the exact selected native resource")]
     Resource,
+    #[error("actual collective binding failed at occurrence {index:?}, equation {ordinal:?}: {cause}")]
+    NativeBinding {
+        index: Option<usize>,
+        ordinal: Option<usize>,
+        #[source]
+        cause: safemlx::distributed::GroupCpuBindingError,
+    },
     #[error("member-only status chain exceeded its original deadline")]
     StatusDeadline,
     #[error("member-only status numerical source failed")]
@@ -50,8 +57,16 @@ pub(in crate::backend::runtime::distributed) enum Cause {
     StatusClone(#[source] safemlx::PreparedArrayCloneCause),
     #[error("distributed source lacks its exact selected native resource at {0}")]
     ResourceAt(&'static std::panic::Location<'static>),
-    #[error("parallel workspace input has no actual floating representation")]
-    WorkspaceRepresentation,
+    #[error("parallel workspace {operation:?} on {group:?}, local rank {rank}/{partitions}, lacks floating scalar evidence: input rank {input_rank}, width {input_width:?}, elements {input_elements:?}")]
+    WorkspaceRepresentation {
+        operation: CommunicationOperation,
+        group: CollectiveGroupId,
+        rank: usize,
+        partitions: usize,
+        input_rank: usize,
+        input_width: Option<i32>,
+        input_elements: Option<u64>,
+    },
     #[error("actual native group refused the selected CPU layout source")]
     NativeLayout,
     #[error("native parallel backing population is not the selected Sum/Gather producer: {0}")]
@@ -87,17 +102,17 @@ struct Failure {
     #[source]
     cause: Cause,
     _source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 fn failure_control_bytes() -> Option<usize> {
     let controls = [size_of::<Failure>(), size_of::<Cause>(), size_of::<Error>(),
         size_of::<eredu_core::BackendFailure>(), size_of::<Result<(), Error>>(),
-        size_of::<(&RetainedCommunicationSource, &WorkspaceMetadataFunding, Cause)>(),
+        size_of::<(&RetainedCommunicationSource, &HostMetadataFunding, Cause)>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?];
     controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
 }
 #[track_caller]
-fn failure(cause: Cause, source: &RetainedCommunicationSource, funding: &WorkspaceMetadataFunding) -> Error {
+fn failure(cause: Cause, source: &RetainedCommunicationSource, funding: &HostMetadataFunding) -> Error {
     let cause = match cause { Cause::Resource => Cause::ResourceAt(std::panic::Location::caller()), other => other };
     Error::with_original_control_source(eredu_core::BackendFailure::new(
         eredu_core::BackendFailureKind::Other,
@@ -112,38 +127,38 @@ pub(crate) struct OriginalCommunicationSource<'a> {
     source: RetainedCommunicationSource,
     registered_buffers: Option<registered_buffers::RegisteredBuffers>,
     // Retires after source and every loan/control field.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl ParallelCommunicators {
     pub(crate) fn bind_original_source<'a>(
         &'a self, selected: &CommunicationManifest, world: &NativeGroup,
-        authority: &'a PartitionCommunicationAuthority, funding: &WorkspaceMetadataFunding,
+        authority: &'a PartitionCommunicationAuthority, funding: &HostMetadataFunding,
     ) -> Result<OriginalCommunicationSource<'a>, Error> {
         self.bind_original_source_retaining(selected,world,authority,funding,&self.source)
     }
     fn bind_original_source_retaining<'a>(
         &'a self, selected:&CommunicationManifest, world:&NativeGroup,
-        authority:&'a PartitionCommunicationAuthority, funding:&WorkspaceMetadataFunding,
+        authority:&'a PartitionCommunicationAuthority, funding:&HostMetadataFunding,
         retained:&RetainedCommunicationSource,
     )->Result<OriginalCommunicationSource<'a>,Error> {
         let controls = [size_of::<OriginalCommunicationSource<'a>>(),
             size_of::<Result<OriginalCommunicationSource<'a>, Error>>(),
-            size_of::<(&Self, &CommunicationManifest, &NativeGroup, &PartitionCommunicationAuthority, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &CommunicationManifest, &NativeGroup, &PartitionCommunicationAuthority, &HostMetadataFunding)>(),
             size_of::<(&Self,&CommunicationManifest,&NativeGroup,&PartitionCommunicationAuthority,
-                &WorkspaceMetadataFunding,&RetainedCommunicationSource)>(),
+                &HostMetadataFunding,&RetainedCommunicationSource)>(),
             size_of::<Cause>(), size_of::<Failure>(), size_of::<eredu_core::BackendFailure>(),
             size_of::<Result<(), eredu_runtime::PartitionExecutionError>>(),
             crate::backend::runtime::distributed::completion::group_source_controls()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             size_of::<(usize, &CommunicationGroupDescriptor, bool)>(),
             size_of::<(usize, &CommunicationRouteDescriptor, bool)>(),
             size_of::<Option<(&Group, &CommunicationGroupDescriptor, bool)>>(),
             size_of::<Option<(&CommunicationRouteRealization, &CommunicationRouteDescriptor, bool)>>(),
             eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         ];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let fail = |cause| failure(cause, retained, funding);
         if !retained.same_source(&self.source) || self.source.manifest() != selected || self.session_identity != self.source.session_identity()
             || self.world_size != selected.world_size() || self.global_rank != selected.rank()
@@ -193,7 +208,7 @@ impl<'a> OriginalCommunicationSource<'a> {
         // Every attempt can return an independently escaped retained failure.
         // The initial source-binding allowance cannot be reused by later calls.
         self.funding.reserve_metadata(failure_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if self.authority.ensure_active().is_err() || self.actual.control_world.native_group().terminal_submission()
             || !crate::backend::runtime::distributed::completion::group_source_available(&self.actual.control_world) {
@@ -226,7 +241,7 @@ impl<'a> OriginalCommunicationSource<'a> {
     }
 
     pub(crate) fn source(&self) -> &RetainedCommunicationSource { &self.source }
-    pub(crate) fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub(crate) fn funding(&self) -> &HostMetadataFunding { &self.funding }
     pub(crate) fn world(&self) -> &'a Group { &self.actual.control_world }
     pub(crate) fn group(&self, order: usize) -> Option<(&'a Group, &CommunicationGroupDescriptor, bool)> {
         let (descriptor, wave) = self.source.group(order)?;

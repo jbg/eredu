@@ -571,8 +571,8 @@ pub enum FundedCaptureError<E: std::error::Error + 'static> {
     #[error(transparent)]
     Partition(#[from] crate::capture::partition::PartitionCaptureProgramError),
     /// Original native/backend source; not converted to a diagnostic String.
-    #[error(transparent)]
-    Backend(E),
+    #[error("{0}")]
+    Backend(#[source] E),
 }
 /// A shared drain failed without consuming the owned pending delivery.
 #[derive(Debug, thiserror::Error)]
@@ -625,7 +625,7 @@ impl FundedCaptureSession {
             envelope_usage: None,
             prepared_prefix: None,
             partition_run: None,
-            session: CaptureSession::from_shared_plan(run.source().clone()),
+            session: CaptureSession::new(run.source().clone()),
             delivery: None,
             lineage,
             run,
@@ -647,6 +647,10 @@ impl FundedCaptureSession {
     /// Exact retained physical admission source; no raw owning export.
     pub fn source(&self) -> &SharedCapturePlan {
         self.run.source()
+    }
+    /// Exact immutable intervention source retained by the admitted run.
+    pub fn intervention_source(&self) -> Option<&crate::working_memory::OriginalInterventionSource> {
+        self.run.intervention_source()
     }
     /// Cumulative logical quota, including failed/aborted attempts.
     pub fn usage(&self) -> CaptureUsage {
@@ -784,7 +788,7 @@ impl FundedCaptureSession {
             None => CaptureLedger::with_inherited_usage(&self.session.plan, current.usage())
                 .map_err(|_| CaptureProtocolError::Geometry)?,
         };
-        let mut ledger = CumulativeUpdate {
+        let ledger = CumulativeUpdate {
             session: &mut self.session,
             current,
         };
@@ -842,14 +846,13 @@ impl FundedCaptureSession {
                 }
             },
         };
-        self.session.checkpoint_ready = step.as_ref().is_some_and(|s| {
-            s.as_ref().outcome == CaptureStepOutcome::Committed
-                && !s
-                    .as_ref()
-                    .records
-                    .iter()
-                    .any(|r| matches!(r.outcome, CaptureOutcome::Failed { .. }))
-        });
+        self.session.checkpoint_ready = match (&step, self.session.transaction) {
+            (Some(step), _) => step.as_ref().outcome == CaptureStepOutcome::Committed
+                && !step.as_ref().records.iter().any(|r| matches!(r.outcome, CaptureOutcome::Failed { .. })),
+            (None, Some((_, CaptureTransactionStatus::Committed))) => !self.run.has_frame_claims(),
+            (None, None) => self.session.checkpoint_ready,
+            _ => false,
+        };
         self.session.transaction = None;
         Ok(step)
     }
@@ -922,7 +925,7 @@ pub(crate) fn control_bytes() -> Result<u64, WorkingMemoryError> {
         .and_then(|n| n.checked_add(size_of::<FundedDelivery>()))
         .and_then(|n| n.checked_add(size_of::<FundedCaptureDrainError>()))
         .and_then(|n| n.checked_add(size_of::<FundedCaptureError<std::convert::Infallible>>()))
-        .and_then(|n| n.checked_add(size_of::<Option<eredu_core::capture::CapturedStepDelivery>>()))
+        .and_then(|n| n.checked_add(size_of::<Option<eredu_core::capture::SharedCapturedStep>>()))
         .and_then(|n| n.checked_mul(3))
         .ok_or(WorkingMemoryError::Overflow)?;
     u64::try_from(n)
@@ -932,3 +935,6 @@ pub(crate) fn control_bytes() -> Result<u64, WorkingMemoryError> {
         })
         .ok_or(WorkingMemoryError::Overflow)
 }
+
+#[cfg(test)]
+mod error_tests;

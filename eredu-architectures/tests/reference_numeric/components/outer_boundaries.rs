@@ -41,7 +41,7 @@ impl ActivationObserver<NumericTensor, Error> for OuterObserver {
                 .push(value.clone());
             if path == "model.layers.0.input.effective" {
                 if let Some(cause) = self.fail.take() {
-                    return Err(Error::backend_source(EffectiveInputFailure(cause)));
+                    return Err(Error::backend_retained_source(EffectiveInputFailure(cause)));
                 }
             }
         }
@@ -109,7 +109,7 @@ fn prepared_looped_outer_replacements_are_once_only_on_actual_tp_pp_owners() {
             )
             .unwrap();
             let mut state = DeviceState::<NumericBackend, _>::create(
-                architecture.state_layout().unwrap(),
+                architecture.state_layout(None).unwrap(),
                 |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
             )
             .unwrap();

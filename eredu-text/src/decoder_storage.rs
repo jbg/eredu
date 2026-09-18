@@ -157,6 +157,24 @@ impl PreparedDecodeSource {
                 }
                 lossy_into(&raw[..len], text)
             }
+            Mode::Metaspace { replacement, remove_first } => {
+                let mut len = 0;
+                let mut first = true;
+                for id in ids {
+                    if let Some(piece) = self.piece(*id, skip_special) {
+                        let piece = std::str::from_utf8(piece).expect("original UTF-8 token spelling");
+                        for c in tokenizers::pre_tokenizers::metaspace::decode_piece(
+                            piece, replacement, first && remove_first,
+                        ) {
+                            let end = len + c.len_utf8();
+                            c.encode_utf8(&mut text[len..end]);
+                            len = end;
+                        }
+                        first = false;
+                    }
+                }
+                len
+            }
             Mode::Fallback { order, strip } => {
                 let len = if order == FallbackOrder::ByteLevelLast {
                     // The exact layout is N + F + F. Derive partitions from
@@ -378,6 +396,7 @@ impl<'source> DecodeStreamLayout<'source> {
                 pieces,
                 pieces.checked_mul(3).ok_or(DecodeStorageError::Overflow)?,
             ),
+            Mode::Metaspace { .. } => (0, pieces),
             Mode::Fallback { order, .. } => {
                 let fused = calls
                     .checked_mul(source.max_piece.max(3))

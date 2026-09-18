@@ -11,7 +11,7 @@ pub struct SpeculativeActivationCheckpoint {
     // Last: copied authority retires before inherited host custody.
     pub(super) host_owner: Arc<crate::capture::CaptureHostOwner>,
     // Original shared shell and authority allocations retire before source H.
-    pub(super) original_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    pub(super) original_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 #[derive(Clone, Debug)]

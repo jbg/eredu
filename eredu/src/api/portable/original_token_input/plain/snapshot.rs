@@ -34,7 +34,8 @@ pub(crate) struct OriginalPlainSnapshot<B: TextSnapshotBackend> {
     // Preserve active time and the first-token observation without advancing a clock.
     active: Duration,
     time_to_first_token: Option<Duration>,
-    cursor: PlainCursor<B>,
+    cursor: PlainCursor,
+    input_custody: Option<eredu_runtime::input::OriginalModelInputCustody>,
 }
 impl<B: TextSnapshotBackend> OriginalPlainSnapshot<B> {
     pub(crate) fn token_ids(&self) -> &[u32] {
@@ -86,7 +87,7 @@ impl<B: TextSnapshotBackend> OriginalPlainSession<'_, B> {
         let pool = B::original_snapshot_host_pool(runtime).ok_or(
             TextSnapshotError::Unsupported("original snapshot host domain"),
         )?;
-        type PublicError = crate::api::portable::managed_plain::ManagedPlainTextSnapshotError;
+        type PublicError = crate::api::portable::managed_plain::GenerationSnapshotError;
         let host = self
             .cursor
             .prepare_snapshot_host_copy::<B, OriginalDomainController, (
@@ -108,6 +109,7 @@ impl<B: TextSnapshotBackend> OriginalPlainSession<'_, B> {
                     crate::api::control::map_snapshot_failure(error, B::into_backend_failure)
                 })?;
         Ok(OriginalPlainSnapshot {
+            input_custody: self.input_custody.clone(),
             state,
             cursor,
             active: self.active,
@@ -147,7 +149,8 @@ where
         let started = Instant::now();
         let preparation = self
             .state
-            .original_resume_preparation_bytes(runtime, config)
+            .original_resume_preparation_bytes(runtime, config, &eredu_core::OriginalTextResumeOptions::new(
+                if branch { eredu_core::OriginalTextResumeKind::Branch } else { eredu_core::OriginalTextResumeKind::Restore }))
             .map_err(|e| crate::api::control::map_snapshot_failure(e, B::into_backend_failure))?;
         let pool = B::original_snapshot_host_pool(runtime).ok_or(
             TextSnapshotError::Unsupported("original resume host domain"),
@@ -182,6 +185,7 @@ where
                 cursor.restrict_remaining(remaining);
             }
             OriginalPlainSession {
+                input_custody: self.input_custody.clone(),
                 source: BackendGenerationTokenSource {
                     generator,
                     on_token: None,

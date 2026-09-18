@@ -1,5 +1,8 @@
 use safemlx::error::Exception;
 
+mod cold_workspace;
+pub use cold_workspace::{WorkspaceCandidateRefusal, WorkspaceQuoteComponents};
+
 mod ordinary_capture;
 pub use ordinary_capture::OrdinaryCaptureFailure;
 mod output_observation;
@@ -60,6 +63,10 @@ fn format_keys(keys: &[String]) -> String {
 /// Error type used by MLX model loading and execution.
 #[non_exhaustive]
 pub enum Error {
+    /// Canonical parameter traversal could not establish complete source coverage.
+    #[error(transparent)]
+    ParameterSource(#[from] eredu_nn::ParameterSourceError),
+
     /// Exact shared embedded protocol diagnostic, with no formatted allocation.
     #[error("{0}")]
     EmbeddedPredictionContract(#[from] eredu_architectures::speculative_execution::EmbeddedPredictionContractError),
@@ -76,7 +83,7 @@ pub enum Error {
     ArrayDescriptor(#[from] safemlx::ArrayDescriptorError),
     /// Fixed host-planning admission refusal; no diagnostic allocation.
     #[error("{0}")]
-    WorkspacePlanning(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    WorkspacePlanning(#[from] eredu_nn::workspace::HostMetadataFundingError),
     /// Exact stream source/constructor refusal, retaining failed native prefixes.
     #[error(transparent)]
     GpuStreamOwnership(#[from] crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError),
@@ -146,6 +153,9 @@ pub enum Error {
         #[source]
         cause: eredu_runtime::working_memory::WorkingMemoryError,
     },
+    /// Fixed retained observation-source validation, without a diagnostic box.
+    #[error("{0}")]
+    PreparedObservation(#[source] eredu_runtime::PreparedSessionObservationError),
     /// No original Scope accepted; the same prepared role remains retained.
     #[error("original prefill scope could not begin: {0}")]
     PrefillScope(#[source] safemlx::SubmissionScopeOwnerCause),
@@ -307,6 +317,12 @@ pub enum Error {
     /// Invalid composed architecture configuration or state usage.
     #[error("architecture model error: {0}")]
     ArchitectureModel(String),
+
+    /// Exact cold architecture projection failure before source publication.
+    #[error("prepared parameter source: {0}")]
+    PreparedParameterSource(
+        #[source] eredu_architectures::prepared_execution::PreparedExecutionError<eredu_nn::Error>,
+    ),
 
     /// A typed model adapter proved preflight rejection or successful rollback.
     #[error(transparent)]

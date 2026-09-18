@@ -37,7 +37,7 @@ use eredu_core::{
     InputExtent, InputMetadataKey, InputModality, ModelRuntime, ObservationRequest, SemanticEvent,
     SpeculativeCapability, SpeculativeConfig, SpeculativeDraft, SpeculativeExecutionTopology,
     SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeOutputError, SpeculativeSemanticState, SpeculativeTokenFilterController,
+    SpeculativeOutputError, SemanticState, SpeculativeTokenFilterController,
     TextGenerationConfig, TokenFilter, TokenFilterController, TokenOutput as _,
     TokenizerCompatibilityProof,
 };
@@ -157,7 +157,7 @@ struct TokenOnlySemanticState {
     events: Vec<SemanticEvent>,
 }
 
-impl SpeculativeSemanticState for TokenOnlySemanticState {
+impl SemanticState for TokenOnlySemanticState {
     fn control_snapshot_bytes(&self) -> Option<u64> {
         // This token-only fixture has no decoder/parser history. Snapshot only
         // after committed events have been delivered, like its fork contract.
@@ -166,10 +166,10 @@ impl SpeculativeSemanticState for TokenOnlySemanticState {
             .then_some(std::mem::size_of::<Self>() as u64 + 256)
     }
 
-    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
+    fn fork_owned(&self) -> Result<eredu_core::SemanticStateOwner, SpeculativeOutputError> {
         let mut fork = self.clone();
         fork.events.clear();
-        Ok(Box::new(fork))
+        Ok(Box::new(fork).into())
     }
 
     fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {

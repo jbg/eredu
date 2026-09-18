@@ -411,7 +411,7 @@ diff --git a/mlx/fast.h b/mlx/fast.h
  namespace mlx::core::fast {
 +// Pure controls of the unchanged mask-free CPU SDPA/GQA fallback.
 +bool cpu_sdpa_fallback_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept;
- // Pure controls of the same CPU default full-width RoPE fallback.
+ // Pure controls of the same rank-three/four full-width CPU RoPE fallback.
  bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept;
  
 diff --git a/mlx/ops.cpp b/mlx/ops.cpp

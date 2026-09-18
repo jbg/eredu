@@ -11,6 +11,9 @@ pub(super) struct RunProgress {
     completed: Option<u64>,
     fenced: bool,
     supersession_claimed: bool,
+    control_issue: u64,
+    sampling_epoch: u64,
+    control_pending: Option<u64>,
 }
 
 /// Move-only logical permission for one prediction of a bound text run.
@@ -140,6 +143,9 @@ impl InferenceTextPreparation {
             completed: None,
             fenced: false,
             supersession_claimed: false,
+            control_issue: 0,
+            sampling_epoch: 0,
+            control_pending: None,
         });
         Ok(())
     }
@@ -200,6 +206,9 @@ impl InferenceTextPreparation {
         if run.fenced {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
+        if run.control_pending.is_some() {
+            return Err(WorkingMemoryError::PreparationNotReady);
+        }
         if run.active.is_some() {
             return Err(WorkingMemoryError::TextStepActive);
         }
@@ -244,6 +253,9 @@ impl InferenceTextPreparation {
         if run.fenced {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
+        if run.control_pending.is_some() {
+            return Err(WorkingMemoryError::PreparationNotReady);
+        }
         if run.active.is_some() {
             return Err(WorkingMemoryError::TextStepActive);
         }
@@ -274,6 +286,13 @@ impl InferenceTextPreparation {
         })
     }
 }
+
+mod control;
+mod branch;
+pub use branch::PendingTextBranchExchange;
+mod sampling;
+pub use sampling::PendingSamplingExtension;
+pub(in crate::working_memory) use sampling::SamplingExtensionBinding;
 
 impl InferenceTextStep {
     /// Issuing ordinal within this exact prepared run. Initial prefill is zero;
@@ -503,6 +522,9 @@ fn supersede_runs(
     if predecessor.prompt != READY || predecessor.sampling != READY {
         return Err(WorkingMemoryError::PreparationNotReady);
     }
+    if previous.control_pending.is_some() {
+        return Err(WorkingMemoryError::PreparationNotReady);
+    }
     if previous.active.is_some() {
         return Err(WorkingMemoryError::TextStepActive);
     }
@@ -588,6 +610,9 @@ impl InferenceTextStepReceipt {
             .ok_or(WorkingMemoryError::TextRunUnbound)?;
         if run.fenced {
             return Err(WorkingMemoryError::ExecutionFenced);
+        }
+        if run.control_pending.is_some() {
+            return Err(WorkingMemoryError::PreparationNotReady);
         }
         if run.active.is_some() {
             return Err(WorkingMemoryError::TextStepActive);

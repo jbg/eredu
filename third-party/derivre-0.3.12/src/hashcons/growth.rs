@@ -1,179 +1,8 @@
-//! Closed paid owner for reached hash-cons backing and entry allocations.
+//! Closed paid growth for reached hash-cons backing and entry allocations.
 use super::{HashConsCapacityError, PreparedVecHashCons, VecHashCons};
-use std::{
-    alloc::Layout,
-    error::Error,
-    fmt,
-    mem::{size_of, size_of_val},
-    sync::{atomic::AtomicUsize, Arc, OnceLock},
-};
-trait Account: fmt::Debug + Send + Sync {
-    fn reserve(&self, bytes: usize) -> bool;
-    fn cause(&self) -> Option<&(dyn Error + 'static)>;
-    fn retire(self: Arc<Self>);
-}
-struct Payload<F, E> {
-    failure: OnceLock<E>,
-    funding: F,
-}
-impl<F, E> fmt::Debug for Payload<F, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HashConsFunding")
-            .field("failed", &self.failure.get().is_some())
-            .finish()
-    }
-}
-impl<F, E> Account for Payload<F, E>
-where
-    F: Fn(usize) -> Result<(), E> + Send + Sync + 'static,
-    E: Error + Send + Sync + 'static,
-{
-    fn reserve(&self, bytes: usize) -> bool {
-        if self.failure.get().is_some() {
-            return false;
-        }
-        match (self.funding)(bytes) {
-            Ok(()) => true,
-            Err(error) => {
-                let _ = self.failure.set(error);
-                false
-            }
-        }
-    }
-    fn cause(&self) -> Option<&(dyn Error + 'static)> {
-        self.failure.get().map(|e| e as _)
-    }
-    fn retire(self: Arc<Self>) {
-        if let Some(payload) = Arc::into_inner(self) {
-            drop(payload);
-        }
-    }
-}
-/// Independently paid callback/first-failure storage. It supplies reached storage
-/// bytes only; the enclosing actual prepared table supplies source and insertion order.
-pub struct PreparedHashConsFunding(Option<Arc<dyn Account>>);
-impl Clone for PreparedHashConsFunding {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-impl Drop for PreparedHashConsFunding {
-    fn drop(&mut self) {
-        if let Some(account) = self.0.take() {
-            account.retire();
-        }
-    }
-}
-impl fmt::Debug for PreparedHashConsFunding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedHashConsFunding")
-            .field(
-                "failed",
-                &self.0.as_ref().is_some_and(|a| a.cause().is_some()),
-            )
-            .finish()
-    }
-}
-/// Inline construction refusal; no callback destination exists on failure.
-#[derive(Debug)]
-pub enum HashConsFundingPreparationError<E> {
-    /// The actual shared callback/error layout cannot be represented.
-    Overflow,
-    /// The real account refused before allocation.
-    Funding(E),
-}
-impl<E: fmt::Display> fmt::Display for HashConsFundingPreparationError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Overflow => f.write_str("hash-cons funding owner layout overflow"),
-            Self::Funding(e) => fmt::Display::fmt(e, f),
-        }
-    }
-}
-impl<E: Error + 'static> Error for HashConsFundingPreparationError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Funding(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-/// The original concrete refusal remains borrowed from its fixed first-error
-/// slot. The final alias frees its Arc shell before dropping error/source/H.
-#[derive(Debug)]
-pub struct HashConsFundingFailure {
-    funding: PreparedHashConsFunding,
-}
-impl fmt::Display for HashConsFundingFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.source() {
-            Some(cause) => fmt::Display::fmt(cause, f),
-            None => f.write_str("hash-cons funding is unavailable"),
-        }
-    }
-}
-impl Error for HashConsFundingFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.funding.0.as_ref().and_then(|a| a.cause())
-    }
-}
-impl PreparedHashConsFunding {
-    /// Exact prospective constructor payment for this actual retained callback
-    /// and its error slot. Inspection invokes no callback or allocation.
-    pub fn preparation_bytes<F, E>(_: &F) -> Option<usize>
-    where F: Fn(usize) -> Result<(), E> + Send + Sync + 'static,
-        E: Error + Send + Sync + 'static,
-    {
-        let layout = Layout::new::<[AtomicUsize; 2]>()
-            .extend(Layout::new::<Payload<F, E>>())
-            .ok()?
-            .0
-            .pad_to_align();
-        let parts = [
-            layout.size(),
-            size_of::<Payload<F, E>>(),
-            size_of::<F>(),
-            size_of::<OnceLock<E>>(),
-            size_of::<Self>(),
-            size_of::<Arc<Payload<F, E>>>(),
-            size_of::<Arc<dyn Account>>(),
-            size_of::<HashConsFundingPreparationError<E>>(),
-            size_of::<HashConsFundingFailure>(),
-            size_of::<Result<Self, HashConsFundingPreparationError<E>>>(),
-            size_of::<Result<(), E>>(),
-            size_of::<Layout>(),
-            size_of::<Option<usize>>(),
-            size_of::<Result<E, E>>(),
-        ];
-        parts
-            .into_iter()
-            .try_fold(size_of_val(&parts), usize::checked_add)
-    }
-    /// Reserves the actual callback/error slot and shared shell before allocation.
-    /// The callback must retain its real cumulative funding account.
-    pub fn prepare<F, E>(funding: F) -> Result<Self, HashConsFundingPreparationError<E>>
-    where
-        F: Fn(usize) -> Result<(), E> + Send + Sync + 'static,
-        E: Error + Send + Sync + 'static,
-    {
-        let bytes = Self::preparation_bytes(&funding)
-            .ok_or(HashConsFundingPreparationError::Overflow)?;
-        funding(bytes).map_err(HashConsFundingPreparationError::Funding)?;
-        Ok(Self(Some(Arc::new(Payload {
-            failure: OnceLock::new(),
-            funding,
-        }))))
-    }
-    fn reserve(&self, bytes: usize) -> Result<(), HashConsCapacityError> {
-        if self.0.as_ref().is_some_and(|a| a.reserve(bytes)) {
-            Ok(())
-        } else {
-            Err(HashConsCapacityError::Funding(HashConsFundingFailure {
-                funding: self.clone(),
-            }))
-        }
-    }
-}
+use crate::{ParserAllocationFailure, ParserAllocationFunding};
+use std::{alloc::Layout, mem::{size_of, size_of_val}};
+
 impl VecHashCons {
     // Shared initialization worker. The ordinary caller retains its existing
     // growth policy; the paid caller supplies exact reached physical geometry.
@@ -190,12 +19,64 @@ impl VecHashCons {
     }
 }
 impl PreparedVecHashCons {
+    pub(crate) fn backing_funding(&self) -> Option<&ParserAllocationFunding> {
+        self.backing_funding.as_ref()
+    }
+
+    /// Starts the shared guarded insertion worker from its intrinsic empty
+    /// representation. The four-word alignment prefix is funded before birth;
+    /// entries and encoding scratch grow only when an insertion reaches them.
+    pub(crate) fn empty_with_funding(
+        funding: ParserAllocationFunding,
+    ) -> Result<Self, HashConsCapacityError> {
+        let mut value = Self {
+            inner: VecHashCons::new(),
+            max_words: 0,
+            max_entries: 0,
+            max_encoded_words: 0,
+            insertion_active: false,
+            backing_funding: Some(funding),
+        };
+        value.grow_backing(0, 0)?;
+        Ok(value)
+    }
+
+    /// Moves an independently copied, quiescent source into the same mutable
+    /// representation. Its existing backing is already owned by the copy plan;
+    /// this operation allocates nothing and invents no future capacity.
+    pub(crate) fn from_copied_source(
+        inner: VecHashCons,
+        source_words: usize,
+        source_encoding: usize,
+        funding: ParserAllocationFunding,
+    ) -> Self {
+        assert_eq!(inner.curr_elt.backing_end, 0);
+        assert_eq!(inner.backing.len(), source_words + 4 + source_encoding);
+        let max_words = source_words;
+        let max_entries = inner.elements.len();
+        Self {
+            inner, max_words, max_entries, max_encoded_words: source_encoding,
+            insertion_active: false, backing_funding: Some(funding),
+        }
+    }
+
+    /// Explicit capacity requests use the same paid physical growth as reached
+    /// insertions. This reserves actual storage, not a claim about future work.
+    pub(crate) fn reserve_additional(&mut self, entries: usize) -> Result<(), HashConsCapacityError> {
+        let requested_entries = self.inner.elements.len().checked_add(entries)
+            .ok_or(HashConsCapacityError::CapacityOverflow)?;
+        let words = entries.checked_mul(4).and_then(|n| self.max_words.checked_add(n))
+            .ok_or(HashConsCapacityError::CapacityOverflow)?;
+        self.grow_backing(words, self.max_encoded_words)?;
+        self.grow_entries(requested_entries.max(self.max_entries))
+    }
+
     /// Attaches one already paid owner to this actual quiescent destination.
     /// The same owner funds reached backing and source-quoted table entry growth.
     /// Source copies do not inherit it, and no ordinary mutation is exposed.
     pub fn bind_backing_funding(
         &mut self,
-        funding: PreparedHashConsFunding,
+        funding: ParserAllocationFunding,
     ) -> Result<(), HashConsCapacityError> {
         if self.insertion_active
             || self.backing_funding.is_some()
@@ -227,10 +108,10 @@ impl PreparedVecHashCons {
             Layout::array::<u32>(total).map_err(|_| HashConsCapacityError::CapacityOverflow)?;
         let parts = [
             size_of::<Self>(),
-            size_of::<PreparedHashConsFunding>(),
-            size_of::<HashConsFundingFailure>(),
+            size_of::<ParserAllocationFunding>(),
+            size_of::<ParserAllocationFailure>(),
             size_of::<HashConsCapacityError>(),
-            size_of::<(&mut VecHashCons, &PreparedHashConsFunding, usize)>(),
+            size_of::<(&mut VecHashCons, &ParserAllocationFunding, usize)>(),
             size_of::<(&mut Vec<u32>, usize)>(),
             size_of::<(usize, usize, usize)>(),
             size_of::<Layout>(),
@@ -283,8 +164,8 @@ impl PreparedVecHashCons {
             Some(Layout::array::<Element>(entries).map_err(|_| HashConsCapacityError::CapacityOverflow)?)
         } else { None };
         let frames = [
-            size_of::<Self>(), size_of::<PreparedHashConsFunding>(),
-            size_of::<HashConsFundingFailure>(), size_of::<HashConsCapacityError>(),
+            size_of::<Self>(), size_of::<ParserAllocationFunding>(),
+            size_of::<ParserAllocationFailure>(), size_of::<HashConsCapacityError>(),
             size_of::<(&mut Self, usize)>(), size_of::<hashbrown::HashTable<u32>>(),
             size_of::<Vec<Element>>(), size_of::<Layout>() * 2,
             size_of::<Option<Layout>>() * 2, size_of::<(usize, usize)>(),

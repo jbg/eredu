@@ -830,7 +830,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         )
     }
 
-    fn new_parallel_with_config(
+    pub(crate) fn new_parallel_with_config(
         config: crate::replicated_text::CompositeModelConfig<VisionConfig>,
         parameter_root: &str,
         merger_intermediates: &[i32],

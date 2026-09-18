@@ -6,7 +6,7 @@ use crate::{
         OriginalPredictionLane, OriginalPredictionStartupContext, StartupCause,
     },
 };
-use eredu_runtime::working_memory::{OriginalSpeculativeSemanticPreparation, WorkingMemoryError};
+use eredu_runtime::working_memory::{PreparedSemanticSource, WorkingMemoryError};
 
 impl MlxModelSession {
     /// Borrows the actual idle loaded extension. It neither fabricates an external
@@ -14,7 +14,7 @@ impl MlxModelSession {
     /// None; a present but unqualified source returns its typed preparation refusal.
     pub(crate) fn prepare_original_prediction_lane(
         &self,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         environment: &OriginalCopyEnvironment<'_>,
     ) -> Result<Option<OriginalPredictionLane>, Error> {
         let model = self
@@ -66,7 +66,7 @@ impl MlxModelSession {
     pub(crate) fn prepare_original_prediction_target(
         &self,
         lane: &OriginalPredictionLane,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         environment: &OriginalCopyEnvironment<'_>,
         expected_frontier: u64,
     ) -> Result<crate::composition::mlx::replicated_text::OriginalPredictionTarget, Error> {
@@ -77,7 +77,7 @@ impl MlxModelSession {
             size_of::<(
                 &Self,
                 &OriginalPredictionLane,
-                &OriginalSpeculativeSemanticPreparation,
+                &PreparedSemanticSource,
                 &OriginalCopyEnvironment<'_>,
                 u64,
             )>(),
@@ -126,3 +126,5 @@ impl MlxModelSession {
         result.map_err(|cause| OriginalPredictionStartupContext::failure(preparation, cause))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

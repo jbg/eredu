@@ -1,6 +1,6 @@
 //! Original frame ingress and selected parameter reads share one source program.
 use crate::backend::error::Error;
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::working_memory::{HostSourceConstructionFacts,HostSourceConstructionProgram,
     OriginalHostSourceBank,OriginalHostSourceProgramBanks,OriginalHostSourceProgramError,WorkingMemoryError};
 use std::mem::{size_of,size_of_val};
@@ -36,11 +36,11 @@ impl FrameSourceProgram {
     pub(super) fn control_bytes()->Option<usize> {
         let frames=[size_of::<Self>(),size_of::<FrameSourceBanks>(),size_of::<OriginalHostSourceBank>(),
             size_of::<Option<OriginalHostSourceBank>>(),size_of::<Option<OriginalHostSourceProgramBanks>>(),
-            size_of::<Result<FrameSourceBanks,Error>>(),size_of::<(&Self,&WorkspaceMetadataFunding)>(),
+            size_of::<Result<FrameSourceBanks,Error>>(),size_of::<(&Self,&HostMetadataFunding)>(),
             WorkspaceContext::metadata_source_bytes::<OriginalHostSourceProgramError>()?];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
-    pub(super) fn accept(&self,bank:OriginalHostSourceBank,funding:&WorkspaceMetadataFunding)
+    pub(super) fn accept(&self,bank:OriginalHostSourceBank,funding:&HostMetadataFunding)
         ->Result<FrameSourceBanks,Error> {
         funding.reserve_metadata(Self::control_bytes().ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)?;
         if !bank.matches_facts(self.facts()){return Err(invalid());}
@@ -60,3 +60,5 @@ impl FrameSourceProgram {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

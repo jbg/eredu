@@ -5,17 +5,18 @@ use crate::backend::runtime::{
     residency::storage::StorageIdentity,
 };
 use eredu_runtime::working_memory::{
-    PreparedResidentKvReset, ResidentKvResetState, ResidentResetDisplaced,
+    PreparedResidentKvReset, ResidentTableResetState, ResidentResetDisplaced,
     ResidentResetPublicationCustody, ResidentResetPublicationProfile, ResidentResetSession,
     ResidentResetSource, WorkingMemoryError, WorkingMemoryPool,
 };
 
 type Plan<'a, S = MlxKeyValueState> = PreparedResidentKvReset<'a, S, StorageIdentity>;
-struct Displaced<S: ResidentKvResetState = MlxKeyValueState> {
+struct Displaced<S: ResidentTableResetState = MlxKeyValueState> {
     _state: ResidentResetDisplaced<S>,
     _memory: NativeMemoryRetention,
+    _publication: Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>,
 }
-struct Retirement<S: ResidentKvResetState = MlxKeyValueState> {
+struct Retirement<S: ResidentTableResetState = MlxKeyValueState> {
     displaced: Option<Displaced<S>>,
     #[cfg(all(
         test,
@@ -27,22 +28,26 @@ struct Retirement<S: ResidentKvResetState = MlxKeyValueState> {
     // Last: same reset custody survives the concrete node and native payload.
     _custody: ResidentResetPublicationCustody,
 }
-struct Prepared<S: ResidentKvResetState = MlxKeyValueState>(
+struct Prepared<S: ResidentTableResetState = MlxKeyValueState>(
     ordinary_retirement::OrdinaryRetirement<Retirement<S>>,
 );
-impl<S: ResidentKvResetState> ResidentResetPublicationProfile for Prepared<S> {
+impl<S: ResidentTableResetState> ResidentResetPublicationProfile for Prepared<S> {
     fn control_bytes() -> Option<u64> {
         let fixed = [
             size_of::<MlxResidentResetReadiness<'_, '_>>(),
             size_of::<eredu_core::SessionCapabilities>(),
             size_of::<eredu_core::SessionResetClaim<'_>>(),
             size_of::<Result<(), BackendFailure>>(),
+            size_of::<Option<crate::backend::distributed::MlxTextPreparationControl>>(),
+            size_of::<eredu_core::run_preparation::TextPreparationStage>(),
+            size_of::<Result<(eredu_runtime::working_memory::ResidentResetInstallation<S>, Self), BackendFailure>>(),
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Displaced<S>>(),
             size_of::<Option<Displaced<S>>>(),
             size_of::<Retirement<S>>(),
             size_of::<NativeMemoryRetention>(),
+            size_of::<Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>>(),
             size_of::<
                 Result<
                     (),
@@ -56,7 +61,10 @@ impl<S: ResidentKvResetState> ResidentResetPublicationProfile for Prepared<S> {
         .into_iter()
         .try_fold(0usize, usize::checked_add)?;
         ordinary_retirement::OrdinaryRetirement::<Retirement<S>>::control_bytes()?
-            .checked_add(u64::try_from(fixed).ok()?)
+            .checked_add(u64::try_from(fixed).ok()?)?
+            .checked_add(u64::try_from(
+                crate::backend::runtime::residency::storage::RetainedStoragePublication::coverage_control_bytes()?
+            ).ok()?)
     }
     fn prepare(custody: ResidentResetPublicationCustody) -> Self {
         Self(ordinary_retirement::OrdinaryRetirement::new(Retirement {
@@ -75,7 +83,7 @@ impl<S: ResidentKvResetState> ResidentResetPublicationProfile for Prepared<S> {
 
 // Typed backend erasure only. State equations/policy and publication checks stay
 // in the shared neutral driver; no family or alternative reset engine lives here.
-trait StateProvider: ResidentKvResetState {
+trait StateProvider: ResidentTableResetState {
     fn source(
         session: &MlxModelSession,
     ) -> Result<ResidentResetSource<'_, Self>, WorkingMemoryError>;
@@ -163,9 +171,6 @@ impl MlxModelSession {
         {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
-        if self.payload.distributed.is_some() || self.payload.target.has_retained_world() {
-            return Err(WorkingMemoryError::UnknownBound);
-        }
         self.authority
             .try_borrow()
             .map_err(|_| WorkingMemoryError::ResetAdmissionBusy)?
@@ -212,8 +217,9 @@ impl MlxModelSession {
     }
 
     /// Consuming readiness (or the explicitly settled test fixture) supplies
-    /// the genuine core claim. No native work or global housekeeping occurs in
-    /// construction or publication here.
+    /// the genuine core claim. Distributed readiness uses its paid, bounded
+    /// coordinator; state construction/publication performs no native work or
+    /// global housekeeping.
     fn publish_prepared_resident_reset(
         &mut self,
         pool: &WorkingMemoryPool,
@@ -245,10 +251,21 @@ impl MlxModelSession {
                 WorkingMemoryError::ResetAdmissionBusy,
             ));
         }
-        let (installation, mut prepared) = self
-            .resident_reset_plan_for::<S>(pool)?
-            .construct_for_publication::<Self, Prepared<S>>(self, claim, pool)
-            .map_err(BackendFailure::from_error)?;
+        let plan = self.resident_reset_plan_for::<S>(pool)?;
+        let control = if let Some(transport) = self.payload.distributed.as_ref() {
+            let bytes = plan.publication_required_bytes::<Prepared<S>>()
+                .ok_or_else(|| readiness_memory(WorkingMemoryError::Overflow))?;
+            let execution = self.payload.model.erased().inference_execution_identity();
+            let funding = pool.prepare_reset_metadata(self, &claim, execution, bytes)
+                .map_err(BackendFailure::from_error)?;
+            let manifest = self.payload.model.inference_blueprint()
+                .and_then(|value| value.selected().communication_manifest())
+                .ok_or_else(|| readiness_memory(WorkingMemoryError::IdentityMismatch))?;
+            Some(transport.prepare_reset_readiness(manifest, transport.native_world(), pool,
+                execution, claim.limits().capacity_bytes, funding).map_err(Error::into_backend_failure)?)
+        } else { None };
+        let local = plan.construct_for_publication::<Self, Prepared<S>>(self, claim, pool)
+            .map_err(BackendFailure::from_error);
         // Constructors above clone source metadata/custody, never this payload.
         // Still return the complete destination if a future change breaks that
         // invariant, before touching installed state.
@@ -266,22 +283,44 @@ impl MlxModelSession {
             not(feature = "cuda")
         )))]
         let rejected = false;
-        let installed = if rejected {
-            Err((WorkingMemoryError::ExecutionFenced, installation))
-        } else {
+        let local = local.and_then(|(installation, prepared)| {
+            if rejected {
+                Err(BackendFailure::from_error(installation.into_error(WorkingMemoryError::ExecutionFenced)))
+            } else { Ok((installation, prepared)) }
+        });
+        let (installation, mut prepared) = self.finish_reset_agreement(pool, control.as_ref(),
+            eredu_core::run_preparation::TextPreparationStage::SessionReset, local)?;
+        let installed = {
             match self.payload.get_mut() {
                 None => Err((WorkingMemoryError::ResetAdmissionBusy, installation)),
-                Some(payload) => match S::install(payload, installation) {
-                    Err(error) => Err(error),
-                    Ok(state) => {
-                        let memory = std::mem::take(&mut payload.state_memory);
-                        // This private slot was prepared empty and has one caller.
-                        // Only moves follow the shared session's first mutation.
-                        prepared.0.displaced = Some(Displaced {
-                            _state: state,
-                            _memory: memory,
+                Some(payload) => {
+                    // The paid comparison precedes mutation. Only this exact
+                    // retained initial publication can cover the old charges.
+                    let covered = payload
+                        .nonstate_publication
+                        .get_mut()
+                        .as_ref()
+                        .is_some_and(|publication| {
+                            payload.model.covers_nonstate_publication(publication)
                         });
-                        Ok(())
+                    match S::install(payload, installation) {
+                        Err(error) => Err(error),
+                        Ok(state) => {
+                            let memory = std::mem::take(&mut payload.state_memory);
+                            let publication = if covered {
+                                payload.nonstate_publication.get_mut().take()
+                            } else {
+                                None
+                            };
+                            // This private slot was prepared empty and has one caller.
+                            // Only moves follow the shared session's first mutation.
+                            prepared.0.displaced = Some(Displaced {
+                                _state: state,
+                                _memory: memory,
+                                _publication: publication,
+                            });
+                            Ok(())
+                        }
                     }
                 },
             }
@@ -289,9 +328,30 @@ impl MlxModelSession {
         // All native session and state loans ended. This only queues the node;
         // its old arrays and complete allocation retire at ordinary housekeeping.
         drop(prepared);
-        installed.map_err(|(cause, installation)| {
+        let local = installed.map_err(|(cause, installation)| {
             BackendFailure::from_error(installation.into_error(cause))
-        })
+        });
+        let result = self.finish_reset_agreement(pool, control.as_ref(),
+            eredu_core::run_preparation::TextPreparationStage::SessionResetPublication, local);
+        // Any disagreement after publication leaves the actual selected session
+        // fenced. Neither state nor shared transport spending is rolled back.
+        if result.is_err() && control.is_some() {
+            self.poison.set(true);
+            if let Some(transport) = self.payload.distributed.as_ref() { transport.fence_reset_publication(); }
+        }
+        result
+    }
+    fn finish_reset_agreement<T>(&self, pool: &WorkingMemoryPool,
+        control: Option<&crate::backend::distributed::MlxTextPreparationControl>,
+        stage: eredu_core::run_preparation::TextPreparationStage, local: Result<T, BackendFailure>)
+        -> Result<T, BackendFailure> {
+        match (control, self.payload.distributed.as_ref()) {
+            (None, None) => local,
+            (Some(control), Some(transport)) => eredu_core::run_preparation::finish_preparation(stage, local,
+                |status| control.agree(transport, pool, self.payload.model.erased().inference_execution_identity(), stage, status),
+                |cause| control.retain_reset_rejection(cause)),
+            _ => Err(readiness_memory(WorkingMemoryError::IdentityMismatch)),
+        }
     }
 }
 
@@ -363,9 +423,7 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
             .inference_blueprint()
             .ok_or_else(|| readiness_memory(WorkingMemoryError::UnknownBound))?
             .selected();
-        if selected.text_realization().residency()
-            != eredu_runtime::LayerWeightResidency::FullyResident
-            || !crate::backend::runtime::cache::kv::PagedKeyValueCache::original_reset_residency_supported(
+        if !crate::backend::runtime::cache::kv::PagedKeyValueCache::original_reset_residency_supported(
                 selected.text_realization().state().policy(),
                 model
                     .erased()
@@ -374,7 +432,8 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
                     .layer_layout(),
                 session.floating_state_dtype_bytes,
             )
-            || selected.communication_manifest().is_some()
+            || selected.communication_manifest().is_some() != session.payload.distributed.is_some()
+            || session.payload.target.has_retained_world() != session.payload.distributed.is_some()
             || selected.prediction_extension().is_some()
             || model.erased().has_embedded_prediction()
             || session.payload.parameter_state.active.is_some()

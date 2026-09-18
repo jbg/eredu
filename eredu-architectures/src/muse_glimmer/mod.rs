@@ -91,34 +91,14 @@ pub fn expert_realization_plan<
 }
 
 /// Declares Muse-Glimmer cache identity independently of concrete state storage.
-pub fn state_identity(
-    args: &DecoderConfig,
-    layout: &eredu_runtime::StateLayout,
-    global_layer_start: usize,
-    topology: eredu_core::cache::PromptCacheTopology,
-) -> Result<eredu_runtime::ModelStateIdentity, ConfigError> {
-    args.validate()?;
-    topology
-        .validate()
-        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ConfigError::Invalid("Muse-Glimmer layer count exceeds usize".into()))?;
-    let global_layer_end = global_layer_start
-        .checked_add(layout.len())
-        .ok_or_else(|| ConfigError::Invalid("Muse-Glimmer owned state range overflowed".into()))?;
-    if global_layer_end > layer_count {
-        return Err(ConfigError::Invalid(format!(
-            "Muse-Glimmer owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
-        )));
-    }
-    eredu_runtime::ModelStateIdentity::new(
-        "muse_glimmer",
-        args.model_type.clone(),
-        args.architecture_fingerprint(),
-        layer_count,
-        global_layer_start,
-        0,
-        topology,
-    )
-    .map_err(|error| ConfigError::Invalid(error.to_string()))
+pub fn state_identity(args:&DecoderConfig,layout:&eredu_runtime::StateLayout,global_layer_start:usize,topology:eredu_core::cache::PromptCacheTopology)->Result<eredu_runtime::ModelStateIdentity,eredu_nn::Error>{
+    state_identity_in(args,layout,global_layer_start,topology,crate::decoder::identity::Metadata::new(None))
+}
+pub(crate) fn state_identity_in(args:&DecoderConfig,layout:&eredu_runtime::StateLayout,global_layer_start:usize,topology:eredu_core::cache::PromptCacheTopology,metadata:crate::decoder::identity::Metadata<'_>)->Result<eredu_runtime::ModelStateIdentity,eredu_nn::Error>{
+    metadata.controls::<(&DecoderConfig,&eredu_runtime::StateLayout,usize,usize,usize,eredu_core::cache::PromptCacheTopology,eredu_runtime::ModelStateIdentity,[(&str,i32);7],[(&str,f32);6],Option<&std::collections::HashMap<String,crate::rotary::RopeValue>>)>()?;
+    args.validate_with(|args|metadata.error(args))?;
+    let layer_count=usize::try_from(args.num_hidden_layers).map_err(|cause|metadata.source(cause))?;
+    let global_layer_end=global_layer_start.checked_add(layout.len()).ok_or_else(||metadata.error(format_args!("Muse-Glimmer owned state range overflowed")))?;
+    if global_layer_end>layer_count{return Err(metadata.error(format_args!("Muse-Glimmer owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers")));}
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(metadata.text("muse_glimmer")?,metadata.text(&args.model_type)?,args.architecture_fingerprint_in(metadata)?,layer_count,global_layer_start,0,topology,|message|metadata.prompt_error(message))
 }

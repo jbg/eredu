@@ -114,8 +114,8 @@ struct ParameterCapture<'a> {
 }
 
 impl<'value> ParameterVisitor<'value, MlxTensor> for ParameterCapture<'_> {
-    fn visit(&mut self, metadata: ParameterMetadata, parameter: &'value MlxTensor) {
-        let destination = match metadata.id.as_str() {
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'value MlxTensor) {
+        let destination = match metadata.id().as_str() {
             "encoder.init_conv1d.bias" => &mut self.direct,
             "encoder.init_conv1d.weight" => &mut self.transposed,
             _ => return,

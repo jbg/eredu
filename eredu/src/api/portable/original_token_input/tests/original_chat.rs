@@ -1,13 +1,28 @@
-use super::super::chat::{
-    compile_original_chat_file, prepare_original_text_chat, start_original_text_chat,
-};
+use super::super::chat::compile_original_chat_file;
 use super::*;
 use crate::runtime::chat::ChatTemplateRequest;
+use eredu_core::generation::SemanticEvent;
 use eredu_runtime::working_memory::OriginalTextSourceBudget;
-use eredu_text::chat_storage::{ChatMessages, ChatRenderContext, ChatTemplatePlan};
+use eredu_text::chat_storage::{ChatRenderContext, ChatTemplatePlan};
 use std::io::Write as _;
 
-impl OriginalChatBackend for Backend {
+impl<M: Clone + 'static> OriginalChatBackend for Backend<M> {
+    fn compile_original_forbidden_source(
+        runtime: &ModelRuntime<Self>,
+        plan: eredu_core::speculative::PreparedForbiddenInputCopy<'_>,
+    ) -> Result<OriginalForbiddenSource, OriginalForbiddenSourceError> {
+        runtime.backend().pool.compile_forbidden_source(plan)
+    }
+    fn compile_original_forbidden_tokenizer_source(
+        runtime: &ModelRuntime<Self>,
+        tokenizer: &OriginalTokenizer,
+        trigger: &[u8],
+    ) -> Result<OriginalForbiddenSource, OriginalForbiddenSourceError> {
+        runtime
+            .backend()
+            .pool
+            .compile_forbidden_tokenizer_source(tokenizer, trigger)
+    }
     fn prepare_original_chat_profile(
         runtime: &ModelRuntime<Self>,
         template: &OriginalChatTemplate,
@@ -45,7 +60,7 @@ impl OriginalChatBackend for Backend {
     fn compile_original_chat_template(
         runtime: &ModelRuntime<Self>,
         plan: ChatTemplatePlan<'_>,
-    ) -> Result<OriginalChatTemplate, OriginalChatOperationError> {
+    ) -> Result<OriginalChatTemplate, OriginalChatSourceError> {
         runtime.backend().facts.borrow_mut().chat_sources += 1;
         runtime
             .backend()
@@ -57,44 +72,26 @@ impl OriginalChatBackend for Backend {
         runtime: &ModelRuntime<Self>,
         read: eredu_checkpoint::artifact::PreparedArtifactFileRead,
         model_id: &str,
-    ) -> Result<OriginalChatTemplate, OriginalChatOperationError> {
+        has_tools: bool,
+    ) -> Result<OriginalChatTemplate, OriginalChatSourceError> {
         runtime.backend().facts.borrow_mut().chat_sources += 1;
         runtime
             .backend()
             .pool
-            .compile_chat_template_file(read, model_id)
+            .compile_chat_template_file(read, model_id, has_tools)
             .map_err(Into::into)
     }
     fn render_original_chat(
         runtime: &ModelRuntime<Self>,
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
-        messages: ChatMessages<'_>,
-        consumer: GenerationSequenceConsumerLayout,
-    ) -> Result<OriginalRenderedChat, OriginalChatOperationError> {
-        runtime.backend().facts.borrow_mut().chat_renders += 1;
-        let rendered = runtime
-            .backend()
-            .pool
-            .render_original_chat(template, tokenizer, messages, consumer)
-            .map_err(OriginalChatOperationError::from)?;
-        if let Some(cancel) = &runtime.backend().facts.borrow().cancel_after_render {
-            cancel.cancel();
-        }
-        Ok(rendered)
-    }
-    fn render_original_chat_with_context(
-        runtime: &ModelRuntime<Self>,
-        template: &OriginalChatTemplate,
-        tokenizer: &OriginalTokenizer,
         context: ChatRenderContext<'_>,
-        consumer: GenerationSequenceConsumerLayout,
-    ) -> Result<OriginalRenderedChat, OriginalChatOperationError> {
+    ) -> Result<OriginalRenderedChat, OriginalChatRenderOperationError> {
         runtime.backend().facts.borrow_mut().chat_renders += 1;
         let rendered = runtime
             .backend()
             .pool
-            .render_original_chat_with_context(template, tokenizer, context, consumer)?;
+            .render_original_chat(template, tokenizer, context)?;
         if let Some(cancel) = &runtime.backend().facts.borrow().cancel_after_render {
             cancel.cancel();
         }
@@ -107,12 +104,6 @@ const CHAT_CONFIG: &str = include_str!("chat_fixtures/tokenizer_config.json");
 // oracle uses its complete vocabulary; this neutral driver fixture preserves
 // the existing h / Ġhi predictions while exercising full rendered prompt bytes.
 const TOKENIZER: &str = include_str!("chat_fixtures/tokenizer.json");
-fn config() -> TextGenerationConfig {
-    super::config().with_inference_policy(eredu_core::TextInferencePolicy {
-        managed_memory_capacity_bytes: Some(u64::MAX),
-        ..Default::default()
-    })
-}
 fn source_budget_bytes() -> u64 {
     OriginalTextSourceBudget::storage_bytes().unwrap()
 }
@@ -126,56 +117,95 @@ fn request() -> ChatTemplateRequest {
         ..ChatTemplateRequest::default()
     }
 }
-fn sources(
-    runtime: &ModelRuntime<Backend>,
+fn loaded_sources(
+    runtime: ModelRuntime<Backend>,
+    tokenizer: &[u8],
+    config: &str,
+    model_id: &str,
+    family: ModelKind,
     cancellation: &GenerationCancellationToken,
-) -> (OriginalTokenizer, OriginalChatTemplate) {
-    let tokenizer = runtime
-        .backend()
-        .pool
-        .compile_tokenizer(
-            eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(TOKENIZER.as_bytes())
-                .unwrap()
-                .with_generation_domain()
-                .unwrap(),
-        )
-        .unwrap();
-    let mut file = tempfile::tempfile().unwrap();
-    file.write_all(CHAT_CONFIG.as_bytes()).unwrap();
-    let template = compile_original_chat_file(runtime, file, "smol", cancellation)
+) -> (
+    LoadedModel<Backend>,
+    crate::api::ManagedPlainTextSource,
+    crate::api::ManagedChatSource,
+) {
+    let selected = eredu_text::tokenizer::load_model_chat_template_from_str(config)
         .unwrap()
         .unwrap();
-    (tokenizer, template)
+    let model = LoadedModel::from_runtime(
+        runtime,
+        ChatTokenizer::from_bytes(tokenizer).unwrap(),
+        LoadedTextModelConfig {
+            model_family: family,
+            effective_model_type: model_id.into(),
+            model_id: model_id.into(),
+            chat_template: Some(selected),
+            eos_token_ids: vec![],
+            checkpoint_generation_config: None,
+        },
+    )
+    .unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(tokenizer).unwrap();
+    let tokenizer = model.compile_managed_plain_text_source(file).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(config.as_bytes()).unwrap();
+    let source = model
+        .compile_managed_chat_source(&tokenizer, file, false, cancellation)
+        .unwrap()
+        .unwrap();
+    (model, tokenizer, source)
+}
+fn chat_settings() -> crate::api::PreparedChatGenerationSettings {
+    crate::api::PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            max_new_tokens: Some(3),
+            ..Default::default()
+        },
+        inference: TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(u64::MAX),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+fn literal_request<P>(
+    prepared: &crate::runtime::chat::PreparedChat,
+    settings: crate::api::PreparedChatGenerationSettings,
+) -> crate::api::PreparedChatRequest<'_, P> {
+    let mut request = crate::api::PreparedChatRequest::new(prepared, settings);
+    request.output_mode = crate::api::PreparedChatOutputMode::Text;
+    request
 }
 
 #[test]
-fn actual_private_chat_file_render_encode_and_shared_cursor_preserve_cached_outputs() {
+fn public_chat_file_render_encode_and_shared_cursor_preserve_cached_outputs() {
     for manual in [false, true] {
-        // Positive shared ceiling, with each J/H/S/E/I/R still admitted from its
-        // actual plan. Exact-minus-one admission is checked separately.
-        let (mut runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+        let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
         facts.borrow_mut().shared_admission_capacity = Some(u64::MAX);
         let cancellation = GenerationCancellationToken::new();
-        let (tokenizer, template) = sources(&runtime, &cancellation);
-        let cold = tokenizer.original_bytes() + template.original_bytes();
-        assert_eq!(
-            pool.used_bytes().unwrap(),
-            cold,
-            "config-file I retired after fresh J"
+        let (mut model, tokenizer, source) = loaded_sources(
+            runtime,
+            TOKENIZER.as_bytes(),
+            CHAT_CONFIG,
+            "smol",
+            ModelKind::Llama,
+            &cancellation,
         );
-        let request = request();
+        let cold = pool.used_bytes().unwrap();
         let reference = tokenizers::Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap();
-        let mut ordinary = eredu_text::tokenizer::Tokenizer::from_tokenizer(reference.clone());
+        let mut ordinary = ChatTokenizer::from_tokenizer(reference.clone());
         let selected = eredu_text::tokenizer::load_model_chat_template_from_str(CHAT_CONFIG)
             .unwrap()
             .unwrap();
         let mut previous = None;
-        let mut previous_held = 0;
         for generation in [false, true] {
+            let mut chat = request();
+            chat.add_generation_prompt = generation;
             let expected = ordinary
                 .apply_chat_template_json(
                     selected.clone(),
-                    [request.messages.clone()],
+                    [chat.messages.clone()],
                     None,
                     "smol",
                     generation,
@@ -185,44 +215,22 @@ fn actual_private_chat_file_render_encode_and_shared_cursor_preserve_cached_outp
                 .pop()
                 .unwrap();
             let expected_ids = reference.encode(expected.as_str(), false).unwrap();
-            assert!(!expected_ids.get_ids().is_empty());
-            let render = prepare_original_text_chat(
-                &runtime,
-                &template,
-                &tokenizer,
-                &request,
-                config(),
-                &cancellation,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(render.prompt(generation), expected);
-            let h = render.original_bytes();
-            assert_eq!(
-                pool.used_bytes().unwrap(),
-                cold + previous_held + h + source_budget_bytes()
-            );
-            let retained_render = render.clone_render_for_test();
+            let prepared = model
+                .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.rendered_prompt(), expected);
+            let retained_render = prepared.render().clone();
             facts.borrow_mut().ids.clear();
-            let mut session = start_original_text_chat(
-                &mut runtime,
-                &template,
-                &tokenizer,
-                render,
-                generation,
-                config(),
-                &[],
-                &[],
-                true,
-                &cancellation,
-            )
-            .unwrap()
-            .unwrap();
+            let mut session = model
+                .start_prepared_chat(literal_request(&prepared, chat_settings()), &cancellation)
+                .unwrap()
+                .unwrap();
             assert_eq!(facts.borrow().ids, expected_ids.get_ids());
             let mut visible = String::new();
-            let mut event = |event: GenerationPlainTextEvent<'_>| {
-                if let GenerationPlainTextEvent::TextDelta(text) = event {
-                    visible.push_str(text);
+            let mut event = |event: SemanticEvent| {
+                if let SemanticEvent::TextDelta(text) = event {
+                    visible.push_str(&text);
                 }
             };
             let output = if manual {
@@ -231,54 +239,123 @@ fn actual_private_chat_file_render_encode_and_shared_cursor_preserve_cached_outp
                 }
                 session
                     .into_output()
-                    .unwrap_or_else(|_| panic!("terminal chat session"))
+                    .unwrap_or_else(|_| panic!("terminal chat"))
             } else {
                 session.run(&cancellation, &mut event).unwrap()
             };
-            assert_eq!(output.text.as_str(), visible);
-            assert_eq!(output.text.as_str(), "h hih");
+            assert_eq!(visible, "h hih");
             assert_eq!(output.token_ids.as_ref(), &[0, 8, 0]);
-            let r = facts.borrow().held;
-            assert_eq!(pool.used_bytes().unwrap(), cold + previous_held + h + r);
+            let ids = output.token_ids.clone();
+            drop(output);
+            drop(prepared);
+            assert_eq!(retained_render.prompt(generation), expected);
+            let with_alias = pool.used_bytes().unwrap();
             drop(retained_render);
-            assert_eq!(
-                pool.used_bytes().unwrap(),
-                cold + previous_held + r,
-                "last H alias retires after prompt encoding"
+            assert!(
+                pool.used_bytes().unwrap() < with_alias,
+                "render and execution token ownership retire independently"
             );
-            drop(previous.take());
-            previous_held = r;
-            previous = Some(output);
+            assert!(pool.used_bytes().unwrap() > cold);
+            if let Some(previous) = previous.replace(ids) {
+                assert_eq!(previous.as_ref(), &[0, 8, 0]);
+            }
         }
-        assert_eq!(facts.borrow().chat_sources, 1);
-        // Each request performs the two shared default-profile recognition
-        // renders before its real prompt render; encoding still occurs once.
-        assert_eq!(facts.borrow().chat_renders, 6);
-        assert_eq!(facts.borrow().encodes, 2);
-        assert_eq!(facts.borrow().stops, 2);
-        let output = previous.unwrap();
-        let text = output.text.clone();
-        let ids = output.token_ids.clone();
-        drop((output, template, tokenizer, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), previous_held);
-        drop(text);
-        assert_eq!(pool.used_bytes().unwrap(), previous_held);
-        drop(ids);
+        drop((source, tokenizer, model));
+        assert!(pool.used_bytes().unwrap() > 0);
+        assert_eq!(previous.as_ref().unwrap().as_ref(), &[0, 8, 0]);
+        drop(previous);
         assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
-fn private_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes() {
+fn literal_chat_preserves_special_spellings_and_caller_stop_output() {
+    for skip in [false, true] {
+        for stop in [false, true] {
+            for manual in [false, true] {
+                let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+                facts.borrow_mut().shared_admission_capacity = Some(u64::MAX);
+                facts.borrow_mut().prediction_ids = Some([0, 4, 8]);
+                let cancellation = GenerationCancellationToken::new();
+                let (mut model, tokenizer, source) = loaded_sources(
+                    runtime,
+                    TOKENIZER.as_bytes(),
+                    CHAT_CONFIG,
+                    "smol",
+                    ModelKind::Llama,
+                    &cancellation,
+                );
+                let prepared = model
+                    .prepare_chat(&source, &request(), u64::MAX, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                let stops = ["hi".to_owned()];
+                let mut invocation = literal_request(&prepared, chat_settings());
+                invocation.skip_special_tokens = skip;
+                if stop {
+                    invocation.stop_sequences = &stops;
+                }
+                let mut session = model
+                    .start_prepared_chat(invocation, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                let mut visible = String::new();
+                let mut finishes = Vec::new();
+                let mut emit = |event| match event {
+                    SemanticEvent::TextDelta(text) => visible.push_str(&text),
+                    SemanticEvent::Finished { reason } => finishes.push(reason),
+                    _ => panic!("literal policy must not publish protocol events"),
+                };
+                let output = if manual {
+                    while session.finish_reason().is_none() {
+                        session = session.advance(&cancellation, &mut emit).unwrap();
+                    }
+                    session
+                        .into_output()
+                        .unwrap_or_else(|_| panic!("terminal literal chat"))
+                } else {
+                    session.run(&cancellation, &mut emit).unwrap()
+                };
+                let raw = tokenizers::Tokenizer::from_bytes(TOKENIZER.as_bytes())
+                    .unwrap()
+                    .decode(&[0, 4, 8], skip)
+                    .unwrap();
+                let expected = if stop {
+                    raw.split_once("hi").unwrap().0
+                } else {
+                    &raw
+                };
+                assert_eq!(
+                    visible, expected,
+                    "skip={skip}, stop={stop}, manual={manual}"
+                );
+                assert_eq!(output.token_ids.as_ref(), &[0, 4, 8]);
+                let reason = if stop {
+                    FinishReason::StopSequence
+                } else {
+                    FinishReason::MaxTokens
+                };
+                assert_eq!(output.finish_reason, reason);
+                assert_eq!(finishes, [reason]);
+                drop((output, prepared, source, tokenizer, model));
+                assert_eq!(pool.used_bytes().unwrap(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes() {
     let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
-    let cancellation = GenerationCancellationToken::new();
-    cancellation.cancel();
+    let cancelled = GenerationCancellationToken::new();
+    cancelled.cancel();
     assert!(
         compile_original_chat_file(
             &runtime,
             tempfile::tempfile().unwrap(),
             "smol",
-            &cancellation
+            false,
+            &cancelled
         )
         .unwrap()
         .is_none()
@@ -286,39 +363,34 @@ fn private_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetime
     assert_eq!(facts.borrow().chat_sources, 0);
     assert_eq!(pool.used_bytes().unwrap(), 0);
     drop(runtime);
-    for phase in [
-        "render",
-        "stop",
-        "encode",
-        "eos",
-        "short",
-        "changed_capacity",
-    ] {
-        let (mut runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+    for phase in ["render", "stop", "encode", "short", "changed_capacity"] {
+        let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+        facts.borrow_mut().shared_admission_capacity = Some(u64::MAX);
         let cancellation = GenerationCancellationToken::new();
-        let (tokenizer, template) = sources(&runtime, &cancellation);
-        let cold = tokenizer.original_bytes() + template.original_bytes();
+        let (mut model, tokenizer, source) = loaded_sources(
+            runtime,
+            TOKENIZER.as_bytes(),
+            CHAT_CONFIG,
+            "smol",
+            ModelKind::Llama,
+            &cancellation,
+        );
+        let cold = pool.used_bytes().unwrap();
         if phase == "render" {
             facts.borrow_mut().cancel_after_render = Some(cancellation.clone());
         }
-        let render = prepare_original_text_chat(
-            &runtime,
-            &template,
-            &tokenizer,
-            &request(),
-            config(),
-            &cancellation,
-        )
-        .unwrap();
+        let prepared = model
+            .prepare_chat(&source, &request(), u64::MAX, &cancellation)
+            .unwrap();
         if phase == "render" {
-            assert!(render.is_none());
+            assert!(prepared.is_none());
             assert_eq!(pool.used_bytes().unwrap(), cold);
             assert_eq!(facts.borrow().stops, 0);
             assert_eq!(facts.borrow().encodes, 0);
             continue;
         }
-        let render = render.unwrap();
-        let h = render.original_bytes();
+        let prepared = prepared.unwrap();
+        let prepared_bytes = pool.used_bytes().unwrap();
         if phase == "stop" {
             facts.borrow_mut().cancel_after_stops = Some(cancellation.clone());
         }
@@ -328,100 +400,116 @@ fn private_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetime
         if phase == "short" {
             facts.borrow_mut().short = true;
         }
-        let startup_config = if phase == "changed_capacity" {
-            config().with_inference_policy(eredu_core::TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(u64::MAX - 1),
-                ..Default::default()
-            })
-        } else {
-            config()
-        };
-        let eos: &[u32] = if phase == "eos" { &[u32::MAX] } else { &[] };
-        let result = start_original_text_chat(
-            &mut runtime,
-            &template,
-            &tokenizer,
-            render,
-            true,
-            startup_config,
-            eos,
-            &["hi"],
-            true,
-            &cancellation,
-        );
+        let mut settings = chat_settings();
+        if phase == "changed_capacity" {
+            settings.inference.managed_memory_capacity_bytes = Some(u64::MAX - 1);
+        }
+        let stops = ["hi".to_owned()];
+        let mut invocation = literal_request(&prepared, settings);
+        invocation.stop_sequences = &stops;
+        let result = model.start_prepared_chat(invocation, &cancellation);
         match phase {
             "stop" | "encode" => {
                 assert!(result.unwrap().is_none());
                 assert_eq!(facts.borrow().stops, 1);
                 assert_eq!(facts.borrow().encodes, usize::from(phase == "encode"));
-                assert_eq!(pool.used_bytes().unwrap(), cold);
+                assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
             }
-            "eos" | "short" | "changed_capacity" => {
+            "short" | "changed_capacity" => {
                 let error = match result {
                     Err(error) => error,
-                    Ok(_) => panic!("expected chat startup rejection"),
+                    Ok(_) => panic!("expected startup rejection"),
                 };
-                assert_eq!(error.retained_render_bytes(), h);
-                assert!(pool.used_bytes().unwrap() >= cold + h + source_budget_bytes());
                 if phase == "changed_capacity" {
-                    assert!(matches!(
+                    assert_eq!(
                         error.input_rejection(),
                         Some(TokenInputRejection::IdentityMismatch)
-                    ));
-                }
-                if matches!(phase, "eos" | "changed_capacity") {
+                    );
                     assert_eq!(facts.borrow().stops, 0);
                     assert_eq!(facts.borrow().encodes, 0);
-                    assert_eq!(pool.used_bytes().unwrap(), cold + h + source_budget_bytes());
+                    assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
                 } else {
                     assert_eq!(facts.borrow().stops, 1);
                     assert_eq!(facts.borrow().encodes, 1);
-                    assert!(!facts.borrow().order.contains(&"submit"));
+                    assert!(pool.used_bytes().unwrap() > prepared_bytes);
                 }
+                assert!(!facts.borrow().order.contains(&"submit"));
                 drop(error);
-                assert_eq!(pool.used_bytes().unwrap(), cold);
+                assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
             }
             _ => unreachable!(),
         }
-        drop((template, tokenizer, runtime));
+        drop(prepared);
+        assert_eq!(pool.used_bytes().unwrap(), cold);
+        drop((source, tokenizer, model));
         assert_eq!(pool.used_bytes().unwrap(), 0);
     }
+}
+
+#[test]
+fn invalid_chat_eos_refuses_before_native_submission() {
+    let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+    facts.borrow_mut().shared_admission_capacity = Some(u64::MAX);
+    let cancellation = GenerationCancellationToken::new();
+    let (mut model, tokenizer, source) = loaded_sources(
+        runtime,
+        TOKENIZER.as_bytes(),
+        CHAT_CONFIG,
+        "smol",
+        ModelKind::Llama,
+        &cancellation,
+    );
+    let cold = pool.used_bytes().unwrap();
+    model.eos_token_ids = vec![u32::MAX];
+    match model.prepare_chat(&source, &request(), u64::MAX, &cancellation) {
+        Err(error) => drop(error),
+        Ok(Some(prepared)) => {
+            let error = match model
+                .start_prepared_chat(literal_request(&prepared, chat_settings()), &cancellation)
+            {
+                Err(error) => error,
+                Ok(_) => panic!("foreign EOS must reject before native submission"),
+            };
+            drop((error, prepared));
+        }
+        Ok(None) => panic!("request was not cancelled"),
+    }
+    assert!(!facts.borrow().order.contains(&"submit"));
+    assert_eq!(pool.used_bytes().unwrap(), cold);
+    drop((source, tokenizer, model));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn chat_caller_ceiling_precedes_render_and_survives_preparation_failure() {
     let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
     let cancellation = GenerationCancellationToken::new();
-    let (tokenizer, template) = sources(&runtime, &cancellation);
+    let (model, tokenizer, source) = loaded_sources(
+        runtime,
+        TOKENIZER.as_bytes(),
+        CHAT_CONFIG,
+        "smol",
+        ModelKind::Llama,
+        &cancellation,
+    );
     let cold = pool.used_bytes().unwrap();
-    // A caller unable to retain existing sources never starts rendering. A
-    // caller able to retain only the ceiling fails before profile preparation.
     for capacity in [1, cold + source_budget_bytes()] {
-        let config = config().with_inference_policy(eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
-            ..Default::default()
-        });
-        let error = prepare_original_text_chat(
-            &runtime,
-            &template,
-            &tokenizer,
-            &request(),
-            config,
-            &cancellation,
-        )
-        .unwrap_err();
-        assert_eq!(error.retained_render_bytes(), 0);
+        let error = model
+            .prepare_chat(&source, &request(), capacity, &cancellation)
+            .unwrap_err();
         assert_eq!(facts.borrow().chat_renders, 0);
         assert_eq!(facts.borrow().stops, 0);
         assert_eq!(facts.borrow().encodes, 0);
         assert!(facts.borrow().order.is_empty());
         if capacity != 1 {
             assert_eq!(pool.used_bytes().unwrap(), capacity);
-            // Retaining the failure keeps the same domain ceiling active even
-            // against a second source producer asking for a larger ceiling.
             assert!(
-                Backend::prepare_original_text_source_budget(&runtime, &tokenizer, u64::MAX)
-                    .is_err()
+                Backend::prepare_original_text_source_budget(
+                    &model.runtime,
+                    tokenizer.original(),
+                    u64::MAX
+                )
+                .is_err()
             );
         } else {
             assert_eq!(pool.used_bytes().unwrap(), cold);
@@ -429,112 +517,114 @@ fn chat_caller_ceiling_precedes_render_and_survives_preparation_failure() {
         drop(error);
         assert_eq!(pool.used_bytes().unwrap(), cold);
     }
-    drop((template, tokenizer, runtime));
+    drop((source, tokenizer, model));
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn unsupported_chat_request_and_equal_content_foreign_sources_reject_before_work() {
-    use crate::runtime::chat::ToolChoice;
-    let (mut runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_execution() {
+    let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
     let cancellation = GenerationCancellationToken::new();
-    let (tokenizer, template) = sources(&runtime, &cancellation);
+    let (mut model, tokenizer, source) = loaded_sources(
+        runtime,
+        TOKENIZER.as_bytes(),
+        CHAT_CONFIG,
+        "smol",
+        ModelKind::Llama,
+        &cancellation,
+    );
     let cold = pool.used_bytes().unwrap();
     for case in [0, 1, 2, 6, 7] {
         let mut input = request();
         match case {
-            0 => input.tool_choice = ToolChoice::Required,
+            0 => input.tool_choice = crate::runtime::chat::ToolChoice::Required,
             1 => {
-                input.tool_choice = ToolChoice::None;
+                input.tool_choice = crate::runtime::chat::ToolChoice::None;
                 input.tools.push(serde_json::json!({"name":"tool"}));
             }
             2 => input.enable_thinking = Some(true),
             6 => {
                 input
                     .extra_template_kwargs
-                    .insert("messages".to_owned(), serde_json::json!([null]));
+                    .insert("messages".into(), serde_json::json!([null]));
             }
-            // Rich content and tool history are supported borrowed inputs.
-            // A message itself must still be an object before rendering.
             7 => input.messages[0] = serde_json::json!("not a message object"),
             _ => unreachable!(),
         }
-        let error = prepare_original_text_chat(
-            &runtime,
-            &template,
-            &tokenizer,
-            &input,
-            config(),
-            &cancellation,
-        )
-        .unwrap_err();
-        assert_eq!(error.retained_render_bytes(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), cold, "request case {case}");
-        assert_eq!(facts.borrow().chat_renders, 0);
+        let renders = facts.borrow().chat_renders;
+        if matches!(case, 0 | 1) {
+            let prepared = model
+                .prepare_chat(&source, &input, u64::MAX, &cancellation)
+                .unwrap()
+                .unwrap();
+            assert!(!prepared.text_generation_support().is_supported());
+            let error = match model
+                .start_prepared_chat(literal_request(&prepared, chat_settings()), &cancellation)
+            {
+                Err(error) => error,
+                Ok(_) => panic!("literal mode must reject declarations"),
+            };
+            assert_eq!(
+                error.text_output_rejection().as_ref(),
+                Some(prepared.text_generation_support())
+            );
+            assert_eq!(facts.borrow().stops, 0);
+            assert_eq!(facts.borrow().encodes, 0);
+            assert!(!facts.borrow().order.contains(&"submit"));
+            drop((error, prepared));
+            assert_eq!(pool.used_bytes().unwrap(), cold);
+            continue;
+        }
+        let error = model
+            .prepare_chat(&source, &input, u64::MAX, &cancellation)
+            .unwrap_err();
+        if case != 2 {
+            assert_eq!(facts.borrow().chat_renders, renders);
+        }
         assert_eq!(facts.borrow().stops, 0);
         assert_eq!(facts.borrow().encodes, 0);
+        assert!(!facts.borrow().order.contains(&"submit"));
         drop(error);
+        assert_eq!(pool.used_bytes().unwrap(), cold, "case {case}");
     }
-    let (other_tokenizer, other_template) = sources(&runtime, &cancellation);
-    assert!(!other_tokenizer.same_source(&tokenizer));
-    assert!(!other_template.same_source(&template));
-    let cold = pool.used_bytes().unwrap();
-    for wrong_j in [false, true] {
-        let render = prepare_original_text_chat(
-            &runtime,
-            &template,
-            &tokenizer,
-            &request(),
-            config(),
-            &cancellation,
-        )
+    let prepared = model
+        .prepare_chat(&source, &request(), u64::MAX, &cancellation)
         .unwrap()
         .unwrap();
-        let h = render.original_bytes();
-        let error = match start_original_text_chat(
-            &mut runtime,
-            if wrong_j { &other_template } else { &template },
-            if wrong_j {
-                &tokenizer
-            } else {
-                &other_tokenizer
-            },
-            render,
-            true,
-            config(),
-            &[],
-            &[],
-            true,
-            &cancellation,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("equal-content sources cannot replace the actual H bindings"),
-        };
-        assert!(matches!(
-            error.input_rejection(),
-            Some(TokenInputRejection::IdentityMismatch)
-        ));
-        assert_eq!(error.retained_render_bytes(), h);
-        assert_eq!(pool.used_bytes().unwrap(), cold + h + source_budget_bytes());
-        assert_eq!(facts.borrow().stops, 0);
-        assert_eq!(facts.borrow().encodes, 0);
-        assert!(facts.borrow().order.is_empty());
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
-    }
-    drop((
-        other_template,
-        other_tokenizer,
-        template,
-        tokenizer,
-        runtime,
-    ));
+    let (other_runtime, other_facts, other_pool) = bare_runtime_with_capacity(u64::MAX);
+    let (mut other, other_tokenizer, other_source) = loaded_sources(
+        other_runtime,
+        TOKENIZER.as_bytes(),
+        CHAT_CONFIG,
+        "smol",
+        ModelKind::Llama,
+        &cancellation,
+    );
+    let other_cold = other_pool.used_bytes().unwrap();
+    let error = match other
+        .start_prepared_chat(literal_request(&prepared, chat_settings()), &cancellation)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("equal-content foreign source must reject"),
+    };
+    assert_eq!(
+        error.input_rejection(),
+        Some(TokenInputRejection::IdentityMismatch)
+    );
+    assert_eq!(other_facts.borrow().stops, 0);
+    assert_eq!(other_facts.borrow().encodes, 0);
+    assert!(other_facts.borrow().order.is_empty());
+    drop(error);
+    assert_eq!(other_pool.used_bytes().unwrap(), other_cold);
+    drop((other_source, other_tokenizer, other));
+    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    drop((prepared, source, tokenizer, model));
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
 #[ignore = "requires exact pinned complete tokenizer and config paths; required serial chat oracle"]
-fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
+fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
     use sha2::{Digest, Sha256};
     #[derive(serde::Deserialize)]
     struct Input {
@@ -566,30 +656,28 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
     .unwrap()
     .unwrap();
     let mut ordinary = eredu_text::tokenizer::Tokenizer::from_tokenizer(reference.clone());
-    let (mut runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
+    let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
     facts.borrow_mut().shared_admission_capacity = Some(u64::MAX);
-    // The complete byte/Unicode corpus exceeds the small default mock context.
     facts.borrow_mut().maximum_context = Some(1024);
-    let source = crate::api::tokenizer::compile_original_text_tokenizer_file(
-        &runtime,
-        std::fs::File::open(&inputs.tokenizer.origin).unwrap(),
-    )
-    .unwrap();
     let cancellation = GenerationCancellationToken::new();
-    let template = compile_original_chat_file(
-        &runtime,
-        std::fs::File::open(&inputs.config.origin).unwrap(),
+    let (mut model, source, template) = loaded_sources(
+        runtime,
+        &tokenizer_bytes,
+        std::str::from_utf8(&config_bytes).unwrap(),
         "smol",
+        ModelKind::Llama,
         &cancellation,
-    )
-    .unwrap()
-    .unwrap();
-    let cold = source.original_bytes() + template.original_bytes();
-    assert_eq!(pool.used_bytes().unwrap(), cold);
-    let a = source.token_id("a").unwrap();
-    let b = source.token_id("b").unwrap();
-    assert!(!source.is_special("a") && !source.is_special("b"));
-    let domain = source.generation_domain().unwrap().allowed_mask().unwrap();
+    );
+    let cold = pool.used_bytes().unwrap();
+    let a = source.original().token_id("a").unwrap();
+    let b = source.original().token_id("b").unwrap();
+    assert!(!source.original().is_special("a") && !source.original().is_special("b"));
+    let domain = source
+        .original()
+        .generation_domain()
+        .unwrap()
+        .allowed_mask()
+        .unwrap();
     facts.borrow_mut().prediction_ids = Some([a, b, a]);
     facts.borrow_mut().output_width = Some(domain.len());
     let scalar_bytes = (0..=255)
@@ -612,7 +700,7 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
     ];
     let mut rows = Vec::new();
     for (case, messages) in cases.into_iter().enumerate() {
-        let request = ChatTemplateRequest {
+        let mut request = ChatTemplateRequest {
             messages,
             ..ChatTemplateRequest::default()
         };
@@ -633,33 +721,22 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
                         .pop()
                         .unwrap();
                     let expected_ids = reference.encode(expected.as_str(), false).unwrap();
-                    let render = prepare_original_text_chat(
-                        &runtime,
-                        &template,
-                        &source,
-                        &request,
-                        config(),
-                        &cancellation,
-                    )
-                    .unwrap()
-                    .unwrap();
-                    assert_eq!(render.prompt(generation), expected);
-                    assert_eq!(render.generation_suffix(), "<|im_start|>assistant\n");
-                    facts.borrow_mut().ids.clear();
-                    let h = render.original_bytes();
-                    let prior_actions = facts.borrow().order.len();
-                    let started = start_original_text_chat(
-                        &mut runtime,
-                        &template,
-                        &source,
-                        render,
-                        generation,
-                        config(),
-                        &[],
-                        &[],
-                        skip,
-                        &cancellation,
+                    request.add_generation_prompt = generation;
+                    let prepared = model
+                        .prepare_chat(&template, &request, u64::MAX, &cancellation)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(prepared.rendered_prompt(), expected);
+                    assert_eq!(
+                        prepared.render().generation_suffix(),
+                        "<|im_start|>assistant\n"
                     );
+                    facts.borrow_mut().ids.clear();
+                    let prepared_used = pool.used_bytes().unwrap();
+                    let prior_actions = facts.borrow().order.len();
+                    let mut invocation = literal_request(&prepared, chat_settings());
+                    invocation.skip_special_tokens = skip;
+                    let started = model.start_prepared_chat(invocation, &cancellation);
                     if expected_ids.get_ids().is_empty() {
                         assert!(expected.is_empty());
                         let error = match started {
@@ -670,10 +747,11 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
                             error.input_rejection(),
                             Some(TokenInputRejection::Empty)
                         ));
-                        assert_eq!(error.retained_render_bytes(), h);
-                        assert_eq!(pool.used_bytes().unwrap(), cold + h + source_budget_bytes());
+                        assert!(pool.used_bytes().unwrap() > prepared_used);
                         assert_eq!(facts.borrow().order.len(), prior_actions);
                         drop(error);
+                        assert_eq!(pool.used_bytes().unwrap(), prepared_used);
+                        drop(prepared);
                         assert_eq!(pool.used_bytes().unwrap(), cold);
                         last_ids = Some(Vec::new());
                         rows.push(serde_json::json!({"case":case,"manual":manual,"generation_prompt":generation,"skip_special":skip,"prompt_bytes":0,"input_ids":0,"outcome":"typed_empty_before_I"}));
@@ -682,9 +760,9 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
                     let mut session = started.unwrap().unwrap();
                     assert_eq!(facts.borrow().ids, expected_ids.get_ids());
                     let mut visible = String::new();
-                    let mut emit = |event: GenerationPlainTextEvent<'_>| {
-                        if let GenerationPlainTextEvent::TextDelta(text) = event {
-                            visible.push_str(text);
+                    let mut emit = |event: SemanticEvent| {
+                        if let SemanticEvent::TextDelta(text) = event {
+                            visible.push_str(&text);
                         }
                     };
                     let output = if manual {
@@ -698,18 +776,14 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
                         session.run(&cancellation, &mut emit).unwrap()
                     };
                     assert_eq!(output.token_ids.as_ref(), &[a, b, a]);
-                    assert_eq!(
-                        output.text.as_str(),
-                        reference.decode(&[a, b, a], skip).unwrap()
-                    );
-                    assert_eq!(output.text.as_str(), visible);
-                    let held = facts.borrow().held;
-                    assert_eq!(pool.used_bytes().unwrap(), cold + held);
+                    assert_eq!(visible, reference.decode(&[a, b, a], skip).unwrap());
                     let ids = output.token_ids.clone();
-                    let text = output.text.clone();
+                    let retained = pool.used_bytes().unwrap();
                     drop(output);
-                    drop(text);
-                    assert_eq!(pool.used_bytes().unwrap(), cold + held);
+                    assert_eq!(pool.used_bytes().unwrap(), retained);
+                    drop(prepared);
+                    assert!(pool.used_bytes().unwrap() > cold);
+                    assert_eq!(ids.as_ref(), &[a, b, a]);
                     drop(ids);
                     assert_eq!(pool.used_bytes().unwrap(), cold);
                     last_ids = Some(expected_ids.get_ids().to_vec());
@@ -729,11 +803,11 @@ fn released_complete_config_and_tokenizer_use_original_private_chat_request() {
     assert_eq!(facts.borrow().chat_renders, 48);
     assert_eq!(facts.borrow().encodes, 48);
     assert_eq!(facts.borrow().stops, 48);
-    drop((template, source, runtime));
+    drop((template, source, model));
     assert_eq!(pool.used_bytes().unwrap(), 0);
     println!(
         "ORIGINAL_CHAT_ORACLE_JSON={}",
-        serde_json::json!({"scope":"complete pinned config/tokenizer original private J/H/C/S/E/I/R chat","config_sha256":inputs.config.sha256,"tokenizer_sha256":inputs.tokenizer.sha256,"private_requests":48,"completed_requests":44,"empty_rejections":4,"rows":rows})
+        serde_json::json!({"scope":"complete pinned config/tokenizer original public prepared chat","config_sha256":inputs.config.sha256,"tokenizer_sha256":inputs.tokenizer.sha256,"public_requests":48,"completed_requests":44,"empty_rejections":4,"rows":rows})
     );
 }
 

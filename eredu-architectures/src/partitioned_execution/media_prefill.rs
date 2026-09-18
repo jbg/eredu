@@ -31,6 +31,7 @@ where
         state: &mut S,
         parallel: Option<&B::ParallelContext>,
         context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        cut: &mut dyn FnMut(&mut dyn FnMut(&mut dyn FnMut(&B::Tensor))) -> Result<(), eredu_nn::Error>,
     ) -> Result<bool, eredu_nn::Error>;
     fn retain(&mut self, group: usize, value: &B::Tensor);
     fn inactive(&mut self, group: usize);
@@ -81,7 +82,7 @@ where
                             dependency,
                             A::prepared_ingress_input(self.plan()),
                         ) && architecture
-                            .group_unit_count(dependency)
+                            .group_unit_count(dependency, None)
                             .is_ok_and(|count| count != 0)
                     })
             {
@@ -101,11 +102,12 @@ where
         state: &mut S,
         parallel: Option<&B::ParallelContext>,
         context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        cut: &mut dyn FnMut(&mut dyn FnMut(&mut dyn FnMut(&B::Tensor))) -> Result<(), eredu_nn::Error>,
     ) -> Result<bool, eredu_nn::Error> {
         if !self.owns_decoder_ingress() {
             return Ok(false);
         }
-        self.enter_group(
+        self.enter_group_with_cut(
             architecture,
             group,
             initial,
@@ -113,6 +115,7 @@ where
             state,
             parallel,
             context,
+            cut,
         )
     }
     fn retain(&mut self, group: usize, value: &B::Tensor) {
@@ -153,14 +156,28 @@ where
         state: &mut S,
         demand: eredu_core::OutputDemand,
         context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        paths: Option<&'a eredu_runtime::PreparedLayeredObservationPaths>,
     ) -> Result<Self::Pass<'a, 'a>, eredu_nn::Error>
     where
         'source: 'a,
         S: 'a,
     {
-        self.architecture
-            .inner()
-            .validate_ingress_plan(invocation.plan())?;
+        let metadata=B::construction_metadata(context).filter(|source|source.uses_checked_metadata());
+        if let Some(metadata)=&metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                Option<&eredu_runtime::PreparedLayeredObservationPaths>,
+                Result<(),eredu_runtime::PreparedLayeredObservationError<std::convert::Infallible>>,
+            )>())?;
+        }
+        if let Some(paths)=paths {
+            self.observation_binding.validate_binding(paths).map_err(|cause|match &metadata {
+                Some(metadata)=>metadata.metadata_source(cause),None=>eredu_nn::Error::backend_retained_source(cause),
+            })?;
+        }
+        match &metadata {
+            Some(metadata)=>self.architecture.inner().validate_ingress_plan(invocation.plan(), Some(metadata))?,
+            None=>self.architecture.inner().validate_ingress_plan(invocation.plan(), None)?,
+        }
         let input = A::prepared_ingress_input(invocation.plan());
         let mut pass = self
             .prepare_composite_pass(
@@ -178,33 +195,27 @@ where
             i32::try_from(invocation.span().input.end - invocation.span().input.start)
                 .map_err(eredu_nn::Error::backend)?;
         pass.group_boundary_sequences[self.primary_group] = pass.sequence_length;
-        pass.primary_ingress_collectives = self
-            .architecture
-            .inner()
-            .media_primary_ingress_collectives(
-                invocation.plan(),
-                invocation.span(),
-                tensor_partitions,
-            )
-            .map_err(eredu_nn::Error::backend)?;
+        pass.primary_ingress_collectives = match &metadata {
+            Some(metadata)=>self.architecture.inner().media_primary_ingress_collectives_with_metadata(
+                invocation.plan(),invocation.span(),tensor_partitions,metadata)?,
+            None=>self.architecture.inner().media_primary_ingress_collectives(
+                invocation.plan(),invocation.span(),tensor_partitions).map_err(eredu_nn::Error::backend)?,
+        };
         for group in 0..self.units.len() {
             if let Some(value) = invocation.imported_group(group) {
                 pass.group_activity[group] = false;
                 pass.group_outputs[group] = value;
                 pass.group_collective_waves[group] = None;
             } else {
-                pass.group_collective_waves[group] = self
-                    .architecture
-                    .inner()
-                    .media_group_collective_waves(
-                        invocation.plan(),
-                        group,
-                        tensor_partitions,
-                        self.pipeline_stages,
-                    )
-                    .map_err(eredu_nn::Error::backend)?;
+                pass.group_collective_waves[group] = match &metadata {
+                    Some(metadata)=>self.architecture.inner().media_group_collective_waves_with_metadata(
+                        invocation.plan(),group,tensor_partitions,self.pipeline_stages,metadata)?,
+                    None=>self.architecture.inner().media_group_collective_waves(
+                        invocation.plan(),group,tensor_partitions,self.pipeline_stages).map_err(eredu_nn::Error::backend)?,
+                };
             }
         }
+        pass.paths=paths;
         pass.media = Some(invocation);
         Ok(pass)
     }

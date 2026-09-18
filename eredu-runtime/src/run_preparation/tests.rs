@@ -572,3 +572,27 @@ fn readiness_validation_borrows_completed_word_custody_through_both_exchanges() 
         });
     }
 }
+
+#[test]
+fn reset_preparation_and_publication_share_cumulative_coordinator_without_text_stage_aliasing() {
+    ranks(Fault::None, |rank,transport,owner| {
+        let rejected=owner.agree(transport,TextPreparationStage::SessionReset,
+            if rank==1 {TextPreparationStatus::Failed} else {TextPreparationStatus::Ready}).unwrap();
+        assert_eq!(rejected,TextPreparationOutcome::Rejected {rank:1});
+        for stage in [TextPreparationStage::SessionReset,TextPreparationStage::SessionResetPublication,
+            TextPreparationStage::Request] {
+            assert_eq!(owner.agree(transport,stage,TextPreparationStatus::Ready).unwrap(),TextPreparationOutcome::Ready);
+        }
+        let usage=owner.usage().unwrap();
+        assert_eq!(usage.attempts,4);
+        assert_eq!(usage.retained_bytes,4*owner.per_attempt().retained_bytes);
+        assert_eq!(usage.host_bytes,4*owner.per_attempt().host_bytes);
+        assert_eq!(transport.calls.load(Ordering::SeqCst),8);
+        assert!(!transport.fenced.load(Ordering::SeqCst));
+    });
+    ranks(Fault::None,|rank,transport,owner| {
+        assert!(owner.agree(transport,if rank==0 {TextPreparationStage::SessionReset}
+            else {TextPreparationStage::Prompt},TextPreparationStatus::Ready).is_err());
+        assert!(transport.fenced.load(Ordering::SeqCst));
+    });
+}

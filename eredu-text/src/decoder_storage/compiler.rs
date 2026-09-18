@@ -87,9 +87,11 @@ impl<'a> DecodeCompilePlan<'a> {
     pub(crate) fn prepare_hf(
         tokenizer: &'a tokenizers::Tokenizer,
     ) -> Result<Self, DecodeSourceError> {
-        let mode = Mode::from_decoder(tokenizer.get_decoder())
-            .ok_or(DecodeSourceError::UnsupportedDecoder)?;
-        let vocabulary = tokenizer.decode_vocabulary();
+        Self::prepare_input(tokenizer.into())
+    }
+    pub(crate) fn prepare_input(input: tokenizers::tokenizer::TokenizerInput<'a>) -> Result<Self, DecodeSourceError> {
+        let mode = Mode::from_decoder(input.decoder()).ok_or(DecodeSourceError::UnsupportedDecoder)?;
+        let vocabulary = input.decode_vocabulary();
         let mut extents = Ok((0usize, 0usize));
         vocabulary.visit_ids(&mut |id| {
             if let Ok((count, bytes)) = &mut extents {

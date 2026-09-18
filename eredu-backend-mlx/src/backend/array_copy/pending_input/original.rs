@@ -12,7 +12,7 @@ use crate::backend::{
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan,
-    WorkspaceMetadataFunding,
+    HostMetadataFunding,
 };
 use eredu_runtime::working_memory::{
     OriginalStorageSourcesLayout, RegisteredPreparedWorkspaceCopy,
@@ -54,7 +54,7 @@ impl RegisteredArrayCopy {
         self.custody.copy_retention()
     }
     pub(crate) fn validate_completed_stream(
-        &self, stream: &Stream, funding: &WorkspaceMetadataFunding,
+        &self, stream: &Stream, funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         reserve(funding, self.completed_stream.source_comparison_control_bytes()
             .ok_or_else(||memory(WorkingMemoryError::Overflow))?)?;
@@ -208,12 +208,12 @@ fn add(a: usize, b: usize) -> Result<usize, Error> {
         .ok_or_else(|| memory(WorkingMemoryError::Overflow))
 }
 fn paid(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     cause: impl std::error::Error + Send + Sync + 'static,
 ) -> Error {
     Error::Neural(funding.metadata_source(cause))
 }
-fn reserve(funding: &WorkspaceMetadataFunding, bytes: usize) -> Result<(), Error> {
+fn reserve(funding: &HostMetadataFunding, bytes: usize) -> Result<(), Error> {
     funding
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)
@@ -238,7 +238,7 @@ impl Program<'_> {
     fn native<'a>(
         &self,
         environment: &'a OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<OriginalCopyPlan<'a>, Error> {
         if let Self::Pending(input) = self {
             input.validate_fixed().map_err(|e| paid(funding, e))?;
@@ -264,7 +264,7 @@ impl Program<'_> {
         self,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Array, Error> {
         match self {
             Self::Pending(input) => input
@@ -283,7 +283,7 @@ impl PreparedPendingTokenInput<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Pending(self).copy_registered(
@@ -301,7 +301,7 @@ impl PreparedPendingTokenInput<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Pending(self).copy_registered(
@@ -320,7 +320,7 @@ impl IsolatedArrayCopy<'_> {
     pub(crate) fn copy_prepared(
         self, prepared:&crate::backend::array_copy::OriginalPreparedArrayCopySource<'_>,
         environment:&OriginalCopyEnvironment<'_>,initialized:&safemlx::PrefillRootsRuntime,
-        mechanisms:MlxMetalWorkspaceMechanisms,funding:&WorkspaceMetadataFunding,capacity:u64,
+        mechanisms:MlxMetalWorkspaceMechanisms,funding:&HostMetadataFunding,capacity:u64,
     )->Result<RegisteredArrayCopy,Error>{
         Program::Isolated(self.source).copy_registered(Proof::Prepared(prepared),
             environment,initialized,mechanisms,funding,capacity)
@@ -334,7 +334,7 @@ impl IsolatedArrayCopy<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Isolated(self.source).copy_registered(
@@ -353,7 +353,7 @@ impl IsolatedArrayCopy<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Isolated(self.source).copy_registered(
@@ -373,7 +373,7 @@ impl Program<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
         let frames = [
@@ -381,7 +381,7 @@ impl Program<'_> {
                 .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
             OriginalCopyLayoutBuilder::resume_control_bytes()
                 .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                 .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
             BackendFailure::source_retention_peak_bytes::<Failure>()
                 .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
@@ -439,7 +439,7 @@ impl Program<'_> {
         environment: &OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         host: &HostPreparationAuthority,
         capacity: u64,
     ) -> Result<RegisteredArrayCopy, Error> {
@@ -687,7 +687,7 @@ impl Program<'_> {
         };
         recovery.seal();
         let array = result?;
-        let status = recovery.finish();
+        let status = recovery.finish()?;
         if !status.settled || status.failed || status.blocked {
             return Err(memory(WorkingMemoryError::UnknownBound));
         }
@@ -717,3 +717,5 @@ impl Program<'_> {
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

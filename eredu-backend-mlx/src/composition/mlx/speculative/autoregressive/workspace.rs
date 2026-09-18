@@ -5,7 +5,7 @@ use crate::backend::nn::workspace::{
 };
 use crate::composition::mlx::model::{retain_planning_error, Executable};
 use eredu_nn::workspace::{
-    WorkspaceContext, WorkspaceDtype, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceContext, WorkspaceDtype, HostMetadataFunding, HostMetadataFundingError,
 };
 use eredu_runtime::{
     speculative::autoregressive::{AutoregressiveInvocation, AutoregressiveSchedulePlan},
@@ -30,13 +30,14 @@ pub(crate) struct AutoregressiveWorkspaceRecipe<'source> {
     state: &'source MlxAutoregressiveState,
     input: Option<&'source MlxModelInput>,
     frontier: u64,
+    media_source: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
     projected: ProjectedResidentState,
     layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     report: InferenceWorkspaceReport,
     recipe: AutoregressiveEquationRecipe,
     context: WorkspaceContext,
     // Every owned report, native inspection clone and Context retires first.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl<'source> AutoregressiveWorkspaceRecipe<'source> {
     /// Runs the actual retained architecture and native fact reducer at the
@@ -69,7 +70,7 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
         state: &'source MlxAutoregressiveState,
         input: Option<&'source MlxModelInput>,
         invocation: AutoregressiveInvocation,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         prepared_prefill: Option<&super::prefill_input::PreparedPrefillInput>,
     ) -> Result<Self, Error> {
         let controls = [
@@ -101,7 +102,7 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
                 &MlxAutoregressiveState,
                 Option<&MlxModelInput>,
                 AutoregressiveInvocation,
-                WorkspaceMetadataFunding,
+                HostMetadataFunding,
             )>(),
         ];
         let bytes = controls
@@ -115,7 +116,7 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
                 }
             })
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)
@@ -143,9 +144,12 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
         let (dtype, prefill_chunk_positions) = match invocation.execution_pass() {
             eredu_runtime::ExpertPass::Prefill => {
                 let input = input.ok_or_else(mismatch)?;
-                let (positions, dtype) = inspect_plain_input(input)
-                    .map_err(|cause| retain_planning_error(cause, funding.clone()))?
-                    .ok_or_else(mismatch)?;
+                let media_shape=input.with_borrowed(|input|input.original_media().map(|packet|packet.shape()));
+                let (positions,dtype)=match media_shape {
+                    Some([1,positions])=>(usize::try_from(positions).map_err(|_|mismatch())?,WorkspaceDtype::Uint32),
+                    Some(_)=>return Err(mismatch()),
+                    None=>inspect_plain_input(input).map_err(|cause|retain_planning_error(cause,funding.clone()))?.ok_or_else(mismatch)?,
+                };
                 if positions != invocation.positions() {
                     return Err(mismatch());
                 }
@@ -210,6 +214,29 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
         if !projected.storage.is_complete() {
             return Err(mismatch());
         }
+        let media_packet=input.and_then(|input|input.with_borrowed(|input|input.original_media().cloned()));
+        let media_semantics=media_packet.as_ref().map(|packet| {
+            let crate::backend::runtime::media::input::OriginalMediaPacket::Original(_)=packet else {return Err(mismatch());};
+            let semantics = prepared_prefill.and_then(|input| input.media_semantics()).cloned()
+                .unwrap_or_else(|| packet.semantics());
+            if !semantics.source().same_source(packet.semantics().source())
+                || !state.native.matches_media_binding(model.erased().inference_execution_identity(), semantics.binding())
+                || semantics.binding().frontier()!=frontier {return Err(mismatch());}
+            Ok(semantics)
+        }).transpose()?;
+        let media=media_packet.as_ref().map(|packet| {
+            let source=packet.clone_lowered().into_prepared();
+            eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput::project_with_metadata(
+                &source,media_semantics.as_ref().ok_or_else(mismatch)?.clone(),&context,&state.pool,
+            ).map_err(|cause|retain_planning_error(cause,funding.clone()))
+        }).transpose()?;
+        let media_source=media.as_ref().map(|input| {
+            let source=input.source_storage();
+            let layout=eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout::<()>::new_with_prepared_source(0,source)
+                .map_err(Error::PrefillControl)?;
+            funding.reserve_metadata(layout.requested_bytes()).map_err(Error::WorkspacePlanning)?;
+            layout.construct_with_prepared_source(&state.pool,&context,std::iter::empty(),source.clone()).map_err(Error::PrefillControl)
+        }).transpose()?;
         let mut recorder = mechanism.recorder(geometry, &context)
             .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
         if let Some(source)=addressable {
@@ -229,6 +256,7 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
                 invocation,
                 prefill_chunk_positions,
                 dtype,
+                media.zip(media_semantics.as_ref().map(|semantics| semantics.binding())),
                 &projected.state,
                 &context,
                 &mut recorder,
@@ -243,6 +271,7 @@ impl<'source> AutoregressiveWorkspaceRecipe<'source> {
             state,
             input,
             frontier,
+            media_source,
             projected,
             layerwise,
             report,

@@ -12,15 +12,15 @@ use crate::capture::{
 };
 use crate::working_memory::WorkspaceCopyLimits;
 use eredu_core::{
-    BackendFailure, HostPreparationAuthority, ModelRuntime, PendingTextInput,
-    TextContinuationBoundary, TextContinuationIdentity, TextSnapshotSource, TokenFilterController,
     capture::CaptureError,
     execution_control::{
         ExecutionControlError, NativeTextStateBackend, SnapshotEstimate, SnapshotResourceKind,
     },
+    BackendFailure, HostPreparationAuthority, ModelRuntime, PendingTextInput,
+    TextContinuationBoundary, TextContinuationIdentity, TextSnapshotSource, TokenFilterController,
 };
 use host_copy::CallbackHostCopy;
-pub use host_copy::{PreparedTextHostCopy, TextHostCopyError};
+pub use host_copy::{PreparedTextHostCopy, PreparedTextHostJournal, TextHostCopyError};
 pub use resume::PendingSnapshotResumeRetention;
 
 /// Allocation policy for the complete saved component requested by a hook.
@@ -131,6 +131,7 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
         _saved: &Self::SavedTextComponents,
         _config: eredu_core::TextGenerationConfig,
         _controller: &C,
+        _options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<Option<u64>, crate::working_memory::WorkingMemoryError> {
         Ok(None)
     }
@@ -141,6 +142,7 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
         _runtime: &ModelRuntime<Self>,
         _saved: &Self::SavedTextComponents,
         _config: eredu_core::TextGenerationConfig,
+        _options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Option<SnapshotEstimate> {
         None
     }
@@ -477,6 +479,24 @@ pub enum TextSnapshotError<E: std::error::Error + 'static> {
     Unsupported(&'static str),
 }
 
+impl<E: std::error::Error + 'static> TextSnapshotError<E> {
+    /// The original neutral provider failure beneath an independently funded
+    /// resume transport. Borrowing it preserves both source and host custody.
+    pub fn resume_backend_failure(&self) -> Option<&BackendFailure> {
+        let Self::Resume(error) = self else {
+            return None;
+        };
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            if let Some(error) = cause.downcast_ref::<BackendFailure>() {
+                return Some(error);
+            }
+            source = cause.source();
+        }
+        None
+    }
+}
+
 impl<E: std::error::Error + 'static> From<TextHostCopyError> for TextSnapshotError<E> {
     fn from(error: TextHostCopyError) -> Self {
         match error {
@@ -533,12 +553,14 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     }
     /// Uses the exact continuation source for a shared preparation/delivery
     /// agreement. Snapshot storage does not create or reset this protocol owner.
-    pub fn finish_text_preparation_cancellable<T,E>(
-        &self,driver:&eredu_core::TextGenerationDriver<'_,B>,
-        stage:eredu_core::run_preparation::TextPreparationStage,local:Result<Option<T>,E>,
-        map_backend:impl FnOnce(eredu_core::BackendFailure)->E,
-    )->Result<Option<T>,E> {
-        driver.finish_text_preparation_cancellable(&self.state,stage,local,map_backend)
+    pub fn finish_text_preparation_cancellable<T, E>(
+        &self,
+        driver: &eredu_core::TextGenerationDriver<'_, B>,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(eredu_core::BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        driver.finish_text_preparation_cancellable(&self.state, stage, local, map_backend)
     }
     /// Advances the installed continuation using the existing ordinary driver.
     #[allow(clippy::type_complexity)]
@@ -563,17 +585,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     > {
         driver.advance_cancellable(&mut self.state, cancellation)
     }
-    /// Settles and drains this continuation's bounded record step.
-    pub fn take_completed_step(
-        &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
-    ) -> Result<
-        Option<eredu_core::capture::CapturedStep>,
-        eredu_core::TextContinuationError<B::Error, C::Error>,
-    > {
-        driver.take_completed_step(&mut self.state)
-    }
-    /// Settles exact completion and moves either legacy or shared capture ownership.
+    /// Settles exact completion and moves the retained capture owner.
     /// Shared frames keep their original custody; this adds no allocation or
     /// authority and never clears an earlier execution or drain failure.
     /// A failed drain preserves the pending frame for a later delivery attempt.
@@ -581,7 +593,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
         &mut self,
         driver: &mut eredu_core::TextGenerationDriver<'_, B>,
     ) -> Result<
-        Option<eredu_core::capture::CapturedStepDelivery>,
+        Option<eredu_core::capture::SharedCapturedStep>,
         eredu_core::TextContinuationError<B::Error, C::Error>,
     > {
         driver.take_completed_delivery(&mut self.state)
@@ -650,9 +662,24 @@ pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterContro
 }
 
 impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapshot<B, C> {
+    /// Remaining admitted output positions represented by the saved frontier.
+    /// A fresh run may shorten this allowance, but cannot refund or extend it.
+    pub fn remaining_tokens(&self) -> Option<usize> {
+        self.remaining_tokens
+    }
     /// Logical reservation retained by this snapshot, including facade host data.
     pub fn retained_bytes(&self) -> u64 {
         self._reservation.retained_bytes()
+    }
+    /// Shared storage reservation for host metadata that can escape the saved
+    /// native state. Retaining it grants no restoration or execution authority.
+    pub fn storage_reservation(&self) -> &SnapshotReservation {
+        &self._reservation
+    }
+    /// Existing destination custody for escaping immutable metadata aliases.
+    /// This permits no allocation or copy and preserves the same paid owner.
+    pub fn host_preparation(&self) -> &HostPreparationAuthority {
+        &self._host_preparation
     }
     /// Absolute next decision represented by this reusable snapshot.
     pub fn next_prediction(&self) -> u64 {

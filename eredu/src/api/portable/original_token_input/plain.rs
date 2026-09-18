@@ -2,10 +2,14 @@
 //! public default, chat rendering or owned live event. Snapshot capture uses the
 //! shared completed-state driver; restore/resume remain separately qualified.
 use super::*;
+use crate::api::request::BackendGenerationTokenSource;
+use crate::runtime::generation::streaming::RetainedConsumerCursor;
+use eredu_core::{BackendFailure, GenerationDecoderError, GenerationSequenceRequest,
+    TokenIdsInputPlan, TokenInputRejection};
 use eredu_core::{
     BackendFailureKind, ControlledTextGenerationError, GenerationCancellationToken,
     GenerationPlainTextEvent, GenerationPlainTextOutput, GenerationSequenceConsumerLayout,
-    GenerationTiming, ModelRuntime, OriginalTokenDomainWitness, TextControllerStorage,
+    GenerationTiming, ModelRuntime, OriginalSourceWitness, TextControllerStorage,
     TextControllerWorkspace, TextPreparationOptions, TokenFilter, TokenFilterController,
     TokenSamplingDecision,
 };
@@ -15,6 +19,7 @@ use eredu_runtime::working_memory::{
 };
 use eredu_text::stop_storage::{StopCompilePlan, StopSourceError};
 use std::time::{Duration, Instant};
+use crate::api::ManagedPlainTextError;
 
 /// No history or callback-owned state. Its one immutable C alias is authenticated
 /// by runtime before admission and before/after each actual decision callback.
@@ -30,8 +35,8 @@ impl OriginalDomainController {
             .generation_domain()
             .expect("selected original generation source")
     }
-    fn witness(&self) -> OriginalTokenDomainWitness<'_> {
-        OriginalTokenDomainWitness::new(&self.source)
+    fn witness(&self) -> OriginalSourceWitness<'_> {
+        OriginalSourceWitness::new(&self.source)
     }
 }
 impl TokenFilterController for OriginalDomainController {
@@ -67,10 +72,9 @@ impl TokenFilterController for OriginalDomainController {
     }
 }
 type PlainSource<'a, B> = BackendGenerationTokenSource<'a, B, OriginalDomainController>;
-type PlainError<B> =
-    ControlledTextGenerationError<<B as eredu_core::BackendProvider>::Error, OriginalDomainError>;
-type PlainCursor<B> =
-    RetainedConsumerCursor<PlainError<B>, GenerationDecoderError, false, true, true>;
+type PlainError = ControlledTextGenerationError<BackendFailure, OriginalDomainError>;
+type PlainCursor =
+    RetainedConsumerCursor<PlainError, GenerationDecoderError, false, true, true>;
 
 /// Startup failures stay by value: a fixed rejection cannot allocate a new error
 /// Box before I/R admission. Existing backend errors retain their actual owners.
@@ -96,16 +100,23 @@ pub(crate) enum OriginalPlainStartError<B: std::error::Error + 'static> {
 pub(crate) struct OriginalPlainSession<'a, B: TextGenerationBackend> {
     source: PlainSource<'a, B>,
     active: Duration,
-    cursor: PlainCursor<B>,
+    cursor: PlainCursor,
+    input_custody: Option<eredu_runtime::input::OriginalModelInputCustody>,
 }
 impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
+    pub(crate) fn retain_input_custody(
+        &mut self,
+        custody: Option<eredu_runtime::input::OriginalModelInputCustody>,
+    ) {
+        self.input_custody = custody;
+    }
     /// Only changes the borrowed delivery callback. Source admission, capture
     /// ledger and native completion remain owned by the existing generator.
     pub(crate) fn set_capture_observer(
         &mut self,
         observer: &'a mut dyn FnMut(
             Option<u32>,
-            Option<eredu_core::capture::CapturedStepDelivery>,
+            Option<eredu_core::capture::SharedCapturedStep>,
             f64,
         ),
     ) {
@@ -125,11 +136,12 @@ impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
         self,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
-    ) -> Result<Self, BackendFailure> {
+    ) -> Result<Self, ManagedPlainTextError> {
         let Self {
             mut source,
             active,
             cursor,
+            input_custody,
         } = self;
         let started = Instant::now();
         // Count prior active preparation/advancement, excluding caller pauses.
@@ -142,17 +154,18 @@ impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
                 source,
                 active: active + started.elapsed(),
                 cursor,
+                input_custody,
             }),
             Err(failure) => {
                 use crate::runtime::generation::streaming::CommittedGenerationError;
-                let kind = match failure.cause() {
+                let (kind,operation) = match failure.cause() {
                     CommittedGenerationError::Source(
-                        ControlledTextGenerationError::Preparation(error),
-                    ) => error.kind(),
-                    _ => BackendFailureKind::Other,
+                        ControlledTextGenerationError::Preparation(error)|ControlledTextGenerationError::Backend(error),
+                    ) => (error.kind(),error.operation()),
+                    _ => (BackendFailureKind::Other,"plain text advancement"),
                 };
                 drop(source);
-                Err(failure.into_backend_failure(kind))
+                Err(ManagedPlainTextError::from_step(failure.into_backend_failure(kind).with_operation(operation), input_custody))
             }
         }
     }
@@ -164,6 +177,7 @@ impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
             source,
             active: _,
             cursor,
+            input_custody: _,
         } = self;
         let timing = GenerationTiming::new(source.time_to_first_token);
         drop(source);
@@ -175,7 +189,7 @@ impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
         mut self,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
-    ) -> Result<GenerationPlainTextOutput, BackendFailure> {
+    ) -> Result<GenerationPlainTextOutput, ManagedPlainTextError> {
         while self.finish_reason().is_none() {
             self = self.advance(cancellation, emit)?;
         }
@@ -183,36 +197,6 @@ impl<'a, B: TextGenerationBackend> OriginalPlainSession<'a, B> {
             .into_output()
             .unwrap_or_else(|_| unreachable!("same terminal cursor")))
     }
-}
-
-/// Borrows caller text, constructs actual per-request S/E once, and hands E's
-/// immutable IDs to the existing genuine I claim. No legacy HF/env is required.
-/// None is pre-start cancellation, before any source compiler or backend callback.
-pub(crate) fn start_original_plain_string<'a, B>(
-    runtime: &'a mut ModelRuntime<B>,
-    source: &OriginalTokenizer,
-    input: &str,
-    config: TextGenerationConfig,
-    eos: &[u32],
-    stops: &[&str],
-    add_special_tokens: bool,
-    skip_special_tokens: bool,
-    cancellation: &GenerationCancellationToken,
-) -> Result<Option<OriginalPlainSession<'a, B>>, OriginalPlainStartError<B::Error>>
-where
-    B: OriginalTokenizerBackend,
-{
-    start_original_plain_string_for::<B, OriginalPlainStartError<B::Error>>(
-        runtime,
-        source,
-        input,
-        config,
-        eos,
-        stops,
-        add_special_tokens,
-        skip_special_tokens,
-        cancellation,
-    )
 }
 
 // Prepared input is lent by its owning public request until the core consumes it.
@@ -224,45 +208,19 @@ enum PlainInput<'a, B: TextGenerationBackend> {
 type StartupControls<'a, B: TextGenerationBackend, E> = (
     E, Option<TextPreparationOptions>, PlainInput<'a, B>,
     Option<eredu_runtime::working_memory::OriginalEncodedTokenIds>,
+    ManagedPlainTextError,
+    Result<OriginalPlainSession<'a, B>, ManagedPlainTextError>,
 );
 
 /// Concrete fixed consumer envelope shared by plain/chat construction. Lifetimes
 /// remain ordinary borrows; this descriptor confers no source/account authority.
 pub(super) fn plain_consumer_layout<B: TextGenerationBackend, E>()
 -> Option<GenerationSequenceConsumerLayout> {
-    PlainCursor::<B>::terminal_layout::<
+    PlainCursor::terminal_layout::<
         PlainSource<'_, B>,
         OriginalPlainSession<'_, B>,
         StartupControls<'_, B, E>,
     >()
-}
-
-pub(in crate::api::portable) fn start_original_plain_string_for<'a, B, E>(
-    runtime: &'a mut ModelRuntime<B>,
-    source: &OriginalTokenizer,
-    input: &str,
-    config: TextGenerationConfig,
-    eos: &[u32],
-    stops: &[&str],
-    add_special_tokens: bool,
-    skip_special_tokens: bool,
-    cancellation: &GenerationCancellationToken,
-) -> Result<Option<OriginalPlainSession<'a, B>>, OriginalPlainStartError<B::Error>>
-where
-    B: OriginalTokenizerBackend,
-{
-    start_original_plain_string_with_options_for::<B, E>(
-        runtime,
-        source,
-        input,
-        config,
-        eos,
-        stops,
-        add_special_tokens,
-        skip_special_tokens,
-        cancellation,
-        None,
-    )
 }
 
 /// Same original startup, consuming the exact immutable source options through
@@ -395,13 +353,14 @@ where B: OriginalTokenizerBackend,
     let sequence = generator
         .take_prepared_sequence()
         .expect("genuine original I/R path");
-    let cursor = PlainCursor::<B>::from_terminal_sequence::<
+    let cursor = PlainCursor::from_terminal_sequence::<
         PlainSource<'_, B>,
         OriginalPlainSession<'_, B>,
         StartupControls<'_, B, E>,
     >(sequence)
     .unwrap_or_else(|_| unreachable!("core checked this concrete consumer"));
     Ok(Some(OriginalPlainSession {
+        input_custody: None,
         source: BackendGenerationTokenSource {
             generator,
             on_token: None,

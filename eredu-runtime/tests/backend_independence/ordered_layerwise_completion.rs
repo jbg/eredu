@@ -158,6 +158,7 @@ fn units() -> Vec<FakeUnit> {
 }
 fn architecture() -> GroupedFixture {
     GroupedFixture {
+            graph: grouped_graph(),
         static_modules: FakeOperator,
         trace: Vec::new(),
     }

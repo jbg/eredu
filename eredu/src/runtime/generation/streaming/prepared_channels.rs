@@ -1,7 +1,7 @@
 //! Facade declaration projection; runtime owns the paid mutable channel worker.
 use crate::runtime::chat::{SemanticRuntimePlan, dialect};
 use eredu_core::{HostPreparationAuthority, SpeculativeBuffer, generation::SemanticEvent};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{
     OriginalForbiddenSource, OriginalSemanticControllerSource, OriginalSemanticChannelParser, OriginalSemanticChannelParserError,
     OriginalSemanticChannelSource, OriginalSemanticChannelSourceError, OriginalTokenizer,
@@ -18,7 +18,7 @@ enum Cause {
     #[error(transparent)]
     Parser(#[from] OriginalSemanticChannelParserError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Buffer(#[from] eredu_core::SpeculativeBufferAllocationError),
     #[error("prepared semantic declaration extent overflow")]
@@ -31,7 +31,7 @@ enum Cause {
 pub(crate) struct Failure {
     #[source]
     cause: Cause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Borrow the actual recipe under paid reference storage, then copy into the
 /// existing original source compiler. No ordinary parser or tool map is built.
@@ -39,7 +39,7 @@ pub(crate) fn compile_source(
     plan: &SemanticRuntimePlan,
     tokenizer: &OriginalTokenizer,
     source: &OriginalForbiddenSource,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<OriginalSemanticChannelSource, Failure> {
     compile_source_for_controller(plan, tokenizer, OriginalSemanticControllerSource::Forbidden(source), funding)
 }
@@ -48,7 +48,7 @@ pub(crate) fn compile_source_for_controller(
     plan: &SemanticRuntimePlan,
     tokenizer: &OriginalTokenizer,
     source: OriginalSemanticControllerSource<'_>,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<OriginalSemanticChannelSource, Failure> {
     let retain = |cause| Failure {
         cause,
@@ -63,7 +63,7 @@ pub(crate) fn compile_source_for_controller(
                 &SemanticRuntimePlan,
                 &OriginalTokenizer,
                 OriginalSemanticControllerSource<'_>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<Result<OriginalSemanticChannelSource, Failure>>(),
             size_of::<Result<OriginalSemanticChannelSource, OriginalSemanticChannelSourceError>>(),
@@ -82,7 +82,7 @@ pub(crate) fn compile_source_for_controller(
             size_of::<Result<PreparedChannelParser, Failure>>(),
             SpeculativeBuffer::<(u32, &str, bool)>::retained_control_bytes(count)
                 .ok_or(Cause::Overflow)?,
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                 .ok_or(Cause::Overflow)?,
         ];
         funding.reserve_metadata(
@@ -101,14 +101,14 @@ pub(crate) fn compile_source_for_controller(
         )?;
         rows.try_extend(plan.original_structural_tokens())
             .map_err(|_| Cause::Population)?;
-        let validation = if matches!(source, OriginalSemanticControllerSource::Grammar(_)) && dialect::channels::json_tools(spec).is_some() {
+        let validation = if matches!(source, OriginalSemanticControllerSource::Grammar(_)) && dialect::channels::tools(spec).is_some() {
             plan.original_tool_validation(funding)?
         } else { None };
         Ok(tokenizer.compile_semantic_channel_source_with_validation(
             source,
             dialect::channels::program(spec),
             &rows,
-            dialect::channels::json_tools(spec),
+            dialect::channels::tools(spec),
             validation,
         )?)
     })();
@@ -116,7 +116,7 @@ pub(crate) fn compile_source_for_controller(
 }
 pub(crate) struct PreparedChannelParser {
     inner: OriginalSemanticChannelParser,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedChannelParser {
     pub(crate) fn prepare(
@@ -124,7 +124,7 @@ impl PreparedChannelParser {
         tokenizer: &OriginalTokenizer,
         source: &OriginalForbiddenSource,
         input_bytes: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Failure> {
         let source = compile_source(plan, tokenizer, source, funding)?;
         let inner = OriginalSemanticChannelParser::prepare(&source, input_bytes, funding).map_err(
@@ -153,7 +153,7 @@ impl PreparedChannelParser {
     pub(crate) fn cancel(&mut self) {
         self.inner.cancel();
     }
-    pub(crate) fn copy(&self, funding: &WorkspaceMetadataFunding) -> Result<Self, Failure> {
+    pub(crate) fn copy(&self, funding: &HostMetadataFunding) -> Result<Self, Failure> {
         funding
             .reserve_metadata(size_of::<Self>() + size_of::<Result<Self, Failure>>())
             .map_err(|cause| Failure {

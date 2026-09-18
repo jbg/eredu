@@ -127,11 +127,17 @@ pub(super) fn compare(
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_intervention_preview_matches_each_host_boundary_and_replay() {
-    compare_modes(Evidence::Preview, "managed_plain::speculative::interventions::evidence::native_original_intervention_preview_matches_each_host_boundary_and_replay");
+    compare_modes(
+        Evidence::Preview,
+        "managed_plain::speculative::interventions::evidence::native_original_intervention_preview_matches_each_host_boundary_and_replay",
+    );
 }
 
 #[test]
 #[ignore = "requires an accessible Metal device"]
 fn native_original_intervention_summary_matches_each_host_boundary_and_replay() {
-    compare_modes(Evidence::Summary, "managed_plain::speculative::interventions::evidence::native_original_intervention_summary_matches_each_host_boundary_and_replay");
+    compare_modes(
+        Evidence::Summary,
+        "managed_plain::speculative::interventions::evidence::native_original_intervention_summary_matches_each_host_boundary_and_replay",
+    );
 }

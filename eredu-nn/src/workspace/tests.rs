@@ -8,8 +8,10 @@ mod domains;
 mod grouped;
 mod hyper;
 mod output_alias;
+mod zeros_like;
 mod parallel;
 mod storage;
+mod masked_scatter;
 
 /// Deliberately simple mechanism with exact documented allocation behavior.
 /// These facts are for the test mechanism, never substituted for native facts.
@@ -40,7 +42,7 @@ impl WorkspaceMechanisms for AllocatingMechanism {
     ) -> Result<Option<WorkspaceOperationBound>, Error> {
         let aliases = matches!(
             operation.kind,
-            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. }
+            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
         );
         Ok(Some(WorkspaceOperationBound {
             outputs: operation
@@ -674,4 +676,61 @@ fn prepared_parameter_representations_extend_static_source_before_construction_o
     assert!(context.extend_parameter_representations(vec![row("late",&[2,3],WorkspaceFloatingType::Float32)]).is_err());
     context.begin_span();
     assert!(context.extend_parameter_representations(Vec::new()).is_err());
+}
+
+#[test]
+fn layer_norm_trace_keeps_exact_optional_affine_roles() {
+    for weight in [false, true] {
+        for bias in [false, true] {
+            let context = context();
+            let input = existing_f32(&[2, 8], &context).unwrap();
+            let scale = existing_f32(&[8], &context).unwrap();
+            let offset = existing_f32(&[8], &context).unwrap();
+            let output = WorkspaceTensor::layer_norm(
+                &input, weight.then_some(&scale), bias.then_some(&offset), 1e-6, &context,
+            ).unwrap();
+            let report = context.report(&[output]).unwrap();
+            assert_eq!(report.operations.len(), 1);
+            let operation = &report.operations[0];
+            assert!(matches!(operation.kind,
+                WorkspaceOperationKind::LayerNorm { weight: actual_weight, bias: actual_bias }
+                if actual_weight == weight && actual_bias == bias));
+            assert_eq!(operation.inputs.len(), 1 + usize::from(weight) + usize::from(bias));
+            assert_eq!(operation.outputs[0].shape(), [2, 8]);
+            assert!(matches!(operation.as_view().kind,
+                WorkspaceOperationKindView::LayerNorm { weight: actual_weight, bias: actual_bias }
+                if actual_weight == weight && actual_bias == bias));
+        }
+    }
+}
+
+#[test]
+fn pure_range_index_retains_normalized_coordinates_without_removing_axes() {
+    let context = context();
+    let input = existing_f32(&[2, 3, 7, 4], &context).unwrap();
+    let selected = input.index(&[Index::Full, Index::Range(1, 3), Index::Range(-5, -1)], &context).unwrap();
+    assert_eq!(selected.shape(), [2, 2, 4, 4]);
+    let empty = input.index(&[Index::Range(2, 2)], &context).unwrap();
+    assert_eq!(empty.shape(), [0, 3, 7, 4]);
+    let removed = input.index(&[Index::Full, Index::At(-1), Index::Range(2, 6)], &context).unwrap();
+    assert_eq!(removed.shape(), [2, 4, 4]);
+    let report = context.report(&[selected, empty, removed]).unwrap();
+    for (operation, starts, ends) in [
+        (&report.operations[0], [0, 1, 2, 0], [2, 3, 6, 4]),
+        (&report.operations[1], [2, 0, 0, 0], [2, 3, 7, 4]),
+    ] {
+        let WorkspaceOperationKind::StaticSlice { starts: actual_start, ends: actual_end, strides } = &operation.kind else {
+            panic!("pure ranges must retain their actual rectangle");
+        };
+        assert_eq!(actual_start, &starts); assert_eq!(actual_end, &ends);
+        assert_eq!(strides, &[1, 1, 1, 1]);
+    }
+    assert!(matches!(report.operations[2].kind, WorkspaceOperationKind::Index { selected_axes: 1 }));
+    assert_eq!(report.tensor_buffers.total_bytes, Some(0));
+    context.begin_span();
+    for indexes in [vec![Index::Range(1, 0)], vec![Index::Range(-3, 2)], vec![Index::Range(0, 3)],
+        vec![Index::Full; 5]] {
+        assert!(input.index(&indexes, &context).is_err());
+    }
+    assert!(context.report(&[]).unwrap().operations.is_empty());
 }

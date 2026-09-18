@@ -31,6 +31,22 @@ struct EquationMechanism {
     omit_attention: bool,
 }
 impl WorkspaceMechanisms for EquationMechanism {
+    fn output_representation(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<WorkspaceRepresentation> {
+        // This independent fixture selects F32 storage for every floating
+        // result. Metadata views alias it and need not be row-contiguous.
+        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32).then_some(
+            WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,
+                !matches!(operation.kind, WorkspaceOperationKindView::View(_)
+                    | WorkspaceOperationKindView::Transpose(_)
+                    | WorkspaceOperationKindView::Index { .. }
+                    | WorkspaceOperationKindView::StaticSlice { .. })),
+        )
+    }
+
     fn host_workspace_bound(
         &self,
         _: &WorkspaceOperation,
@@ -50,7 +66,7 @@ impl WorkspaceMechanisms for EquationMechanism {
         }
         let aliases = matches!(
             op.kind,
-            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. }
+            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
         );
         let scratch_bytes = if matches!(op.kind, WorkspaceOperationKind::Attention { .. }) {
             let q = op.inputs[0].shape();

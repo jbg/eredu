@@ -6,8 +6,8 @@ use eredu_runtime::parameter_operations::{PreparedParameterLocation, PreparedPar
 
 struct Metadata(Vec<ParameterMetadata>);
 impl<'a> ParameterVisitor<'a, MlxTensor> for Metadata {
-    fn visit(&mut self, metadata: ParameterMetadata, _value: &'a MlxTensor) {
-        self.0.push(metadata);
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, _value: &'a MlxTensor) {
+        self.0.push(metadata.to_owned());
     }
 }
 
@@ -20,7 +20,7 @@ pub(in crate::composition::mlx::replicated_text) fn collect_module<M: Parameteri
     declarations: &mut Vec<ParameterMetadata>,
 ) -> Result<(), Error> {
     let mut metadata = Metadata(Vec::new());
-    module.visit_parameters(&mut metadata);
+    module.visit_parameters(&mut metadata)?;
     for parameter in metadata.0 {
         declarations.push(parameter.clone());
         let Some(binding) = bindings.iter().find(|binding| {

@@ -122,11 +122,14 @@ fn verify(device: LocalDevice) {
             let generation = loaded.speculative_generation_options().unwrap().unwrap();
             let (mut model, _) = loaded.into_parts();
             let chat = model
-                .prepare_chat(ChatTemplateRequest {
-                    messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
-                    add_generation_prompt: true,
-                    ..Default::default()
-                })
+                .source_chat_with_capacity(
+                    ChatTemplateRequest {
+                        messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
+                        add_generation_prompt: true,
+                        ..Default::default()
+                    },
+                    ORIGINAL_CAPACITY,
+                )
                 .unwrap();
             let settings = PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -139,10 +142,13 @@ fn verify(device: LocalDevice) {
             // Retain completed pools and partial windows at the saved frontier;
             // subsequent decode completes both ratio-4 and ratio-128 windows.
             let prefix: Vec<u32> = (0..255).map(|i| 1 + i % 15).collect();
-            let request = || PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, prefix.clone()),
+            let request = || PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&prefix),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings,
+                settings: chat_settings(&chat, settings),
                 options: generation.clone(),
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -187,7 +193,7 @@ fn verify(device: LocalDevice) {
             };
             let mut baseline_captures = Vec::new();
             let baseline = model
-                .generate_observed_text_speculative(request(), options.clone(), |step| {
+                .generate_observed_prepared_chat_speculative(request(), options.clone(), |step| {
                     baseline_captures.extend(step.captures.iter().cloned());
                     ControlFlow::Continue(())
                 })
@@ -200,10 +206,11 @@ fn verify(device: LocalDevice) {
                     .any(|record| {
                         matches!(&record.payload, Some(CapturePayload::Candidates(values))
                     if values.candidates.iter().any(|c| c.score != 0.0))
-                }));
+                    })
+            );
             let mut observed = Vec::new();
             let output = model
-                .with_controlled_text_speculative(request(), options, |session| {
+                .with_controlled_prepared_chat_speculative(request(), options, |session| {
                     observed.extend(session.step()?.unwrap().captures.iter().cloned());
                     assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                     let saved = session.snapshot()?;
@@ -284,7 +291,7 @@ fn verify(device: LocalDevice) {
             // A known complete estimate must fail the explicit copy budget
             // before retention; the run remains usable after this rejection.
             let rejected = model
-                .with_controlled_text_speculative(request(), tiny, |session| {
+                .with_controlled_prepared_chat_speculative(request(), tiny, |session| {
                     session.step()?;
                     let before = session.snapshot_usage();
                     let error = session

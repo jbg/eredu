@@ -2,14 +2,16 @@
 use super::{
     ErasedSharedStorageOwner, SharedStorageAttachmentError, SharedStorageCustody,
     SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
+    HostPreparationAuthority,
 };
 use std::{fmt, sync::Arc};
 
 /// Trusted immutable declaration producer used by neutral composition.
 ///
 /// Implementations must own all reported allocations independently: no mutable
-/// execution state, ordinary compiler/factory aliases, account ownership, or
-/// hidden independently escaping numerical payload. The capacity is the exact
+/// execution state, ordinary compiler/factory aliases, or hidden independently
+/// escaping numerical payload. Retained constructor funding may outlive the
+/// declaration; it must not retain an attachment back to this same source. The capacity is the exact
 /// completed allocation population from the producer's checked constructor,
 /// including spare capacity, and must remain fixed for this owner's lifetime.
 /// Constructor scratch and fixed call frames are excluded. Reporting bytes
@@ -22,6 +24,7 @@ pub trait ControllerDeclarationData: Send + Sync + 'static {
 struct Inner<T> {
     value: T,
     custody: SharedStorageCustody,
+    authority: HostPreparationAuthority,
 }
 impl<T: ControllerDeclarationData> SharedStorageRetirement for Inner<T> {
     fn retire(self: Arc<Self>) {
@@ -43,6 +46,12 @@ fn capacity<T: ControllerDeclarationData>(owner: &ErasedSharedStorageOwner) -> O
         .value
         .owned_capacity_bytes()
 }
+fn retains_funding<T: ControllerDeclarationData>(
+    owner: &ErasedSharedStorageOwner, funding: &super::super::HostMetadataFunding,
+) -> bool {
+    owner.downcast_ref::<Inner<T>>().expect("closed declaration type")
+        .authority.is_funded_by(funding)
+}
 /// Shared immutable declaration data with exact identity and attached storage
 /// accounting. Payload destruction precedes custody on every typed/erased exit.
 /// No mutable, raw-Arc, Weak or consuming payload export exists.
@@ -51,6 +60,7 @@ pub struct SharedControllerDeclaration {
     owner: ErasedSharedStorageOwner,
     custody: fn(&ErasedSharedStorageOwner) -> &SharedStorageCustody,
     capacity: fn(&ErasedSharedStorageOwner) -> Option<u64>,
+    retains_funding: fn(&ErasedSharedStorageOwner, &super::super::HostMetadataFunding) -> bool,
 }
 impl SharedControllerDeclaration {
     /// Exact initial declaration-owner and identity allocation requests. The
@@ -60,8 +70,27 @@ impl SharedControllerDeclaration {
         use std::{alloc::Layout, sync::atomic::AtomicUsize};
         let header = Layout::new::<[AtomicUsize; 2]>();
         let owner = header.extend(Layout::new::<Inner<T>>()).ok()?.0.pad_to_align();
-        let identity = header.extend(Layout::new::<()>()).ok()?.0.pad_to_align();
-        owner.size().checked_add(identity.size())
+        owner.size().checked_add(SharedStorageIdentity::source_shell_bytes()?)
+    }
+
+    /// Actual shared shell and named move/erasure/custody constructor controls.
+    /// The declaration producer must pay this before transferring its payload;
+    /// reachable payload allocations and their own inspection remain separate.
+    pub fn source_constructor_bytes<T: ControllerDeclarationData>() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let parts = [
+            Self::source_shell_bytes::<T>()?,
+            size_of::<T>(),
+            size_of::<Inner<T>>(),
+            size_of::<Arc<Inner<T>>>(),
+            size_of::<SharedStorageOwner<Inner<T>>>(),
+            size_of::<ErasedSharedStorageOwner>(),
+            size_of::<SharedStorageCustody>(),
+            size_of::<SharedStorageIdentity>(),
+            size_of::<HostPreparationAuthority>(),
+            size_of::<Self>(),
+        ];
+        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Fixed borrowed type/identity/capacity inspection transports. This query
@@ -83,18 +112,22 @@ impl SharedControllerDeclaration {
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
     }
-    /// Transfers an independently constructed declaration without cloning it.
+    /// Transfers an independently constructed declaration and its original
+    /// construction authority without cloning the payload. The authority retires
+    /// after the shared allocation, declaration and accounting custody.
     /// Callers must establish their applicable constructor permission first;
     /// this constructor neither adopts managed work nor certifies its producer.
-    pub fn new<T: ControllerDeclarationData>(value: T) -> Self {
+    pub fn new<T: ControllerDeclarationData>(value: T, authority: HostPreparationAuthority) -> Self {
         Self {
             owner: SharedStorageOwner::new(Inner {
                 value,
                 custody: SharedStorageCustody::new(),
+                authority,
             })
             .erase(),
             custody: custody::<T>,
             capacity: capacity::<T>,
+            retains_funding: retains_funding::<T>,
         }
     }
     /// Borrows the original concrete declaration with no owning or mutable escape.
@@ -114,6 +147,11 @@ impl SharedControllerDeclaration {
     /// Whether both handles retain the same declaration allocation owner.
     pub fn same_storage(&self, other: &Self) -> bool {
         self.identity() == other.identity()
+    }
+    /// Checks that this exact metadata account survives every declaration alias.
+    /// Custody alone neither certifies the producer nor grants a storage bound.
+    pub fn retains_funding(&self, funding: &super::super::HostMetadataFunding) -> bool {
+        (self.retains_funding)(&self.owner, funding)
     }
     pub(super) fn has_accounting_custody(&self, domain: &SharedStorageDomain)
         -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {

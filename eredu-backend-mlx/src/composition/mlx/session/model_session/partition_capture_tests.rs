@@ -209,7 +209,7 @@ fn verify_native_partition_components(
         }
         .unwrap();
         let count = plan.points().len();
-        let mut capture = Some(CaptureSession::new(plan));
+        let mut capture = Some(CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan)));
         let identity = PartitionCaptureIdentity::for_session(
             discovery.artifact_identity,
             session
@@ -412,9 +412,9 @@ fn verify_native_partition_components(
                     let result = collector.take_activation_capture().unwrap();
                     assert!(result.completed);
                     assert_eq!(result.invocation, step_index);
-                    result.captures.into_legacy().unwrap()
+                    result.captures.as_step().clone()
                 }
-                None => capture.as_mut().unwrap().take_step().unwrap(),
+                None => capture.as_mut().unwrap().take_shared_step().map(|frame| frame.as_step().clone()).unwrap(),
             };
             assert_eq!(step.prediction_index, prediction);
             assert_eq!(step.invocation, invocation);

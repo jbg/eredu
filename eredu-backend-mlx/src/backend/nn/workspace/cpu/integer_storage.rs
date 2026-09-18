@@ -1,7 +1,6 @@
-//! Existing CPU aliases and scalar row overwrite used by packed I32 status.
-//! Integer layouts deliberately carry no floating representation. Singleton
-//! reshape needs no stride inference; Slice authenticates its actual input
-//! span, and SliceUpdate authenticates both complete rows before dispatch.
+//! Scalar row overwrite used by packed I32 status. Structural views and
+//! StaticSlice use their shared typed producers; SliceUpdate authenticates
+//! both complete rows before dispatch without floating representation.
 use super::*;
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
@@ -12,29 +11,6 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     }
     let mut population=CpuPopulation::default();
     let (rank,alias,shells,bytes)=match operation.kind {
-        WorkspaceOperationKindView::View("reshape")=>{
-            let Some([input])=operation.inputs.array() else{return Ok(None)};
-            let rank=input.shape().len();let output_rank=output.shape().len();
-            if rank>4||output_rank>4||input.elements()?!=1||output.elements()?!=1{return Ok(None);}
-            let Some(native)=OperationEvent::cpu_reshape_alias_layout(rank,output_rank,false)else{return Ok(None)};
-            if native.backing_births()!=0||population.copy(native,1).is_none(){return Ok(None);}
-            (rank.max(output_rank),Some(0),0,0)
-        }
-        WorkspaceOperationKindView::StaticSlice{..}=>{
-            if !super::super::basic::is_static_slice(operation){return Ok(None);}
-            let input=operation.inputs.get(0).expect("qualified static source");
-            let rank=input.shape().len();
-            if !(1..=4).contains(&rank)||output.elements()?!=1
-                ||input.shape().iter().any(|&n|n<=0)||input.elements()?>i32::MAX as u64{return Ok(None);}
-            let whole=input.shape()==output.shape();
-            if !whole {
-                let Some(native)=OperationEvent::cpu_slice_layout(rank,false)else{return Ok(None)};
-                if native.backing_births()!=0||population.copy(native,1).is_none(){return Ok(None);}
-            }
-            population.controls=population.controls.checked_add(crate::tensor::narrow::control_bytes(rank)
-                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
-            (rank,Some(0),usize::from(whole),0)
-        }
         WorkspaceOperationKindView::StaticSliceUpdate{starts,ends,strides}=>{
             let Some([input,update])=operation.inputs.array()else{return Ok(None)};
             // This ordinary status worker writes one scalar into a column.

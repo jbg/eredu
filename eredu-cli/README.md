@@ -65,8 +65,8 @@ thinking control.
 Use `--timing` for concise performance statistics, `--verbose` for execution
 details, and `--telemetry-json PATH` for a versioned machine-readable report.
 Unrecognized templates use literal text generation with TTFT and supported
-speculative drafting. They retain EOS and caller stop sequences; native tools
-and parsed reasoning still require a recognized protocol.
+speculative drafting and EOS stopping. The `--stop` flag requires `--tools`;
+native tools and parsed reasoning require a recognized protocol.
 
 ## Automatic planning
 
@@ -104,6 +104,13 @@ Supported mixture-of-experts models can use an independent expert cache. These
 policies accept explicit host and device budgets and trade transfer or I/O work
 for a smaller resident parameter set.
 
+`--managed-memory-capacity-bytes` sets the generation working-memory capacity
+(default: 1 GiB). The same capacity applies to chat preparation and execution,
+including raw text and speculative generation; it is separate from weight
+residency budgets. Tokenizer and template sources use the loaded model's
+retained configuration, including GGUF metadata and explicit overrides.
+Capacity refusals are reported as errors rather than retrying without a bound.
+
 See [Model loading, quantization, and memory](https://github.com/jbg/eredu/blob/main/doc/model-loading.md) for
 the policy contracts and accounting model.
 
@@ -119,8 +126,8 @@ eredu --model /path/to/target \
   "Explain speculative decoding."
 ```
 
-Speculative generation requires a recognized executable chat protocol and is
-not available with `--raw`. See [Speculative decoding and
+Speculative generation uses a prepared chat template and is not available with
+`--raw`. Unrecognized templates retain the literal-output support described above. See [Speculative decoding and
 MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md) for
 compatibility and placement rules.
 

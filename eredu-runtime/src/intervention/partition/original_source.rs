@@ -1,16 +1,18 @@
 //! Actual original operation and paid local geometry, without native authority.
 use super::*;
 use crate::working_memory::OriginalInterventionSource;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
+    #[error("{0}")]
+    Coordinates(#[from] eredu_core::component::ComponentCoordinateConstructionError),
+
     #[error(transparent)] Geometry(#[from] CaptureError),
     #[error(transparent)] SourceGeometry(#[from] eredu_core::intervention::InterventionGeometryError),
     #[error(transparent)] Projection(#[from] CaptureContiguousProjectionError),
-    #[error(transparent)] Coordinates(#[from] eredu_core::component::ComponentCoordinateCopyError),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Metadata(#[from] eredu_nn::Error),
     #[error(transparent)] Payload(#[from] PreparedWindowInterventionPayloadError),
 }
@@ -20,7 +22,7 @@ enum Cause {
 pub struct PartitionInterventionProjectionSourceError {
     #[source] cause: Cause,
     _source: OriginalInterventionSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 #[derive(Debug)]
 enum Geometry {
@@ -67,7 +69,7 @@ pub struct PreparedPartitionInterventionProjection {
     updates: Vec<Update>,
     clear: Option<InterventionAction>,
     source: OriginalInterventionSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedPartitionInterventionProjection {
     /// Construct from the retained architecture axis/map and original schedule.
@@ -75,7 +77,7 @@ impl PreparedPartitionInterventionProjection {
     pub fn prepare(source: &OriginalInterventionSource, operation: usize, phase: CapturePhase,
         prediction: u64, invocation: Option<CaptureInvocationShape>, global: &[u64], axis: usize,
         coordinates: &ComponentCoordinateMap, sum_offset_owner: Option<bool>, maximum_regions: usize,
-        funding: WorkspaceMetadataFunding) -> Result<Self, PartitionInterventionProjectionSourceError> {
+        funding: HostMetadataFunding) -> Result<Self, PartitionInterventionProjectionSourceError> {
         let result: Result<Self, Cause> = (|| {
             funding.reserve_metadata(Self::control_bytes().ok_or(CaptureError::Overflow)?)?;
             let plan = source.plan().admission();
@@ -96,11 +98,7 @@ impl PreparedPartitionInterventionProjection {
             let global = copy(global, &funding)?;
             let mut local = copy(&global, &funding)?;
             local[axis] = coordinates.local_count() as u64;
-            let count = coordinates.copy_storage_elements();
-            let indices = funding.metadata_vec(count)?;
-            let inverse = funding.metadata_vec(count)?;
-            funding.reserve_metadata(ComponentCoordinateMap::copy_control_bytes().ok_or(CaptureError::Overflow)?)?;
-            let coordinates = coordinates.copy_with_storage(indices, inverse)?;
+            let coordinates = coordinates.try_clone_with_funding(&funding)?;
             let geometry = if sum_offset_owner == Some(false) && matches!(action, InterventionAction::Add { .. }) {
                 Geometry::Empty
             } else if local_columns {
@@ -192,11 +190,11 @@ impl PreparedPartitionInterventionProjection {
     /// or the existing checked coordinate projection constructor source.
     pub fn control_bytes() -> Option<usize> {
         let frames = [size_of::<Self>(), size_of::<Cause>(), size_of::<PartitionInterventionProjectionSourceError>(),
-            size_of::<OriginalInterventionSource>(), size_of::<WorkspaceMetadataFunding>(), size_of::<Geometry>(),
+            size_of::<OriginalInterventionSource>(), size_of::<HostMetadataFunding>(), size_of::<Geometry>(),
             size_of::<Update>(), size_of::<ResolvedCaptureSlice>(), size_of::<[Vec<u64>; 6]>(),
             size_of::<Result<Self, Cause>>(), size_of::<Result<Self, PartitionInterventionProjectionSourceError>>(),
             size_of::<(usize, CapturePhase, u64, Option<CaptureInvocationShape>, usize, Option<bool>, usize)>(),
-            size_of::<(&OriginalInterventionSource, &[u64], &ComponentCoordinateMap, &WorkspaceMetadataFunding)>(),
+            size_of::<(&OriginalInterventionSource, &[u64], &ComponentCoordinateMap, &HostMetadataFunding)>(),
             size_of::<Option<InterventionAction>>(), size_of::<Option<PreparedWindowInterventionPayload>>(),
             size_of::<Sha256>(), size_of::<(&Geometry, usize)>(), size_of::<(usize, &[u64], &ComponentCoordinateMap)>(),
             size_of::<Result<Vec<u64>, eredu_nn::Error>>(), size_of::<Result<Vec<Update>, eredu_nn::Error>>(),
@@ -204,15 +202,17 @@ impl PreparedPartitionInterventionProjection {
         frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
 }
-fn copy(values: &[u64], funding: &WorkspaceMetadataFunding) -> Result<Vec<u64>, Cause> {
+fn copy(values: &[u64], funding: &HostMetadataFunding) -> Result<Vec<u64>, Cause> {
     let mut copy = funding.metadata_vec(values.len())?;
     copy.extend_from_slice(values);
     Ok(copy)
 }
-fn slice(rank: usize, funding: &WorkspaceMetadataFunding) -> Result<ResolvedCaptureSlice, Cause> {
-    fn axis(rank: usize, funding: &WorkspaceMetadataFunding) -> Result<Vec<u64>, Cause> {
+fn slice(rank: usize, funding: &HostMetadataFunding) -> Result<ResolvedCaptureSlice, Cause> {
+    fn axis(rank: usize, funding: &HostMetadataFunding) -> Result<Vec<u64>, Cause> {
         let mut values = funding.metadata_vec(rank)?; values.resize(rank, 0); Ok(values)
     }
     Ok(ResolvedCaptureSlice { starts: axis(rank, funding)?, ends: axis(rank, funding)?,
         strides: axis(rank, funding)?, shape: axis(rank, funding)? })
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

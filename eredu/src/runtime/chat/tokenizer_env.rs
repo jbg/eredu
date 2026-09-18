@@ -98,7 +98,7 @@ fn from_prepared_raw_with_info(
         ));
     }
 
-    let mut info = TokRxInfo::new(vocab_size, 0);
+    let mut info = TokRxInfo::new(vocab_size, eos_token_ids.first().copied().unwrap_or(llguidance::toktrie::INVALID_TOKEN));
     let token_bytes = vocabulary_bytes(&tokenizer, &vocabulary, &decoder, &mut info)?;
     if let Some(&primary_eos) = eos_token_ids.first() {
         info.tok_eos = primary_eos;
@@ -191,9 +191,6 @@ impl DecoderKind {
 
     fn token_bytes(&self, token: &str, special: bool) -> Result<Vec<u8>, String> {
         let failure = |cause: eredu_text::token_bytes::TokenByteError| match cause {
-            eredu_text::token_bytes::TokenByteError::Unmapped(character) => {
-                format!("byte-level token {token:?} contains unmapped character {character:?}")
-            }
             eredu_text::token_bytes::TokenByteError::Fallback(Some(error)) => {
                 format!("invalid byte-fallback token {token:?}: {error}")
             }
@@ -225,17 +222,7 @@ fn vocabulary_bytes(
         // it unreachable from a reasoning grammar that names its text spelling.
         // Dialects can still refer to any explicitly structural token by ID.
         if added.special {
-            match added.content.as_str() {
-                "</s>"
-                | "<|endoftext|>"
-                | "<|end_of_text|>"
-                | "<｜end▁of▁sentence｜>"
-                | "<eos>" => info.tok_eos = id,
-                "<|end|>" | "<|eot_id|>" | "<|im_end|>" => info.tok_end_of_turn = Some(id),
-                "<unk>" | "<|unk|>" => info.tok_unk = Some(id),
-                "<pad>" | "<|pad|>" => info.tok_pad = Some(id),
-                _ => {}
-            }
+            apply_special_metadata(info, id, &added.content);
             special_ids.insert(id);
         }
     }
@@ -246,6 +233,19 @@ fn vocabulary_bytes(
     }
 
     Ok(token_bytes)
+}
+
+/// Shared metadata policy for ordinary and retained original tokenizer sources.
+/// EOS is selected only by the exact configured list. Multiple recognized
+/// spellings use the highest canonical ID independently of hash iteration order.
+pub(super) fn apply_special_metadata(info: &mut TokRxInfo, id: TokenId, spelling: &str) {
+    let selected = match spelling {
+        "<|end|>" | "<|eot_id|>" | "<|im_end|>" => &mut info.tok_end_of_turn,
+        "<unk>" | "<|unk|>" => &mut info.tok_unk,
+        "<pad>" | "<|pad|>" => &mut info.tok_pad,
+        _ => return,
+    };
+    *selected = Some(selected.map_or(id, |previous| previous.max(id)));
 }
 
 #[cfg(test)]

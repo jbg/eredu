@@ -1,6 +1,6 @@
 //! One prepaid synchronous root worker shared by prediction and target completion.
 use crate::{MlxTensor, backend::error::Error};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
     OriginalOperationMetadataCustody, OriginalSpeculativeBudgetCustody, WorkingMemoryError,
 };
@@ -25,7 +25,7 @@ pub(crate) struct NestedRootCompletion {
     validations: usize,
     used: bool,
     completed: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl NestedRootCompletion {
     pub(crate) fn control_bytes(roots: usize, validations: usize) -> Option<usize> {
@@ -70,13 +70,13 @@ impl NestedRootCompletion {
         roots: usize,
         validations: usize,
         custody: OriginalSpeculativeBudgetCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::prepare_metadata(roots, validations, custody.into(), funding)
     }
     /// Same paid root destination for a child of an admitted text/control role.
     pub(crate) fn prepare_metadata(roots: usize, validations: usize,
-        custody: OriginalOperationMetadataCustody, funding: &WorkspaceMetadataFunding) -> Result<Self, Error> {
+        custody: OriginalOperationMetadataCustody, funding: &HostMetadataFunding) -> Result<Self, Error> {
         funding
             .reserve_metadata(Self::control_bytes(roots, validations).ok_or_else(|| {
                 Error::from(funding.metadata_source(WorkingMemoryError::Overflow))
@@ -184,3 +184,5 @@ mod projection;
 pub(crate) use projection::{
     NestedCompletionActivation, NestedCompletionOwner, NestedCompletionProjection,
 };
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

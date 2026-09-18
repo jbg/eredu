@@ -9,7 +9,7 @@ pub(crate) struct OriginalCommunicationOwner {
     authority: PartitionCommunicationAuthority,
     source: RetainedCommunicationSource,
     registered_buffers: Option<super::registered_buffers::RegisteredBuffers>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for OriginalCommunicationOwner {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
@@ -28,17 +28,17 @@ impl OriginalCommunicationOwner {
     pub(crate) fn bind(
         actual:&Rc<ParallelCommunicators>, selected:&CommunicationManifest,
         world:&NativeGroup, authority:&PartitionCommunicationAuthority,
-        funding:&WorkspaceMetadataFunding,
+        funding:&HostMetadataFunding,
     )->Result<Self,Error> {
         let controls=[size_of::<Self>(),size_of::<Result<Self,Error>>(),
             size_of::<(&Rc<ParallelCommunicators>,&CommunicationManifest,&NativeGroup,
-                &PartitionCommunicationAuthority,&WorkspaceMetadataFunding)>(),
+                &PartitionCommunicationAuthority,&HostMetadataFunding)>(),
             size_of::<OriginalCommunicationSource<'_>>(),
             size_of::<Result<OriginalCommunicationSource<'_>,Error>>(),
             size_of::<Option<Rc<ParallelCommunicators>>>(),
         ];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         // Share only after the common binder has authenticated every realized
         // group/route, actual native world, selection and live authority.
@@ -50,13 +50,13 @@ impl OriginalCommunicationOwner {
         self.actual.as_deref().expect("live communicator owner")
     }
     pub(crate) fn source(&self)->&RetainedCommunicationSource{&self.source}
-    pub(crate) fn funding(&self)->&WorkspaceMetadataFunding{&self.funding}
+    pub(crate) fn funding(&self)->&HostMetadataFunding{&self.funding}
     pub(crate) fn borrow(&self)->Result<OriginalCommunicationSource<'_>,Error> {self.borrow_funded(&self.funding)}
-    pub(crate) fn borrow_funded(&self,funding:&WorkspaceMetadataFunding)->Result<OriginalCommunicationSource<'_>,Error> {
+    pub(crate) fn borrow_funded(&self,funding:&HostMetadataFunding)->Result<OriginalCommunicationSource<'_>,Error> {
         let controls=[size_of::<&Self>(),size_of::<OriginalCommunicationSource<'_>>(),
             size_of::<Result<OriginalCommunicationSource<'_>,Error>>()];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         // Reuse exact validation, including current availability. Accepted
         // completion retains its own source and does not reenter this method.
@@ -74,7 +74,7 @@ impl OriginalCommunicationOwner {
             size_of::<(&mut Self,&eredu_runtime::working_memory::WorkingMemoryPool)>(),
             size_of::<(RetainedCommunicationSource,super::registered_buffers::RegisteredBuffers)>()];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let (source,proof)=super::registered_buffers::pin(self.actual(),&self.source,
             &self.funding,pool)?;
@@ -92,7 +92,7 @@ impl OriginalCommunicationOwner {
             size_of::<Result<parallel::OriginalParallelSource,Error>>(),
             size_of::<(CollectiveGroupId,&eredu_runtime::working_memory::WorkingMemoryPool)>()];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let owner=self.pin_registered_buffers(pool)?;
         let mut source=owner.borrow()?.prepare_initialized_parallel_source(id,pool)?;
@@ -110,7 +110,7 @@ impl OriginalCommunicationOwner {
             size_of::<(Option<CollectiveGroupId>,CollectiveGroupId,eredu_runtime::PartitionOutputPublication,&eredu_runtime::working_memory::WorkingMemoryPool)>(),
         ];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let self_=self.pin_registered_buffers(pool)?;
         let mut source={self_.borrow()?.prepare_model_parallel_source(tensor,agreement,publication,pool)?};

@@ -16,7 +16,7 @@ fn accepted(
         .into_incremental()
         .with_span_workspace()
         .unwrap();
-    let (_, r, q) = sealed_plan(pool, &q, 1_000_000).unwrap();
+    let (r, q) = sealed_plan(pool, &q, 1_000_000).unwrap();
     let (r, run) = r.into_funding().unwrap();
     (r, run, q)
 }
@@ -190,7 +190,7 @@ fn source_witness_and_compact_receipt_recheck_the_same_explicit_zero_and_nonzero
             let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
             let root = pool.register_storage([(1u32, 64)]).unwrap();
             let source_q = replacement_quote(&pool, geometry(), 0).into_incremental();
-            let (_, source_r, _) = sealed_plan(&pool, &source_q, 1_000_000).unwrap();
+            let (source_r, _) = sealed_plan(&pool, &source_q, 1_000_000).unwrap();
             let (source_r, source_run) = source_r.into_funding().unwrap();
             let source_scope = source_run.scope().unwrap();
             let registered = source_scope
@@ -205,7 +205,7 @@ fn source_witness_and_compact_receipt_recheck_the_same_explicit_zero_and_nonzero
                 .unwrap()
                 .with_span_workspace()
                 .unwrap();
-            let (_, r, q) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
+            let (r, q) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
             drop((initial, registered));
             let (r, run) = r.into_funding().unwrap();
             let plan = q.span_workspace().plan().clone();
@@ -260,7 +260,7 @@ fn unsealed_candidate_rejects_without_attachment_or_losing_diagnostic_aliases() 
     let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
     let root = pool.register_storage([(1u32, 64)]).unwrap();
     let initial = replacement_quote(&pool, geometry(), 0).into_incremental();
-    let (_, r, q) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
+    let (r, q) = sealed_plan(&pool, &initial, 1_000_000).unwrap();
     drop(initial);
     let (r, run) = r.into_funding().unwrap();
     let plan = q.span_workspace().plan().clone();
@@ -298,7 +298,7 @@ fn retained_peak_contains_actual_attachment_compact_owner_and_failure_moves_befo
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, _) = sealed_plan(&pool, &q, exact).unwrap();
+    let (r, _) = sealed_plan(&pool, &q, exact).unwrap();
     assert_eq!(r.bytes(), before + p);
     drop((q, r, root));
     assert_eq!(pool.used_bytes().unwrap(), 0);

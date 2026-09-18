@@ -1,12 +1,19 @@
 use std::path::PathBuf;
 
+use anyhow::{Context, ensure};
+
 use eredu::{
-    api::{default_local_device, local_device_plan, LoadedModel},
+    api::{
+        ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatOutputMode,
+        PreparedChatRequest, TokenizerSourceInput, default_local_device, local_device_plan,
+    },
     runtime::chat::ChatTemplateRequest,
 };
 use eredu_architectures::ModelKind;
-use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
-use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
+use eredu_backend_mlx::{MlxBackendFactory, backend::MlxBackend};
+use eredu_core::{
+    ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides, TextInferencePolicy,
+};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -14,7 +21,7 @@ fn main() -> anyhow::Result<()> {
         .first()
         .map(PathBuf::from)
         .or_else(default_e4b_snapshot)
-        .expect("usage: cargo run -p eredu --example gemma4_generate -- <model-dir> [prompt]");
+        .expect("usage: cargo run -p eredu --example gemma4_generate -- <model-dir> [prompt] [temperature] [capacity-bytes]");
     let prompt = args
         .get(1)
         .cloned()
@@ -24,48 +31,67 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(0.0);
 
+    // Explicit per-request framework storage ceiling; override for longer prompts.
+    let capacity = args
+        .get(3)
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(1024 * 1024 * 1024);
+    ensure!(capacity > 0, "capacity must be positive");
+
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
 
-    let prepared = model.prepare_chat(ChatTemplateRequest {
-        messages: vec![gemma4_message(&prompt, model.model_family())],
-        add_generation_prompt: true,
-        ..ChatTemplateRequest::default()
-    })?;
-    let rendered = prepared.rendered_prompt().to_owned();
-    println!("\n=== prompt ===\n{rendered}\n");
-    println!("temperature: {temp}");
+    let cancellation = GenerationCancellationToken::new();
+    let tokenizer =
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .context("cancelled before template compilation")?;
+    let prepared = model
+        .prepare_chat(
+            &source,
+            &ChatTemplateRequest {
+                messages: vec![gemma4_message(&prompt, model.model_family())],
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+            capacity,
+            &cancellation,
+        )?
+        .context("cancelled before chat preparation")?;
+    println!("\n=== prompt ===\n{}\n", prepared.rendered_prompt());
+    println!("temperature: {temp}; capacity bytes: {capacity}");
 
-    let ids = model.encode(&rendered, false)?;
-    let eos = model.eos_token_ids().to_vec();
-    print_first_token_distribution(&mut model, ids.clone())?;
+    print_first_token_distribution(&mut model, &prepared, capacity, &cancellation)?;
     model.reset()?;
-    let mut output_ids = Vec::new();
-
-    {
-        let resolved = model.resolve_generation_config(GenerationConfigOverrides {
+    let maximum = model
+        .resolve_generation_config(GenerationConfigOverrides {
             temperature: Some(temp),
             ..Default::default()
-        })?;
-        let mut generator =
-            model.generate_tokens(ids, TextGenerationConfig::new(resolved).with_seed(0))?;
-        for _ in 0..120 {
-            let token = match generator.next() {
-                Some(token) => token?.token_id()?,
-                None => break,
-            };
-            let id = token;
-            output_ids.push(id);
-            if eos.contains(&id) {
-                break;
-            }
-        }
-    }
-
-    println!("=== output ids ===\n{output_ids:?}\n");
-    println!("=== output ===\n{}", model.decode(&output_ids, false)?);
+        })?
+        .max_new_tokens
+        .unwrap_or(120)
+        .min(120);
+    let mut request = PreparedChatRequest::new(&prepared, settings(temp, maximum, capacity));
+    request.output_mode = PreparedChatOutputMode::Text;
+    request.skip_special_tokens = false;
+    let output = model
+        .start_prepared_chat(request, &cancellation)?
+        .context("cancelled before generation")?
+        .run(&cancellation, &mut |_| {})?;
+    println!("=== output ids ===\n{:?}\n", output.token_ids);
+    println!(
+        "=== output ===\n{}",
+        model.decode(&output.token_ids, false)?
+    );
     Ok(())
 }
 
@@ -80,24 +106,41 @@ fn gemma4_message(prompt: &str, model_family: ModelKind) -> serde_json::Value {
     }
 }
 
+fn settings(temperature: f32, maximum: usize, capacity: u64) -> PreparedChatGenerationSettings {
+    PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            temperature: Some(temperature),
+            max_new_tokens: Some(maximum),
+            ..Default::default()
+        },
+        inference: TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(capacity),
+            ..Default::default()
+        },
+        seed: 0,
+        ..Default::default()
+    }
+}
+
 fn print_first_token_distribution(
     model: &mut LoadedModel<MlxBackend<'_>>,
-    tokens: Vec<u32>,
+    chat: &eredu::runtime::chat::PreparedChat,
+    capacity: u64,
+    cancellation: &GenerationCancellationToken,
 ) -> anyhow::Result<()> {
-    let resolved = model.resolve_generation_config(GenerationConfigOverrides {
-        temperature: Some(0.0),
-        ..Default::default()
-    })?;
-    let mut generator = model.generate_tokens(tokens, TextGenerationConfig::new(resolved))?;
-    let Some(first) = generator.next() else {
-        return Ok(());
-    };
-    let first_id = first?.token_id()?;
-    drop(generator);
-    println!(
-        "first greedy id: {first_id} {:?}",
-        model.decode(&[first_id], false)?
-    );
+    let mut request = PreparedChatRequest::new(chat, settings(0.0, 1, capacity));
+    request.output_mode = PreparedChatOutputMode::Text;
+    request.skip_special_tokens = false;
+    let output = model
+        .start_prepared_chat(request, cancellation)?
+        .context("cancelled before greedy inspection")?
+        .run(cancellation, &mut |_| {})?;
+    if let Some(&first_id) = output.token_ids.first() {
+        println!(
+            "first greedy id: {first_id} {:?}",
+            model.decode(&[first_id], false)?
+        );
+    }
     Ok(())
 }
 

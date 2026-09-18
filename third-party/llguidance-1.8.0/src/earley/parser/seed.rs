@@ -12,13 +12,12 @@ pub use session::{PreparedTokenParser, PreparedTokenParserError};
 mod speculation;
 mod token;
 mod validate;
-use super::{seed_predictions, CGrammar, GrammarStackNode, Item, LexemeSet, ParamValue, Scratch};
+use super::{seed_predictions, CGrammar, SharedGrammar, GrammarStackNode, Item, LexemeSet, ParamValue, Scratch};
 use std::{
     alloc::Layout,
     collections::TryReserveError,
     fmt,
     mem::{size_of, size_of_val},
-    sync::Arc,
 };
 use toktrie::{
     SimpleVob, TokenMaskConstructionFailure, TokenMaskConstructionPlan, TokenMaskSourceError,
@@ -119,7 +118,7 @@ pub struct PreparedEarleySeed {
     capture_pending: Option<Vec<u8>>,
     captures: Vec<agenda::InitialCapture>,
     agenda_closed: bool,
-    grammar: Arc<CGrammar>,
+    grammar: SharedGrammar,
 }
 impl fmt::Debug for PreparedEarleySeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -132,7 +131,7 @@ impl fmt::Debug for PreparedEarleySeed {
 fn allocation_bytes<T>(total: usize) -> Option<usize> {
     Some(Layout::array::<T>(total).ok()?.size())
 }
-fn reserve<T, F: Fn(usize) -> Result<(), E>, E>(
+fn reserve<T, F: crate::earley::PreparedFunding<Error = E>, E>(
     values: &mut Vec<T>,
     total: usize,
     funding: &F,
@@ -140,7 +139,7 @@ fn reserve<T, F: Fn(usize) -> Result<(), E>, E>(
     if total <= values.capacity() {
         return Ok(());
     }
-    funding(
+    funding.reserve(
         allocation_bytes::<T>(total).ok_or(Cause::Overflow)?,
     )
     .map_err(Cause::Funding)?;
@@ -152,13 +151,13 @@ fn reserve<T, F: Fn(usize) -> Result<(), E>, E>(
     }
     Ok(())
 }
-fn mask<F: Fn(usize) -> Result<(), E>, E>(bits: usize, funding: &F) -> Result<SimpleVob, Cause<E>> {
+fn mask<F: crate::earley::PreparedFunding<Error = E>, E>(bits: usize, funding: &F) -> Result<SimpleVob, Cause<E>> {
     let plan = TokenMaskConstructionPlan::zeroed(bits).map_err(Cause::MaskSource)?;
-    funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+    funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
     plan.compile().map_err(Cause::Mask)
 }
 impl PreparedEarleySeed {
-    fn vacant(grammar: Arc<CGrammar>) -> Self {
+    fn vacant(grammar: SharedGrammar) -> Self {
         Self {
             scratch: None,
             lexemes: None,
@@ -196,7 +195,7 @@ impl PreparedEarleySeed {
             size_of::<Scratch>(),
             size_of::<Cause<E>>(),
             size_of::<PreparedEarleySeedError<E>>(),
-            size_of::<Arc<CGrammar>>(),
+            size_of::<SharedGrammar>(),
             size_of::<F>(),
             size_of::<TokenMaskConstructionPlan<'_>>(),
             size_of::<Result<Self, PreparedEarleySeedError<E>>>(),
@@ -221,13 +220,13 @@ impl PreparedEarleySeed {
     }
     /// Consumes the caller's actual immutable declaration alias, reserves each
     /// destination, then invokes the same Scratch and initial prediction workers.
-    pub fn prepare<F: Fn(usize) -> Result<(), E>, E>(
-        grammar: Arc<CGrammar>,
+    pub fn prepare<F: crate::earley::PreparedFunding<Error = E>, E>(
+        grammar: SharedGrammar,
         funding: &F,
     ) -> Result<Self, PreparedEarleySeedError<E>> {
         let mut owner = Self::vacant(grammar);
         let result = (|| -> Result<(), Cause<E>> {
-            funding(Self::controls::<F, E>().ok_or(Cause::Overflow)?).map_err(Cause::Funding)?;
+            funding.reserve(Self::controls::<F, E>().ok_or(Cause::Overflow)?).map_err(Cause::Funding)?;
             owner.lexemes = Some(LexemeSet::from_owned_vob(mask(
                 owner.grammar.lexer_spec().lexemes.len(),
                 funding,
@@ -237,7 +236,7 @@ impl PreparedEarleySeed {
                 funding,
             )?);
             owner.scratch = Some(Scratch::from_masks(
-                Arc::clone(&owner.grammar),
+                owner.grammar.clone(),
                 owner.lexemes.take().expect("lexemes"),
                 owner.grammars.take().expect("grammars"),
             ));
@@ -273,4 +272,8 @@ impl PreparedEarleySeed {
     pub fn grammar(&self) -> &CGrammar {
         &self.grammar
     }
+}
+
+impl<E> Cause<E> {
+ fn frame(error: crate::earley::FrameError<E>) -> Self { match error { crate::earley::FrameError::Overflow => Self::Overflow, crate::earley::FrameError::Funding(error) => Self::Funding(error) } }
 }

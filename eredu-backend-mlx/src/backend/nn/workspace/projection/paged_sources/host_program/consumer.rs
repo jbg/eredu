@@ -221,6 +221,8 @@ impl PreparedPagedHostProgram {
             size_of::<Result<(usize, bool), CacheSourceError>>(),
             size_of::<(usize, bool)>(),
             size_of::<std::slice::Iter<'_, StoreSlot>>(),
+        size_of::<std::slice::IterMut<'_, StoreSlot>>(),
+        size_of::<std::slice::IterMut<'_, LoadSlot>>(),
             size_of::<std::slice::Iter<'_, LoadSlot>>(),
             size_of::<std::slice::Iter<'_, ProjectedPagedSource>>(),
             size_of::<std::slice::Iter<'_, super::super::scan_program::ScanSourceRow>>(),
@@ -324,6 +326,14 @@ impl PreparedPagedHostProgram {
         stream: &Stream,
     ) -> Result<(), Exception> {
         loop {
+            // A previous completed demotion may have retained an escaped numerical
+            // alias until this boundary. Drain only these exact native-dead owners.
+            for store in &mut self.stores {
+                if let Some(mover) = &mut store.mover { mover.reclaim_replaced_device(); }
+            }
+            for load in &mut self.loads {
+                if let Some(promotion) = &mut load.promotion { promotion.reclaim_replaced_device(); }
+            }
             let Some(id) = proof.manager().original_host_victim(
                 proof,
                 required,
@@ -445,6 +455,9 @@ impl PreparedPagedHostProgram {
                     .as_mut()
                     .ok_or_else(|| victim.error(CacheSourceError::Identity))?
                     .run(&eviction, stream)?;
+                // The completed Host source replaces this initial Device read.
+                // Any escaped native alias keeps the backing-attached reservation.
+                store.pair.arrays = [None, None];
             }
             self.make_disk_room(bank, &victim, ordinal, required, 0, true)?;
         }
@@ -586,6 +599,7 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<HostCheckout<'_>>(),
         size_of::<HostRead>(),
         size_of::<Option<HostRead>>(),
+        size_of::<[Option<Array>; 2]>(),
         size_of::<OriginalPagedScanSource<'_>>(),
         size_of::<OriginalPagedHostEviction<'_, '_>>(),
         size_of::<(

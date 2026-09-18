@@ -21,6 +21,8 @@ mod implementation {
     };
 
     pub(crate) type Family = PreparedMetalKernelFamily<SharedNativeInitializationCustody>;
+    use crate::backend::managed_memory::kernel_family::UnenforcedFamilyCache;
+    static UNENFORCED: [UnenforcedFamilyCache; 4] = [const { UnenforcedFamilyCache::new() }; 4];
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum ScanKernel {
         DecodeScalar,
@@ -113,9 +115,6 @@ mod implementation {
             specializations: signatures(),
         },
     ];
-    pub(crate) fn plan(kind: ScanKernel) -> &'static MetalKernelDefinitionPlan<'static, 6, 2> {
-        &PLANS[kind.index()].definition
-    }
     static INITIALIZED: [OnceLock<InitializedSharedNative<Family>>; 4] =
         [const { OnceLock::new() }; 4];
     static INITIALIZING: AtomicBool = AtomicBool::new(false);
@@ -147,6 +146,7 @@ mod implementation {
         // Shared source preamble, ABI and retirement statics are already in
         // the pointwise family's process baseline. These are this owner's rows.
         size_of::<[OnceLock<InitializedSharedNative<Family>>; 4]>()
+            + std::mem::size_of_val(&UNENFORCED)
             + std::mem::size_of_val(&SOURCE_QUALIFIED)
             + size_of::<AtomicBool>()
             + std::mem::size_of_val(&PLANS)
@@ -194,13 +194,23 @@ mod implementation {
         grid: [i32; 3],
         stream: &Stream,
     ) -> Result<[Array; 2], Exception> {
-        let observer = OriginalScopeObserver::require_current()?;
-        let family = INITIALIZED[kind.index()]
-            .get()
-            .ok_or_else(|| observer.capacity_error())?;
-        family
-            .output()
-            .apply_fixed_device(inputs, outputs, &[], grid, [256, 1, 1], stream)
+        let observer = OriginalScopeObserver::try_current()?;
+        if let Some(family) = INITIALIZED[kind.index()].get() {
+            return family.output().apply_fixed_device(
+                inputs,
+                outputs,
+                &[],
+                grid,
+                [256, 1, 1],
+                stream,
+            );
+        }
+        if let Some(observer) = observer {
+            return Err(observer.capacity_error());
+        }
+        let family =
+            UNENFORCED[kind.index()].get_or_try_init(|owner| PLANS[kind.index()].realize(owner))?;
+        family.apply_fixed_device(inputs, outputs, &[], grid, [256, 1, 1], stream)
     }
     #[derive(Debug)]
     pub(crate) struct Initializer(ScanKernel);

@@ -1,8 +1,14 @@
 //! Internal format-dialect implementations.
 
+use super::grammar_text::{
+    Error as GrammarError, Literal, Quoted, StructuralTokens, Text as GrammarText, field_sequence,
+    is_required, repeated_rule, structural_literal,
+};
+use llguidance::{api::TopLevelGrammar, derivre::ParserAllocationFunding};
 pub(crate) mod channels;
 mod profile;
 mod snapshot;
+use crate::runtime::chat::tool_schema::{ToolCallSchema, ToolDefinition};
 use profile::ToolNameError;
 pub(crate) use profile::{DeclarationError, ProfileDeclaration};
 
@@ -12,11 +18,10 @@ use std::{
     fmt,
 };
 
-use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
 
 use crate::{
-    runtime::chat::constraints::{parse_tools, tool_call_bounds, tool_call_schema},
+    runtime::chat::constraints::tool_call_bounds,
     runtime::chat::{ParallelToolCallPolicy, ToolChoice},
     runtime::generation::streaming::{JsonFragmentBuffer, ProtocolParser, SemanticEventSink},
 };
@@ -82,7 +87,7 @@ impl fmt::Debug for DialectParameters {
 }
 
 /// A complete grammar ready for tokenizer-specific compilation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ConstraintConfiguration {
     pub(crate) grammar: TopLevelGrammar,
 }
@@ -123,18 +128,20 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String>;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError>;
 
     fn semantic_constraint_configuration(
         &self,
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
         let _ = eos_token_ids;
         self.constraint_configuration(
             parameters,
@@ -142,6 +149,7 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
             ToolChoice::None,
             ParallelToolCallPolicy::Disabled,
             resolved_structural_token_ids,
+            funding,
         )
     }
 
@@ -183,7 +191,7 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
     fn incremental_parser_state_with_tools(
         &self,
         parameters: DialectParameters,
-        _tools: &[Value],
+        _tools: &[ToolDefinition<'_>],
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
         self.incremental_parser_state(parameters)
     }
@@ -224,8 +232,14 @@ pub(crate) struct JsonFunctionEnvelope {
 impl JsonFunctionEnvelope {
     fn fields(&self) -> eredu_text::json_fragments::JsonFieldNames<'static> {
         eredu_text::json_fragments::JsonFieldNames {
-            name: self.name_field, arguments: self.arguments_field,
-            call_id: self.call_id.map(|id| eredu_text::json_fragments::JsonCallId { field: id.field, length: id.length }),
+            name: self.name_field,
+            arguments: self.arguments_field,
+            call_id: self
+                .call_id
+                .map(|id| eredu_text::json_fragments::JsonCallId {
+                    field: id.field,
+                    length: id.length,
+                }),
         }
     }
 }
@@ -265,6 +279,17 @@ pub(crate) struct TaggedParametersEncoding {
     pub(crate) strip_value_framing: bool,
     pub(crate) parameter_suffix: &'static str,
     pub(crate) function_suffix: &'static str,
+}
+
+impl TaggedParametersEncoding {
+    pub(crate) fn program(self) -> eredu_text::semantic_channels::tagged::TaggedEncoding<'static> {
+        use eredu_text::semantic_channels::{tagged::TaggedEncoding, JsonEnvelope};
+        TaggedEncoding { function_prefix: self.function_prefix, function_name_suffix: self.function_name_suffix,
+            parameter_prefix: self.parameter_prefix, parameter_name_suffix: self.parameter_name_suffix,
+            parameter_type: self.parameter_type.map(|e| JsonEnvelope { prefix: e.prefix, suffix: e.suffix }),
+            parameter_value_prefix: self.parameter_value_prefix, strip_value_framing: self.strip_value_framing,
+            parameter_suffix: self.parameter_suffix, function_suffix: self.function_suffix }
+    }
 }
 
 /// Exact syntax around a tool name followed by a JSON argument object.
@@ -612,35 +637,39 @@ impl DeclarativeDialectSpec {
 
     fn lark_grammar(
         &self,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<String, String> {
-        self.validate()?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
+        self.validate_fixed()?;
         if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
-            return Err(format!(
+            return Err(funding.try_format(format_args!(
                 "declarative dialect declares {} structural tokens but {} tokenizer IDs were resolved",
                 self.required_structural_tokens.len(),
                 resolved_structural_token_ids.len()
-            ));
+            ))?.into());
         }
         let literal = |text: &str| {
             structural_literal(
                 text,
                 self.required_structural_tokens,
                 resolved_structural_token_ids,
+                funding,
             )
         };
         if self
             .protocol_max_tools
             .is_some_and(|maximum| tools.len() > maximum)
         {
-            return Err(format!(
-                "declarative protocol accepts at most {} tools, received {}",
-                self.protocol_max_tools.expect("checked maximum"),
-                tools.len()
-            ));
+            return Err(funding
+                .try_format(format_args!(
+                    "declarative protocol accepts at most {} tools, received {}",
+                    self.protocol_max_tools.expect("checked maximum"),
+                    tools.len()
+                ))?
+                .into());
         }
         let (mut min_calls, mut max_calls) =
             tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
@@ -670,27 +699,28 @@ impl DeclarativeDialectSpec {
         let constrained_reasoning_channel = self
             .reasoning_channel
             .filter(|channel| !(channel.prefix_in_prompt && tool_choice == ToolChoice::Auto));
-        let mut grammar = String::from("start: ");
+        let mut grammar = GrammarText::new(funding)?;
+        grammar.push_str("start: ")?;
         if let Some(channel) = constrained_reasoning_channel {
             grammar.push_str(if channel.required {
                 "reasoning "
             } else {
                 "reasoning? "
-            });
+            })?;
         }
         if let Some(channel) = self.text_channel {
             grammar.push_str(if channel.required {
                 "visible_text "
             } else {
                 "visible_text? "
-            });
+            })?;
         } else if self.raw_text_before_calls {
-            grammar.push_str("raw_text? ");
+            grammar.push_str("raw_text? ")?;
         }
-        grammar.push_str("tool_output\n");
+        grammar.push_str("tool_output\n")?;
 
         if let Some(channel) = constrained_reasoning_channel {
-            grammar.push_str(&format!(
+            grammar.push_fmt(format_args!(
                 "reasoning: {} channel_text {}\n",
                 literal(if channel.prefix_in_prompt {
                     ""
@@ -698,242 +728,254 @@ impl DeclarativeDialectSpec {
                     channel.prefix
                 })?,
                 literal(channel.suffix)?
-            ));
+            ))?;
         }
         if let Some(channel) = self.text_channel {
-            grammar.push_str(&format!(
+            grammar.push_fmt(format_args!(
                 "visible_text: {} channel_text {}\n",
                 literal(channel.prefix)?,
                 literal(channel.suffix)?
-            ));
+            ))?;
         }
         if self.raw_text_before_calls {
-            grammar.push_str("raw_text: RAW_TEXT_CHARACTER+\n");
-            grammar.push_str("RAW_TEXT_CHARACTER: /[^<]/\n");
+            grammar.push_str("raw_text: RAW_TEXT_CHARACTER+\n")?;
+            grammar.push_str("RAW_TEXT_CHARACTER: /[^<]/\n")?;
         }
         if constrained_reasoning_channel.is_some() || self.text_channel.is_some() {
-            grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
-            grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]/\n");
+            grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n")?;
+            grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]/\n")?;
         }
 
         let separator = if matches!(
             self.payload_shape,
             DeclarativePayloadShape::TaggedParameters(_)
         ) {
-            "tagged_ws".to_owned()
+            funding.try_copy_str("tagged_ws")?
         } else {
             literal(self.call_separator)?
         };
-        let calls = repeated_rule("call", &separator, min_calls, max_calls);
+        let calls = repeated_rule("call", &separator, min_calls, max_calls, funding)?;
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
                 let function = self
                     .json_function
                     .expect("validated JSON payload has a function envelope");
-                let schema = tool_call_schema(
+                let schema = ToolCallSchema::new(
                     tools,
                     function.name_field,
                     function.arguments_field,
                     function.call_id,
                 )?;
-                let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
                 if self.output.prefix.is_empty() {
-                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                    grammar.push_fmt(format_args!("tool_output: {calls}\n"))?;
                 } else {
-                    grammar.push_str(&format!(
+                    grammar.push_fmt(format_args!(
                         "tool_output: {} {} {}\n",
                         literal(self.output.prefix)?,
                         calls,
                         literal(self.output.suffix)?
-                    ));
+                    ))?;
                 }
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "call: {} {} call_json {} {}\n",
                     literal(self.call.prefix)?,
                     literal(function.envelope.prefix)?,
                     literal(function.envelope.suffix)?,
                     literal(self.call.suffix)?
-                ));
-                grammar.push_str(&format!("call_json: %json {schema}\n"));
+                ))?;
+                grammar.push_str("call_json: %json ")?;
+                grammar.push_json(&schema)?;
+                grammar.push_str("\n")?;
             }
             DeclarativePayloadShape::JsonList => {
                 let function = self
                     .json_function
                     .expect("validated JSON payload has a function envelope");
-                let schema = tool_call_schema(
+                let schema = ToolCallSchema::new(
                     tools,
                     function.name_field,
                     function.arguments_field,
                     function.call_id,
                 )?;
-                let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "tool_output: {} {} \"[\" {} \"]\" {} {}\n",
                     literal(self.output.prefix)?,
                     literal(self.call.prefix)?,
                     calls,
                     literal(self.call.suffix)?,
                     literal(self.output.suffix)?
-                ));
-                grammar.push_str(&format!(
+                ))?;
+                grammar.push_fmt(format_args!(
                     "call: {} call_json {}\n",
                     literal(function.envelope.prefix)?,
                     literal(function.envelope.suffix)?
-                ));
-                grammar.push_str(&format!("call_json: %json {schema}\n"));
+                ))?;
+                grammar.push_str("call_json: %json ")?;
+                grammar.push_json(&schema)?;
+                grammar.push_str("\n")?;
             }
             DeclarativePayloadShape::NamedJsonArguments(encoding) => {
-                let tools = parse_tools(tools)?;
-                let mut alternatives = Vec::with_capacity(tools.len());
-                let mut argument_rules = String::new();
-                for (index, tool) in tools.into_iter().enumerate() {
-                    encoding.name_constraint.validate(&tool.name)?;
-                    let schema = serde_json::to_string(
-                        &crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "")?,
-                    )
-                    .expect("JSON schema values serialize");
-                    alternatives.push(if let Some(call_id) = encoding.call_id {
-                        format!(
-                            "{} {} {} /[0-9]+/ {} named_arguments_{index}",
-                            literal(call_id.prefix)?,
-                            literal(&tool.name)?,
-                            literal(call_id.index_separator)?,
-                            literal(encoding.name_suffix)?,
-                        )
-                    } else {
-                        format!(
-                            "{} {} named_arguments_{index}",
-                            literal(&tool.name)?,
-                            literal(encoding.name_suffix)?,
-                        )
-                    });
-                    argument_rules.push_str(&format!("named_arguments_{index}: %json {schema}\n"));
-                }
-                if alternatives.is_empty() {
-                    alternatives.push("\"__eredu_unreachable_named_json_tool_call__\"".to_owned());
-                }
                 if self.output.prefix.is_empty() {
-                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                    grammar.push_fmt(format_args!("tool_output: {calls}\n"))?;
                 } else {
-                    grammar.push_str(&format!(
-                        "tool_output: {} {} {}\n",
+                    grammar.push_fmt(format_args!(
+                        "tool_output: {} {calls} {}\n",
                         literal(self.output.prefix)?,
-                        calls,
                         literal(self.output.suffix)?
-                    ));
+                    ))?;
                 }
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "call: {} named_json_call {} {}\n",
                     literal(self.call.prefix)?,
                     literal(encoding.arguments_suffix)?,
                     literal(self.call.suffix)?
-                ));
-                grammar.push_str(&format!("named_json_call: {}\n", alternatives.join(" | ")));
-                grammar.push_str(&argument_rules);
+                ))?;
+                grammar.push_str("named_json_call: ")?;
+                for (index, tool) in tools.iter().enumerate() {
+                    if let Err(cause) = encoding.name_constraint.validate_fixed(tool.name) {
+                        return Err(funding.try_format(format_args!("{cause}"))?.into());
+                    }
+                    if index != 0 {
+                        grammar.push_str(" | ")?;
+                    }
+                    if let Some(call_id) = encoding.call_id {
+                        grammar.push_fmt(format_args!(
+                            "{} {} {} /[0-9]+/ {} named_arguments_{index}",
+                            literal(call_id.prefix)?,
+                            literal(tool.name)?,
+                            literal(call_id.index_separator)?,
+                            literal(encoding.name_suffix)?
+                        ))?;
+                    } else {
+                        grammar.push_fmt(format_args!(
+                            "{} {} named_arguments_{index}",
+                            literal(tool.name)?,
+                            literal(encoding.name_suffix)?
+                        ))?;
+                    }
+                }
+                if tools.is_empty() {
+                    grammar.push_str("\"__eredu_unreachable_named_json_tool_call__\"")?;
+                }
+                grammar.push_str("\n")?;
+                for (index, tool) in tools.iter().enumerate() {
+                    let schema = crate::runtime::chat::tool_schema::ArgumentsSchema::new(
+                        tool.parameters,
+                        "",
+                    )?;
+                    grammar.push_fmt(format_args!("named_arguments_{index}: %json "))?;
+                    grammar.push_json(&schema)?;
+                    grammar.push_str("\n")?;
+                }
             }
             DeclarativePayloadShape::TaggedParameters(encoding) => {
                 if self.output.prefix.is_empty() {
-                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                    grammar.push_fmt(format_args!("tool_output: {calls}\n"))?;
                 } else {
-                    grammar.push_str(&format!(
+                    grammar.push_fmt(format_args!(
                         "tool_output: {} {} {}\n",
                         literal(self.output.prefix)?,
                         calls,
                         literal(self.output.suffix)?
-                    ));
+                    ))?;
                 }
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "call: {} tagged_ws tagged_call tagged_ws {}\n",
                     literal(self.call.prefix)?,
                     literal(self.call.suffix)?
-                ));
-                grammar.push_str(&tagged_parameters_grammar(tools, encoding)?);
+                ))?;
+                grammar.push_str(&tagged_parameters_grammar(tools, encoding, funding)?)?;
             }
             DeclarativePayloadShape::StructuralObject(encoding) => {
                 if self.output.prefix.is_empty() {
-                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                    grammar.push_fmt(format_args!("tool_output: {calls}\n"))?;
                 } else {
-                    grammar.push_str(&format!(
+                    grammar.push_fmt(format_args!(
                         "tool_output: {} {} {}\n",
                         literal(self.output.prefix)?,
                         calls,
                         literal(self.output.suffix)?
-                    ));
+                    ))?;
                 }
-                grammar.push_str(&format!(
+                grammar.push_fmt(format_args!(
                     "call: {} structural_call {}\n",
                     literal(self.call.prefix)?,
                     literal(self.call.suffix)?
-                ));
+                ))?;
                 grammar.push_str(&structural_object_grammar(
                     tools,
                     encoding,
                     self.required_structural_tokens,
                     resolved_structural_token_ids,
-                )?);
+                    funding,
+                )?)?;
             }
         }
-        Ok(grammar)
+        Ok(grammar.finish())
     }
 
     fn semantic_lark_grammar(
         &self,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-    ) -> Result<String, String> {
-        self.validate()?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
+        self.validate_fixed()?;
         if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
-            return Err(format!(
+            return Err(funding.try_format(format_args!(
                 "declarative dialect declares {} structural tokens but {} tokenizer IDs were resolved",
                 self.required_structural_tokens.len(),
                 resolved_structural_token_ids.len()
-            ));
+            ))?.into());
         }
         let literal = |text: &str| {
             structural_literal(
                 text,
                 self.required_structural_tokens,
                 resolved_structural_token_ids,
+                funding,
             )
         };
-        let terminal_ids = self
-            .stop_sequences
-            .iter()
-            .filter_map(|stop| {
-                self.required_structural_tokens
-                    .iter()
-                    .position(|token| token == stop)
-                    .map(|index| resolved_structural_token_ids[index])
-            })
-            .chain(eos_token_ids.iter().copied())
-            .collect::<BTreeSet<_>>();
-        if terminal_ids.is_empty() {
+        let terminals = super::grammar_text::Terminals::new(
+            self.stop_sequences
+                .iter()
+                .filter_map(|stop| {
+                    self.required_structural_tokens
+                        .iter()
+                        .position(|token| token == stop)
+                        .map(|index| resolved_structural_token_ids[index])
+                })
+                .chain(eos_token_ids.iter().copied()),
+            funding,
+        )?;
+        if terminals.is_empty() {
             return Err(
                 "declarative semantic generation requires a structural stop or EOS token".into(),
             );
         }
 
-        let mut grammar = String::from("start: ");
+        let mut grammar = GrammarText::new(funding)?;
+        grammar.push_str("start: ")?;
         if let Some(channel) = self.reasoning_channel {
             grammar.push_str(if channel.required {
                 "reasoning "
             } else {
                 "reasoning? "
-            });
+            })?;
         }
         if let Some(channel) = self.text_channel {
             grammar.push_str(if channel.required {
                 "visible_text "
             } else {
                 "visible_text? "
-            });
+            })?;
         } else {
-            grammar.push_str("raw_text ");
+            grammar.push_str("raw_text ")?;
         }
-        grammar.push_str("terminal\n");
+        grammar.push_str("terminal\n")?;
 
         if let Some(channel) = self.reasoning_channel {
-            grammar.push_str(&format!(
+            grammar.push_fmt(format_args!(
                 "reasoning: {} channel_text {}\n",
                 literal(if channel.prefix_in_prompt {
                     ""
@@ -941,217 +983,191 @@ impl DeclarativeDialectSpec {
                     channel.prefix
                 })?,
                 literal(channel.suffix)?
-            ));
+            ))?;
         }
         if let Some(channel) = self.text_channel {
-            grammar.push_str(&format!(
+            grammar.push_fmt(format_args!(
                 "visible_text: {} channel_text {}\n",
                 literal(channel.prefix)?,
                 literal(channel.suffix)?
-            ));
+            ))?;
         } else {
-            grammar.push_str("raw_text: CHANNEL_TEXT_CHARACTER*\n");
+            grammar.push_str("raw_text: CHANNEL_TEXT_CHARACTER*\n")?;
         }
-        grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
-        grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]|<[^|]/\n");
-        grammar.push_str(&format!(
-            "terminal: {}\n",
-            terminal_ids
-                .into_iter()
-                .map(|id| format!("<[{}]>", id))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
-        Ok(grammar)
+        grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n")?;
+        grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]|<[^|]/\n")?;
+        grammar.push_fmt(format_args!("terminal: {terminals}\n"))?;
+        Ok(grammar.finish())
     }
 }
 
 fn tagged_parameters_grammar(
-    tools: &[Value],
+    tools: &[ToolDefinition<'_>],
     encoding: TaggedParametersEncoding,
-) -> Result<String, String> {
-    let tools = parse_tools(tools)?;
-    let mut rules = String::from("tagged_ws: /[ \\t\\r\\n]*/\n");
+    funding: &ParserAllocationFunding,
+) -> Result<String, GrammarError> {
+    let mut rules = GrammarText::new(funding)?;
+    rules.push_str("tagged_ws: /[ \\t\\r\\n]*/\n")?;
     if tools.is_empty() {
-        rules.push_str("tagged_call: \"__eredu_unreachable_tagged_tool_call__\"\n");
-        return Ok(rules);
+        rules.push_str("tagged_call: \"__eredu_unreachable_tagged_tool_call__\"\n")?;
+        return Ok(rules.finish());
     }
-
-    let mut tool_rules = Vec::with_capacity(tools.len());
     let mut next_value = 0usize;
     for (tool_index, tool) in tools.iter().enumerate() {
-        let properties = tagged_properties(&tool.parameters);
-        let required = tool
-            .parameters
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<BTreeSet<_>>();
-        let mut parameter_rules = Vec::with_capacity(properties.len());
-        for (name, schema) in properties {
-            validate_tagged_parameter_name(&name)?;
-            let value_rule = format!("tagged_value_{next_value}");
-            next_value += 1;
+        let mut parameter_names = Vec::new();
+        for (index, field) in tagged_properties(&tool.parameters, funding)?.enumerate() {
+            let (name, schema) = field?;
+            validate_tagged_parameter_name(name).map_err(|error| error.grammar(funding))?;
+            let value_index = next_value;
+            next_value = next_value.checked_add(1).ok_or(GrammarError::Overflow)?;
             let mut value_consumes_suffix = false;
-            match tagged_value_kind(&schema)? {
+            match tagged_value_kind(schema) {
                 TaggedValueKind::RawStringOrJson => {
-                    rules.push_str(&format!(
-                        "{value_rule}[lazy]: /(?s:.)*/ {}\n",
-                        literal(encoding.parameter_suffix)
-                    ));
+                    rules.push_fmt(format_args!(
+                        "tagged_value_{value_index}[lazy]: /(?s:.)*/ {}\n",
+                        Literal(encoding.parameter_suffix)
+                    ))?;
                     value_consumes_suffix = true;
                 }
                 TaggedValueKind::RawString => {
                     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-                        let alternatives = values
+                        rules.push_fmt(format_args!("tagged_value_{value_index}: "))?;
+                        let mut first = true;
+                        for value in values
                             .iter()
                             .filter_map(Value::as_str)
                             .filter(|value| !value.contains(encoding.parameter_suffix))
-                            .flat_map(|value| {
-                                if !encoding.strip_value_framing {
-                                    return vec![literal(value)];
-                                }
-                                let mut spellings = vec![
-                                    literal(&format!("\n{value}\n")),
-                                    literal(&format!("\r\n{value}\r\n")),
-                                ];
+                        {
+                            if !first {
+                                rules.push_str(" | ")?;
+                            }
+                            first = false;
+                            if !encoding.strip_value_framing {
+                                rules.push_fmt(format_args!("{}", Literal(value)))?;
+                            } else {
+                                rules.push_fmt(format_args!(
+                                    "{} | {}",
+                                    Quoted(format_args!("\n{value}\n")),
+                                    Quoted(format_args!("\r\n{value}\r\n"))
+                                ))?;
                                 if !value.starts_with('\n') && !value.starts_with("\r\n") {
-                                    spellings.push(literal(value));
+                                    rules.push_fmt(format_args!(" | {}", Literal(value)))?;
                                 }
-                                spellings
-                            })
-                            .collect::<Vec<_>>();
-                        rules.push_str(&format!("{value_rule}: {}\n", alternatives.join(" | ")));
+                            }
+                        }
+                        rules.push_str("\n")?;
                     } else {
-                        rules.push_str(&format!(
-                            "{value_rule}[lazy]: /(?s:.)*/ {}\n",
-                            literal(encoding.parameter_suffix)
-                        ));
+                        rules.push_fmt(format_args!(
+                            "tagged_value_{value_index}[lazy]: /(?s:.)*/ {}\n",
+                            Literal(encoding.parameter_suffix)
+                        ))?;
                         value_consumes_suffix = true;
                     }
                 }
                 TaggedValueKind::Json => {
-                    let schema = serde_json::to_string(&schema)
-                        .expect("validated tagged parameter schemas serialize");
-                    rules.push_str(&format!(
-                        "{value_rule}: tagged_ws {value_rule}_json tagged_ws\n{value_rule}_json: %json {schema}\n"
-                    ));
+                    rules.push_fmt(format_args!("tagged_value_{value_index}: tagged_ws tagged_value_{value_index}_json tagged_ws\ntagged_value_{value_index}_json: %json "))?;
+                    rules.push_json(schema)?;
+                    rules.push_str("\n")?;
                 }
             }
-            let parameter_rule = format!("tagged_parameter_{tool_index}_{}", parameter_rules.len());
-            rules.push_str(&format!(
-                "{parameter_rule}: {} {} {} {} {value_rule} {} tagged_ws\n",
-                literal(encoding.parameter_prefix),
-                literal(&name),
-                literal(encoding.parameter_name_suffix),
-                tagged_value_header_grammar(encoding, &schema),
-                if value_consumes_suffix {
-                    literal("")
+            rules.push_fmt(format_args!(
+                "tagged_parameter_{tool_index}_{index}: {} {} {} ",
+                Literal(encoding.parameter_prefix),
+                Literal(name),
+                Literal(encoding.parameter_name_suffix)
+            ))?;
+            tagged_value_header_grammar(&mut rules, encoding, schema)?;
+            rules.push_fmt(format_args!(
+                " tagged_value_{value_index} {} tagged_ws\n",
+                Literal(if value_consumes_suffix {
+                    ""
                 } else {
-                    literal(encoding.parameter_suffix)
-                },
-            ));
-            parameter_rules.push((name, parameter_rule));
+                    encoding.parameter_suffix
+                })
+            ))?;
+            funding.try_push(&mut parameter_names, name)?;
         }
-        let sequence =
-            if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
-                let name = format!("tagged_any_parameter_{tool_index}");
-                let value = format!("tagged_any_value_{tool_index}");
-                rules.push_str(&format!(
-                "{name}: {} /[^<>\\r\\n]+/ {} {} {value} tagged_ws\n{value}[lazy]: /(?s:.)*/ {}\n",
-                literal(encoding.parameter_prefix),
-                literal(encoding.parameter_name_suffix),
-                tagged_value_header_grammar(encoding, &Value::Bool(true)),
-                literal(encoding.parameter_suffix),
-            ));
-                format!("{name}*")
-            } else {
-                tagged_parameter_sequence(&parameter_rules, &required, 0)
-            };
-        let tool_rule = format!("tagged_tool_{tool_index}");
-        rules.push_str(&format!(
-            "{tool_rule}: {} {} {} tagged_ws {sequence} {}\n",
-            literal(encoding.function_prefix),
-            literal(&tool.name),
-            literal(encoding.function_name_suffix),
-            literal(encoding.function_suffix),
-        ));
-        tool_rules.push(tool_rule);
-    }
-    rules.push_str(&format!("tagged_call: {}\n", tool_rules.join(" | ")));
-    Ok(rules)
-}
-
-fn discard_tagged_whitespace(pending: &mut String) {
-    let length = pending.len() - pending.trim_start_matches([' ', '\t', '\r', '\n']).len();
-    pending.drain(..length);
-}
-
-fn tagged_value_text(raw: &str) -> &str {
-    // The opening line break determines framing. Matching it at the end
-    // preserves a value's trailing CR when the template uses LF framing.
-    for newline in ["\r\n", "\n"] {
-        if let Some(value) = raw.strip_prefix(newline) {
-            return value.strip_suffix(newline).unwrap_or(value);
+        if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
+            rules.push_fmt(format_args!(
+                "tagged_any_parameter_{tool_index}: {} /[^<>\\r\\n]+/ {} ",
+                Literal(encoding.parameter_prefix),
+                Literal(encoding.parameter_name_suffix)
+            ))?;
+            tagged_value_header_grammar(&mut rules, encoding, &Value::Bool(true))?;
+            rules.push_fmt(format_args!(" tagged_any_value_{tool_index} tagged_ws\ntagged_any_value_{tool_index}[lazy]: /(?s:.)*/ {}\n",
+                Literal(encoding.parameter_suffix)))?;
         }
+        rules.push_fmt(format_args!(
+            "tagged_tool_{tool_index}: {} {} {} tagged_ws ",
+            Literal(encoding.function_prefix),
+            Literal(tool.name),
+            Literal(encoding.function_name_suffix)
+        ))?;
+        if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
+            rules.push_fmt(format_args!("tagged_any_parameter_{tool_index}*"))?;
+        } else {
+            tagged_parameter_sequence(&mut rules, &parameter_names, &tool.parameters, tool_index)?;
+        }
+        rules.push_fmt(format_args!(" {}\n", Literal(encoding.function_suffix)))?;
     }
-    raw
+    rules.push_str("tagged_call: ")?;
+    for index in 0..tools.len() {
+        if index != 0 {
+            rules.push_str(" | ")?;
+        }
+        rules.push_fmt(format_args!("tagged_tool_{index}"))?;
+    }
+    rules.push_str("\n")?;
+    Ok(rules.finish())
 }
 
 fn tagged_parameter_sequence(
-    fields: &[(String, String)],
-    required: &BTreeSet<&str>,
-    index: usize,
-) -> String {
-    let Some((name, rule)) = fields.get(index) else {
-        return literal("");
-    };
-    let tail = tagged_parameter_sequence(fields, required, index + 1);
-    let selected = format!("{rule} {tail}");
-    if required.contains(name.as_str()) {
-        selected
-    } else {
-        format!("({selected})?")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaggedValueKind {
-    RawString,
-    Json,
-    RawStringOrJson,
-}
-
-fn tagged_value_kind(schema: &Value) -> Result<TaggedValueKind, String> {
-    if schema.get("type").and_then(Value::as_str) == Some("string") {
-        return Ok(TaggedValueKind::RawString);
-    }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        let strings = values.iter().filter(|value| value.is_string()).count();
-        if strings == values.len() {
-            return Ok(TaggedValueKind::RawString);
+    output: &mut GrammarText<'_>,
+    fields: &[&str],
+    schema: &Value,
+    tool_index: usize,
+) -> Result<(), GrammarError> {
+    // The nested optional suffix is intentional: omitting a field also omits
+    // its following suffix. Emit the same nesting without recursive strings.
+    for (index, name) in fields.iter().enumerate() {
+        if !is_required(schema, name) {
+            output.push_str("(")?;
         }
-        if strings != 0 {
-            return Ok(TaggedValueKind::RawStringOrJson);
+        output.push_fmt(format_args!("tagged_parameter_{tool_index}_{index} "))?;
+    }
+    output.push_str("\"\"")?;
+    for name in fields.iter().rev() {
+        if !is_required(schema, name) {
+            output.push_str(")?")?;
         }
     }
-    if schema.get("type").and_then(Value::as_str).is_none() {
-        return Ok(TaggedValueKind::RawStringOrJson);
-    }
-    Ok(TaggedValueKind::Json)
+    Ok(())
 }
 
-fn validate_tagged_parameter_name(name: &str) -> Result<(), String> {
-    if name.is_empty()
-        || name
-            .chars()
-            .any(|character| matches!(character, '<' | '>' | '\r' | '\n'))
-    {
-        return Err(format!(
-            "tagged parameter name {name:?} must be non-empty and cannot contain tag delimiters or newlines"
-        ));
+use eredu_text::semantic_channels::tagged::{TaggedValueKind, tagged_value_kind, tagged_schema_has_union, TaggedTypeName};
+
+#[derive(Debug)]
+struct TaggedNameError<'a>(&'a str);
+impl fmt::Display for TaggedNameError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tagged parameter name {:?} must be non-empty and cannot contain tag delimiters or newlines",
+            self.0
+        )
+    }
+}
+impl TaggedNameError<'_> {
+    fn grammar(self, funding: &ParserAllocationFunding) -> GrammarError {
+        match funding.try_format(format_args!("{self}")) {
+            Ok(message) => GrammarError::Policy(message),
+            Err(error) => error.into(),
+        }
+    }
+}
+fn validate_tagged_parameter_name(name: &str) -> Result<(), TaggedNameError<'_>> {
+    if !eredu_text::semantic_channels::tagged::valid_parameter_name(name) {
+        return Err(TaggedNameError(name));
     }
     Ok(())
 }
@@ -1162,43 +1178,98 @@ struct TaggedToolSchema {
     required: BTreeSet<String>,
 }
 
-fn tagged_properties(root: &Value) -> serde_json::Map<String, Value> {
-    // Resolve simple local references only for the raw-string/JSON wire choice.
-    // Validation always uses the complete original schema and its proper scopes.
-    fn resolve(schema: &Value, root: &Value, depth: usize) -> Value {
-        if depth >= 64 {
-            return schema.clone();
-        }
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            if let Some(target) = reference
-                .strip_prefix('#')
-                .and_then(|pointer| root.pointer(pointer))
-            {
-                return resolve(target, root, depth + 1);
-            }
-        }
-        schema.clone()
+struct TaggedAllocation<'a>(&'a ParserAllocationFunding);
+impl serde_json::allocation::Allocation for TaggedAllocation<'_> {
+    fn reserve(&self, bytes: usize) -> Result<(), serde_json::allocation::AllocationError> {
+        self.0
+            .reserve(bytes)
+            .map_err(|_| serde_json::allocation::AllocationError::Refused)
     }
-    let object = resolve(root, root, 0);
-    object
-        .get("properties")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|properties| properties.iter())
-        .map(|(name, schema)| (name.clone(), resolve(schema, root, 0)))
-        .collect()
+    fn is_enforced(&self) -> bool {
+        self.0.is_enforced()
+    }
+}
+pub(crate) fn tagged_properties<'a>(
+    root: &'a Value,
+    funding: &'a ParserAllocationFunding,
+) -> Result<TaggedProperties<'a>, GrammarError> {
+    let object = resolve_tagged_reference(root, root, funding)?;
+    Ok(TaggedProperties {
+        root,
+        funding,
+        fields: object
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|map| map.iter()),
+    })
+}
+// Grammar lowering and parser catalog construction share reference semantics.
+fn resolve_tagged_reference<'a>(
+    mut schema: &'a Value,
+    root: &'a Value,
+    funding: &ParserAllocationFunding,
+) -> Result<&'a Value, GrammarError> {
+    for _ in 0..64 {
+        let Some(pointer) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix('#'))
+        else {
+            break;
+        };
+        let target = root
+            .pointer_with_allocations(pointer, &TaggedAllocation(funding))
+            .map_err(|error| {
+                funding.failure().map_or_else(
+                    || GrammarError::JsonAllocation(error),
+                    GrammarError::Funding,
+                )
+            })?;
+        let Some(target) = target else {
+            break;
+        };
+        schema = target;
+    }
+    Ok(schema)
+}
+pub(crate) struct TaggedProperties<'a> {
+    root: &'a Value,
+    funding: &'a ParserAllocationFunding,
+    fields: Option<serde_json::map::Iter<'a>>,
+}
+impl<'a> Iterator for TaggedProperties<'a> {
+    type Item = Result<(&'a str, &'a Value), GrammarError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let (name, schema) = self.fields.as_mut()?.next()?;
+        Some(
+            resolve_tagged_reference(schema, self.root, self.funding)
+                .map(|schema| (name.as_str(), schema)),
+        )
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+}
+impl ExactSizeIterator for TaggedProperties<'_> {
+    fn len(&self) -> usize {
+        self.fields.as_ref().map_or(0, ExactSizeIterator::len)
+    }
 }
 
-fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSchema>, String> {
-    parse_tools(tools)?
-        .into_iter()
+fn tagged_tool_catalog(
+    tools: &[ToolDefinition<'_>],
+) -> Result<BTreeMap<String, TaggedToolSchema>, String> {
+    let funding = ParserAllocationFunding::unenforced();
+    tools
+        .iter()
         .map(|tool| {
-            let parameters = tagged_properties(&tool.parameters)
+            let parameters = tagged_properties(&tool.parameters, &funding)
+                .map_err(|error| error.to_string())?
                 .into_iter()
-                .map(|(name, schema)| {
-                    validate_tagged_parameter_name(&name)?;
-                    tagged_value_kind(&schema)?;
-                    Ok((name, schema))
+                .map(|field| {
+                    let (name, schema) = field.map_err(|error| error.to_string())?;
+                    validate_tagged_parameter_name(&name).map_err(|error| error.to_string())?;
+                    Ok((name.to_owned(), schema.clone()))
                 })
                 .collect::<Result<BTreeMap<_, _>, String>>()?;
             let required = tool
@@ -1211,7 +1282,7 @@ fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSch
                 .map(str::to_owned)
                 .collect();
             Ok((
-                tool.name,
+                tool.name.to_owned(),
                 TaggedToolSchema {
                     parameters,
                     required,
@@ -1221,6 +1292,21 @@ fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSch
         .collect()
 }
 
+struct OrdinaryTaggedSchemas<'a>(&'a BTreeMap<String, TaggedToolSchema>);
+impl eredu_text::semantic_channels::tagged::TaggedSchemas for OrdinaryTaggedSchemas<'_> {
+    type Error = eredu_text::semantic_channels::tagged::TaggedValueError<std::convert::Infallible>;
+    fn contains_tool(&self, name: &str) -> bool { self.0.contains_key(name) }
+    fn missing_required(&self, tool: &str, parameters: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool {
+        self.0.get(tool).is_none_or(|s| s.required.iter().any(|n| !parameters.contains(n)))
+    }
+    fn parse_parameter(&self, tool: &str, parameter: &str, declared: Option<&str>, raw: &str,
+        funding: &dyn serde_json::allocation::Allocation) -> Result<Value, Self::Error> {
+        let schema = self.0.get(tool).and_then(|s| s.parameters.get(parameter)).unwrap_or(&Value::Bool(true));
+        eredu_text::semantic_channels::tagged::parse_tagged_value(schema, declared, raw, funding,
+            |value| Ok(tagged_value_matches_schema(value, schema)))
+    }
+}
+
 fn tagged_value_matches_schema(value: &Value, schema: &Value) -> bool {
     // References may be rooted in the complete tool schema. The sink validates
     // those with the correct scope once the argument object is complete.
@@ -1228,358 +1314,198 @@ fn tagged_value_matches_schema(value: &Value, schema: &Value) -> bool {
         .map_or(true, |validator| validator.is_valid(value))
 }
 
-fn tagged_schema_has_union(schema: &Value) -> bool {
-    schema
-        .get("oneOf")
-        .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
-        || schema
-            .get("anyOf")
-            .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
-        || schema
-            .get("type")
-            .and_then(Value::as_array)
-            .is_some_and(|types| types.len() > 1)
-        || schema.get("items").is_some_and(tagged_schema_has_union)
-        || schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .is_some_and(|properties| properties.values().any(tagged_schema_has_union))
-}
-
-/// Compact JSON-schema type spelling used by tagged argument annotations.
-/// A union (including nested unions) describes its actual JSON value type.
 fn tagged_type_name(schema: &Value, value: Option<&Value>) -> String {
-    if tagged_schema_has_union(schema) {
-        if let Some(value) = value {
-            return match value {
-                Value::Null => "null",
-                Value::Bool(_) => "boolean",
-                Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
-                Value::Number(_) => "number",
-                Value::String(_) => "string",
-                Value::Array(_) => "array",
-                Value::Object(_) => "object",
-            }
-            .into();
-        }
-    }
-    let type_name = schema.get("type").and_then(|kind| {
-        kind.as_str().or_else(|| {
-            kind.as_array()
-                .filter(|types| types.len() == 1)?
-                .first()?
-                .as_str()
-        })
-    });
-    match type_name {
-        Some("array") => format!(
-            "array[{}]",
-            schema
-                .get("items")
-                .map_or_else(|| "any".into(), |items| tagged_type_name(items, None))
-        ),
-        Some(name) => name.into(),
-        None if schema.get("$ref").and_then(Value::as_str).is_some() => schema["$ref"]
-            .as_str()
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .into(),
-        None if schema.get("properties").is_some() => "object".into(),
-        None if schema.get("items").is_some() => {
-            format!("array[{}]", tagged_type_name(&schema["items"], None))
-        }
-        None => "any".into(),
-    }
+    TaggedTypeName { schema, value }.to_string()
 }
 
-fn tagged_value_header_grammar(encoding: TaggedParametersEncoding, schema: &Value) -> String {
-    let mut header = String::new();
+fn tagged_value_header_grammar(
+    output: &mut GrammarText<'_>,
+    encoding: TaggedParametersEncoding,
+    schema: &Value,
+) -> Result<(), GrammarError> {
     if let Some(tag) = encoding.parameter_type {
-        let types = if tagged_schema_has_union(schema) {
-            [
+        output.push_fmt(format_args!("tagged_ws {} (", Literal(tag.prefix)))?;
+        if tagged_schema_has_union(schema) {
+            for (index, name) in [
                 "null", "boolean", "integer", "number", "string", "array", "object",
             ]
-            .map(literal)
-            .join(" | ")
-        } else {
-            literal(&tagged_type_name(schema, None))
-        };
-        header = format!(
-            "tagged_ws {} ({types}) {} ",
-            literal(tag.prefix),
-            literal(tag.suffix)
-        );
-    }
-    if !encoding.parameter_value_prefix.is_empty() {
-        header.push_str(&format!(
-            "tagged_ws {}",
-            literal(encoding.parameter_value_prefix)
-        ));
-    }
-    header
-}
-
-fn literal(text: &str) -> String {
-    serde_json::to_string(text).expect("strings serialize as JSON/Lark literals")
-}
-
-fn structural_literal(
-    text: &str,
-    structural_tokens: &[&str],
-    resolved_structural_token_ids: &[u32],
-) -> Result<String, String> {
-    let mut sequence = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let Some((position, structural_index)) = structural_tokens
             .iter()
             .enumerate()
-            .filter_map(|(index, token)| remaining.find(token).map(|position| (position, index)))
-            .min_by_key(|(position, index)| (*position, *index))
-        else {
-            sequence.push(literal(remaining));
-            break;
-        };
-        if position > 0 {
-            sequence.push(literal(&remaining[..position]));
+            {
+                if index != 0 {
+                    output.push_str(" | ")?;
+                }
+                output.push_fmt(format_args!("{}", Literal(name)))?;
+            }
+        } else {
+            output.push_fmt(format_args!(
+                "{}",
+                Quoted(TaggedTypeName {
+                    schema,
+                    value: None
+                })
+            ))?;
         }
-        sequence.push(format!(
-            "<[{}]>",
-            resolved_structural_token_ids[structural_index]
-        ));
-        remaining = &remaining[position + structural_tokens[structural_index].len()..];
+        output.push_fmt(format_args!(") {} ", Literal(tag.suffix)))?;
     }
-    if sequence.is_empty() {
-        sequence.push(literal(""));
+    if !encoding.parameter_value_prefix.is_empty() {
+        output.push_fmt(format_args!(
+            "tagged_ws {}",
+            Literal(encoding.parameter_value_prefix)
+        ))?;
     }
-    Ok(sequence.join(" "))
-}
-
-fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<usize>) -> String {
-    if maximum == Some(0) {
-        return String::new();
-    }
-    let tail = if separator == literal("") {
-        format!("({item})")
-    } else {
-        format!("({separator} {item})")
-    };
-    if minimum == 0 {
-        return match maximum {
-            Some(1) => format!("{item}?"),
-            Some(maximum) => format!("({item} {tail}{{0,{}}})?", maximum - 1),
-            None => format!("({item} {tail}*)?"),
-        };
-    }
-
-    let required = std::iter::once(item.to_owned())
-        .chain(std::iter::repeat_n(tail.clone(), minimum - 1))
-        .collect::<Vec<_>>()
-        .join(" ");
-    match maximum {
-        Some(maximum) if maximum == minimum => required,
-        Some(maximum) => format!("{required} {tail}{{0,{}}}", maximum - minimum),
-        None => format!("{required} {tail}*"),
-    }
+    Ok(())
 }
 
 fn structural_object_grammar(
-    tools: &[Value],
+    tools: &[ToolDefinition<'_>],
     encoding: StructuralObjectEncoding,
     structural_tokens: &[&str],
     resolved_structural_token_ids: &[u32],
-) -> Result<String, String> {
-    let tools = parse_tools(tools)?;
+    funding: &ParserAllocationFunding,
+) -> Result<String, GrammarError> {
     if tools.is_empty() {
-        return Ok("structural_call: \"__eredu_unreachable_structural_tool_call__\"\n".into());
+        return Ok(funding
+            .try_copy_str("structural_call: \"__eredu_unreachable_structural_tool_call__\"\n")?);
     }
-
-    let resolver = StructuralLiteralResolver {
-        structural_tokens,
-        resolved_structural_token_ids,
+    let tokens = StructuralTokens::new(structural_tokens, resolved_structural_token_ids)?;
+    let mut builder = StructuralGrammarBuilder {
+        encoding,
+        tokens,
+        funding,
+        next_rule: 0,
+        rules: GrammarText::new(funding)?,
     };
-    let mut builder = StructuralGrammarBuilder::new(encoding, &resolver);
-    let alternatives = tools
-        .iter()
-        .map(|tool| {
-            let arguments = builder.object_rule(&tool.parameters)?;
-            Ok(format!(
-                "{} {} {arguments}",
-                resolver.resolve(encoding.name_prefix)?,
-                resolver.resolve(&tool.name)?
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut grammar = format!("structural_call: {}\n", alternatives.join(" | "));
-    let any_string = builder.schema_rule(&serde_json::json!({"type": "string"}))?;
-    grammar.push_str(&builder.rules);
-    grammar.push_str(&format!(r#"structural_value: {any_string} | STRUCTURAL_NUMBER | "true" | "false" | "null" | structural_any_object | structural_any_array
+    let mut grammar = GrammarText::new(funding)?;
+    grammar.push_str("structural_call: ")?;
+    for (index, tool) in tools.iter().enumerate() {
+        if index != 0 {
+            grammar.push_str(" | ")?;
+        }
+        let arguments = builder.object_rule(&tool.parameters)?;
+        grammar.push_fmt(format_args!(
+            "{} {} {arguments}",
+            tokens.literal(encoding.name_prefix),
+            tokens.literal(tool.name)
+        ))?;
+    }
+    grammar.push_str("\n")?;
+    let any_string = builder.string_rule()?;
+    grammar.push_str(&builder.rules.finish())?;
+    grammar.push_fmt(format_args!(r#"structural_value: {any_string} | STRUCTURAL_NUMBER | "true" | "false" | "null" | structural_any_object | structural_any_array
 structural_any_object: "{{" (structural_pair ("," structural_pair)*)? "}}"
 structural_pair: /[^{{}}\[\],:\s<>][^{{}}\[\],:<>]*/ ":" structural_value
 structural_any_array: "[" (structural_value ("," structural_value)*)? "]"
-"#));
-    grammar.push_str("STRUCTURAL_INTEGER: /-?(0|[1-9][0-9]*)/\n");
-    grammar.push_str("STRUCTURAL_NUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\n");
-    grammar.push_str("STRUCTURAL_STRING_CHARACTER: /[^<]/\n");
-    Ok(grammar)
-}
-
-struct StructuralLiteralResolver<'a> {
-    structural_tokens: &'a [&'a str],
-    resolved_structural_token_ids: &'a [u32],
-}
-
-impl StructuralLiteralResolver<'_> {
-    fn resolve(&self, text: &str) -> Result<String, String> {
-        structural_literal(
-            text,
-            self.structural_tokens,
-            self.resolved_structural_token_ids,
-        )
-    }
+"#))?;
+    grammar.push_str("STRUCTURAL_INTEGER: /-?(0|[1-9][0-9]*)/\n")?;
+    grammar.push_str("STRUCTURAL_NUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\n")?;
+    grammar.push_str("STRUCTURAL_STRING_CHARACTER: /[^<]/\n")?;
+    Ok(grammar.finish())
 }
 
 struct StructuralGrammarBuilder<'a> {
     encoding: StructuralObjectEncoding,
-    literal: &'a StructuralLiteralResolver<'a>,
+    tokens: StructuralTokens<'a>,
+    funding: &'a ParserAllocationFunding,
     next_rule: usize,
-    rules: String,
+    rules: GrammarText<'a>,
 }
 
-impl<'a> StructuralGrammarBuilder<'a> {
-    fn new(encoding: StructuralObjectEncoding, literal: &'a StructuralLiteralResolver<'a>) -> Self {
-        Self {
-            encoding,
-            literal,
-            next_rule: 0,
-            rules: String::new(),
-        }
+impl StructuralGrammarBuilder<'_> {
+    fn rule_name(&mut self, stem: &str) -> Result<String, GrammarError> {
+        let name = self
+            .funding
+            .try_format(format_args!("{stem}_{}", self.next_rule))?;
+        self.next_rule = self
+            .next_rule
+            .checked_add(1)
+            .ok_or(GrammarError::Overflow)?;
+        Ok(name)
     }
 
-    fn rule_name(&mut self, stem: &str) -> String {
-        let name = format!("{stem}_{}", self.next_rule);
-        self.next_rule += 1;
-        name
-    }
-
-    fn schema_rule(&mut self, schema: &Value) -> Result<String, String> {
+    fn schema_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            return values
-                .iter()
-                .map(|value| self.value_literal(value))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| format!("({})", values.join(" | ")));
-        }
-        match schema.get("type").and_then(Value::as_str) {
-            Some("object") => self.object_rule(schema),
-            Some("array") => self.array_rule(schema),
-            Some("string") => {
-                let rule = self.rule_name("structural_string");
-                let text_rule = self.rule_name("structural_string_text");
-                self.rules.push_str(&format!(
-                    "{rule}: {} {text_rule} {}\n",
-                    self.literal.resolve(self.encoding.string_delimiter)?,
-                    self.literal.resolve(self.encoding.string_delimiter)?
-                ));
-                self.rules
-                    .push_str(&format!("{text_rule}: STRUCTURAL_STRING_CHARACTER*\n"));
-                Ok(rule)
+            let mut output = GrammarText::new(self.funding)?;
+            output.push_str("(")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(" | ")?;
+                }
+                self.value_literal(&mut output, value)?;
             }
-            Some("integer") => Ok("STRUCTURAL_INTEGER".into()),
-            Some("number") => Ok("STRUCTURAL_NUMBER".into()),
-            Some("boolean") => Ok("(\"true\" | \"false\")".into()),
-            Some("null") => Ok("\"null\"".into()),
-            _ => Ok("structural_value".into()),
+            output.push_str(")")?;
+            return Ok(output.finish());
         }
+        let rule = match schema.get("type").and_then(Value::as_str) {
+            Some("object") => return self.object_rule(schema),
+            Some("array") => return self.array_rule(schema),
+            Some("string") => return self.string_rule(),
+            Some("integer") => "STRUCTURAL_INTEGER",
+            Some("number") => "STRUCTURAL_NUMBER",
+            Some("boolean") => "(\"true\" | \"false\")",
+            Some("null") => "\"null\"",
+            _ => "structural_value",
+        };
+        Ok(self.funding.try_copy_str(rule)?)
     }
 
-    fn object_rule(&mut self, schema: &Value) -> Result<String, String> {
-        if !crate::runtime::chat::tool_schema::has_simple_properties(schema) {
-            return Ok("structural_any_object".into());
-        }
-        let object_rule = self.rule_name("structural_object");
-        let first_rule = self.rule_name("structural_first");
-        let properties = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let required = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        let fields = properties.into_iter().collect::<Vec<_>>();
+    fn string_rule(&mut self) -> Result<String, GrammarError> {
+        let rule = self.rule_name("structural_string")?;
+        let text_rule = self.rule_name("structural_string_text")?;
+        self.rules.push_fmt(format_args!(
+            "{rule}: {} {text_rule} {}\n",
+            self.tokens.literal(self.encoding.string_delimiter),
+            self.tokens.literal(self.encoding.string_delimiter)
+        ))?;
+        self.rules
+            .push_fmt(format_args!("{text_rule}: STRUCTURAL_STRING_CHARACTER*\n"))?;
+        Ok(rule)
+    }
 
+    fn object_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
+        if !crate::runtime::chat::tool_schema::has_simple_properties(schema) {
+            return Ok(self.funding.try_copy_str("structural_any_object")?);
+        }
+        let object_rule = self.rule_name("structural_object")?;
+        let first_rule = self.rule_name("structural_first")?;
+        let properties = schema.get("properties").and_then(Value::as_object);
+        let mut fields = Vec::new();
+        for (name, field_schema) in properties
+            .into_iter()
+            .flat_map(|properties| properties.iter())
+        {
+            let value = self.schema_rule(field_schema)?;
+            let rule = self
+                .funding
+                .try_format(format_args!("{} \":\" {value}", self.tokens.literal(name)))?;
+            self.funding
+                .try_push(&mut fields, (is_required(schema, name), rule))?;
+        }
         if fields.is_empty() {
             self.rules
-                .push_str(&format!("{object_rule}: \"{{\" \"}}\"\n"));
+                .push_fmt(format_args!("{object_rule}: \"{{\" \"}}\"\n"))?;
             return Ok(object_rule);
         }
-
-        let field_rules = fields
-            .iter()
-            .map(|(name, schema)| {
-                let value = self.schema_rule(schema)?;
-                Ok(format!("{} \":\" {value}", self.literal.resolve(name)?))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let suffix_rules = (0..fields.len())
-            .map(|_| self.rule_name("structural_suffix"))
-            .collect::<Vec<_>>();
-
-        let first = self.field_sequence(&fields, &field_rules, &suffix_rules, &required, 0, false);
-        self.rules.push_str(&format!("{first_rule}: {first}\n"));
-        for index in 0..fields.len() {
-            let suffix =
-                self.field_sequence(&fields, &field_rules, &suffix_rules, &required, index, true);
-            self.rules
-                .push_str(&format!("{}: {suffix}\n", suffix_rules[index]));
+        let mut suffix_rules = Vec::new();
+        for _ in 0..fields.len() {
+            let rule = self.rule_name("structural_suffix")?;
+            self.funding.try_push(&mut suffix_rules, rule)?;
+        }
+        self.rules.push_fmt(format_args!("{first_rule}: "))?;
+        field_sequence(&mut self.rules, &fields, &suffix_rules, 0, "")?;
+        self.rules.push_str("\n")?;
+        for (index, rule) in suffix_rules.iter().enumerate() {
+            self.rules.push_fmt(format_args!("{rule}: "))?;
+            field_sequence(&mut self.rules, &fields, &suffix_rules, index, "\",\"")?;
+            self.rules.push_str("\n")?;
         }
         self.rules
-            .push_str(&format!("{object_rule}: \"{{\" {first_rule} \"}}\"\n"));
+            .push_fmt(format_args!("{object_rule}: \"{{\" {first_rule} \"}}\"\n"))?;
         Ok(object_rule)
     }
 
-    fn field_sequence(
-        &self,
-        fields: &[(String, Value)],
-        field_rules: &[String],
-        suffix_rules: &[String],
-        required: &std::collections::BTreeSet<&str>,
-        index: usize,
-        comma: bool,
-    ) -> String {
-        if index >= fields.len() {
-            return literal("");
-        }
-        let prefix = if comma { "\",\"" } else { "" };
-        let tail = suffix_rules
-            .get(index + 1)
-            .map(String::as_str)
-            .unwrap_or("");
-        let selected = format!("{prefix} {} {tail}", field_rules[index]);
-        if required.contains(fields[index].0.as_str()) {
-            selected
-        } else {
-            let skipped = self.field_sequence(
-                fields,
-                field_rules,
-                suffix_rules,
-                required,
-                index + 1,
-                comma,
-            );
-            format!("{selected} | {skipped}")
-        }
-    }
-
-    fn array_rule(&mut self, schema: &Value) -> Result<String, String> {
-        let rule = self.rule_name("structural_array");
+    fn array_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
+        let rule = self.rule_name("structural_array")?;
         let item = self.schema_rule(schema.get("items").unwrap_or(&Value::Bool(true)))?;
         let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
         let maximum = schema
@@ -1587,39 +1513,48 @@ impl<'a> StructuralGrammarBuilder<'a> {
             .and_then(Value::as_u64)
             .map(|value| value as usize);
         if minimum > 4096 || maximum.is_some_and(|max| minimum > max || max > 4096) {
-            return Ok("structural_any_array".into());
+            return Ok(self.funding.try_copy_str("structural_any_array")?);
         }
-        let items = repeated_rule(&item, "\",\"", minimum, maximum);
+        let items = repeated_rule(&item, "\",\"", minimum, maximum, self.funding)?;
         self.rules
-            .push_str(&format!("{rule}: \"[\" {items} \"]\"\n"));
+            .push_fmt(format_args!("{rule}: \"[\" {items} \"]\"\n"))?;
         Ok(rule)
     }
 
-    fn value_literal(&self, value: &Value) -> Result<String, String> {
+    fn value_literal(
+        &self,
+        output: &mut GrammarText<'_>,
+        value: &Value,
+    ) -> Result<(), GrammarError> {
         match value {
-            Value::String(value) => Ok(format!(
+            Value::String(value) => output.push_fmt(format_args!(
                 "{} {} {}",
-                self.literal.resolve(self.encoding.string_delimiter)?,
-                self.literal.resolve(value)?,
-                self.literal.resolve(self.encoding.string_delimiter)?
+                self.tokens.literal(self.encoding.string_delimiter),
+                self.tokens.literal(value),
+                self.tokens.literal(self.encoding.string_delimiter)
             )),
-            Value::Array(values) => values
-                .iter()
-                .map(|value| self.value_literal(value))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| format!("\"[\" {} \"]\"", values.join(" \",\" "))),
-            Value::Object(values) => values
-                .iter()
-                .map(|(key, value)| {
-                    Ok(format!(
-                        "{} \":\" {}",
-                        self.literal.resolve(key)?,
-                        self.value_literal(value)?
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map(|values| format!("\"{{\" {} \"}}\"", values.join(" \",\" "))),
-            _ => Ok(literal(&value.to_string())),
+            Value::Array(values) => {
+                output.push_str("\"[\" ")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push_str(" \",\" ")?;
+                    }
+                    self.value_literal(output, value)?;
+                }
+                output.push_str(" \"]\"")
+            }
+            Value::Object(values) => {
+                output.push_str("\"{\" ")?;
+                for (index, (key, value)) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push_str(" \",\" ")?;
+                    }
+                    output.push_fmt(format_args!("{} \":\" ", self.tokens.literal(key)))?;
+                    self.value_literal(output, value)?;
+                }
+                output.push_str(" \"}\"")
+            }
+            _ => output.push_fmt(format_args!("{}", Quoted(value))),
         }
     }
 }
@@ -1692,19 +1627,21 @@ impl FormatDialect for DeclarativeDialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        let grammar = Self::spec(parameters)?.lark_grammar(
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        let grammar = Self::spec_fixed(parameters)?.lark_grammar(
             tools,
             tool_choice,
             parallel_tool_calls,
             resolved_structural_token_ids,
+            funding,
         )?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(grammar),
+            grammar: crate::runtime::chat::grammar_text::lark(grammar, funding)?,
         })
     }
 
@@ -1713,12 +1650,14 @@ impl FormatDialect for DeclarativeDialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        let spec = Self::spec(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        let spec = Self::spec_fixed(parameters)?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(
-                spec.semantic_lark_grammar(resolved_structural_token_ids, eos_token_ids)?,
-            ),
+            grammar: crate::runtime::chat::grammar_text::lark(
+                spec.semantic_lark_grammar(resolved_structural_token_ids, eos_token_ids, funding)?,
+                funding,
+            )?,
         })
     }
 
@@ -1760,7 +1699,7 @@ impl FormatDialect for DeclarativeDialect {
     fn incremental_parser_state_with_tools(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
         Ok(Box::new(DeclarativeParser::new_with_tools(
             Self::spec(parameters)?,
@@ -1790,23 +1729,7 @@ enum DeclarativeParserState {
         json: JsonFragmentBuffer,
         emitted: usize,
     },
-    TaggedFunctionPrefix,
-    TaggedFunctionName,
-    TaggedParameterOrEnd {
-        tool: String,
-        arguments: serde_json::Map<String, Value>,
-    },
-    TaggedParameterName {
-        tool: String,
-        arguments: serde_json::Map<String, Value>,
-    },
-    TaggedParameterValue {
-        tool: String,
-        parameter: String,
-        arguments: serde_json::Map<String, Value>,
-        header_consumed: bool,
-        declared_type: Option<String>,
-    },
+    Tagged(eredu_text::semantic_channels::tagged::TaggedCall),
     StructuralName {
         prefix_consumed: bool,
     },
@@ -1837,7 +1760,7 @@ impl DeclarativeParser {
 
     fn new_with_tools(
         spec: &'static DeclarativeDialectSpec,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
     ) -> Result<Self, String> {
         let tagged_tools = if matches!(
             spec.payload_shape,
@@ -1870,7 +1793,7 @@ impl DeclarativeParser {
             }
             DeclarativePayloadShape::NamedJsonArguments(_) => DeclarativeParserState::NamedJsonName,
             DeclarativePayloadShape::TaggedParameters(_) => {
-                DeclarativeParserState::TaggedFunctionPrefix
+                DeclarativeParserState::Tagged(Default::default())
             }
             DeclarativePayloadShape::StructuralObject(_) => {
                 DeclarativeParserState::StructuralName {
@@ -1882,9 +1805,10 @@ impl DeclarativeParser {
 
     fn start_call_payload_state(&self) -> DeclarativeParserState {
         match self.spec.payload_shape {
-            DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
-                self.json_state(eredu_text::semantic_channels::JsonFrame::call_payload(channels::json_tools(self.spec).expect("validated JSON declaration")))
-            }
+            DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => self
+                .json_state(eredu_text::semantic_channels::JsonFrame::call_payload(
+                    channels::json_tools(self.spec).expect("validated JSON declaration"),
+                )),
             DeclarativePayloadShape::NamedJsonArguments(_)
             | DeclarativePayloadShape::TaggedParameters(_) => self.start_payload_state(),
             DeclarativePayloadShape::StructuralObject(_) => self.start_payload_state(),
@@ -1944,7 +1868,9 @@ impl DeclarativeParser {
                 }
                 channels::Next::Tool => {
                     if let Some(program) = channels::json_tools(self.spec) {
-                        self.json_state(eredu_text::semantic_channels::JsonFrame::after_channel(program))
+                        self.json_state(eredu_text::semantic_channels::JsonFrame::after_channel(
+                            program,
+                        ))
                     } else if !self.spec.output.prefix.is_empty() {
                         DeclarativeParserState::ToolStart
                     } else if !self.spec.call.prefix.is_empty() {
@@ -1962,7 +1888,9 @@ impl DeclarativeParser {
         Some(match self.state {
             DeclarativeParserState::ToolStart => JsonFrame::ToolStart,
             DeclarativeParserState::JsonEnvelopeStart => JsonFrame::FunctionStart,
-            DeclarativeParserState::ListItemOrEnd { allow_end } => JsonFrame::ListItem { allow_end },
+            DeclarativeParserState::ListItemOrEnd { allow_end } => {
+                JsonFrame::ListItem { allow_end }
+            }
             DeclarativeParserState::AfterPayload => JsonFrame::AfterPayload,
             DeclarativeParserState::AfterJsonFunctionSuffix => JsonFrame::AfterFunctionSuffix,
             DeclarativeParserState::AfterEnvelope => JsonFrame::AfterEnvelope,
@@ -1970,13 +1898,18 @@ impl DeclarativeParser {
             _ => return None,
         })
     }
-    fn json_state(&self, frame: eredu_text::semantic_channels::JsonFrame) -> DeclarativeParserState {
+    fn json_state(
+        &self,
+        frame: eredu_text::semantic_channels::JsonFrame,
+    ) -> DeclarativeParserState {
         use eredu_text::semantic_channels::JsonFrame;
         match frame {
             JsonFrame::ToolStart => DeclarativeParserState::ToolStart,
             JsonFrame::FunctionStart => DeclarativeParserState::JsonEnvelopeStart,
             JsonFrame::Payload => self.start_payload_state(),
-            JsonFrame::ListItem { allow_end } => DeclarativeParserState::ListItemOrEnd { allow_end },
+            JsonFrame::ListItem { allow_end } => {
+                DeclarativeParserState::ListItemOrEnd { allow_end }
+            }
             JsonFrame::AfterPayload => DeclarativeParserState::AfterPayload,
             JsonFrame::AfterFunctionSuffix => DeclarativeParserState::AfterJsonFunctionSuffix,
             JsonFrame::AfterEnvelope => DeclarativeParserState::AfterEnvelope,
@@ -1984,8 +1917,13 @@ impl DeclarativeParser {
             JsonFrame::Outside => DeclarativeParserState::Outside,
         }
     }
-    fn process_json_frame(&mut self, program: eredu_text::semantic_channels::JsonToolProgram<'_>, frame: eredu_text::semantic_channels::JsonFrame, sink: &mut SemanticEventSink) -> Result<bool, String> {
-        use eredu_text::semantic_channels::{json_frame_step, JsonFrameError};
+    fn process_json_frame(
+        &mut self,
+        program: eredu_text::semantic_channels::JsonToolProgram<'_>,
+        frame: eredu_text::semantic_channels::JsonFrame,
+        sink: &mut SemanticEventSink,
+    ) -> Result<bool, String> {
+        use eredu_text::semantic_channels::{JsonFrameError, json_frame_step};
         let step = match json_frame_step(program, frame, &self.pending) {
             Ok(step) => step,
             Err(failure) => {
@@ -2001,9 +1939,25 @@ impl DeclarativeParser {
             }
         };
         self.pending.drain(..step.consume_before);
-        if step.end_call { sink.end_tool_call()?; }
+        if step.end_call {
+            sink.end_tool_call()?;
+        }
         self.pending.drain(..step.consume_after);
         self.state = self.json_state(step.next);
+        Ok(step.wait)
+    }
+
+    fn process_tagged_frame(&mut self, program: eredu_text::semantic_channels::tagged::TaggedToolProgram<'_>,
+        frame: eredu_text::semantic_channels::tagged::TaggedFrame, sink: &mut SemanticEventSink) -> Result<bool, String> {
+        use eredu_text::semantic_channels::tagged::{TaggedFrame as F, tagged_frame_step};
+        let step = tagged_frame_step(program, frame, &self.pending).map_err(|e| e.to_string())?;
+        self.pending.drain(..step.consumed);
+        if step.end_call { sink.end_tool_call()?; }
+        self.state = match step.next { F::ToolStart => DeclarativeParserState::ToolStart,
+            F::Payload => DeclarativeParserState::Tagged(Default::default()),
+            F::AfterPayload => DeclarativeParserState::AfterPayload,
+            F::AfterEnvelope => DeclarativeParserState::AfterEnvelope,
+            F::Outside => DeclarativeParserState::Outside };
         Ok(step.wait)
     }
 
@@ -2017,9 +1971,23 @@ impl DeclarativeParser {
                 }
                 continue;
             }
-            if let (Some(program), Some(frame)) = (channels::json_tools(self.spec), self.json_frame()) {
-                if self.process_json_frame(program, frame, sink)? { return Ok(()); }
+            if let (Some(program), Some(frame)) =
+                (channels::json_tools(self.spec), self.json_frame())
+            {
+                if self.process_json_frame(program, frame, sink)? {
+                    return Ok(());
+                }
                 continue;
+            }
+            if let Some(eredu_text::semantic_channels::tagged::ToolProgram::Tagged(program)) = channels::tools(self.spec) {
+                use eredu_text::semantic_channels::tagged::TaggedFrame as F;
+                let frame = match self.state { DeclarativeParserState::ToolStart => Some(F::ToolStart),
+                    DeclarativeParserState::AfterPayload => Some(F::AfterPayload),
+                    DeclarativeParserState::AfterEnvelope => Some(F::AfterEnvelope), _ => None };
+                if let Some(frame) = frame {
+                    if self.process_tagged_frame(program, frame, sink)? { return Ok(()); }
+                    continue;
+                }
             }
             match &mut self.state {
                 DeclarativeParserState::PrefilledChannelOrTool { .. }
@@ -2034,7 +2002,9 @@ impl DeclarativeParser {
                         | DeclarativePayloadShape::StructuralObject(_) => {
                             self.spec.call.prefix.to_owned()
                         }
-                        DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => unreachable!("shared JSON framing"),
+                        DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
+                            unreachable!("shared JSON framing")
+                        }
                     };
                     if !self.consume_exact(&expected)? {
                         return Ok(());
@@ -2043,7 +2013,9 @@ impl DeclarativeParser {
                 }
                 DeclarativeParserState::JsonEnvelopeStart
                 | DeclarativeParserState::ListItemOrEnd { .. }
-                | DeclarativeParserState::AfterJsonFunctionSuffix => unreachable!("shared JSON framing"),
+                | DeclarativeParserState::AfterJsonFunctionSuffix => {
+                    unreachable!("shared JSON framing")
+                }
                 DeclarativeParserState::JsonPayload(json) => {
                     if self.pending.is_empty() {
                         return Ok(());
@@ -2131,207 +2103,24 @@ impl DeclarativeParser {
                     }
                     self.state = DeclarativeParserState::AfterPayload;
                 }
-                DeclarativeParserState::TaggedFunctionPrefix => {
-                    let DeclarativePayloadShape::TaggedParameters(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("tagged-function state requires tagged parameters")
+                DeclarativeParserState::Tagged(call) => {
+                    use eredu_text::semantic_channels::tagged::TaggedEvent;
+                    let DeclarativePayloadShape::TaggedParameters(encoding) = self.spec.payload_shape else {
+                        unreachable!("tagged state requires tagged declaration");
                     };
-                    discard_tagged_whitespace(&mut self.pending);
-                    if !self.consume_exact(encoding.function_prefix)? {
-                        return Ok(());
-                    }
-                    self.state = DeclarativeParserState::TaggedFunctionName;
-                }
-                DeclarativeParserState::TaggedFunctionName => {
-                    let DeclarativePayloadShape::TaggedParameters(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("tagged-function state requires tagged parameters")
-                    };
-                    let Some(position) = self.pending.find(encoding.function_name_suffix) else {
-                        return Ok(());
-                    };
-                    let name = self.pending[..position].to_owned();
-                    if !self.tagged_tools.contains_key(&name) {
-                        return Err(format!("unknown tagged tool function {name:?}"));
-                    }
-                    self.pending
-                        .drain(..position + encoding.function_name_suffix.len());
-                    let id = format!("call_{}", sink.next_tool_index());
-                    sink.start_tool_call(id, name.clone());
-                    self.state = DeclarativeParserState::TaggedParameterOrEnd {
-                        tool: name,
-                        arguments: serde_json::Map::new(),
-                    };
-                }
-                DeclarativeParserState::TaggedParameterOrEnd { tool, arguments } => {
-                    let DeclarativePayloadShape::TaggedParameters(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("tagged-parameter state requires tagged parameters")
-                    };
-                    discard_tagged_whitespace(&mut self.pending);
-                    if self.pending.starts_with(encoding.function_suffix) {
-                        let schema = self
-                            .tagged_tools
-                            .get(tool)
-                            .expect("selected tagged tool has a schema");
-                        if let Some(missing) = schema
-                            .required
-                            .iter()
-                            .find(|name| !arguments.contains_key(*name))
-                        {
-                            return Err(format!(
-                                "tagged tool {tool:?} is missing required parameter {missing:?}"
-                            ));
-                        }
-                        self.pending.drain(..encoding.function_suffix.len());
-                        let arguments =
-                            serde_json::to_string(&Value::Object(std::mem::take(arguments)))
-                                .expect("tagged arguments serialize as JSON");
-                        sink.tool_arguments(&arguments);
-                        self.state = DeclarativeParserState::AfterPayload;
-                    } else if self.pending.starts_with(encoding.parameter_prefix) {
-                        self.pending.drain(..encoding.parameter_prefix.len());
-                        self.state = DeclarativeParserState::TaggedParameterName {
-                            tool: std::mem::take(tool),
-                            arguments: std::mem::take(arguments),
-                        };
-                    } else if encoding.function_suffix.starts_with(&self.pending)
-                        || encoding.parameter_prefix.starts_with(&self.pending)
-                    {
-                        return Ok(());
-                    } else {
-                        return Err(format!(
-                            "expected tagged parameter or function closing delimiter for {tool:?}"
-                        ));
-                    }
-                }
-                DeclarativeParserState::TaggedParameterName { tool, arguments } => {
-                    let DeclarativePayloadShape::TaggedParameters(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("tagged-parameter state requires tagged parameters")
-                    };
-                    let Some(position) = self.pending.find(encoding.parameter_name_suffix) else {
-                        return Ok(());
-                    };
-                    let parameter = self.pending[..position].to_owned();
-                    validate_tagged_parameter_name(&parameter)?;
-                    if arguments.contains_key(&parameter) {
-                        return Err(format!(
-                            "tagged tool {tool:?} repeats parameter {parameter:?}"
-                        ));
-                    }
-                    self.pending
-                        .drain(..position + encoding.parameter_name_suffix.len());
-                    self.state = DeclarativeParserState::TaggedParameterValue {
-                        tool: std::mem::take(tool),
-                        parameter,
-                        arguments: std::mem::take(arguments),
-                        header_consumed: false,
-                        declared_type: None,
-                    };
-                }
-                DeclarativeParserState::TaggedParameterValue {
-                    tool,
-                    parameter,
-                    arguments,
-                    header_consumed,
-                    declared_type,
-                } => {
-                    let DeclarativePayloadShape::TaggedParameters(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("tagged-parameter state requires tagged parameters")
-                    };
-                    if !*header_consumed {
-                        // Retain the complete header until it is available, so a
-                        // split inside either tag cannot consume it twice.
-                        let mut header = self.pending.as_str();
-                        if let Some(tag) = encoding.parameter_type {
-                            header = header.trim_start_matches([' ', '\t', '\r', '\n']);
-                            let Some(tail) = header.strip_prefix(tag.prefix) else {
-                                if tag.prefix.starts_with(header) {
-                                    return Ok(());
-                                }
-                                return Err("expected tagged parameter type".into());
-                            };
-                            let Some(end) = tail.find(tag.suffix) else {
-                                return Ok(());
-                            };
-                            *declared_type = Some(tail[..end].to_owned());
-                            header = &tail[end + tag.suffix.len()..];
-                        }
-                        if !encoding.parameter_value_prefix.is_empty() {
-                            header = header.trim_start_matches([' ', '\t', '\r', '\n']);
-                            let Some(tail) = header.strip_prefix(encoding.parameter_value_prefix)
-                            else {
-                                if encoding.parameter_value_prefix.starts_with(header) {
-                                    return Ok(());
-                                }
-                                return Err("expected tagged parameter value".into());
-                            };
-                            header = tail;
-                        }
-                        let consumed = self.pending.len() - header.len();
-                        self.pending.drain(..consumed);
-                        *header_consumed = true;
-                    }
-                    let Some(position) = self.pending.find(encoding.parameter_suffix) else {
-                        return Ok(());
-                    };
-                    let raw = if encoding.strip_value_framing {
-                        tagged_value_text(&self.pending[..position])
-                    } else {
-                        &self.pending[..position]
-                    };
-                    let schema = &self
-                        .tagged_tools
-                        .get(tool)
-                        .expect("selected tagged tool has a schema")
-                        .parameters
-                        .get(parameter)
-                        .unwrap_or(&Value::Bool(true));
-                    let kind = match declared_type.as_deref() {
-                        Some("string") => TaggedValueKind::RawString,
-                        Some(_) if tagged_schema_has_union(schema) => TaggedValueKind::Json,
-                        _ => tagged_value_kind(schema)?,
-                    };
-                    let value = match kind {
-                        TaggedValueKind::RawString => Value::String(raw.to_owned()),
-                        TaggedValueKind::RawStringOrJson => {
-                            serde_json::from_str(raw).ok()
-                                .filter(|value| tagged_value_matches_schema(value, schema))
-                                .unwrap_or_else(|| Value::String(raw.to_owned()))
-                        }
-                        TaggedValueKind::Json => serde_json::from_str(raw).map_err(|error| {
-                            format!(
-                                "tagged tool {tool:?} parameter {parameter:?} contains invalid JSON: {error}"
-                            )
-                        })?,
-                    };
-                    if let Some(declared) = declared_type {
-                        let expected = tagged_type_name(schema, Some(&value));
-                        if *declared != expected {
-                            return Err(format!(
-                                "tagged parameter {parameter:?} declares type {declared:?}; expected {expected:?}"
-                            ));
+                    let (consumed, wait, event) = call.advance(encoding.program(), &self.pending,
+                        &OrdinaryTaggedSchemas(&self.tagged_tools), &serde_json::allocation::Unenforced)
+                        .map_err(|error| error.to_string())?;
+                    self.pending.drain(..consumed);
+                    match event {
+                        TaggedEvent::None => {},
+                        TaggedEvent::Start => sink.start_tool_call(format!("call_{}", sink.next_tool_index()), call.name().to_owned()),
+                        TaggedEvent::Complete => {
+                            sink.tool_arguments(call.arguments());
+                            self.state = DeclarativeParserState::AfterPayload;
                         }
                     }
-                    if !tagged_value_matches_schema(&value, schema) {
-                        return Err(format!(
-                            "tagged tool {tool:?} parameter {parameter:?} has the wrong type or value"
-                        ));
-                    }
-                    arguments.insert(parameter.clone(), value);
-                    self.pending
-                        .drain(..position + encoding.parameter_suffix.len());
-                    self.state = DeclarativeParserState::TaggedParameterOrEnd {
-                        tool: std::mem::take(tool),
-                        arguments: std::mem::take(arguments),
-                    };
+                    if wait { return Ok(()); }
                 }
                 DeclarativeParserState::StructuralName { prefix_consumed } => {
                     let DeclarativePayloadShape::StructuralObject(encoding) =
@@ -2382,7 +2171,9 @@ impl DeclarativeParser {
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::AfterPayload => match self.spec.payload_shape {
-                    DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => unreachable!("shared JSON framing"),
+                    DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
+                        unreachable!("shared JSON framing")
+                    }
                     DeclarativePayloadShape::NamedJsonArguments(encoding) => {
                         let expected =
                             format!("{}{}", encoding.arguments_suffix, self.spec.call.suffix);
@@ -2411,40 +2202,9 @@ impl DeclarativeParser {
                             DeclarativeParserState::AfterEnvelope
                         };
                     }
-                    DeclarativePayloadShape::TaggedParameters(_) => {
-                        discard_tagged_whitespace(&mut self.pending);
-                        if !self.consume_exact(self.spec.call.suffix)? {
-                            return Ok(());
-                        }
-                        sink.end_tool_call()?;
-                        self.state = DeclarativeParserState::AfterEnvelope;
-                    }
+                    DeclarativePayloadShape::TaggedParameters(_) => unreachable!("shared tagged framing"),
                 },
                 DeclarativeParserState::AfterEnvelope => {
-                    if matches!(
-                        self.spec.payload_shape,
-                        DeclarativePayloadShape::TaggedParameters(_)
-                    ) {
-                        discard_tagged_whitespace(&mut self.pending);
-                        if self.pending.is_empty() {
-                            return Ok(());
-                        }
-                        if !self.spec.output.suffix.is_empty() {
-                            if self.pending.starts_with(self.spec.output.suffix) {
-                                self.pending.drain(..self.spec.output.suffix.len());
-                                self.state = DeclarativeParserState::Outside;
-                                continue;
-                            }
-                            if self.spec.output.suffix.starts_with(&self.pending) {
-                                return Ok(());
-                            }
-                        }
-                        if !self.consume_exact(self.spec.call.prefix)? {
-                            return Ok(());
-                        }
-                        self.state = self.start_call_payload_state();
-                        continue;
-                    }
                     if !self.spec.output.suffix.is_empty()
                         && self.pending.starts_with(self.spec.output.suffix)
                     {
@@ -2495,15 +2255,20 @@ struct JsonCallContext<'a> {
 impl eredu_text::json_fragments::ObjectContext for JsonCallContext<'_> {
     type Key = String;
     type Error = String;
-    fn raw_len(&self) -> usize { self.data.fragment.len() }
+    fn raw_len(&self) -> usize {
+        self.data.fragment.len()
+    }
     fn append(&mut self, character: char) -> Result<(), String> {
-        self.data.fragment.push(character); Ok(())
+        self.data.fragment.push(character);
+        Ok(())
     }
     fn key(&mut self, raw: std::ops::Range<usize>) -> Result<String, String> {
         let key: String = serde_json::from_str(&self.data.fragment[raw])
             .map_err(|error| format!("invalid declarative tool-call field name: {error}"))?;
         if !self.data.fields.insert(key.clone()) {
-            return Err(format!("declarative tool call contains duplicate field {key:?}"));
+            return Err(format!(
+                "declarative tool call contains duplicate field {key:?}"
+            ));
         }
         Ok(key)
     }
@@ -2515,10 +2280,19 @@ impl eredu_text::json_fragments::ObjectContext for JsonCallContext<'_> {
     }
 }
 impl IncrementalJsonCall {
-    fn push(&mut self, input: &str, function: &JsonFunctionEnvelope, sink: &mut SemanticEventSink)
-        -> Result<(usize, bool), String>
-    {
-        let (consumed, complete) = self.cursor.push(input, &mut JsonCallContext { data: &mut self.data, function })?;
+    fn push(
+        &mut self,
+        input: &str,
+        function: &JsonFunctionEnvelope,
+        sink: &mut SemanticEventSink,
+    ) -> Result<(usize, bool), String> {
+        let (consumed, complete) = self.cursor.push(
+            input,
+            &mut JsonCallContext {
+                data: &mut self.data,
+                function,
+            },
+        )?;
         self.data.maybe_start(function, sink)?;
         if self.data.started {
             let visible_arguments = match self.cursor.active_value(self.data.fragment.len()) {
@@ -2530,23 +2304,39 @@ impl IncrementalJsonCall {
                 self.data.arguments_emitted = visible_arguments.len();
             }
         }
-        if complete { self.data.validate_complete(function)?; }
+        if complete {
+            self.data.validate_complete(function)?;
+        }
         Ok((consumed, complete))
     }
 }
 impl JsonCallData {
-    fn finish_field(&mut self, key: String, raw: std::ops::Range<usize>, function: &JsonFunctionEnvelope) -> Result<(), String> {
+    fn finish_field(
+        &mut self,
+        key: String,
+        raw: std::ops::Range<usize>,
+        function: &JsonFunctionEnvelope,
+    ) -> Result<(), String> {
         let raw = &self.fragment[raw];
         let parsed: Value = serde_json::from_str(raw).map_err(|error| {
             format!("invalid declarative tool-call JSON field {key:?}: {error}")
         })?;
         use eredu_text::json_fragments::{JsonFieldRole, JsonValueKind};
         let fields = function.fields();
-        match fields.inspect(&key, JsonValueKind::of(&parsed), parsed.as_str())
-            .map_err(|cause| cause.display(fields).to_string())? {
-            JsonFieldRole::Name => self.name = Some(parsed.as_str().expect("validated name").to_owned()),
-            JsonFieldRole::Arguments => { self.arguments = raw.to_owned(); self.arguments_seen = true; }
-            JsonFieldRole::CallId => self.id = Some(parsed.as_str().expect("validated ID").to_owned()),
+        match fields
+            .inspect(&key, JsonValueKind::of(&parsed), parsed.as_str())
+            .map_err(|cause| cause.display(fields).to_string())?
+        {
+            JsonFieldRole::Name => {
+                self.name = Some(parsed.as_str().expect("validated name").to_owned())
+            }
+            JsonFieldRole::Arguments => {
+                self.arguments = raw.to_owned();
+                self.arguments_seen = true;
+            }
+            JsonFieldRole::CallId => {
+                self.id = Some(parsed.as_str().expect("validated ID").to_owned())
+            }
             JsonFieldRole::Other => (),
         }
         Ok(())
@@ -2570,7 +2360,8 @@ impl JsonCallData {
             id
         } else {
             let mut id = String::new();
-            eredu_text::json_fragments::write_generated_call_id(&mut id, sink.next_tool_index()).expect("String writer");
+            eredu_text::json_fragments::write_generated_call_id(&mut id, sink.next_tool_index())
+                .expect("String writer");
             id
         };
         sink.start_tool_call(id, name);
@@ -2585,7 +2376,8 @@ impl JsonCallData {
             return Err("declarative tool call must be a JSON object".into());
         }
         let fields = function.fields();
-        fields.complete(self.name.is_some(), self.arguments_seen, self.id.is_some())
+        fields
+            .complete(self.name.is_some(), self.arguments_seen, self.id.is_some())
             .map_err(|cause| cause.display(fields).to_string())?;
         Ok(())
     }
@@ -2898,11 +2690,7 @@ impl ProtocolParser for DeclarativeParser {
                 kind: ChannelKind::Text,
                 ..
             } => sink.text(std::mem::take(&mut self.pending)),
-            DeclarativeParserState::TaggedFunctionPrefix
-            | DeclarativeParserState::TaggedFunctionName
-            | DeclarativeParserState::TaggedParameterOrEnd { .. }
-            | DeclarativeParserState::TaggedParameterName { .. }
-            | DeclarativeParserState::TaggedParameterValue { .. } => {
+            DeclarativeParserState::Tagged(_) => {
                 return Err("incomplete tagged-parameter tool call".into());
             }
             DeclarativeParserState::AfterPayload
@@ -3220,13 +3008,13 @@ mod tests {
     }
 
     fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
-        let mut state = plan.generation_constraint().grammar_state();
+        let mut state = plan.generation_constraint().grammar_matcher();
         for byte in text.bytes() {
-            if state.commit(byte as TokenId).is_err() {
+            if state.consume_token(byte as TokenId).is_err() {
                 return false;
             }
         }
-        state.is_complete().unwrap()
+        state.is_accepting().unwrap()
     }
 
     fn event_text(events: &[SemanticEvent], reasoning: bool) -> String {
@@ -3666,10 +3454,10 @@ mod tests {
             .strip_suffix("<|tool_response>")
             .expect("profile stop is not part of the grammar");
         if !accepts(&plan, grammar_output) {
-            let mut state = plan.generation_constraint().grammar_state();
+            let mut state = plan.generation_constraint().grammar_matcher();
             for (index, byte) in grammar_output.bytes().enumerate() {
                 state
-                    .commit(byte as TokenId)
+                    .consume_token(byte as TokenId)
                     .unwrap_or_else(|error| panic!("rejected byte {index}: {error}"));
             }
             panic!("structural grammar did not accept its completed output");
@@ -4317,14 +4105,14 @@ mod tests {
                 vec![250],
             )
             .unwrap();
-        let mut literal_state = plan.generation_constraint().grammar_state();
-        assert!(literal_state.commit(u32::from(b'[')).is_err());
-        let mut state = plan.generation_constraint().grammar_state();
-        state.commit(250).unwrap();
+        let mut literal_state = plan.generation_constraint().grammar_matcher();
+        assert!(literal_state.consume_token(u32::from(b'[')).is_err());
+        let mut state = plan.generation_constraint().grammar_matcher();
+        state.consume_token(250).unwrap();
         for byte in br#"[{"name":"lookup","arguments":{"value":1},"id":"abc123456"}]"# {
-            state.commit(u32::from(*byte)).unwrap();
+            state.consume_token(u32::from(*byte)).unwrap();
         }
-        assert!(state.is_complete().unwrap());
+        assert!(state.is_accepting().unwrap());
     }
 
     #[test]
@@ -4559,17 +4347,21 @@ mod tests {
         fn constraint_configuration(
             &self,
             parameters: DialectParameters,
-            _tools: &[Value],
+            _tools: &[crate::runtime::chat::tool_schema::ToolDefinition<'_>],
             _tool_choice: ToolChoice,
             _parallel_tool_calls: ParallelToolCallPolicy,
             _resolved_structural_token_ids: &[u32],
-        ) -> Result<ConstraintConfiguration, String> {
+            funding: &llguidance::derivre::ParserAllocationFunding,
+        ) -> Result<ConstraintConfiguration, super::GrammarError> {
             let parameters = parameters.custom::<CustomParameters>()?;
             Ok(ConstraintConfiguration {
-                grammar: TopLevelGrammar::from_lark(format!(
-                    "start: {}",
-                    serde_json::to_string(parameters.literal).unwrap()
-                )),
+                grammar: crate::runtime::chat::grammar_text::lark(
+                    format!(
+                        "start: {}",
+                        serde_json::to_string(parameters.literal).unwrap()
+                    ),
+                    funding,
+                )?,
             })
         }
 
@@ -4649,3 +4441,6 @@ mod tests {
         assert_eq!(event_text(sink.events(), false), "custom");
     }
 }
+
+#[cfg(test)]
+mod producer_tests;

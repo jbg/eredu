@@ -12,6 +12,54 @@ use referencing::{Uri, Vocabulary};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
+fn typed_item_errors<'i, F: Json>(
+    instance: &F::Node<'i>,
+    location: &LazyLocation,
+    tracker: Option<&RefTracker>,
+    schema_path: &Location,
+    expected: JsonType,
+    valid: impl Fn(&F::Node<'i>) -> bool,
+    ctx: &mut ValidationContext,
+    mut output: Option<&mut Vec<ValidationError<'i>>>,
+) -> Result<(), ValidationError<'i>> {
+    let Some(array) = instance.as_array() else {
+        return Ok(());
+    };
+    if !ctx.workspace.reserve(
+        std::mem::size_of_val(&valid).checked_add(std::mem::size_of::<(
+            JsonType,
+            usize,
+            F::Node<'i>,
+            Option<&mut Vec<ValidationError<'i>>>,
+        )>()),
+    ) {
+        return Ok(());
+    }
+    for (index, item) in array.elements().enumerate() {
+        if !valid(&item) {
+            if let Err(error) =
+                ctx.diagnostic::<F>(&item, &location.push(index), tracker, schema_path, |_| {
+                    Ok(crate::error::ValidationErrorKind::Type {
+                        kind: crate::error::TypeKind::Single(expected),
+                    })
+                })
+            {
+                if let Some(errors) = output.as_deref_mut() {
+                    if !ctx.workspace.push(errors, error) {
+                        return Ok(());
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+            if ctx.workspace.failed() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct ItemsArrayValidator<F: Json = SerdeJson> {
     items: Vec<SchemaNode<F>>,
 }
@@ -21,18 +69,22 @@ impl ItemsArrayValidator {
         ctx: &compiler::Context<F>,
         schemas: &'a [Value],
     ) -> CompilationResult<'a, F> {
-        let kctx = ctx.new_at_location("items");
-        let mut items = Vec::with_capacity(schemas.len());
+        let kctx = ctx.new_at_location("items")?;
+        let mut items = Vec::new();
+        ctx.funding().grow(&mut items, schemas.len())?;
         for (idx, item) in schemas.iter().enumerate() {
-            let ictx = kctx.new_at_location(idx);
+            let ictx = kctx.new_at_location(idx)?;
             let validators = compiler::compile(&ictx, ictx.as_resource_ref(item))?;
             items.push(validators);
         }
-        Ok(Box::new(ItemsArrayValidator { items }))
+        Ok(ctx.funding().boxed(ItemsArrayValidator { items })?)
     }
 }
 impl<F: Json> Validate<F> for ItemsArrayValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.nodes(&self.items)
     }
 
@@ -40,11 +92,15 @@ impl<F: Json> Validate<F> for ItemsArrayValidator<F> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             for (item, node) in array.elements().zip(self.items.iter()) {
@@ -58,7 +114,7 @@ impl<F: Json> Validate<F> for ItemsArrayValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -73,7 +129,7 @@ impl<F: Json> Validate<F> for ItemsArrayValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -118,13 +174,16 @@ impl ItemsObjectValidator {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("items");
+        let ctx = ctx.new_at_location("items")?;
         let node = compiler::compile(&ctx, ctx.as_resource_ref(schema))?;
-        Ok(Box::new(ItemsObjectValidator { node }))
+        Ok(ctx.funding().boxed(ItemsObjectValidator { node })?)
     }
 }
 impl<F: Json> Validate<F> for ItemsObjectValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -132,11 +191,15 @@ impl<F: Json> Validate<F> for ItemsObjectValidator<F> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| self.node.is_valid(&item, ctx))
@@ -145,7 +208,7 @@ impl<F: Json> Validate<F> for ItemsObjectValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -161,7 +224,7 @@ impl<F: Json> Validate<F> for ItemsObjectValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -217,17 +280,19 @@ impl ItemsObjectSkipPrefixValidator {
         skip_prefix: usize,
         ctx: &compiler::Context<F>,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("items");
+        let ctx = ctx.new_at_location("items")?;
         let node = compiler::compile(&ctx, ctx.as_resource_ref(schema))?;
-        Ok(Box::new(ItemsObjectSkipPrefixValidator {
-            node,
-            skip_prefix,
-        }))
+        Ok(ctx
+            .funding()
+            .boxed(ItemsObjectSkipPrefixValidator { node, skip_prefix })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsObjectSkipPrefixValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -235,11 +300,15 @@ impl<F: Json> Validate<F> for ItemsObjectSkipPrefixValidator<F> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array
@@ -251,7 +320,7 @@ impl<F: Json> Validate<F> for ItemsObjectSkipPrefixValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -267,7 +336,7 @@ impl<F: Json> Validate<F> for ItemsObjectSkipPrefixValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -325,13 +394,19 @@ pub(crate) struct ItemsNumberTypeValidator {
 
 impl ItemsNumberTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ItemsNumberTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ItemsNumberTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsNumberTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -340,11 +415,15 @@ impl<F: Json> Validate<F> for ItemsNumberTypeValidator {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| item.is_number())
@@ -353,54 +432,41 @@ impl<F: Json> Validate<F> for ItemsNumberTypeValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(array) = instance.as_array() {
-            for (idx, item) in array.elements().enumerate() {
-                if !item.is_number() {
-                    return Err(ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Number,
-                    ));
-                }
-            }
-        }
-        Ok(())
+        typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Number,
+            |item| item.is_number(),
+            ctx,
+            None,
+        )
     }
-
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        let Some(array) = instance.as_array() else {
-            return;
-        };
-        errors.extend(
-            array
-                .elements()
-                .enumerate()
-                .filter(|(_, item)| !item.is_number())
-                .map(|(idx, item)| {
-                    ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Number,
-                    )
-                }),
+        let _ = typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Number,
+            |item| item.is_number(),
+            ctx,
+            Some(errors),
         );
     }
 
@@ -446,13 +512,19 @@ pub(crate) struct ItemsStringTypeValidator {
 
 impl ItemsStringTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ItemsStringTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(ItemsStringTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsStringTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -461,11 +533,15 @@ impl<F: Json> Validate<F> for ItemsStringTypeValidator {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| item.is_string())
@@ -474,54 +550,41 @@ impl<F: Json> Validate<F> for ItemsStringTypeValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(array) = instance.as_array() {
-            for (idx, item) in array.elements().enumerate() {
-                if !item.is_string() {
-                    return Err(ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::String,
-                    ));
-                }
-            }
-        }
-        Ok(())
+        typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::String,
+            |item| item.is_string(),
+            ctx,
+            None,
+        )
     }
-
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        let Some(array) = instance.as_array() else {
-            return;
-        };
-        errors.extend(
-            array
-                .elements()
-                .enumerate()
-                .filter(|(_, item)| !item.is_string())
-                .map(|(idx, item)| {
-                    ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::String,
-                    )
-                }),
+        let _ = typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::String,
+            |item| item.is_string(),
+            ctx,
+            Some(errors),
         );
     }
 
@@ -567,26 +630,40 @@ pub(crate) struct ItemsIntegerTypeValidator {
 
 impl ItemsIntegerTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ItemsIntegerTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx
+            .funding()
+            .boxed(ItemsIntegerTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsIntegerTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
     #[inline]
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature="arbitrary-precision") {return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision integer classification")));}
+
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| {
@@ -598,61 +675,47 @@ impl<F: Json> Validate<F> for ItemsIntegerTypeValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(array) = instance.as_array() {
-            for (idx, item) in array.elements().enumerate() {
-                let valid = item
-                    .as_number()
-                    .is_some_and(|n| super::type_::is_integer(&n));
-                if !valid {
-                    return Err(ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Integer,
-                    ));
-                }
-            }
-        }
-        Ok(())
+        typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Integer,
+            |item| {
+                item.as_number()
+                    .is_some_and(|number| super::type_::is_integer(&number))
+            },
+            ctx,
+            None,
+        )
     }
-
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        let Some(array) = instance.as_array() else {
-            return;
-        };
-        errors.extend(
-            array
-                .elements()
-                .enumerate()
-                .filter(|(_, item)| {
-                    !item
-                        .as_number()
-                        .is_some_and(|n| super::type_::is_integer(&n))
-                })
-                .map(|(idx, item)| {
-                    ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Integer,
-                    )
-                }),
+        let _ = typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Integer,
+            |item| {
+                item.as_number()
+                    .is_some_and(|number| super::type_::is_integer(&number))
+            },
+            ctx,
+            Some(errors),
         );
     }
 
@@ -703,26 +766,40 @@ pub(crate) struct ItemsIntegerTypeValidatorDraft4 {
 
 impl ItemsIntegerTypeValidatorDraft4 {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ItemsIntegerTypeValidatorDraft4 { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx
+            .funding()
+            .boxed(ItemsIntegerTypeValidatorDraft4 { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsIntegerTypeValidatorDraft4 {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
     #[inline]
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature="arbitrary-precision") {return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision integer classification")));}
+
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| {
@@ -734,61 +811,47 @@ impl<F: Json> Validate<F> for ItemsIntegerTypeValidatorDraft4 {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(array) = instance.as_array() {
-            for (idx, item) in array.elements().enumerate() {
-                let valid = item
-                    .as_number()
-                    .is_some_and(|n| super::legacy::type_draft_4::is_integer(&n));
-                if !valid {
-                    return Err(ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Integer,
-                    ));
-                }
-            }
-        }
-        Ok(())
+        typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Integer,
+            |item| {
+                item.as_number()
+                    .is_some_and(|number| super::legacy::type_draft_4::is_integer(&number))
+            },
+            ctx,
+            None,
+        )
     }
-
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        let Some(array) = instance.as_array() else {
-            return;
-        };
-        errors.extend(
-            array
-                .elements()
-                .enumerate()
-                .filter(|(_, item)| {
-                    !item
-                        .as_number()
-                        .is_some_and(|n| super::legacy::type_draft_4::is_integer(&n))
-                })
-                .map(|(idx, item)| {
-                    ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Integer,
-                    )
-                }),
+        let _ = typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Integer,
+            |item| {
+                item.as_number()
+                    .is_some_and(|number| super::legacy::type_draft_4::is_integer(&number))
+            },
+            ctx,
+            Some(errors),
         );
     }
 
@@ -838,13 +901,21 @@ pub(crate) struct ItemsBooleanTypeValidator {
 
 impl ItemsBooleanTypeValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(ItemsBooleanTypeValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
+        location: Location,
+    ) -> CompilationResult<'a, F> {
+        Ok(ctx
+            .funding()
+            .boxed(ItemsBooleanTypeValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for ItemsBooleanTypeValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -853,11 +924,15 @@ impl<F: Json> Validate<F> for ItemsBooleanTypeValidator {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array.elements().all(|item| item.as_boolean().is_some())
@@ -866,54 +941,41 @@ impl<F: Json> Validate<F> for ItemsBooleanTypeValidator {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if let Some(array) = instance.as_array() {
-            for (idx, item) in array.elements().enumerate() {
-                if item.as_boolean().is_none() {
-                    return Err(ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Boolean,
-                    ));
-                }
-            }
-        }
-        Ok(())
+        typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Boolean,
+            |item| item.as_boolean().is_some(),
+            ctx,
+            None,
+        )
     }
-
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
         errors: &mut Vec<ValidationError<'i>>,
     ) {
-        let Some(array) = instance.as_array() else {
-            return;
-        };
-        errors.extend(
-            array
-                .elements()
-                .enumerate()
-                .filter(|(_, item)| item.as_boolean().is_none())
-                .map(|(idx, item)| {
-                    ValidationError::single_type_error(
-                        self.location.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &self.location),
-                        (&location.push(idx)).into(),
-                        item.to_value(),
-                        JsonType::Boolean,
-                    )
-                }),
+        let _ = typed_item_errors::<F>(
+            instance,
+            location,
+            tracker,
+            &self.location,
+            JsonType::Boolean,
+            |item| item.as_boolean().is_some(),
+            ctx,
+            Some(errors),
         );
     }
 
@@ -974,38 +1036,43 @@ impl<F: Json> FusedItems<F> {
     fn compile<'a>(
         ctx: &compiler::Context<F>,
         items: &'a Value,
-    ) -> Result<Self, ValidationError<'a>> {
+    ) -> Result<Self, crate::compilation::CompileError<'a>> {
         if let Some(type_name) = get_simple_type_schema(items) {
-            let location = ctx.location().join("items").join("type");
+            let location = ctx
+                .location()
+                .join_with_funding("items", ctx.funding())?
+                .join_with_funding("type", ctx.funding())?;
             match type_name {
                 "number" => {
                     return Ok(FusedItems::Number(ItemsNumberTypeValidator::compile(
-                        location,
+                        ctx, location,
                     )?))
                 }
                 "string" => {
                     return Ok(FusedItems::String(ItemsStringTypeValidator::compile(
-                        location,
+                        ctx, location,
                     )?))
                 }
                 "boolean" => {
                     return Ok(FusedItems::Boolean(ItemsBooleanTypeValidator::compile(
-                        location,
+                        ctx, location,
                     )?))
                 }
                 "integer" => {
                     return Ok(if ctx.draft() == Draft::Draft4 {
                         FusedItems::IntegerDraft4(ItemsIntegerTypeValidatorDraft4::compile(
-                            location,
+                            ctx, location,
                         )?)
                     } else {
-                        FusedItems::IntegerDraft7(ItemsIntegerTypeValidator::compile(location)?)
+                        FusedItems::IntegerDraft7(ItemsIntegerTypeValidator::compile(
+                            ctx, location,
+                        )?)
                     });
                 }
                 _ => {}
             }
         }
-        let ctx = ctx.new_at_location("items");
+        let ctx = ctx.new_at_location("items")?;
         Ok(FusedItems::Generic(compiler::compile(
             &ctx,
             ctx.as_resource_ref(items),
@@ -1031,73 +1098,73 @@ impl ArrayShapeValidator {
         items: &'a Value,
     ) -> CompilationResult<'a, F> {
         let items = FusedItems::compile(ctx, items)?;
-        let type_location = ctx.location().join("type");
-        let type_absolute_location = ctx.absolute_location(&type_location);
-        let constraint = |key: &str| -> Option<CountConstraint> {
-            let limit = accepts_item_count(ctx, parent.get(key)?)?;
-            let location = ctx.location().join(key);
-            let absolute_location = ctx.absolute_location(&location);
-            Some(CountConstraint {
+        let type_location = ctx.location().join_with_funding("type", ctx.funding())?;
+        let type_absolute_location = ctx.absolute_location(&type_location)?;
+        let constraint = |key: &str| -> Result<Option<CountConstraint>, crate::CompilationError> {
+            let Some(limit) = parent
+                .get(key)
+                .and_then(|value| accepts_item_count(ctx, value))
+            else {
+                return Ok(None);
+            };
+            let location = ctx.location().join_with_funding(key, ctx.funding())?;
+            let absolute_location = ctx.absolute_location(&location)?;
+            Ok(Some(CountConstraint {
                 limit,
                 location,
                 absolute_location,
-            })
+            }))
         };
-        Ok(Box::new(ArrayShapeValidator {
+        Ok(ctx.funding().boxed(ArrayShapeValidator {
             items,
-            min_items: constraint("minItems"),
-            max_items: constraint("maxItems"),
+            min_items: constraint("minItems")?,
+            max_items: constraint("maxItems")?,
             type_location,
             type_absolute_location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> ArrayShapeValidator<F> {
-    fn type_error<'i>(
+    fn type_failure<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-    ) -> ValidationError<'i> {
-        ValidationError::single_type_error(
-            self.type_location.clone(),
-            crate::paths::capture_evaluation_path(tracker, &self.type_location),
-            location.into(),
-            instance.to_value(),
-            JsonType::Array,
-        )
+        ctx: &mut ValidationContext,
+    ) -> Result<(), ValidationError<'i>> {
+        ctx.diagnostic::<F>(instance, location, tracker, &self.type_location, |_| {
+            Ok(crate::error::ValidationErrorKind::Type {
+                kind: crate::error::TypeKind::Single(JsonType::Array),
+            })
+        })
     }
 }
-
 fn min_items_error<'i, F: Json>(
     constraint: &CountConstraint,
     instance: &F::Node<'i>,
     location: &LazyLocation,
     tracker: Option<&RefTracker>,
-) -> ValidationError<'i> {
-    ValidationError::min_items(
-        constraint.location.clone(),
-        crate::paths::capture_evaluation_path(tracker, &constraint.location),
-        location.into(),
-        instance.to_value(),
-        constraint.limit,
-    )
+    ctx: &mut ValidationContext,
+) -> Result<(), ValidationError<'i>> {
+    ctx.diagnostic::<F>(instance, location, tracker, &constraint.location, |_| {
+        Ok(crate::error::ValidationErrorKind::MinItems {
+            limit: constraint.limit,
+        })
+    })
 }
-
 fn max_items_error<'i, F: Json>(
     constraint: &CountConstraint,
     instance: &F::Node<'i>,
     location: &LazyLocation,
     tracker: Option<&RefTracker>,
-) -> ValidationError<'i> {
-    ValidationError::max_items(
-        constraint.location.clone(),
-        crate::paths::capture_evaluation_path(tracker, &constraint.location),
-        location.into(),
-        instance.to_value(),
-        constraint.limit,
-    )
+    ctx: &mut ValidationContext,
+) -> Result<(), ValidationError<'i>> {
+    ctx.diagnostic::<F>(instance, location, tracker, &constraint.location, |_| {
+        Ok(crate::error::ValidationErrorKind::MaxItems {
+            limit: constraint.limit,
+        })
+    })
 }
 
 /// Wraps an absorbed keyword's failure as a child node at that keyword's own schema location,
@@ -1122,25 +1189,41 @@ fn absorbed_error_node(
 }
 
 impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         match &self.items {
-            FusedItems::Number(value) | FusedItems::String(value) | FusedItems::Boolean(value)
-            | FusedItems::IntegerDraft4(value) | FusedItems::IntegerDraft7(value) => source.boxed(value)?,
+            FusedItems::Number(value)
+            | FusedItems::String(value)
+            | FusedItems::Boolean(value)
+            | FusedItems::IntegerDraft4(value)
+            | FusedItems::IntegerDraft7(value) => source.boxed(value)?,
             FusedItems::Generic(value) => source.node(value)?,
         }
-        for value in [&self.min_items, &self.max_items].into_iter().flatten() { source.location(&value.location)?; source.uri(&value.absolute_location)?; }
-        source.uri(&self.type_absolute_location)?; source.location(&self.type_location)
+        for value in [&self.min_items, &self.max_items].into_iter().flatten() {
+            source.location(&value.location)?;
+            source.uri(&value.absolute_location)?;
+        }
+        source.uri(&self.type_absolute_location)?;
+        source.location(&self.type_location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        if cfg!(feature="arbitrary-precision") {return Err(crate::validator::workspace::Error::Unqualified(crate::validator::workspace::Component::Validator("arbitrary-precision integer classification")));}
+
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         let Some(array) = instance.as_array() else {
             return false;
@@ -1172,7 +1255,7 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1180,21 +1263,17 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         let Some(array) = instance.as_array() else {
-            return Err(self.type_error(instance, location, tracker));
+            return self.type_failure(instance, location, tracker, ctx);
         };
         let count = array.len() as u64;
         if let Some(constraint) = &self.min_items {
             if count < constraint.limit {
-                return Err(min_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                return min_items_error::<F>(constraint, instance, location, tracker, ctx);
             }
         }
         if let Some(constraint) = &self.max_items {
             if count > constraint.limit {
-                return Err(max_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                return max_items_error::<F>(constraint, instance, location, tracker, ctx);
             }
         }
         match &self.items {
@@ -1214,7 +1293,7 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -1223,22 +1302,38 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         errors: &mut Vec<ValidationError<'i>>,
     ) {
         let Some(array) = instance.as_array() else {
-            errors.push(self.type_error(instance, location, tracker));
+            if let Err(error) = self.type_failure(instance, location, tracker, ctx) {
+                ctx.workspace.push(errors, error);
+            }
             return;
         };
         let count = array.len() as u64;
         if let Some(constraint) = &self.min_items {
             if count < constraint.limit {
-                errors.push(min_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                if let Err(error) =
+                    min_items_error::<F>(constraint, instance, location, tracker, ctx)
+                {
+                    if !ctx.workspace.push(errors, error) {
+                        return;
+                    }
+                }
+                if ctx.workspace.failed() {
+                    return;
+                }
             }
         }
         if let Some(constraint) = &self.max_items {
             if count > constraint.limit {
-                errors.push(max_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                if let Err(error) =
+                    max_items_error::<F>(constraint, instance, location, tracker, ctx)
+                {
+                    if !ctx.workspace.push(errors, error) {
+                        return;
+                    }
+                }
+                if ctx.workspace.failed() {
+                    return;
+                }
             }
         }
         match &self.items {
@@ -1282,9 +1377,11 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         let mut children = Vec::with_capacity(array.len());
         if let Some(constraint) = &self.min_items {
             if count < constraint.limit {
-                let error = ErrorDescription::from_validation_error(&min_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                let Err(error) = min_items_error::<F>(constraint, instance, location, tracker, ctx)
+                else {
+                    return EvaluationResult::valid_empty();
+                };
+                let error = ErrorDescription::from_validation_error(&error);
                 children.push(absorbed_error_node(
                     location,
                     tracker,
@@ -1297,9 +1394,11 @@ impl<F: Json> Validate<F> for ArrayShapeValidator<F> {
         }
         if let Some(constraint) = &self.max_items {
             if count > constraint.limit {
-                let error = ErrorDescription::from_validation_error(&max_items_error::<F>(
-                    constraint, instance, location, tracker,
-                ));
+                let Err(error) = max_items_error::<F>(constraint, instance, location, tracker, ctx)
+                else {
+                    return EvaluationResult::valid_empty();
+                };
+                let error = ErrorDescription::from_validation_error(&error);
                 children.push(absorbed_error_node(
                     location,
                     tracker,
@@ -1442,19 +1541,24 @@ pub(crate) fn compile<'a, F: Json>(
             // the validation vocabulary that defines `type` is in effect.
             if ctx.has_vocabulary(&Vocabulary::Validation) {
                 if let Some(type_name) = get_simple_type_schema(schema) {
-                    let location = ctx.location().join("items").join("type");
+                    let location = crate::keywords::try_compile!(ctx
+                        .location()
+                        .join_with_funding("items", ctx.funding()))
+                    .join("type");
                     match type_name {
-                        "number" => return Some(ItemsNumberTypeValidator::compile(location)),
-                        "string" => return Some(ItemsStringTypeValidator::compile(location)),
+                        "number" => return Some(ItemsNumberTypeValidator::compile(ctx, location)),
+                        "string" => return Some(ItemsStringTypeValidator::compile(ctx, location)),
                         "integer" => {
                             // Draft 4 has stricter integer semantics
                             return if ctx.draft() == Draft::Draft4 {
-                                Some(ItemsIntegerTypeValidatorDraft4::compile(location))
+                                Some(ItemsIntegerTypeValidatorDraft4::compile(ctx, location))
                             } else {
-                                Some(ItemsIntegerTypeValidator::compile(location))
+                                Some(ItemsIntegerTypeValidator::compile(ctx, location))
                             };
                         }
-                        "boolean" => return Some(ItemsBooleanTypeValidator::compile(location)),
+                        "boolean" => {
+                            return Some(ItemsBooleanTypeValidator::compile(ctx, location))
+                        }
                         _ => {}
                     }
                 }

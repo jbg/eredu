@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::ParserResult as Result;
 
 struct StackNode<'a, T, S> {
     ast: &'a T,
@@ -8,14 +8,16 @@ struct StackNode<'a, T, S> {
 
 pub fn map_ast<T, S>(
     ast: &T,
+    funding: &crate::ParserAllocationFunding,
     get_args: impl Fn(&T) -> &[T],
     mut map_node: impl FnMut(&T, &mut Vec<S>) -> Result<S>,
 ) -> Result<S> {
-    let mut stack = vec![StackNode {
+    let mut stack = Vec::new();
+    funding.try_push(&mut stack, StackNode {
         ast,
         trg: 0,
         args: Vec::new(),
-    }];
+    })?;
 
     while let Some(mut entry) = stack.pop() {
         let args = get_args(entry.ast);
@@ -23,14 +25,14 @@ pub fn map_ast<T, S>(
             // children not yet processed
             let trg = stack.len();
             // re-push current
-            stack.push(entry);
+            funding.try_push(&mut stack, entry)?;
             // and children
             for ast in args.iter().rev() {
-                stack.push(StackNode {
+                funding.try_push(&mut stack, StackNode {
                     ast,
                     trg,
                     args: Vec::new(),
-                });
+                })?;
             }
         } else {
             assert!(entry.args.len() == args.len());
@@ -38,7 +40,7 @@ pub fn map_ast<T, S>(
             if stack.is_empty() {
                 return Ok(r);
             }
-            stack[entry.trg].args.push(r);
+            funding.try_push(&mut stack[entry.trg].args, r)?;
         }
     }
 

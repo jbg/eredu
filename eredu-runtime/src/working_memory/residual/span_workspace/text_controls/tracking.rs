@@ -91,9 +91,20 @@ impl PreparedTextControlWorkspace {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         facts.total_bytes()?;
+        if let Some(funding) = plan.metadata_funding() {
+            let shell = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<()>()).map_err(|_| WorkingMemoryError::Overflow)?.0.pad_to_align().size();
+            let bytes = [shell, size_of::<PreparedTextControlWorkspace>(), size_of::<TextControlBinding>(),
+                size_of::<Result<PreparedTextControlWorkspace, WorkingMemoryError>>(),
+                size_of::<TextHostControlFacts>(), size_of::<InferenceGeometry>()]
+                .into_iter().try_fold(0usize, usize::checked_add).ok_or(WorkingMemoryError::Overflow)?;
+            funding.reserve_metadata(bytes).map_err(crate::working_memory::reservation_metadata::funding_error)?;
+        }
         Ok(Self {
             binding: TextControlBinding {
                 identity: Arc::new(()),
+                _metadata_funding: plan.metadata_funding(),
+                sampling_extension: None,
                 source: None,
                 sequence: None,
                 prefill_paths: None,
@@ -121,6 +132,7 @@ impl PreparedTextControlWorkspace {
         mut self,
         facts: SubmissionTrackingFacts,
     ) -> Result<Self, WorkingMemoryError> {
+        cold_controls::<(Self, SubmissionTrackingFacts, Result<Self, WorkingMemoryError>)>(self.plan.metadata_funding().as_ref())?;
         if self.binding.tracking.is_some() {
             return Err(WorkingMemoryError::AlreadyStarted);
         }
@@ -168,11 +180,24 @@ impl OwnedTextSpanWorkspace {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         preparation.validate_tracking_preparation(facts.requested_ceiling)?;
+        self.publish_tracking(facts)
+    }
+    pub(super) fn take_extension_submission_tracking(&mut self,
+        origin: &crate::working_memory::text_preparation::SamplingExtensionBinding,
+    ) -> Result<Option<OriginalSubmissionTracking>, WorkingMemoryError> {
+        origin.validate_pending()?;
+        let binding = self.workspace().control_binding().ok_or(WorkingMemoryError::IdentityMismatch)?;
+        if !binding.sampling_extension.as_ref().is_some_and(|expected| expected.same(origin)) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let Some(facts) = binding.tracking else { return Ok(None); };
+        self.publish_tracking(facts)
+    }
+    fn publish_tracking(&mut self, facts: SubmissionTrackingFacts)
+        -> Result<Option<OriginalSubmissionTracking>, WorkingMemoryError> {
+        if self.tracking_taken { return Err(WorkingMemoryError::AlreadyStarted); }
         self.controls.validate_reservation(self.reservation())?;
-        let original = OriginalSubmissionTracking {
-            facts,
-            _raw: self.controls.custody.raw().clone(),
-        };
+        let original = OriginalSubmissionTracking { facts, _raw: self.controls.custody.raw().clone() };
         self.tracking_taken = true;
         Ok(Some(original))
     }

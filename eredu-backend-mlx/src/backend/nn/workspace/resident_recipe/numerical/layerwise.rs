@@ -6,6 +6,29 @@ use crate::backend::runtime::residency::manager::WindowPopulation;
 use safemlx::OperationEvent;
 
 impl SpeculativeNumericalRecipe {
+    /// Join the independently scoped copy/aggregate producers only after the
+    /// numerical equation population is complete. Their constructors share the
+    /// graph arena, but are not entries in the equation's Eval tape.
+    pub(crate) fn with_indexed_source(
+        self,
+        residency: &crate::backend::runtime::residency::parameter_bank::IndexedResidencyPlan,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let invalid = || context.metadata_error(format_args!(
+            "addressable transfer source differs from its actual numerical population"));
+        context.charge_metadata(std::mem::size_of::<(
+            Self, &crate::backend::runtime::residency::parameter_bank::IndexedResidencyPlan,
+            &WorkspaceContext, PreparedSourceCopies, Result<Self, Error>,
+            &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
+            WindowPopulation, usize, Result<PreparedSourceCopies, Error>,
+        )>())?;
+        context.charge_metadata(PreparedSourceCopies::inspection_control_bytes().ok_or_else(invalid)?)?;
+        let source = residency.with_native_copy_source(|source, window, calls|
+            PreparedSourceCopies::inspect(source, window, calls))
+            .map_err(|cause| context.metadata_source(cause))?;
+        self.with_prepared_source_copies(source, context)
+    }
+
     pub(super) fn with_prepared_source_copies(self, source:PreparedSourceCopies,
         context:&WorkspaceContext)->Result<Self,Error> {
         let invalid=||context.metadata_error(format_args!(
@@ -31,19 +54,9 @@ impl SpeculativeNumericalRecipe {
             graph.maximum_rank().max(source.rank), graph.maximum_operands().max(4),
             graph.additional_shells().checked_add(transfers.binding_shells).ok_or_else(invalid)?,
         ).ok_or_else(invalid)?;
-        let mut dispatch = completion.dispatch.ok_or_else(invalid)?;
-        if dispatch.cpu_model.is_some() { return Err(invalid()); }
-        dispatch.worker_rank = dispatch.worker_rank.max(source.rank);
-        let worker = OperationEvent::resident_gpu_worker_layout_with_router(
-            dispatch.gpu_entries, dispatch.gpu_input_edges, dispatch.gpu_siblings,
-            limits.arrays, dispatch.gpu_births, dispatch.worker_rank,
-            completion.graph.maximum_operands(), dispatch.additional_sort_kernels,
-            dispatch.cpu_entries.checked_sub(dispatch.parallel_entries).ok_or_else(invalid)?,
-        ).ok_or_else(invalid)?;
-        dispatch.worker_graph_extents = worker.allocation_extents()
-            .checked_add(dispatch.copy_rank_extents)
-            .and_then(|n|n.checked_add(dispatch.parallel_graph_extents)).ok_or_else(invalid)?;
-        dispatch.kernel_attempts = worker.kernel_attempts();
+        let (dispatch, worker_controls) = source.expand_equation_dispatch(
+            completion.dispatch.ok_or_else(invalid)?, limits, completion.graph.maximum_operands())
+            .map_err(|cause|context.metadata_source(cause))?;
         completion.dispatch = Some(dispatch);
         // Equation completions retain their own finite root distribution.
         // Transfers have separate exact Eval/Wait producers in the same arena.
@@ -73,7 +86,7 @@ impl SpeculativeNumericalRecipe {
             .ok_or_else(invalid)?;
         result.controls = result.controls.checked_add(u64::try_from(source.controls)
             .map_err(|_|invalid())?).and_then(|n|n.checked_add(graph.control_bytes()?))
-            .and_then(|n|n.checked_add(u64::try_from(worker.control_bytes()?).ok()?))
+            .and_then(|n|n.checked_add(u64::try_from(worker_controls).ok()?))
             .ok_or_else(invalid)?;
         Ok(result)
     }

@@ -79,8 +79,8 @@ impl<'a> RecordValue<'a> {
         let parts = [
             size_of::<ReadValue<'a>>(),
             size_of::<ReadKind<'a>>(),
-            size_of::<ReadArray<'a>>(),
-            size_of::<ReadArrayIter<'a>>(),
+            size_of::<InputArray<'a>>(),
+            size_of::<InputArrayIter<'a>>(),
             size_of::<ReadObject<'a>>(),
             size_of::<ReadPairs<'a>>(),
             size_of::<NaturalPairs<'a>>(),
@@ -172,6 +172,7 @@ mod tests {
 pub(in crate::bounded) enum ReadValue<'a> {
     Json(&'a serde_json::Value),
     Record(RecordValue<'a>),
+    Array(InputArray<'a>),
 }
 impl<'a> From<&'a serde_json::Value> for ReadValue<'a> {
     fn from(value: &'a serde_json::Value) -> Self {
@@ -184,21 +185,22 @@ pub(in crate::bounded) enum ReadKind<'a> {
     Bool(bool),
     Text(&'a str),
     Number(&'a serde_json::Number),
-    Array(ReadArray<'a>),
+    Array(InputArray<'a>),
     Object(ReadObject<'a>),
 }
 impl<'a> ReadValue<'a> {
     pub(in crate::bounded) fn kind(self) -> ReadKind<'a> {
         use serde_json::Value as J;
         match self {
+            Self::Array(value) => ReadKind::Array(value),
             Self::Json(J::Null) | Self::Record(RecordValue::Null) => ReadKind::Null,
             Self::Json(J::Bool(value)) => ReadKind::Bool(*value),
             Self::Record(RecordValue::Bool(value)) => ReadKind::Bool(value),
             Self::Json(J::String(value)) => ReadKind::Text(value),
             Self::Record(RecordValue::Text(value)) => ReadKind::Text(value),
             Self::Json(J::Number(value)) => ReadKind::Number(value),
-            Self::Json(J::Array(value)) => ReadKind::Array(ReadArray::Json(value)),
-            Self::Record(RecordValue::Array(value)) => ReadKind::Array(ReadArray::Record(value)),
+            Self::Json(J::Array(value)) => ReadKind::Array(InputArray::Json(value)),
+            Self::Record(RecordValue::Array(value)) => ReadKind::Array(InputArray::Record(value)),
             Self::Json(J::Object(value)) => ReadKind::Object(ReadObject::Json(value)),
             Self::Record(RecordValue::Object(value)) => ReadKind::Object(ReadObject::Record(value)),
         }
@@ -209,7 +211,7 @@ impl<'a> ReadValue<'a> {
             _ => None,
         }
     }
-    pub(in crate::bounded) fn as_array(self) -> Option<ReadArray<'a>> {
+    pub(in crate::bounded) fn as_array(self) -> Option<InputArray<'a>> {
         match self.kind() {
             ReadKind::Array(value) => Some(value),
             _ => None,
@@ -230,6 +232,8 @@ impl<'a> ReadValue<'a> {
     pub(in crate::bounded) fn same_source(self, other: Self) -> bool {
         match (self, other) {
             (Self::Json(a), Self::Json(b)) => std::ptr::eq(a, b),
+            (Self::Array(InputArray::Json(a)), Self::Array(InputArray::Json(b))) => std::ptr::eq(a, b),
+            (Self::Array(InputArray::Record(a)), Self::Array(InputArray::Record(b))) => std::ptr::eq(a, b),
             (Self::Record(RecordValue::Array(a)), Self::Record(RecordValue::Array(b))) => {
                 std::ptr::eq(a, b)
             }
@@ -240,12 +244,15 @@ impl<'a> ReadValue<'a> {
         }
     }
 }
+/// A borrowed sequence accepted by the shared structured-input reader.
 #[derive(Clone, Copy, Debug)]
-pub(in crate::bounded) enum ReadArray<'a> {
+pub enum InputArray<'a> {
+    /// Actual borrowed caller JSON values, including nested schemas.
     Json(&'a [serde_json::Value]),
+    /// Actual borrowed source records used by immutable probes.
     Record(&'a [RecordValue<'a>]),
 }
-impl<'a> ReadArray<'a> {
+impl<'a> InputArray<'a> {
     pub(in crate::bounded) fn len(self) -> usize {
         match self {
             Self::Json(a) => a.len(),
@@ -258,19 +265,19 @@ impl<'a> ReadArray<'a> {
             Self::Record(a) => a.get(index).copied().map(ReadValue::Record),
         }
     }
-    pub(in crate::bounded) fn iter(self) -> ReadArrayIter<'a> {
-        ReadArrayIter {
+    pub(in crate::bounded) fn iter(self) -> InputArrayIter<'a> {
+        InputArrayIter {
             array: self,
             next: 0,
         }
     }
 }
 #[derive(Clone, Debug)]
-pub(in crate::bounded) struct ReadArrayIter<'a> {
-    array: ReadArray<'a>,
+pub(in crate::bounded) struct InputArrayIter<'a> {
+    array: InputArray<'a>,
     next: usize,
 }
-impl<'a> Iterator for ReadArrayIter<'a> {
+impl<'a> Iterator for InputArrayIter<'a> {
     type Item = ReadValue<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.array.get(self.next)?;
@@ -282,7 +289,7 @@ impl<'a> Iterator for ReadArrayIter<'a> {
         (n, Some(n))
     }
 }
-impl ExactSizeIterator for ReadArrayIter<'_> {}
+impl ExactSizeIterator for InputArrayIter<'_> {}
 #[derive(Clone, Copy, Debug)]
 pub(in crate::bounded) enum ReadObject<'a> {
     Json(&'a serde_json::Map<String, serde_json::Value>),

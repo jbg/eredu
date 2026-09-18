@@ -17,6 +17,7 @@ mod sources;
 mod empty;
 #[path = "tests/construction.rs"]
 mod construction;
+mod preparation;
 use backend::Session;
 
 thread_local! {
@@ -109,7 +110,7 @@ impl InferenceStateRetention for State {
         self.retention.retain(request);
     }
 }
-impl ResidentKvResetState for State {
+impl ResidentTableResetState for State {
     type Layer = Slot;
     type ResetPlan = (usize, usize);
     type ResetContext = ();
@@ -119,7 +120,7 @@ impl ResidentKvResetState for State {
         } else { Ok(((0, 0), 0)) }
     }
     fn prepare_resident_reset_context(&self, plan: &Self::ResetPlan,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>) -> Result<(), BackendFailure> {
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Result<(), BackendFailure> {
         if construction::enabled() {
             if *plan != (self.global_start, self.layers.len()) {
                 return Err(BackendFailure::from_error(WorkingMemoryError::IdentityMismatch));
@@ -164,6 +165,7 @@ impl ResidentKvResetState for State {
         }
     }
     fn from_resident_reset(
+        _context: &mut Self::ResetContext,
         layout: SharedStateLayout,
         global_start: usize,
         layers: HostSlotTable<Slot>,
@@ -304,6 +306,7 @@ impl Backend {
             let held = plan
                 .required_bytes()
                 .checked_add(claim.limits().safety_reserve_bytes);
+            let _preparation = preparation::prepare(session, &claim, &data.pool, &data.execution, plan.required_bytes())?;
             let foreign = Session(self.data.clone());
             let target = if data.foreign { &foreign } else { session };
             (
@@ -710,6 +713,8 @@ fn original_source_witness_and_new_revision_retain_actual_account_without_regist
             "successful association moves custody"
         );
         assert_eq!(pin.bytes(), metadata.capacity_bytes().unwrap());
+        assert!(!pin.same_registered_storage(&pin),
+            "registered-key equality cannot stand in for retained original table custody");
         assert_eq!(data.pool.used_bytes().unwrap(), used);
         drop(host);
         assert_eq!(host_drops.load(Ordering::SeqCst), 0);

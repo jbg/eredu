@@ -1177,9 +1177,8 @@ fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::Distribut
                 mamba,
                 |metadata, shape| {
                     let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
+                        .linear_companion_of()
+                        .unwrap_or(metadata.id())
                         .as_str();
                     if name.ends_with("in_proj.weight") || name.ends_with("in_proj.bias") {
                         Ok(MemberSharding::PartitionedSegments {
@@ -1222,9 +1221,8 @@ fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::Distribut
                 attention,
                 |metadata, shape| {
                     let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
+                        .linear_companion_of()
+                        .unwrap_or(metadata.id())
                         .as_str();
                     if name.ends_with("q_proj.weight")
                         || name.ends_with("k_proj.weight")
@@ -1264,9 +1262,8 @@ fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::Distribut
                 &moe.experts,
                 |metadata, _| {
                     let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
+                        .linear_companion_of()
+                        .unwrap_or(metadata.id())
                         .as_str();
                     if name.contains("up_proj") {
                         Ok(MemberSharding::Partitioned { axis: 1 })

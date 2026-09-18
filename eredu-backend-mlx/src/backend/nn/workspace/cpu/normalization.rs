@@ -3,6 +3,9 @@ use super::*;
 use eredu_nn::NormalizationScale;
 use safemlx::{CpuUnaryOperation, Dtype};
 mod weightless_half;
+mod grouped;
+#[cfg(test)]
+mod grouped_tests;
 
 #[derive(Clone, Copy)]
 enum Buffer { Full=0, Row=1, Vector=2, Scalar=3 }
@@ -39,11 +42,13 @@ impl Population {
 }
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
+    if let WorkspaceOperationKindView::ConstructedNormalization(spec)=operation.kind {
+        if let Some(groups)=spec.groups {return grouped::inspect(operation,mechanism,spec,groups);}
+    }
     let (learned,constructed)=match operation.kind {
         WorkspaceOperationKindView::Normalization("rms",None)=>(operation.inputs.len()==2,false),
         WorkspaceOperationKindView::ConstructedNormalization(spec)=>{
             spec.validate_fixed()?;
-            if spec.groups.is_some() {return Ok(None);}
             match &spec.scale {
                 NormalizationScale::Learned(_)=>(true,true),
                 NormalizationScale::Unit=>(false,true),

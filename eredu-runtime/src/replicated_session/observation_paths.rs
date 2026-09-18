@@ -63,13 +63,13 @@ where
     pub(super) fn bind_observation_paths(
         &self,
         source: &SharedLayeredObservationPaths,
-    ) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
         PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
         let result = match &self.kind {
-            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.bind_observation_paths(source),
-            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.bind_observation_paths(source),
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.bind_observation_paths(source, metadata),
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.bind_observation_paths(source, metadata),
         };
         result.map_err(|error| map_prepared(error, ReplicatedTextSessionError::Architecture))
     }
@@ -244,7 +244,7 @@ where
                 PreparedSessionObservationError::Unavailable,
             ),
         )?;
-        let rebound = D::bind_observation_paths(&self.execution, current.source())
+        let rebound = D::bind_observation_paths(&self.execution, current.source(), None)
             .map_err(widen_infallible)?;
         self.observation_paths = Some(rebound);
         Ok(())

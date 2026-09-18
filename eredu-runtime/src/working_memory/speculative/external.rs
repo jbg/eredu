@@ -71,13 +71,13 @@ impl OriginalSpeculativeRequest {
     }
     /// Fund a fresh continuation without replacing prior roles or spent ordinals.
     pub fn prepare_external_continuation(&self, continuation: &ExternalContinuation,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding)
+        funding: &eredu_nn::workspace::HostMetadataFunding)
         -> Result<(), SpeculativeContinuationError>
     {
         self.prepare_continuation_slots(ScheduleIdentity::External(continuation.identity()),
             continuation.previous_slots(), continuation.next_slots(),
             continuation.control_bytes().and_then(|n| n.checked_add(size_of::<(&Self,
-                &ExternalContinuation, &eredu_nn::workspace::WorkspaceMetadataFunding)>())), funding)
+                &ExternalContinuation, &eredu_nn::workspace::HostMetadataFunding)>())), funding)
     }
 }
 

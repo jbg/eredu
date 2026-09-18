@@ -90,6 +90,8 @@ impl PartialEq for CaptureError {
     fn eq(&self, other: &Self) -> bool {
         use CaptureError::*;
         match (self.cause(), other.cause()) {
+            (Intervention(a), Intervention(b)) => a == b,
+            (AdmissionStorage(a), AdmissionStorage(b)) => a == b,
             (Invalid(a), Invalid(b))
             | (Unsupported(a), Unsupported(b))
             | (MissingPath(a), MissingPath(b)) => a == b,

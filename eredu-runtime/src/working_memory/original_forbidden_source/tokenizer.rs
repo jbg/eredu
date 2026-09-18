@@ -103,7 +103,7 @@ impl WorkingMemoryPool {
                 // retires before settlement and does not create a scalar refund.
                 drop(packed);
                 match account.finish() {
-                    Ok(()) => Ok(OriginalForbiddenSource { inputs, account }),
+                    Ok(()) => Ok(OriginalForbiddenSource { inputs, tokenizer: Some(tokenizer.clone()), account }),
                     Err(cause) => Err(OriginalForbiddenSourceError {
                         cause: cause.into(),
                         settlement: None,

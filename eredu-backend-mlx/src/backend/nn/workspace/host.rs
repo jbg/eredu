@@ -28,6 +28,9 @@ pub(super) fn emit(
     }
     use WorkspaceOperationKindView as K;
     use facts::mul;
+    if matches!(operation.kind, K::ParameterPlaceholder) {
+        return basic::emit_parameter_placeholder_host(operation, sink).map(Some);
+    }
     if matches!(operation.kind, K::GroupSelection { .. }) {
         return routing::emit_selector_host(operation, mechanisms.allocation, sink);
     }
@@ -86,10 +89,6 @@ pub(super) fn emit(
             0,
             "fixed compact E4M3 Uint8 to F32 ConvertFP8 uses the Metal unary kernel directly; no host conversion vector",
         ),
-        K::ParameterPlaceholder => (
-            0,
-            "the stack scalar is copied directly into the already-priced shared native allocation; lazy fill/shape descriptors have no disjoint host numerical payload",
-        ),
         K::GeneratedF32Initialization => {
             let plan = basic::generated_f32_plan_view(operation)?;
             (
@@ -120,6 +119,10 @@ pub(super) fn emit(
             if !basic::is_prepared_token_input(operation) { return Ok(None); }
             (0, "prepared token payload belongs to the existing input producer; the model borrows its completed integer matrix")
         }
+        K::Elementwise("masked_scatter") => (
+            0,
+            "Mask flatten/compaction, source cast, U32 exclusive-scan offsets and destination copy use shared native buffers; no numerical host staging; graph and embedded-kernel controls are priced separately",
+        ),
         K::Initialize | K::InitializeFloating(_) | K::CastFloating(_) => (
             0,
             "borrowed host input is copied directly into shared native storage; scalar fills and copies use the same allocator; the caller owns and separately prices the input payload",
@@ -128,7 +131,7 @@ pub(super) fn emit(
             if super::byte_view::inspect(operation).is_none(){return Ok(None);}
             (0,"byte reinterpretation uses shared storage or the same GPU general-copy worker; no numerical host vector")
         }
-        K::View("broadcast" | "transpose" | "squeeze" | "expand_dims" | "reshape")
+        K::View("broadcast" | "squeeze" | "expand_dims" | "reshape")
         | K::Transpose(_)
         | K::Index { .. }
         | K::StaticSlice { .. }
@@ -197,12 +200,12 @@ pub(super) fn emit(
         | K::Normalization(
             "rms"
             | "l2"
-            | "layer_norm"
             | "constructed_rms"
             | "gated_group_rms_norm"
             | "silu_gated_group_rms_norm",
             _,
         )
+        | K::LayerNorm { .. }
         | K::ConstructedNormalization(_) => (
             0,
             "normalization/reduction intermediates, partial reductions, learned-scale casts and scalars use shared native storage; local kernel reductions require no host payload",

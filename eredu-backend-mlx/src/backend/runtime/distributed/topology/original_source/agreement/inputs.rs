@@ -8,13 +8,13 @@ pub(crate) struct OriginalAgreementInputs {
     runtime:PreparedInputRuntime,
     group:CollectiveGroupId,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalCommunicationSource<'_> {
     pub(crate) fn prepare_agreement_inputs(&self,group:CollectiveGroupId,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool)->Result<OriginalAgreementInputs,Error> {
         reserve(&self.funding,&[
-            size_of::<OriginalAgreementInputs>(),size_of::<RetainedCommunicationSource>(),size_of::<WorkspaceMetadataFunding>(),
+            size_of::<OriginalAgreementInputs>(),size_of::<RetainedCommunicationSource>(),size_of::<HostMetadataFunding>(),
             size_of::<Result<OriginalAgreementInputs,Error>>(),
             size_of::<(&Self,CollectiveGroupId,&eredu_runtime::working_memory::WorkingMemoryPool)>(),
             size_of::<PreparedInputRuntime>(),

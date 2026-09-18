@@ -9,8 +9,7 @@ use crate::{rotary::RopeValue, GgufTensorCatalog};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
-        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
-        StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
@@ -446,15 +445,10 @@ impl ModelArgs {
     pub fn routed_observation_points(
         &self,
         unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoints::new(
-                eredu_runtime::RoutedBankId::new(0),
-                format!("{unit_path}.feed_forward"),
-                self.num_experts,
-            )
-        })
+        layer: usize, metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>{
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+if !(self.layer_policy(layer).is_some_and(|policy|policy.feed_forward==FeedForwardPolicy::SparseMoe)){return Ok(None);}
+        eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0),format_args!("{unit_path}.feed_forward"),self.num_experts,metadata_context).map(Some)
     }
 
     /// Returns whether any layer contains routed experts.
@@ -1077,9 +1071,9 @@ mod tests {
         assert_eq!(args.layer_schedule_fingerprint(), "cd,cd,afe,ce");
         assert!(args.use_expert_bias);
         assert!(args
-            .routed_observation_points("model.layers.0", 0)
+            .routed_observation_points("model.layers.0", 0, None).expect("ordinary routed point construction")
             .is_none());
-        let point = args.routed_observation_points("model.layers.2", 2).unwrap();
+        let point = args.routed_observation_points("model.layers.2", 2, None).expect("ordinary routed point construction").unwrap();
         assert_eq!(
             point
                 .bank(eredu_runtime::RoutedBankId::new(0))

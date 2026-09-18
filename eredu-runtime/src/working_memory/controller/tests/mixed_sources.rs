@@ -64,7 +64,7 @@ fn buffer(capacity: usize) -> Vec<u8> {
 }
 
 fn source(capacity: usize) -> SharedControllerBytes {
-    SharedControllerBytes::new(buffer(capacity))
+    SharedControllerBytes::new(buffer(capacity), eredu_core::HostPreparationAuthority::unmanaged())
 }
 
 fn mismatch(error: ControllerStorageError) {
@@ -78,7 +78,7 @@ fn mismatch(error: ControllerStorageError) {
 fn mixed_inventory_deduplicates_aliases_but_preserves_zero_and_equal_size_identities() {
     let filter = mask(37);
     let bytes = source(53);
-    let empty = SharedControllerBytes::new(Vec::new());
+    let empty = SharedControllerBytes::new(Vec::new(), eredu_core::HostPreparationAuthority::unmanaged());
     let mut controller = MixedController::new(
         vec![filter.clone(), filter],
         vec![bytes.clone(), empty.clone(), bytes],
@@ -100,7 +100,7 @@ fn mixed_inventory_deduplicates_aliases_but_preserves_zero_and_equal_size_identi
             available_bytes: 89,
         })
     ));
-    controller.bytes[1] = SharedControllerBytes::new(Vec::new());
+    controller.bytes[1] = SharedControllerBytes::new(Vec::new(), eredu_core::HostPreparationAuthority::unmanaged());
     mismatch(contract.validate(&controller).unwrap_err());
     controller.bytes[1] = empty;
     contract.validate(&controller).unwrap();
@@ -330,7 +330,7 @@ fn postdecision_witness_requires_complete_exact_sources_and_survives_forced_over
 
 #[test]
 fn zero_byte_owners_require_witnesses_while_legacy_masks_keep_optional_witness() {
-    let empty = MixedController::new(vec![], vec![SharedControllerBytes::new(Vec::new())], 0);
+    let empty = MixedController::new(vec![], vec![SharedControllerBytes::new(Vec::new(), eredu_core::HostPreparationAuthority::unmanaged())], 0);
     let contract = ControllerStorageContract::inspect(&empty).unwrap();
     mismatch(
         contract
@@ -344,7 +344,7 @@ fn zero_byte_owners_require_witnesses_while_legacy_masks_keep_optional_witness()
         )
         .unwrap();
     let different_empty =
-        MixedController::new(vec![], vec![SharedControllerBytes::new(Vec::new())], 0);
+        MixedController::new(vec![], vec![SharedControllerBytes::new(Vec::new(), eredu_core::HostPreparationAuthority::unmanaged())], 0);
     mismatch(
         contract
             .validate_decision(

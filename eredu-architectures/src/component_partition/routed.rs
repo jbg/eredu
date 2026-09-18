@@ -28,8 +28,41 @@ pub(crate) fn derive_coordinates_for_experts(
     layout: &LocalModelLayout,
     local_groups: &[usize],
 ) -> Result<RoutedComponentCoordinateMap, ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(component.id.clone());
-    let experts = ComponentCoordinateMap::indices(component.expert_count, local_groups.to_vec())?;
+    experts_worker(component, layout, local_groups, Destination(None))
+}
+fn packed_coordinates(
+    name: &str,
+    expert_count: usize,
+    units_per_expert: usize,
+    output_width: usize,
+    tensor: &LocalTensorLayout,
+) -> Result<(ComponentCoordinateMap, ComponentCoordinateMap), ComponentPartitionError> {
+    packed_worker(
+        name,
+        expert_count,
+        units_per_expert,
+        output_width,
+        tensor,
+        Destination(None),
+    )
+}
+pub(in crate::component_partition) fn experts_worker(
+    component: &RoutedComponentGroup,
+    layout: &LocalModelLayout,
+    local_groups: &[usize],
+    allocation: Destination<'_>,
+) -> Result<RoutedComponentCoordinateMap, ComponentPartitionError> {
+    allocation.controls::<(
+        &RoutedComponentGroup,
+        &LocalModelLayout,
+        &[usize],
+        RoutedComponentCoordinateMap,
+        ComponentCoordinateMap,
+        Option<ComponentCoordinateMap>,
+        &LocalTensorLayout,
+    )>()?;
+    let invalid = || allocation.invalid(&component.id);
+    let experts = allocation.indices(component.expert_count, allocation.copy(local_groups)?)?;
     if experts.local_count() == 0 {
         return Ok(RoutedComponentCoordinateMap::new(
             experts,
@@ -40,13 +73,14 @@ pub(crate) fn derive_coordinates_for_experts(
         RoutedComponentParameter::Packed { name } => {
             let tensor = layout
                 .tensor(&name.parameter)
-                .ok_or_else(|| ComponentPartitionError::MissingWeight(name.parameter.clone()))?;
-            let (stored_experts, units) = packed_coordinates(
+                .ok_or_else(|| allocation.missing(&name.parameter))?;
+            let (stored_experts, units) = packed_worker(
                 &component.id,
                 component.expert_count,
                 component.units_per_expert,
                 component.output_width,
                 tensor,
+                allocation,
             )?;
             if local_groups
                 .iter()
@@ -63,14 +97,18 @@ pub(crate) fn derive_coordinates_for_experts(
             let mut units = None;
             for expert in local_groups {
                 let name = names[*expert].as_ref().ok_or_else(invalid)?;
-                let tensor = layout.tensor(&name.parameter).ok_or_else(|| {
-                    ComponentPartitionError::MissingWeight(name.parameter.clone())
-                })?;
+                let tensor = layout
+                    .tensor(&name.parameter)
+                    .ok_or_else(|| allocation.missing(&name.parameter))?;
                 if tensor.global_shape().first() != Some(&component.output_width) {
                     return Err(invalid());
                 }
-                let next =
-                    derive_write_coordinates(&name.parameter, component.units_per_expert, tensor)?;
+                let next = coordinates::write_worker(
+                    &name.parameter,
+                    component.units_per_expert,
+                    tensor,
+                    allocation,
+                )?;
                 if units.as_ref().is_some_and(|units| *units != next) {
                     return Err(invalid());
                 }
@@ -82,14 +120,27 @@ pub(crate) fn derive_coordinates_for_experts(
     Ok(RoutedComponentCoordinateMap::new(experts, units))
 }
 
-fn packed_coordinates(
+fn packed_worker(
     name: &str,
     expert_count: usize,
     units_per_expert: usize,
     output_width: usize,
     tensor: &LocalTensorLayout,
+    allocation: Destination<'_>,
 ) -> Result<(ComponentCoordinateMap, ComponentCoordinateMap), ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(name.into());
+    allocation.controls::<(
+        &str,
+        usize,
+        usize,
+        usize,
+        &LocalTensorLayout,
+        Option<ComponentCoordinateMap>,
+        Option<TensorPlacement>,
+        LocalTensorLayout,
+        ComponentCoordinateMap,
+        ComponentCoordinateMap,
+    )>()?;
+    let invalid = || allocation.invalid(name);
     let global = tensor.global_shape();
     let local = tensor.local_shape();
     if global.len() != 3
@@ -131,7 +182,7 @@ fn packed_coordinates(
                 *axis,
                 TensorPlacement::Indices {
                     axis: 1,
-                    indices: indices.clone(),
+                    indices: allocation.copy(indices)?,
                 },
             ),
             _ => return Err(invalid()),
@@ -143,7 +194,7 @@ fn packed_coordinates(
                         ComponentCoordinateMap::range(global[0], start..end)?
                     }
                     TensorPlacement::Indices { indices, .. } => {
-                        ComponentCoordinateMap::indices(global[0], indices)?
+                        allocation.indices(global[0], indices)?
                     }
                     TensorPlacement::Shard { index, parts, .. }
                         if parts > 0 && index < parts && global[0].is_multiple_of(parts) =>
@@ -168,17 +219,17 @@ fn packed_coordinates(
     // Reuse the dense write-axis proof, including packed-column scaling and
     // retained semantic ranges. No encoding factor is guessed from dtype/names.
     let matrix = LocalTensorLayout::new(
-        tensor.logical_name(),
+        allocation.text(tensor.logical_name())?,
         tensor.role(),
-        global[1..].to_vec(),
-        local[1..].to_vec(),
+        allocation.copy(&global[1..])?,
+        allocation.copy(&local[1..])?,
         unit_placement.unwrap_or(TensorPlacement::Replicated),
         tensor.logical_units(),
         tensor.logical_range().cloned(),
         tensor.fell_back_to_replication(),
     )
     .with_partition_chunk_size(tensor.partition_chunk_size());
-    let units = derive_write_coordinates(name, units_per_expert, &matrix)?;
+    let units = coordinates::write_worker(name, units_per_expert, &matrix, allocation)?;
     Ok((experts, units))
 }
 

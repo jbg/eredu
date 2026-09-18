@@ -41,7 +41,7 @@ fn window_run_shape(limit: u64, total: u64) -> (CaptureSession, CaptureDiscovery
         },
     };
     let edit = edit.admit_invocations(&edits, bounds, "session").unwrap();
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session
         .enable_interventions(edit, Arc::new(Estimates))
         .unwrap();
@@ -234,7 +234,7 @@ fn invalid_window_row_declarations_reject_before_step_or_native_work() {
                 bounds(),
             )
             .unwrap();
-        let mut run = CaptureSession::new(plan);
+        let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
         let before = run.cumulative_usage();
         let mut backend = Backend::default();
         let started = run.begin_invocation_window(

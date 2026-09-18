@@ -74,15 +74,15 @@ fn run(kind: &str, mode: &str) -> serde_json::Value {
     serde_json::json!({"ids":output.token_ids(),"text":visible})
 }
 fn parity(kind: &str, case: &str) {
-    parity_with(kind, case, run)
+    parity_with(kind, case, &["ordinary", "managed", "controlled"], run)
 }
-fn parity_with(kind: &str, case: &str, run: fn(&str, &str) -> serde_json::Value) {
+fn parity_with(kind: &str, case: &str, modes: &[&str], run: fn(&str, &str) -> serde_json::Value) {
     if let Ok(mode) = std::env::var(MODE) {
         println!("\n{RESULT}{}", run(kind, &mode));
         return;
     }
     let mut expected = None;
-    for mode in ["ordinary", "managed", "controlled"] {
+    for mode in modes {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", case, "--ignored", "--nocapture"])
             .env(MODE, mode)

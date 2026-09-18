@@ -25,25 +25,32 @@ use eredu_runtime::{
     TensorPlacement, WeightLoweringDescriptor, WeightLoweringKind,
 };
 
-struct Module(ParameterBindingTarget);
+struct Module(ParameterBindingTarget, ParameterSpec);
+impl Module {
+    fn new(value: ParameterBindingTarget) -> Self { Self(value, ParameterSpec::trainable("weight").unwrap()) }
+}
 
 impl Parameterized<ParameterBindingTarget> for Module {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, ParameterBindingTarget>>(
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, ParameterBindingTarget>>(
         &'a self,
         visitor: &mut V,
-    ) {
-        visitor.visit(
-            ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true),
+    ) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+        visitor.parameter(
+            eredu_nn::ParameterMetadataView::from_spec(&self.1,true),
             &self.0,
         );
-    }
+
+ __source_result
+}
 
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, ParameterBindingTarget>>(
         &'a mut self,
         visitor: &mut V,
     ) {
         visitor.visit_mut(
-            ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true),
+            eredu_nn::ParameterMetadataView::from_spec(&self.1,true),
             &mut self.0,
         );
     }
@@ -164,7 +171,7 @@ fn bind(
     shape: Vec<usize>,
     layout: Option<&LocalModelLayout>,
 ) -> Result<Vec<eredu_runtime::WeightBinding>, ModuleBindingPlanError> {
-    let module = Module(ParameterBindingTarget {
+    let module = Module::new(ParameterBindingTarget {
         shape,
         dtype: if source.overlay {
             RecipeDtype::U32

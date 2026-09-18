@@ -2,7 +2,7 @@ use crate::api::metadata::{
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
     read_checkpoint_generation_config,
 };
-use crate::api::request::prepare_chat_from_parts;
+use crate::api::request::inspect_chat_from_parts;
 use crate::api::tokenizer::{load_chat_template, load_tokenizer_template_kwargs};
 use crate::api::{chat_template_kwargs, load_tokenizer, TextModelError};
 use crate::{
@@ -462,7 +462,7 @@ fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() 
     .unwrap();
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(KIMI_LINEAR_FIXTURE.into()),
         "moonshotai/Kimi-Linear-48B-A3B-Instruct",
@@ -525,7 +525,7 @@ fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() 
 }
 
 fn plan_accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, output: &str) -> bool {
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().grammar_matcher();
     let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
     let mut offset = 0;
     while offset < output.len() {
@@ -538,21 +538,21 @@ fn plan_accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, output: &str
             })
             .flatten()
         {
-            if grammar.commit(*token_id).is_err() {
+            if grammar.consume_token(*token_id).is_err() {
                 return false;
             }
             offset += spelling.len();
             continue;
         }
         if grammar
-            .commit(u32::from(output.as_bytes()[offset]))
+            .consume_token(u32::from(output.as_bytes()[offset]))
             .is_err()
         {
             return false;
         }
         offset += 1;
     }
-    grammar.is_complete().unwrap()
+    grammar.is_accepting().unwrap()
 }
 
 fn tool_argument_events(events: &[SemanticEvent]) -> Vec<String> {
@@ -604,7 +604,7 @@ fn prepares_prompt_and_generation_contribution_separately() {
         extra_template_kwargs: serde_json::Map::from_iter([("tone".into(), json!("brief"))]),
     };
 
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "chat-preparation-test",
@@ -640,7 +640,7 @@ fn tool_choice_none_does_not_render_tool_definitions() {
             .into(),
     );
 
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "none-hides-tools",
@@ -683,7 +683,7 @@ fn preparation_selects_named_tool_template_without_model_type_fallback() {
     };
 
     let prepared =
-        prepare_chat_from_parts(&mut tokenizer, template, "llama", &[], None, request).unwrap();
+        inspect_chat_from_parts(&mut tokenizer, template, "llama", &[], None, request).unwrap();
 
     assert_eq!(prepared.rendered_prompt(), "tool-use:generate");
     assert_eq!(prepared.generation_prompt(), ":generate");
@@ -720,7 +720,7 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
         (true, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
     ] {
         let mut tokenizer = production_chat_tokenizer(9);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(template.into()),
             "deliberately-not-a-qwen-model-type",
@@ -774,7 +774,7 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
 fn qwen25_instruct_template_renders_chat_tools_and_checkpoint_stops() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut tokenizer = production_chat_tokenizer(9);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(QWEN25_FIXTURE.into()),
         "qwen2",
@@ -806,7 +806,7 @@ fn qwen25_instruct_template_renders_chat_tools_and_checkpoint_stops() {
 fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_keys() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut qwen_vl_tokenizer = production_chat_tokenizer(3);
-    let qwen_vl = prepare_chat_from_parts(
+    let qwen_vl = inspect_chat_from_parts(
         &mut qwen_vl_tokenizer,
         ModelChatTemplate::Single(QWEN3_VL_FIXTURE.into()),
         "unrelated",
@@ -838,7 +838,7 @@ fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_ke
     assert_eq!(qwen_vl_plan.auto_activation_trigger(), None);
 
     let mut hermes_tokenizer = production_chat_tokenizer(5);
-    let hermes = prepare_chat_from_parts(
+    let hermes = inspect_chat_from_parts(
         &mut hermes_tokenizer,
         ModelChatTemplate::Named(BTreeMap::from([
             ("default".into(), "default template".into()),
@@ -888,7 +888,7 @@ fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_ke
 fn behavioral_recognition_survives_nonsemantic_template_refactors() {
     fn prepare(tokenizer: &mut ChatTokenizer, template: String, expected_identity: &str) {
         let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             tokenizer,
             ModelChatTemplate::Single(template),
             "architecture-metadata-is-not-a-recognition-key",
@@ -1024,7 +1024,7 @@ fn behavioral_recognition_survives_nonsemantic_template_refactors() {
 #[test]
 fn behavioral_recognition_rejects_changed_wire_envelopes() {
     let changed = QWEN25_FIXTURE.replace("<tool_call>", "<tool_invoke>");
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut production_chat_tokenizer(5),
         ModelChatTemplate::Single(changed),
         "qwen",
@@ -1113,7 +1113,7 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
     {
         for add_generation_prompt in [false, true] {
             let mut tokenizer = mistral_chat_tokenizer(4);
-            let prepared = prepare_chat_from_parts(
+            let prepared = inspect_chat_from_parts(
                 &mut tokenizer,
                 ModelChatTemplate::Single(template.into()),
                 "architecture-name-is-not-a-support-key",
@@ -1212,7 +1212,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
         (LLAMA32_FIXTURE, "llama.json-tools.v1"),
     ] {
         let mut tokenizer = llama_chat_tokenizer(7, &["<|eot_id|>"]);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(template.into()),
             "unrelated",
@@ -1311,7 +1311,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
 
     let mut tokenizer =
         llama_chat_tokenizer(11, &["<|python_start|>", "<|python_end|>", "<|eot|>"]);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(LLAMA4_FIXTURE.into()),
         "unrelated",
@@ -1431,7 +1431,7 @@ fn production_nemotron_renders_golden_parallel_history_and_prompt() {
         .strip_suffix('\n')
         .unwrap();
     let mut tokenizer = llama_chat_tokenizer(5, &["<|eot_id|>"]);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "unrelated",
@@ -1605,7 +1605,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
         json!({"role": "user", "content": "again"}),
     ];
     let mut tokenizer = llama_chat_tokenizer(19, &["<SPECIAL_12>"]);
-    let required = prepare_chat_from_parts(
+    let required = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "unrelated-architecture-name",
@@ -1728,7 +1728,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
         .is_err());
 
     let mut tokenizer = llama_chat_tokenizer(23, &["<SPECIAL_12>"]);
-    let auto = prepare_chat_from_parts(
+    let auto = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "nemotron_h",
@@ -1788,7 +1788,7 @@ fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
             (ToolChoice::Required, None),
         ] {
             let mut tokenizer = llama_chat_tokenizer(17, structural_tokens);
-            let prepared = prepare_chat_from_parts(
+            let prepared = inspect_chat_from_parts(
                 &mut tokenizer,
                 ModelChatTemplate::Single(template.into()),
                 "llama-model-family-must-not-select-a-profile",
@@ -1811,7 +1811,7 @@ fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
     }
 
     let mut tokenizer = llama_chat_tokenizer(2, &["<|eot_id|>"]);
-    let unsupported = prepare_chat_from_parts(
+    let unsupported = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(
             "{{ bos_token }} generic Llama template without a tool protocol".into(),
@@ -1861,7 +1861,7 @@ fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
         json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
         json!({"role": "user", "content": "Now summarize."}),
     ];
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "architecture-metadata-must-not-select-harmony",
@@ -1931,7 +1931,7 @@ fn lfm2_without_tools_generates_text_and_stops_at_message_end() {
         ] {
             for tool_choice in [ToolChoice::None, ToolChoice::Auto] {
                 let mut tokenizer = lfm2_chat_tokenizer(252);
-                let prepared = prepare_chat_from_parts(
+                let prepared = inspect_chat_from_parts(
                     &mut tokenizer,
                     ModelChatTemplate::Single(template.trim_end_matches('\n').into()),
                     "lfm2-text-regression",
@@ -1960,11 +1960,8 @@ fn lfm2_without_tools_generates_text_and_stops_at_message_end() {
                     "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|>"
                 ));
 
-                let mut constraints =
-                    crate::runtime::chat::constraints::ConstraintController::from_generation_plan_unregistered(
-                        plan,
-                    )
-                    .unwrap();
+                let source_plan = crate::runtime::chat::constraints::fixtures::Compiler::byte_tokens(eos_token_ids).compile_like(plan, ParallelToolCallPolicy::Disabled);
+                let mut constraints = source_plan.controller();
                 let mut history = Vec::new();
                 for token in answer.bytes().map(u32::from) {
                     assert!(constraints.filter_at(&history).unwrap().allows(token));
@@ -2014,7 +2011,7 @@ fn lfm2_optional_keyword_arguments_prepare_parse_and_render_history() {
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     };
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(LFM25_12B_FIXTURE.into()),
         "LiquidAI/LFM2.5-1.2B-Instruct",
@@ -2080,7 +2077,7 @@ fn lfm2_optional_keyword_arguments_prepare_parse_and_render_history() {
             }]}),
             json!({"role": "tool", "content": "Done."}),
         ];
-        let history = prepare_chat_from_parts(
+        let history = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(LFM25_12B_FIXTURE.into()),
             "LiquidAI/LFM2.5-1.2B-Instruct",
@@ -2109,7 +2106,7 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
         .strip_suffix('\n')
         .expect("the fixture-only file terminator is documented");
     inspect_chat_template_kwargs(vl_template, "lfm2.5-vl").unwrap();
-    let current = prepare_chat_from_parts(
+    let current = inspect_chat_from_parts(
         &mut current_tokenizer,
         ModelChatTemplate::Single(current_template.into()),
         "architecture-metadata-must-not-select-lfm2",
@@ -2168,7 +2165,7 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
     let classic_template = LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR
         .strip_suffix('\n')
         .expect("the fixture-only file terminator is documented");
-    let classic = prepare_chat_from_parts(
+    let classic = inspect_chat_from_parts(
         &mut classic_tokenizer,
         ModelChatTemplate::Single(classic_template.into()),
         "architecture-metadata-must-not-select-lfm2",
@@ -2250,7 +2247,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         ),
     ] {
         let mut tokenizer = deepseek_chat_tokenizer(preceding_tokens);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(template.into()),
             "deepseek architecture metadata is not a support key",
@@ -2312,7 +2309,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         ),
     ] {
         let mut tokenizer = deepseek_chat_tokenizer(51);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(template.into()),
             "unrelated",
@@ -2341,7 +2338,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
     }
 
     for template in [DEEPSEEK_V3_TOOL_FIXTURE, DEEPSEEK_V31_TOOL_FIXTURE] {
-        let error = prepare_chat_from_parts(
+        let error = inspect_chat_from_parts(
             &mut deepseek_chat_tokenizer(61),
             ModelChatTemplate::Single(template.into()),
             "unrelated",
@@ -2366,7 +2363,7 @@ fn inkling_reasoning_toggle_maps_to_named_effort() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     for (enabled, expected) in [(false, "0"), (true, "0.9")] {
         let mut tokenizer = inkling_chat_tokenizer(7);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
             "unrelated-model-id",
@@ -2391,7 +2388,7 @@ fn inkling_recognition_is_behavioral_and_exposes_native_tools() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let refactored = format!("{{# source-only refactor #}}{INKLING_SMALL_FIXTURE}");
     let mut tokenizer = inkling_chat_tokenizer(11);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(refactored),
         "unrelated-model-id",
@@ -2420,7 +2417,7 @@ fn inkling_recognition_is_behavioral_and_exposes_native_tools() {
         "<|content_thinking|><|content_model_end_sampling|>"
     );
     let mut tokenizer = inkling_chat_tokenizer(17);
-    let unsupported = prepare_chat_from_parts(
+    let unsupported = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(marker_soup.into()),
         "inkling_mm_model",
@@ -2465,7 +2462,7 @@ fn inkling_native_tools_render_constrain_and_parse_protocol() {
         json!({"role": "user", "content": "Now look up two more."}),
     ];
     let mut tokenizer = inkling_chat_tokenizer(29);
-    let required = prepare_chat_from_parts(
+    let required = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
         "unrelated-model-id",
@@ -2573,7 +2570,7 @@ fn inkling_native_tools_render_constrain_and_parse_protocol() {
     );
 
     let mut tokenizer = inkling_chat_tokenizer(37);
-    let auto = prepare_chat_from_parts(
+    let auto = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
         "unrelated-model-id",
@@ -2617,7 +2614,7 @@ fn inkling_real_checkpoint_template_is_recognized() {
         .expect("Inkling checkpoint must provide a chat template");
     let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&model_dir).unwrap());
     tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(&model_dir).unwrap());
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "real-inkling-checkpoint",
@@ -2643,7 +2640,7 @@ fn gemma_recognition_accepts_source_refactors_and_splits_tool_capabilities() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut tokenizer = gemma4_chat_tokenizer(50);
     let refactored = format!("{GEMMA4_EDGE_FIXTURE}\n{{# converter-only comment #}}");
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(refactored),
         "converter-variant",
@@ -2675,7 +2672,7 @@ fn gemma_recognition_accepts_source_refactors_and_splits_tool_capabilities() {
         .is_supported());
 
     let mut reasoning_tokenizer = gemma4_reasoning_tokenizer(60);
-    let reasoning_only = prepare_chat_from_parts(
+    let reasoning_only = inspect_chat_from_parts(
         &mut reasoning_tokenizer,
         ModelChatTemplate::Single(GEMMA4_EDGE_FIXTURE.into()),
         "converter-variant",
@@ -2711,7 +2708,7 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
     let template = MUSE_GLIMMER_FIXTURE_WITH_TERMINATOR
         .strip_suffix('\n')
         .expect("the fixture-only file terminator is documented");
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "behavior-not-model-id-selects-muse",
@@ -2748,7 +2745,7 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
         .is_supported());
     assert!(prepared.tool_runtime_plan().is_some());
 
-    let direct = prepare_chat_from_parts(
+    let direct = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "behavior-not-model-id-selects-muse",
@@ -2766,7 +2763,7 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
         " to=user<|message|>direct answer<|eot|>"
     ));
 
-    let low_effort = prepare_chat_from_parts(
+    let low_effort = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "behavior-not-model-id-selects-muse",
@@ -2800,7 +2797,7 @@ fn muse_atem_accepts_structural_eot_that_is_also_checkpoint_eos() {
     let template = MUSE_GLIMMER_FIXTURE_WITH_TERMINATOR
         .strip_suffix('\n')
         .expect("the fixture-only file terminator is documented");
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template.into()),
         "behavior-not-model-id-selects-muse",
@@ -2828,7 +2825,7 @@ fn gemma_recognition_accepts_self_defaulting_kwargs_and_gguf_added_tokens() {
         GEMMA4_EDGE_FIXTURE
     );
     let mut tokenizer = gemma4_gguf_chat_tokenizer(50);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(template),
         "converter-variant",
@@ -2862,7 +2859,7 @@ fn unsloth_gemma_variant_is_recognized_behaviorally_and_accepts_both_argument_fo
         json!("{\"value\":\"serialized\"}"),
     ] {
         let mut tokenizer = gemma4_chat_tokenizer(70);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(template.into()),
             "converter-and-model-id-are-not-support-keys",
@@ -2985,7 +2982,7 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
 
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut tokenizer = gemma4_chat_tokenizer(23);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(GEMMA4_EDGE_FIXTURE.into()),
         "unrelated-architecture",
@@ -3022,7 +3019,7 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
     let grammar_output = tool_output
         .strip_suffix("<|tool_response>")
         .expect("profile stop is outside the tool grammar");
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().grammar_matcher();
     let mut remaining = grammar_output;
     while !remaining.is_empty() {
         let next = structural_spellings
@@ -3036,19 +3033,19 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
             .min_by_key(|(position, index, _)| (*position, *index));
         let Some((position, structural_index, spelling)) = next else {
             for byte in remaining.bytes() {
-                grammar.commit(u32::from(byte)).unwrap();
+                grammar.consume_token(u32::from(byte)).unwrap();
             }
             break;
         };
         for byte in remaining[..position].bytes() {
-            grammar.commit(u32::from(byte)).unwrap();
+            grammar.consume_token(u32::from(byte)).unwrap();
         }
         grammar
-            .commit(23 + u32::try_from(structural_index).unwrap())
+            .consume_token(23 + u32::try_from(structural_index).unwrap())
             .unwrap();
         remaining = &remaining[position + spelling.len()..];
     }
-    assert!(grammar.is_complete().unwrap());
+    assert!(grammar.is_accepting().unwrap());
 
     for split in 0..=tool_output.len() {
         let mut parser = plan.create_parser_with_stops(std::iter::empty()).unwrap();
@@ -3131,7 +3128,7 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
 fn gemma4_model_type_does_not_grant_unregistered_template_support() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single("unregistered Gemma 4 template".into()),
         "gemma4",
@@ -3161,7 +3158,7 @@ fn explicit_thinking_requires_a_recognized_semantic_protocol_unless_opted_out() 
         enable_thinking: Some(true),
         ..ChatTemplateRequest::default()
     };
-    let error = prepare_chat_from_parts(
+    let error = inspect_chat_from_parts(
         &mut tokenizer,
         template.clone(),
         "unknown",
@@ -3174,7 +3171,7 @@ fn explicit_thinking_requires_a_recognized_semantic_protocol_unless_opted_out() 
         .to_string()
         .contains("no semantic reasoning protocol was recognized"));
 
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "unknown",
@@ -3195,11 +3192,11 @@ fn explicit_thinking_requires_a_recognized_semantic_protocol_unless_opted_out() 
 }
 
 #[test]
-fn controlled_text_requires_raw_thinking_opt_in_even_with_a_recognized_parser() {
+fn text_capability_requires_raw_thinking_opt_in_even_with_a_recognized_parser() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     for allow_unparsed_reasoning in [false, true] {
         let mut tokenizer = production_chat_tokenizer(50);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut tokenizer,
             ModelChatTemplate::Single(QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR.into()),
             "thinking-text",
@@ -3218,14 +3215,6 @@ fn controlled_text_requires_raw_thinking_opt_in_even_with_a_recognized_parser() 
             prepared.text_generation_support().is_supported(),
             allow_unparsed_reasoning
         );
-        let runtime = super::request::prepared_text_control_runtime(
-            &prepared,
-            &[],
-            eredu_core::SharedTokenFilter::new(
-                eredu_core::TokenFilter::allowed(vec![true; 256]).unwrap(),
-            ),
-        );
-        assert_eq!(runtime.is_ok(), allow_unparsed_reasoning);
     }
 }
 
@@ -3234,7 +3223,7 @@ fn mistral_architecture_name_does_not_grant_an_unregistered_template_support() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
     let template = ModelChatTemplate::Single("unregistered mistral template".into());
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "MistralForCausalLM",
@@ -3261,7 +3250,7 @@ fn named_template_behavioral_recognition_uses_only_the_selected_body() {
     ]));
 
     let mut tokenizer = production_chat_tokenizer(31);
-    let default = prepare_chat_from_parts(
+    let default = inspect_chat_from_parts(
         &mut tokenizer,
         templates.clone(),
         "named-selection",
@@ -3286,7 +3275,7 @@ fn named_template_behavioral_recognition_uses_only_the_selected_body() {
             if reason.contains("no behavioral format recognizer")
     ));
 
-    let selected_tool_use = prepare_chat_from_parts(
+    let selected_tool_use = inspect_chat_from_parts(
         &mut tokenizer,
         templates,
         "named-selection",
@@ -3337,7 +3326,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     };
-    let prepared = prepare_chat_from_parts(
+    let prepared = inspect_chat_from_parts(
         &mut tokenizer,
         template.clone(),
         "synthetic",
@@ -3382,7 +3371,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
         extra_template_kwargs: serde_json::Map::from_iter([("fail_render".into(), json!(true))]),
         ..ChatTemplateRequest::default()
     };
-    let error = prepare_chat_from_parts(
+    let error = inspect_chat_from_parts(
         &mut tokenizer,
         template,
         "synthetic",
@@ -3393,7 +3382,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
     .unwrap_err();
     assert!(matches!(
         error,
-        TextModelError::ToolConstraint(ref message) if message.contains("tools[0].function.parameters")
+        TextModelError::ToolPreparation(ref cause) if cause.to_string().contains("tools[0].function.parameters")
     ));
 }
 
@@ -3417,7 +3406,7 @@ fn structural_tokens_resolve_against_each_preparation_tokenizer() {
     };
 
     let mut first_tokenizer = synthetic_chat_tokenizer(0);
-    let first = prepare_chat_from_parts(
+    let first = inspect_chat_from_parts(
         &mut first_tokenizer,
         ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
         "synthetic-first",
@@ -3427,7 +3416,7 @@ fn structural_tokens_resolve_against_each_preparation_tokenizer() {
     )
     .unwrap();
     let mut second_tokenizer = synthetic_chat_tokenizer(7);
-    let second = prepare_chat_from_parts(
+    let second = inspect_chat_from_parts(
         &mut second_tokenizer,
         ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
         "synthetic-second",
@@ -3456,7 +3445,7 @@ fn tokenizer_analysis_is_model_scoped_while_schemas_compile_per_prepare_chat() {
     let mut tokenizer = synthetic_chat_tokenizer(0);
 
     let prepare = |tokenizer: &mut ChatTokenizer, property: &str| {
-        prepare_chat_from_parts(
+        inspect_chat_from_parts(
             tokenizer,
             ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
             "one-loaded-model",
@@ -3505,7 +3494,7 @@ fn missing_structural_added_token_fails_before_prompt_rendering() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
-    let error = prepare_chat_from_parts(
+    let error = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
         "synthetic-missing-structural-token",
@@ -3534,7 +3523,7 @@ fn missing_structural_added_token_fails_before_prompt_rendering() {
 fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
     let mut tokenizer = synthetic_chat_tokenizer(0);
     let compiler = Err("failed to compile tool grammar: synthetic compiler failure".into());
-    let error = prepare_chat_from_parts(
+    let error = inspect_chat_from_parts(
         &mut tokenizer,
         ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
         "synthetic-grammar-failure",
@@ -3589,7 +3578,7 @@ fn prepared_prompt_matches_direct_tokenizer_rendering() {
             .unwrap()
             .remove(0);
         let mut preparation_tokenizer = ChatTokenizer::from_tokenizer(raw);
-        let prepared = prepare_chat_from_parts(
+        let prepared = inspect_chat_from_parts(
             &mut preparation_tokenizer,
             template.clone(),
             "prepared-chat-rendering",

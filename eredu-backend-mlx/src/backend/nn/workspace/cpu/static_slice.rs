@@ -1,4 +1,4 @@
-//! Exact static capture rectangles through the ordinary CPU Slice source.
+//! Exact static rectangles through the ordinary CPU Slice source.
 use super::*;
 
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
@@ -10,41 +10,63 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
     let input=operation.inputs.get(0).expect("qualified slice input");
     let output=operation.outputs.get(0).expect("qualified slice output");
     let rank=input.shape().len();
-    if !(1..=4).contains(&rank) || input.dtype()!=WorkspaceDtype::Float32
-        || input.shape().iter().chain(output.shape()).any(|&n|n<=0)
+    if !(1..=4).contains(&rank)
+        || input.shape().iter().chain(output.shape()).any(|&n|n<0)
         || strides.iter().any(|&n|n<=0) {return Ok(None);}
-    let Some(representation)=input.representation() else {return Ok(None);};
     if input.elements()?>i32::MAX as u64 {return Ok(None);}
-    let Some(source_strides)=views::physical_strides(input,representation) else {return Ok(None);};
-    // The same selected non-singleton coordinates must fit the retained stride
-    // slot and the native positive span. Unit axes observe only coordinate zero.
-    let mut span=1u64;
-    for axis in 0..rank {
-        let step=if output.shape()[axis]==1 {1}else{
-            match u64::try_from(source_strides[axis]).ok().and_then(|s|s.checked_mul(strides[axis] as u64)) {
-                Some(step) if step>0 && step<=u32::MAX as u64=>step,_=>return Ok(None),
-            }
-        };
-        span=match (output.shape()[axis] as u64-1).checked_mul(step).and_then(|n|span.checked_add(n)) {
-            Some(span) if span<=i64::MAX as u64=>span,_=>return Ok(None),
-        };
-    }
+    let empty=output.elements()?==0;
+    let representation=input.representation();
+    let dtype=if input.dtype()==WorkspaceDtype::Float32 {
+        let Some(representation)=representation else {return Ok(None);};
+        if !empty {
+        let Some(source_strides)=views::physical_strides(input,representation) else {return Ok(None);};
+        // Floating consumers retain the exact selected stride facts. Unit axes
+        // observe only coordinate zero; every remaining slot must fit them.
+        let mut span=1u64;
+        for axis in 0..rank {
+            let step=if output.shape()[axis]==1 {1}else{
+                match u64::try_from(source_strides[axis]).ok().and_then(|s|s.checked_mul(strides[axis] as u64)) {
+                    Some(step) if step>0 && step<=u32::MAX as u64=>step,_=>return Ok(None),
+                }
+            };
+            span=match (output.shape()[axis] as u64-1).checked_mul(step).and_then(|n|span.checked_add(n)) {
+                Some(span) if span<=i64::MAX as u64=>span,_=>return Ok(None),
+            };
+        }
+        }
+        representation.dtype()
+    } else {
+        if representation.is_some() || output.representation().is_some() {return Ok(None);}
+        // Integer/boolean/byte layouts already state their physical scalar
+        // width. Slice is a dtype-preserving alias: its fixed native controls
+        // depend on rank, never inferred floating strides. The actual Slice
+        // guard independently checks offset + selected span against the exact
+        // retained input backing before sharing it. This internal plan field
+        // is unused for nonfloating outputs and publishes no representation.
+        WorkspaceFloatingType::Float32
+    };
     // MLX returns the input directly for a complete positive-stride slice.
     // The C result still owns a handle, but creates no Slice/Eval/task.
     let whole = input.shape() == output.shape();
     let mut population=CpuPopulation::default();
     if !whole {
-        let Some(source)=OperationEvent::cpu_slice_layout(rank,false) else {return Ok(None);};
+        let Some(source)=OperationEvent::cpu_slice_layout(rank, empty, false) else {return Ok(None);};
         if source.backing_births()!=0 || population.copy(source,1).is_none() {return Ok(None);}
+        // The empty branch calls allocate_data(0), publishing one Data owner
+        // without a physical birth. Nonempty Slice shares the original Data.
+        population.maximum_captures=usize::from(empty);
     }
-    let frames=[views::physical_stride_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+    let frames=[if representation.is_some() && !empty {
+            views::physical_stride_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?
+        } else {0},
         crate::tensor::narrow::control_bytes(rank).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
         size_of::<WorkspaceOperationView<'_>>(),size_of::<WorkspaceLayoutView<'_>>()*2,
         size_of::<WorkspaceRepresentation>(),size_of::<Option<WorkspaceRepresentation>>(),
+        size_of::<WorkspaceDtype>(),size_of::<WorkspaceFloatingType>(),
         size_of::<CpuCopyEvalLayout>(),size_of::<Option<CpuCopyEvalLayout>>(),
         size_of::<CpuPopulation>(),size_of::<OperationPlan>(),size_of::<Option<OperationPlan>>(),
         size_of::<facts::FactResult<Option<OperationPlan>>>(),size_of::<usize>()*4,
-        size_of::<u64>()*2,size_of::<bool>()*2,size_of::<std::ops::Range<usize>>(),
+        size_of::<u64>()*2,size_of::<bool>()*3,size_of::<std::ops::Range<usize>>(),
         size_of::<std::iter::Rev<std::ops::Range<usize>>>(),
         size_of::<std::slice::Iter<'_,i32>>(),
         size_of::<std::iter::Chain<std::slice::Iter<'_,i32>,std::slice::Iter<'_,i32>>>(),
@@ -55,7 +77,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
         size_of::<u64>()*3,size_of::<Option<u64>>(),size_of::<usize>()];
     population.controls=frames.into_iter().try_fold(population.controls.checked_add(size_of_val(&frames))
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,|n,b|n.checked_add(b).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW))?;
-    Ok(Some(OperationPlan {dtype:representation.dtype(),population,alias_input:Some(0),
+    Ok(Some(OperationPlan {dtype,population,alias_input:(!empty||whole).then_some(0),
         output_bytes:0,scratch_bytes:0,rank,parameter_shells:usize::from(whole),seeds:0,validations:0}))
 }
 
@@ -68,6 +90,7 @@ pub(super) fn representation(operation:WorkspaceOperationView<'_>,input:Workspac
     let output=operation.outputs.get(0).expect("qualified static slice");
     let WorkspaceOperationKindView::StaticSlice{strides,..}=operation.kind else{unreachable!("qualified static slice")};
     if source.shape()==output.shape(){return input;}
+    if output.shape().contains(&0){return WorkspaceRepresentation::new(input.dtype(),true);}
     let source_strides=views::physical_strides(source,input).expect("qualified slice source strides");
     let mut selected=[1u64;4];let mut dense_stride=1u64;let mut rows=true;
     for axis in (0..source.shape().len()).rev() {
@@ -237,3 +260,49 @@ mod tests {
     }
 
 }
+
+#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+mod index_tests {
+    use super::*;
+    use eredu_nn::{Index, Tensor};
+
+    #[test]
+    fn cpu_paged_range_index_retains_key_scalar_strides_and_exact_source_backing() {
+        let ordinary=MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let choice=MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu=MlxCpuWorkspaceMechanisms::new(ordinary.allocation(),choice);
+        let context=WorkspaceContext::new(cpu);
+        let storage=eredu_nn::workspace::WorkspaceExistingStorage::try_new(Some(8192),&context).unwrap();
+        let input=WorkspaceTensor::existing_with_storage(context.layout(&[1,2,5,4],WorkspaceDtype::Float32).unwrap()
+            .with_representation(Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,true))),&storage,&context).unwrap();
+        context.begin_state_span([&input]).unwrap();
+        let page=input.index(&[Index::Full,Index::Full,Index::Range(1,4),Index::Full],&context).unwrap();
+        let representation=page.layout().representation().expect("exact paged key source");
+        assert_eq!(representation.dtype(),WorkspaceFloatingType::Float32);
+        assert!(!representation.row_contiguous());assert!(representation.last_axis_contiguous());
+        assert_eq!(representation.element_stride_at(4,1),Some(20));
+        assert_eq!(representation.element_stride_at(4,2),Some(4));
+        let report=context.report(std::slice::from_ref(&page)).unwrap();
+        assert_eq!(report.tensor_buffers.total_bytes,Some(0));
+        assert_eq!(report.state.as_ref().unwrap().retained_bytes,Some(8192));
+        let op=report.operations[0].as_view();
+        let WorkspaceOperationKindView::StaticSlice{starts,ends,strides}=op.kind else{panic!("actual coordinates lost")};
+        assert_eq!(starts,[0,0,1,0]);assert_eq!(ends,[1,2,4,4]);assert_eq!(strides,[1,1,1,1]);
+        let plan=cpu.plan(op).unwrap().unwrap();
+        assert_eq!(plan.alias_input,Some(0));assert_eq!(plan.population.births,0);assert_eq!(plan.population.primitives,1);
+        // The isolated CPU range consumer reads this same exact event and
+        // retains its separate Slice source, without a rank-count fallback.
+        let range=SpeculativeNumericalRecipe::inspect_cpu_range(&report,ordinary,&context).unwrap();
+        assert!(range.graph_capacity>0 && range.record_capacity>0);
+        let unknown=[op.inputs.get(0).unwrap().with_representation(None)];
+        assert!(cpu.plan(WorkspaceOperationView{inputs:WorkspaceLayoutList::Views(&unknown),..op}).unwrap().is_none());
+        // The old rank-count-only event does not receive a fabricated geometry.
+        assert!(cpu.plan(WorkspaceOperationView{kind:WorkspaceOperationKindView::Index{selected_axes:0},..op}).unwrap().is_none());
+    }
+}
+
+#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+mod scalar_tests;
+
+#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+mod empty_tests;

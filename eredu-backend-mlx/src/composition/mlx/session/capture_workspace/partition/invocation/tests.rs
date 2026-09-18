@@ -21,8 +21,8 @@ fn projected_decode_source_shares_host_geometry_and_preserves_raw_additive_reduc
             capture_plan_identity:source.admission().identity().into(),selection_index:0,phase:CapturePhase::Decode,prediction:2,forward_epoch:8,invocation:None};
         let mut ledger=CaptureLedger::new(source.admission());ledger.begin_step();
         let limits=PartitionCaptureReceiptLimits{max_producers:2,max_fragments:2,max_record_bytes:64<<10};
-        let receipt=if sum{PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),context,producers,2,limits,&mut ledger)}
-            else{PartitionCaptureReceiptPlan::new_shared(source.clone(),context,producers,2,limits,&mut ledger)}.unwrap();
+        let receipt=if sum{PartitionCaptureReceiptPlan::new_sum(source.clone(),context,producers,2,limits,&mut ledger)}
+            else{PartitionCaptureReceiptPlan::new(source.clone(),context,producers,2,limits,&mut ledger)}.unwrap();
         let host=PartitionFragmentHostPlan::prepare(&receipt).unwrap();
         assert_eq!(host.fragment_count(),2);assert!(host.fragment_peak_bytes()>0);
         assert_eq!(host.assembly_peak_bytes()>0,sum&&matches!(transform,CaptureTransform::Summary|CaptureTransform::Histogram{..}));

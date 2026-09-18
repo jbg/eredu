@@ -326,7 +326,7 @@ mod retained_media_prefill_tests {
                     for _ in 0..3 {
                         ids.push(generation.next().unwrap().unwrap().token_id());
                         if captured {
-                            captures.push(generation.take_captured_step().unwrap().unwrap());
+                            captures.push(generation.take_captured_delivery().unwrap().unwrap());
                         }
                     }
                     assert!(generation.next().is_none());

@@ -3,7 +3,7 @@ use core::{
     panic::{RefUnwindSafe, UnwindSafe},
 };
 
-use alloc::{borrow::Cow, format, sync::Arc};
+use alloc::sync::Arc;
 
 use regex_syntax::hir::{literal, Hir};
 
@@ -15,13 +15,27 @@ use crate::{
     },
     nfa::thompson::{self, WhichCaptures, NFA},
     util::{
+        allocation::{Allocation, Allocator},
         captures::{Captures, GroupInfo},
         look::LookMatcher,
         prefilter::{self, Prefilter, PrefilterI},
         primitives::{NonMaxUsize, PatternID},
-        search::{Anchored, HalfMatch, Input, Match, MatchKind, PatternSet},
+        search::{
+            Anchored, HalfMatch, Input, Match, MatchError, MatchKind,
+            PatternSet,
+        },
     },
 };
+
+/// Borrowed diagnostic pieces; formatting a strategy name owns no text.
+#[derive(Debug)]
+pub(super) struct StrategyName(&'static str, &'static str);
+impl core::fmt::Display for StrategyName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)?;
+        f.write_str(self.1)
+    }
+}
 
 /// A trait that represents a single meta strategy. Its main utility is in
 /// providing a way to do dynamic dispatch over a few choices.
@@ -41,46 +55,72 @@ pub(super) trait Strategy:
     Debug + Send + Sync + RefUnwindSafe + UnwindSafe + 'static
 {
     #[allow(dead_code)]
-    fn name(&self) -> Cow<'static, str>;
+    fn name(&self) -> StrategyName;
 
     fn group_info(&self) -> &GroupInfo;
 
-    fn create_cache(&self) -> Cache;
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error>;
 
-    fn reset_cache(&self, cache: &mut Cache);
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError>;
+
+    fn reset_cache(
+        &self,
+        cache: &mut Cache,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError>;
 
     fn is_accelerated(&self) -> bool;
 
     fn memory_usage(&self) -> usize;
 
-    fn search(&self, cache: &mut Cache, input: &Input<'_>) -> Option<Match>;
+    fn search(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError>;
 
     fn search_half(
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch>;
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError>;
 
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool;
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError>;
 
     fn search_slots(
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID>;
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError>;
 
     fn which_overlapping_matches(
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    );
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError>;
 }
 
-pub(super) fn new(
+pub(super) fn new_with_allocations(
     info: &RegexInfo,
     hirs: &[&Hir],
+    funding: &dyn Allocation,
 ) -> Result<Arc<dyn Strategy>, BuildError> {
     // At this point, we're committed to a regex engine of some kind. So pull
     // out a prefilter if we can, which will feed to each of the constituent
@@ -112,10 +152,14 @@ pub(super) fn new(
         Some(pre.clone())
     } else if info.config().get_auto_prefilter() {
         let kind = info.config().get_match_kind();
-        let prefixes = crate::util::prefilter::prefixes(kind, hirs);
+        let prefixes = crate::util::prefilter::prefixes_with_allocations(
+            kind, hirs, funding,
+        )?;
         // If we can build a full `Strategy` from just the extracted prefixes,
         // then we can short-circuit and avoid building a regex engine at all.
-        if let Some(pre) = Pre::from_prefixes(info, &prefixes) {
+        if let Some(pre) =
+            Pre::from_prefixes_with_allocations(info, &prefixes, funding)?
+        {
             debug!(
                 "found that the regex can be broken down to a literal \
                  search, avoiding the regex engine entirely",
@@ -135,7 +179,9 @@ pub(super) fn new(
         //
         // One wonders if we should just roll this our heuristic literal
         // extraction, and then I think this case could disappear entirely.
-        if let Some(pre) = Pre::from_alternation_literals(info, hirs) {
+        if let Some(pre) = Pre::from_alternation_literals_with_allocations(
+            info, hirs, funding,
+        )? {
             debug!(
                 "found plain alternation of literals, \
                  avoiding regex engine entirely and using Aho-Corasick"
@@ -143,19 +189,18 @@ pub(super) fn new(
             debug!("using {} strategy", pre.name());
             return Ok(pre);
         }
-        prefixes.literals().and_then(|strings| {
-            debug!(
-                "creating prefilter from {} literals: {:?}",
-                strings.len(),
-                strings,
-            );
-            Prefilter::new(kind, strings)
-        })
+        match prefixes.literals() {
+            Some(strings) => {
+                Prefilter::new_with_allocations(kind, strings, funding)?
+            }
+            None => None,
+        }
     } else {
         debug!("skipping literal extraction since prefilters were disabled");
         None
     };
-    let mut core = Core::new(info.clone(), pre.clone(), hirs)?;
+    let mut core =
+        Core::new_with_allocations(info.clone(), pre.clone(), hirs, funding)?;
     // Now that we have our core regex engines built, there are a few cases
     // where we can do a little bit better than just a normal "search forward
     // and maybe use a prefilter when in a start state." However, these cases
@@ -169,25 +214,25 @@ pub(super) fn new(
         Err(core) => core,
         Ok(ra) => {
             debug!("using {} strategy", ra.name());
-            return Ok(Arc::new(ra));
+            return Ok(Allocator::new(funding).arc(ra)?);
         }
     };
-    core = match ReverseSuffix::new(core, hirs) {
+    core = match ReverseSuffix::new_with_allocations(core, hirs, funding)? {
         Err(core) => core,
         Ok(rs) => {
             debug!("using {} strategy", rs.name());
-            return Ok(Arc::new(rs));
+            return Ok(Allocator::new(funding).arc(rs)?);
         }
     };
-    core = match ReverseInner::new(core, hirs) {
+    core = match ReverseInner::new_with_allocations(core, hirs, funding)? {
         Err(core) => core,
         Ok(ri) => {
             debug!("using {} strategy", ri.name());
-            return Ok(Arc::new(ri));
+            return Ok(Allocator::new(funding).arc(ri)?);
         }
     };
     debug!("using {} strategy", core.name());
-    Ok(Arc::new(core))
+    Ok(Allocator::new(funding).arc(core)?)
 }
 
 #[derive(Clone, Debug)]
@@ -197,13 +242,20 @@ struct Pre<P> {
 }
 
 impl<P: PrefilterI> Pre<P> {
-    fn new(pre: P) -> Arc<dyn Strategy> {
-        // The only thing we support when we use prefilters directly as a
-        // strategy is the start and end of the overall match for a single
-        // pattern. In other words, exactly one implicit capturing group. Which
-        // is exactly what we use here for a GroupInfo.
-        let group_info = GroupInfo::new([[None::<&str>]]).unwrap();
-        Arc::new(Pre { pre, group_info })
+    fn new_with_allocations(
+        pre: P,
+        funding: &dyn Allocation,
+    ) -> Result<Arc<dyn Strategy>, BuildError> {
+        let group_info =
+            GroupInfo::new_with_allocations([[None::<&str>]], funding)
+                .map_err(|error| {
+                    BuildError::from(
+                        error
+                            .allocation_error()
+                            .expect("fixed implicit capture definition"),
+                    )
+                })?;
+        Ok(Allocator::new(funding).arc(Pre { pre, group_info })?)
     }
 }
 
@@ -226,16 +278,17 @@ impl Pre<()> {
     /// returns something, then it isn't a prefilter but a matcher itself.
     /// Therefore, it shouldn't suffer from the problems typical to prefilters
     /// (such as a high false positive rate).
-    fn from_prefixes(
+    fn from_prefixes_with_allocations(
         info: &RegexInfo,
         prefixes: &literal::Seq,
-    ) -> Option<Arc<dyn Strategy>> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Arc<dyn Strategy>>, BuildError> {
         let kind = info.config().get_match_kind();
         // Check to see if our prefixes are exact, which means we might be
         // able to bypass the regex engine entirely and just rely on literal
         // searches.
         if !prefixes.is_exact() {
-            return None;
+            return Ok(None);
         }
         // We also require that we have a single regex pattern. Namely,
         // we reuse the prefilter infrastructure to implement search and
@@ -244,14 +297,14 @@ impl Pre<()> {
         // Aho-Corasick and we might still just use a regular prefilter, but
         // that's done below.
         if info.pattern_len() != 1 {
-            return None;
+            return Ok(None);
         }
         // We can't have any capture groups either. The literal engines don't
         // know how to deal with things like '(foo)(bar)'. In that case, a
         // prefilter will just be used and then the regex engine will resolve
         // the capture groups.
         if info.props()[0].explicit_captures_len() != 0 {
-            return None;
+            return Ok(None);
         }
         // We also require that it has zero look-around assertions. Namely,
         // literal extraction treats look-around assertions as if they match
@@ -261,13 +314,13 @@ impl Pre<()> {
         // the regex engine. 'fooquux' will be used as a normal prefilter, and
         // then the regex engine will try to look for an actual match.
         if !info.props()[0].look_set().is_empty() {
-            return None;
+            return Ok(None);
         }
         // Finally, currently, our prefilters are all oriented around
         // leftmost-first match semantics, so don't try to use them if the
         // caller asked for anything else.
         if kind != MatchKind::LeftmostFirst {
-            return None;
+            return Ok(None);
         }
         // The above seems like a lot of requirements to meet, but it applies
         // to a lot of cases. 'foo', '[abc][123]' and 'foo|bar|quux' all meet
@@ -288,25 +341,41 @@ impl Pre<()> {
             prefixes.len(),
             prefixes,
         );
-        let choice = match prefilter::Choice::new(kind, prefixes) {
+        let choice = match prefilter::Choice::new_with_allocations(
+            kind, prefixes, funding,
+        )? {
             Some(choice) => choice,
             None => {
                 debug!(
                     "regex bypass failed because no prefilter could be built"
                 );
-                return None;
+                return Ok(None);
             }
         };
         let strat: Arc<dyn Strategy> = match choice {
-            prefilter::Choice::Memchr(pre) => Pre::new(pre),
-            prefilter::Choice::Memchr2(pre) => Pre::new(pre),
-            prefilter::Choice::Memchr3(pre) => Pre::new(pre),
-            prefilter::Choice::Memmem(pre) => Pre::new(pre),
-            prefilter::Choice::Teddy(pre) => Pre::new(pre),
-            prefilter::Choice::ByteSet(pre) => Pre::new(pre),
-            prefilter::Choice::AhoCorasick(pre) => Pre::new(pre),
+            prefilter::Choice::Memchr(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::Memchr2(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::Memchr3(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::Memmem(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::Teddy(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::ByteSet(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
+            prefilter::Choice::AhoCorasick(pre) => {
+                Pre::new_with_allocations(pre, funding)?
+            }
         };
-        Some(strat)
+        Ok(Some(strat))
     }
 
     /// Attempts to extract an alternation of literals, and if it's deemed
@@ -316,15 +385,28 @@ impl Pre<()> {
     /// could in theory do something if there are multiple HIRs where all of
     /// them are alternation of literals, but I haven't had the time to go down
     /// that path yet.
-    fn from_alternation_literals(
+    fn from_alternation_literals_with_allocations(
         info: &RegexInfo,
         hirs: &[&Hir],
-    ) -> Option<Arc<dyn Strategy>> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Arc<dyn Strategy>>, BuildError> {
         use crate::util::prefilter::AhoCorasick;
-
-        let lits = crate::meta::literal::alternation_literals(info, hirs)?;
-        let ac = AhoCorasick::new(MatchKind::LeftmostFirst, &lits)?;
-        Some(Pre::new(ac))
+        let Some(lits) =
+            crate::meta::literal::alternation_literals_with_allocations(
+                info, hirs, funding,
+            )?
+        else {
+            return Ok(None);
+        };
+        let Some(ac) = AhoCorasick::new_with_allocations(
+            MatchKind::LeftmostFirst,
+            &lits,
+            funding,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Pre::new_with_allocations(ac, funding)?))
     }
 }
 
@@ -358,8 +440,16 @@ impl Pre<()> {
 // strategy when len(patterns)==1 if the number of literals is large. In that
 // case, literal extraction gives up and will return an infinite set.)
 impl<P: PrefilterI> Strategy for Pre<P> {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Owned(format!("prefilter {}", self.pre.name()))
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.group_info.visit_source_storage(visitor)?;
+        self.pre.visit_source_storage(visitor)
+    }
+
+    fn name(&self) -> StrategyName {
+        StrategyName("prefilter ", self.pre.name())
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -367,18 +457,32 @@ impl<P: PrefilterI> Strategy for Pre<P> {
         &self.group_info
     }
 
-    fn create_cache(&self) -> Cache {
-        Cache {
-            capmatches: Captures::all(self.group_info().clone()),
-            pikevm: wrappers::PikeVMCache::none(),
-            backtrack: wrappers::BoundedBacktrackerCache::none(),
-            onepass: wrappers::OnePassCache::none(),
-            hybrid: wrappers::HybridCache::none(),
-            revhybrid: wrappers::ReverseHybridCache::none(),
-        }
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        Ok({
+            Cache {
+                capmatches: Captures::all_with_allocations(
+                    self.group_info().clone(),
+                    funding,
+                )?,
+                pikevm: wrappers::PikeVMCache::none(),
+                backtrack: wrappers::BoundedBacktrackerCache::none(),
+                onepass: wrappers::OnePassCache::none(),
+                hybrid: wrappers::HybridCache::none(),
+                revhybrid: wrappers::ReverseHybridCache::none(),
+            }
+        })
     }
 
-    fn reset_cache(&self, _cache: &mut Cache) {}
+    fn reset_cache(
+        &self,
+        _cache: &mut Cache,
+        _funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({})
+    }
 
     fn is_accelerated(&self) -> bool {
         self.pre.is_fast()
@@ -389,19 +493,26 @@ impl<P: PrefilterI> Strategy for Pre<P> {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn search(&self, _cache: &mut Cache, input: &Input<'_>) -> Option<Match> {
-        if input.is_done() {
-            return None;
-        }
-        if input.get_anchored().is_anchored() {
-            return self
-                .pre
-                .prefix(input.haystack(), input.get_span())
-                .map(|sp| Match::new(PatternID::ZERO, sp));
-        }
-        self.pre
-            .find(input.haystack(), input.get_span())
-            .map(|sp| Match::new(PatternID::ZERO, sp))
+    fn search(
+        &self,
+        _cache: &mut Cache,
+        input: &Input<'_>,
+        _funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            if input.is_done() {
+                return Ok(None);
+            }
+            if input.get_anchored().is_anchored() {
+                return Ok(self
+                    .pre
+                    .prefix(input.haystack(), input.get_span())
+                    .map(|sp| Match::new(PatternID::ZERO, sp)));
+            }
+            self.pre
+                .find(input.haystack(), input.get_span())
+                .map(|sp| Match::new(PatternID::ZERO, sp))
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -409,13 +520,22 @@ impl<P: PrefilterI> Strategy for Pre<P> {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        self.search(cache, input).map(|m| HalfMatch::new(m.pattern(), m.end()))
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            self.search(cache, input, funding)?
+                .map(|m| HalfMatch::new(m.pattern(), m.end()))
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        self.search(cache, input).is_some()
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok(self.search(cache, input, funding)?.is_some())
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -424,15 +544,20 @@ impl<P: PrefilterI> Strategy for Pre<P> {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        let m = self.search(cache, input)?;
-        if let Some(slot) = slots.get_mut(0) {
-            *slot = NonMaxUsize::new(m.start());
-        }
-        if let Some(slot) = slots.get_mut(1) {
-            *slot = NonMaxUsize::new(m.end());
-        }
-        Some(m.pattern())
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            let Some(m) = self.search(cache, input, funding)? else {
+                return Ok(None);
+            };
+            if let Some(slot) = slots.get_mut(0) {
+                *slot = NonMaxUsize::new(m.start());
+            }
+            if let Some(slot) = slots.get_mut(1) {
+                *slot = NonMaxUsize::new(m.end());
+            }
+            Some(m.pattern())
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -441,10 +566,13 @@ impl<P: PrefilterI> Strategy for Pre<P> {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        if self.search(cache, input).is_some() {
-            patset.insert(PatternID::ZERO);
-        }
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            if self.search(cache, input, funding)?.is_some() {
+                patset.insert(PatternID::ZERO);
+            }
+        })
     }
 }
 
@@ -462,17 +590,18 @@ struct Core {
 }
 
 impl Core {
-    fn new(
+    fn new_with_allocations(
         info: RegexInfo,
         pre: Option<Prefilter>,
         hirs: &[&Hir],
+        funding: &dyn Allocation,
     ) -> Result<Core, BuildError> {
         let mut lookm = LookMatcher::new();
         lookm.set_line_terminator(info.config().get_line_terminator());
         let thompson_config = info.config().to_thompson_config();
         let nfa = thompson::Compiler::new()
             .configure(thompson_config.clone())
-            .build_many_from_hir(hirs)
+            .build_many_from_hir_with_allocations(hirs, funding)
             .map_err(BuildError::nfa)?;
         // It's possible for the PikeVM or the BB to fail to build, even though
         // at this point, we already have a full NFA in hand. They can fail
@@ -487,7 +616,8 @@ impl Core {
         // fail in many cases because it is an optimization that doesn't apply
         // to all regexes. The 'OnePass' wrapper encapsulates this failure (and
         // logs a message if it occurs).
-        let onepass = wrappers::OnePass::new(&info, &nfa);
+        let onepass =
+            wrappers::OnePass::new_with_allocations(&info, &nfa, funding)?;
         // We try to encapsulate whether a particular regex engine should be
         // used within each respective wrapper, but the DFAs need a reverse NFA
         // to build itself, and we really do not want to build a reverse NFA if
@@ -519,12 +649,18 @@ impl Core {
                             .which_captures(WhichCaptures::None)
                             .reverse(true),
                     )
-                    .build_many_from_hir(hirs)
+                    .build_many_from_hir_with_allocations(hirs, funding)
                     .map_err(BuildError::nfa)?;
                 let dfa = if !info.config().get_dfa() {
                     wrappers::DFA::none()
                 } else {
-                    wrappers::DFA::new(&info, pre.clone(), &nfa, &nfarev)
+                    wrappers::DFA::new_with_allocations(
+                        &info,
+                        pre.clone(),
+                        &nfa,
+                        &nfarev,
+                        funding,
+                    )?
                 };
                 let hybrid = if !info.config().get_hybrid() {
                     wrappers::Hybrid::none()
@@ -554,13 +690,18 @@ impl Core {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Option<Result<Option<Match>, RetryFailError>> {
         if let Some(e) = self.dfa.get(input) {
             trace!("using full DFA for search at {:?}", input.get_span());
             Some(e.try_search(input))
         } else if let Some(e) = self.hybrid.get(input) {
             trace!("using lazy DFA for search at {:?}", input.get_span());
-            Some(e.try_search(&mut cache.hybrid, input))
+            Some(e.try_search_with_allocations(
+                &mut cache.hybrid,
+                input,
+                funding,
+            ))
         } else {
             None
         }
@@ -570,44 +711,67 @@ impl Core {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<Match> {
-        let caps = &mut cache.capmatches;
-        caps.set_pattern(None);
-        // We manually inline 'try_search_slots_nofail' here because we need to
-        // borrow from 'cache.capmatches' in this method, but if we do, then
-        // we can't pass 'cache' wholesale to to 'try_slots_no_hybrid'. It's a
-        // classic example of how the borrow checker inhibits decomposition.
-        // There are of course work-arounds (more types and/or interior
-        // mutability), but that's more annoying than this IMO.
-        let pid = if let Some(ref e) = self.onepass.get(input) {
-            trace!("using OnePass for search at {:?}", input.get_span());
-            e.search_slots(&mut cache.onepass, input, caps.slots_mut())
-        } else if let Some(ref e) = self.backtrack.get(input) {
-            trace!(
-                "using BoundedBacktracker for search at {:?}",
-                input.get_span()
-            );
-            e.search_slots(&mut cache.backtrack, input, caps.slots_mut())
-        } else {
-            trace!("using PikeVM for search at {:?}", input.get_span());
-            let e = self.pikevm.get();
-            e.search_slots(&mut cache.pikevm, input, caps.slots_mut())
-        };
-        caps.set_pattern(pid);
-        caps.get_match()
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            let caps = &mut cache.capmatches;
+            caps.set_pattern(None);
+            // We manually inline 'try_search_slots_nofail' here because we need to
+            // borrow from 'cache.capmatches' in this method, but if we do, then
+            // we can't pass 'cache' wholesale to to 'try_slots_no_hybrid'. It's a
+            // classic example of how the borrow checker inhibits decomposition.
+            // There are of course work-arounds (more types and/or interior
+            // mutability), but that's more annoying than this IMO.
+            let pid = if let Some(ref e) = self.onepass.get(input) {
+                trace!("using OnePass for search at {:?}", input.get_span());
+                e.search_slots_with_allocations(
+                    &mut cache.onepass,
+                    input,
+                    caps.slots_mut(),
+                    funding,
+                )?
+            } else if let Some(ref e) = self.backtrack.get(input) {
+                trace!(
+                    "using BoundedBacktracker for search at {:?}",
+                    input.get_span()
+                );
+                e.search_slots_with_allocations(
+                    &mut cache.backtrack,
+                    input,
+                    caps.slots_mut(),
+                    funding,
+                )?
+            } else {
+                trace!("using PikeVM for search at {:?}", input.get_span());
+                let e = self.pikevm.get();
+                e.search_slots_with_allocations(
+                    &mut cache.pikevm,
+                    input,
+                    caps.slots_mut(),
+                    funding,
+                )?
+            };
+            caps.set_pattern(pid);
+            caps.get_match()
+        })
     }
 
     fn search_half_nofail(
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        // Only the lazy/full DFA returns half-matches, since the DFA requires
-        // a reverse scan to find the start position. These fallback regex
-        // engines can find the start and end in a single pass, so we just do
-        // that and throw away the start offset to conform to the API.
-        let m = self.search_nofail(cache, input)?;
-        Some(HalfMatch::new(m.pattern(), m.end()))
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            // Only the lazy/full DFA returns half-matches, since the DFA requires
+            // a reverse scan to find the start position. These fallback regex
+            // engines can find the start and end in a single pass, so we just do
+            // that and throw away the start offset to conform to the API.
+            let Some(m) = self.search_nofail(cache, input, funding)? else {
+                return Ok(None);
+            };
+            Some(HalfMatch::new(m.pattern(), m.end()))
+        })
     }
 
     fn search_slots_nofail(
@@ -615,50 +779,85 @@ impl Core {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        if let Some(ref e) = self.onepass.get(input) {
-            trace!(
-                "using OnePass for capture search at {:?}",
-                input.get_span()
-            );
-            e.search_slots(&mut cache.onepass, input, slots)
-        } else if let Some(ref e) = self.backtrack.get(input) {
-            trace!(
-                "using BoundedBacktracker for capture search at {:?}",
-                input.get_span()
-            );
-            e.search_slots(&mut cache.backtrack, input, slots)
-        } else {
-            trace!(
-                "using PikeVM for capture search at {:?}",
-                input.get_span()
-            );
-            let e = self.pikevm.get();
-            e.search_slots(&mut cache.pikevm, input, slots)
-        }
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            if let Some(ref e) = self.onepass.get(input) {
+                trace!(
+                    "using OnePass for capture search at {:?}",
+                    input.get_span()
+                );
+                e.search_slots_with_allocations(
+                    &mut cache.onepass,
+                    input,
+                    slots,
+                    funding,
+                )?
+            } else if let Some(ref e) = self.backtrack.get(input) {
+                trace!(
+                    "using BoundedBacktracker for capture search at {:?}",
+                    input.get_span()
+                );
+                e.search_slots_with_allocations(
+                    &mut cache.backtrack,
+                    input,
+                    slots,
+                    funding,
+                )?
+            } else {
+                trace!(
+                    "using PikeVM for capture search at {:?}",
+                    input.get_span()
+                );
+                let e = self.pikevm.get();
+                e.search_slots_with_allocations(
+                    &mut cache.pikevm,
+                    input,
+                    slots,
+                    funding,
+                )?
+            }
+        })
     }
 
-    fn is_match_nofail(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        if let Some(ref e) = self.onepass.get(input) {
-            trace!(
-                "using OnePass for is-match search at {:?}",
-                input.get_span()
-            );
-            e.search_slots(&mut cache.onepass, input, &mut []).is_some()
-        } else if let Some(ref e) = self.backtrack.get(input) {
-            trace!(
-                "using BoundedBacktracker for is-match search at {:?}",
-                input.get_span()
-            );
-            e.is_match(&mut cache.backtrack, input)
-        } else {
-            trace!(
-                "using PikeVM for is-match search at {:?}",
-                input.get_span()
-            );
-            let e = self.pikevm.get();
-            e.is_match(&mut cache.pikevm, input)
-        }
+    fn is_match_nofail(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok({
+            if let Some(ref e) = self.onepass.get(input) {
+                trace!(
+                    "using OnePass for is-match search at {:?}",
+                    input.get_span()
+                );
+                e.search_slots_with_allocations(
+                    &mut cache.onepass,
+                    input,
+                    &mut [],
+                    funding,
+                )?
+                .is_some()
+            } else if let Some(ref e) = self.backtrack.get(input) {
+                trace!(
+                    "using BoundedBacktracker for is-match search at {:?}",
+                    input.get_span()
+                );
+                e.is_match_with_allocations(
+                    &mut cache.backtrack,
+                    input,
+                    funding,
+                )?
+            } else {
+                trace!(
+                    "using PikeVM for is-match search at {:?}",
+                    input.get_span()
+                );
+                let e = self.pikevm.get();
+                e.is_match_with_allocations(&mut cache.pikevm, input, funding)?
+            }
+        })
     }
 
     fn is_capture_search_needed(&self, slots_len: usize) -> bool {
@@ -667,8 +866,27 @@ impl Core {
 }
 
 impl Strategy for Core {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("core")
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.info.visit_source_storage(visitor)?;
+        if let Some(pre) = &self.pre {
+            pre.visit_source_storage(visitor)?;
+        }
+        self.nfa.visit_source_storage(visitor)?;
+        if let Some(nfa) = &self.nfarev {
+            nfa.visit_source_storage(visitor)?;
+        }
+        self.pikevm.visit_source_storage(visitor)?;
+        self.backtrack.visit_source_storage(visitor)?;
+        self.onepass.visit_source_storage(visitor)?;
+        self.hybrid.visit_source_storage(visitor)?;
+        self.dfa.visit_source_storage(visitor)
+    }
+
+    fn name(&self) -> StrategyName {
+        StrategyName("", "core")
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -677,23 +895,43 @@ impl Strategy for Core {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn create_cache(&self) -> Cache {
-        Cache {
-            capmatches: Captures::all(self.group_info().clone()),
-            pikevm: self.pikevm.create_cache(),
-            backtrack: self.backtrack.create_cache(),
-            onepass: self.onepass.create_cache(),
-            hybrid: self.hybrid.create_cache(),
-            revhybrid: wrappers::ReverseHybridCache::none(),
-        }
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        Ok({
+            Cache {
+                capmatches: Captures::all_with_allocations(
+                    self.group_info().clone(),
+                    funding,
+                )?,
+                pikevm: self.pikevm.create_cache(),
+                backtrack: self.backtrack.create_cache(),
+                onepass: self
+                    .onepass
+                    .create_cache_with_allocations(funding)?,
+                hybrid: self.hybrid.create_cache_with_allocations(funding)?,
+                revhybrid: wrappers::ReverseHybridCache::none(),
+            }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn reset_cache(&self, cache: &mut Cache) {
-        cache.pikevm.reset(&self.pikevm);
-        cache.backtrack.reset(&self.backtrack);
-        cache.onepass.reset(&self.onepass);
-        cache.hybrid.reset(&self.hybrid);
+    fn reset_cache(
+        &self,
+        cache: &mut Cache,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            cache.pikevm.reset_with_allocations(&self.pikevm, funding)?;
+            cache
+                .backtrack
+                .reset_with_allocations(&self.backtrack, funding)?;
+            cache
+                .onepass
+                .reset_with_allocations(&self.onepass, funding)?;
+            cache.hybrid.reset_with_allocations(&self.hybrid, funding)?;
+        })
     }
 
     fn is_accelerated(&self) -> bool {
@@ -710,30 +948,53 @@ impl Strategy for Core {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn search(&self, cache: &mut Cache, input: &Input<'_>) -> Option<Match> {
-        // We manually inline try_search_mayfail here because letting the
-        // compiler do it seems to produce pretty crappy codegen.
-        return if let Some(e) = self.dfa.get(input) {
-            trace!("using full DFA for full search at {:?}", input.get_span());
-            match e.try_search(input) {
-                Ok(x) => x,
-                Err(_err) => {
-                    trace!("full DFA search failed: {_err}");
-                    self.search_nofail(cache, input)
+    fn search(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            // We manually inline try_search_mayfail here because letting the
+            // compiler do it seems to produce pretty crappy codegen.
+            if let Some(e) = self.dfa.get(input) {
+                trace!(
+                    "using full DFA for full search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search(input) {
+                    Ok(x) => x,
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("full DFA search failed: {_err}");
+                        self.search_nofail(cache, input, funding)?
+                    }
                 }
-            }
-        } else if let Some(e) = self.hybrid.get(input) {
-            trace!("using lazy DFA for full search at {:?}", input.get_span());
-            match e.try_search(&mut cache.hybrid, input) {
-                Ok(x) => x,
-                Err(_err) => {
-                    trace!("lazy DFA search failed: {_err}");
-                    self.search_nofail(cache, input)
+            } else if let Some(e) = self.hybrid.get(input) {
+                trace!(
+                    "using lazy DFA for full search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search_with_allocations(
+                    &mut cache.hybrid,
+                    input,
+                    funding,
+                ) {
+                    Ok(x) => x,
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("lazy DFA search failed: {_err}");
+                        self.search_nofail(cache, input, funding)?
+                    }
                 }
+            } else {
+                self.search_nofail(cache, input, funding)?
             }
-        } else {
-            self.search_nofail(cache, input)
-        };
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -741,62 +1002,98 @@ impl Strategy for Core {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        // The main difference with 'search' is that if we're using a DFA, we
-        // can use a single forward scan without needing to run the reverse
-        // DFA.
-        if let Some(e) = self.dfa.get(input) {
-            trace!("using full DFA for half search at {:?}", input.get_span());
-            match e.try_search_half_fwd(input) {
-                Ok(x) => x,
-                Err(_err) => {
-                    trace!("full DFA half search failed: {_err}");
-                    self.search_half_nofail(cache, input)
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            // The main difference with 'search' is that if we're using a DFA, we
+            // can use a single forward scan without needing to run the reverse
+            // DFA.
+            if let Some(e) = self.dfa.get(input) {
+                trace!(
+                    "using full DFA for half search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search_half_fwd(input) {
+                    Ok(x) => x,
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("full DFA half search failed: {_err}");
+                        self.search_half_nofail(cache, input, funding)?
+                    }
                 }
-            }
-        } else if let Some(e) = self.hybrid.get(input) {
-            trace!("using lazy DFA for half search at {:?}", input.get_span());
-            match e.try_search_half_fwd(&mut cache.hybrid, input) {
-                Ok(x) => x,
-                Err(_err) => {
-                    trace!("lazy DFA half search failed: {_err}");
-                    self.search_half_nofail(cache, input)
+            } else if let Some(e) = self.hybrid.get(input) {
+                trace!(
+                    "using lazy DFA for half search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search_half_fwd_with_allocations(
+                    &mut cache.hybrid,
+                    input,
+                    funding,
+                ) {
+                    Ok(x) => x,
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("lazy DFA half search failed: {_err}");
+                        self.search_half_nofail(cache, input, funding)?
+                    }
                 }
+            } else {
+                self.search_half_nofail(cache, input, funding)?
             }
-        } else {
-            self.search_half_nofail(cache, input)
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        if let Some(e) = self.dfa.get(input) {
-            trace!(
-                "using full DFA for is-match search at {:?}",
-                input.get_span()
-            );
-            match e.try_search_half_fwd(input) {
-                Ok(x) => x.is_some(),
-                Err(_err) => {
-                    trace!("full DFA half search failed: {_err}");
-                    self.is_match_nofail(cache, input)
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok({
+            if let Some(e) = self.dfa.get(input) {
+                trace!(
+                    "using full DFA for is-match search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search_half_fwd(input) {
+                    Ok(x) => x.is_some(),
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("full DFA half search failed: {_err}");
+                        self.is_match_nofail(cache, input, funding)?
+                    }
                 }
-            }
-        } else if let Some(e) = self.hybrid.get(input) {
-            trace!(
-                "using lazy DFA for is-match search at {:?}",
-                input.get_span()
-            );
-            match e.try_search_half_fwd(&mut cache.hybrid, input) {
-                Ok(x) => x.is_some(),
-                Err(_err) => {
-                    trace!("lazy DFA half search failed: {_err}");
-                    self.is_match_nofail(cache, input)
+            } else if let Some(e) = self.hybrid.get(input) {
+                trace!(
+                    "using lazy DFA for is-match search at {:?}",
+                    input.get_span()
+                );
+                match e.try_search_half_fwd_with_allocations(
+                    &mut cache.hybrid,
+                    input,
+                    funding,
+                ) {
+                    Ok(x) => x.is_some(),
+                    Err(_err) => {
+                        if let Some(error) = _err.allocation_error() {
+                            return Err(error.into());
+                        }
+                        trace!("lazy DFA half search failed: {_err}");
+                        self.is_match_nofail(cache, input, funding)?
+                    }
                 }
+            } else {
+                self.is_match_nofail(cache, input, funding)?
             }
-        } else {
-            self.is_match_nofail(cache, input)
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -805,63 +1102,75 @@ impl Strategy for Core {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        // Even if the regex has explicit capture groups, if the caller didn't
-        // provide any explicit slots, then it doesn't make sense to try and do
-        // extra work to get offsets for those slots. Ideally the caller should
-        // realize this and not call this routine in the first place, but alas,
-        // we try to save the caller from themselves if they do.
-        if !self.is_capture_search_needed(slots.len()) {
-            trace!("asked for slots unnecessarily, trying fast path");
-            let m = self.search(cache, input)?;
-            copy_match_to_slots(m, slots);
-            return Some(m.pattern());
-        }
-        // If the onepass DFA is available for this search (which only happens
-        // when it's anchored), then skip running a fallible DFA. The onepass
-        // DFA isn't as fast as a full or lazy DFA, but it is typically quite
-        // a bit faster than the backtracker or the PikeVM. So it isn't as
-        // advantageous to try and do a full/lazy DFA scan first.
-        //
-        // We still theorize that it's better to do a full/lazy DFA scan, even
-        // when it's anchored, because it's usually much faster and permits us
-        // to say "no match" much more quickly. This does hurt the case of,
-        // say, parsing each line in a log file into capture groups, because
-        // in that case, the line always matches. So the lazy DFA scan is
-        // usually just wasted work. But, the lazy DFA is usually quite fast
-        // and doesn't cost too much here.
-        if self.onepass.get(&input).is_some() {
-            return self.search_slots_nofail(cache, &input, slots);
-        }
-        let m = match self.try_search_mayfail(cache, input) {
-            Some(Ok(Some(m))) => m,
-            Some(Ok(None)) => return None,
-            Some(Err(_err)) => {
-                trace!("fast capture search failed: {_err}");
-                return self.search_slots_nofail(cache, input, slots);
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            // Even if the regex has explicit capture groups, if the caller didn't
+            // provide any explicit slots, then it doesn't make sense to try and do
+            // extra work to get offsets for those slots. Ideally the caller should
+            // realize this and not call this routine in the first place, but alas,
+            // we try to save the caller from themselves if they do.
+            if !self.is_capture_search_needed(slots.len()) {
+                trace!("asked for slots unnecessarily, trying fast path");
+                let Some(m) = self.search(cache, input, funding)? else {
+                    return Ok(None);
+                };
+                copy_match_to_slots(m, slots);
+                return Ok(Some(m.pattern()));
             }
-            None => {
-                return self.search_slots_nofail(cache, input, slots);
+            // If the onepass DFA is available for this search (which only happens
+            // when it's anchored), then skip running a fallible DFA. The onepass
+            // DFA isn't as fast as a full or lazy DFA, but it is typically quite
+            // a bit faster than the backtracker or the PikeVM. So it isn't as
+            // advantageous to try and do a full/lazy DFA scan first.
+            //
+            // We still theorize that it's better to do a full/lazy DFA scan, even
+            // when it's anchored, because it's usually much faster and permits us
+            // to say "no match" much more quickly. This does hurt the case of,
+            // say, parsing each line in a log file into capture groups, because
+            // in that case, the line always matches. So the lazy DFA scan is
+            // usually just wasted work. But, the lazy DFA is usually quite fast
+            // and doesn't cost too much here.
+            if self.onepass.get(&input).is_some() {
+                return Ok(
+                    self.search_slots_nofail(cache, &input, slots, funding)?
+                );
             }
-        };
-        // At this point, now that we've found the bounds of the
-        // match, we need to re-run something that can resolve
-        // capturing groups. But we only need to run on it on the
-        // match bounds and not the entire haystack.
-        trace!(
-            "match found at {}..{} in capture search, \
+            let m = match self.try_search_mayfail(cache, input, funding) {
+                Some(Ok(Some(m))) => m,
+                Some(Ok(None)) => return Ok(None),
+                Some(Err(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("fast capture search failed: {_err}");
+                    return Ok(self
+                        .search_slots_nofail(cache, input, slots, funding)?);
+                }
+                None => {
+                    return Ok(self
+                        .search_slots_nofail(cache, input, slots, funding)?);
+                }
+            };
+            // At this point, now that we've found the bounds of the
+            // match, we need to re-run something that can resolve
+            // capturing groups. But we only need to run on it on the
+            // match bounds and not the entire haystack.
+            trace!(
+                "match found at {}..{} in capture search, \
              using another engine to find captures",
-            m.start(),
-            m.end(),
-        );
-        let input = input
-            .clone()
-            .span(m.start()..m.end())
-            .anchored(Anchored::Pattern(m.pattern()));
-        Some(
-            self.search_slots_nofail(cache, &input, slots)
-                .expect("should find a match"),
-        )
+                m.start(),
+                m.end(),
+            );
+            let input = input
+                .clone()
+                .span(m.start()..m.end())
+                .anchored(Anchored::Pattern(m.pattern()));
+            Some(
+                self.search_slots_nofail(cache, &input, slots, funding)?
+                    .expect("should find a match"),
+            )
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -870,40 +1179,57 @@ impl Strategy for Core {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        if let Some(e) = self.dfa.get(input) {
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            if let Some(e) = self.dfa.get(input) {
+                trace!(
+                    "using full DFA for overlapping search at {:?}",
+                    input.get_span()
+                );
+                let _err = match e.try_which_overlapping_matches(input, patset)
+                {
+                    Ok(()) => return Ok(()),
+                    Err(err) => err,
+                };
+                if let Some(error) = _err.allocation_error() {
+                    return Err(error.into());
+                }
+                trace!("fast overlapping search failed: {_err}");
+            } else if let Some(e) = self.hybrid.get(input) {
+                trace!(
+                    "using lazy DFA for overlapping search at {:?}",
+                    input.get_span()
+                );
+                let _err = match e
+                    .try_which_overlapping_matches_with_allocations(
+                        &mut cache.hybrid,
+                        input,
+                        patset,
+                        funding,
+                    ) {
+                    Ok(()) => {
+                        return Ok(());
+                    }
+                    Err(err) => err,
+                };
+                if let Some(error) = _err.allocation_error() {
+                    return Err(error.into());
+                }
+                trace!("fast overlapping search failed: {_err}");
+            }
             trace!(
-                "using full DFA for overlapping search at {:?}",
+                "using PikeVM for overlapping search at {:?}",
                 input.get_span()
             );
-            let _err = match e.try_which_overlapping_matches(input, patset) {
-                Ok(()) => return,
-                Err(err) => err,
-            };
-            trace!("fast overlapping search failed: {_err}");
-        } else if let Some(e) = self.hybrid.get(input) {
-            trace!(
-                "using lazy DFA for overlapping search at {:?}",
-                input.get_span()
-            );
-            let _err = match e.try_which_overlapping_matches(
-                &mut cache.hybrid,
+            let e = self.pikevm.get();
+            e.which_overlapping_matches_with_allocations(
+                &mut cache.pikevm,
                 input,
                 patset,
-            ) {
-                Ok(()) => {
-                    return;
-                }
-                Err(err) => err,
-            };
-            trace!("fast overlapping search failed: {_err}");
-        }
-        trace!(
-            "using PikeVM for overlapping search at {:?}",
-            input.get_span()
-        );
-        let e = self.pikevm.get();
-        e.which_overlapping_matches(&mut cache.pikevm, input, patset)
+                funding,
+            )?
+        })
     }
 }
 
@@ -954,6 +1280,7 @@ impl ReverseAnchored {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryFailError> {
         // We of course always want an anchored search. In theory, the
         // underlying regex engines should automatically enable anchored
@@ -971,7 +1298,11 @@ impl ReverseAnchored {
                 "using lazy DFA for reverse anchored search at {:?}",
                 input.get_span()
             );
-            e.try_search_half_rev(&mut cache.hybrid, &input)
+            e.try_search_half_rev_with_allocations(
+                &mut cache.hybrid,
+                &input,
+                funding,
+            )
         } else {
             unreachable!("ReverseAnchored always has a DFA")
         }
@@ -986,8 +1317,15 @@ impl ReverseAnchored {
 // Thus, in this impl, we can actually assume that the end position in 'input'
 // is equivalent to the length of the haystack.
 impl Strategy for ReverseAnchored {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("reverse anchored")
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.core.visit_source_storage(visitor)
+    }
+
+    fn name(&self) -> StrategyName {
+        StrategyName("", "reverse anchored")
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -996,13 +1334,22 @@ impl Strategy for ReverseAnchored {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn create_cache(&self) -> Cache {
-        self.core.create_cache()
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        Ok(self.core.create_cache(funding)?)
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn reset_cache(&self, cache: &mut Cache) {
-        self.core.reset_cache(cache);
+    fn reset_cache(
+        &self,
+        cache: &mut Cache,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            self.core.reset_cache(cache, funding)?;
+        })
     }
 
     fn is_accelerated(&self) -> bool {
@@ -1017,20 +1364,30 @@ impl Strategy for ReverseAnchored {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn search(&self, cache: &mut Cache, input: &Input<'_>) -> Option<Match> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search(cache, input);
-        }
-        match self.try_search_half_anchored_rev(cache, input) {
-            Err(_err) => {
-                trace!("fast reverse anchored search failed: {_err}");
-                self.core.search_nofail(cache, input)
+    fn search(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search(cache, input, funding)?);
             }
-            Ok(None) => None,
-            Ok(Some(hm)) => {
-                Some(Match::new(hm.pattern(), hm.offset()..input.end()))
+            match self.try_search_half_anchored_rev(cache, input, funding) {
+                Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("fast reverse anchored search failed: {_err}");
+                    self.core.search_nofail(cache, input, funding)?
+                }
+                Ok(None) => None,
+                Ok(Some(hm)) => {
+                    Some(Match::new(hm.pattern(), hm.offset()..input.end()))
+                }
             }
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1038,41 +1395,57 @@ impl Strategy for ReverseAnchored {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_half(cache, input);
-        }
-        match self.try_search_half_anchored_rev(cache, input) {
-            Err(_err) => {
-                trace!("fast reverse anchored search failed: {_err}");
-                self.core.search_half_nofail(cache, input)
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search_half(cache, input, funding)?);
             }
-            Ok(None) => None,
-            Ok(Some(hm)) => {
-                // Careful here! 'try_search_half' is a *forward* search that
-                // only cares about the *end* position of a match. But
-                // 'hm.offset()' is actually the start of the match. So we
-                // actually just throw that away here and, since we know we
-                // have a match, return the only possible position at which a
-                // match can occur: input.end().
-                Some(HalfMatch::new(hm.pattern(), input.end()))
+            match self.try_search_half_anchored_rev(cache, input, funding) {
+                Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("fast reverse anchored search failed: {_err}");
+                    self.core.search_half_nofail(cache, input, funding)?
+                }
+                Ok(None) => None,
+                Ok(Some(hm)) => {
+                    // Careful here! 'try_search_half' is a *forward* search that
+                    // only cares about the *end* position of a match. But
+                    // 'hm.offset()' is actually the start of the match. So we
+                    // actually just throw that away here and, since we know we
+                    // have a match, return the only possible position at which a
+                    // match can occur: input.end().
+                    Some(HalfMatch::new(hm.pattern(), input.end()))
+                }
             }
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        if input.get_anchored().is_anchored() {
-            return self.core.is_match(cache, input);
-        }
-        match self.try_search_half_anchored_rev(cache, input) {
-            Err(_err) => {
-                trace!("fast reverse anchored search failed: {_err}");
-                self.core.is_match_nofail(cache, input)
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.is_match(cache, input, funding)?);
             }
-            Ok(None) => false,
-            Ok(Some(_)) => true,
-        }
+            match self.try_search_half_anchored_rev(cache, input, funding) {
+                Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("fast reverse anchored search failed: {_err}");
+                    self.core.is_match_nofail(cache, input, funding)?
+                }
+                Ok(None) => false,
+                Ok(Some(_)) => true,
+            }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1081,31 +1454,44 @@ impl Strategy for ReverseAnchored {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_slots(cache, input, slots);
-        }
-        match self.try_search_half_anchored_rev(cache, input) {
-            Err(_err) => {
-                trace!("fast reverse anchored search failed: {_err}");
-                self.core.search_slots_nofail(cache, input, slots)
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self
+                    .core
+                    .search_slots(cache, input, slots, funding)?);
             }
-            Ok(None) => None,
-            Ok(Some(hm)) => {
-                if !self.core.is_capture_search_needed(slots.len()) {
-                    trace!("asked for slots unnecessarily, skipping captures");
-                    let m = Match::new(hm.pattern(), hm.offset()..input.end());
-                    copy_match_to_slots(m, slots);
-                    return Some(m.pattern());
+            match self.try_search_half_anchored_rev(cache, input, funding) {
+                Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("fast reverse anchored search failed: {_err}");
+                    self.core
+                        .search_slots_nofail(cache, input, slots, funding)?
                 }
-                let start = hm.offset();
-                let input = input
-                    .clone()
-                    .span(start..input.end())
-                    .anchored(Anchored::Pattern(hm.pattern()));
-                self.core.search_slots_nofail(cache, &input, slots)
+                Ok(None) => None,
+                Ok(Some(hm)) => {
+                    if !self.core.is_capture_search_needed(slots.len()) {
+                        trace!(
+                            "asked for slots unnecessarily, skipping captures"
+                        );
+                        let m =
+                            Match::new(hm.pattern(), hm.offset()..input.end());
+                        copy_match_to_slots(m, slots);
+                        return Ok(Some(m.pattern()));
+                    }
+                    let start = hm.offset();
+                    let input = input
+                        .clone()
+                        .span(start..input.end())
+                        .anchored(Anchored::Pattern(hm.pattern()));
+                    self.core
+                        .search_slots_nofail(cache, &input, slots, funding)?
+                }
             }
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1114,12 +1500,16 @@ impl Strategy for ReverseAnchored {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        // It seems like this could probably benefit from a reverse anchored
-        // optimization, perhaps by doing an overlapping reverse search (which
-        // the DFAs do support). I haven't given it much thought though, and
-        // I'm currently focus more on the single pattern case.
-        self.core.which_overlapping_matches(cache, input, patset)
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            // It seems like this could probably benefit from a reverse anchored
+            // optimization, perhaps by doing an overlapping reverse search (which
+            // the DFAs do support). I haven't given it much thought though, and
+            // I'm currently focus more on the single pattern case.
+            self.core
+                .which_overlapping_matches(cache, input, patset, funding)?
+        })
     }
 }
 
@@ -1130,13 +1520,17 @@ struct ReverseSuffix {
 }
 
 impl ReverseSuffix {
-    fn new(core: Core, hirs: &[&Hir]) -> Result<ReverseSuffix, Core> {
+    fn new_with_allocations(
+        core: Core,
+        hirs: &[&Hir],
+        funding: &dyn Allocation,
+    ) -> Result<Result<ReverseSuffix, Core>, BuildError> {
         if !core.info.config().get_auto_prefilter() {
             debug!(
                 "skipping reverse suffix optimization because \
                  automatic prefilters are disabled"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // Also like the reverse inner optimization, a reverse suffix encodes
         // leftmost-first match semantics.
@@ -1146,7 +1540,7 @@ impl ReverseSuffix {
                  match kind is {:?} but this only supports leftmost-first",
                 core.info.config().get_match_kind(),
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // Like the reverse inner optimization, we don't do this for regexes
         // that are always anchored. It could lead to scanning too much, but
@@ -1168,7 +1562,7 @@ impl ReverseSuffix {
                 "skipping reverse suffix optimization because \
                  the regex is always anchored at the start",
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // Only DFAs can do reverse searches (currently), so we need one of
         // them in order to do this optimization. It's possible (although
@@ -1178,35 +1572,38 @@ impl ReverseSuffix {
                 "skipping reverse suffix optimization because \
                  we don't have a lazy DFA or a full DFA"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         if core.pre.as_ref().map_or(false, |p| p.is_fast()) {
             debug!(
                 "skipping reverse suffix optimization because \
                  we already have a prefilter that we think is fast"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         let kind = core.info.config().get_match_kind();
-        let suffixes = crate::util::prefilter::suffixes(kind, hirs);
+        let suffixes = crate::util::prefilter::suffixes_with_allocations(
+            kind, hirs, funding,
+        )?;
         let lcs = match suffixes.longest_common_suffix() {
             None => {
                 debug!(
                     "skipping reverse suffix optimization because \
                      a longest common suffix could not be found",
                 );
-                return Err(core);
+                return Ok(Err(core));
             }
             Some(lcs) if lcs.is_empty() => {
                 debug!(
                     "skipping reverse suffix optimization because \
                      the longest common suffix is the empty string",
                 );
-                return Err(core);
+                return Ok(Err(core));
             }
             Some(lcs) => lcs,
         };
-        let pre = match Prefilter::new(kind, &[lcs]) {
+        let pre = match Prefilter::new_with_allocations(kind, &[lcs], funding)?
+        {
             Some(pre) => pre,
             None => {
                 debug!(
@@ -1214,7 +1611,7 @@ impl ReverseSuffix {
                      a prefilter could not be constructed from the \
                      longest common suffix",
                 );
-                return Err(core);
+                return Ok(Err(core));
             }
         };
         if !pre.is_fast() {
@@ -1223,17 +1620,17 @@ impl ReverseSuffix {
                  while we have a suffix prefilter, it is not \
                  believed to be 'fast'"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
-        if !reverse_suffix::has_no_earlier_match(hirs, &lcs) {
+        if !reverse_suffix::has_no_earlier_match_with_allocations(hirs, &lcs, funding)? {
             debug!(
                 "skipping reverse suffix optimization because \
                  an earlier suffix match could be a complete match \
                  inside of a larger match"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
-        Ok(ReverseSuffix { core, pre })
+        Ok(Ok(ReverseSuffix { core, pre }))
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1241,6 +1638,7 @@ impl ReverseSuffix {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryError> {
         let mut span = input.get_span();
         let mut min_start = 0;
@@ -1254,9 +1652,9 @@ impl ReverseSuffix {
                 .clone()
                 .anchored(Anchored::Yes)
                 .span(input.start()..litmatch.end);
-            if let Some(hm) =
-                self.try_search_half_rev_limited(cache, &revinput, min_start)?
-            {
+            if let Some(hm) = self.try_search_half_rev_limited(
+                cache, &revinput, min_start, funding,
+            )? {
                 return Ok(Some(hm));
             }
 
@@ -1274,6 +1672,7 @@ impl ReverseSuffix {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryFailError> {
         if let Some(e) = self.core.dfa.get(&input) {
             trace!(
@@ -1286,7 +1685,11 @@ impl ReverseSuffix {
                 "using lazy DFA for forward reverse suffix search at {:?}",
                 input.get_span()
             );
-            e.try_search_half_fwd(&mut cache.hybrid, &input)
+            e.try_search_half_fwd_with_allocations(
+                &mut cache.hybrid,
+                &input,
+                funding,
+            )
         } else {
             unreachable!("ReverseSuffix always has a DFA")
         }
@@ -1298,6 +1701,7 @@ impl ReverseSuffix {
         cache: &mut Cache,
         input: &Input<'_>,
         min_start: usize,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryError> {
         if let Some(e) = self.core.dfa.get(&input) {
             trace!(
@@ -1314,7 +1718,12 @@ impl ReverseSuffix {
                 input.get_span(),
                 min_start,
             );
-            e.try_search_half_rev_limited(&mut cache.hybrid, &input, min_start)
+            e.try_search_half_rev_limited_with_allocations(
+                &mut cache.hybrid,
+                &input,
+                min_start,
+                funding,
+            )
         } else {
             unreachable!("ReverseSuffix always has a DFA")
         }
@@ -1322,8 +1731,16 @@ impl ReverseSuffix {
 }
 
 impl Strategy for ReverseSuffix {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("reverse suffix")
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.core.visit_source_storage(visitor)?;
+        self.pre.visit_source_storage(visitor)
+    }
+
+    fn name(&self) -> StrategyName {
+        StrategyName("", "reverse suffix")
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1332,13 +1749,22 @@ impl Strategy for ReverseSuffix {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn create_cache(&self) -> Cache {
-        self.core.create_cache()
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        Ok(self.core.create_cache(funding)?)
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn reset_cache(&self, cache: &mut Cache) {
-        self.core.reset_cache(cache);
+    fn reset_cache(
+        &self,
+        cache: &mut Cache,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            self.core.reset_cache(cache, funding)?;
+        })
     }
 
     fn is_accelerated(&self) -> bool {
@@ -1350,45 +1776,60 @@ impl Strategy for ReverseSuffix {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn search(&self, cache: &mut Cache, input: &Input<'_>) -> Option<Match> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search(cache, input);
-        }
-        match self.try_search_half_start(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse suffix optimization failed: {_err}");
-                self.core.search(cache, input)
+    fn search(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!("reverse suffix reverse fast search failed: {_err}");
-                self.core.search_nofail(cache, input)
-            }
-            Ok(None) => None,
-            Ok(Some(hm_start)) => {
-                let fwdinput = input
-                    .clone()
-                    .anchored(Anchored::Pattern(hm_start.pattern()))
-                    .span(hm_start.offset()..input.end());
-                match self.try_search_half_fwd(cache, &fwdinput) {
-                    Err(_err) => {
-                        trace!(
+            match self.try_search_half_start(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse suffix optimization failed: {_err}");
+                    self.core.search(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!(
+                        "reverse suffix reverse fast search failed: {_err}"
+                    );
+                    self.core.search_nofail(cache, input, funding)?
+                }
+                Ok(None) => None,
+                Ok(Some(hm_start)) => {
+                    let fwdinput = input
+                        .clone()
+                        .anchored(Anchored::Pattern(hm_start.pattern()))
+                        .span(hm_start.offset()..input.end());
+                    match self.try_search_half_fwd(cache, &fwdinput, funding) {
+                        Err(_err) => {
+                            if let Some(error) = _err.allocation_error() {
+                                return Err(error.into());
+                            }
+                            trace!(
                             "reverse suffix forward fast search failed: {_err}"
                         );
-                        self.core.search_nofail(cache, input)
-                    }
-                    Ok(None) => {
-                        unreachable!(
-                            "suffix match plus reverse match implies \
+                            self.core.search_nofail(cache, input, funding)?
+                        }
+                        Ok(None) => {
+                            unreachable!(
+                                "suffix match plus reverse match implies \
                              there must be a match",
-                        )
+                            )
+                        }
+                        Ok(Some(hm_end)) => Some(Match::new(
+                            hm_start.pattern(),
+                            hm_start.offset()..hm_end.offset(),
+                        )),
                     }
-                    Ok(Some(hm_end)) => Some(Match::new(
-                        hm_start.pattern(),
-                        hm_start.offset()..hm_end.offset(),
-                    )),
                 }
             }
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1396,74 +1837,94 @@ impl Strategy for ReverseSuffix {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_half(cache, input);
-        }
-        match self.try_search_half_start(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse suffix half optimization failed: {_err}");
-                self.core.search_half(cache, input)
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search_half(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!(
+            match self.try_search_half_start(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse suffix half optimization failed: {_err}");
+                    self.core.search_half(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!(
                     "reverse suffix reverse fast half search failed: {_err}"
                 );
-                self.core.search_half_nofail(cache, input)
-            }
-            Ok(None) => None,
-            Ok(Some(hm_start)) => {
-                // This is a bit subtle. It is tempting to just stop searching
-                // at this point and return a half-match with an offset
-                // corresponding to where the suffix was found. But the suffix
-                // match does not necessarily correspond to the end of the
-                // proper leftmost-first match. Consider /[a-z]+ing/ against
-                // 'tingling'. The first suffix match is the first 'ing', and
-                // the /[a-z]+/ matches the 't'. So if we stopped here, then
-                // we'd report 'ting' as the match. But 'tingling' is the
-                // correct match because of greediness.
-                let fwdinput = input
-                    .clone()
-                    .anchored(Anchored::Pattern(hm_start.pattern()))
-                    .span(hm_start.offset()..input.end());
-                match self.try_search_half_fwd(cache, &fwdinput) {
-                    Err(_err) => {
-                        trace!(
+                    self.core.search_half_nofail(cache, input, funding)?
+                }
+                Ok(None) => None,
+                Ok(Some(hm_start)) => {
+                    // This is a bit subtle. It is tempting to just stop searching
+                    // at this point and return a half-match with an offset
+                    // corresponding to where the suffix was found. But the suffix
+                    // match does not necessarily correspond to the end of the
+                    // proper leftmost-first match. Consider /[a-z]+ing/ against
+                    // 'tingling'. The first suffix match is the first 'ing', and
+                    // the /[a-z]+/ matches the 't'. So if we stopped here, then
+                    // we'd report 'ting' as the match. But 'tingling' is the
+                    // correct match because of greediness.
+                    let fwdinput = input
+                        .clone()
+                        .anchored(Anchored::Pattern(hm_start.pattern()))
+                        .span(hm_start.offset()..input.end());
+                    match self.try_search_half_fwd(cache, &fwdinput, funding) {
+                        Err(_err) => {
+                            if let Some(error) = _err.allocation_error() {
+                                return Err(error.into());
+                            }
+                            trace!(
                             "reverse suffix forward fast search failed: {_err}"
                         );
-                        self.core.search_half_nofail(cache, input)
-                    }
-                    Ok(None) => {
-                        unreachable!(
-                            "suffix match plus reverse match implies \
+                            self.core
+                                .search_half_nofail(cache, input, funding)?
+                        }
+                        Ok(None) => {
+                            unreachable!(
+                                "suffix match plus reverse match implies \
                              there must be a match",
-                        )
+                            )
+                        }
+                        Ok(Some(hm_end)) => Some(hm_end),
                     }
-                    Ok(Some(hm_end)) => Some(hm_end),
                 }
             }
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        if input.get_anchored().is_anchored() {
-            return self.core.is_match(cache, input);
-        }
-        match self.try_search_half_start(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse suffix half optimization failed: {_err}");
-                self.core.is_match_nofail(cache, input)
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.is_match(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!(
+            match self.try_search_half_start(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse suffix half optimization failed: {_err}");
+                    self.core.is_match_nofail(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!(
                     "reverse suffix reverse fast half search failed: {_err}"
                 );
-                self.core.is_match_nofail(cache, input)
+                    self.core.is_match_nofail(cache, input, funding)?
+                }
+                Ok(None) => false,
+                Ok(Some(_)) => true,
             }
-            Ok(None) => false,
-            Ok(Some(_)) => true,
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1472,43 +1933,62 @@ impl Strategy for ReverseSuffix {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_slots(cache, input, slots);
-        }
-        if !self.core.is_capture_search_needed(slots.len()) {
-            trace!("asked for slots unnecessarily, trying fast path");
-            let m = self.search(cache, input)?;
-            copy_match_to_slots(m, slots);
-            return Some(m.pattern());
-        }
-        let hm_start = match self.try_search_half_start(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse suffix captures optimization failed: {_err}");
-                return self.core.search_slots(cache, input, slots);
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self
+                    .core
+                    .search_slots(cache, input, slots, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!(
-                    "reverse suffix reverse fast captures search failed: \
+            if !self.core.is_capture_search_needed(slots.len()) {
+                trace!("asked for slots unnecessarily, trying fast path");
+                let Some(m) = self.search(cache, input, funding)? else {
+                    return Ok(None);
+                };
+                copy_match_to_slots(m, slots);
+                return Ok(Some(m.pattern()));
+            }
+            let hm_start = match self
+                .try_search_half_start(cache, input, funding)
+            {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!(
+                        "reverse suffix captures optimization failed: {_err}"
+                    );
+                    return Ok(self
+                        .core
+                        .search_slots(cache, input, slots, funding)?);
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!(
+                        "reverse suffix reverse fast captures search failed: \
                      {_err}"
-                );
-                return self.core.search_slots_nofail(cache, input, slots);
-            }
-            Ok(None) => return None,
-            Ok(Some(hm_start)) => hm_start,
-        };
-        trace!(
-            "match found at {}..{} in capture search, \
+                    );
+                    return Ok(self
+                        .core
+                        .search_slots_nofail(cache, input, slots, funding)?);
+                }
+                Ok(None) => return Ok(None),
+                Ok(Some(hm_start)) => hm_start,
+            };
+            trace!(
+                "match found at {}..{} in capture search, \
              using another engine to find captures",
-            hm_start.offset(),
-            input.end(),
-        );
-        let start = hm_start.offset();
-        let input = input
-            .clone()
-            .span(start..input.end())
-            .anchored(Anchored::Pattern(hm_start.pattern()));
-        self.core.search_slots_nofail(cache, &input, slots)
+                hm_start.offset(),
+                input.end(),
+            );
+            let start = hm_start.offset();
+            let input = input
+                .clone()
+                .span(start..input.end())
+                .anchored(Anchored::Pattern(hm_start.pattern()));
+            self.core
+                .search_slots_nofail(cache, &input, slots, funding)?
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1517,8 +1997,12 @@ impl Strategy for ReverseSuffix {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        self.core.which_overlapping_matches(cache, input, patset)
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            self.core
+                .which_overlapping_matches(cache, input, patset, funding)?
+        })
     }
 }
 
@@ -1532,13 +2016,17 @@ struct ReverseInner {
 }
 
 impl ReverseInner {
-    fn new(core: Core, hirs: &[&Hir]) -> Result<ReverseInner, Core> {
+    fn new_with_allocations(
+        core: Core,
+        hirs: &[&Hir],
+        funding: &dyn Allocation,
+    ) -> Result<Result<ReverseInner, Core>, BuildError> {
         if !core.info.config().get_auto_prefilter() {
             debug!(
                 "skipping reverse inner optimization because \
                  automatic prefilters are disabled"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // Currently we hard-code the assumption of leftmost-first match
         // semantics. This isn't a huge deal because 'all' semantics tend to
@@ -1550,7 +2038,7 @@ impl ReverseInner {
                  match kind is {:?} but this only supports leftmost-first",
                 core.info.config().get_match_kind(),
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // It's likely that a reverse inner scan has too much overhead for it
         // to be worth it when the regex is anchored at the start. It is
@@ -1572,7 +2060,7 @@ impl ReverseInner {
                 "skipping reverse inner optimization because \
                  the regex is always anchored at the start",
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         // Only DFAs can do reverse searches (currently), so we need one of
         // them in order to do this optimization. It's possible (although
@@ -1582,14 +2070,14 @@ impl ReverseInner {
                 "skipping reverse inner optimization because \
                  we don't have a lazy DFA or a full DFA"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         if core.pre.as_ref().map_or(false, |p| p.is_fast()) {
             debug!(
                 "skipping reverse inner optimization because \
                  we already have a prefilter that we think is fast"
             );
-            return Err(core);
+            return Ok(Err(core));
         } else if core.pre.is_some() {
             debug!(
                 "core engine has a prefix prefilter, but it is \
@@ -1597,21 +2085,25 @@ impl ReverseInner {
                  use reverse inner prefilter"
             );
         }
-        let prefilter = match reverse_inner::InnerPrefilter::new(hirs) {
-            Some(prefilter) => prefilter,
-            // N.B. the 'new' function emits debug messages explaining
-            // why we bailed out here.
-            None => return Err(core),
-        };
-        if !reverse_inner::has_no_earlier_match(
+        let prefilter =
+            match reverse_inner::InnerPrefilter::new_with_allocations(
+                hirs, funding,
+            )? {
+                Some(prefilter) => prefilter,
+                // N.B. the 'new' function emits debug messages explaining
+                // why we bailed out here.
+                None => return Ok(Err(core)),
+            };
+        if !reverse_inner::has_no_earlier_match_with_allocations(
             &prefilter.prefix,
             &prefilter.literals,
-        ) {
+            funding,
+        )? {
             debug!(
                 "skipping reverse inner optimization because an inner \
                  literal match could be confirmed before an earlier match"
             );
-            return Err(core);
+            return Ok(Err(core));
         }
         debug!("building reverse NFA for prefix before inner literal");
         let thompson_config = core
@@ -1622,23 +2114,28 @@ impl ReverseInner {
             .which_captures(WhichCaptures::None);
         let result = thompson::Compiler::new()
             .configure(thompson_config)
-            .build_from_hir(&prefilter.prefix);
+            .build_from_hir_with_allocations(&prefilter.prefix, funding);
         let nfarev = match result {
             Ok(nfarev) => nfarev,
             Err(_err) => {
+                if let Some(error) = _err.allocation_error() {
+                    return Err(error.into());
+                }
                 debug!(
                     "skipping reverse inner optimization because the \
                      reverse NFA failed to build: {}",
                     _err,
                 );
-                return Err(core);
+                return Ok(Err(core));
             }
         };
         debug!("building reverse DFA for prefix before inner literal");
         let dfa = if !core.info.config().get_dfa() {
             wrappers::ReverseDFA::none()
         } else {
-            wrappers::ReverseDFA::new(&core.info, &nfarev)
+            wrappers::ReverseDFA::new_with_allocations(
+                &core.info, &nfarev, funding,
+            )?
         };
         let hybrid = if !core.info.config().get_hybrid() {
             wrappers::ReverseHybrid::none()
@@ -1651,7 +2148,13 @@ impl ReverseInner {
         } else {
             wrappers::ReverseHybrid::new(&core.info, &nfarev)
         };
-        Ok(ReverseInner { core, preinner: prefilter.pre, nfarev, hybrid, dfa })
+        Ok(Ok(ReverseInner {
+            core,
+            preinner: prefilter.pre,
+            nfarev,
+            hybrid,
+            dfa,
+        }))
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1659,6 +2162,7 @@ impl ReverseInner {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<Match>, RetryError> {
         let mut span = input.get_span();
         let mut min_match_start = 0;
@@ -1691,12 +2195,15 @@ impl ReverseInner {
                 cache,
                 &revinput,
                 min_match_start,
+                funding,
             )? {
                 let fwdinput = input
                     .clone()
                     .anchored(Anchored::Pattern(hm_start.pattern()))
                     .span(hm_start.offset()..input.end());
-                match self.try_search_half_fwd_stopat(cache, &fwdinput)? {
+                match self
+                    .try_search_half_fwd_stopat(cache, &fwdinput, funding)?
+                {
                     Err(stopat) => {
                         min_pre_start = stopat;
                         span.start = litmatch.start.checked_add(1).unwrap();
@@ -1724,6 +2231,7 @@ impl ReverseInner {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Result<HalfMatch, usize>, RetryFailError> {
         if let Some(e) = self.core.dfa.get(&input) {
             trace!(
@@ -1736,7 +2244,11 @@ impl ReverseInner {
                 "using lazy DFA for forward reverse inner search at {:?}",
                 input.get_span()
             );
-            e.try_search_half_fwd_stopat(&mut cache.hybrid, &input)
+            e.try_search_half_fwd_stopat_with_allocations(
+                &mut cache.hybrid,
+                &input,
+                funding,
+            )
         } else {
             unreachable!("ReverseInner always has a DFA")
         }
@@ -1748,6 +2260,7 @@ impl ReverseInner {
         cache: &mut Cache,
         input: &Input<'_>,
         min_start: usize,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryError> {
         if let Some(e) = self.dfa.get(&input) {
             trace!(
@@ -1764,10 +2277,11 @@ impl ReverseInner {
                 input.get_span(),
                 min_start,
             );
-            e.try_search_half_rev_limited(
+            e.try_search_half_rev_limited_with_allocations(
                 &mut cache.revhybrid,
                 &input,
                 min_start,
+                funding,
             )
         } else {
             unreachable!("ReverseInner always has a DFA")
@@ -1776,8 +2290,19 @@ impl ReverseInner {
 }
 
 impl Strategy for ReverseInner {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("reverse inner")
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.core.visit_source_storage(visitor)?;
+        self.preinner.visit_source_storage(visitor)?;
+        self.nfarev.visit_source_storage(visitor)?;
+        self.hybrid.visit_source_storage(visitor)?;
+        self.dfa.visit_source_storage(visitor)
+    }
+
+    fn name(&self) -> StrategyName {
+        StrategyName("", "reverse inner")
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1786,16 +2311,30 @@ impl Strategy for ReverseInner {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn create_cache(&self) -> Cache {
-        let mut cache = self.core.create_cache();
-        cache.revhybrid = self.hybrid.create_cache();
-        cache
+    fn create_cache(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, MatchError> {
+        Ok({
+            let mut cache = self.core.create_cache(funding)?;
+            cache.revhybrid =
+                self.hybrid.create_cache_with_allocations(funding)?;
+            cache
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn reset_cache(&self, cache: &mut Cache) {
-        self.core.reset_cache(cache);
-        cache.revhybrid.reset(&self.hybrid);
+    fn reset_cache(
+        &self,
+        cache: &mut Cache,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            self.core.reset_cache(cache, funding)?;
+            cache
+                .revhybrid
+                .reset_with_allocations(&self.hybrid, funding)?;
+        })
     }
 
     fn is_accelerated(&self) -> bool {
@@ -1810,21 +2349,31 @@ impl Strategy for ReverseInner {
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn search(&self, cache: &mut Cache, input: &Input<'_>) -> Option<Match> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search(cache, input);
-        }
-        match self.try_search_full(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse inner optimization failed: {_err}");
-                self.core.search(cache, input)
+    fn search(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!("reverse inner fast search failed: {_err}");
-                self.core.search_nofail(cache, input)
+            match self.try_search_full(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse inner optimization failed: {_err}");
+                    self.core.search(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("reverse inner fast search failed: {_err}");
+                    self.core.search_nofail(cache, input, funding)?
+                }
+                Ok(matornot) => matornot,
             }
-            Ok(matornot) => matornot,
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1832,41 +2381,57 @@ impl Strategy for ReverseInner {
         &self,
         cache: &mut Cache,
         input: &Input<'_>,
-    ) -> Option<HalfMatch> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_half(cache, input);
-        }
-        match self.try_search_full(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse inner half optimization failed: {_err}");
-                self.core.search_half(cache, input)
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.search_half(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!("reverse inner fast half search failed: {_err}");
-                self.core.search_half_nofail(cache, input)
+            match self.try_search_full(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse inner half optimization failed: {_err}");
+                    self.core.search_half(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("reverse inner fast half search failed: {_err}");
+                    self.core.search_half_nofail(cache, input, funding)?
+                }
+                Ok(None) => None,
+                Ok(Some(m)) => Some(HalfMatch::new(m.pattern(), m.end())),
             }
-            Ok(None) => None,
-            Ok(Some(m)) => Some(HalfMatch::new(m.pattern(), m.end())),
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    fn is_match(&self, cache: &mut Cache, input: &Input<'_>) -> bool {
-        if input.get_anchored().is_anchored() {
-            return self.core.is_match(cache, input);
-        }
-        match self.try_search_full(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse inner half optimization failed: {_err}");
-                self.core.is_match_nofail(cache, input)
+    fn is_match(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self.core.is_match(cache, input, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!("reverse inner fast half search failed: {_err}");
-                self.core.is_match_nofail(cache, input)
+            match self.try_search_full(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!("reverse inner half optimization failed: {_err}");
+                    self.core.is_match_nofail(cache, input, funding)?
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!("reverse inner fast half search failed: {_err}");
+                    self.core.is_match_nofail(cache, input, funding)?
+                }
+                Ok(None) => false,
+                Ok(Some(_)) => true,
             }
-            Ok(None) => false,
-            Ok(Some(_)) => true,
-        }
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1875,39 +2440,58 @@ impl Strategy for ReverseInner {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        if input.get_anchored().is_anchored() {
-            return self.core.search_slots(cache, input, slots);
-        }
-        if !self.core.is_capture_search_needed(slots.len()) {
-            trace!("asked for slots unnecessarily, trying fast path");
-            let m = self.search(cache, input)?;
-            copy_match_to_slots(m, slots);
-            return Some(m.pattern());
-        }
-        let m = match self.try_search_full(cache, input) {
-            Err(RetryError::Quadratic(_err)) => {
-                trace!("reverse inner captures optimization failed: {_err}");
-                return self.core.search_slots(cache, input, slots);
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        Ok({
+            if input.get_anchored().is_anchored() {
+                return Ok(self
+                    .core
+                    .search_slots(cache, input, slots, funding)?);
             }
-            Err(RetryError::Fail(_err)) => {
-                trace!("reverse inner fast captures search failed: {_err}");
-                return self.core.search_slots_nofail(cache, input, slots);
+            if !self.core.is_capture_search_needed(slots.len()) {
+                trace!("asked for slots unnecessarily, trying fast path");
+                let Some(m) = self.search(cache, input, funding)? else {
+                    return Ok(None);
+                };
+                copy_match_to_slots(m, slots);
+                return Ok(Some(m.pattern()));
             }
-            Ok(None) => return None,
-            Ok(Some(m)) => m,
-        };
-        trace!(
-            "match found at {}..{} in capture search, \
+            let m = match self.try_search_full(cache, input, funding) {
+                Err(RetryError::Quadratic(_err)) => {
+                    trace!(
+                        "reverse inner captures optimization failed: {_err}"
+                    );
+                    return Ok(self
+                        .core
+                        .search_slots(cache, input, slots, funding)?);
+                }
+                Err(RetryError::Fail(_err)) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
+                    trace!(
+                        "reverse inner fast captures search failed: {_err}"
+                    );
+                    return Ok(self
+                        .core
+                        .search_slots_nofail(cache, input, slots, funding)?);
+                }
+                Ok(None) => return Ok(None),
+                Ok(Some(m)) => m,
+            };
+            trace!(
+                "match found at {}..{} in capture search, \
              using another engine to find captures",
-            m.start(),
-            m.end(),
-        );
-        let input = input
-            .clone()
-            .span(m.start()..m.end())
-            .anchored(Anchored::Pattern(m.pattern()));
-        self.core.search_slots_nofail(cache, &input, slots)
+                m.start(),
+                m.end(),
+            );
+            let input = input
+                .clone()
+                .span(m.start()..m.end())
+                .anchored(Anchored::Pattern(m.pattern()));
+            self.core
+                .search_slots_nofail(cache, &input, slots, funding)?
+        })
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1916,8 +2500,12 @@ impl Strategy for ReverseInner {
         cache: &mut Cache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        self.core.which_overlapping_matches(cache, input, patset)
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        Ok({
+            self.core
+                .which_overlapping_matches(cache, input, patset, funding)?
+        })
     }
 }
 
@@ -1971,8 +2559,8 @@ mod tests {
     fn strategy_with(patterns: &[&str], config: Config) -> Arc<dyn Strategy> {
         let hirs = syntax::parse_many(patterns).unwrap();
         let hirs: Vec<&Hir> = hirs.iter().collect();
-        let info = RegexInfo::new(config, &hirs);
-        new(&info, &hirs).unwrap()
+        let info = RegexInfo::new_with_allocations(config, &hirs, &crate::util::allocation::Unenforced).unwrap();
+        new_with_allocations(&info, &hirs, &crate::util::allocation::Unenforced).unwrap()
     }
 
     #[track_caller]
@@ -1987,7 +2575,7 @@ mod tests {
         config: Config,
     ) {
         let strategy = strategy_with(patterns, config);
-        assert_eq!(name, strategy.name().as_ref());
+        assert_eq!(name, alloc::format!("{}", strategy.name()));
     }
 
     fn literal_alternation(count: usize) -> String {

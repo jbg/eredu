@@ -1,6 +1,7 @@
 //! Original immutable source preparation before ordinary native model construction.
 
 use super::*;
+use super::super::ParameterConstructors;
 use eredu_architectures::{
     prepared_execution::{project_replicated_text_binding_destinations, PreparedExecutionError},
     prepared_sources::PreparedModelSources,
@@ -19,6 +20,13 @@ pub(crate) struct PreparedLayerwiseManager {
 }
 
 impl PreparedLayerwiseManager {
+    pub(crate) fn parameter_exclusions(&self, selected: &BTreeSet<String>)
+        -> Result<super::super::MlxParameterExclusions, Error> {
+        let source = self.manager.original_parameter_exclusions()
+            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+        source.for_selection(selected).map_err(Error::PrefillControl)
+    }
+
     pub(crate) fn validate_and_take(
         self,
         declarations: &PreparedLayerwiseDeclarations,
@@ -109,7 +117,7 @@ fn prepare_selected_layerwise_manager(
         ) => {
             return Ok(None);
         },
-        Err(cause) => return Err(Error::ArchitectureModel(cause.to_string())),
+        Err(cause) => return Err(Error::PreparedParameterSource(cause)),
     };
     let contract = projected.contract();
     let selected = contract.selected();
@@ -204,14 +212,19 @@ fn prepare_selected_layerwise_manager(
         unit_bindings,
         supplementary,
     )?;
-    prepare_manager_from_declarations(declarations, selected.residency(), layout,
-        pool, source_stream, execution_stream)
+    let constructors = projected.units().iter().map(ParameterConstructors::from_layouts)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?;
+    prepare_manager_from_declarations(declarations, selected.residency(), layout, &addressable,
+        Some(&constructors), pool, source_stream, execution_stream)
 }
 
 pub(crate) fn prepare_manager_from_declarations(
     declarations: PreparedLayerwiseDeclarations,
     residency: LayerWeightResidency,
     layout: &ExecutionUnitLayout,
+    parameter_exclusions: &BTreeSet<String>,
+    parameter_constructors: Option<&[ParameterConstructors]>,
     pool: &WorkingMemoryPool,
     source_stream: &Stream,
     execution_stream: &Stream,
@@ -249,6 +262,8 @@ pub(crate) fn prepare_manager_from_declarations(
             &declarations.unit_ids,
             layout,
             declarations.depth,
+            parameter_exclusions,
+            parameter_constructors,
             source_stream,
             execution_stream,
             pool,
@@ -263,6 +278,8 @@ pub(crate) fn prepare_manager_from_declarations(
                 &declarations.unit_ids,
                 layout,
                 declarations.depth,
+                parameter_exclusions,
+                parameter_constructors,
                 source_stream,
                 execution_stream,
                 pool,

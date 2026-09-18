@@ -21,7 +21,7 @@ pub use original_sources::{
 mod host_transfer;
 pub(in crate::working_memory) mod reset_layout;
 pub(super) use host_transfer::{
-    publish_dense_host_slots, publish_dense_host_slots_prepared, dense_host_transfer_control_bytes,
+    publish_dense_host_slots, dense_host_transfer_control_bytes,
 };
 
 #[cfg(test)]
@@ -523,6 +523,20 @@ impl<K: Ord + Send + 'static> Drop for StorageOwner<K> {
 }
 
 impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
+    /// Whether these live registrations cover exactly the same registered
+    /// keys and capacity in the same pool. Extra original-source custody is
+    /// deliberately excluded. This observation neither transfers ownership nor
+    /// authorizes work: the caller must retain the other registration while
+    /// the corresponding storage survives.
+    pub fn same_registered_storage(&self, other: &Self) -> bool {
+        self.0.original_sources.is_none()
+            && other.0.original_sources.is_none()
+            && self.0.pool.as_ref().zip(other.0.pool.as_ref())
+                .is_some_and(|(a, b)| a.same_domain(b))
+            && self.0.bytes == other.0.bytes
+            && self.0.keys == other.0.keys
+    }
+
     // The caller holds the same usage lock used for destination admission.
     // A live pin makes capacities immutable; check every origin's current
     // health rather than treating a cold identity snapshot as settled work.

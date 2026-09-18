@@ -28,6 +28,8 @@ use std::{
 
 /// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
+    pub(super) parameter_constructors: Option<Vec<crate::backend::runtime::execution::generic::ParameterConstructors>>,
+    pub(super) parameter_exclusions: Option<crate::backend::runtime::execution::generic::MlxParameterExclusions>,
     pub(super) sources: ResidencySources,
     pub(super) dense_controller:
         std::sync::OnceLock<crate::backend::runtime::execution::layerwise::PreparedDenseController>,
@@ -454,13 +456,22 @@ impl ResidentTransfer {
         } else {
             let mut consumer = self.consumer.borrow_mut();
             if let Some(ResidentRecovery::Original(child)) = consumer.as_mut() {
-                if child
+                use crate::backend::submission_recovery::observed::RetirementAttempt;
+                match child
                     .try_finish_successfully()
                     .map_err(ResidencyError::OriginalNative)?
                 {
+                    RetirementAttempt::Retired => {
                     // The child's successful native lifetime proof precedes
                     // TransferObservation::drop decrementing children.
                     consumer.take();
+                    }
+                    RetirementAttempt::Pending => {}
+                    RetirementAttempt::Stopped(cause) => {
+                        consumer.take();
+                        self.application.mark_failed();
+                        return Err(ResidencyError::OriginalRetirement(cause.into_cause()));
+                    }
                 }
             }
         }
@@ -748,17 +759,23 @@ impl ResidentTransfer {
         }
         if let Some(retained) = self.retained.take() {
             let status = match retained.finish() {
-                Ok(observed) => observed.status,
+                Ok(observed) if observed.can_retire() => observed.status,
+                Ok(_) => {
+                    self.retirement_transferred = true;
+                    return Err(ResidencyError::OriginalOperationRetirementTransferred);
+                }
                 Err(cause) => {
                     // The consuming failure safely quarantines the SAME node.
                     // Its absence here cannot turn a later query into completion.
                     // This is a local ownership fence, not native failure poison.
                     self.retirement_transferred = true;
-                    return Err(operation_error(
-                        self.original.is_some(),
-                        "resident transfer retirement",
-                        cause,
-                    ));
+                    use crate::backend::submission_recovery::observed::FinishRetainingError;
+                    return Err(match cause {
+                        FinishRetainingError::Native(cause) => operation_error(
+                            self.original.is_some(), "resident transfer retirement", cause),
+                        FinishRetainingError::Retirement(cause) => ResidencyError::OriginalRetirement(cause),
+                        FinishRetainingError::Observation(_) => ResidencyError::OriginalOperationRetirementTransferred,
+                    });
                 }
             };
             if status.failed || status.blocked {

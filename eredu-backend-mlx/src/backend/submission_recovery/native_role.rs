@@ -3,7 +3,7 @@
 //! selects equations nor supplies a missing workspace bound.
 use super::{PreparedRecovery, Retention, Status};
 use crate::backend::{error::Error, runtime::residency::storage::native_storage::BankOwner};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::OriginalTextControlGuard;
 use safemlx::{
     OriginalBufferBudget, OriginalScopeObserver, PreparedPrefillFailure,
@@ -21,7 +21,7 @@ pub(crate) struct NativeRoleCapacity {
     pub(crate) backing: usize,
 }
 fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
 fn sum_controls(parts:&[usize])->Option<usize> {
     parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
@@ -173,7 +173,7 @@ impl RoleBudget<'_> {
 fn fixed_control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>()->Option<usize> {
     sum_controls(&[error_bytes::<C>()?,
         size_of::<NativeRoleContext<'_>>(),size_of::<Retained<I,C>>(),
-        size_of::<C>(),size_of::<Option<std::time::Duration>>(),size_of::<&WorkspaceMetadataFunding>(),
+        size_of::<C>(),size_of::<Option<std::time::Duration>>(),size_of::<&HostMetadataFunding>(),
         size_of::<(RoleBudget<'_>,&C,&Stream)>(),
         size_of::<(&RoleBudget<'_>,Result<OriginalBufferBudget,Error>)>(),
         size_of::<Result<OriginalBufferBudget,Error>>(),size_of::<Option<OriginalScopeObserver>>(),
@@ -231,7 +231,7 @@ pub(crate) fn control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>
 
 pub(crate) fn run<I,T,E,F,C>(invocation:I,capacity:NativeRoleCapacity,
     pipeline:Option<safemlx::PreparedPipelineCachePlan>,bank:&BankOwner,
-    controls:&OriginalTextControlGuard,custody:&C,funding:&WorkspaceMetadataFunding,
+    controls:&OriginalTextControlGuard,custody:&C,funding:&HostMetadataFunding,
     timeout:std::time::Duration,run:F)->Result<Result<T,E>,eredu_core::BackendFailure>
 where I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static,
     F:FnOnce(&I,&OriginalScopeObserver)->Result<Result<T,E>,Error> {
@@ -246,7 +246,7 @@ pub(crate) fn run_with_context<I, T, E, F, C>(
     bank: &BankOwner,
     controls: &OriginalTextControlGuard,
     custody: &C,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     timeout: Option<std::time::Duration>,
     run: F,
 ) -> Result<Result<T, E>, eredu_core::BackendFailure>
@@ -265,7 +265,7 @@ where
 pub(crate) fn run_with_prepared_budget<I,T,E,F,C>(
     invocation:I,capacity:NativeRoleCapacity,pipeline:Option<safemlx::PreparedPipelineCachePlan>,
     budget:&OriginalBufferBudget,parent:&OriginalScopeObserver,custody:&C,
-    funding:&WorkspaceMetadataFunding,timeout:Option<std::time::Duration>,run:F,
+    funding:&HostMetadataFunding,timeout:Option<std::time::Duration>,run:F,
 )->Result<Result<T,E>,eredu_core::BackendFailure>
 where I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static,
     F:FnOnce(&I,&NativeRoleContext<'_>)->Result<Result<T,E>,Error>,
@@ -280,7 +280,7 @@ fn run_with_budget_source<I, T, E, F, C>(
     pipeline: Option<safemlx::PreparedPipelineCachePlan>,
     budget_source:RoleBudget<'_>,
     custody: &C,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     timeout: Option<std::time::Duration>,
     run: F,
 ) -> Result<Result<T, E>, eredu_core::BackendFailure>
@@ -474,7 +474,7 @@ where
         .expect("successful scope binding")
         .retire_completed_records()
         .map_err(|cause| fail(RoleCause::Native(cause)))?;
-    let status = recovery.finish();
+    let status = recovery.finish().map_err(|cause| fail(RoleCause::Backend(cause.into_error())))?;
     if !status.settled || status.failed || status.blocked {
         if let Some(cause) = observer
             .as_ref()

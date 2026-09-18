@@ -50,7 +50,7 @@ impl OriginalIndexedChunkSource {
                 .ok_or_else(||self.failure(Cause::Overflow))?,
             Array::descriptor_comparison_control_bytes().and_then(|bytes|bytes.checked_mul(operands))
                 .ok_or_else(||self.failure(Cause::Overflow))?,
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
         let bytes=fixed.into_iter().try_fold(size_of_val(&fixed),usize::checked_add)
             .ok_or_else(||self.failure(Cause::Overflow))?;
         b.funding.reserve_metadata(bytes).map_err(|cause|self.failure(Cause::Funding(cause)))?;

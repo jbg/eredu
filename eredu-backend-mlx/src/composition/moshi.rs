@@ -86,7 +86,7 @@ trait ErasedRealtimeExecutionContract {
         _temporal:&[crate::MlxTensor],
         _driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
         _stream:&Stream,_parallel:&crate::backend::runtime::distributed::Group,
-        _funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        _funding:&eredu_nn::workspace::HostMetadataFunding)
         ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
         Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))
     }
@@ -100,7 +100,7 @@ trait ErasedRealtimeExecutionContract {
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         (
             Option<crate::MlxTensor>,
@@ -201,7 +201,7 @@ where
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         (
             Option<crate::MlxTensor>,
@@ -311,7 +311,7 @@ where
         temporal:&[crate::MlxTensor],
         driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
         stream:&Stream,parallel:&crate::backend::runtime::distributed::Group,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        funding:&eredu_nn::workspace::HostMetadataFunding)
         ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
         let eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime)=&self.execution else {
             return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
@@ -351,7 +351,7 @@ where
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         (
             Option<crate::MlxTensor>,
@@ -869,7 +869,7 @@ impl MlxRealtimeExecution {
     fn execute_realtime_body(&mut self,state:&mut MlxKeyValueState,
         temporal:&[crate::MlxTensor],
         driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
-        stream:&Stream,funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        stream:&Stream,funding:Option<&eredu_nn::workspace::HostMetadataFunding>)
         ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
         Rc::get_mut(&mut self.payload).ok_or(Error::PrefillScopeUnavailable)?
             .execution.execute_decisions(state,temporal,driver,stream,funding)
@@ -1169,3 +1169,5 @@ mod tests {
         );
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

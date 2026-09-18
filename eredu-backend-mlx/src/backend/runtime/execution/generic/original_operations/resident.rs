@@ -17,6 +17,20 @@ pub(super) enum Projection {
     Realtime(realtime::Projection),
 }
 impl Projection {
+    fn require_idle(&self) -> Result<(), Error> {
+        match self {
+            Self::Text(value) => match value.value.upgrade() {
+                Some(bank) => {
+                    bank.registry.require_idle()?;
+                    drop(bank.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?);
+                    Ok(())
+                }
+                None => Ok(()),
+            },
+            _ if self.is_live() => Err(Error::PrefillScopeReentrant),
+            _ => Ok(()),
+        }
+    }
     fn is_live(&self) -> bool {
         match self {
             Self::Text(value) => value.value.strong_count() != 0,
@@ -58,8 +72,9 @@ impl<U: 'static> ResidentNeuralSlot<U> {
         &self,
         layout: &ExecutionUnitLayout,
         geometry: eredu_core::InferenceGeometry,
+        groups: eredu_runtime::GroupSubmissionMechanism,
     ) -> Result<ResidentNeuralPlan<U>, Error> {
-        let neural = NeuralPopulation::from_layout_with_final(layout, geometry, false)?;
+        let neural = NeuralPopulation::from_execution(layout, geometry, groups, false)?;
         Ok(ResidentNeuralPlan {
             slot: self.clone(),
             geometry,
@@ -208,7 +223,10 @@ impl<U: 'static> ResidentNeuralPlan<U> {
     }
     pub(crate) fn control_bytes(&self) -> Option<u64> {
         if self.neural.submissions == 0 && !self.addressable {
-            return selected_plan_control_bytes::<U>();
+            // This branch does not enter the neural bank's measured layout,
+            // but its population source still passed the selected mechanism.
+            return selected_plan_control_bytes::<U>()?.checked_add(u64::try_from(
+                NeuralPopulation::group_source_control_bytes()?).ok()?);
         }
         let scopes = Layout::array::<safemlx::OriginalScopeObserver>(self.scopes)
             .ok()?
@@ -237,6 +255,10 @@ impl<U: 'static> ResidentNeuralPlan<U> {
             size_of::<Result<(), TryReserveError>>(),
             size_of::<PreparationFailure>(),
             size_of::<(PreparedNeuralSubmission, safemlx::OriginalScopeObserver)>(),
+            size_of::<&ResidentBank>(), size_of::<&OwnedResidentBank<U>>(),
+            size_of::<Option<Rc<ResidentBank>>>(), size_of::<TextProjection>(),
+            size_of::<Option<&Projection>>(), size_of::<Result<(), Error>>(),
+            OriginalOperationActivation::control_bytes()?,
         ]
         .into_iter()
         .try_fold(scopes, usize::checked_add)?;
@@ -281,11 +303,9 @@ impl<U: 'static> ResidentNeuralPlan<U> {
             return Ok(None);
         }
         let previous = self.slot.0.resident.take();
-        let busy = previous.as_ref().is_some_and(|view| view.is_live());
+        let idle = previous.as_ref().map_or(Ok(()), Projection::require_idle);
         self.slot.0.resident.set(previous);
-        if busy {
-            return Err(Error::PrefillScopeReentrant);
-        }
+        idle?;
         let mut scopes = Vec::new();
         scopes
             .try_reserve_exact(self.scopes)
@@ -297,6 +317,8 @@ impl<U: 'static> ResidentNeuralPlan<U> {
             scope_limit: self.scopes,
             registered_scopes: Cell::new(0),
             active: Cell::new(true),
+            entered: Cell::new(false),
+            retirement_failure: Cell::new(None),
         });
         let bank = Rc::new(ResidentBank {
             selected_stream: self.selected_stream.ok_or_else(identity)?,
@@ -333,7 +355,25 @@ struct OwnedResidentBank<U: 'static> {
     slot: ResidentNeuralSlot<U>,
     registration: OriginalOperationRegistration,
 }
-impl<U: 'static> ErasedOwner for OwnedResidentBank<U> {}
+impl<U: 'static> ErasedOwner for OwnedResidentBank<U> {
+    fn activate(&self, controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
+        let OperationControls::Text(controls) = controls else { return Err(identity()); };
+        controls.validate_reservation(self.bank.registry.request.memory_reservation().ok_or_else(identity)?)
+            .map_err(memory)?;
+        self.bank.registry.require_idle()?;
+        drop(self.bank.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?);
+        let previous = self.slot.0.resident.take();
+        let idle = previous.as_ref().map_or(Ok(()), Projection::require_idle);
+        self.slot.0.resident.set(previous);
+        idle?;
+        let previous = self.slot.0.resident.replace(Some(Projection::Text(TextProjection {
+            value: Rc::downgrade(&self.bank), controls: controls.clone(),
+        })));
+        let guard = self.bank.registry.enter();
+        drop(previous);
+        Ok(guard)
+    }
+}
 impl<U: 'static> Drop for OwnedResidentBank<U> {
     fn drop(&mut self) {
         let previous = self.slot.0.resident.take();

@@ -7,7 +7,7 @@ use eredu_core::{capture::*, intervention::*};
 use eredu_nn::{
     Tensor,
     workspace::{
-        WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceTensor,
+        WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor,
     },
 };
 use eredu_runtime::{
@@ -76,7 +76,7 @@ pub(crate) struct PreparedModelInterventions {
     evidence_skips: Option<Vec<[Option<CaptureSkipReason>; 2]>>,
     source: OriginalInterventionSource,
     // Row vectors and C retire before their actual preparation account.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl PreparedModelInterventions {
     /// Actual sparse original worker profile; count/geometry qualification stays
@@ -555,3 +555,5 @@ impl PreparedModelInterventions {
             .try_fold(size_of_val(&frames), usize::checked_add)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

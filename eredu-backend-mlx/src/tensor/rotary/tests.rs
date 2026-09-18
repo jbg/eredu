@@ -43,6 +43,8 @@ fn native_prepared_rotary_matches_generated_values_for_every_layout() {
         .unwrap();
         for (actual, expected) in [(&prepared.0, &ordinary.0), (&prepared.1, &ordinary.1)] {
             assert_eq!(actual.shape(), [2, spec.dimensions().unwrap()]);
+            assert_eq!(actual.as_array().dtype(), safemlx::Dtype::Float32);
+            assert_eq!(expected.as_array().dtype(), safemlx::Dtype::Float32);
             let a = actual.as_array().evaluated().unwrap();
             let b = expected.as_array().evaluated().unwrap();
             assert_eq!(

@@ -68,7 +68,7 @@ fn original_tracking_control_only_quote_is_exact_nonrefillable_and_not_native_he
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     drop(quote);
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();

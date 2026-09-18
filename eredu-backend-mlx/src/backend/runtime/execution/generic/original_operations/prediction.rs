@@ -1,7 +1,7 @@
 //! Exact supplementary-module occurrences using the existing residency worker.
 use super::*;
 use crate::backend::runtime::residency::manager::{SupplementaryResidencySource, WindowPopulation};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
 use eredu_runtime::working_memory::{
     OriginalEmbeddedSpeculativeRole, OriginalOperationMetadataCustody,
 };
@@ -23,11 +23,11 @@ pub(crate) struct PredictionModuleCall {
 struct PlanningFailure<E: std::error::Error + 'static> {
     #[source]
     cause: E,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 fn planned_error<E: std::error::Error + Send + Sync + 'static>(
     cause: E,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Error {
     Error::Neural(funding.metadata_source(PlanningFailure {
         cause,
@@ -51,7 +51,7 @@ pub(crate) struct PredictionModulePlan {
         eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
         eredu_runtime::speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     )>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PredictionModulePlan {
     pub(crate) fn inspect(
@@ -247,6 +247,7 @@ impl PredictionModulePlan {
                         self.source.foreground().ok_or_else(identity)?.source(),
                         plan.forward_population().ok_or_else(unknown)?,
                         plan.population().ok_or_else(unknown)?,
+                        self.source.foreground().ok_or_else(identity)?.destination_device_type(),
                     )?;
                 }
                 (None, Some(host)) => recipe.bind_host_copies(host)
@@ -527,3 +528,5 @@ impl Drop for ActivePredictionModuleBank {
 
 mod call;
 use call::call_control_bytes;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

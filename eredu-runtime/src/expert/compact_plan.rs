@@ -63,6 +63,13 @@ impl AddressableChunkPlan {
         }
     }
 
+    /// Narrows only the row population of this already selected immutable plan.
+    /// The physical member domain, route width and compact chunk policy remain
+    /// unchanged; this descriptive projection creates no acquisition authority.
+    pub fn for_rows(self, rows: usize) -> Option<Self> {
+        (rows <= self.rows).then_some(Self { rows, ..self })
+    }
+
     /// Exact number of sequential acquisitions for this invocation.
     pub fn len(self) -> usize { self.rows.div_ceil(self.chunk_rows) }
     /// Whether the invocation contains no token rows.
@@ -132,5 +139,32 @@ impl AddressableChunkCensus {
     /// Distinct selected-member ceiling for this chunk.
     pub fn maximum_members(self) -> usize {
         self.plan.maximum_members(self.index).expect("validated chunk route count")
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    #[test]
+    fn completed_rows_only_narrow_the_retained_chunk_program() {
+        for access in [ParameterBankAccess::Bulk,ParameterBankAccess::Incremental] {
+            let source=AddressableChunkPlan::new(17,2,8,access,Some(128),512).unwrap();
+            for rows in [0,1,2,3,16,17] {
+                let actual=source.for_rows(rows).unwrap();
+                let ordinary=AddressableChunkPlan::new(rows,2,8,access,Some(128),512).unwrap();
+                assert_eq!(actual,ordinary);
+                assert!(actual.len()<=source.len());
+                assert_eq!(actual.workspace_source().chunk_rows,source.workspace_source().chunk_rows);
+                assert_eq!(actual.workspace_source().members,8);
+                assert_eq!(actual.workspace_source().routes,2);
+                let covered=actual.ranges().map(|range|range.len()).sum::<usize>();
+                assert_eq!(covered,rows);
+                assert_eq!(AddressableChunkCensus::new(7,11,actual,0,access).is_some(),rows!=0);
+                assert!(actual.for_rows(rows+1).is_none());
+            }
+            assert!(source.for_rows(18).is_none());
+            assert!(source.for_rows(usize::MAX).is_none());
+            assert_eq!(source.workspace_source().rows,17);
+        }
     }
 }

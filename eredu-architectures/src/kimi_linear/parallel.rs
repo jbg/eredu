@@ -824,41 +824,44 @@ fn validate_realization(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B>(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
-{
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "model.embed_tokens",
+pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>(modules: &StaticModules<B>) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    static_parallel_parameter_groups_destination(modules, None).map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)
+}
+
+pub(crate) fn static_parallel_parameter_groups_destination<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>(modules: &StaticModules<B>, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<ParameterGroupSpec>, crate::decoder::parameter_metadata::ParameterGroupError> {
+    let destination = crate::decoder::parameter_metadata::DeclarationDestination(metadata);
+    destination.controls::<(&StaticModules<B>, &ModelArgs, usize, String, Vec<ParameterGroupSpec>, [(&str, &B::Normalization);2], [(&B::Linear, eredu_runtime::ProjectionSharding);3], [std::ops::Range<usize>;3], usize, MemberSharding)>()?;
+
+    let mut groups = destination.vector(3)?;
+    groups.extend([
+        destination.module::<B::Tensor, _>(
+            format_args!("model.embed_tokens"),
             ParameterRole::Vocabulary,
             &modules.embeddings,
-            |_, shape| {
+            |shape| {
                 (!shape.is_empty())
                     .then_some(MemberSharding::Balanced { axis: 0 })
                     .ok_or_else(|| {
-                        ParallelPlanError::InvalidTensor("Kimi embedding is scalar".into())
+                        destination.tensor_error(format_args!("Kimi embedding is scalar"))
                     })
             },
         )?,
-        module_parameter_group::<B::Tensor, _>(
-            "model.norm",
+        destination.module::<B::Tensor, _>(
+            format_args!("model.norm"),
             ParameterRole::Replicated,
             &modules.norm,
-            |_, _| Ok(MemberSharding::Replicated),
+            |_| Ok(MemberSharding::Replicated),
         )?,
-    ];
+    ]);
     if let Some(head) = &modules.lm_head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
+        groups.push(destination.module::<B::Tensor, _>(
+            format_args!("lm_head"),
             ParameterRole::Vocabulary,
             head,
-            |_, shape| {
+            |shape| {
                 (!shape.is_empty())
                     .then_some(MemberSharding::Balanced { axis: 0 })
-                    .ok_or_else(|| ParallelPlanError::InvalidTensor("Kimi output is scalar".into()))
+                    .ok_or_else(|| destination.tensor_error(format_args!("Kimi output is scalar")))
             },
         )?);
     }
@@ -866,33 +869,32 @@ where
 }
 
 /// Declares semantic groups for one scheduled Kimi block.
-pub fn layer_parallel_parameter_groups<B>(
-    block: &Block<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
-{
-    let root = format!("model.layers.{layer}");
-    let mut groups = Vec::new();
+pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>(block: &Block<B>, args: &ModelArgs, layer: usize) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    layer_parallel_parameter_groups_destination(block, args, layer, None).map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)
+}
+
+pub(crate) fn layer_parallel_parameter_groups_destination<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>(block: &Block<B>, args: &ModelArgs, layer: usize, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<ParameterGroupSpec>, crate::decoder::parameter_metadata::ParameterGroupError> {
+    let destination = crate::decoder::parameter_metadata::DeclarationDestination(metadata);
+    destination.controls::<(&Block<B>, &ModelArgs, usize, String, Vec<ParameterGroupSpec>, [(&str, &B::Normalization);2], [(&B::Linear, eredu_runtime::ProjectionSharding);3], [std::ops::Range<usize>;3], usize, MemberSharding)>()?;
+
+    let root = destination.text(format_args!("model.layers.{layer}"))?;
+    let mut groups = destination.vector(6)?;
     let (units, role) = match &block.mixer {
         TokenMixer::Kda(_) => (args.kda_config.num_heads, ParameterRole::AttentionHeads),
         TokenMixer::Mla(_) => (args.num_attention_heads, ParameterRole::AttentionHeads),
     };
-    groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-        format!("{root}.self_attn.heads"),
+    groups.push(destination.partitioned_module_metadata::<B::Tensor, _>(
+        format_args!("{root}.self_attn.heads"),
         role,
         usize::try_from(units)
-            .map_err(|_| ParallelPlanError::InvalidGroup("Kimi head count exceeds usize".into()))?,
+            .map_err(|_| destination.group_error(format_args!("Kimi head count exceeds usize")))?,
         &block.mixer,
         |metadata, shape| {
             // Quantization companions carry their primary projection identity.
             // They follow the same semantic head or output-column partition.
             let name = metadata
-                .linear_companion_of
-                .as_ref()
-                .unwrap_or(&metadata.id)
+                .linear_companion_of()
+                .unwrap_or(metadata.id())
                 .as_str();
             if name.ends_with("q_proj.weight")
                 || name.ends_with("k_proj.weight")
@@ -921,71 +923,71 @@ where
         ("input_layernorm", &block.input_norm),
         ("post_attention_layernorm", &block.post_attention_norm),
     ] {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.{name}"),
+        groups.push(destination.module::<B::Tensor, _>(
+            format_args!("{root}.{name}"),
             ParameterRole::Replicated,
             norm,
-            |_, _| Ok(MemberSharding::Replicated),
+            |_| Ok(MemberSharding::Replicated),
         )?);
     }
     match &block.feed_forward {
         FeedForward::Dense(DenseSwiGlu { gate, down, up }) => {
             let width = usize::try_from(args.intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Kimi dense width exceeds usize".into())
+                destination.group_error(format_args!("Kimi dense width exceeds usize"))
             })?;
-            groups.push(eredu_runtime::partitioned_projection_group::<
+            groups.push(destination.projections::<
                 B::Tensor,
                 B::Linear,
             >(
-                format!("{root}.mlp.intermediate"),
+                format_args!("{root}.mlp.intermediate"),
                 ParameterRole::FeedForwardIntermediate,
                 &[
                     (gate, eredu_runtime::ProjectionSharding::Column),
                     (up, eredu_runtime::ProjectionSharding::Column),
                     (down, eredu_runtime::ProjectionSharding::Row),
                 ],
-                aligned_partition_units(&root, width, 1, 1)?,
+                destination.aligned(&root, width, 1, 1)?,
             )?);
         }
         FeedForward::Sparse(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.gate"),
+            groups.push(destination.module::<B::Tensor, _>(
+                format_args!("{root}.mlp.gate"),
                 ParameterRole::Replicated,
                 &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
+                |_| Ok(MemberSharding::Replicated),
             )?);
             let width = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Kimi expert width exceeds usize".into())
+                destination.group_error(format_args!("Kimi expert width exceeds usize"))
             })?;
-            let segments = vec![0..width, width..2 * width];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.experts.intermediate"),
+            let segments = [0..width, width..2 * width];
+            groups.push(destination.partitioned_module_metadata::<B::Tensor, _>(
+                format_args!("{root}.mlp.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
                 width,
                 &moe.experts,
                 |metadata, _| {
-                    if metadata.id.as_str().contains("gate_up_proj") {
+                    if metadata.id().as_str().contains("gate_up_proj") {
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 1,
-                            segments: segments.clone(),
+                            segments: { let mut copy = destination.vector(segments.len())?; copy.extend(segments.iter().cloned()); copy },
                         })
                     } else {
                         Ok(MemberSharding::Partitioned { axis: 2 })
                     }
                 },
             )?);
-            groups.push(eredu_runtime::partitioned_projection_group::<
+            groups.push(destination.projections::<
                 B::Tensor,
                 B::Linear,
             >(
-                format!("{root}.mlp.shared_experts.intermediate"),
+                format_args!("{root}.mlp.shared_experts.intermediate"),
                 ParameterRole::FeedForwardIntermediate,
                 &[
                     (&moe.shared.gate, eredu_runtime::ProjectionSharding::Column),
                     (&moe.shared.up, eredu_runtime::ProjectionSharding::Column),
                     (&moe.shared.down, eredu_runtime::ProjectionSharding::Row),
                 ],
-                aligned_partition_units(&root, width, 1, 1)?,
+                destination.aligned(&root, width, 1, 1)?,
             )?);
         }
     }
@@ -996,6 +998,11 @@ where
 mod tests {
     use super::*;
     use eredu_runtime::{LocalTensorLayout, ParameterRole};
+
+    #[test]
+    fn canonical_kimi_linear_parameters_state_and_identity_use_the_actual_destination() {
+        crate::architecture_parameter_metadata_tests::exercise(|context| crate::kimi_linear::LayeredModel::<eredu_nn::workspace::WorkspaceBackend>::new(args(),context));
+    }
 
     fn args() -> ModelArgs {
         crate::kimi_linear::model_args_from_config_value(&serde_json::json!({

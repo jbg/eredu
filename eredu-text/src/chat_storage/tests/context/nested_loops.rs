@@ -117,7 +117,6 @@ fn wrong_unpack_lengths_and_unsupported_loop_protocols_refuse() {
     }
     for template in [
         "{% for x in rows recursive %}{{ x }}{% endfor %}",
-        "{% for x in rows if x %}{{ x }}{% endfor %}",
         "{% for x in rows %}{{ x }}{% else %}empty{% endfor %}",
         "{% for k,(a,b) in rows %}{{ k }}{% endfor %}",
     ] {

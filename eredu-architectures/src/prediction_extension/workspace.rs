@@ -135,7 +135,7 @@ struct WorkspacePredictionFailure {
     #[source]
     cause: Error,
     // Erased source shell and cause retire before the paying account.
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 fn with_failure<T, F: FnOnce() -> Result<T, Error>>(
     context: &WorkspaceContext,

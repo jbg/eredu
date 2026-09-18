@@ -42,9 +42,6 @@ impl Error {
             }
         }
     }
-    pub(crate) fn is_ordinary_capture_failure(&self) -> bool {
-        matches!(self, Self::OrdinaryCapture(_))
-    }
 }
 /// Fixed core source/control representation; variable diagnostics remain ordinary.
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::backend::{
     OriginalCopyEnvironment,
 };
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{WorkspaceBorrowedStorage, WorkspaceContext, WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceBorrowedStorage, WorkspaceContext, HostMetadataFunding};
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
@@ -18,19 +18,28 @@ use std::mem::{size_of, size_of_val};
 pub(in crate::composition::mlx::replicated_text) struct SourceBindings {
     _bindings: Vec<OriginalResidentSourceBinding>,
     _selection: WorkspaceBorrowedStorage,
+    _prepared: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
     _host: HostPreparationAuthority,
 }
 impl SourceBindings {
     pub(in crate::composition::mlx::replicated_text) fn prepare(
         context: &WorkspaceContext,
         native: &[&ProjectedNativeStorage],
+        prepared: Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
         completed: &[&CompletedResidentSource],
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         host: HostPreparationAuthority,
     ) -> Result<Self, Error> {
         let frames = [
             size_of::<Self>(),
+            size_of::<(
+                Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
+                eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout<()>,
+                Result<eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout<()>, WorkingMemoryError>,
+                Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
+                Result<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>, WorkingMemoryError>,
+            )>(),
             size_of::<Result<Self, Error>>(),
             size_of::<Vec<OriginalResidentSourceBinding>>(),
             size_of::<(
@@ -38,7 +47,7 @@ impl SourceBindings {
                 &[&ProjectedNativeStorage],
                 &[&CompletedResidentSource],
                 &OriginalCopyEnvironment<'_>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
                 HostPreparationAuthority,
             )>(),
             size_of::<usize>(),
@@ -71,15 +80,23 @@ impl SourceBindings {
                 &host,
             )?);
         }
+        let prepared = prepared.map(|source| {
+            let layout = eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout::<()>::new_with_prepared_source(0, source)
+                .map_err(Error::PrefillControl)?;
+            funding.reserve_metadata(layout.requested_bytes()).map_err(Error::WorkspacePlanning)?;
+            layout.construct_unselected_with_prepared_source(environment.pool(), context,
+                std::iter::empty(), source.clone()).map_err(Error::PrefillControl)
+        }).transpose()?;
+        let prepared_roots = prepared.as_ref().map(|binding| binding.borrowed_storage().roots()).unwrap_or(&[]);
         let roots = bindings
             .iter()
-            .try_fold(0usize, |n, binding| {
+            .try_fold(prepared_roots.len(), |n, binding| {
                 n.checked_add(binding.borrowed().roots().len())
             })
             .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
         let iter = bindings
             .iter()
-            .flat_map(|binding| binding.borrowed().roots());
+            .flat_map(|binding| binding.borrowed().roots()).chain(prepared_roots);
         funding
             .reserve_metadata(
                 WorkspaceBorrowedStorage::construction_bytes(roots)
@@ -94,8 +111,11 @@ impl SourceBindings {
             .map_err(|cause| Error::Neural(context.metadata_source(cause)))?;
         Ok(Self {
             _bindings: bindings,
+            _prepared: prepared,
             _selection: selection,
             _host: host,
         })
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

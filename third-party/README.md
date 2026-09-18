@@ -9,14 +9,16 @@ remain in Eredu's existing neutral contracts and runtime.
 | --- | --- | --- |
 | derivre | 0.3.12 | `a892ec3953f4ca893e8d2086ed03d4b58e19c77ffb864a574b332d7d40c175f3` |
 | llguidance | 1.8.0 | `207e72ede15e79f1e7a7f0e2683387da031c1931f6de650020afb80c571efb67` |
+| regex-syntax | 0.8.11 | `d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4` |
+| referencing | 0.52.1 | `d38a014525040cdc9893361b7419bcf1f43b7ba7055eabaf6d91d6b75caa8b3f` |
 
 The original crates.io archives were checked against the pre-change Cargo.lock
 before extraction. `parser-upstream.json` records those hashes, each original
 file's SHA-256, and the archived VCS metadata. Archive hashes are authoritative;
 llguidance's archived VCS metadata reports a dirty checkout. Each package retains
-its upstream MIT license, original manifest and source artifacts.
+its upstream licenses, original manifest and source artifacts.
 
-Both forks inherit the workspace `unsafe_code = "forbid"` lint. The local
+These forks inherit the workspace `unsafe_code = "forbid"` lint. The local
 llguidance package builds only its Rust library. Its upstream C-ABI modules,
 static/shared C libraries, header generation and header-copy build script are
 excluded from compilation. The original C-ABI sources remain as provenance
@@ -30,6 +32,13 @@ outside the archive. Their targets and unused test dependencies are omitted from
 the local manifest; their original sources remain recorded. The self-contained
 upstream library tests, local public-parser tests and Eredu's grammar conformance
 tests are executable. Derivre's packaged upstream tests remain enabled.
+
+Compiled llguidance grammars have one closed shared owner used by ordinary
+parsers and funded Earley state. Publication reserves its shell through the actual
+compiler account; final retirement frees the shell before the immutable graph
+and its account. The factory accepts that shared source without a deep copy.
+There is no infallible deep clone of a compiled grammar. Explicit independent
+copies remain fallible operations with their own construction requirements.
 
 The hash-cons table's retained-capacity API describes its owned vector capacity
 and hash-table allocation. A prepared table may insert within its fixed
@@ -63,6 +72,16 @@ rows and skip selection all preserve the original typed cause on failure; a
 failed lexer is never published as a successful parser. Independent clones keep
 the same per-instance cap. Other compiler/parser allocations still require their
 own bounds.
+
+The regex-syntax fork adds borrowed allocation admission to the existing AST
+parser and HIR translator. Ordinary construction supplies the unenforced policy
+to those same workers. The dependency reports its actual box, vector and string
+producers; it does not depend on host accounts or backend resources. Iterative
+tree teardown uses explicit geometric stacks, with storage credit reserved
+before node creation. HIR move/retirement sentinels and diagnostic formatting do
+not allocate. The caller retains its funding owner through syntax, parser and
+error retirement. Integration status and focused validation are recorded in
+`doc/bounded-followup-regex-syntax.md`.
 
 Matcher failures preserve the known closed configuration/parser causes and their
 diagnostic text. They do not retain arbitrary constructor errors that might own
@@ -211,28 +230,38 @@ and four Rust deltas: a closed borrowed workspace, tests, child export and priva
 SparseSet reserve helpers. All ordinary APIs/features/manifests and upstream
 unsafe statements remain unchanged; no workspace lint is weakened.
 
-The workspace's seven buffers are fallibly prepared from actual NFA geometry.
-Failures retain partial buffers and the source borrow. Search delegates to the
-existing worker without a pool, source swap or raw cache projection. This is no
-regex source-construction, original account or complete-tokenizer claim. Fancy,
-HF and Eredu integration remain subsequent work. Registry publication requires
-upstream or a published patched dependency; vanilla 0.4.18 lacks this API.
+The PikeVM workspace's seven buffers are fallibly prepared from actual NFA
+geometry. Capturing delegates and Unicode word assertions retain that mechanism.
+The capture-free tokenizer profiles now use immutable DFA tables through the
+same fancy VM and iterator workers for ordinary and enforced construction.
+Private recipes are emitted by the pinned ordinary compiler in both byte orders.
+The checked source constructor validates exact input/profile/table structure
+before allocating, then declares and copies five vector tables and one boxed
+owner. Every partial allocation remains owned on failure. The superseded NFA
+recipe constructor and capture-table adapter have been removed.
 
+## fancy-regex 0.19.0 canonical engine fork
 
-## fancy-regex 0.17.0 explicit workspace fork
+Tokenizer and schema consumers now use the exact selected 0.19.0 engine.
+The 0.17 production source is removed; its historical patch and archive hashes
+remain as provenance. `parser-upstream.json` records all 58 original 0.19 files,
+its archive hash and upstream revision; the MIT license remains in the fork.
+The portable workspace member inherits the unsafe-code prohibition.
 
-`fancy-regex-workspace.patch` is the reviewable delta over the complete pinned
-crate archive; its JSON records all upstream members and changed files. The
-root registry patch actually consumes this external crate. Both fancy manifests
-bind the exact relative regex-automata 0.4.18 fork. Apply the separately pinned
-RA fixed-selector successor after PikeVM step 1; ordinary RA defaults do not
-enable the selector. The new fancy path does not construct a meta-regex/cache
-pool: its direct delegates use the closed source-bound PikeVM workspace. It
-keeps normal constructors, defaults, compiler, VM and iteration policy shared.
-The current conservative VM branch/undo bound can be large; it is not a promise
-of DFA throughput, total allocator peak, cold parser construction or complete HF
-regex support. These APIs are not supplied by vanilla crates.io releases;
-publishing consumers requires upstreaming or publishing the audited forks.
+The original 0.19 VM and iterator progression each have one shared worker.
+Explicit tokenizer workspaces retain capture-free immutable DFA delegates and
+native character-class instructions; capturing delegates use the tagged NFA.
+The regenerated closed inventory has 15 distinct DFA sources. Original dynamic
+source construction and ordinary pooled scratch retain their upstream behavior;
+general schema compiler/runtime funding remains unfinished and is not granted
+by the closed tokenizer constructor.
+
+`doc/bounded-followup-schema-regex.md` records the semantic upgrade audit,
+independent pristine reference, exact storage/refusal tests and current full
+split measurements. The older measurements in `bounded-followup-tokenizer.md`
+remain historical evidence for the preceding 0.17 consolidation. No runtime
+source compiler runs inside the admitted immutable-table constructor. These
+APIs are absent from vanilla crates.io releases; publication requires the forks.
 
 MiniJinja lexical successor: apply `minijinja-checked-frontend.patch` after the complete `minijinja-original-chat.patch` (including its safe-module lint correction), then verify the exact member manifest in `minijinja-checked-frontend.json`. The new default-syntax constructor shares ordinary scanning and literal workers; full parser/codegen/VM ownership remains unfinished.
 
@@ -311,3 +340,59 @@ all actual scratch precedes its payer loan in drop order. This is context
 construction machinery, not a full-schema admission API: input parsing,
 unevaluated masks/sets, uniqueness, regex, content and numeric scratch remain
 to be joined before public tool completion can use it.
+
+
+## Reference registry and URI source storage
+
+The referencing 0.52.1 fork owns prospective registry, cache, index, pointer,
+anchor, vocabulary and resolver allocation facts. Its ordinary and enforced
+entry points use the same producers. Bundled meta-schema bytes enter the shared
+funded JSON producer under the actual source owner; preparation does not adopt
+lazy global parsed values. External retrievers require a prospective callback
+contract under enforcement, including their returned values and errors.
+
+The already selected fluent-uri 0.4.1 fork owns the actual normalization,
+resolution, owned-copy and fragment buffer requests. Its archive SHA-256 is
+`bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e`;
+`parser-upstream.json` retains all original file hashes and VCS metadata.
+The independent validation executable checks original hashes before comparing
+URI behavior against the pristine archive library. See
+[`doc/bounded-followup-referencing.md`](../doc/bounded-followup-referencing.md)
+for the concrete tests and the callback boundary.
+
+## ECMA regex source translation
+
+The exact selected jsonschema-regex 0.52.1 source is a portable workspace member.
+Its shared ordinary/funded workers expose original AST/HIR parsing, visitor
+stacks, replacement strings, syntax group/name tables, literal optimizations,
+and witness construction through the neutral regex-syntax allocation callback.
+Fixed syntax and allocation failures remain distinct. The original archive
+hashes and VCS revision are retained in `parser-upstream.json`; its declared MIT
+license notice is included from the same project's existing 0.52.1 value fork.
+See [`doc/bounded-followup-schema-regex.md`](../doc/bounded-followup-schema-regex.md)
+for refusal tests and the independently linked pristine-source comparison.
+
+## Schema text and numeric invocation producers
+
+Exact idna 1.1.0, idna_adapter 1.2.2 and icu_normalizer 2.3.0 sources keep the
+original UTS 46 and normalization data and workers while exposing prospective
+borrowed allocation hooks. Exact fraction 0.17.0, num-rational 0.4.2 and
+num-bigint 0.4.8 sources expose the original finite-float rational conversion and
+limb operations through the same ordinary/funded workers. These portable members
+inherit the unsafe-code prohibition; safe checked conversions replace upstream
+unsafe sites. All archives, file hashes and upstream licenses remain recorded.
+The caller owns source/error custody and resource admission. Neither family
+selects a backend or introduces a second parser/arithmetic engine.
+
+See [`doc/bounded-followup-schema-compiler.md`](../doc/bounded-followup-schema-compiler.md)
+for exact refusal, pristine-source comparison and performance evidence, plus the
+remaining optional arbitrary-precision and dynamic-source boundaries.
+
+## Shared ordered collection mechanism
+
+The local JSON default ordered map now consumes `eredu-collections`' single
+safe AVL worker. That workspace foundation contains the local node implementation
+and its generic behavior/refusal tests; JSON serialization tests remain in this
+fork. The JSON allocation adapter still calls its original policy before each
+exact node allocation. Archive provenance and upstream licenses are unchanged;
+no upstream file is claimed as the provenance of the local AVL implementation.

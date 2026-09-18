@@ -10,12 +10,7 @@ pub(crate) struct IdentityMatching<'a> {
 }
 impl<'a> IdentityMatching<'a> {
     pub(super) fn ordinary(source: &'a AddedVocabulary) -> Self {
-        let normalized = match &source.storage {
-            Storage::Legacy(value) => value.split_normalized_trie.is_some(),
-            Storage::Packed(value) => {
-                value.ids.iter().any(|&i| value.token(i).normalized)
-            }
-        };
+        let normalized = source.tokens().any(|(_, token)| token.normalized);
         Self { source, normalized }
     }
     pub(crate) fn checked(
@@ -23,7 +18,6 @@ impl<'a> IdentityMatching<'a> {
         normalizer: Option<&NormalizerWrapper>,
     ) -> Option<Self> {
         if normalizer.is_some()
-            || !matches!(&source.storage, Storage::Packed(_))
             || !source
                 .tokens()
                 .all(|(_, t)| !t.single_word && !t.lstrip && !t.rstrip)
@@ -45,9 +39,8 @@ impl<'a> IdentityMatching<'a> {
             sentence,
             visit: &mut visit,
         };
-        self.source.visit_matches(sentence, false, |id, offsets| {
-            raw.accept(id, offsets)
-        })
+        self.source
+            .visit_matches(sentence, false, |id, offsets| raw.accept(id, offsets))
     }
     pub(crate) fn control_bytes<E>(&self) -> Option<usize> {
         // Only references to V are stored, so its concrete closure layout does
@@ -80,11 +73,7 @@ struct RawPhase<'a, V> {
     visit: &'a mut V,
 }
 impl<V> RawPhase<'_, V> {
-    fn accept<E>(
-        &mut self,
-        id: Option<u32>,
-        (start, end): Offsets,
-    ) -> std::result::Result<(), E>
+    fn accept<E>(&mut self, id: Option<u32>, (start, end): Offsets) -> std::result::Result<(), E>
     where
         V: FnMut(Option<u32>, Offsets) -> std::result::Result<(), E>,
     {
@@ -95,11 +84,10 @@ impl<V> RawPhase<'_, V> {
             base: start,
             visit: &mut *self.visit,
         };
-        self.source.visit_matches(
-            &self.sentence[start..end],
-            true,
-            |id, offsets| local.accept(id, offsets),
-        )
+        self.source
+            .visit_matches(&self.sentence[start..end], true, |id, offsets| {
+                local.accept(id, offsets)
+            })
     }
 }
 struct OffsetPhase<'a, V> {
@@ -107,11 +95,7 @@ struct OffsetPhase<'a, V> {
     visit: &'a mut V,
 }
 impl<V> OffsetPhase<'_, V> {
-    fn accept<E>(
-        &mut self,
-        id: Option<u32>,
-        (start, end): Offsets,
-    ) -> std::result::Result<(), E>
+    fn accept<E>(&mut self, id: Option<u32>, (start, end): Offsets) -> std::result::Result<(), E>
     where
         V: FnMut(Option<u32>, Offsets) -> std::result::Result<(), E>,
     {

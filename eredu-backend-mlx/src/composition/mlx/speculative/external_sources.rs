@@ -4,7 +4,7 @@ use crate::{backend::error::Error, composition::mlx::{model::retain_planning_err
     session::OriginalInterventionDeclaration}};
 use eredu_core::{InferenceGeometry, SpeculativeRequestId,
     speculative::{SpeculativeActivationOrigin, SpeculativePrefillSpan}};
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::{speculative::external_occurrence::{ExternalContinuation, ExternalInvocationKind,
     ExternalOccurrenceClaim, ExternalOccurrenceCursor, ExternalOccurrenceError, ExternalSchedulePlan},
     working_memory::{OriginalSpeculativeRequest, WorkingMemoryError}};
@@ -32,7 +32,7 @@ impl<'a> OriginalExternalSources<'a> {
             size_of::<ExternalSchedulePlan<'a>>(), size_of::<(OriginalSpeculativeNumericalPreparation, u64, Option<OriginalInterventionDeclaration>)>()];
         source.metadata_funding().reserve_metadata(frames.into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let request = OriginalSpeculativeRequest::prepare_external(source.pool(),
             source.execution_identity(), &schedule, capacity)
@@ -65,7 +65,7 @@ impl ExternalInvocationSource for OriginalExternalSources<'_> {
             size_of::<Result<ExternalOccurrenceClaim<'_>, ExternalOccurrenceError>>()];
         self.numerical.metadata_funding().reserve_metadata(frames.into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if self.scheduler_request.get().is_some_and(|prior| prior != origin.request) {
             return Err(self.numerical.retain_startup_error(WorkingMemoryError::IdentityMismatch));
@@ -87,7 +87,7 @@ impl ExternalInvocationSource for OriginalExternalSources<'_> {
             size_of::<Result<(), eredu_runtime::working_memory::SpeculativeContinuationError>>()];
         let funding = self.numerical.metadata_funding();
         funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let mut cursor = self.cursor.try_borrow_mut()
             .map_err(|_| self.numerical.retain_startup_error(WorkingMemoryError::AccountConstructionBusy))?;

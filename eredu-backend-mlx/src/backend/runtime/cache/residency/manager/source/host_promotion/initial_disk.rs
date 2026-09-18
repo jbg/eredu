@@ -10,7 +10,7 @@ pub(crate) struct PreparedInitialDiskReturn {
     generation: u64,
     reservation: CachePoolReservation,
     context: WorkspaceContext,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 impl CacheBlockSourceLoan<'_> {
     pub(crate) fn prepare_initial_disk_return(
@@ -103,3 +103,5 @@ impl PreparedInitialDiskReturn {
         Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

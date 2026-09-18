@@ -9,25 +9,34 @@ use eredu_core::{
 use std::time::{Duration, Instant};
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    original_sources::Fixture<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
     let mut model = unicode_model(None);
-    let chat = model
-        .prepare_chat(ChatTemplateRequest {
+    let chat = {
+        let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"hello"})],
             add_generation_prompt: true,
             ..Default::default()
-        })
-        .unwrap();
-    let settings = PreparedChatGenerationSettings {
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let settings = original_sources::settings(PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(6),
             ..Default::default()
         },
         ..Default::default()
-    };
+    });
     (model, chat, settings)
 }
 fn options() -> ControlledSpeculativeOptions {
@@ -48,8 +57,11 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
     use eredu_core::{capture::*, intervention::*};
     for factor in [1.0, 2.0] {
         let (mut model, chat, settings) = setup();
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        let request = || PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+            output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
             settings,
             options: Default::default(),
@@ -74,7 +86,7 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
         let identity = plan.identity().to_owned();
         let mut record_steps = Vec::new();
         let output = model
-            .with_controlled_chat_speculative(
+            .with_controlled_prepared_chat_speculative(
                 request(),
                 ControlledSpeculativeOptions {
                     activations: Some(plan.clone()),
@@ -96,17 +108,24 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
         if factor == 1.0 {
             assert_eq!(output.token_ids(), baseline.token_ids());
         }
-        assert_eq!(records[0].captures.as_step().invocation.unwrap().sequence, 2);
-        assert!(records
-            .iter()
-            .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str())));
-        assert!(records
-            .iter()
-            .flat_map(|r| &r.captures.as_step().interventions)
-            .any(|edit| edit.outcome == InterventionOutcome::Applied));
+        assert_eq!(
+            records[0].captures.as_step().invocation.unwrap().sequence,
+            2
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str()))
+        );
+        assert!(
+            records
+                .iter()
+                .flat_map(|r| &r.captures.as_step().interventions)
+                .any(|edit| edit.outcome == InterventionOutcome::Applied)
+        );
         let mut continuous_steps = Vec::new();
         let streamed = model
-            .generate_observed_chat_speculative(
+            .generate_observed_prepared_chat_speculative(
                 request(),
                 ControlledSpeculativeOptions {
                     activations: Some(plan.clone()),
@@ -118,7 +137,10 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                 },
             )
             .unwrap();
-        let continuous: Vec<_> = continuous_steps.iter().flat_map(|rows| rows.iter()).collect();
+        let continuous: Vec<_> = continuous_steps
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .collect();
         assert_eq!(streamed.token_ids(), output.token_ids());
         assert_eq!(continuous.len(), records.len());
         for (a, b) in continuous.iter().zip(&records) {
@@ -127,13 +149,16 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                 (b.origin, b.phase, b.captures.as_step().invocation)
             );
             assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
-            assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
+            assert_eq!(
+                a.captures.as_step().interventions,
+                b.captures.as_step().interventions
+            );
         }
         let fresh = model.generate_prepared_chat_speculative(request()).unwrap();
         assert_eq!(fresh.token_ids(), baseline.token_ids());
         let (mut other, _, _) = setup();
         let mut entered = false;
-        let result = other.with_controlled_chat_speculative(
+        let result = other.with_controlled_prepared_chat_speculative(
             request(),
             ControlledSpeculativeOptions {
                 activations: Some(plan),
@@ -170,9 +195,12 @@ fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() 
                 },
             })
             .unwrap();
-        let result = model.with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        let result = model.with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -225,12 +253,13 @@ fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() 
 fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_failed_proposals() {
     let (mut model, chat, settings) = setup();
     let mut expected_events = Vec::new();
+    SPECULATIVE_RESULT_FAULT.set(Some(CONTROL_REJECTION_PROMPT_TOKEN));
     let expected = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::prepared_backend_input(
-                &chat,
-                vec![CONTROL_REJECTION_PROMPT_TOKEN],
-            ),
+        .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+            output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
             settings,
             options: Default::default(),
@@ -241,13 +270,14 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
         .unwrap();
     let mut events = Vec::new();
     let mut steps = Vec::new();
+    SPECULATIVE_RESULT_FAULT.set(Some(CONTROL_REJECTION_PROMPT_TOKEN));
     let output = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(
-                    &chat,
-                    vec![CONTROL_REJECTION_PROMPT_TOKEN],
-                ),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -270,10 +300,11 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
     assert_eq!(output.token_ids(), expected.token_ids());
     assert_eq!(output.finish_reason(), expected.finish_reason());
     assert_eq!(events, expected_events);
-    assert!(steps.iter().any(|s| s
-        .drafted
-        .as_ref()
-        .is_some_and(|d| d.token_ids == [11, 11, 11])));
+    assert!(steps.iter().any(|s| {
+        s.drafted
+            .as_ref()
+            .is_some_and(|d| d.token_ids == [11, 11, 11])
+    }));
     let verified = steps.iter().find_map(|s| s.verification.as_ref()).unwrap();
     assert_eq!(
         verified.dispositions,
@@ -322,9 +353,12 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
     let mut events = Vec::new();
     let mut replayed = Vec::new();
     model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -419,9 +453,12 @@ fn speculative_ttft_excludes_pause_and_delivery_and_counts_invisible_first_commi
     let wall = Instant::now();
     let mut delivered_timing = None;
     let output = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -449,9 +486,12 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
     for before in [true, false] {
         let (mut model, chat, settings) = setup();
         let output = model
-            .with_controlled_chat_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                    skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
                     settings,
                     options: Default::default(),
@@ -484,9 +524,12 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
 fn trace_limit_failure_is_terminal_even_if_the_controller_ignores_it() {
     let (mut model, chat, settings) = setup();
     let error = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -520,9 +563,12 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
     for pass in 0..2 {
         let (mut model, chat, settings) = setup();
         model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
                     settings,
                     options: Default::default(),
@@ -571,9 +617,12 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
     let events = std::cell::RefCell::new(Vec::new());
     for pass in 0..2 {
         model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+            .with_controlled_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[0]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
                     settings,
                     options: Default::default(),
@@ -610,12 +659,14 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
                     ));
                     assert_eq!(session.token_ids(), [7]);
                     let unchanged = session.sampling_state();
-                    assert!(session
-                        .override_sampling(eredu::api::SamplingOverride {
-                            temperature: Some(-1.0),
-                            reseed: None
-                        })
-                        .is_err());
+                    assert!(
+                        session
+                            .override_sampling(eredu::api::SamplingOverride {
+                                temperature: Some(-1.0),
+                                reseed: None
+                            })
+                            .is_err()
+                    );
                     assert_eq!(session.sampling_state(), unchanged);
                     session.override_sampling(eredu::api::SamplingOverride {
                         temperature: Some(0.7),

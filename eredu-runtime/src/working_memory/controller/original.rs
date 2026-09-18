@@ -1,9 +1,9 @@
 //! Authentication for one originally constructed immutable C token domain.
 use super::*;
-use crate::working_memory::{OriginalTokenizer, WorkingMemoryFundingRun, WorkingMemoryReservation};
+use crate::working_memory::{OriginalTokenizer, WorkingMemoryFundingRun, WorkingMemoryReservation, InferenceExecutionIdentity};
 use eredu_core::{
     BackendFailure, GenerationSequenceBankRejection, GenerationSequencePreparation,
-    OriginalTokenDomainWitness, TextControllerContract, TextFilterWorkspace,
+    OriginalSourceWitness, TextControllerContract, TextFilterWorkspace,
 };
 
 impl ControllerStorageContract {
@@ -14,21 +14,35 @@ impl ControllerStorageContract {
         controller: &C,
         workspace: TextControllerWorkspace<'_>,
         pool: &WorkingMemoryPool,
+        execution: &InferenceExecutionIdentity,
         claim: &GenerationSequencePreparation<'_, '_>,
     ) -> Result<Self, BackendFailure> {
         let reject = || GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure();
-        let source = controller
-            .inference_storage()
-            .original_token_domain()
-            .and_then(|witness| witness.downcast_ref::<OriginalTokenizer>())
-            .ok_or_else(reject)?;
-        let original =
-            OriginalTokenDomainBinding::prepare(source, claim, pool).map_err(|_| reject())?;
+        let declaration = controller.inference_storage();
+        let semantic = Self::semantic_binding(declaration, pool, execution).map_err(|_| reject())?;
+        let source = match &semantic {
+            Some(binding) => binding.tokenizer(),
+            None => declaration.original_token_domain()
+                .and_then(|witness| witness.downcast_ref::<OriginalTokenizer>()).ok_or_else(reject)?,
+        };
+        let original = if let Some(binding) = &semantic {
+            let state = claim.request().semantic_state().and_then(|owner| owner.prepared_source())
+                .and_then(|source| source.downcast_ref::<crate::working_memory::PreparedSemanticState>())
+                .ok_or_else(reject)?;
+            let TextControllerStorage::RunOwnedWithPreparedSemantic { source: actual, .. } = declaration else {
+                return Err(reject());
+            };
+            binding.validate_semantic_state(state, actual, claim.request().max_new_tokens()).map_err(|_| reject())?;
+            OriginalTokenDomainBinding::prepare_semantic(source, claim, pool).map_err(|_| reject())?
+        } else {
+            OriginalTokenDomainBinding::prepare(source, claim, pool).map_err(|_| reject())?
+        };
         Self::validate_original_workspace(&original, workspace).map_err(|_| reject())?;
         Ok(Self {
             shared: BTreeMap::new(),
             shared_bytes: 0,
             original: Some(original),
+            semantic,
         })
     }
 
@@ -40,18 +54,22 @@ impl ControllerStorageContract {
         controller: &C,
         workspace: TextControllerWorkspace<'_>,
         pool: &WorkingMemoryPool,
+        execution: &InferenceExecutionIdentity,
         maximum: u64,
     ) -> Result<Self, BackendFailure> {
         let reject = || GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure();
         let declaration = controller.inference_storage();
-        let Some(witness) = declaration.original_token_domain() else {
+        let semantic = Self::semantic_binding(declaration, pool, execution).map_err(|_| reject())?;
+        let witness = semantic.as_ref().map(|binding| OriginalSourceWitness::new(binding.tokenizer()))
+            .or_else(|| declaration.original_token_domain());
+        let Some(witness) = witness else {
             // An already copied run-owned controller can have no shared source.
             // Match initial original-input admission: unknown/nonempty ordinary
             // inventories cannot enter a retained original request.
             if !declaration.shared_sources().is_some_and(|mut sources| sources.next().is_none()) {
                 return Err(reject());
             }
-            let contract = Self { shared: BTreeMap::new(), shared_bytes: 0, original: None };
+            let contract = Self { shared: BTreeMap::new(), shared_bytes: 0, original: None, semantic: None };
             contract.validate_workspace(workspace).map_err(|_| reject())?;
             return Ok(contract);
         };
@@ -64,7 +82,22 @@ impl ControllerStorageContract {
             shared: BTreeMap::new(),
             shared_bytes: 0,
             original: Some(original),
+            semantic,
         })
+    }
+
+    fn semantic_binding(
+        declaration: TextControllerStorage<'_>, pool: &WorkingMemoryPool,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<Option<PreparedControllerBinding>, WorkingMemoryError> {
+        let TextControllerStorage::RunOwnedWithPreparedSemantic { binding, source } = declaration else {
+            return Ok(None);
+        };
+        let binding = binding.downcast_ref::<PreparedControllerBinding>()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        binding.validate_execution(pool, execution)?;
+        binding.validate_source(source)?;
+        Ok(Some(binding.clone()))
     }
 
     /// Whether this sealed contract uses the authenticated original-source path.
@@ -75,7 +108,7 @@ impl ControllerStorageContract {
 
     fn original_source<'a>(
         binding: &'a OriginalTokenDomainBinding,
-        witness: OriginalTokenDomainWitness<'_>,
+        witness: OriginalSourceWitness<'_>,
     ) -> Result<&'a OriginalTokenizer, ControllerStorageError> {
         let supplied = witness
             .downcast_ref::<OriginalTokenizer>()
@@ -88,9 +121,20 @@ impl ControllerStorageContract {
     }
 
     pub(super) fn validate_original_declaration(
+        &self,
         binding: &OriginalTokenDomainBinding,
         declaration: TextControllerStorage<'_>,
     ) -> Result<(), ControllerStorageError> {
+        if let Some(expected) = &self.semantic {
+            let TextControllerStorage::RunOwnedWithPreparedSemantic { binding, source } = declaration else {
+                return Err(WorkingMemoryError::IdentityMismatch.into());
+            };
+            let actual = binding.downcast_ref::<PreparedControllerBinding>()
+                .ok_or(WorkingMemoryError::IdentityMismatch)?;
+            if actual != expected { return Err(WorkingMemoryError::IdentityMismatch.into()); }
+            expected.validate_source(source)?;
+            return Ok(());
+        }
         let witness = declaration
             .original_token_domain()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
@@ -161,7 +205,7 @@ impl ControllerStorageContract {
             return self.validate_decision(decision);
         };
         self.validate_original_pool(pool)?;
-        Self::validate_original_declaration(
+        self.validate_original_declaration(
             binding,
             decision
                 .controller_storage()

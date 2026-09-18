@@ -218,7 +218,7 @@ impl<U: 'static> MlxUnitLease<U> {
         }
         match self.recovery {
             OperationRecovery::Ordinary(value) => {
-                let status = value.finish();
+                let status = value.finish()?;
                 if status.failed || status.blocked {
                     return Err(Error::ArchitectureModel(
                         "native execution-unit retirement failed".into(),
@@ -270,6 +270,7 @@ fn release_unit_payload<U: 'static>(retention: &mut UnitRetention<U>) {
 fn finish_error(cause: FinishRetainingError<safemlx::error::Exception>) -> Error {
     match cause {
         FinishRetainingError::Native(cause) => cause.into(),
+        FinishRetainingError::Retirement(cause) => cause.into_error(),
         // Native observers translate fixed/retained causes before consumption.
         // This fallback fences an unavailable observation without new strings.
         FinishRetainingError::Observation(_) => Error::PrefillScopeUnavailable,

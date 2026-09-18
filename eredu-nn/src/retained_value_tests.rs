@@ -10,15 +10,19 @@ fn retained(module: &impl Parameterized<i32>) -> (bool, Vec<i32>) {
     (complete, values)
 }
 
-struct Legacy {
+struct Incomplete {
     weight: Parameter<i32>,
     hidden: Vec<i32>,
 }
 
-impl Parameterized<i32> for Legacy {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, i32>>(&'a self, visitor: &mut V) {
-        self.weight.visit_parameters(visitor);
-    }
+impl Parameterized<i32> for Incomplete {
+    fn visit_parameter_sources<'a, V: crate::ParameterSourceVisitor<'a, i32>>(&'a self, visitor: &mut V) -> Result<(), crate::ParameterSourceError> {
+ let mut __source_result = Err(crate::ParameterSourceError::UnclassifiedRetainedField);
+
+__source_result = __source_result.and(        self.weight.visit_parameter_sources(visitor));
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, i32>>(&'a mut self, visitor: &mut V) {
         self.weight.visit_parameters_mut(visitor);
     }
@@ -42,7 +46,7 @@ struct ExplicitValues {
 #[derive(Parameterized)]
 #[parameterized(tensor = "i32")]
 struct Nested {
-    opaque: Legacy,
+    opaque: Incomplete,
     known_after_opaque: ExplicitValues,
 }
 
@@ -68,7 +72,7 @@ enum Choice {
 
 #[test]
 fn legacy_default_exposes_parameters_but_cannot_certify_hidden_buffers() {
-    let legacy = Legacy {
+    let legacy = Incomplete {
         weight: parameter("weight", 3),
         hidden: vec![5, 7],
     };
@@ -99,7 +103,7 @@ fn retained_buffers_are_borrowed_without_changing_parameter_topology() {
     assert_eq!(validate_parameter_topology(&module).unwrap(), before);
     struct Replace;
     impl<'a> ParameterVisitorMut<'a, i32> for Replace {
-        fn visit_mut(&mut self, _: ParameterMetadata, value: &'a mut i32) {
+        fn visit_mut(&mut self, _: crate::ParameterMetadataView<'_>, value: &'a mut i32) {
             *value = 11;
         }
     }
@@ -117,7 +121,7 @@ fn retained_buffers_are_borrowed_without_changing_parameter_topology() {
 #[test]
 fn incomplete_children_never_suppress_later_known_values() {
     let module = Nested {
-        opaque: Legacy {
+        opaque: Incomplete {
             weight: parameter("legacy", 2),
             hidden: vec![99],
         },
@@ -130,19 +134,19 @@ fn incomplete_children_never_suppress_later_known_values() {
     };
     assert_eq!(retained(&module), (false, vec![2, 3, 5, 7]));
     let modules = vec![
-        Legacy {
+        Incomplete {
             weight: parameter("first", 11),
             hidden: vec![13],
         },
-        Legacy {
+        Incomplete {
             weight: parameter("second", 17),
             hidden: vec![19],
         },
     ];
     assert_eq!(retained(&modules), (false, vec![11, 17]));
     assert_eq!(retained(&Some(module)), (false, vec![2, 3, 5, 7]));
-    assert_eq!(retained(&None::<Legacy>), (true, vec![]));
-    assert_eq!(retained(&Vec::<Legacy>::new()), (true, vec![]));
+    assert_eq!(retained(&None::<Incomplete>), (true, vec![]));
+    assert_eq!(retained(&Vec::<Incomplete>::new()), (true, vec![]));
 }
 
 #[test]

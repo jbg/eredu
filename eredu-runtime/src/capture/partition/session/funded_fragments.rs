@@ -1,6 +1,6 @@
 //! Exact fragment sources lent to the ordinary global receipt cost worker.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// One actual native quote, bound to its retained receipt fragment. This is a
@@ -57,7 +57,7 @@ struct Row {
 enum Cause {
     #[error("partition fragment source: {0}")]
     Source(&'static str),
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Destination(#[from] eredu_nn::Error),
     #[error(transparent)] Capture(#[from] CaptureError),
 }
@@ -67,8 +67,8 @@ enum Cause {
 #[error("original partition fragment allowance: {cause}")]
 pub struct PartitionCaptureFragmentAllowanceError {
     #[source] cause: Cause,
-    _source: Option<SharedCapturePlan>,
-    _metadata: WorkspaceMetadataFunding,
+    _source: SharedCapturePlan,
+    _metadata: HostMetadataFunding,
 }
 
 /// Per-rank/per-fragment sources and a local allowance from the ordinary global
@@ -85,7 +85,7 @@ pub struct PreparedPartitionFragmentAllowance {
     descriptor: [u8; 32],
     rank: usize,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 /// Move-only native credits retaining the exact source and metadata account.
 #[must_use = "spend through the source-bound fragment destination"]
@@ -93,7 +93,7 @@ pub struct PreparedPartitionFragmentAllowance {
 pub struct PreparedPartitionFragmentLoan {
     quota: CaptureQuota,
     source: SharedCapturePlan,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 impl PreparedPartitionFragmentLoan {
     /// Lend only this fragment's already charged native credits.
@@ -107,7 +107,7 @@ impl PreparedPartitionFragmentAllowance {
     /// Empty producers remain in the receipt but require no invented native row.
     pub fn prepare<T: PartitionCaptureTransport>(
         transport: &T, receipt: &mut PartitionCaptureReceiptPlan,
-        sources: &[PartitionCaptureFragmentSource<'_>], metadata: &WorkspaceMetadataFunding,
+        sources: &[PartitionCaptureFragmentSource<'_>], metadata: &HostMetadataFunding,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureFragmentAllowanceError>
     where T::Error: Send + Sync + 'static,
@@ -116,10 +116,10 @@ impl PreparedPartitionFragmentAllowance {
         Self::prepare_sources(transport,receipt,Sources::Typed(sources),metadata,ledger)
     }
     fn prepare_sources<T:PartitionCaptureTransport>(transport:&T,receipt:&mut PartitionCaptureReceiptPlan,
-        sources:Sources<'_,'_>,metadata:&WorkspaceMetadataFunding,ledger:&mut dyn CaptureReservation)
+        sources:Sources<'_,'_>,metadata:&HostMetadataFunding,ledger:&mut dyn CaptureReservation)
         ->Result<Self,PartitionCaptureFragmentAllowanceError>
     where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
-        let source = receipt.shared_plan_source().cloned();
+        let source = receipt.shared_plan_source().clone();
         let error = |cause| PartitionCaptureFragmentAllowanceError {
             cause, _source: source.clone(), _metadata: metadata.clone(),
         };
@@ -140,8 +140,8 @@ impl PreparedPartitionFragmentAllowance {
             size_of::<Result<PartitionCaptureNativeEstimate, CaptureError>>(),
             size_of::<Result<(), CaptureError>>(),
             size_of::<(&T, &mut PartitionCaptureReceiptPlan, &[PartitionCaptureFragmentSource<'_>],
-                &WorkspaceMetadataFunding, &mut dyn CaptureReservation)>(),
-            size_of::<(&T,&mut PartitionCaptureReceiptPlan,Sources<'_,'_>,&WorkspaceMetadataFunding,&mut dyn CaptureReservation)>(),
+                &HostMetadataFunding, &mut dyn CaptureReservation)>(),
+            size_of::<(&T,&mut PartitionCaptureReceiptPlan,Sources<'_,'_>,&HostMetadataFunding,&mut dyn CaptureReservation)>(),
             PartitionCaptureReceiptPlan::record_bound_control_bytes()
                 .ok_or_else(|| error(Cause::Source("record-bound controls overflow")))?,
         ];
@@ -152,7 +152,7 @@ impl PreparedPartitionFragmentAllowance {
             metadata.reserve_metadata(routed::control_bytes().ok_or_else(||error(Cause::Source("sparse source controls overflow")))?)
                 .map_err(|cause|error(cause.into()))?;
         }
-        let retained = source.as_ref().ok_or_else(|| error(Cause::Source("receipt has no original source")))?;
+        let retained = &source;
         if receipt.context().capture_plan_identity != retained.admission().identity()
             || receipt.context().invocation.is_some()
             || transport.participant_count() != receipt.world_size()
@@ -220,7 +220,7 @@ impl PreparedPartitionFragmentAllowance {
     }
     /// Compare physical admission and finalized descriptor before any source use.
     pub fn matches(&self, receipt: &PartitionCaptureReceiptPlan) -> bool {
-        receipt.shared_plan_source().is_some_and(|source| self.source.same_storage(source))
+        self.source.same_storage(receipt.shared_plan_source())
             && receipt.identity() == self.identity
     }
     /// The global charge includes every producer and each rank's delivery work.
@@ -241,7 +241,7 @@ impl PreparedPartitionFragmentAllowance {
         -> Result<PreparedPartitionFragmentLoan, PartitionCaptureFragmentAllowanceError>
     {
         let error = |cause| PartitionCaptureFragmentAllowanceError { cause,
-            _source: Some(self.source.clone()), _metadata: self.metadata.clone() };
+            _source: self.source.clone(), _metadata: self.metadata.clone() };
         let parts = [size_of::<(&mut Self, &PartitionCaptureReceiptPlan, usize, &TensorDtype)>(),
             size_of::<PartitionCaptureNativeEstimate>(), size_of::<CaptureQuota>(),
             size_of::<Result<PreparedPartitionFragmentLoan, PartitionCaptureFragmentAllowanceError>>(),
@@ -314,3 +314,5 @@ impl PartitionCaptureFragmentAllowanceError {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

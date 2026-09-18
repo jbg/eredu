@@ -50,7 +50,7 @@ fn authority(
 ) -> PartitionCaptureReceiptPlan {
     let slice = resolve_slice(&plan.points()[0], &plan.plan().selections[0], &[3, 20]).unwrap();
     PartitionCaptureReceiptPlan::new(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(plan),
         maps.iter()
             .enumerate()
@@ -132,7 +132,7 @@ fn producer_receipts_roundtrip_exact_values_and_retain_execution_context() {
         assert_eq!(result.context(), &context(&plan));
         assert_eq!(result.producers(), [0, 1, 2]);
         assert_eq!(result.capture().contributions().len(), 2);
-        let mut ordinary = CaptureSession::new(plan.clone());
+        let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
         ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
         ordinary
             .observe(&mut Backend::default(), "block.output", &global)
@@ -204,7 +204,7 @@ fn receipt_admission_rejects_ownership_gaps_and_overlap_before_capture() {
     for ranges in [vec![0..8], vec![0..11, 8..20]] {
         let mut ledger = CaptureLedger::new(&plan);
         let result = PartitionCaptureReceiptPlan::new(
-            plan.clone(),
+            eredu_core::capture::SharedCapturePlan::new(plan.clone()),
             context(&plan),
             ranges
                 .into_iter()

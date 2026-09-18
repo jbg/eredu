@@ -14,13 +14,13 @@ fn invalid() -> Error {
     Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
 }
 fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
 struct ModelSource {
     stream: PreparedStreamCopy<model::StreamOwner>,
     budget: OriginalBufferBudget,
     custody: OriginalSpeculativeBudgetCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl ModelSource {
     fn prepare(
@@ -120,7 +120,7 @@ fn borrow_completed(
     struct Failure {
         #[source]
         cause: PreparedArrayCloneCause,
-        _funding: WorkspaceMetadataFunding,
+        _funding: HostMetadataFunding,
     }
     let controls = [
         PreparedArrayClone::control_bytes().ok_or_else(overflow)?,

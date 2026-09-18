@@ -10,9 +10,14 @@ struct OpaqueNativeLeaf {
 }
 
 impl NativeRetainedValues for OpaqueNativeLeaf {
-    fn visit_native_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        visitor(MlxTensor::ref_cast(&self.weight.value));
-        false
+    fn native_parameter_source_count(&self) -> Option<usize> { Some(1) }
+    fn visit_native_parameter_sources<'a>(&'a self, visitor: &mut dyn NativeParameterSourceVisitor<'a>) -> Result<(),ParameterSourceError> {
+        visitor.parameter("weight", &self.weight.value, true);
+        Err(ParameterSourceError::UnclassifiedRetainedField)
+    }
+    fn visit_native_parameter_sources_mut<'a>(&'a mut self, visitor: &mut dyn NativeParameterSourceVisitorMut<'a>) -> Result<(),ParameterSourceError> {
+        visitor.parameter("weight", &mut self.weight.value, true);
+        Err(ParameterSourceError::UnclassifiedRetainedField)
     }
 }
 
@@ -30,7 +35,7 @@ fn retained_wrappers_preserve_incomplete_native_inventory_without_evaluation() {
     )
     .unwrap();
     let wrapped = MlxModule::new(module);
-    let before = eredu_nn::validate_parameter_topology(&wrapped).unwrap();
+    let before = eredu_nn::validate_parameter_topology(&wrapped).unwrap_err();
     let mut values = Vec::new();
     assert!(!wrapped.visit_retained_values(&mut |value| values.push(value.clone())));
     assert_eq!(values.len(), 1);
@@ -41,7 +46,7 @@ fn retained_wrappers_preserve_incomplete_native_inventory_without_evaluation() {
     assert_eq!(wrapped.inner.inner.hidden.allocation_info().unwrap(), None);
     assert_eq!(hidden.allocation_info().unwrap(), None);
     assert_eq!(
-        eredu_nn::validate_parameter_topology(&wrapped).unwrap(),
+        eredu_nn::validate_parameter_topology(&wrapped).unwrap_err(),
         before
     );
 }

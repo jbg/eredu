@@ -510,3 +510,35 @@ fn ordinary_source_error_retains_genuine_participant_after_callers_drop_their_le
     drop(error);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
+
+#[test]
+fn partial_native_attachment_returns_no_complete_receipt_and_preserves_loading_authority() {
+    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let loading = NativeMemoryOwner::acquire(&pool).unwrap();
+    let array = safemlx::Array::from_slice(&[53u32, 59], &[2]);
+    let bytes = array.allocation_info().unwrap().unwrap().bytes() as u64;
+    let retired = table();
+    let dead_token = retired.metadata().clone();
+    let table_bytes = dead_token.capacity_bytes().unwrap();
+    drop(retired);
+    let mut storage = inventory([dead_token.clone()]);
+    storage.include_array(&array).unwrap();
+    // Native attachment precedes the deliberately retired host-slot source.
+    // The failed complete publication can return only its typed error, never a
+    // receipt authorizing omission of future attachments.
+    let error = storage.publish_unquoted(&loading).unwrap_err();
+    assert!(matches!(
+        cause::<HostSlotAttachmentError<WorkingMemoryError>>(&error),
+        Some(HostSlotAttachmentError::Retired)
+    ));
+    reclaim(&pool, bytes);
+    assert_eq!(pool.peak_bytes().unwrap(), bytes + table_bytes);
+    assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
+    assert_eq!(array.evaluated().unwrap().as_slice::<u32>(), &[53, 59]);
+    drop((array, error, dead_token));
+    safemlx::reclaim_allocation_owners();
+    reclaim(&pool, 0);
+    assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
+    drop(loading);
+    assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
+}

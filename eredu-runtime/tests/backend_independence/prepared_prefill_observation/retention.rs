@@ -50,7 +50,7 @@ impl ScheduledCaptureBackend for CaptureBackend {
             std::panic::panic_any(self.identity.clone());
         }
         if self.failure == Failure::Bootstrap {
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Original(self.identity.clone()),
             )));
         }
@@ -91,7 +91,7 @@ impl ScheduledCaptureBackend for CaptureBackend {
             self.failure,
             Failure::Retirement | Failure::RetirementAndSettlement
         ) {
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Original(self.identity.clone()),
             )));
         }
@@ -145,7 +145,7 @@ impl
             std::panic::panic_any(self.identity.clone());
         }
         if self.failure == Failure::Input {
-            return Err(Error::backend_source(Original(self.identity.clone())));
+            return Err(Error::backend_retained_source(Original(self.identity.clone())));
         }
         Ok(FakeTensor(vec![3, 7]))
     }
@@ -302,7 +302,7 @@ fn exercise(failure: Failure, initial_cancel: bool) {
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         funded
-            .with_observer(&mut backend, 0, &|e| Error::backend_source(e), |observer| {
+            .with_observer(&mut backend, 0, &|e| Error::backend_retained_source(e), |observer| {
                 let mut driver = eredu_runtime::prefill::PrefillDriver::new(
                     session.inference_execution_identity(),
                     request.clone(),

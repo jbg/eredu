@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::{
     mem::size_of,
@@ -14,7 +14,7 @@ use std::{
 pub struct PreparedCachePoolReservation {
     storage: Option<PreparedCacheTable<u64, CachePoolUsage>>,
     pool: CacheResidencyPool,
-    funding: Option<WorkspaceMetadataFunding>,
+    funding: Option<HostMetadataFunding>,
 }
 /// A failed preparation retains the account that paid for its construction.
 #[derive(Debug, thiserror::Error)]
@@ -22,7 +22,7 @@ pub struct PreparedCachePoolReservation {
 pub struct CachePoolReservationPreparationFailure {
     #[source]
     cause: PreparationCause,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 #[derive(Debug, thiserror::Error)]
 enum PreparationCause {

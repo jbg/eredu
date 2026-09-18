@@ -44,37 +44,33 @@ fn run_with_state(mode: &str, state: eredu_runtime::CacheResidencyPolicy) -> ser
     let options = settings(0.0);
     let (ids, text) = if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user","content":"hello"})],
-                tools: vec![],
-                tool_choice: ToolChoice::None,
-                add_generation_prompt: true,
-                ..Default::default()
-            })
-            .unwrap_or_else(report_failure);
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+                    tools: vec![],
+                    tool_choice: ToolChoice::None,
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+                8 << 30,
+            )
+            .unwrap_or_else(|error| panic!("source chat preparation: {error:#}"));
         let mut ordinary = options;
         ordinary.inference = TextInferencePolicy {
             prefill_chunk_positions: NonZeroU64::new(2),
             ..Default::default()
         };
-        let prepared = with_parts(|parts| {
-            model.prepare_controlled_input(
-                &chat,
-                ordinary_prompt(parts),
-                ordinary,
-                PreparedInputInstrumentation::Capture {
-                    plan: capture_plan(),
-                },
-                TraceLimits {
-                    per_record_bytes: 1 << 20,
-                    total_bytes: 8 << 20,
-                },
-            )
-        })
-        .unwrap_or_else(report_failure);
-        assert_eq!(prepared.prompt_attribution().decoder_positions, 5);
-        let mut observe = |record: PreparedControlledGenerationRecord| {
-            if let PreparedControlledGenerationEvent::Progress { event } = &record.event {
+        let cancellation = GenerationCancellationToken::new();
+        let input = with_parts(|parts| model.prepare_chat_input(&chat, parts, &cancellation))
+            .unwrap_or_else(report_failure)
+            .expect("live media preparation");
+        let capture = capture_plan();
+        let mut prepared = PreparedChatRequest::new(&chat, chat_settings(&chat, ordinary));
+        prepared.input = PreparedChatPrompt::Media(input);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&capture);
+        let mut observe = |record: ControlledGenerationRecord| {
+            if let ControlledGenerationEvent::Progress { event } = &record.event {
                 if let Some(frame) = event.shared_captures() {
                     frames.push(frame.clone());
                 }
@@ -82,8 +78,18 @@ fn run_with_state(mode: &str, state: eredu_runtime::CacheResidencyPolicy) -> ser
             ControlFlow::Continue(())
         };
         let mut session = model
-            .start_controlled_prepared_text(prepared, &[], Default::default(), &mut observe)
-            .unwrap_or_else(report_failure);
+            .start_controlled_chat(
+                prepared,
+                TraceLimits {
+                    per_record_bytes: 1 << 20,
+                    total_bytes: 8 << 20,
+                },
+                Default::default(),
+                &mut observe,
+            )
+            .unwrap_or_else(report_failure)
+            .expect("live control");
+        assert_eq!(session.prompt_attribution().decoder_positions, 5);
         session.run(&mut observe).unwrap_or_else(report_failure);
         let ids = session.token_ids().to_vec();
         drop(session);
@@ -117,16 +123,15 @@ fn run_with_state(mode: &str, state: eredu_runtime::CacheResidencyPolicy) -> ser
         let request = ManagedPreparedInputRequest::from_original(input, options);
         let cancellation = GenerationCancellationToken::new();
         let mut delivered = Vec::new();
-        let mut observe =
-            |token: Option<u32>, frame: Option<CapturedStepDelivery>, seconds: f64| {
-                assert!(seconds >= 0.0);
-                delivered.push(token.expect("committed media token"));
-                let Some(CapturedStepDelivery::Shared(frame)) = frame else {
-                    panic!("retained managed media capture");
-                };
-                assert_eq!(frame.prediction_index() as usize, frames.len());
-                frames.push(frame);
+        let mut observe = |token: Option<u32>, frame: Option<SharedCapturedStep>, seconds: f64| {
+            assert!(seconds >= 0.0);
+            delivered.push(token.expect("committed media token"));
+            let Some(frame) = frame else {
+                panic!("retained managed media capture");
             };
+            assert_eq!(frame.prediction_index() as usize, frames.len());
+            frames.push(frame);
+        };
         let mut visible = String::new();
         let mut emit = |event: GenerationPlainTextEvent<'_>| {
             if let GenerationPlainTextEvent::TextDelta(delta) = event {
@@ -181,12 +186,30 @@ fn run_with_state(mode: &str, state: eredu_runtime::CacheResidencyPolicy) -> ser
     assert_eq!(frames.len(), 4);
     if paged {
         model.synchronize().unwrap();
-        let cache = model.cache_residency_telemetry().unwrap().expect("actual paged decoder");
-        assert_eq!(cache.logical_cached_tokens, 8, "five media positions plus three cached decodes");
-        assert!(cache.key_value_blocks > 0 && cache.device_blocks > 0, "sealed three-token pages: {cache:?}");
-        assert!(cache.block_seals >= 2, "pages seal within/across prompt chunks: {cache:?}");
-        assert!(cache.mutable_tail_bytes > 0, "eight positions retain a two-token tail: {cache:?}");
-        assert!(cache.current_device_bytes > 0 && cache.current_device_bytes <= 8 << 20, "finite canonical state: {cache:?}");
+        let cache = model
+            .cache_residency_telemetry()
+            .unwrap()
+            .expect("actual paged decoder");
+        assert_eq!(
+            cache.logical_cached_tokens, 8,
+            "five media positions plus three cached decodes"
+        );
+        assert!(
+            cache.key_value_blocks > 0 && cache.device_blocks > 0,
+            "sealed three-token pages: {cache:?}"
+        );
+        assert!(
+            cache.block_seals >= 2,
+            "pages seal within/across prompt chunks: {cache:?}"
+        );
+        assert!(
+            cache.mutable_tail_bytes > 0,
+            "eight positions retain a two-token tail: {cache:?}"
+        );
+        assert!(
+            cache.current_device_bytes > 0 && cache.current_device_bytes <= 8 << 20,
+            "finite canonical state: {cache:?}"
+        );
     }
     drop((model, root));
     for (index, frame) in frames.iter().enumerate() {
@@ -272,43 +295,45 @@ fn compare_modes(case: &str, mode_variable: &str, run: fn(&str) -> serde_json::V
     }
 }
 
-
 fn check_saved_media_capture(after_commit: bool) {
     check_saved_media_capture_with_state(after_commit, eredu_runtime::CacheResidencyPolicy::Device);
 }
 
-fn check_saved_media_capture_with_state(after_commit: bool, state: eredu_runtime::CacheResidencyPolicy) {
-    let root=fixture();
-    let execution=ExecutionPlan::fully_resident(
-        local_device_plan(LocalDevice::Accelerator(0)).unwrap())
-        .with_required_session_capabilities(SessionCapabilities::new(true,true,true));
-    let model=load_with_state(&root,&execution,state);
-    let input=with_parts(|parts|model.prepare_managed_model_input(parts,8<<30))
+fn check_saved_media_capture_with_state(
+    after_commit: bool,
+    state: eredu_runtime::CacheResidencyPolicy,
+) {
+    let root = fixture();
+    let execution =
+        ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)).unwrap())
+            .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
+    let model = load_with_state(&root, &execution, state);
+    let input = with_parts(|parts| model.prepare_managed_model_input(parts, 8 << 30))
         .unwrap_or_else(report_failure);
-    super::super::capture::check_saved_prepared_capture_loaded(
-        model,root,input,after_commit);
+    super::super::capture::check_saved_prepared_capture_loaded(model, root, input, after_commit);
 }
 
 #[test]
-#[ignore="requires an accessible Metal device and original media input sources"]
+#[ignore = "requires an accessible Metal device and original media input sources"]
 fn native_gemma_original_media_capture_pending_restore_and_fork_keep_sources_and_spending() {
     check_saved_media_capture(false);
 }
 
 #[test]
-#[ignore="requires an accessible Metal device and original media input sources"]
+#[ignore = "requires an accessible Metal device and original media input sources"]
 fn native_gemma_original_media_capture_committed_restore_and_fork_keep_sources_and_spending() {
     check_saved_media_capture(true);
 }
 
 #[test]
-#[ignore="requires an accessible Metal device and original media input sources"]
+#[ignore = "requires an accessible Metal device and original media input sources"]
 fn native_gemma_original_media_paged_capture_pending_restore_and_fork_keep_sources_and_spending() {
     check_saved_media_capture_with_state(false, paged_state());
 }
 
 #[test]
-#[ignore="requires an accessible Metal device and original media input sources"]
-fn native_gemma_original_media_paged_capture_committed_restore_and_fork_keep_sources_and_spending() {
+#[ignore = "requires an accessible Metal device and original media input sources"]
+fn native_gemma_original_media_paged_capture_committed_restore_and_fork_keep_sources_and_spending()
+{
     check_saved_media_capture_with_state(true, paged_state());
 }

@@ -27,11 +27,11 @@ fn plan() -> CapturePlan {
         limits: limits(),
     }
 }
-fn frames(records: &[PreparedControlledGenerationRecord]) -> Vec<&CapturedStep> {
+fn frames(records: &[ControlledGenerationRecord]) -> Vec<&CapturedStep> {
     records
         .iter()
         .filter_map(|r| match &r.event {
-            PreparedControlledGenerationEvent::Progress { event } => {
+            ControlledGenerationEvent::Progress { event } => {
                 let frame = event.captures();
                 if frame.is_some() {
                     assert!(
@@ -197,7 +197,7 @@ fn captured_branches(global: bool) {
                 .unwrap()
                 .into_parts();
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user","content":"hello"})],
                 tools: vec![],
                 tool_choice: ToolChoice::None,
@@ -218,31 +218,36 @@ fn captured_branches(global: bool) {
             per_record_bytes: 1 << 20,
             total_bytes: 128 << 20,
         };
-        let prepared = model
-            .prepare_controlled_input(
-                &chat,
-                prepared_media_copy::prompt(),
-                settings,
-                PreparedInputInstrumentation::Capture {
-                    plan: if global { global_plan() } else { plan() },
-                },
-                trace,
-            )
-            .unwrap();
-        let attribution = prepared.prompt_attribution().clone();
-        assert_eq!(attribution.decoder_positions, 13);
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let input = prepared_media_copy::with_parts(|parts| {
+            model.prepare_chat_input(&chat, parts, &cancellation)
+        })
+        .unwrap()
+        .expect("live media preparation");
+        let capture = if global { global_plan() } else { plan() };
+        let mut settings = original_settings(settings);
+        settings.inference.prefill_chunk_positions = std::num::NonZeroU64::new(2);
+        let mut prepared = PreparedChatRequest::new(&chat, settings);
+        prepared.input = PreparedChatPrompt::Media(input);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&capture);
         let mut session = model
-            .start_controlled_prepared_text(prepared, &[], Default::default(), |_| {
+            .start_controlled_chat(prepared, trace, Default::default(), |_| {
                 ControlFlow::Continue(())
             })
-            .unwrap();
+            .unwrap()
+            .expect("live control");
+        let attribution = session.prompt_attribution().clone();
+        assert_eq!(attribution.decoder_positions, 13);
         let snapshot_limits = SnapshotLimits {
             max_snapshots: 1,
             max_branches: 1,
             retained_bytes: 256 << 20,
             cumulative_copy_bytes: 2 << 30,
         };
-        session.enable_snapshots(snapshot_limits).unwrap();
+        session
+            .enable_snapshots(snapshot_limits, ORIGINAL_CAPACITY, copy_limits())
+            .unwrap();
         let initial = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
         let mut records = Vec::new();
         session
@@ -348,15 +353,14 @@ fn captured_branches(global: bool) {
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         let mut retained_limit = false;
         while let Some(error) = cause {
-            if let Some(ControlledGenerationError::Snapshot(
-                eredu_runtime::execution_control::TextSnapshotError::Control(
-                    ExecutionControlError::Limit("retained bytes"),
-                ),
-            )) = error.downcast_ref::<ControlledGenerationError>()
-            {
-                retained_limit = true;
-                break;
-            }
+            if error.downcast_ref::<ControlledGenerationError>().is_some_and(|error| {
+            matches!(error, ControlledGenerationError::Snapshot(snapshot)
+                if matches!(snapshot.cause(), eredu_runtime::execution_control::TextSnapshotError::Control(
+                    ExecutionControlError::Limit("retained bytes"))))
+        }) {
+            retained_limit = true;
+            break;
+        }
             cause = error.source();
         }
         assert!(retained_limit, "typed retained-byte refusal");

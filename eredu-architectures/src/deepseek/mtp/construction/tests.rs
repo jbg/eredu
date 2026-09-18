@@ -53,15 +53,15 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(bytes)
             })
             .map(|_| ())
-            .map_err(|left| WorkspaceMetadataFundingError::Capacity {
+            .map_err(|left| HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: left as u64,
             })
@@ -74,14 +74,14 @@ impl Drop for Account {
 }
 struct Retained<T> {
     value: T,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn rows(value: &impl Parameterized<WorkspaceTensor>) -> Vec<(String, Vec<i32>, WorkspaceDtype)> {
     struct Rows(Vec<(String, Vec<i32>, WorkspaceDtype)>);
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Rows {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a WorkspaceTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
             self.0.push((
-                metadata.id.as_str().to_owned(),
+                metadata.id().as_str().to_owned(),
                 value.shape().to_vec(),
                 value.layout().dtype(),
             ));
@@ -125,7 +125,7 @@ fn retained_prediction_specs_preserve_companions_and_refuse_before_an_unfunded_c
         remaining: AtomicUsize::new(usize::MAX),
         retired: AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     let context = WorkspaceContext::new_with_metadata_funding(Facts, funding).unwrap();
     let value = spec.instantiate::<WorkspaceBackend>(&context).unwrap();
     let retained = Retained {
@@ -142,7 +142,7 @@ fn retained_prediction_specs_preserve_companions_and_refuse_before_an_unfunded_c
         .unwrap();
     assert!(matches!(
         error.into_metadata_funding_error(),
-        Ok(WorkspaceMetadataFundingError::Capacity { .. })
+        Ok(HostMetadataFundingError::Capacity { .. })
     ));
     assert_eq!(context.metadata_census().unwrap().context_bytes(), consumed);
     assert_eq!(rows(&retained.value), expected);
@@ -175,7 +175,7 @@ fn retained_v3_target_source_preserves_dense_routed_companions_and_paid_outputs(
     model.install_construction_units(Some(source)).unwrap();
     let state = Arc::new(State { remaining: AtomicUsize::new(usize::MAX), retired: AtomicBool::new(false) });
     let context = WorkspaceContext::new_with_metadata_funding(Facts,
-        WorkspaceMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
+        HostMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
     let units = (0..2).map(|index| model.construct_unit(0,index,&context).unwrap()).collect::<Vec<_>>();
     assert_eq!(units.iter().map(rows).collect::<Vec<_>>(), expected);
     let consumed = context.metadata_census().unwrap().context_bytes();

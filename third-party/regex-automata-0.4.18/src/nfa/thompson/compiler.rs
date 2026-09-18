@@ -1,6 +1,7 @@
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 use core::{borrow::Borrow, cell::RefCell};
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 
 use regex_syntax::{
     hir::{self, Hir},
@@ -736,6 +737,14 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    /// Reuse inline parser/configuration facts with fresh allocation-free scratch.
+    pub(crate) fn fresh(&self) -> Self {
+        let mut compiler = Self::new();
+        compiler.parser = self.parser.clone();
+        compiler.config = self.config.clone();
+        compiler
+    }
+
     /// Create a new NFA builder with its default configuration.
     pub fn new() -> Compiler {
         Compiler {
@@ -804,21 +813,30 @@ impl Compiler {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn build_many<P: AsRef<str>>(
+    pub fn build_many<P: AsRef<str>>(&self, patterns: &[P]) -> Result<NFA, BuildError> {
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Parse and compile with the same prospective policy at every source producer.
+    /// The enclosing owner retains its authority through compiler scratch, NFA
+    /// aliases and errors. Clearing a reusable compiler does not refund that work.
+    pub fn build_many_with_allocations<P: AsRef<str>>(
         &self,
         patterns: &[P],
+        funding: &dyn Allocation,
     ) -> Result<NFA, BuildError> {
-        let mut hirs = vec![];
+        let allocation = Allocator::new(funding);
+        let mut hirs = Vec::new();
         for p in patterns {
-            hirs.push(
-                self.parser
-                    .build()
-                    .parse(p.as_ref())
-                    .map_err(BuildError::syntax)?,
-            );
+            let hir = self
+                .parser
+                .build()
+                .parse_with_allocations(p.as_ref(), &allocation)
+                .map_err(BuildError::syntax)?;
+            allocation.push(&mut hirs, hir)?;
             debug!("parsed: {:?}", p.as_ref());
         }
-        self.build_many_from_hir(&hirs)
+        self.build_many_from_hir_with_allocations(&hirs, funding)
     }
 
     /// Compile the given high level intermediate representation of a regular
@@ -896,11 +914,31 @@ impl Compiler {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn build_many_from_hir<H: Borrow<Hir>>(
+    pub fn build_many_from_hir<H: Borrow<Hir>>(&self, exprs: &[H]) -> Result<NFA, BuildError> {
+        self.build_many_from_hir_with_allocations(exprs, &Unenforced)
+    }
+
+    /// Compile one already constructed HIR with prospective NFA funding.
+    pub fn build_from_hir_with_allocations(
+        &self,
+        expr: &Hir,
+        funding: &dyn Allocation,
+    ) -> Result<NFA, BuildError> {
+        self.build_many_from_hir_with_allocations(core::slice::from_ref(expr), funding)
+    }
+
+    /// Compile the original HIR sequence, retaining the selected compression,
+    /// direction, literal priority and capture behavior.
+    pub fn build_many_from_hir_with_allocations<H: Borrow<Hir>>(
         &self,
         exprs: &[H],
+        funding: &dyn Allocation,
     ) -> Result<NFA, BuildError> {
-        self.compile(exprs)
+        Compilation {
+            compiler: self,
+            allocation: Allocator::new(funding),
+        }
+        .compile(exprs)
     }
 
     /// Apply the given NFA configuration options to this builder.
@@ -943,16 +981,24 @@ impl Compiler {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Compiler {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Compiler {
         config.apply(&mut self.parser);
         self
     }
 }
 
-impl Compiler {
+struct Compilation<'a> {
+    compiler: &'a Compiler,
+    allocation: Allocator<'a>,
+}
+impl core::ops::Deref for Compilation<'_> {
+    type Target = Compiler;
+    fn deref(&self) -> &Compiler {
+        self.compiler
+    }
+}
+
+impl Compilation<'_> {
     /// Compile the sequence of HIR expressions given. Pattern IDs are
     /// allocated starting from 0, in correspondence with the slice given.
     ///
@@ -962,15 +1008,15 @@ impl Compiler {
         if exprs.len() > PatternID::LIMIT {
             return Err(BuildError::too_many_patterns(exprs.len()));
         }
-        if self.config.get_reverse()
-            && self.config.get_which_captures().is_any()
-        {
+        if self.config.get_reverse() && self.config.get_which_captures().is_any() {
             return Err(BuildError::unsupported_captures());
         }
 
         self.builder.borrow_mut().clear();
         self.builder.borrow_mut().set_utf8(self.config.get_utf8());
-        self.builder.borrow_mut().set_reverse(self.config.get_reverse());
+        self.builder
+            .borrow_mut()
+            .set_reverse(self.config.get_reverse());
         self.builder
             .borrow_mut()
             .set_look_matcher(self.config.get_look_matcher());
@@ -994,7 +1040,15 @@ impl Compiler {
         let unanchored_prefix = if anchored {
             self.c_empty()?
         } else {
-            self.c_at_least(&Hir::dot(hir::Dot::AnyByte), false, 0)?
+            self.c_at_least(
+                &Hir::dot_with_allocations(
+                    hir::Dot::AnyByte,
+                    regex_syntax::allocation::Allocator::new(&self.allocation),
+                )
+                .map_err(AllocationError::from)?,
+                false,
+                0,
+            )?
         };
 
         let compiled = self.c_alt_iter(exprs.iter().map(|e| {
@@ -1003,33 +1057,20 @@ impl Compiler {
             let match_state_id = self.add_match()?;
             self.patch(one.end, match_state_id)?;
             let _ = self.finish_pattern(one.start)?;
-            Ok(ThompsonRef { start: one.start, end: match_state_id })
+            Ok(ThompsonRef {
+                start: one.start,
+                end: match_state_id,
+            })
         }))?;
         self.patch(unanchored_prefix.end, compiled.start)?;
-        let nfa = self
-            .builder
-            .borrow_mut()
-            .build(compiled.start, unanchored_prefix.start)?;
+        let nfa = self.builder.borrow_mut().build_with_allocations(
+            compiled.start,
+            unanchored_prefix.start,
+            self.allocation.policy(),
+        )?;
 
         debug!("HIR-to-NFA compilation complete, config: {:?}", self.config);
         Ok(nfa)
-    }
-
-    /// Compile an arbitrary HIR expression.
-    fn c(&self, expr: &Hir) -> Result<ThompsonRef, BuildError> {
-        use regex_syntax::hir::{Class, HirKind::*};
-
-        match *expr.kind() {
-            Empty => self.c_empty(),
-            Literal(hir::Literal(ref bytes)) => self.c_literal(bytes),
-            Class(Class::Bytes(ref c)) => self.c_byte_class(c),
-            Class(Class::Unicode(ref c)) => self.c_unicode_class(c),
-            Look(ref look) => self.c_look(look),
-            Repetition(ref rep) => self.c_repetition(rep),
-            Capture(ref c) => self.c_cap(c.index, c.name.as_deref(), &c.sub),
-            Concat(ref es) => self.c_concat(es.iter().map(|e| self.c(e))),
-            Alternation(ref es) => self.c_alt_slice(es),
-        }
     }
 
     /// Compile a concatenation of the sub-expressions yielded by the given
@@ -1042,14 +1083,21 @@ impl Compiler {
     where
         I: DoubleEndedIterator<Item = Result<ThompsonRef, BuildError>>,
     {
-        let first = if self.is_reverse() { it.next_back() } else { it.next() };
+        let first = if self.is_reverse() {
+            it.next_back()
+        } else {
+            it.next()
+        };
         let ThompsonRef { start, mut end } = match first {
             Some(result) => result?,
             None => return self.c_empty(),
         };
         loop {
-            let next =
-                if self.is_reverse() { it.next_back() } else { it.next() };
+            let next = if self.is_reverse() {
+                it.next_back()
+            } else {
+                it.next()
+            };
             let compiled = match next {
                 Some(result) => result?,
                 None => break,
@@ -1060,29 +1108,12 @@ impl Compiler {
         Ok(ThompsonRef { start, end })
     }
 
-    /// Compile an alternation of the given HIR values.
-    ///
-    /// This is like 'c_alt_iter', but it accepts a slice of HIR values instead
-    /// of an iterator of compiled NFA sub-graphs. The point of accepting a
-    /// slice here is that it opens up some optimization opportunities. For
-    /// example, if all of the HIR values are literals, then this routine might
-    /// re-shuffle them to make NFA epsilon closures substantially faster.
-    fn c_alt_slice(&self, exprs: &[Hir]) -> Result<ThompsonRef, BuildError> {
-        // self.c_alt_iter(exprs.iter().map(|e| self.c(e)))
-        let literal_count = exprs
-            .iter()
-            .filter(|e| {
-                matches!(*e.kind(), hir::HirKind::Literal(hir::Literal(_)))
-            })
-            .count();
-        if literal_count <= 1 || literal_count < exprs.len() {
-            return self.c_alt_iter(exprs.iter().map(|e| self.c(e)));
-        }
-
+    /// Preserve the original literal-priority trie optimization.
+    fn c_literal_alternation(&self, exprs: &[Hir]) -> Result<ThompsonRef, BuildError> {
         let mut trie = if self.is_reverse() {
-            LiteralTrie::reverse()
+            LiteralTrie::with_allocations(true, self.allocation)?
         } else {
-            LiteralTrie::forward()
+            LiteralTrie::with_allocations(false, self.allocation)?
         };
         for expr in exprs.iter() {
             let literal = match *expr.kind() {
@@ -1130,229 +1161,6 @@ impl Compiler {
         Ok(ThompsonRef { start: union, end })
     }
 
-    /// Compile the given capture sub-expression. `expr` should be the
-    /// sub-expression contained inside the capture. If "capture" states are
-    /// enabled, then they are added as appropriate.
-    ///
-    /// This accepts the pieces of a capture instead of a `hir::Capture` so
-    /// that it's easy to manufacture a "fake" group when necessary, e.g., for
-    /// adding the entire pattern as if it were a group in order to create
-    /// appropriate "capture" states in the NFA.
-    fn c_cap(
-        &self,
-        index: u32,
-        name: Option<&str>,
-        expr: &Hir,
-    ) -> Result<ThompsonRef, BuildError> {
-        match self.config.get_which_captures() {
-            // No capture states means we always skip them.
-            WhichCaptures::None => return self.c(expr),
-            // Implicit captures states means we only add when index==0 since
-            // index==0 implies the group is implicit.
-            WhichCaptures::Implicit if index > 0 => return self.c(expr),
-            _ => {}
-        }
-
-        let start = self.add_capture_start(index, name)?;
-        let inner = self.c(expr)?;
-        let end = self.add_capture_end(index)?;
-        self.patch(start, inner.start)?;
-        self.patch(inner.end, end)?;
-        Ok(ThompsonRef { start, end })
-    }
-
-    /// Compile the given repetition expression. This handles all types of
-    /// repetitions and greediness.
-    fn c_repetition(
-        &self,
-        rep: &hir::Repetition,
-    ) -> Result<ThompsonRef, BuildError> {
-        match (rep.min, rep.max) {
-            (0, Some(1)) => self.c_zero_or_one(&rep.sub, rep.greedy),
-            (min, None) => self.c_at_least(&rep.sub, rep.greedy, min),
-            (min, Some(max)) if min == max => self.c_exactly(&rep.sub, min),
-            (min, Some(max)) => self.c_bounded(&rep.sub, rep.greedy, min, max),
-        }
-    }
-
-    /// Compile the given expression such that it matches at least `min` times,
-    /// but no more than `max` times.
-    ///
-    /// When `greedy` is true, then the preference is for the expression to
-    /// match as much as possible. Otherwise, it will match as little as
-    /// possible.
-    fn c_bounded(
-        &self,
-        expr: &Hir,
-        greedy: bool,
-        min: u32,
-        max: u32,
-    ) -> Result<ThompsonRef, BuildError> {
-        let prefix = self.c_exactly(expr, min)?;
-        if min == max {
-            return Ok(prefix);
-        }
-
-        // It is tempting here to compile the rest here as a concatenation
-        // of zero-or-one matches. i.e., for `a{2,5}`, compile it as if it
-        // were `aaa?a?a?`. The problem here is that it leads to this program:
-        //
-        //     >000000: 61 => 01
-        //      000001: 61 => 02
-        //      000002: union(03, 04)
-        //      000003: 61 => 04
-        //      000004: union(05, 06)
-        //      000005: 61 => 06
-        //      000006: union(07, 08)
-        //      000007: 61 => 08
-        //      000008: MATCH
-        //
-        // And effectively, once you hit state 2, the epsilon closure will
-        // include states 3, 5, 6, 7 and 8, which is quite a bit. It is better
-        // to instead compile it like so:
-        //
-        //     >000000: 61 => 01
-        //      000001: 61 => 02
-        //      000002: union(03, 08)
-        //      000003: 61 => 04
-        //      000004: union(05, 08)
-        //      000005: 61 => 06
-        //      000006: union(07, 08)
-        //      000007: 61 => 08
-        //      000008: MATCH
-        //
-        // So that the epsilon closure of state 2 is now just 3 and 8.
-        let empty = self.add_empty()?;
-        let mut prev_end = prefix.end;
-        for _ in min..max {
-            let union = if greedy {
-                self.add_union()
-            } else {
-                self.add_union_reverse()
-            }?;
-            let compiled = self.c(expr)?;
-            self.patch(prev_end, union)?;
-            self.patch(union, compiled.start)?;
-            self.patch(union, empty)?;
-            prev_end = compiled.end;
-        }
-        self.patch(prev_end, empty)?;
-        Ok(ThompsonRef { start: prefix.start, end: empty })
-    }
-
-    /// Compile the given expression such that it may be matched `n` or more
-    /// times, where `n` can be any integer. (Although a particularly large
-    /// integer is likely to run afoul of any configured size limits.)
-    ///
-    /// When `greedy` is true, then the preference is for the expression to
-    /// match as much as possible. Otherwise, it will match as little as
-    /// possible.
-    fn c_at_least(
-        &self,
-        expr: &Hir,
-        greedy: bool,
-        n: u32,
-    ) -> Result<ThompsonRef, BuildError> {
-        if n == 0 {
-            // When the expression cannot match the empty string, then we
-            // can get away with something much simpler: just one 'alt'
-            // instruction that optionally repeats itself. But if the expr
-            // can match the empty string... see below.
-            if expr.properties().minimum_len().map_or(false, |len| len > 0) {
-                let union = if greedy {
-                    self.add_union()
-                } else {
-                    self.add_union_reverse()
-                }?;
-                let compiled = self.c(expr)?;
-                self.patch(union, compiled.start)?;
-                self.patch(compiled.end, union)?;
-                return Ok(ThompsonRef { start: union, end: union });
-            }
-
-            // What's going on here? Shouldn't x* be simpler than this? It
-            // turns out that when implementing leftmost-first (Perl-like)
-            // match semantics, x* results in an incorrect preference order
-            // when computing the transitive closure of states if and only if
-            // 'x' can match the empty string. So instead, we compile x* as
-            // (x+)?, which preserves the correct preference order.
-            //
-            // See: https://github.com/rust-lang/regex/issues/779
-            let compiled = self.c(expr)?;
-            let plus = if greedy {
-                self.add_union()
-            } else {
-                self.add_union_reverse()
-            }?;
-            self.patch(compiled.end, plus)?;
-            self.patch(plus, compiled.start)?;
-
-            let question = if greedy {
-                self.add_union()
-            } else {
-                self.add_union_reverse()
-            }?;
-            let empty = self.add_empty()?;
-            self.patch(question, compiled.start)?;
-            self.patch(question, empty)?;
-            self.patch(plus, empty)?;
-            Ok(ThompsonRef { start: question, end: empty })
-        } else if n == 1 {
-            let compiled = self.c(expr)?;
-            let union = if greedy {
-                self.add_union()
-            } else {
-                self.add_union_reverse()
-            }?;
-            self.patch(compiled.end, union)?;
-            self.patch(union, compiled.start)?;
-            Ok(ThompsonRef { start: compiled.start, end: union })
-        } else {
-            let prefix = self.c_exactly(expr, n - 1)?;
-            let last = self.c(expr)?;
-            let union = if greedy {
-                self.add_union()
-            } else {
-                self.add_union_reverse()
-            }?;
-            self.patch(prefix.end, last.start)?;
-            self.patch(last.end, union)?;
-            self.patch(union, last.start)?;
-            Ok(ThompsonRef { start: prefix.start, end: union })
-        }
-    }
-
-    /// Compile the given expression such that it may be matched zero or one
-    /// times.
-    ///
-    /// When `greedy` is true, then the preference is for the expression to
-    /// match as much as possible. Otherwise, it will match as little as
-    /// possible.
-    fn c_zero_or_one(
-        &self,
-        expr: &Hir,
-        greedy: bool,
-    ) -> Result<ThompsonRef, BuildError> {
-        let union =
-            if greedy { self.add_union() } else { self.add_union_reverse() }?;
-        let compiled = self.c(expr)?;
-        let empty = self.add_empty()?;
-        self.patch(union, compiled.start)?;
-        self.patch(union, empty)?;
-        self.patch(compiled.end, empty)?;
-        Ok(ThompsonRef { start: union, end: empty })
-    }
-
-    /// Compile the given HIR expression exactly `n` times.
-    fn c_exactly(
-        &self,
-        expr: &Hir,
-        n: u32,
-    ) -> Result<ThompsonRef, BuildError> {
-        let it = (0..n).map(|_| self.c(expr));
-        self.c_concat(it)
-    }
-
     /// Compile the given byte oriented character class.
     ///
     /// This uses "sparse" states to represent an alternation between ranges in
@@ -1363,12 +1171,10 @@ impl Compiler {
     /// fair bit of overhead when traversing an NFA.
     ///
     /// This routine compiles an empty character class into a "fail" state.
-    fn c_byte_class(
-        &self,
-        cls: &hir::ClassBytes,
-    ) -> Result<ThompsonRef, BuildError> {
+    fn c_byte_class(&self, cls: &hir::ClassBytes) -> Result<ThompsonRef, BuildError> {
         let end = self.add_empty()?;
-        let mut trans = Vec::with_capacity(cls.ranges().len());
+        let mut trans = Vec::new();
+        self.allocation.grow(&mut trans, cls.ranges().len())?;
         for r in cls.iter() {
             trans.push(Transition {
                 start: r.start(),
@@ -1376,7 +1182,10 @@ impl Compiler {
                 next: end,
             });
         }
-        Ok(ThompsonRef { start: self.add_sparse(trans)?, end })
+        Ok(ThompsonRef {
+            start: self.add_sparse(trans)?,
+            end,
+        })
     }
 
     /// Compile the given Unicode character class.
@@ -1392,16 +1201,14 @@ impl Compiler {
     /// pattern.
     ///
     /// This routine compiles an empty character class into a "fail" state.
-    fn c_unicode_class(
-        &self,
-        cls: &hir::ClassUnicode,
-    ) -> Result<ThompsonRef, BuildError> {
+    fn c_unicode_class(&self, cls: &hir::ClassUnicode) -> Result<ThompsonRef, BuildError> {
         // If all we have are ASCII ranges wrapped in a Unicode package, then
         // there is zero reason to bring out the big guns. We can fit all ASCII
         // ranges within a single sparse state.
         if cls.is_ascii() {
             let end = self.add_empty()?;
-            let mut trans = Vec::with_capacity(cls.ranges().len());
+            let mut trans = Vec::new();
+            self.allocation.grow(&mut trans, cls.ranges().len())?;
             for r in cls.iter() {
                 // The unwraps below are OK because we've verified that this
                 // class only contains ASCII codepoints.
@@ -1412,7 +1219,10 @@ impl Compiler {
                     next: end,
                 });
             }
-            Ok(ThompsonRef { start: self.add_sparse(trans)?, end })
+            Ok(ThompsonRef {
+                start: self.add_sparse(trans)?,
+                end,
+            })
         } else if self.is_reverse() {
             if !self.config.get_shrink() {
                 // When we don't want to spend the extra time shrinking, we
@@ -1433,21 +1243,21 @@ impl Compiler {
                 // we might want to turn this off if we know we won't be
                 // compiling a DFA.
                 let mut trie = self.trie_state.borrow_mut();
-                trie.clear();
+                trie.clear(self.allocation)?;
 
                 for rng in cls.iter() {
                     for mut seq in Utf8Sequences::new(rng.start(), rng.end()) {
                         seq.reverse();
-                        trie.insert(seq.as_slice());
+                        trie.insert(seq.as_slice(), self.allocation)?;
                     }
                 }
                 let mut builder = self.builder.borrow_mut();
                 let mut utf8_state = self.utf8_state.borrow_mut();
                 let mut utf8c =
-                    Utf8Compiler::new(&mut *builder, &mut *utf8_state)?;
-                trie.iter(|seq| {
+                    Utf8Compiler::new(&mut *builder, &mut *utf8_state, self.allocation)?;
+                trie.iter(self.allocation, |seq| {
                     utf8c.add(&seq)?;
-                    Ok(())
+                    Ok::<(), BuildError>(())
                 })?;
                 utf8c.finish()
             }
@@ -1458,8 +1268,7 @@ impl Compiler {
             // approach.
             let mut builder = self.builder.borrow_mut();
             let mut utf8_state = self.utf8_state.borrow_mut();
-            let mut utf8c =
-                Utf8Compiler::new(&mut *builder, &mut *utf8_state)?;
+            let mut utf8c = Utf8Compiler::new(&mut *builder, &mut *utf8_state, self.allocation)?;
             for rng in cls.iter() {
                 for seq in Utf8Sequences::new(rng.start(), rng.end()) {
                     utf8c.add(seq.as_slice())?;
@@ -1537,7 +1346,7 @@ impl Compiler {
         // advantage of caching suffixes is that it does give us a win, and
         // has a very small additional overhead.
         let mut cache = self.utf8_suffix.borrow_mut();
-        cache.clear();
+        cache.clear(self.allocation)?;
 
         let union = self.add_union()?;
         let alt_end = self.add_empty()?;
@@ -1564,7 +1373,10 @@ impl Compiler {
                 self.patch(union, end)?;
             }
         }
-        Ok(ThompsonRef { start: union, end: alt_end })
+        Ok(ThompsonRef {
+            start: union,
+            end: alt_end,
+        })
     }
 
     /// Compile the given HIR look-around assertion to an NFA look-around
@@ -1634,52 +1446,65 @@ impl Compiler {
     // reverse mode.
 
     fn patch(&self, from: StateID, to: StateID) -> Result<(), BuildError> {
-        self.builder.borrow_mut().patch(from, to)
+        self.builder
+            .borrow_mut()
+            .patch_with_allocations(from, to, self.allocation.policy())
     }
 
     fn start_pattern(&self) -> Result<PatternID, BuildError> {
-        self.builder.borrow_mut().start_pattern()
+        self.builder
+            .borrow_mut()
+            .start_pattern_with_allocations(self.allocation.policy())
     }
 
-    fn finish_pattern(
-        &self,
-        start_id: StateID,
-    ) -> Result<PatternID, BuildError> {
+    fn finish_pattern(&self, start_id: StateID) -> Result<PatternID, BuildError> {
         self.builder.borrow_mut().finish_pattern(start_id)
     }
 
     fn add_empty(&self) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_empty()
+        self.builder
+            .borrow_mut()
+            .add_empty_with_allocations(self.allocation.policy())
     }
 
     fn add_range(&self, start: u8, end: u8) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_range(Transition {
-            start,
-            end,
-            next: StateID::ZERO,
-        })
+        self.builder.borrow_mut().add_range_with_allocations(
+            Transition {
+                start,
+                end,
+                next: StateID::ZERO,
+            },
+            self.allocation.policy(),
+        )
     }
 
-    fn add_sparse(
-        &self,
-        ranges: Vec<Transition>,
-    ) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_sparse(ranges)
+    fn add_sparse(&self, ranges: Vec<Transition>) -> Result<StateID, BuildError> {
+        self.builder
+            .borrow_mut()
+            .add_sparse_with_allocations(ranges, self.allocation.policy())
     }
 
     fn add_look(&self, mut look: Look) -> Result<StateID, BuildError> {
         if self.is_reverse() {
             look = look.reversed();
         }
-        self.builder.borrow_mut().add_look(StateID::ZERO, look)
+        self.builder.borrow_mut().add_look_with_allocations(
+            StateID::ZERO,
+            look,
+            self.allocation.policy(),
+        )
     }
 
     fn add_union(&self) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_union(vec![])
+        self.builder
+            .borrow_mut()
+            .add_union_with_allocations(vec![], self.allocation.policy())
     }
 
     fn add_union_reverse(&self) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_union_reverse(vec![])
+        self.builder
+            .borrow_mut()
+            .add_union_reverse_with_allocations(vec![], self.allocation.policy())
     }
 
     fn add_capture_start(
@@ -1687,27 +1512,35 @@ impl Compiler {
         capture_index: u32,
         name: Option<&str>,
     ) -> Result<StateID, BuildError> {
-        let name = name.map(Arc::from);
-        self.builder.borrow_mut().add_capture_start(
+        let name = name.map(|name| self.allocation.arc_str(name)).transpose()?;
+        self.builder
+            .borrow_mut()
+            .add_capture_start_with_allocations(
+                StateID::ZERO,
+                capture_index,
+                name,
+                self.allocation.policy(),
+            )
+    }
+
+    fn add_capture_end(&self, capture_index: u32) -> Result<StateID, BuildError> {
+        self.builder.borrow_mut().add_capture_end_with_allocations(
             StateID::ZERO,
             capture_index,
-            name,
+            self.allocation.policy(),
         )
     }
 
-    fn add_capture_end(
-        &self,
-        capture_index: u32,
-    ) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_capture_end(StateID::ZERO, capture_index)
-    }
-
     fn add_fail(&self) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_fail()
+        self.builder
+            .borrow_mut()
+            .add_fail_with_allocations(self.allocation.policy())
     }
 
     fn add_match(&self) -> Result<StateID, BuildError> {
-        self.builder.borrow_mut().add_match()
+        self.builder
+            .borrow_mut()
+            .add_match_with_allocations(self.allocation.policy())
     }
 
     fn is_reverse(&self) -> bool {
@@ -1749,6 +1582,7 @@ struct Utf8Compiler<'a> {
     builder: &'a mut Builder,
     state: &'a mut Utf8State,
     target: StateID,
+    allocation: Allocator<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -1771,12 +1605,16 @@ struct Utf8LastTransition {
 
 impl Utf8State {
     fn new() -> Utf8State {
-        Utf8State { compiled: Utf8BoundedMap::new(10_000), uncompiled: vec![] }
+        Utf8State {
+            compiled: Utf8BoundedMap::new(10_000),
+            uncompiled: vec![],
+        }
     }
 
-    fn clear(&mut self) {
-        self.compiled.clear();
+    fn clear(&mut self, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        self.compiled.clear(allocation)?;
         self.uncompiled.clear();
+        Ok(())
     }
 }
 
@@ -1784,11 +1622,17 @@ impl<'a> Utf8Compiler<'a> {
     fn new(
         builder: &'a mut Builder,
         state: &'a mut Utf8State,
+        allocation: Allocator<'a>,
     ) -> Result<Utf8Compiler<'a>, BuildError> {
-        let target = builder.add_empty()?;
-        state.clear();
-        let mut utf8c = Utf8Compiler { builder, state, target };
-        utf8c.add_empty();
+        let target = builder.add_empty_with_allocations(allocation.policy())?;
+        state.clear(allocation)?;
+        let mut utf8c = Utf8Compiler {
+            builder,
+            state,
+            target,
+            allocation,
+        };
+        utf8c.add_empty()?;
         Ok(utf8c)
     }
 
@@ -1796,7 +1640,10 @@ impl<'a> Utf8Compiler<'a> {
         self.compile_from(0)?;
         let node = self.pop_root();
         let start = self.compile(node)?;
-        Ok(ThompsonRef { start, end: self.target })
+        Ok(ThompsonRef {
+            start,
+            end: self.target,
+        })
     }
 
     fn add(&mut self, ranges: &[Utf8Range]) -> Result<(), BuildError> {
@@ -1804,41 +1651,41 @@ impl<'a> Utf8Compiler<'a> {
             .iter()
             .zip(&self.state.uncompiled)
             .take_while(|&(range, node)| {
-                node.last.as_ref().map_or(false, |t| {
-                    (t.start, t.end) == (range.start, range.end)
-                })
+                node.last
+                    .as_ref()
+                    .map_or(false, |t| (t.start, t.end) == (range.start, range.end))
             })
             .count();
         assert!(prefix_len < ranges.len());
         self.compile_from(prefix_len)?;
-        self.add_suffix(&ranges[prefix_len..]);
+        self.add_suffix(&ranges[prefix_len..])?;
         Ok(())
     }
 
     fn compile_from(&mut self, from: usize) -> Result<(), BuildError> {
         let mut next = self.target;
         while from + 1 < self.state.uncompiled.len() {
-            let node = self.pop_freeze(next);
+            let node = self.pop_freeze(next)?;
             next = self.compile(node)?;
         }
-        self.top_last_freeze(next);
+        self.top_last_freeze(next)?;
         Ok(())
     }
 
-    fn compile(
-        &mut self,
-        node: Vec<Transition>,
-    ) -> Result<StateID, BuildError> {
+    fn compile(&mut self, node: Vec<Transition>) -> Result<StateID, BuildError> {
         let hash = self.state.compiled.hash(&node);
         if let Some(id) = self.state.compiled.get(&node, hash) {
             return Ok(id);
         }
-        let id = self.builder.add_sparse(node.clone())?;
+        let id = self.builder.add_sparse_with_allocations(
+            self.allocation.copy_slice(&node)?,
+            self.allocation.policy(),
+        )?;
         self.state.compiled.set(node, hash, id);
         Ok(id)
     }
 
-    fn add_suffix(&mut self, ranges: &[Utf8Range]) {
+    fn add_suffix(&mut self, ranges: &[Utf8Range]) -> Result<(), AllocationError> {
         assert!(!ranges.is_empty());
         let last = self
             .state
@@ -1852,21 +1699,34 @@ impl<'a> Utf8Compiler<'a> {
             end: ranges[0].end,
         });
         for r in &ranges[1..] {
-            self.state.uncompiled.push(Utf8Node {
-                trans: vec![],
-                last: Some(Utf8LastTransition { start: r.start, end: r.end }),
-            });
+            self.allocation.push(
+                &mut self.state.uncompiled,
+                Utf8Node {
+                    trans: vec![],
+                    last: Some(Utf8LastTransition {
+                        start: r.start,
+                        end: r.end,
+                    }),
+                },
+            )?;
         }
+        Ok(())
     }
 
-    fn add_empty(&mut self) {
-        self.state.uncompiled.push(Utf8Node { trans: vec![], last: None });
+    fn add_empty(&mut self) -> Result<(), AllocationError> {
+        self.allocation.push(
+            &mut self.state.uncompiled,
+            Utf8Node {
+                trans: vec![],
+                last: None,
+            },
+        )
     }
 
-    fn pop_freeze(&mut self, next: StateID) -> Vec<Transition> {
+    fn pop_freeze(&mut self, next: StateID) -> Result<Vec<Transition>, AllocationError> {
         let mut uncompiled = self.state.uncompiled.pop().unwrap();
-        uncompiled.set_last_transition(next);
-        uncompiled.trans
+        uncompiled.set_last_transition(next, self.allocation)?;
+        Ok(uncompiled.trans)
     }
 
     fn pop_root(&mut self) -> Vec<Transition> {
@@ -1875,26 +1735,34 @@ impl<'a> Utf8Compiler<'a> {
         self.state.uncompiled.pop().expect("non-empty nodes").trans
     }
 
-    fn top_last_freeze(&mut self, next: StateID) {
+    fn top_last_freeze(&mut self, next: StateID) -> Result<(), AllocationError> {
         let last = self
             .state
             .uncompiled
             .len()
             .checked_sub(1)
             .expect("non-empty nodes");
-        self.state.uncompiled[last].set_last_transition(next);
+        self.state.uncompiled[last].set_last_transition(next, self.allocation)
     }
 }
 
 impl Utf8Node {
-    fn set_last_transition(&mut self, next: StateID) {
+    fn set_last_transition(
+        &mut self,
+        next: StateID,
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         if let Some(last) = self.last.take() {
-            self.trans.push(Transition {
-                start: last.start,
-                end: last.end,
-                next,
-            });
+            allocation.push(
+                &mut self.trans,
+                Transition {
+                    start: last.start,
+                    end: last.end,
+                    next,
+                },
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -1930,7 +1798,11 @@ mod tests {
 
     fn s_byte(byte: u8, next: usize) -> State {
         let next = sid(next);
-        let trans = Transition { start: byte, end: byte, next };
+        let trans = Transition {
+            start: byte,
+            end: byte,
+            next,
+        };
         State::ByteRange { trans }
     }
 
@@ -1958,7 +1830,10 @@ mod tests {
     }
 
     fn s_bin_union(alt1: usize, alt2: usize) -> State {
-        State::BinaryUnion { alt1: sid(alt1), alt2: sid(alt2) }
+        State::BinaryUnion {
+            alt1: sid(alt1),
+            alt2: sid(alt2),
+        }
     }
 
     fn s_union(alts: &[usize]) -> State {
@@ -1985,7 +1860,9 @@ mod tests {
     }
 
     fn s_match(id: usize) -> State {
-        State::Match { pattern_id: pid(id) }
+        State::Match {
+            pattern_id: pid(id),
+        }
     }
 
     // Test that building an unanchored NFA has an appropriate `(?s:.)*?`
@@ -2095,7 +1972,12 @@ mod tests {
         );
         assert_eq!(
             build("☃").states(),
-            &[s_byte(0xE2, 1), s_byte(0x98, 2), s_byte(0x83, 3), s_match(0)]
+            &[
+                s_byte(0xE2, 1),
+                s_byte(0x98, 2),
+                s_byte(0x83, 3),
+                s_match(0)
+            ]
         );
 
         // Check that non-UTF-8 literals work.
@@ -2168,7 +2050,12 @@ mod tests {
     fn compile_group() {
         assert_eq!(
             build(r"ab+").states(),
-            &[s_byte(b'a', 1), s_byte(b'b', 2), s_bin_union(1, 3), s_match(0)]
+            &[
+                s_byte(b'a', 1),
+                s_byte(b'b', 2),
+                s_bin_union(1, 3),
+                s_match(0)
+            ]
         );
         assert_eq!(
             build(r"(ab)").states(),
@@ -2176,7 +2063,12 @@ mod tests {
         );
         assert_eq!(
             build(r"(ab)+").states(),
-            &[s_byte(b'a', 1), s_byte(b'b', 2), s_bin_union(0, 3), s_match(0)]
+            &[
+                s_byte(b'a', 1),
+                s_byte(b'b', 2),
+                s_bin_union(0, 3),
+                s_match(0)
+            ]
         );
     }
 
@@ -2277,8 +2169,10 @@ mod tests {
         let config = NFA::config()
             .which_captures(WhichCaptures::None)
             .unanchored_prefix(false);
-        let nfa =
-            NFA::compiler().configure(config).build_from_hir(&hir).unwrap();
+        let nfa = NFA::compiler()
+            .configure(config)
+            .build_from_hir(&hir)
+            .unwrap();
         assert_eq!(nfa.states(), &[s_fail(), s_match(0)]);
     }
 
@@ -2291,8 +2185,10 @@ mod tests {
         let config = NFA::config()
             .which_captures(WhichCaptures::None)
             .unanchored_prefix(false);
-        let nfa =
-            NFA::compiler().configure(config).build_from_hir(&hir).unwrap();
+        let nfa = NFA::compiler()
+            .configure(config)
+            .build_from_hir(&hir)
+            .unwrap();
         assert_eq!(nfa.states(), &[s_fail(), s_match(0)]);
     }
 
@@ -2360,9 +2256,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             nfa.states(),
-            &[s_byte(b'a', 1), s_byte(b'b', 2), s_byte(b'c', 3), s_match(0)]
+            &[
+                s_byte(b'a', 1),
+                s_byte(b'b', 2),
+                s_byte(b'c', 3),
+                s_match(0)
+            ]
         );
         let ginfo = nfa.group_info();
         assert_eq!(0, ginfo.all_group_len());
     }
 }
+
+#[cfg(all(test, feature = "nfa-pikevm"))]
+mod funding_tests;
+
+mod stack;

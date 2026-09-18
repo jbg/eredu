@@ -6,7 +6,7 @@ pub(super) fn prefill_source(receipt:&PartitionCaptureReceiptPlan,producer:usize
     inference:InferenceGeometry)->Result<(),CaptureRunHostError> {
     if receipt.context().phase!=CapturePhase::Prefill || receipt.context().prediction!=0
         || receipt.context().invocation.is_some() {return Err(CaptureRunHostError::ReceiptMismatch);}
-    let source=receipt.shared_plan_source().ok_or(CaptureRunHostError::ReceiptMismatch)?;
+    let source=receipt.shared_plan_source();
     let logical=CaptureRoutedPrefillPlan::prepare(source.admission(),receipt.context().selection_index,inference)
         .map_err(CapturePrefillHostError::from)?;
     let host=CapturePartitionRoutedHostPlan::prepare(receipt,producer,fragment)?;

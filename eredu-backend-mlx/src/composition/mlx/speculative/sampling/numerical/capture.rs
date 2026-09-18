@@ -123,7 +123,7 @@ impl<'a> CaptureSource<'a> {
             }
         }
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
         sources
             .metadata_funding()
@@ -135,7 +135,7 @@ impl<'a> CaptureSource<'a> {
             .map_err(|cause| sources.retain_startup_error(cause))?;
         if let Some(source) = self.interventions {
             let controls=eredu_runtime::working_memory::OriginalInterventionSource::validation_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
             sources
                 .metadata_funding()
                 .reserve_metadata(controls)
@@ -482,7 +482,7 @@ impl Plan {
             }
         }
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
         sources
             .metadata_funding()
@@ -494,7 +494,7 @@ impl Plan {
             .map_err(|cause| sources.retain_startup_error(cause))?;
         if let Some(edits) = &self.edits {
             let controls=eredu_runtime::working_memory::OriginalInterventionSource::validation_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
             sources
                 .metadata_funding()
                 .reserve_metadata(controls)
@@ -915,3 +915,5 @@ fn floating_dtype(source: &Array) -> Result<TensorDtype, CaptureTensorNativeErro
         dtype => Err(CaptureTensorNativeError::UnsupportedDtype(dtype)),
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -118,6 +118,7 @@ fn sources(pool: &WorkingMemoryPool) -> (OriginalInterventionSource, AdmittedCap
     .unwrap();
     (source, capture)
 }
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 #[test]
 fn model_companion_trace_counts_lazy_summary_frontiers_and_metadata_only_window_sides() {
     let capacity = 1 << 27;

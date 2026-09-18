@@ -89,6 +89,7 @@ impl WorkspaceParameterProjection<'_> {
             size_of::<WorkspaceTensor>(), size_of::<Range<usize>>(),
             size_of::<std::result::Result<WorkspaceTensor, Error>>(),
             size_of::<std::result::Result<(), Error>>(),
+            size_of::<(&dyn WorkspaceParameterRows, &eredu_nn::ParameterId, &str, bool)>(),
         ];
         context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
             .ok_or(WorkspaceMetadataError::Overflow)?)?;
@@ -118,6 +119,7 @@ impl WorkspaceParameterProjection<'_> {
             let name = std::str::from_utf8(&self.names[row.name.clone()]).map_err(|_| fail())?;
             bindings.push(crate::PreparedParameterBinding::new(name, value));
         }
-        crate::working_memory::bind_prepared_workspace_parameters(module, &mut bindings, context)
+        crate::working_memory::bind_prepared_workspace_parameters(module, &mut bindings, context,
+            |id| self.source.excludes_parameter(id.as_str()))
     }
 }

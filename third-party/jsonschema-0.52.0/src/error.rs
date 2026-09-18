@@ -71,6 +71,7 @@ struct ValidationErrorRepr<'a> {
     /// Set when the schema has a real base URI (via `$id` or `with_base_uri()`).
     /// `None` for schemas using the internal `json-schema:///` default.
     absolute_keyword_location: Option<Arc<Uri<String>>>,
+    funding: crate::compilation::Funding,
 }
 
 impl fmt::Debug for ValidationErrorRepr<'_> {
@@ -262,7 +263,12 @@ pub enum ValidationErrorKind {
     BacktrackLimitExceeded { error: fancy_regex::Error },
     /// The regex engine failed to evaluate a `pattern` (e.g. recovered panic from
     /// [`regex-automata`](https://github.com/rust-lang/regex/issues/1344)).
-    RegexEngineFailure { message: String },
+    RegexEngineFailure {
+        /// Stable diagnostic text for the failed pattern.
+        message: String,
+        /// Original delegated engine failure, when the worker returned one.
+        error: Option<RegexEngineError>,
+    },
     /// The input value doesn't match expected constant.
     Constant { expected_value: Value },
     /// The input array doesn't contain items conforming to the specified schema.
@@ -414,16 +420,35 @@ impl<'a> ValidationError<'a> {
         schema_path: Location,
         tracker: impl Into<LazyEvaluationPath>,
     ) -> Self {
-        Self {
-            repr: Box::new(ValidationErrorRepr {
+        Self::new_with_funding(
+            instance,
+            kind,
+            instance_path,
+            schema_path,
+            tracker,
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary diagnostic allocation")
+    }
+    pub(crate) fn new_with_funding(
+        instance: Cow<'a, Value>,
+        kind: ValidationErrorKind,
+        instance_path: Location,
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        Ok(Self {
+            repr: funding.boxed(ValidationErrorRepr {
                 instance,
                 kind,
                 instance_path,
                 schema_path,
                 tracker: tracker.into(),
                 absolute_keyword_location: None,
-            }),
-        }
+                funding: funding.clone(),
+            })?,
+        })
     }
 
     /// Returns a reference to the instance that failed validation.
@@ -545,15 +570,28 @@ impl<'a> ValidationError<'a> {
     /// Converts the `ValidationError` into an owned version with `'static` lifetime.
     #[must_use]
     pub fn to_owned(self) -> ValidationError<'static> {
-        let parts = self.into_parts();
-        ValidationError::new(
-            Cow::Owned(parts.instance.into_owned()),
-            parts.kind,
-            parts.instance_path,
-            parts.schema_path,
-            parts.evaluation_path,
-        )
-        .with_absolute_keyword_location(parts.absolute_keyword_location)
+        let funding = self.repr.funding.clone();
+        self.to_owned_with_funding(&funding)
+            .expect("diagnostic ownership through original source")
+    }
+    pub(crate) fn to_owned_with_funding(
+        self,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'static>, crate::CompilationError> {
+        let repr = *self.repr;
+        let instance = match repr.instance {
+            Cow::Owned(value) => value,
+            Cow::Borrowed(value) => funding.value(value)?,
+        };
+        Ok(ValidationError::new_with_funding(
+            Cow::Owned(instance),
+            repr.kind,
+            repr.instance_path,
+            repr.schema_path,
+            repr.tracker,
+            funding,
+        )?
+        .with_absolute_keyword_location(repr.absolute_keyword_location))
     }
 
     pub(crate) fn additional_items(
@@ -593,10 +631,9 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         context: Vec<Vec<ValidationError<'a>>>,
     ) -> ValidationError<'a> {
-        let context = context
-            .into_iter()
-            .map(|errors| errors.into_iter().map(ValidationError::to_owned).collect())
-            .collect::<Vec<_>>();
+        let context = crate::compilation::Funding::default()
+            .error_context(context)
+            .expect("ordinary diagnostic context ownership");
 
         Self::borrowed(
             instance,
@@ -630,7 +667,10 @@ impl<'a> ValidationError<'a> {
     ) -> ValidationError<'a> {
         Self::borrowed(
             instance,
-            ValidationErrorKind::RegexEngineFailure { message },
+            ValidationErrorKind::RegexEngineFailure {
+                message,
+                error: None,
+            },
             instance_path,
             schema_path,
             tracker,
@@ -853,14 +893,31 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         format: impl Into<String>,
     ) -> ValidationError<'a> {
-        Self::borrowed(
+        Self::format_with_funding(
+            schema_path,
+            tracker,
+            instance_path,
             instance,
-            ValidationErrorKind::Format {
-                format: format.into(),
-            },
+            format.into(),
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary format diagnostic allocation")
+    }
+    pub(crate) fn format_with_funding(
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        instance_path: Location,
+        instance: Cow<'a, Value>,
+        format: String,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'a>, crate::CompilationError> {
+        Self::new_with_funding(
+            instance,
+            ValidationErrorKind::Format { format },
             instance_path,
             schema_path,
             tracker,
+            funding,
         )
     }
     pub(crate) fn from_utf8(error: FromUtf8Error) -> ValidationError<'a> {
@@ -1047,10 +1104,9 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         context: Vec<Vec<ValidationError<'a>>>,
     ) -> ValidationError<'a> {
-        let context = context
-            .into_iter()
-            .map(|errors| errors.into_iter().map(ValidationError::to_owned).collect())
-            .collect::<Vec<_>>();
+        let context = crate::compilation::Funding::default()
+            .error_context(context)
+            .expect("ordinary diagnostic context ownership");
 
         Self::borrowed(
             instance,
@@ -1067,10 +1123,9 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         context: Vec<Vec<ValidationError<'a>>>,
     ) -> ValidationError<'a> {
-        let context = context
-            .into_iter()
-            .map(|errors| errors.into_iter().map(ValidationError::to_owned).collect())
-            .collect::<Vec<_>>();
+        let context = crate::compilation::Funding::default()
+            .error_context(context)
+            .expect("ordinary diagnostic context ownership");
 
         Self::borrowed(
             instance,
@@ -1135,7 +1190,25 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         type_name: JsonType,
     ) -> ValidationError<'a> {
-        Self::borrowed(
+        Self::single_type_error_with_funding(
+            schema_path,
+            tracker,
+            instance_path,
+            instance,
+            type_name,
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary type diagnostic allocation")
+    }
+    pub(crate) fn single_type_error_with_funding(
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        instance_path: Location,
+        instance: Cow<'a, Value>,
+        type_name: JsonType,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'a>, crate::CompilationError> {
+        Self::new_with_funding(
             instance,
             ValidationErrorKind::Type {
                 kind: TypeKind::Single(type_name),
@@ -1143,6 +1216,7 @@ impl<'a> ValidationError<'a> {
             instance_path,
             schema_path,
             tracker,
+            funding,
         )
     }
     pub(crate) fn multiple_type_error(
@@ -1152,7 +1226,25 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         types: JsonTypeSet,
     ) -> ValidationError<'a> {
-        Self::borrowed(
+        Self::multiple_type_error_with_funding(
+            schema_path,
+            tracker,
+            instance_path,
+            instance,
+            types,
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary type diagnostic allocation")
+    }
+    pub(crate) fn multiple_type_error_with_funding(
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        instance_path: Location,
+        instance: Cow<'a, Value>,
+        types: JsonTypeSet,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'a>, crate::CompilationError> {
+        Self::new_with_funding(
             instance,
             ValidationErrorKind::Type {
                 kind: TypeKind::Multiple(types),
@@ -1160,6 +1252,7 @@ impl<'a> ValidationError<'a> {
             instance_path,
             schema_path,
             tracker,
+            funding,
         )
     }
     pub(crate) fn unevaluated_items(
@@ -1198,12 +1291,29 @@ impl<'a> ValidationError<'a> {
         instance_path: Location,
         instance: Cow<'a, Value>,
     ) -> ValidationError<'a> {
-        Self::borrowed(
+        Self::unique_items_with_funding(
+            schema_path,
+            tracker,
+            instance_path,
+            instance,
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary uniqueness diagnostic")
+    }
+    pub(crate) fn unique_items_with_funding(
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        instance_path: Location,
+        instance: Cow<'a, Value>,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'a>, crate::CompilationError> {
+        Self::new_with_funding(
             instance,
             ValidationErrorKind::UniqueItems,
             instance_path,
             schema_path,
             tracker,
+            funding,
         )
     }
     /// Create a custom validation error with just a message.
@@ -1336,20 +1446,49 @@ impl<'a> ValidationError<'a> {
         instance: Cow<'a, Value>,
         message: impl Into<String>,
     ) -> ValidationError<'a> {
-        Self::borrowed(
+        Self::compile_error_with_funding(
+            schema_path,
+            tracker,
+            instance_path,
+            instance,
+            message.into(),
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary compiler diagnostic allocation")
+    }
+    pub(crate) fn compile_error_with_funding(
+        schema_path: Location,
+        tracker: impl Into<LazyEvaluationPath>,
+        instance_path: Location,
+        instance: Cow<'a, Value>,
+        message: String,
+        funding: &crate::compilation::Funding,
+    ) -> Result<ValidationError<'a>, crate::CompilationError> {
+        Self::new_with_funding(
             instance,
             ValidationErrorKind::Custom {
                 keyword: String::new(),
-                message: message.into(),
+                message,
             },
             instance_path,
             schema_path,
             tracker,
+            funding,
         )
     }
 }
 
-impl error::Error for ValidationError<'_> {}
+impl error::Error for ValidationError<'_> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self.kind() {
+            ValidationErrorKind::RegexEngineFailure {
+                error: Some(error), ..
+            } => Some(error),
+            ValidationErrorKind::BacktrackLimitExceeded { error } => Some(error),
+            _ => None,
+        }
+    }
+}
 impl From<referencing::Error> for ValidationError<'_> {
     #[inline]
     fn from(err: referencing::Error) -> Self {
@@ -1632,7 +1771,7 @@ impl fmt::Display for ValidationError<'_> {
                 Ok(())
             }
             ValidationErrorKind::Custom { message, .. }
-            | ValidationErrorKind::RegexEngineFailure { message } => f.write_str(message),
+            | ValidationErrorKind::RegexEngineFailure { message, .. } => f.write_str(message),
         }
     }
 }
@@ -1822,7 +1961,7 @@ impl fmt::Display for MaskedValidationError<'_, '_, '_> {
                 Ok(())
             }
             ValidationErrorKind::Custom { message, .. }
-            | ValidationErrorKind::RegexEngineFailure { message } => f.write_str(message),
+            | ValidationErrorKind::RegexEngineFailure { message, .. } => f.write_str(message),
         }
     }
 }
@@ -2365,5 +2504,30 @@ mod tests {
             absolute_location.as_str(),
             "https://example.com/string.json#/type"
         );
+    }
+}
+
+/// Original failure returned by the selected regular-expression engine.
+#[derive(Clone, Debug)]
+pub enum RegexEngineError {
+    /// General engine or VM failure from fancy-regex.
+    Fancy(fancy_regex::Error),
+    /// Search failure from the standard regex engine.
+    Standard(regex::SearchError),
+}
+impl fmt::Display for RegexEngineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fancy(error) => error.fmt(formatter),
+            Self::Standard(error) => error.fmt(formatter),
+        }
+    }
+}
+impl error::Error for RegexEngineError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Fancy(error) => Some(error),
+            Self::Standard(error) => Some(error),
+        }
     }
 }

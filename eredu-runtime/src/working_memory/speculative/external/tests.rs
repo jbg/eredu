@@ -184,3 +184,35 @@ fn external_population_overflow_is_refused_before_issuing_a_schedule() {
         &SpeculativeConfig {max_tokens:5,max_draft_tokens:2,..Default::default()},
         SpeculativeSchedulerOptions {lookahead_blocks:usize::MAX-1,..Default::default()}).is_err());
 }
+
+#[test]
+fn retained_speculative_origin_accepts_closed_source_and_refuses_foreign_or_quarantined_account() {
+    for quarantine in [false, true] {
+        let source = selected();
+        let plan = schedule(&source, ExternalPredictionShape::Sequential);
+        let invocation = plan.invocation(ExternalInvocationKind::AssistantStep, geometry(18, 1), None, origin()).unwrap();
+        let capacity = 1 << 26;
+        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let foreign = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let execution = InferenceExecutionIdentity::default();
+        let request = OriginalSpeculativeRequest::prepare_external(&pool, &execution, &plan, capacity).unwrap();
+        let report = report(invocation.geometry());
+        let mut cursor = plan.into_cursor();
+        let role = request.reserve_external_role(cursor.claim(invocation).unwrap(),
+            requirements(report.span_workspace_plan())).unwrap();
+        let source = role.budget_custody();
+        let custody: crate::working_memory::OriginalOperationMetadataCustody = source.clone().into();
+        custody.validate_retained_origin(&pool).unwrap();
+        assert_eq!(custody.validate_retained_origin(&foreign), Err(WorkingMemoryError::IdentityMismatch));
+        request.close().unwrap();
+        if quarantine { source.quarantine(); }
+        drop((request, role, source));
+        let held = pool.used_bytes().unwrap();
+        assert!(held > 0);
+        assert_eq!(custody.validate_retained_origin(&pool),
+            if quarantine { Err(WorkingMemoryError::ExecutionFenced) } else { Ok(()) });
+        assert_eq!(pool.used_bytes().unwrap(), held);
+        drop(custody);
+        assert_eq!(pool.used_bytes().unwrap(), if quarantine { held } else { 0 });
+    }
+}

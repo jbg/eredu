@@ -1,4 +1,5 @@
 //! The actual PP or combined TP/PP plan traversed by the ordinary partition executor.
+use crate::prepared_execution::workspace::layerwise::QuoteError;
 use super::*;
 use crate::partitioned_execution::{PartitionTensorAllocator, PipelinePartitionExecutor};
 use eredu_nn::workspace::{WorkspaceDtype, WorkspaceFloatingType, WorkspaceParallelContext};
@@ -198,8 +199,7 @@ where A:crate::partitioned_execution::TextPartitionArchitecture<WorkspaceBackend
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
     let paths = visitor.observation.map(|observation|
         <Strategy<A,Q,U> as ReplicatedTextExecutionStrategy<A,WorkspaceBackend,ResidentState,Q,Q>>::bind_observation_paths(
-            &runtime, observation.paths,
-        )).transpose().map_err(|cause| context.metadata_source(cause))?;
+            &runtime, observation.paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error)))).transpose().map_err(|cause| cause.into_quote_error(context))?;
     let hook_bytes = paths.as_ref().map(|paths| paths.traversal_host_peak_bytes()
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)).transpose()?.unwrap_or(0);
     visitor.quote_spans_with_prepublication_observation(hook_bytes, |tokens, state, demand, mut observer, span| {
@@ -216,6 +216,7 @@ where A:crate::partitioned_execution::TextPartitionArchitecture<WorkspaceBackend
             |runtime| {
                 let mut strategy = Strategy::<A,Q,U>::new();
                 let pass = match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
                     InferenceWorkspaceSpan::Prefill(_) => eredu_runtime::ExpertPass::Prefill,
                     InferenceWorkspaceSpan::Decode { .. } => eredu_runtime::ExpertPass::Decode,
                 };

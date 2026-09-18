@@ -233,7 +233,7 @@ fn shared_controller_matches_ordinary_output_and_preexisting_alias_owns_exact_fi
             while let Some(token) = driver.advance(&mut continuation).unwrap() {
                 outputs.push(token.into_output());
                 assert!(driver
-                    .take_completed_step(&mut continuation)
+                    .take_completed_delivery(&mut continuation)
                     .unwrap()
                     .is_none());
             }
@@ -530,7 +530,7 @@ fn loading_hook_registers_shared_mask_before_inference_and_rejects_active_run_fa
     while let Some(token) = driver.advance(&mut continuation).unwrap() {
         outputs.push(token.into_output());
         assert!(driver
-            .take_completed_step(&mut continuation)
+            .take_completed_delivery(&mut continuation)
             .unwrap()
             .is_none());
     }

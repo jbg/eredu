@@ -1,11 +1,10 @@
-use super::super::vocabulary::VocabularyPlan;
 use super::*;
-use eredu_core::{TokenFilter, TokenFilterController};
-use eredu_nn::workspace::WorkspaceMetadataAccount;
-use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
+use eredu_nn::workspace::HostMetadataAccount;
+use eredu_runtime::working_memory::WorkingMemoryPool;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
 };
 
 #[derive(Debug)]
@@ -14,14 +13,14 @@ struct Account {
     limit: Arc<AtomicUsize>,
     retired: Arc<AtomicBool>,
 }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let used = self.used.load(Ordering::SeqCst);
         let next = used
             .checked_add(bytes)
-            .ok_or(WorkspaceMetadataFundingError::Overflow)?;
+            .ok_or(HostMetadataFundingError::Overflow)?;
         if next > self.limit.load(Ordering::SeqCst) {
-            return Err(WorkspaceMetadataFundingError::Capacity {
+            return Err(HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: self.limit.load(Ordering::SeqCst).saturating_sub(used) as u64,
             });
@@ -37,7 +36,7 @@ impl Drop for Account {
 }
 
 fn funding() -> (
-    WorkspaceMetadataFunding,
+    HostMetadataFunding,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     Arc<AtomicBool>,
@@ -45,7 +44,7 @@ fn funding() -> (
     let used = Arc::new(AtomicUsize::new(0));
     let limit = Arc::new(AtomicUsize::new(usize::MAX));
     let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account {
+    let funding = HostMetadataFunding::new(Account {
         used: used.clone(),
         limit: limit.clone(),
         retired: retired.clone(),
@@ -54,240 +53,169 @@ fn funding() -> (
     (funding, used, limit, retired)
 }
 
-fn controller() -> ConstraintController {
-    let words: Vec<Vec<u8>> = [
-        b"<".as_slice(),
-        b"ca",
-        b"ll>",
-        b"safe",
-        b"<call>",
-        "é".as_bytes(),
-        b"\0",
-        b"",
-        b"llx>",
-    ]
-    .into_iter()
-    .map(<[u8]>::to_vec)
-    .collect();
-    let trie = TokTrie::from(&TokRxInfo::new(words.len() as u32, 0), &words);
-    let vocabulary = VocabularyPlan::new(Arc::new(ApproximateTokEnv::new(trie)))
-        .unwrap()
-        .unregistered();
-    ConstraintController {
-        runtime: ConstraintRuntime::Forbidden {
-            vocabulary,
-            trigger: b"<call>".to_vec(),
-            pending: TriggerPrefix::default(),
-        },
-        committed_tokens: PlainControllerHistory::default(),
-        validity: SharedTokenFilter::new(
-            TokenFilter::allowed(vec![true, true, true, true, true, true, false, true, true])
-                .unwrap(),
-        ),
-        authority: HostPreparationAuthority::unmanaged(),
+/// Explicit byte fixture compiled by the actual immutable source worker. Its
+/// empty, binary and non-ASCII tokens are intentional controller edge cases.
+struct Fixture {
+    plan: super::super::fixtures::Plan,
+    packed: Vec<u8>,
+    pool: WorkingMemoryPool,
+}
+impl Fixture {
+    fn new(pool: WorkingMemoryPool) -> Self {
+        use super::super::{fixtures, frozen_tests, ParallelToolCallPolicy, ToolChoice};
+        let compiler = fixtures::Compiler::byte_tokens(&[255, 254]);
+        let plan = compiler
+            .compile_tool_plan(
+                &crate::runtime::chat::dialect::DECLARATIVE_DIALECT,
+                frozen_tests::PARAMETERS,
+                &frozen_tests::ordinary_tools(),
+                ToolChoice::None,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        let words: [&[u8]; 9] = [
+            b"{",
+            b"\"ca",
+            b"lls\":",
+            b"safe",
+            br#"{"calls":"#,
+            "é".as_bytes(),
+            b"\0",
+            b"",
+            b"llx\":",
+        ];
+        let mut packed = Vec::new();
+        let mut offset = (words.len() + 1) * 8;
+        for bytes in words {
+            packed.extend_from_slice(&(offset as u64).to_le_bytes());
+            offset += bytes.len();
+        }
+        packed.extend_from_slice(&(offset as u64).to_le_bytes());
+        for bytes in words {
+            packed.extend_from_slice(bytes);
+        }
+        Self { plan, packed, pool }
+    }
+    fn controller(
+        &self,
+        capacity: usize,
+        funding: &HostMetadataFunding,
+    ) -> Result<ConstraintController, ForbiddenSourceError> {
+        ConstraintController::from_original_forbidden_generation_plan_with(
+            &self.plan,
+            SharedTokenFilter::new(
+                TokenFilter::allowed(vec![true, true, true, true, true, true, false, true, true])
+                    .unwrap(),
+            ),
+            capacity,
+            funding,
+            |trigger| {
+                Ok(self.pool.compile_forbidden_source(
+                    eredu_core::speculative::PreparedForbiddenInputCopy::new(
+                        &self.packed,
+                        9,
+                        9,
+                        trigger,
+                    )?,
+                )?)
+            },
+        )
     }
 }
 
 #[test]
-fn forbidden_source_preserves_ordinary_filters_history_and_escaped_custody() {
-    let mut controller = controller();
+fn forbidden_original_source_preserves_filter_bytes_atomic_history_and_escaped_custody() {
+    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let fixture = Fixture::new(pool.clone());
+    let (funding, _, _, retired) = funding();
+    let mut controller = fixture.controller(4, &funding).unwrap();
     controller.commit_token(0).unwrap();
     controller.commit_token(1).unwrap();
-    let (funding, used, _, retired) = funding();
-    let before = used.load(Ordering::SeqCst);
-    let source = controller.prepare_forbidden_source(&funding).unwrap();
-    assert!(used.load(Ordering::SeqCst) > before);
+    let source = controller.prepared_forbidden_source().unwrap();
     assert_eq!(source.history(), &[0, 1]);
-    assert_eq!(source.pending(), b"<ca");
-    assert_eq!(source.token_bytes(5), Some("é".as_bytes()));
-    assert_eq!(source.token_bytes(6), Some(b"\0".as_slice()));
-    assert_eq!(source.token_bytes(7), Some(b"".as_slice()));
-    assert!(source.validity().same_storage(&controller.validity));
-    let ordinary = controller.current_filter().unwrap();
-    for token in 0..source.vocabulary_len() as u32 + 1 {
-        assert_eq!(source.allows(token), ordinary.allows(token));
+    assert_eq!(source.prefix().bytes(source.inputs().trigger()), b"{\"ca");
+    assert_eq!(source.inputs().token_bytes(5), Some("é".as_bytes()));
+    assert_eq!(source.inputs().token_bytes(6), Some(b"\0".as_slice()));
+    assert_eq!(source.inputs().token_bytes(7), Some(b"".as_slice()));
+    let mask = controller.current_filter().unwrap();
+    for token in 0..11 {
+        assert_eq!(mask.allows(token), token < 9 && ![2, 4, 6].contains(&token));
     }
-    assert!(!source.allows(2));
     assert!(controller.commit_token(2).is_err());
     assert_eq!(&*controller.committed_tokens, &[0, 1]);
-    assert_eq!(controller.current_filter().unwrap(), ordinary);
-    controller.commit_token(3).unwrap();
-    assert!(controller.current_filter().unwrap().allows(2));
-    assert!(
-        !source.allows(2),
-        "source preserves the exact earlier state"
-    );
-    drop((controller, funding));
-    assert!(!retired.load(Ordering::SeqCst));
-    assert_eq!(source.history(), &[0, 1]);
-    drop(source);
-    assert!(retired.load(Ordering::SeqCst));
-}
-
-#[test]
-fn forbidden_source_refusal_retains_cause_and_rejects_plain_state() {
-    let controller = controller();
-    let (funding, used, limit, retired) = funding();
-    let before = used.load(Ordering::SeqCst);
-    limit.store(before + controls().unwrap(), Ordering::SeqCst);
-    let failure = controller.prepare_forbidden_source(&funding).unwrap_err();
+    assert_eq!(controller.current_filter().unwrap(), mask);
+    let source = controller.prepared_forbidden_source().unwrap();
     assert!(matches!(
-        failure.cause,
-        Cause::Funding(WorkspaceMetadataFundingError::Capacity { .. })
+        source.decision_at(&[0, 1, 2, 6]),
+        Err(ForbiddenControllerError::Forbidden(2))
     ));
-    assert_eq!(used.load(Ordering::SeqCst), before + controls().unwrap());
-    drop((controller, funding));
-    assert!(!retired.load(Ordering::SeqCst));
-    assert!(std::error::Error::source(&failure).is_some());
-    drop(failure);
-    assert!(retired.load(Ordering::SeqCst));
-
-    let (funding, _, _, _) = self::funding();
-    let plain = ConstraintController::text(SharedTokenFilter::new(TokenFilter::All));
     assert!(matches!(
-        plain.prepare_forbidden_source(&funding).unwrap_err().cause,
-        Cause::Source
-    ));
-}
-
-#[test]
-fn forbidden_decision_keeps_error_order_atomic_prefix_and_exact_retained_identity() {
-    use eredu_core::speculative::ForbiddenControllerMutation;
-    let mut controller = controller();
-    controller.commit_token(0).unwrap();
-    controller.commit_token(1).unwrap();
-    let (funding, _, _, retired) = funding();
-    let source = controller.prepare_forbidden_source(&funding).unwrap();
-    let borrowed = source.source().unwrap();
-    assert!(
-        matches!(
-            borrowed.decision_at(&[0, 1, 2, 6]),
-            Err(ForbiddenControllerError::Forbidden(2))
-        ),
-        "the first forbidden transition precedes a later invalid tokenizer ID"
-    );
-    assert!(matches!(
-        borrowed.decision_at(&[1]),
+        source.decision_at(&[1]),
         Err(ForbiddenControllerError::History(
             PlainControllerError::History
         ))
     ));
-    let provisional = borrowed.decision_at(&[0, 1, 8]).unwrap();
-    assert!(provisional.allows(2));
-    assert!(!borrowed.decision_at(&[0, 1]).unwrap().allows(2));
-    assert_eq!(source.pending(), b"<ca");
-
-    funding
-        .reserve_metadata(
-            PlainControllerHistory::copy_metadata_bytes(2).unwrap()
-                + PlainControllerHistory::copy_metadata_bytes(4).unwrap()
-                + ForbiddenControllerInputs::operation_control_bytes().unwrap(),
-        )
-        .unwrap();
-    let host = HostPreparationAuthority::retain(funding.clone());
-    let mut full = source.history.copy_prepared(2, host.clone()).unwrap();
-    let mut full_prefix = source.prefix;
-    let failure = ForbiddenControllerMutation::new(
-        &mut full,
-        &source.validity,
-        &source.inputs,
-        &mut full_prefix,
-    )
-    .unwrap()
-    .commit(3)
-    .unwrap_err();
+    assert!(source.decision_at(&[0, 1, 8]).unwrap().allows(2));
+    let escaped = source.retain_prepared_identity().unwrap();
+    // An escaped history alias prevents mutation rather than overwriting it.
     assert!(matches!(
-        failure,
-        ForbiddenControllerError::History(PlainControllerError::Destination)
+        controller.prepared_forbidden_mutation().unwrap().commit(3),
+        Err(ForbiddenControllerError::History(
+            PlainControllerError::Destination
+        ))
     ));
-    assert_eq!(&*full, &[0, 1]);
-    assert_eq!(full_prefix, source.prefix);
-
-    let mut copied = source.history.copy_prepared(4, host.clone()).unwrap();
-    let mut prefix = source.prefix;
-    let copied_source =
-        ForbiddenControllerSource::new(&copied, &source.validity, &source.inputs, prefix).unwrap();
-    assert!(borrowed.matches_copy(copied_source, 4));
-    let identity = copied_source.retain_prepared_identity().unwrap();
-    assert!(copied_source.matches_prepared_identity(&identity));
-    let failure = ForbiddenControllerMutation::new(
-        &mut copied,
-        &source.validity,
-        &source.inputs,
-        &mut prefix,
-    )
-    .unwrap()
-    .commit(3)
-    .unwrap_err();
-    assert!(matches!(
-        failure,
-        ForbiddenControllerError::History(PlainControllerError::Destination)
-    ));
-    assert_eq!(prefix, source.prefix);
-    drop(identity);
-    ForbiddenControllerMutation::new(&mut copied, &source.validity, &source.inputs, &mut prefix)
-        .unwrap()
-        .commit(3)
-        .unwrap();
-    assert_eq!(&*copied, &[0, 1, 3]);
-    assert_eq!(prefix.bytes(source.trigger()), b"");
-    let escaped = ForbiddenControllerSource::new(&copied, &source.validity, &source.inputs, prefix)
-        .unwrap()
-        .retain_prepared_identity()
-        .unwrap();
-    funding
-        .reserve_metadata(
-            ForbiddenControllerInputs::copy_metadata_bytes(
-                source.inputs.vocabulary().len(),
-                source.trigger().len(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let foreign = ForbiddenControllerInputs::copy_prepared(
-        source.inputs.vocabulary(),
-        source.inputs.vocabulary_len(),
-        6,
-        source.trigger(),
-        host.clone(),
-    )
-    .unwrap();
-    let different =
-        ForbiddenControllerSource::new(&copied, &source.validity, &foreign, prefix).unwrap();
-    assert!(
-        !different.matches_prepared_identity(&escaped),
-        "equal bytes are not source identity"
-    );
-    drop((foreign, controller, source, full, copied, host, funding));
+    drop((controller, funding));
     assert!(!retired.load(Ordering::SeqCst));
+    assert!(pool.used_bytes().unwrap() > 0);
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn forbidden_controller_copy_uses_exact_inputs_and_independent_atomic_history() {
-    use eredu_core::SpeculativeTokenFilterController;
-    let mut ordinary = controller();
-    ordinary.commit_token(0).unwrap();
-    ordinary.commit_token(1).unwrap();
+fn forbidden_startup_refusal_preserves_cause_and_source_budget() {
+    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let fixture = Fixture::new(pool.clone());
+    let (funding, used, limit, retired) = funding();
+    let before = used.load(Ordering::SeqCst);
+    limit.store(before, Ordering::SeqCst);
+    let failure = fixture.controller(4, &funding).err().unwrap();
+    assert!(matches!(
+        failure.cause,
+        Cause::Funding(HostMetadataFundingError::Capacity { .. })
+    ));
+    assert_eq!(used.load(Ordering::SeqCst), before);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    drop(funding);
+    assert!(!retired.load(Ordering::SeqCst));
+    assert!(std::error::Error::source(&failure).is_some());
+    drop(failure);
+    assert!(retired.load(Ordering::SeqCst));
+    let plain = ConstraintController::text(SharedTokenFilter::new(TokenFilter::All));
+    assert!(plain.prepared_forbidden_source().is_none());
+    assert!(plain.prepared_forbidden_copy_bytes(4).is_none());
+}
+
+#[test]
+fn forbidden_copy_uses_exact_inputs_independent_history_and_shared_forcing() {
+    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let fixture = Fixture::new(pool.clone());
     let (funding, _, _, retired) = funding();
-    let prepared = ordinary.prepare_forbidden_controller(4, &funding).unwrap();
+    let mut prepared = fixture.controller(4, &funding).unwrap();
+    prepared.commit_token(0).unwrap();
+    prepared.commit_token(1).unwrap();
     assert!(prepared.prepared_plain_source().is_none());
-    assert!(prepared.prepared_plain_copy_bytes(4).is_none());
-    let source = prepared.prepared_forbidden_source().unwrap();
-    assert_eq!(source.history(), &[0, 1]);
-    let ordinary_mask = ordinary.current_filter().unwrap();
-    for token in 0..10 {
-        assert_eq!(
-            source.decision_at(&[0, 1]).unwrap().allows(token),
-            ordinary_mask.allows(token)
-        );
-    }
-    let bytes = prepared.prepared_forbidden_copy_bytes(3).unwrap()
-        + HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().unwrap();
-    funding.reserve_metadata(bytes).unwrap();
+    assert!(prepared.prepared_forbidden_copy_bytes(1).is_none());
+    funding
+        .reserve_metadata(
+            prepared.prepared_forbidden_copy_bytes(3).unwrap()
+                + HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
+        )
+        .unwrap();
     let host = HostPreparationAuthority::retain(funding.clone());
     let mut copied = prepared.copy_prepared_forbidden(3, host.clone()).unwrap();
+    let source = prepared.prepared_forbidden_source().unwrap();
     assert!(source.matches_copy(copied.prepared_forbidden_source().unwrap(), 3));
     assert!(matches!(
         copied.prepared_forbidden_mutation().unwrap().commit(2),
@@ -298,16 +226,11 @@ fn forbidden_controller_copy_uses_exact_inputs_and_independent_atomic_history() 
         .unwrap()
         .commit(3)
         .unwrap();
-    ordinary.commit_token(3).unwrap();
-    assert_eq!(
-        copied.current_filter().unwrap(),
-        ordinary.current_filter().unwrap()
-    );
+    assert_eq!(source.history(), &[0, 1]);
     assert_eq!(
         copied.prepared_forbidden_source().unwrap().history(),
         &[0, 1, 3]
     );
-    assert_eq!(source.history(), &[0, 1]);
     let prefix = copied.prepared_forbidden_source().unwrap().prefix();
     assert!(matches!(
         copied.prepared_forbidden_mutation().unwrap().commit(0),
@@ -316,7 +239,14 @@ fn forbidden_controller_copy_uses_exact_inputs_and_independent_atomic_history() 
         ))
     ));
     assert_eq!(copied.prepared_forbidden_source().unwrap().prefix(), prefix);
-    // Ordinary forcing and the fixed prepared decision share the same domain.
+    // Equal source bytes from a separate original compiler do not authenticate.
+    let foreign = fixture.controller(4, &funding).unwrap();
+    let identity = source.retain_prepared_identity().unwrap();
+    assert!(!foreign
+        .prepared_forbidden_source()
+        .unwrap()
+        .matches_prepared_identity(&identity));
+    drop(identity);
     let mut choice = eredu_runtime::execution_control::TokenChoiceController::new(
         copied,
         eredu_runtime::TokenDomain::new(9),
@@ -349,21 +279,18 @@ fn forbidden_controller_copy_uses_exact_inputs_and_independent_atomic_history() 
             .filter(|&token| decision.before_forcing().allows(token))
             .count() as u64
     );
-    assert!(observed.constrained);
-    assert!(
-        observed.allowed_tokens > 1,
-        "capture excludes the forced-token override"
-    );
+    assert!(observed.constrained && observed.allowed_tokens > 1);
     let escaped = choice
         .inner()
         .prepared_forbidden_source()
         .unwrap()
         .retain_prepared_identity()
         .unwrap();
-    drop((ordinary, prepared, choice, host, funding));
+    drop((prepared, choice, foreign, host, funding));
     assert!(!retired.load(Ordering::SeqCst));
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -380,31 +307,23 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
     fn plan(source: &Sampler) -> PreparedSpeculativeController<'_, Sampler> {
         SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_controller(source).unwrap()
     }
-    let mut ordinary = controller();
-    ordinary.commit_token(0).unwrap();
-    ordinary.commit_token(1).unwrap();
     let (funding, _, _, retired) = funding();
     let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let foreign_pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let source = Sampler::new(
-        DefaultSampler,
-        ordinary
-            .prepare_original_forbidden_controller_with(2, &funding, |plan| {
-                pool.compile_forbidden_source(plan)
-            })
-            .unwrap(),
-    );
+    let fixture = Fixture::new(pool.clone());
+    let mut controller = fixture.controller(2, &funding).unwrap();
+    controller.commit_token(0).unwrap();
+    controller.commit_token(1).unwrap();
+    let source = Sampler::new(DefaultSampler, controller);
     let original = source.controller().original_forbidden_source().unwrap();
     let actual = source.controller().prepared_forbidden_source().unwrap();
     original.validate_controller(actual, &pool).unwrap();
     assert!(original.validate_controller(actual, &foreign_pool).is_err());
-    assert!(
-        actual
-            .original_storage()
-            .unwrap()
-            .downcast_ref::<eredu_runtime::working_memory::OriginalForbiddenSource>()
-            .is_some()
-    );
+    assert!(actual
+        .original_storage()
+        .unwrap()
+        .downcast_ref::<eredu_runtime::working_memory::OriginalForbiddenSource>()
+        .is_some());
     assert!(matches!(
         plan(&source).controller_source().unwrap(),
         PreparedControllerSource::Forbidden(_)
@@ -420,7 +339,7 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
     let mask = decision.mask_plan(&shape).unwrap();
     let mut invalid = Vec::with_capacity(mask.elements());
     mask.fill(&mut invalid).unwrap();
-    let actual = ordinary.current_filter().unwrap();
+    let actual = source.controller().filter_at(&[0, 1]).unwrap();
     assert_eq!(
         invalid,
         (0..9)
@@ -431,7 +350,7 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
     funding
         .reserve_metadata(
             plan(&source).copy_metadata_bytes()
-                + HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().unwrap(),
+                + HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
         )
         .unwrap();
     let host = HostPreparationAuthority::retain(funding.clone());
@@ -460,7 +379,7 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
     );
     assert!(!plan(&committed).matches_choice(&escaped));
     assert!(plan(&forced).matches_choice(&escaped));
-    drop((ordinary, source, forced, committed, host, funding));
+    drop((source, forced, committed, host, funding));
     assert!(!retired.load(Ordering::SeqCst));
     assert!(pool.used_bytes().unwrap() > 0);
     drop(escaped);

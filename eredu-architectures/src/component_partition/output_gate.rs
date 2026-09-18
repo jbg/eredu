@@ -1,25 +1,41 @@
 //! Exact ownership and replicated scalar geometry of post-projection gates.
 use super::*;
 use eredu_core::{
+    ObservationPosition as Position, SymbolicDimension, TensorAxis,
     capture::CaptureError,
     component::{ComponentReadRole, ComponentRowMapping},
-    ObservationPosition as Position, SymbolicDimension, TensorAxis,
 };
 
-pub(super) fn insert_observations(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+pub(super) fn worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     component: &ComponentGroup,
     layout: &LocalModelLayout,
     local: bool,
     owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &ComponentGroup,
+        &LocalModelLayout,
+        bool,
+        &str,
+        Option<Position>,
+        [usize; 2],
+    )>()?;
+    allocation.controls_of(&owns)?;
     let gate = component
         .output_gate
         .as_ref()
         .expect("declared output gate");
-    let invalid =
-        || CaptureError::Invalid(format!("invalid scalar output gate for {}", component.id));
+    let invalid = || {
+        allocation.capture_invalid(format_args!(
+            "invalid scalar output gate for {}",
+            component.id
+        ))
+    };
     let point = |path: &str, position: Option<Position>| {
         let point = descriptor.observations.get(path).ok_or_else(&invalid)?;
         if position.is_some_and(|position| point.position != position) {
@@ -83,8 +99,8 @@ pub(super) fn insert_observations(
     {
         return Err(invalid().into());
     }
-    for (parameter, shape) in std::iter::once((&gate.read.weight, vec![1, *width]))
-        .chain(gate.read.bias.iter().map(|bias| (bias, vec![1])))
+    for (parameter, shape) in std::iter::once((&gate.read.weight, [1, *width].as_slice()))
+        .chain(gate.read.bias.iter().map(|bias| (bias, [1].as_slice())))
     {
         if owns(parameter)? != local {
             return Err(invalid().into());
@@ -92,7 +108,7 @@ pub(super) fn insert_observations(
         if local {
             let tensor = layout
                 .tensor(parameter)
-                .ok_or_else(|| ComponentPartitionError::MissingWeight(parameter.clone()))?;
+                .ok_or_else(|| allocation.missing(parameter))?;
             if tensor.global_shape() != shape
                 || tensor.local_shape() != shape
                 || !matches!(
@@ -101,7 +117,7 @@ pub(super) fn insert_observations(
                 )
                 || !tensor.additional_placements().is_empty()
             {
-                return Err(ComponentPartitionError::InvalidPlacement(parameter.clone()));
+                return Err(allocation.invalid(parameter));
             }
         }
     }
@@ -111,18 +127,37 @@ pub(super) fn insert_observations(
         (&gate.output, "gate"),
         (&gate.effective_output, "gate"),
     ] {
-        replicated_observation(
+        observations::replicated(
             observations,
             descriptor,
             path,
             axis,
             local,
             ObservationHookSite::Unit,
+            allocation,
         )?;
     }
     Ok(())
 }
 
+pub(super) fn insert_observations(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    component: &ComponentGroup,
+    layout: &LocalModelLayout,
+    local: bool,
+    owns: &impl Fn(&str) -> Result<bool, ComponentPartitionError>,
+) -> Result<(), ComponentPartitionError> {
+    worker(
+        observations,
+        descriptor,
+        component,
+        layout,
+        local,
+        owns,
+        Destination(None),
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,7 +210,7 @@ mod tests {
         let (descriptor, component, layout) = fixture();
         let gate = component.output_gate.as_ref().unwrap();
         for local in [false, true] {
-            let mut observations = BTreeMap::new();
+            let mut observations = SourceMap::new();
             insert_observations(
                 &mut observations,
                 &descriptor,
@@ -206,15 +241,17 @@ mod tests {
                 );
             }
         }
-        assert!(insert_observations(
-            &mut BTreeMap::new(),
-            &descriptor,
-            &component,
-            &layout,
-            true,
-            &|_| Ok(false)
-        )
-        .is_err());
+        assert!(
+            insert_observations(
+                &mut SourceMap::new(),
+                &descriptor,
+                &component,
+                &layout,
+                true,
+                &|_| Ok(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -224,7 +261,7 @@ mod tests {
                         component: &ComponentGroup,
                         layout: &LocalModelLayout| {
             insert_observations(
-                &mut BTreeMap::new(),
+                &mut SourceMap::new(),
                 descriptor,
                 component,
                 layout,

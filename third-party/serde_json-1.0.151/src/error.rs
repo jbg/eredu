@@ -25,6 +25,28 @@ pub struct Error {
 pub type Result<T> = result::Result<T, Error>;
 
 impl Error {
+    pub(crate) fn custom_with_allocations(
+        msg: impl Display,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> result::Result<Self, crate::allocation::AllocationError> {
+        let allocator = crate::allocation::Allocator::new(allocation);
+        let text = allocator.format(msg)?;
+        allocator.reserve(Self::bounded_number_storage_bytes())?;
+        Ok(make_error(text))
+    }
+    pub(crate) fn invalid_type_with_allocations(
+        unexp: de::Unexpected<'_>,
+        exp: &dyn de::Expected,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> Self {
+        match Self::custom_with_allocations(
+            format_args!("invalid type: {}, expected {}", JsonUnexpected(unexp), exp),
+            allocation,
+        ) {
+            Ok(error) => error,
+            Err(error) => Self::syntax(ErrorCode::Allocation(error), 0, 0),
+        }
+    }
     /// One-based line number at which the error was detected.
     ///
     /// Characters in the first line of the input (before the first newline
@@ -45,6 +67,15 @@ impl Error {
         self.err.column
     }
 
+    /// A prospective producer refusal, distinct from JSON syntax or semantic errors.
+    pub fn allocation_error(&self) -> Option<crate::allocation::AllocationError> {
+        if let ErrorCode::Allocation(error) = self.err.code {
+            Some(error)
+        } else {
+            None
+        }
+    }
+
     /// Categorizes the cause of this error.
     ///
     /// - `Category::Io` - failure to read or write bytes on an I/O stream
@@ -53,7 +84,7 @@ impl Error {
     /// - `Category::Eof` - unexpected end of the input data
     pub fn classify(&self) -> Category {
         match self.err.code {
-            ErrorCode::Message(_) => Category::Data,
+            ErrorCode::Message(_) | ErrorCode::Allocation(_) => Category::Data,
             ErrorCode::Io(_) => Category::Io,
             ErrorCode::EofWhileParsingList
             | ErrorCode::EofWhileParsingObject
@@ -235,7 +266,10 @@ struct ErrorImpl {
 
 pub(crate) enum ErrorCode {
     /// Catchall for syntax error messages
-    Message(Box<str>),
+    Message(String),
+
+    /// A fixed failure from a prospectively admitted source producer.
+    Allocation(crate::allocation::AllocationError),
 
     /// Some I/O error occurred while serializing or deserializing.
     Io(io::Error),
@@ -311,6 +345,13 @@ pub(crate) enum ErrorCode {
 }
 
 impl Error {
+    /// Exact boxed error payload created when serialization propagates an I/O
+    /// error. The caller separately accounts for any storage owned by that I/O
+    /// error; an `ErrorKind` conversion has no such owned diagnostic payload.
+    pub fn io_storage_bytes() -> usize {
+        core::mem::size_of::<ErrorImpl>()
+    }
+
     pub(crate) fn bounded_number_storage_bytes() -> usize {
         core::mem::size_of::<ErrorImpl>()
     }
@@ -320,7 +361,9 @@ impl Error {
     pub(crate) fn relocate_number(mut self, prefix: &str) -> Self {
         let lines = prefix.bytes().filter(|byte| *byte == b'\n').count();
         if self.err.line == 1 {
-            let column = prefix.rfind('\n').map_or(prefix.len(), |at| prefix.len() - at - 1);
+            let column = prefix
+                .rfind('\n')
+                .map_or(prefix.len(), |at| prefix.len() - at - 1);
             self.err.column += column;
         }
         self.err.line += lines;
@@ -366,6 +409,7 @@ impl Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorCode::Message(msg) => f.write_str(msg),
+            ErrorCode::Allocation(error) => fmt::Display::fmt(error, f),
             ErrorCode::Io(err) => Display::fmt(err, f),
             ErrorCode::EofWhileParsingList => f.write_str("EOF while parsing a list"),
             ErrorCode::EofWhileParsingObject => f.write_str("EOF while parsing an object"),
@@ -407,6 +451,7 @@ impl serde::de::StdError for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.err.code {
             ErrorCode::Io(err) => err.source(),
+            ErrorCode::Allocation(error) => Some(error),
             _ => None,
         }
     }
@@ -449,7 +494,8 @@ impl Debug for Error {
 impl de::Error for Error {
     #[cold]
     fn custom<T: Display>(msg: T) -> Error {
-        make_error(msg.to_string())
+        Error::custom_with_allocations(msg, &crate::allocation::Unenforced)
+            .expect("ordinary JSON diagnostic allocation")
     }
 
     #[cold]
@@ -474,7 +520,8 @@ impl de::Error for Error {
 impl ser::Error for Error {
     #[cold]
     fn custom<T: Display>(msg: T) -> Error {
-        make_error(msg.to_string())
+        Error::custom_with_allocations(msg, &crate::allocation::Unenforced)
+            .expect("ordinary JSON diagnostic allocation")
     }
 }
 
@@ -500,7 +547,7 @@ fn make_error(mut msg: String) -> Error {
     let (line, column) = parse_line_col(&mut msg).unwrap_or((0, 0));
     Error {
         err: Box::new(ErrorImpl {
-            code: ErrorCode::Message(msg.into_boxed_str()),
+            code: ErrorCode::Message(msg),
             line,
             column,
         }),

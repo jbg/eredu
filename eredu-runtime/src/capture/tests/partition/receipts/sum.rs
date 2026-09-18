@@ -7,7 +7,7 @@ fn sum_authority(
 ) -> PartitionCaptureReceiptPlan {
     let slice = resolve_slice(&plan.points()[0], &plan.plan().selections[0], &[3, 20]).unwrap();
     PartitionCaptureReceiptPlan::new_sum(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(plan),
         (0..ranks)
             .map(|rank| PartitionCaptureProducer {
@@ -199,7 +199,7 @@ fn sum_authority_rejects_partial_coverage_disjoint_terms_and_forged_wire_equatio
             .collect()
     };
     assert!(PartitionCaptureReceiptPlan::new_sum(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(&plan),
         producers(vec![0..10, 10..20]),
         2,
@@ -209,7 +209,7 @@ fn sum_authority_rejects_partial_coverage_disjoint_terms_and_forged_wire_equatio
     .is_err());
     assert!(matches!(
         PartitionCaptureReceiptPlan::new(
-            plan.clone(),
+            eredu_core::capture::SharedCapturePlan::new(plan.clone()),
             context(&plan),
             producers(vec![0..20, 0..20]),
             2,

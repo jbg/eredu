@@ -5,12 +5,14 @@
 use crate::{capture::*, ObservationPoint, ObservationSupportStatus, TensorAxis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+mod admission;
+pub use admission::{InterventionDeclarationError, PreparedInterventionAdmission, InterventionAdmissionError,
+    InterventionPhaseView, PreparedInterventionPointCopy};
 
 mod geometry;
 pub use geometry::InterventionGeometryError;
 mod source;
-pub use source::{SharedInterventionPlan, PreparedInterventionPlanCopy, InterventionSourceError};
+pub use source::{SharedInterventionPlan, PreparedInterventionPlanCopy, PreparedInterventionRequestCopy, InterventionSourceError};
 mod routed;
 pub use routed::*;
 
@@ -551,6 +553,26 @@ impl InterventionPlan {
         text_origin: CaptureTextOrigin,
         session_id: &str,
     ) -> Result<AdmittedInterventionPlan, CaptureError> {
+        PreparedInterventionAdmission::inspect(&self, discovery, request,
+            invocation_bounds, text_origin, session_id)
+            .and_then(|prepared| prepared.construct(&crate::HostPreparationAuthority::unmanaged()))
+            .map_err(|error| match error {
+                InterventionAdmissionError::Declaration(error) => error,
+                InterventionAdmissionError::Copy(error) => CaptureError::Invalid(error.to_string()),
+            })
+    }
+
+    fn validate_declarations(
+        &self, discovery: &InterventionDiscovery, request: CaptureRequestShape,
+        invocation_bounds: Option<CaptureInvocationBounds>, text_origin: CaptureTextOrigin,
+        session_id: &str, scratch: &mut [u32],
+    ) -> Result<(), CaptureError> {
+        if let Some(bounds) = invocation_bounds {
+            bounds.maximum_fixed().map_err(InterventionDeclarationError::Axes)?;
+            require(request.batch == bounds.batch && request.prompt_tokens == bounds.max_sequence
+                && request.max_predictions == bounds.max_predictions,
+                "intervention invocation request differs from its bounds")?;
+        }
         require(
             self.schema_version == INTERVENTION_SCHEMA_VERSION
                 && discovery.schema_version == INTERVENTION_SCHEMA_VERSION,
@@ -583,11 +605,9 @@ impl InterventionPlan {
             "too many intervention operations",
         )?;
         let mut payload_bytes = 0;
-        let mut ids = BTreeSet::new();
-        let mut points = Vec::new();
-        for operation in &self.operations {
+        for (index, operation) in self.operations.iter().enumerate() {
             require(
-                !operation.id.is_empty() && operation.id.len() <= 128 && ids.insert(&operation.id),
+                !operation.id.is_empty() && operation.id.len() <= 128 && !self.operations[..index].iter().any(|prior| prior.id == operation.id),
                 "intervention IDs must be unique and contain 1..=128 bytes",
             )?;
             require(
@@ -605,15 +625,15 @@ impl InterventionPlan {
                 .filter(|p| p.path == operation.target);
             let point = matching
                 .next()
-                .ok_or_else(|| CaptureError::MissingPath(operation.target.clone()))?;
+                .ok_or(InterventionDeclarationError::MissingPath { operation: index })?;
             require(
                 matching.next().is_none(),
                 "ambiguous intervention target declaration",
             )?;
-            validate_operation(operation, point, request, invocation_bounds, text_origin)?;
-            points.push(point.clone());
+            validate_operation(operation, point, request, invocation_bounds, text_origin, scratch)?;
         }
-        for (index, (operation, point)) in self.operations.iter().zip(&points).enumerate() {
+        for (index, operation) in self.operations.iter().enumerate() {
+            let point = discovery.points.iter().find(|point| point.path == operation.target).expect("validated declaration");
             if point.routing.is_none() {
                 continue;
             }
@@ -642,46 +662,7 @@ impl InterventionPlan {
                 }
             }
         }
-        let mut encoded = PlanCounter(0);
-        serde_json::to_writer(&mut encoded, &self)
-            .map_err(|_| CaptureError::Invalid("intervention plan exceeds encoded bound".into()))?;
-        let identity = intervention_digest(
-            IDENTITY_PREFIX,
-            &(
-                &self,
-                &points,
-                request,
-                &discovery.artifact_identity,
-                &discovery.session_identity,
-                session_id,
-            ),
-        )?;
-        let intent_identity = intervention_digest(
-            INTENT_PREFIX,
-            &(&self, &points, request, &discovery.artifact_identity),
-        )?;
-        let (identity, intent_identity) = match invocation_bounds {
-            Some(bounds) => (
-                intervention_digest(IDENTITY_PREFIX, &("invocation", &identity, bounds))?,
-                intervention_digest(INTENT_PREFIX, &("invocation", &intent_identity, bounds))?,
-            ),
-            None if text_origin != CaptureTextOrigin::default() => (
-                intervention_digest(IDENTITY_PREFIX, &("text_origin", &identity, text_origin))?,
-                intervention_digest(INTENT_PREFIX, &("text_origin", &intent_identity, text_origin))?,
-            ),
-            None => (identity, intent_identity),
-        };
-        Ok(AdmittedInterventionPlan {
-            plan: self,
-            points,
-            request,
-            invocation_bounds,
-            text_origin,
-            identity,
-            intent_identity,
-            artifact_identity: discovery.artifact_identity.clone(),
-            session_id: session_id.into(),
-        })
+        Ok(())
     }
 }
 
@@ -702,22 +683,13 @@ fn intervention_digest_bytes(value: &impl Serialize) -> Result<[u8; 32], serde_j
     serde_json::to_writer(&mut writer, value)?;
     Ok(writer.0.finalize().into())
 }
-fn intervention_digest(prefix: &str, value: &impl Serialize) -> Result<String, CaptureError> {
-    let digest = intervention_digest_bytes(value)
-        .map_err(|e| CaptureError::Invalid(e.to_string()))?
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(format!("{prefix}-{digest}"))
-}
 struct PlanCounter(u64);
 impl std::io::Write for PlanCounter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0 = self
             .0
             .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= MAX_INTERVENTION_PLAN_BYTES)
-            .ok_or_else(|| std::io::Error::other("intervention plan bound"))?;
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::FileTooLarge))?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -907,6 +879,7 @@ fn validate_operation(
     request: CaptureRequestShape,
     invocation_bounds: Option<CaptureInvocationBounds>,
     text_origin: CaptureTextOrigin,
+    scratch: &mut [u32],
 ) -> Result<(), CaptureError> {
     if let Some(routed) = &point.routed_units {
         routed.validate(point)?;
@@ -935,17 +908,16 @@ fn validate_operation(
                 .is_none_or(|end| end > operation.schedule.first_prediction),
         "invalid intervention schedule",
     )?;
-    let mut axes = BTreeSet::new();
-    for axis in &point.axes {
+    for (index, axis) in point.axes.iter().enumerate() {
         require(
-            axes.insert(&axis.name),
+            !point.axes[..index].iter().any(|prior| prior.name == axis.name),
             "ambiguous intervention axis declaration",
         )?;
     }
-    let mut selected = BTreeSet::new();
-    for slice in &operation.slices {
+    for (index, slice) in operation.slices.iter().enumerate() {
         require(
-            selected.insert(&slice.axis) && axes.contains(&slice.axis),
+            !operation.slices[..index].iter().any(|prior| prior.axis == slice.axis)
+                && point.axes.iter().any(|axis| axis.name == slice.axis),
             "duplicate or unknown intervention axis",
         )?;
         require(
@@ -993,7 +965,7 @@ fn validate_operation(
         )?,
         InterventionEvidence::None => (),
     }
-    validate_action(&operation.action, point)?;
+    validate_action(&operation.action, point, scratch)?;
     for (phase, status) in [
         (CapturePhase::Prefill, &point.prefill),
         (CapturePhase::Decode, &point.decode),
@@ -1012,20 +984,33 @@ fn validate_operation(
                 status,
                 ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
             ) {
-                return Err(CaptureError::Unsupported(format!(
-                    "intervention {} {phase:?}: {status:?}",
-                    point.path
-                )));
+                return Err(InterventionDeclarationError::Unsupported(
+                    "intervention phase is unsupported by the selected declaration").into());
             }
-            let geometry = point.observation_geometry();
             let actual = match invocation_bounds {
-                Some(bounds) => bounds.maximum()?,
+                Some(bounds) => bounds.maximum_fixed().map_err(InterventionDeclarationError::Axes)?,
                 None => text_origin.invocation_shape(request, phase, last)?,
             };
-            actual.validate_slices(&geometry, &operation.slices)?;
-            if let Some(shape) = actual.resolve(&geometry)? {
-                let slice = operation.resolve_slice(point, &shape)?;
-                validate_payload_shape(&operation.action, &slice.shape)?;
+            let rank = point.axes.len();
+            let mut shape = [0; 32];
+            let known = actual.resolve_axes_into(&point.axes, &mut shape[..rank])
+                .map_err(InterventionDeclarationError::Axes)?;
+            for (index, slice) in operation.slices.iter().enumerate() {
+                let axis = point.axes.iter().find(|axis| axis.name == slice.axis).expect("checked axis");
+                if actual.extent_fixed(&axis.dimension).map_err(InterventionDeclarationError::Axes)?
+                    .is_some_and(|extent| slice.end > extent) {
+                    return Err(InterventionDeclarationError::Slice(CaptureSliceDestinationError::Range { index }).into());
+                }
+            }
+            if known {
+                let mut starts = [0; 32];
+                let mut ends = [0; 32];
+                let mut strides = [0; 32];
+                let mut selected = [0; 32];
+                resolve_slice_into(Some(&point.axes), &operation.slices, &shape[..rank],
+                    &mut starts[..rank], &mut ends[..rank], &mut strides[..rank], &mut selected[..rank])
+                    .map_err(InterventionDeclarationError::Slice)?;
+                validate_payload_shape(&operation.action, &selected[..rank])?;
             }
         }
     }
@@ -1072,7 +1057,7 @@ fn validate_activation_parameters(
         }
         A::MaskComponents { indices, .. } => {
             let width = vocabulary.ok_or_else(|| {
-                CaptureError::Unsupported("component mask requires a known component extent".into())
+                CaptureError::from(InterventionDeclarationError::Unsupported("component mask requires a known component extent"))
             })?;
             require(
                 unique_ids_in_range(indices, width),
@@ -1081,7 +1066,7 @@ fn validate_activation_parameters(
         }
         A::MaskLogits { token_ids, .. } => {
             let vocabulary = vocabulary.ok_or_else(|| {
-                CaptureError::Unsupported("logit mask requires known vocabulary extent".into())
+                CaptureError::from(InterventionDeclarationError::Unsupported("logit mask requires known vocabulary extent"))
             })?;
             validate_ids(token_ids, vocabulary)?;
             require(
@@ -1091,9 +1076,7 @@ fn validate_activation_parameters(
         }
         A::Zero { .. } => (),
         _ => {
-            return Err(CaptureError::Invalid(
-                "routing action cannot replace an activation".into(),
-            ))
+            return Err(InterventionDeclarationError::Invalid("routing action cannot replace an activation").into())
         }
     }
     Ok(())
@@ -1102,6 +1085,7 @@ fn validate_activation_parameters(
 fn validate_action(
     action: &InterventionAction,
     point: &InterventionPoint,
+    scratch: &mut [u32],
 ) -> Result<(), CaptureError> {
     use InterventionAction as A;
     if action.dtype().is_some() {
@@ -1122,7 +1106,7 @@ fn validate_action(
             let axis = point
                 .axes
                 .last()
-                .ok_or_else(|| CaptureError::Invalid("component mask needs an axis".into()))?;
+                .ok_or_else(|| CaptureError::from(InterventionDeclarationError::Invalid("component mask needs an axis")))?;
             require(
                 axis.name == "component",
                 "component masks require a declared final component axis",
@@ -1145,7 +1129,7 @@ fn validate_action(
             let policy = point
                 .routing
                 .as_ref()
-                .ok_or_else(|| CaptureError::Invalid("missing routing policy".into()))?;
+                .ok_or_else(|| CaptureError::from(InterventionDeclarationError::Invalid("missing routing policy")))?;
             require(
                 point.stage == InterventionStage::RoutingBeforeDispatch,
                 "routing control requires pre-dispatch target",
@@ -1176,9 +1160,10 @@ fn validate_action(
                 for row in expert_ids.chunks(policy.top_k as usize) {
                     validate_ids(row, policy.expert_count)?;
                     let width = policy.expert_count / policy.groups;
-                    let groups: BTreeSet<_> = row.iter().map(|id| id / width).collect();
+                    let groups = row.iter().enumerate().filter(|(index, id)|
+                        !row[..*index].iter().any(|prior| prior / width == **id / width)).count();
                     require(
-                        groups.len() <= policy.selected_groups as usize,
+                        groups <= policy.selected_groups as usize,
                         "forced IDs exceed architecture's selected-group count",
                     )?;
                 }
@@ -1194,7 +1179,9 @@ fn validate_action(
                 // eligible members. This conservative condition prevents -inf IDs
                 // from silently entering a dispatch after group selection.
                 let width = policy.expert_count / policy.groups;
-                let mut available = vec![width; policy.groups as usize];
+                let available = scratch.get_mut(..policy.groups as usize)
+                    .ok_or(InterventionDeclarationError::Invalid("routing scratch capacity differs"))?;
+                available.fill(width);
                 for id in expert_ids {
                     available[(id / width) as usize] -= 1;
                 }
@@ -1270,11 +1257,11 @@ fn unique_ids_in_range(ids: &[u32], count: u32) -> bool {
     true
 }
 
-fn require(condition: bool, message: &str) -> Result<(), CaptureError> {
+fn require(condition: bool, message: &'static str) -> Result<(), CaptureError> {
     if condition {
         Ok(())
     } else {
-        Err(CaptureError::Invalid(message.into()))
+        Err(InterventionDeclarationError::Invalid(message).into())
     }
 }
 

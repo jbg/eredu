@@ -8,7 +8,7 @@ use crate::{
         PreparedReplicatedTextModules, PreparedRoutedCompositeTextArchitecture,
     },
 };
-use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
+use eredu_nn::{ParameterVisitor, Parameterized};
 use std::collections::BTreeMap;
 mod partitioned;
 pub use partitioned::{PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations};
@@ -206,8 +206,8 @@ fn collect(
         duplicate: Option<String>,
     }
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Collector {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a WorkspaceTensor) {
-            let name = metadata.id.as_str().to_owned();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
+            let name = metadata.id().as_str().to_owned();
             if self
                 .values
                 .insert(name.clone(), value.layout().clone())
@@ -218,9 +218,9 @@ fn collect(
         }
     }
     let mut collector = Collector::default();
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector).map_err(Error::backend_retained_source)?;
     if let Some(parameter) = collector.duplicate {
-        return Err(Error::backend_source(
+        return Err(Error::backend_retained_source(
             eredu_runtime::ModuleBindingPlanError::DuplicateParameter { parameter },
         ));
     }

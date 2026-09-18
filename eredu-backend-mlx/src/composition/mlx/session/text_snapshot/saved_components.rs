@@ -53,17 +53,23 @@ impl MlxSavedTextComponents {
     pub(super) fn original_resume_preparation_bytes(
         &self,
         runtime: &ModelRuntime<MlxBackend<'_>>,
+        config: eredu_core::TextGenerationConfig,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<u64, eredu_runtime::working_memory::WorkingMemoryError> {
         use crate::composition::mlx::session::model_session::saved_array_copy::decoder::PreparedSavedTextResumeQuote;
         use eredu_runtime::working_memory::WorkingMemoryError;
         let source = self
             .funded_source_fixed()
             .ok_or(WorkingMemoryError::UnknownBound)?;
+        PreparedSavedTextResumeQuote::validate_resume_options(source, config, options)?;
         let bytes =
             PreparedSavedTextResumeQuote::known_source_preparation_component_bytes(runtime, source)
                 .map_err(|cause| cause.into_memory())?;
         let parts = [
             bytes,
+            std::mem::size_of::<eredu_core::OriginalTextResumeOptions<'_>>(),
+            std::mem::size_of::<eredu_core::SamplingStateFacts>(),
+            std::mem::size_of::<Result<eredu_runtime::execution_control::ValidatedSamplingOverride, eredu_core::SamplingOverrideError<Error>>>(),
             std::mem::size_of::<Option<&CopiedTextComponentsOwner>>(),
             std::mem::size_of::<Result<u64, WorkingMemoryError>>(),
             std::mem::size_of::<Result<Option<u64>, WorkingMemoryError>>(),
@@ -80,7 +86,10 @@ impl MlxSavedTextComponents {
         &self,
         runtime: &ModelRuntime<MlxBackend<'_>>,
         config: eredu_core::TextGenerationConfig,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Option<SnapshotEstimate> {
+        model_session::saved_array_copy::decoder::PreparedSavedTextResumeQuote::validate_resume_options(
+            self.funded_source_fixed()?, config, options).ok()?;
         cold_estimate::resume(
             self.funded_source_fixed()?
                 .logical_resume_source(runtime, config)?,

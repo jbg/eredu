@@ -169,7 +169,7 @@ struct SourceFailure {
     #[source]
     cause: SourceCause,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl TerminalCommunicationBackend for WorkspaceBackend {
     fn mark_terminal_submission(group: &WorkspaceCommunicationGroup) {
@@ -261,7 +261,7 @@ impl CommunicationBackend for WorkspaceBackend {
     fn with_prepared_publication_group<T, E, F>(
         group: &WorkspaceCommunicationGroup,
         prepared: &WorkspaceParallelContext,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         executor: &WorkspaceContext,
         run: F,
     ) -> Result<Result<T, E>, Error>
@@ -276,7 +276,7 @@ impl CommunicationBackend for WorkspaceBackend {
             Result<Result<T, E>, Error>,
             &WorkspaceCommunicationGroup,
             &WorkspaceParallelContext,
-            &WorkspaceMetadataFunding,
+            &HostMetadataFunding,
         )>())?;
         group.select(CommunicationOperation::Broadcast, executor)?;
         if prepared.rank() != group.source.manifest().rank()
@@ -298,9 +298,9 @@ impl CommunicationBackend for WorkspaceBackend {
         let funding = route
             .context
             .metadata_funding()
-            .ok_or_else(|| BackendFailure::from(WorkspaceMetadataFundingError::Unavailable))?;
+            .ok_or_else(|| BackendFailure::from(HostMetadataFundingError::Unavailable))?;
         let bytes = BackendFailure::source_retention_peak_bytes::<SourceFailure>()
-            .ok_or_else(|| BackendFailure::from(WorkspaceMetadataFundingError::Overflow))?;
+            .ok_or_else(|| BackendFailure::from(HostMetadataFundingError::Overflow))?;
         funding
             .reserve_metadata(bytes)
             .map_err(BackendFailure::from)?;
@@ -360,7 +360,53 @@ impl CommunicationBackend for WorkspaceBackend {
         completed((), executor)
     }
 }
+#[derive(Debug, thiserror::Error)]
+enum WaveCause<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Operation(Error),
+    #[error(transparent)]
+    Validation(E),
+}
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+struct WaveFailure<E: std::error::Error + 'static> {
+    #[source]
+    cause: WaveCause<E>,
+    source: RetainedCommunicationSource,
+    funding: HostMetadataFunding,
+}
 impl SumReductionBackend for WorkspaceBackend {
+    fn complete_model_sum_wave<E,V>(values:&[WorkspaceTensor],group:&WorkspaceCommunicationGroup,
+        _context:&WorkspaceParallelContext,executor:&WorkspaceContext,mut validate:V)
+        ->Result<Option<Vec<WorkspaceTensor>>,BackendFailure>
+    where E: std::error::Error + Send + Sync + 'static,
+          V:FnMut(&[WorkspaceTensor],&HostMetadataFunding,bool)->Result<(),E> {
+        let funding=executor.metadata_funding().ok_or_else(||HostMetadataFundingError::Unavailable.into_backend_failure())?;
+        let frames=std::mem::size_of::<(
+            &[WorkspaceTensor], &WorkspaceCommunicationGroup, &WorkspaceParallelContext,
+            &WorkspaceContext, Vec<WorkspaceTensor>, Vec<&WorkspaceTensor>, V,
+            std::slice::Iter<'_, WorkspaceTensor>, Result<Vec<WorkspaceTensor>, WaveCause<E>>,
+            Result<(),E>, HostMetadataFunding, Option<HostMetadataFunding>, WaveFailure<E>, WaveCause<E>,
+        )>().checked_add(BackendFailure::source_retention_peak_bytes::<WaveFailure<E>>()
+            .ok_or_else(||HostMetadataFundingError::Overflow.into_backend_failure())?)
+            .ok_or_else(||HostMetadataFundingError::Overflow.into_backend_failure())?;
+        funding.reserve_metadata(frames).map_err(HostMetadataFundingError::into_backend_failure)?;
+        let run=(|| ->Result<Vec<WorkspaceTensor>,WaveCause<E>> {
+            // Validate source identity even for an empty wave.
+            group.select(CommunicationOperation::AllReduceSum,executor).map_err(WaveCause::Operation)?;
+            validate(values,&funding,false).map_err(WaveCause::Validation)?;
+            let mut outputs=executor.metadata_vec(values.len()).map_err(WaveCause::Operation)?;
+            for value in values { outputs.push(Self::all_reduce_sum(value.clone(),group,executor).map_err(WaveCause::Operation)?.output); }
+            let mut roots=executor.metadata_vec(outputs.len()).map_err(WaveCause::Operation)?;
+            roots.extend(outputs.iter());
+            if !roots.is_empty() { executor.complete_values(&roots).map_err(WaveCause::Operation)?; }
+            validate(&outputs,&funding,true).map_err(WaveCause::Validation)?;
+            Ok(outputs)
+        })();
+        run.map(Some).map_err(|cause|BackendFailure::from_error(WaveFailure {
+            cause,source:group.source.clone(),funding:funding.clone(),
+        }))
+    }
     fn complete_model_sum(value:&WorkspaceTensor, group:&WorkspaceCommunicationGroup,
         _context:&WorkspaceParallelContext, executor:&WorkspaceContext)
         ->Result<Option<WorkspaceTensor>,Error>{
@@ -580,16 +626,16 @@ impl CommunicationTensorMetadata<WorkspaceBackend> for WorkspaceCommunicationMet
         &self,
         tensor: &WorkspaceTensor,
         shape: &[i32],
-        funding: &WorkspaceMetadataFunding,
-    ) -> Result<Option<bool>, WorkspaceMetadataFundingError> {
+        funding: &HostMetadataFunding,
+    ) -> Result<Option<bool>, HostMetadataFundingError> {
         funding.reserve_metadata(size_of::<(&WorkspaceTensor, &[i32], Option<bool>)>())?;
         Ok(Some(tensor.shape() == shape))
     }
     fn fixed_metadata_with_funding(
         &self,
         tensor: &WorkspaceTensor,
-        funding: &WorkspaceMetadataFunding,
-    ) -> Result<Option<(TensorDtype, usize, Option<usize>)>, WorkspaceMetadataFundingError> {
+        funding: &HostMetadataFunding,
+    ) -> Result<Option<(TensorDtype, usize, Option<usize>)>, HostMetadataFundingError> {
         funding.reserve_metadata(size_of::<(
             &WorkspaceTensor,
             TensorDtype,

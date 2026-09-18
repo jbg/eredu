@@ -4,13 +4,17 @@
 //! decoding, stop matching, and semantic events. This module supplies only the
 //! checkpoint-specific Python surface grammar and its incremental normalizer.
 
-use std::collections::BTreeSet;
+use super::grammar_text::{
+    Error as GrammarError, Literal, Quoted, StructuralTokens, Text as GrammarText, field_sequence,
+    is_required, repeated_rule,
+};
+use crate::runtime::chat::tool_schema::ToolDefinition;
+use llguidance::derivre::ParserAllocationFunding;
 
-use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
 
 use crate::{
-    runtime::chat::constraints::{parse_tools, tool_call_bounds},
+    runtime::chat::constraints::tool_call_bounds,
     runtime::chat::dialect::{
         ConstraintConfiguration, DialectParameters, FormatDialect, GenerationPromptBehavior,
     },
@@ -43,27 +47,29 @@ impl Lfm2Dialect {
     }
 
     fn grammar(
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-    ) -> Result<String, String> {
+        funding: &ParserAllocationFunding,
+    ) -> Result<String, GrammarError> {
         if STRUCTURAL_TOKENS.len() != structural_token_ids.len() {
-            return Err(format!(
-                "LFM2 declares {} structural tokens but {} tokenizer IDs were resolved",
-                STRUCTURAL_TOKENS.len(),
-                structural_token_ids.len()
-            ));
+            return Err(funding
+                .try_format(format_args!(
+                    "LFM2 declares {} structural tokens but {} tokenizer IDs were resolved",
+                    STRUCTURAL_TOKENS.len(),
+                    structural_token_ids.len()
+                ))?
+                .into());
         }
 
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__eredu_lfm2_tools_disabled__\"\n".into());
+            return Ok(funding.try_copy_str("start: \"__eredu_lfm2_tools_disabled__\"\n")?);
         }
 
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
-        let tools = parse_tools(tools)?;
-        for tool in &tools {
-            validate_function_name(&tool.name)?;
+        for tool in tools {
+            validate_function_name(&tool.name).map_err(|error| error.grammar(funding))?;
             for name in tool
                 .parameters
                 .get("properties")
@@ -71,62 +77,59 @@ impl Lfm2Dialect {
                 .into_iter()
                 .flat_map(|properties| properties.keys())
             {
-                validate_identifier(name, "tool argument name")?;
+                validate_identifier(name, "tool argument name")
+                    .map_err(|error| error.grammar(funding))?;
             }
         }
 
-        let calls = repeated_rule("python_call", "\", \"", 1, maximum);
-        let structural =
-            |text: &str| structural_literal(text, STRUCTURAL_TOKENS, structural_token_ids);
-
-        let mut builder = PythonGrammarBuilder::default();
-        let alternatives = tools
-            .iter()
-            .enumerate()
-            .map(|(index, tool)| {
-                let arguments = builder.arguments_rule(&tool.parameters)?;
-                Ok(format!(
-                    "python_call_{index}: {} \"(\" {arguments} \")\"\n",
-                    literal(&tool.name)
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-
-        let mut grammar = format!(
+        let calls = repeated_rule("python_call", "\", \"", 1, maximum, funding)?;
+        let structural = StructuralTokens::new(STRUCTURAL_TOKENS, structural_token_ids)?;
+        let mut builder = PythonGrammarBuilder {
+            next_rule: 0,
+            rules: GrammarText::new(funding)?,
+            funding,
+        };
+        let mut grammar = GrammarText::new(funding)?;
+        grammar.push_fmt(format_args!(
             "start: {} \"[\" {calls} \"]\" {}\n",
-            structural(TOOL_CALL_START)?,
-            structural(TOOL_CALL_END)?,
-        );
-        if alternatives.is_empty() {
-            grammar.push_str("python_call: \"__eredu_unreachable_lfm2_function_call__\"\n");
+            structural.literal(TOOL_CALL_START),
+            structural.literal(TOOL_CALL_END),
+        ))?;
+        if tools.is_empty() {
+            grammar.push_str("python_call: \"__eredu_unreachable_lfm2_function_call__\"\n")?;
         } else {
-            grammar.push_str(&format!(
-                "python_call: {}\n",
-                (0..alternatives.len())
-                    .map(|index| format!("python_call_{index}"))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ));
-            for alternative in alternatives {
-                grammar.push_str(&alternative);
+            grammar.push_str("python_call: ")?;
+            for index in 0..tools.len() {
+                if index != 0 {
+                    grammar.push_str(" | ")?;
+                }
+                grammar.push_fmt(format_args!("python_call_{index}"))?;
+            }
+            grammar.push_str("\n")?;
+            for (index, tool) in tools.iter().enumerate() {
+                let arguments = builder.arguments_rule(&tool.parameters)?;
+                grammar.push_fmt(format_args!(
+                    "python_call_{index}: {} \"(\" {arguments} \")\"\n",
+                    Literal(tool.name)
+                ))?;
             }
         }
-        grammar.push_str(&builder.rules);
+        grammar.push_str(&builder.rules.finish())?;
         grammar.push_str(r#"python_value: PY_SINGLE_STRING | PY_DOUBLE_STRING | PY_NUMBER | "True" | "False" | "None" | "true" | "false" | "null" | python_any_mapping | python_any_array
 python_any_mapping: "{" (python_pair (", " python_pair)*)? "}"
 python_pair: (PY_SINGLE_STRING | PY_DOUBLE_STRING) ": " python_value
 python_any_array: "[" (python_value (", " python_value)*)? "]"
 python_any_arguments: (python_argument (", " python_argument)*)?
 python_argument: /[a-zA-Z_][a-zA-Z0-9_]*/ "=" python_value
-"#);
+"#)?;
         grammar.push_str(
             r#"PY_INTEGER: /-?(0|[1-9][0-9]*)/
 PY_NUMBER: /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/
 PY_SINGLE_STRING: /'([^'\\\x00-\x1f]|\\(['"\\\/bfnrt]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*'/
 PY_DOUBLE_STRING: /"([^"\\\x00-\x1f]|\\(['"\\\/bfnrt]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*"/
 "#,
-        );
-        Ok(grammar)
+        )?;
+        Ok(grammar.finish())
     }
 }
 
@@ -157,19 +160,24 @@ impl FormatDialect for Lfm2Dialect {
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
-        tools: &[Value],
+        tools: &[ToolDefinition<'_>],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<Lfm2Parameters>()?;
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(Self::grammar(
-                tools,
-                tool_choice,
-                parallel_tool_calls,
-                resolved_structural_token_ids,
-            )?),
+            grammar: crate::runtime::chat::grammar_text::lark(
+                Self::grammar(
+                    tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    resolved_structural_token_ids,
+                    funding,
+                )?,
+                funding,
+            )?,
         })
     }
 
@@ -178,32 +186,35 @@ impl FormatDialect for Lfm2Dialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        Self::parameters(parameters)?;
+        funding: &ParserAllocationFunding,
+    ) -> Result<ConstraintConfiguration, GrammarError> {
+        parameters.custom_fixed::<Lfm2Parameters>()?;
         if resolved_structural_token_ids.len() != STRUCTURAL_TOKENS.len() {
-            return Err(format!(
-                "LFM2 declares {} structural tokens but {} tokenizer IDs were resolved",
-                STRUCTURAL_TOKENS.len(),
-                resolved_structural_token_ids.len()
-            ));
+            return Err(funding
+                .try_format(format_args!(
+                    "LFM2 declares {} structural tokens but {} tokenizer IDs were resolved",
+                    STRUCTURAL_TOKENS.len(),
+                    resolved_structural_token_ids.len()
+                ))?
+                .into());
         }
         // The disabled-tool placeholder is only used to obtain tokenizer data
         // for forbidden-trigger sampling. Ordinary replies need a text grammar
         // that ends at the assistant message boundary, never a tool-call end.
-        let terminal_ids = std::iter::once(resolved_structural_token_ids[2])
-            .chain(eos_token_ids.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let terminals = terminal_ids
-            .into_iter()
-            .map(|id| format!("<[{id}]>"))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        let terminals = super::grammar_text::Terminals::new(
+            std::iter::once(resolved_structural_token_ids[2]).chain(eos_token_ids.iter().copied()),
+            funding,
+        )?;
+
         Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(format!(
-                "start: LFM2_TEXT* terminal\n\
+            grammar: crate::runtime::chat::grammar_text::lark(
+                funding.try_format(format_args!(
+                    "start: LFM2_TEXT* terminal\n\
                  LFM2_TEXT: /[^<]|<[^|]/\n\
                  terminal: {terminals}\n"
-            )),
+                ))?,
+                funding,
+            )?,
         })
     }
 
@@ -240,76 +251,48 @@ impl FormatDialect for Lfm2Dialect {
     }
 }
 
-fn literal(text: &str) -> String {
-    serde_json::to_string(text).expect("strings serialize as Lark literals")
+#[derive(Debug)]
+struct IdentifierError<'a> {
+    name: &'a str,
+    kind: &'a str,
 }
-
-fn structural_literal(
-    text: &str,
-    structural_tokens: &[&str],
-    structural_token_ids: &[u32],
-) -> Result<String, String> {
-    let mut sequence = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let Some((position, structural_index)) = structural_tokens
-            .iter()
-            .enumerate()
-            .filter_map(|(index, token)| remaining.find(token).map(|position| (position, index)))
-            .min_by_key(|(position, index)| (*position, *index))
-        else {
-            sequence.push(literal(remaining));
-            break;
-        };
-        if position > 0 {
-            sequence.push(literal(&remaining[..position]));
+impl std::fmt::Display for IdentifierError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LFM2 {} {:?} is not a valid Python identifier",
+            self.kind, self.name
+        )
+    }
+}
+impl IdentifierError<'_> {
+    fn grammar(self, funding: &ParserAllocationFunding) -> GrammarError {
+        match funding.try_format(format_args!("{self}")) {
+            Ok(message) => GrammarError::Policy(message),
+            Err(error) => error.into(),
         }
-        sequence.push(format!("<[{}]>", structural_token_ids[structural_index]));
-        remaining = &remaining[position + structural_tokens[structural_index].len()..];
-    }
-    if sequence.is_empty() {
-        sequence.push(literal(""));
-    }
-    Ok(sequence.join(" "))
-}
-
-fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<usize>) -> String {
-    let tail = format!("({separator} {item})");
-    let required = std::iter::once(item.to_owned())
-        .chain(std::iter::repeat_n(tail.clone(), minimum.saturating_sub(1)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    match maximum {
-        Some(maximum) if maximum == minimum => required,
-        Some(maximum) => format!("{required} {tail}{{0,{}}}", maximum - minimum),
-        None => format!("{required} {tail}*"),
     }
 }
-
-fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
-    // Check the lexical spelling only. LFM2 templates render argument keys
-    // verbatim as name=value, including Python keywords. These keys become
-    // JSON object members; the calls are never executed as Python.
+fn validate_identifier<'a>(name: &'a str, kind: &'a str) -> Result<(), IdentifierError<'a>> {
+    // Keys become JSON members; Python keyword spellings are permitted.
     let mut characters = name.chars();
     let valid = characters
         .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && characters.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if valid {
         Ok(())
     } else {
-        Err(format!(
-            "LFM2 {kind} {name:?} is not a valid Python identifier"
-        ))
+        Err(IdentifierError { name, kind })
     }
 }
-
-fn validate_function_name(name: &str) -> Result<(), String> {
+fn validate_function_name(name: &str) -> Result<(), IdentifierError<'_>> {
     validate_identifier(name, "tool function name")?;
     if PYTHON_KEYWORDS.contains(&name) {
-        return Err(format!(
-            "LFM2 tool function name {name:?} is not a valid Python identifier"
-        ));
+        return Err(IdentifierError {
+            name,
+            kind: "tool function name",
+        });
     }
     Ok(())
 }
@@ -321,115 +304,125 @@ const PYTHON_KEYWORDS: &[&str] = &[
     "with", "yield",
 ];
 
-#[derive(Default)]
-struct PythonGrammarBuilder {
+struct PythonGrammarBuilder<'a> {
+    funding: &'a ParserAllocationFunding,
     next_rule: usize,
-    rules: String,
+    rules: GrammarText<'a>,
 }
 
-impl PythonGrammarBuilder {
-    fn rule_name(&mut self, stem: &str) -> String {
-        let name = format!("{stem}_{}", self.next_rule);
-        self.next_rule += 1;
-        name
+impl PythonGrammarBuilder<'_> {
+    fn rule_name(&mut self, stem: &str) -> Result<String, GrammarError> {
+        let name = self
+            .funding
+            .try_format(format_args!("{stem}_{}", self.next_rule))?;
+        self.next_rule = self
+            .next_rule
+            .checked_add(1)
+            .ok_or(GrammarError::Overflow)?;
+        Ok(name)
     }
 
-    fn arguments_rule(&mut self, schema: &Value) -> Result<String, String> {
+    fn arguments_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
         self.object_rule(schema, ObjectSurface::Arguments)
     }
 
-    fn schema_rule(&mut self, schema: &Value) -> Result<String, String> {
+    fn schema_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            return values
-                .iter()
-                .map(python_value_literal)
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| format!("({})", values.join(" | ")));
+            let mut output = GrammarText::new(self.funding)?;
+            output.push_str("(")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(" | ")?;
+                }
+                python_value_literal(&mut output, value)?;
+            }
+            output.push_str(")")?;
+            return Ok(output.finish());
         }
-        match schema.get("type").and_then(Value::as_str) {
-            Some("object") => self.object_rule(schema, ObjectSurface::Mapping),
-            Some("array") => self.array_rule(schema),
-            Some("string") => Ok("(PY_SINGLE_STRING | PY_DOUBLE_STRING)".into()),
-            Some("integer") => Ok("PY_INTEGER".into()),
-            Some("number") => Ok("PY_NUMBER".into()),
-            Some("boolean") => Ok("(\"True\" | \"False\" | \"true\" | \"false\")".into()),
-            Some("null") => Ok("(\"None\" | \"null\")".into()),
-            _ => Ok("python_value".into()),
-        }
+        let rule = match schema.get("type").and_then(Value::as_str) {
+            Some("object") => return self.object_rule(schema, ObjectSurface::Mapping),
+            Some("array") => return self.array_rule(schema),
+            Some("string") => "(PY_SINGLE_STRING | PY_DOUBLE_STRING)",
+            Some("integer") => "PY_INTEGER",
+            Some("number") => "PY_NUMBER",
+            Some("boolean") => "(\"True\" | \"False\" | \"true\" | \"false\")",
+            Some("null") => "(\"None\" | \"null\")",
+            _ => "python_value",
+        };
+        Ok(self.funding.try_copy_str(rule)?)
     }
 
-    fn object_rule(&mut self, schema: &Value, surface: ObjectSurface) -> Result<String, String> {
+    fn object_rule(
+        &mut self,
+        schema: &Value,
+        surface: ObjectSurface,
+    ) -> Result<String, GrammarError> {
         if !crate::runtime::chat::tool_schema::has_simple_properties(schema) {
-            return Ok(match surface {
+            return Ok(self.funding.try_copy_str(match surface {
                 ObjectSurface::Arguments => "python_any_arguments",
                 ObjectSurface::Mapping => "python_any_mapping",
-            }
-            .into());
+            })?);
         }
         let object_rule = self.rule_name(match surface {
             ObjectSurface::Arguments => "python_arguments",
             ObjectSurface::Mapping => "python_mapping",
-        });
-        let first_rule = self.rule_name("python_first_field");
-        let properties = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let required = schema
-            .get("required")
-            .and_then(Value::as_array)
+        })?;
+        let first_rule = self.rule_name("python_first_field")?;
+        let properties = schema.get("properties").and_then(Value::as_object);
+        let mut fields = Vec::new();
+        for (name, field_schema) in properties
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<BTreeSet<_>>();
-        let fields = properties.into_iter().collect::<Vec<_>>();
-
+            .flat_map(|properties| properties.iter())
+        {
+            let value = self.schema_rule(field_schema)?;
+            let rule = match surface {
+                ObjectSurface::Arguments => self
+                    .funding
+                    .try_format(format_args!("{} \"=\" {value}", Literal(name)))?,
+                ObjectSurface::Mapping => self
+                    .funding
+                    .try_format(format_args!("{} \": \" {value}", Quoted(Literal(name))))?,
+            };
+            self.funding
+                .try_push(&mut fields, (is_required(schema, name), rule))?;
+        }
         if fields.is_empty() {
-            self.rules.push_str(&match surface {
-                ObjectSurface::Arguments => format!("{object_rule}: \"\"\n"),
-                ObjectSurface::Mapping => format!("{object_rule}: \"{{\" \"}}\"\n"),
-            });
+            match surface {
+                ObjectSurface::Arguments => {
+                    self.rules.push_fmt(format_args!("{object_rule}: \"\"\n"))?
+                }
+                ObjectSurface::Mapping => self
+                    .rules
+                    .push_fmt(format_args!("{object_rule}: \"{{\" \"}}\"\n"))?,
+            }
             return Ok(object_rule);
         }
-
-        let field_rules = fields
-            .iter()
-            .map(|(name, schema)| {
-                let value = self.schema_rule(schema)?;
-                Ok(match surface {
-                    ObjectSurface::Arguments => {
-                        format!("{} \"=\" {value}", literal(name))
-                    }
-                    ObjectSurface::Mapping => {
-                        format!("{} \": \" {value}", literal(&json_key(name)))
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let suffix_rules = (0..fields.len())
-            .map(|_| self.rule_name("python_field_suffix"))
-            .collect::<Vec<_>>();
-
-        let first = field_sequence(&fields, &field_rules, &suffix_rules, &required, 0, false);
-        self.rules.push_str(&format!("{first_rule}: {first}\n"));
-        for index in 0..fields.len() {
-            let suffix =
-                field_sequence(&fields, &field_rules, &suffix_rules, &required, index, true);
-            self.rules
-                .push_str(&format!("{}: {suffix}\n", suffix_rules[index]));
+        let mut suffix_rules = Vec::new();
+        for _ in 0..fields.len() {
+            let rule = self.rule_name("python_field_suffix")?;
+            self.funding.try_push(&mut suffix_rules, rule)?;
         }
-        self.rules.push_str(&match surface {
-            ObjectSurface::Arguments => format!("{object_rule}: {first_rule}\n"),
-            ObjectSurface::Mapping => {
-                format!("{object_rule}: \"{{\" {first_rule} \"}}\"\n")
-            }
-        });
+        self.rules.push_fmt(format_args!("{first_rule}: "))?;
+        field_sequence(&mut self.rules, &fields, &suffix_rules, 0, "")?;
+        self.rules.push_str("\n")?;
+        for (index, rule) in suffix_rules.iter().enumerate() {
+            self.rules.push_fmt(format_args!("{rule}: "))?;
+            field_sequence(&mut self.rules, &fields, &suffix_rules, index, "\", \"")?;
+            self.rules.push_str("\n")?;
+        }
+        match surface {
+            ObjectSurface::Arguments => self
+                .rules
+                .push_fmt(format_args!("{object_rule}: {first_rule}\n"))?,
+            ObjectSurface::Mapping => self
+                .rules
+                .push_fmt(format_args!("{object_rule}: \"{{\" {first_rule} \"}}\"\n"))?,
+        }
         Ok(object_rule)
     }
 
-    fn array_rule(&mut self, schema: &Value) -> Result<String, String> {
-        let rule = self.rule_name("python_array");
+    fn array_rule(&mut self, schema: &Value) -> Result<String, GrammarError> {
+        let rule = self.rule_name("python_array")?;
         let item = self.schema_rule(schema.get("items").unwrap_or(&Value::Bool(true)))?;
         let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
         let maximum = schema
@@ -437,23 +430,31 @@ impl PythonGrammarBuilder {
             .and_then(Value::as_u64)
             .map(|value| value as usize);
         if minimum > 4096 || maximum.is_some_and(|max| minimum > max || max > 4096) {
-            return Ok("python_any_array".into());
+            return Ok(self.funding.try_copy_str("python_any_array")?);
         }
-        let items = if maximum == Some(0) {
-            String::new()
+        self.rules.push_fmt(format_args!("{rule}: \"[\" "))?;
+        if maximum == Some(0) {
         } else if minimum == 0 {
             match maximum {
-                Some(1) => format!("{item}?"),
-                Some(maximum) => {
-                    format!("({item} (\", \" {item}){{0,{}}})?", maximum - 1)
-                }
-                None => format!("({item} (\", \" {item})*)?"),
+                Some(1) => self.rules.push_fmt(format_args!("{item}?"))?,
+                Some(maximum) => self.rules.push_fmt(format_args!(
+                    "({item} (\", \" {item}){{0,{}}})?",
+                    maximum - 1
+                ))?,
+                None => self
+                    .rules
+                    .push_fmt(format_args!("({item} (\", \" {item})*)?"))?,
             }
         } else {
-            repeated_rule(&item, "\", \"", minimum, maximum)
-        };
-        self.rules
-            .push_str(&format!("{rule}: \"[\" {items} \"]\"\n"));
+            self.rules.push_str(&repeated_rule(
+                &item,
+                "\", \"",
+                minimum,
+                maximum,
+                self.funding,
+            )?)?;
+        }
+        self.rules.push_str(" \"]\"\n")?;
         Ok(rule)
     }
 }
@@ -464,95 +465,66 @@ enum ObjectSurface {
     Mapping,
 }
 
-fn field_sequence(
-    fields: &[(String, Value)],
-    field_rules: &[String],
-    suffix_rules: &[String],
-    required: &BTreeSet<&str>,
-    index: usize,
-    comma: bool,
-) -> String {
-    if index >= fields.len() {
-        return literal("");
-    }
-    let prefix = if comma { "\", \"" } else { "" };
-    let tail = suffix_rules
-        .get(index + 1)
-        .map(String::as_str)
-        .unwrap_or("");
-    let selected = format!("{prefix} {} {tail}", field_rules[index]);
-    if required.contains(fields[index].0.as_str()) {
-        selected
-    } else {
-        let skipped = field_sequence(
-            fields,
-            field_rules,
-            suffix_rules,
-            required,
-            index + 1,
-            comma,
-        );
-        format!("{selected} | {skipped}")
-    }
-}
-
-fn json_key(value: &str) -> String {
-    serde_json::to_string(value).expect("object keys serialize")
-}
-
-fn python_value_literal(value: &Value) -> Result<String, String> {
+fn python_value_literal(output: &mut GrammarText<'_>, value: &Value) -> Result<(), GrammarError> {
     match value {
-        Value::Null => Ok("(\"None\" | \"null\")".into()),
-        Value::Bool(true) => Ok("(\"True\" | \"true\")".into()),
-        Value::Bool(false) => Ok("(\"False\" | \"false\")".into()),
-        Value::Number(value) => Ok(literal(&value.to_string())),
-        Value::String(value) => Ok(format!(
+        Value::Null => output.push_str("(\"None\" | \"null\")"),
+        Value::Bool(true) => output.push_str("(\"True\" | \"true\")"),
+        Value::Bool(false) => output.push_str("(\"False\" | \"false\")"),
+        Value::Number(value) => output.push_fmt(format_args!("{}", Quoted(value))),
+        Value::String(value) => output.push_fmt(format_args!(
             "({} | {})",
-            literal(&python_string_literal(value, '\'')),
-            literal(&python_string_literal(value, '"'))
+            Quoted(PythonString(value, '\'')),
+            Quoted(PythonString(value, '"'))
         )),
-        Value::Array(values) => values
-            .iter()
-            .map(python_value_literal)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|values| format!("\"[\" {} \"]\"", values.join(" \", \" "))),
-        Value::Object(values) => values
-            .iter()
-            .map(|(key, value)| {
-                Ok(format!(
-                    "{} \": \" {}",
-                    literal(&json_key(key)),
-                    python_value_literal(value)?
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map(|values| format!("\"{{\" {} \"}}\"", values.join(" \", \" "))),
-    }
-}
-
-fn python_string_literal(value: &str, quote: char) -> String {
-    let mut output = String::new();
-    output.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            '\u{0008}' => output.push_str("\\b"),
-            '\u{000c}' => output.push_str("\\f"),
-            character if character == quote => {
-                output.push('\\');
-                output.push(character);
+        Value::Array(values) => {
+            output.push_str("\"[\" ")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(" \", \" ")?;
+                }
+                python_value_literal(output, value)?;
             }
-            character if character.is_control() => {
-                output.push_str(&format!("\\u{:04x}", character as u32));
+            output.push_str(" \"]\"")
+        }
+        Value::Object(values) => {
+            output.push_str("\"{\" ")?;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(" \", \" ")?;
+                }
+                output.push_fmt(format_args!("{} \": \" ", Quoted(Literal(key))))?;
+                python_value_literal(output, value)?;
             }
-            character => output.push(character),
+            output.push_str(" \"}\"")
         }
     }
-    output.push(quote);
-    output
+}
+
+struct PythonString<'a>(&'a str, char);
+impl std::fmt::Display for PythonString<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        output.write_char(self.1)?;
+        for character in self.0.chars() {
+            match character {
+                '\\' => output.write_str("\\\\")?,
+                '\n' => output.write_str("\\n")?,
+                '\r' => output.write_str("\\r")?,
+                '\t' => output.write_str("\\t")?,
+                '\u{0008}' => output.write_str("\\b")?,
+                '\u{000c}' => output.write_str("\\f")?,
+                character if character == self.1 => {
+                    output.write_char('\\')?;
+                    output.write_char(character)?;
+                }
+                character if character.is_control() => {
+                    write!(output, "\\u{:04x}", character as u32)?
+                }
+                character => output.write_char(character)?,
+            }
+        }
+        output.write_char(self.1)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -625,7 +597,7 @@ impl Lfm2Parser {
                 }
                 ParserState::CallName(mut name) => {
                     if current == '(' {
-                        validate_function_name(&name)?;
+                        validate_function_name(&name).map_err(|error| error.to_string())?;
                         let id = format!("call_{}", sink.next_tool_index());
                         sink.start_tool_call(id, name);
                         sink.tool_arguments("{");
@@ -653,7 +625,8 @@ impl Lfm2Parser {
                 }
                 ParserState::Keyword(mut name) => {
                     if current == '=' {
-                        validate_identifier(&name, "tool argument name")?;
+                        validate_identifier(&name, "tool argument name")
+                            .map_err(|error| error.to_string())?;
                         let key = serde_json::to_string(&name)
                             .expect("Python identifiers serialize as JSON strings");
                         sink.tool_arguments(&key);
@@ -1159,7 +1132,7 @@ mod tests {
     }
 
     fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
-        let mut grammar = plan.generation_constraint().grammar_state();
+        let mut grammar = plan.generation_constraint().grammar_matcher();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;
         while offset < text.len() {
@@ -1172,18 +1145,18 @@ mod tests {
                 })
                 .flatten()
             {
-                if grammar.commit(*token).is_err() {
+                if grammar.consume_token(*token).is_err() {
                     return false;
                 }
                 offset += spelling.len();
             } else {
-                if grammar.commit(text.as_bytes()[offset] as TokenId).is_err() {
+                if grammar.consume_token(text.as_bytes()[offset] as TokenId).is_err() {
                     return false;
                 }
                 offset += 1;
             }
         }
-        grammar.is_complete().unwrap()
+        grammar.is_accepting().unwrap()
     }
 
     fn joined_text(events: &[SemanticEvent]) -> String {
@@ -1669,3 +1642,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod producer_tests;

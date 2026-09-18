@@ -157,14 +157,7 @@ impl Clone for Account {
 impl Drop for Account {
     fn drop(&mut self) {
         if let Some(value) = self.0.take() {
-            let retired = Arc::into_inner(value);
-            let id = retired.as_ref().map(|value| value.ticket.id());
-            drop(retired);
-            if let Some(id) = id {
-                if std::env::var_os("EREDU_WORKSPACE_LEDGER_TRACE").is_some() {
-                    eprintln!("WORKSPACE_LEDGER_RETIRED id={} kind=numerical", id);
-                }
-            }
+            drop(Arc::into_inner(value));
         }
     }
 }
@@ -336,10 +329,6 @@ impl OriginalSpeculativeRequest {
             bytes,
             controls,
         )?;
-        if std::env::var_os("EREDU_WORKSPACE_LEDGER_TRACE").is_some() {
-            eprintln!("WORKSPACE_LEDGER_COMPONENT id={} kind=numerical ordinal={} physical={} graph={} record={} controls={}",
-                ticket.id(), ordinal, requirements.physical, requirements.graph, requirements.record, controls);
-        }
         let account = Account(Some(Arc::new(Charge {
             request: self.identity,
             request_account: self.ticket.id(),

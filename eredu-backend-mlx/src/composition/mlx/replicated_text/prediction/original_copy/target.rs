@@ -16,7 +16,7 @@ impl OriginalPredictionTarget {
 
     pub(super) fn validate(
         &self,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<(), StartupCause> {
         self.copy.validate(preparation, origin)
@@ -28,14 +28,14 @@ impl OriginalPredictionTarget {
     pub(super) fn into_prepared<S: MlxStateMechanisms>(
         self,
         source: &S,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<PreparedLane<S>, StartupCause> {
         let parts = [
             size_of::<Self>(),
             size_of::<(
                 &S,
-                &OriginalSpeculativeSemanticPreparation,
+                &PreparedSemanticSource,
                 &ReplicatedTextControlOrigin,
             )>(),
             size_of::<Result<S, OriginalResidentState>>(),
@@ -69,7 +69,7 @@ impl OriginalPredictionLane {
     pub(crate) fn prepare_registered_target(
         &self,
         source: PreparedResidentDecoderCopy<'_>,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
         frontier: u64,
     ) -> Result<OriginalPredictionTarget, StartupCause> {
@@ -81,7 +81,7 @@ impl OriginalPredictionLane {
             size_of::<(
                 &Self,
                 PreparedResidentDecoderCopy<'_>,
-                &OriginalSpeculativeSemanticPreparation,
+                &PreparedSemanticSource,
                 &ReplicatedTextControlOrigin,
                 u64,
             )>(),

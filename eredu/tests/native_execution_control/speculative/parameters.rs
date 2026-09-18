@@ -4,7 +4,9 @@ use eredu_core::{
     component::ComponentResidualBase, intervention::InterventionDtype, parameters::*,
 };
 
-pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
+pub(super) fn captures<
+    B: eredu_core::SpeculativeGenerationBackend + eredu_runtime::working_memory::OriginalChatBackend,
+>(
     model: &mut LoadedModel<B>,
     generation: &PreparedChatSpeculativeGenerationOptions,
     paths: &[String],
@@ -15,23 +17,32 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
     Vec<(SpeculativeActivationPhase, Vec<CaptureRecord>)>,
 ) {
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
-            add_generation_prompt: true,
-            ..Default::default()
-        })
-        .unwrap();
-    let request = || PreparedChatSpeculativeGenerationRequest {
-        input: PreparedChatInput::token_ids(&chat, prefix.to_vec()),
-        drafting: eredu_core::SpeculativeDraft::Embedded,
-        settings: PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                max_new_tokens: Some(5),
-                temperature: Some(0.0),
+        .source_chat_with_capacity(
+            ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
+                add_generation_prompt: true,
                 ..Default::default()
             },
-            ..Default::default()
-        },
+            ORIGINAL_CAPACITY,
+        )
+        .unwrap();
+    let request = || PreparedChatSpeculativeRequest {
+        chat: &chat,
+        input: eredu::api::PreparedChatPrompt::TokenIds(&prefix),
+        output_mode: eredu::api::PreparedChatOutputMode::Text,
+        skip_special_tokens: true,
+        drafting: eredu_core::SpeculativeDraft::Embedded,
+        settings: chat_settings(
+            &chat,
+            PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(5),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         options: generation.clone(),
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -92,7 +103,7 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
     let mut records = Vec::new();
     let output = if controlled {
         model
-            .with_controlled_text_speculative(request(), options, |session| {
+            .with_controlled_prepared_chat_speculative(request(), options, |session| {
                 records.extend(session.step()?.unwrap().activations.iter().cloned());
                 let saved = session.snapshot()?;
                 let start = records.len();
@@ -116,7 +127,7 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
             .unwrap()
     } else {
         model
-            .generate_observed_text_speculative(request(), options, |step| {
+            .generate_observed_prepared_chat_speculative(request(), options, |step| {
                 records.extend(step.activations.iter().cloned());
                 ControlFlow::Continue(())
             })
@@ -126,14 +137,16 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
         r.phase,
         SpeculativeActivationPhase::Proposal { .. } | SpeculativeActivationPhase::FusedProposal
     )));
-    assert!(records
-        .iter()
-        .all(|r| r.admission_identity.as_deref() == Some(identity.as_str()) && r.completed));
+    assert!(
+        records
+            .iter()
+            .all(|r| r.admission_identity.as_deref() == Some(identity.as_str()) && r.completed)
+    );
     (
         output.token_ids().to_vec(),
         records
             .into_iter()
-            .map(|r| (r.phase, r.captures.into_legacy().unwrap().records))
+            .map(|r| (r.phase, r.captures.as_step().records.clone()))
             .collect(),
     )
 }

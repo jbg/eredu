@@ -157,20 +157,20 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
             >,
         }
         impl<'a, 'r> ParameterVisitor<'a, ReferenceTensor> for Bindings<'r> {
-            fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
+            fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a ReferenceTensor) {
                 let bytes = value
                     .shape()
                     .iter()
                     .map(|dimension| u64::try_from(*dimension).unwrap())
                     .product::<u64>()
                     * 4;
-                let binding = self.recipes.remove(metadata.id.as_str()).map(|recipe| {
-                    eredu_runtime::WeightBinding::from_recipe(metadata.id.as_str(), recipe, bytes)
+                let binding = self.recipes.remove(metadata.id().as_str()).map(|recipe| {
+                    eredu_runtime::WeightBinding::from_recipe(metadata.id().as_str(), recipe, bytes)
                 });
                 if let Some(binding) = binding {
                     self.values.push(binding.unwrap());
                 } else {
-                    self.missing.push(metadata.id.as_str().to_owned());
+                    self.missing.push(metadata.id().as_str().to_owned());
                 }
             }
         }
@@ -695,7 +695,7 @@ where
     }
 
     fn session_failure(error: eredu_core::BackendFailure) -> Error {
-        Error::backend_source(error)
+        Error::backend_retained_source(error)
     }
 
     fn take_telemetry() -> Result<Self::Telemetry, Error> {
@@ -1481,7 +1481,7 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
         let mut module = A::module::<ReferenceBackend>(config.clone(), &())?;
         struct Bindings(Vec<eredu_runtime::WeightBinding>);
         impl<'a> ParameterVisitor<'a, ReferenceTensor> for Bindings {
-            fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
+            fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a ReferenceTensor) {
                 let expected_bytes = value
                     .shape()
                     .iter()
@@ -1493,9 +1493,9 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
                     // recipe and binding checks without reading the released-size
                     // sparse payload which this fixture never uses numerically.
                     eredu_runtime::WeightBinding::from_recipe(
-                        metadata.id.as_str(),
+                        metadata.id().as_str(),
                         eredu_checkpoint::recipe::DerivedWeightRecipe::source(
-                            metadata.id.as_str(),eredu_checkpoint::store::TensorSelection::Full),
+                            metadata.id().as_str(),eredu_checkpoint::store::TensorSelection::Full),
                         expected_bytes,
                     )
                     .unwrap(),

@@ -183,12 +183,23 @@ fn relative(
     sink.finish(total.checked_sub(query).ok_or_else(invalid)?, format_args!("MLX Metal relative-profile attention: exact integer masks, optional logarithmic query/bias scaling, direct profile gather, GQA reshape copies, two selected dense products and precise softmax; all casts and child buffers retained through completion; page={} with bounded oversized reuse; no disjoint host payload",a.page_size())).map(Some)
 }
 
-fn rotary(
-    op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
-    spec: MultiAxisRotarySpecRef<'_>,
-    sink: &mut Emitter<'_>,
-) -> FactResult<Option<WorkspaceOperationFacts>> {
+/// The native worker casts positions to F32, multiplies stored F32
+/// frequencies, and applies cosine/sine before reshaping. Reuse its exact
+/// geometry validation; this scalar fact grants no allocation or submission.
+pub(super) fn rotary_representation(op: WorkspaceOperationView<'_>, output: usize)
+    -> Option<WorkspaceRepresentation> {
+    let spec = match op.kind {
+        WorkspaceOperationKindView::MultiAxisRotary(spec)
+        | WorkspaceOperationKindView::PreparedMultiAxisRotary(spec) => spec,
+        _ => return None,
+    };
+    if output >= 2 { return None; }
+    rotary_geometry(op, spec).ok()??;
+    Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false))
+}
+
+fn rotary_geometry(op: WorkspaceOperationView<'_>, spec: MultiAxisRotarySpecRef<'_>)
+    -> FactResult<Option<(u64, i32)>> {
     let dimensions = spec.dimensions()?;
     if op.inputs.len() != 1 || op.outputs.len() != 2 {
         return Err(invalid());
@@ -216,6 +227,17 @@ fn rotary(
     ) {
         return Ok(None);
     }
+    Ok(Some((rows, dimensions)))
+}
+
+fn rotary(
+    op: WorkspaceOperationView<'_>,
+    a: MetalAllocationFacts,
+    spec: MultiAxisRotarySpecRef<'_>,
+    sink: &mut Emitter<'_>,
+) -> FactResult<Option<WorkspaceOperationFacts>> {
+    let Some((rows, dimensions)) = rotary_geometry(op, spec)? else { return Ok(None); };
+    let input = op.inputs.get(0).expect("validated rotary geometry");
     let full = capacity(a, mul(rows, dimensions as u64)?)?;
     let half = dimensions as u64 / 2;
     // Input flattening can copy, then all integer positions widen once to I64.

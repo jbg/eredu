@@ -1,0 +1,247 @@
+diff --git a/mlx/backend/cpu/argsort_f32.h b/mlx/backend/cpu/argsort_f32.h
+--- a/mlx/backend/cpu/argsort_f32.h
++++ b/mlx/backend/cpu/argsort_f32.h
+@@ -5,33 +5,33 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <utility>
++#include <type_traits>
+ 
+ namespace mlx::core::cpu::detail {
+ 
+-// Private rank-one F32 worker. The caller supplies the existing output storage
++// Shared F32/I32 row worker. The caller supplies the existing output storage
+ // and valid signed strides; count is bounded by MLX's signed dimension width.
+ // Ascending IDs encode stable ties, including the old stable_sort's trailing
+ // NaN equivalence class. No score is rewritten and no auxiliary heap is used.
+-inline auto argsort_f32_at(uint32_t* indices, int64_t output_stride) noexcept {
++inline auto argsort_at(uint32_t* indices, int64_t output_stride) noexcept {
+   return [indices, output_stride](size_t i) -> uint32_t& {
+     return indices[static_cast<int64_t>(i) * output_stride];
+   };
+ }
+-inline auto argsort_f32_less(const float* values, int64_t input_stride) noexcept {
++template<class T>
++inline auto argsort_less(const T* values, int64_t input_stride) noexcept {
+   return [values, input_stride](uint32_t a, uint32_t b) {
+-    const float x = values[static_cast<int64_t>(a) * input_stride];
+-    const float y = values[static_cast<int64_t>(b) * input_stride];
+-    if (std::isnan(x)) {
+-      return std::isnan(y) && a < b;
+-    }
+-    if (std::isnan(y)) {
+-      return true;
++    const T x = values[static_cast<int64_t>(a) * input_stride];
++    const T y = values[static_cast<int64_t>(b) * input_stride];
++    if constexpr (std::is_floating_point_v<T>) {
++      if (std::isnan(x)) return std::isnan(y) && a < b;
++      if (std::isnan(y)) return true;
+     }
+     return x < y || (x == y && a < b);
+   };
+ }
+ template<class At,class Less>
+-inline auto argsort_f32_sift(const At& at,const Less& less) noexcept {
++inline auto argsort_sift(const At& at,const Less& less) noexcept {
+   return [&at, &less](size_t root, size_t length) {
+     while (root < length / 2) {
+       size_t child = root * 2 + 1;
+@@ -47,17 +47,22 @@
+   };
+ }
+ // The same three callables execute the worker and describe its fixed controls.
+-inline size_t argsort_f32_row_control_bytes() noexcept {
+-  const auto at=argsort_f32_at(nullptr,0);
+-  const auto less=argsort_f32_less(nullptr,0);
+-  const auto sift=argsort_f32_sift(at,less);
+-  return sizeof(at)+sizeof(less)+sizeof(sift)+sizeof(const float*)+sizeof(uint32_t*)+
+-      sizeof(int64_t)*2+sizeof(size_t)*7+sizeof(uint32_t)*3+sizeof(float)*2+
++template<class T>
++inline size_t argsort_row_control_bytes() noexcept {
++  const auto at=argsort_at(nullptr,0);
++  const auto less=argsort_less<T>(nullptr,0);
++  const auto sift=argsort_sift(at,less);
++  // Eight size_t controls: count, at(i), sift(root,length,child), and the
++  // initialization/extraction/build loop positions. Comparator IDs plus swap
++  // temporary are U32; values retain the actual source scalar type.
++  return sizeof(at)+sizeof(less)+sizeof(sift)+sizeof(const T*)+sizeof(uint32_t*)+
++      sizeof(int64_t)*2+sizeof(size_t)*8+sizeof(uint32_t)*3+sizeof(T)*2+
+       sizeof(const decltype(at)*)+sizeof(const decltype(less)*)+sizeof(bool)*4;
+ }
+ 
+-inline void argsort_f32_row(
+-    const float* values,
++template<class T>
++inline void argsort_row(
++    const T* values,
+     int64_t input_stride,
+     uint32_t* indices,
+     int64_t output_stride,
+@@ -65,14 +70,14 @@
+   if (count == 0) {
+     return;
+   }
+-  const auto at = argsort_f32_at(indices, output_stride);
+-  const auto less = argsort_f32_less(values, input_stride);
++  const auto at = argsort_at(indices, output_stride);
++  const auto less = argsort_less(values, input_stride);
+   for (size_t i = 0; i < count; ++i) {
+     at(i) = static_cast<uint32_t>(i);
+   }
+   // Test before computing 2 * root + 1; the child is then strictly below
+   // length, including the final single-child parent of an even-length heap.
+-  const auto sift = argsort_f32_sift(at, less);
++  const auto sift = argsort_sift(at, less);
+   for (size_t parent = count / 2; parent > 0; --parent) {
+     sift(parent - 1, count);
+   }
+@@ -87,11 +92,8 @@
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+ MLX_API bool is_argsort_eval_primitive(const array&) noexcept;
+-MLX_API bool argsort_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool argsort_eval_layout(Dtype source,size_t rank,size_t columns,size_t rows,
++    bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool argsort_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }
+ 
+-namespace mlx::core::cpu {
+-MLX_API bool argsort_row_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+-
+-}
+diff --git a/mlx/backend/cpu/sort.cpp b/mlx/backend/cpu/sort.cpp
+--- a/mlx/backend/cpu/sort.cpp
++++ b/mlx/backend/cpu/sort.cpp
+@@ -329,20 +329,36 @@
+ }
+ 
+ // Naming the unchanged ArgSort callable exposes its real queued TaskNode.
++// Actual fixed controls of the selected row loop; the row helper separately
++// describes its comparison/heap controls. Integer rows use the same stable
++// (value, original-index) ordering as ordinary stable_sort, without scratch.
++struct ArgSortRows {
++  size_t columns;
++  size_t rows;
++  size_t row;
++};
+ struct ArgSortTask {
+   array in,out;
+   int axis_;
+   void operator()() {
+-    if (in.dtype() == float32 && (in.ndim() == 1 ||
+-        (in.ndim() >= 2 && in.ndim() <= 3 && (axis_ == -1 || axis_ == in.ndim()-1) &&
+-         in.size() == size_t(in.shape(-1))))) {
+-      const auto count = static_cast<size_t>(in.shape(-1));
+-      // Avoid both the generic worker's zero-width division and a null data
+-      // pointer access for an empty row. Native allocation/dispatch is unchanged.
+-      if (count != 0) {
+-        cpu::detail::argsort_f32_row(
+-            in.data<float>(), in.strides().back(), out.data<uint32_t>(),
+-            out.strides().back(), count);
++    const bool final_axis = axis_ == -1 || axis_ == in.ndim()-1;
++    const bool float_row = in.dtype() == float32 && (in.ndim() == 1 ||
++        (in.ndim() >= 2 && in.ndim() <= 3 && final_axis &&
++         in.size() == size_t(in.shape(-1))));
++    const bool integer_rows = in.dtype() == int32 && in.ndim() >= 1 &&
++        in.ndim() <= 3 && final_axis && in.flags().row_contiguous;
++    if (float_row || integer_rows) {
++      ArgSortRows loop{static_cast<size_t>(in.shape(-1)),0,0};
++      if (loop.columns == 0) return;
++      loop.rows = in.size() / loop.columns;
++      for (; loop.row < loop.rows; ++loop.row) {
++        if (float_row) {
++          cpu::detail::argsort_row(in.data<float>(), in.strides().back(),
++              out.data<uint32_t>(), out.strides().back(), loop.columns);
++        } else {
++          cpu::detail::argsort_row(in.data<int32_t>() + loop.row * loop.columns, 1,
++              out.data<uint32_t>() + loop.row * loop.columns, 1, loop.columns);
++        }
+       }
+       return;
+     }
+@@ -547,48 +563,56 @@
+   return output.has_primitive() && output.primitive().stream().device==Device::cpu &&
+       typeid(output.primitive())==typeid(ArgSort);
+ }
+-bool argsort_row_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank<1 || rank>3 || !elements || elements>size_t(INT_MAX) ||
+-      Shape::inline_capacity<3 || Strides::inline_capacity<3)return false;
++bool argsort_eval_layout(Dtype source,size_t rank,size_t columns,size_t rows,
++    bool tracer,CopyEvalStorage& out) noexcept {
++  if((source!=float32&&source!=int32)||source.size()!=4||rank<1||rank>3||
++      !columns||!rows||columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/columns||
++      (rank==1&&rows!=1)||(source==float32&&rows!=1)||
++      Shape::inline_capacity<3||Strides::inline_capacity<3)return false;
+   DispatchLayout task;EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
+   if(!CommandEncoder::dispatch_layout<ArgSortTask>(task))return false;
+-  const size_t worker_controls=detail::argsort_f32_row_control_bytes();
++  const size_t worker_controls=source==float32?detail::argsort_row_control_bytes<float>():
++      detail::argsort_row_control_bytes<int32_t>();
+   if(task.controls>SIZE_MAX-worker_controls)return false;
+   dispatch={task.task_bytes,task.task_alignment,0,task.controls+worker_controls};
+   if(!single_output_eval_layout(rank,1,tracer,&dispatch,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+-  const size_t controls=sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(task)+sizeof(dispatch)+
+-      sizeof(common)+sizeof(value)+sizeof(worker_controls)+sizeof(ArgSortTask)*2+
+-      sizeof(const array*)*2+sizeof(size_t)*6+sizeof(int)*2+sizeof(int64_t)+sizeof(bool)*7;
++  // Guard: input/output references, destination reference, seven geometry
++  // scalars and the actual axis. Task: captured arrays/axis in its incoming
++  // and dispatched copies, three selection booleans and its row-loop record.
++  struct GuardControls {
++    const array *output,*input;CopyEvalStorage* destination;
++    size_t rank,elements,span,delta,dimension,columns,rows;int axis;
++  };
++  struct TaskControls { ArgSortTask incoming,dispatched;bool final_axis,float_row,integer_rows;ArgSortRows loop; };
++  const size_t controls=sizeof(source)+sizeof(rank)+sizeof(columns)+sizeof(rows)+
++      sizeof(tracer)+sizeof(out)+sizeof(task)+sizeof(dispatch)+sizeof(common)+
++      sizeof(value)+sizeof(worker_controls)+sizeof(GuardControls)+sizeof(TaskControls)+sizeof(size_t);
+   if(value.named_control_bytes>SIZE_MAX-controls)return false;
+   value.named_control_bytes+=controls;out=value;return true;
+ }
+-bool argsort_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  CopyEvalStorage value;
+-  if(!argsort_row_eval_layout(1,elements,tracer,value))return false;
+-  const size_t controls=sizeof(value)+sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(size_t);
+-  if(value.named_control_bytes>SIZE_MAX-controls)return false;
+-  value.named_control_bytes+=controls;out=value;return true;
+-}
+ bool argsort_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+-  if(!is_argsort_eval_primitive(output) || !output.siblings().empty() || output.inputs().size()!=1 ||
+-      output.dtype()!=uint32 || output.itemsize()!=sizeof(uint32_t))return false;
++  if(!is_argsort_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1||
++      output.dtype()!=uint32||output.itemsize()!=sizeof(uint32_t))return false;
+   const auto& input=output.inputs()[0];const size_t rank=input.ndim();
+-  if(rank<1 || rank>3 || input.dtype()!=float32 || input.itemsize()!=sizeof(float) ||
+-      input.shape()!=output.shape() || input.shape(-1)<=0 || input.strides().size()!=rank ||
+-      input.strides().back()<0)return false;
+-  // ArgSort retains the caller's axis, unlike Partition/GatherAxis. Both
+-  // spellings select this same final row; every other axis remains rejected.
++  if(rank<1||rank>3||(input.dtype()!=float32&&input.dtype()!=int32)||input.itemsize()!=4||
++      input.shape()!=output.shape()||input.shape(-1)<=0||input.strides().size()!=rank)return false;
+   const int axis=static_cast<const ArgSort&>(output.primitive()).state();
+   if(axis!=-1&&axis!=int(rank)-1)return false;
+-  for(size_t axis=0;axis+1<rank;++axis)if(input.shape(axis)!=1)return false;
+-  const size_t elements=input.size(),stride=size_t(input.strides().back());
+-  if(elements!=size_t(input.shape(-1)) || elements>size_t(INT_MAX) ||
+-      (elements>1 && stride>(size_t(PTRDIFF_MAX)-1)/(elements-1)))return false;
+-  const size_t span=1+(elements-1)*stride;
+-  if(span>input.data_size() || span>size_t(PTRDIFF_MAX)/sizeof(float))return false;
+-  return rank==1?argsort_eval_layout(elements,output.is_tracer(),out):
+-      argsort_row_eval_layout(rank,elements,output.is_tracer(),out);
++  size_t elements=1,span=1,delta=0;
++  for(size_t dimension=0;dimension<rank;++dimension) {
++    if(input.shape(dimension)<=0||input.strides()[dimension]<0||
++        size_t(input.shape(dimension))>size_t(INT_MAX)/elements)return false;
++    elements*=size_t(input.shape(dimension));
++    if(size_t(input.shape(dimension)-1)&&size_t(input.strides()[dimension])>
++        (size_t(PTRDIFF_MAX)-span)/size_t(input.shape(dimension)-1))return false;
++    delta=size_t(input.shape(dimension)-1)*size_t(input.strides()[dimension]);span+=delta;
++  }
++  const size_t columns=size_t(input.shape(-1)),rows=elements/columns;
++  if(elements!=input.size()||span>input.data_size()||span>size_t(PTRDIFF_MAX)/4||
++      (input.dtype()==float32&&rows!=1)||
++      (input.dtype()==int32&&(!input.flags().row_contiguous||span!=elements)))return false;
++  return argsort_eval_layout(input.dtype(),rank,columns,rows,output.is_tracer(),out);
+ }
+ 
+ bool is_partition_eval_primitive(const array& output) noexcept {

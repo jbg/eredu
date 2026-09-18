@@ -84,6 +84,14 @@ impl Deref for PlainControllerHistory {
     }
 }
 impl PlainControllerHistory {
+    /// Whether this actual retained history uses the supplied construction payer.
+    /// Ordinary vectors cannot acquire authority through this comparison.
+    pub fn is_funded_by(&self, funding: &crate::HostMetadataFunding) -> bool {
+        match &self.0 {
+            Storage::Ordinary(_) => false,
+            Storage::Retained(value) => value.0.as_ref().expect("live history").values.is_funded_by(funding),
+        }
+    }
     pub(super) fn is_prepared(&self) -> bool {
         matches!(self.0, Storage::Retained(_))
     }
@@ -94,7 +102,9 @@ impl PlainControllerHistory {
             Storage::Retained(v) => v.0.as_ref().expect("live history").values.capacity(),
         }
     }
-    pub(super) fn is_unique_prepared(&self) -> bool {
+    /// Whether mutation can use the existing paid destination without a copy.
+    /// Shared retained prefixes remain immutable until independently copied.
+    pub fn is_unique_prepared(&self) -> bool {
         matches!(&self.0,Storage::Retained(value) if Arc::strong_count(value.0.as_ref().expect("live history"))==1)
     }
     /// Actual destination buffer, shared shell and constructor controls.
@@ -181,6 +191,11 @@ impl<'a> PlainControllerSource<'a> {
             validity,
             storage,
         }
+    }
+    /// Borrow the actual history and validity for semantic preparation binding.
+    /// This projection grants no funding, registration or execution authority.
+    pub fn preparation_source(self) -> crate::PreparedControllerSource<'a> {
+        crate::PreparedControllerSource::Plain { history: self.history, validity: self.validity }
     }
     /// Durable prefix, without a clone.
     pub fn history(self) -> &'a [u32] {

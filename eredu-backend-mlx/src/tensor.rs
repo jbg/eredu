@@ -52,7 +52,7 @@ pub(crate) fn portable_dtype(dtype: Dtype) -> TensorDtype {
 }
 
 fn backend<T>(result: Result<T, safemlx::error::Exception>) -> Result<T, Error> {
-    result.map_err(Error::backend_source)
+    result.map_err(Error::backend_retained_source)
 }
 
 /// Backend-native MLX tensor handle used at Eredu's neutral tensor boundary.
@@ -131,7 +131,7 @@ impl Tensor for MlxTensor {
     ) -> Result<Self, Error> {
         tensor(
             Array::try_from_slice(values, shape)
-                .map_err(Error::backend_source)?
+                .map_err(Error::backend_retained_source)?
                 .copy(context),
         )
     }
@@ -143,7 +143,7 @@ impl Tensor for MlxTensor {
     ) -> Result<Self, Error> {
         tensor(
             Array::try_from_slice(values, shape)
-                .map_err(Error::backend_source)?
+                .map_err(Error::backend_retained_source)?
                 .copy(context),
         )
     }
@@ -160,7 +160,7 @@ impl Tensor for MlxTensor {
         }
         backend(array.evaluated())?
             .try_to_vec::<f32>()
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
 
     fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
@@ -173,13 +173,13 @@ impl Tensor for MlxTensor {
         if array.size() == 0 {
             return Ok(Vec::new());
         }
-        evaluated.try_to_vec::<i32>().map_err(Error::backend_source)
+        evaluated.try_to_vec::<i32>().map_err(Error::backend_retained_source)
     }
 
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::full::<f32>(
             shape,
-            Array::try_from_f32(value).map_err(Error::backend_source)?,
+            Array::try_from_f32(value).map_err(Error::backend_retained_source)?,
             context,
         ))
     }
@@ -187,7 +187,14 @@ impl Tensor for MlxTensor {
     fn full_i32(value: i32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::full::<i32>(
             shape,
-            Array::try_from_int(value).map_err(Error::backend_source)?,
+            Array::try_from_int(value).map_err(Error::backend_retained_source)?,
+            context,
+        ))
+    }
+    fn full_u32(value: u32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        tensor(Array::full::<u32>(
+            shape,
+            Array::try_from_scalar(value).map_err(Error::backend_retained_source)?,
             context,
         ))
     }
@@ -207,7 +214,7 @@ impl Tensor for MlxTensor {
     fn multiply_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::multiply(
             self.as_array(),
-            Array::try_from_f32(rhs).map_err(Error::backend_source)?,
+            Array::try_from_f32(rhs).map_err(Error::backend_retained_source)?,
             context,
         ))
     }
@@ -227,7 +234,7 @@ impl Tensor for MlxTensor {
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::maximum(
             self.as_array(),
-            Array::try_from_f32(rhs).map_err(Error::backend_source)?,
+            Array::try_from_f32(rhs).map_err(Error::backend_retained_source)?,
             context,
         ))
     }
@@ -235,7 +242,7 @@ impl Tensor for MlxTensor {
     fn maximum_i32(&self, rhs: i32, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::maximum(
             self.as_array(),
-            Array::try_from_int(rhs).map_err(Error::backend_source)?,
+            Array::try_from_int(rhs).map_err(Error::backend_retained_source)?,
             context,
         ))
     }
@@ -301,7 +308,7 @@ impl Tensor for MlxTensor {
     }
 
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error> {
-        let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend_source)?;
+        let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend_retained_source)?;
         let normalized = if axis < 0 { axis + rank } else { axis };
         if !(0..rank).contains(&normalized) {
             return Err(Error::backend("gather axis is outside tensor rank"));
@@ -311,7 +318,7 @@ impl Tensor for MlxTensor {
             self.as_array().dim(normalized),
             context,
         )
-        .map_err(Error::backend_source)?;
+        .map_err(Error::backend_retained_source)?;
         tensor(Array::take_axis(self.as_array(), &indexes, axis, context))
     }
 
@@ -321,7 +328,7 @@ impl Tensor for MlxTensor {
 
     fn equal_i32(&self, value: i32, context: &Self::Context) -> Result<Self, Error> {
         tensor(self.as_array().eq(
-            Array::try_from_int(value).map_err(Error::backend_source)?,
+            Array::try_from_int(value).map_err(Error::backend_retained_source)?,
             context,
         ))
     }

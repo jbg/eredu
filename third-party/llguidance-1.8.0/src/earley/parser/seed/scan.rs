@@ -7,11 +7,10 @@ use crate::{
 };
 use std::{
     mem::{size_of, size_of_val},
-    sync::Arc,
 };
 use toktrie::{TokTrie, TokenMaskConstructionPlan};
 
-fn append<F: Fn(usize) -> Result<(), E>, E>(
+fn append<F: crate::earley::PreparedFunding<Error = E>, E>(
     scratch: &mut Scratch,
     item: Item,
     arg: ParamValue,
@@ -28,7 +27,7 @@ fn append<F: Fn(usize) -> Result<(), E>, E>(
     Ok(())
 }
 impl PreparedEarleySeed {
-    pub(super) fn scan_lexeme<F: Fn(usize) -> Result<(), E>, E>(
+    pub(super) fn scan_lexeme<F: crate::earley::PreparedFunding<Error = E>, E>(
         &mut self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -39,7 +38,7 @@ impl PreparedEarleySeed {
     ) -> Result<bool, Cause<E>> {
         let controls = [
             size_of::<(&mut Self, &mut PreparedLexer, &TokTrie, &Lexeme, &F)>(),
-            size_of::<Arc<super::super::CGrammar>>(),
+            size_of::<crate::earley::SharedGrammar>(),
             size_of::<Cause<E>>(),
             size_of::<PreparedLexerOperationError<E>>(),
             size_of::<super::super::Row>(),
@@ -54,7 +53,7 @@ impl PreparedEarleySeed {
             size_of::<std::ops::Range<usize>>(),
             size_of::<Option<derivre::StateID>>(),
         ];
-        funding(
+        funding.reserve(
             controls
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
@@ -70,8 +69,8 @@ impl PreparedEarleySeed {
         let previous_state = previous.lexer_start_state;
         let previous_top = previous.grammar_stack_ptr;
         let next = index.checked_add(1).ok_or(Cause::Overflow)?;
-        let grammar = Arc::clone(&self.grammar);
-        let matches = crate::earley::lexer::matching(grammar.lexer_spec(), lexeme.idx, |state| {
+        let grammar = self.grammar.clone();
+        let matches = crate::earley::lexer::matching(&grammar.lexer_spec().lexemes, lexeme.idx, |state| {
             lexer.vector().state_desc(state)
         })
         .ok_or(Cause::Source)?;
@@ -122,7 +121,7 @@ impl PreparedEarleySeed {
                 .ok_or(Cause::Source)?
                 .possible;
             let plan = possible.copy_plan().map_err(Cause::MaskSource)?;
-            funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+            funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
             self.initial_selection = Some(super::super::LexemeSet::from_owned_vob(
                 plan.compile().map_err(Cause::Mask)?,
             ));

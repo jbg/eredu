@@ -1,6 +1,8 @@
 use core::{cell::RefCell, fmt, mem};
 
-use alloc::{collections::BTreeMap, rc::Rc, vec, vec::Vec};
+use super::dense::{BuildError, StateMap};
+use crate::util::allocation::{AllocationError, Allocator};
+use alloc::{rc::Rc, vec, vec::Vec};
 
 use crate::{
     dfa::{automaton::Automaton, dense, DEAD},
@@ -43,6 +45,7 @@ use crate::{
 ///    paper.)
 pub(crate) struct Minimizer<'a> {
     dfa: &'a mut dense::OwnedDFA,
+    allocation: Allocator<'a>,
     in_transitions: Vec<Vec<Vec<StateID>>>,
     partitions: Vec<StateSet>,
     waiting: Vec<StateSet>,
@@ -77,30 +80,57 @@ struct StateSet {
 }
 
 impl<'a> Minimizer<'a> {
-    pub fn new(dfa: &'a mut dense::OwnedDFA) -> Minimizer<'a> {
-        let in_transitions = Minimizer::incoming_transitions(dfa);
-        let partitions = Minimizer::initial_partitions(dfa);
-        let waiting = partitions.clone();
-        Minimizer { dfa, in_transitions, partitions, waiting }
+    pub fn new(
+        dfa: &'a mut dense::OwnedDFA,
+        allocation: Allocator<'a>,
+    ) -> Result<Minimizer<'a>, BuildError> {
+        allocation.reserve(core::mem::size_of::<Self>())?;
+        let in_transitions = Minimizer::incoming_transitions(dfa, allocation)?;
+        let partitions = Minimizer::initial_partitions(dfa, allocation)?;
+        let mut waiting = Vec::new();
+        allocation.grow(&mut waiting, partitions.len())?;
+        waiting.extend(partitions.iter().cloned());
+        Ok(Minimizer {
+            dfa,
+            allocation,
+            in_transitions,
+            partitions,
+            waiting,
+        })
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self) -> Result<(), BuildError> {
+        let allocation = self.allocation;
+        // These controls are reused while all source-dependent work resides in
+        // admitted vectors. Neither refinement nor sorting recurses.
+        allocation.reserve(
+            core::mem::size_of::<[StateSet; 3]>()
+                + core::mem::size_of::<Vec<StateSet>>()
+                + core::mem::size_of::<[Vec<StateID>; 2]>()
+                + core::mem::size_of::<
+                    Vec<(
+                        StateID,
+                        crate::util::search::Anchored,
+                        crate::util::start::Start,
+                    )>,
+                >()
+                + core::mem::size_of::<StateMap<Vec<PatternID>>>()
+                + core::mem::size_of::<Result<(), BuildError>>(),
+        )?;
         let stride2 = self.dfa.stride2();
-        let as_state_id = |index: usize| -> StateID {
-            StateID::new(index << stride2).unwrap()
-        };
+        let as_state_id = |index: usize| -> StateID { StateID::new(index << stride2).unwrap() };
         let as_index = |id: StateID| -> usize { id.as_usize() >> stride2 };
 
-        let mut incoming = StateSet::empty();
-        let mut scratch1 = StateSet::empty();
-        let mut scratch2 = StateSet::empty();
+        let mut incoming = StateSet::empty(allocation)?;
+        let mut scratch1 = StateSet::empty(allocation)?;
+        let mut scratch2 = StateSet::empty(allocation)?;
         let mut newparts = vec![];
 
         // This loop is basically Hopcroft's algorithm. Everything else is just
         // shuffling data around to fit our representation.
         while let Some(set) = self.waiting.pop() {
             for b in self.dfa.byte_classes().iter() {
-                self.find_incoming_to(b, &set, &mut incoming);
+                self.find_incoming_to(b, &set, &mut incoming)?;
                 // If incoming is empty, then the intersection with any other
                 // set must also be empty. So 'newparts' just ends up being
                 // 'self.partitions'. So there's no need to go through the loop
@@ -115,32 +145,34 @@ impl<'a> Minimizer<'a> {
                 }
 
                 for p in 0..self.partitions.len() {
-                    self.partitions[p].intersection(&incoming, &mut scratch1);
+                    self.partitions[p].intersection(&incoming, &mut scratch1, allocation)?;
                     if scratch1.is_empty() {
-                        newparts.push(self.partitions[p].clone());
+                        allocation.push(&mut newparts, self.partitions[p].clone())?;
                         continue;
                     }
 
-                    self.partitions[p].subtract(&incoming, &mut scratch2);
+                    self.partitions[p].subtract(&incoming, &mut scratch2, allocation)?;
                     if scratch2.is_empty() {
-                        newparts.push(self.partitions[p].clone());
+                        allocation.push(&mut newparts, self.partitions[p].clone())?;
                         continue;
                     }
 
-                    let (x, y) =
-                        (scratch1.deep_clone(), scratch2.deep_clone());
-                    newparts.push(x.clone());
-                    newparts.push(y.clone());
+                    let (x, y) = (
+                        scratch1.deep_clone(allocation)?,
+                        scratch2.deep_clone(allocation)?,
+                    );
+                    allocation.push(&mut newparts, x.clone())?;
+                    allocation.push(&mut newparts, y.clone())?;
                     match self.find_waiting(&self.partitions[p]) {
                         Some(i) => {
                             self.waiting[i] = x;
-                            self.waiting.push(y);
+                            allocation.push(&mut self.waiting, y)?;
                         }
                         None => {
                             if x.len() <= y.len() {
-                                self.waiting.push(x);
+                                allocation.push(&mut self.waiting, x)?;
                             } else {
-                                self.waiting.push(y);
+                                allocation.push(&mut self.waiting, y)?;
                             }
                         }
                     }
@@ -158,7 +190,8 @@ impl<'a> Minimizer<'a> {
         // Create a map from DFA state ID to the representative ID of the
         // equivalence class to which it belongs. The representative ID of an
         // equivalence class of states is the minimum ID in that class.
-        let mut state_to_part = vec![DEAD; self.dfa.state_len()];
+        let mut state_to_part = Vec::new();
+        allocation.resize_copy(&mut state_to_part, self.dfa.state_len(), DEAD)?;
         for p in &self.partitions {
             p.iter(|id| state_to_part[as_index(id)] = p.min());
         }
@@ -167,7 +200,8 @@ impl<'a> Minimizer<'a> {
         // create a map from equivalence IDs to the new IDs. Thus, the new
         // minimal ID of *any* state in the unminimized DFA can be obtained
         // with minimals_ids[state_to_part[old_id]].
-        let mut minimal_ids = vec![DEAD; self.dfa.state_len()];
+        let mut minimal_ids = Vec::new();
+        allocation.resize_copy(&mut minimal_ids, self.dfa.state_len(), DEAD)?;
         let mut new_index = 0;
         for state in self.dfa.states() {
             if state_to_part[as_index(state.id())] == state.id() {
@@ -205,29 +239,27 @@ impl<'a> Minimizer<'a> {
         // collect everything before-hand to work around the borrow checker.
         // We're already allocating so much that this is probably fine. If this
         // turns out to be costly, then I guess add a `starts_mut` iterator.
-        let starts: Vec<_> = self.dfa.starts().collect();
+        let mut starts = Vec::new();
+        for start in self.dfa.starts() {
+            allocation.push(&mut starts, start)?;
+        }
         for (old_start_id, anchored, start_type) in starts {
-            self.dfa.set_start_state(
-                anchored,
-                start_type,
-                remap(old_start_id),
-            );
+            self.dfa
+                .set_start_state(anchored, start_type, remap(old_start_id));
         }
 
         // Update the match state pattern ID list for multi-regexes. All we
         // need to do is remap the match state IDs. The pattern ID lists are
         // always the same as they were since match states with distinct
         // pattern ID lists are always considered distinct states.
-        let mut pmap = BTreeMap::new();
-        for (match_id, pattern_ids) in self.dfa.pattern_map() {
+        let mut pmap = StateMap::new(stride2);
+        for (match_id, pattern_ids) in self.dfa.pattern_map(allocation)?.into_iter() {
             let new_id = remap(match_id);
-            pmap.insert(new_id, pattern_ids);
+            pmap.insert(new_id, pattern_ids, allocation)?;
         }
-        // This unwrap is OK because minimization never increases the number of
-        // match states or patterns in those match states. Since minimization
-        // runs after the pattern map has already been set at least once, we
-        // know that our match states cannot error.
-        self.dfa.set_pattern_map(&pmap).unwrap();
+        // Minimization preserves geometry, but rebuilding the retained rows
+        // still admits its destination and can refuse.
+        self.dfa.set_pattern_map(&pmap, allocation)?;
 
         // In order to update the ID of the maximum match state, we need to
         // find the maximum ID among all of the match states in the minimized
@@ -274,6 +306,7 @@ impl<'a> Minimizer<'a> {
         }
         new.quit_id = remap(new.quit_id);
         new.set_max();
+        Ok(())
     }
 
     fn find_waiting(&self, set: &StateSet) -> Option<usize> {
@@ -285,79 +318,108 @@ impl<'a> Minimizer<'a> {
         b: alphabet::Unit,
         set: &StateSet,
         incoming: &mut StateSet,
-    ) {
+    ) -> Result<(), AllocationError> {
         incoming.clear();
-        set.iter(|id| {
-            for &inid in
-                &self.in_transitions[self.dfa.to_index(id)][b.as_usize()]
-            {
-                incoming.add(inid);
-            }
-        });
-        incoming.canonicalize();
-    }
-
-    fn initial_partitions(dfa: &dense::OwnedDFA) -> Vec<StateSet> {
-        // For match states, we know that two match states with different
-        // pattern ID lists will *always* be distinct, so we can partition them
-        // initially based on that.
-        let mut matching: BTreeMap<Vec<PatternID>, StateSet> = BTreeMap::new();
-        let mut is_quit = StateSet::empty();
-        let mut no_match = StateSet::empty();
-        for state in dfa.states() {
-            if dfa.is_match_state(state.id()) {
-                let mut pids = vec![];
-                for i in 0..dfa.match_len(state.id()) {
-                    pids.push(dfa.match_pattern(state.id(), i));
-                }
-                matching
-                    .entry(pids)
-                    .or_insert(StateSet::empty())
-                    .add(state.id());
-            } else if dfa.is_quit_state(state.id()) {
-                is_quit.add(state.id());
-            } else {
-                no_match.add(state.id());
+        for &id in set.ids.borrow().iter() {
+            for &inid in &self.in_transitions[self.dfa.to_index(id)][b.as_usize()] {
+                incoming.add(inid, self.allocation)?;
             }
         }
-
-        let mut sets: Vec<StateSet> =
-            matching.into_iter().map(|(_, set)| set).collect();
-        sets.push(no_match);
-        sets.push(is_quit);
-        sets
+        incoming.canonicalize(self.allocation)?;
+        Ok(())
     }
 
-    fn incoming_transitions(dfa: &dense::OwnedDFA) -> Vec<Vec<Vec<StateID>>> {
-        let mut incoming = vec![];
+    fn initial_partitions(
+        dfa: &dense::OwnedDFA,
+        allocation: Allocator<'_>,
+    ) -> Result<Vec<StateSet>, AllocationError> {
+        allocation.reserve(
+            core::mem::size_of::<hashbrown::HashMap<Vec<PatternID>, StateSet>>()
+                + core::mem::size_of::<[StateSet; 2]>()
+                + core::mem::size_of::<Vec<PatternID>>()
+                + core::mem::size_of::<Vec<(Vec<PatternID>, StateSet)>>()
+                + core::mem::size_of::<Vec<StateSet>>(),
+        )?;
+        // Group by the original ordered pattern lists, then restore the same
+        // lexicographic group order with an allocation-free in-place sort.
+        let mut matching: hashbrown::HashMap<Vec<PatternID>, StateSet> = hashbrown::HashMap::new();
+        let mut is_quit = StateSet::empty(allocation)?;
+        let mut no_match = StateSet::empty(allocation)?;
+        for state in dfa.states() {
+            if dfa.is_match_state(state.id()) {
+                let mut pids = Vec::new();
+                for i in 0..dfa.match_len(state.id()) {
+                    allocation.push(&mut pids, dfa.match_pattern(state.id(), i))?;
+                }
+                if let Some(set) = matching.get_mut(&pids) {
+                    set.add(state.id(), allocation)?;
+                } else {
+                    let mut set = StateSet::empty(allocation)?;
+                    set.add(state.id(), allocation)?;
+                    allocation.insert(&mut matching, pids, set)?;
+                }
+            } else if dfa.is_quit_state(state.id()) {
+                is_quit.add(state.id(), allocation)?;
+            } else {
+                no_match.add(state.id(), allocation)?;
+            }
+        }
+        let mut ordered = Vec::new();
+        allocation.grow(&mut ordered, matching.len())?;
+        ordered.extend(matching);
+        dense::sort::sort_by(&mut ordered, |a, b| a.0.cmp(&b.0), allocation)?;
+        let mut sets = Vec::new();
+        for (_, set) in ordered {
+            allocation.push(&mut sets, set)?;
+        }
+        allocation.push(&mut sets, no_match)?;
+        allocation.push(&mut sets, is_quit)?;
+        Ok(sets)
+    }
+
+    fn incoming_transitions(
+        dfa: &dense::OwnedDFA,
+        allocation: Allocator<'_>,
+    ) -> Result<Vec<Vec<Vec<StateID>>>, AllocationError> {
+        allocation.reserve(
+            core::mem::size_of::<Vec<Vec<Vec<StateID>>>>()
+                + core::mem::size_of::<Vec<Vec<StateID>>>(),
+        )?;
+        let mut incoming = Vec::new();
         for _ in dfa.states() {
-            incoming.push(vec![vec![]; dfa.alphabet_len()]);
+            let mut row = Vec::new();
+            allocation.grow(&mut row, dfa.alphabet_len())?;
+            row.resize_with(dfa.alphabet_len(), Vec::new);
+            allocation.push(&mut incoming, row)?;
         }
         for state in dfa.states() {
             for (b, next) in state.transitions() {
-                incoming[dfa.to_index(next)][b.as_usize()].push(state.id());
+                allocation.push(&mut incoming[dfa.to_index(next)][b.as_usize()], state.id())?;
             }
         }
-        incoming
+        Ok(incoming)
     }
 }
 
 impl StateSet {
-    fn empty() -> StateSet {
-        StateSet { ids: Rc::new(RefCell::new(vec![])) }
+    fn empty(allocation: Allocator<'_>) -> Result<StateSet, AllocationError> {
+        Ok(StateSet {
+            ids: allocation.rc(RefCell::new(vec![]))?,
+        })
     }
 
-    fn add(&mut self, id: StateID) {
-        self.ids.borrow_mut().push(id);
+    fn add(&mut self, id: StateID, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        allocation.push(&mut self.ids.borrow_mut(), id)
     }
 
     fn min(&self) -> StateID {
         self.ids.borrow()[0]
     }
 
-    fn canonicalize(&mut self) {
-        self.ids.borrow_mut().sort();
+    fn canonicalize(&mut self, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        dense::sort::sort_by(&mut self.ids.borrow_mut(), Ord::cmp, allocation)?;
         self.ids.borrow_mut().dedup();
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -372,9 +434,11 @@ impl StateSet {
         self.len() == 0
     }
 
-    fn deep_clone(&self) -> StateSet {
-        let ids = self.ids.borrow().iter().cloned().collect();
-        StateSet { ids: Rc::new(RefCell::new(ids)) }
+    fn deep_clone(&self, allocation: Allocator<'_>) -> Result<StateSet, AllocationError> {
+        let ids = allocation.copy_slice(&self.ids.borrow())?;
+        Ok(StateSet {
+            ids: allocation.rc(RefCell::new(ids))?,
+        })
     }
 
     fn iter<F: FnMut(StateID)>(&self, mut f: F) {
@@ -383,10 +447,15 @@ impl StateSet {
         }
     }
 
-    fn intersection(&self, other: &StateSet, dest: &mut StateSet) {
+    fn intersection(
+        &self,
+        other: &StateSet,
+        dest: &mut StateSet,
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         dest.clear();
         if self.is_empty() || other.is_empty() {
-            return;
+            return Ok(());
         }
 
         let (seta, setb) = (self.ids.borrow(), other.ids.borrow());
@@ -394,7 +463,7 @@ impl StateSet {
         let (mut a, mut b) = (ita.next().unwrap(), itb.next().unwrap());
         loop {
             if a == b {
-                dest.add(a);
+                dest.add(a, allocation)?;
                 a = match ita.next() {
                     None => break,
                     Some(a) => a,
@@ -415,13 +484,21 @@ impl StateSet {
                 };
             }
         }
+        Ok(())
     }
 
-    fn subtract(&self, other: &StateSet, dest: &mut StateSet) {
+    fn subtract(
+        &self,
+        other: &StateSet,
+        dest: &mut StateSet,
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         dest.clear();
         if self.is_empty() || other.is_empty() {
-            self.iter(|s| dest.add(s));
-            return;
+            for &id in self.ids.borrow().iter() {
+                dest.add(id, allocation)?;
+            }
+            return Ok(());
         }
 
         let (seta, setb) = (self.ids.borrow(), other.ids.borrow());
@@ -435,13 +512,13 @@ impl StateSet {
                 };
                 b = match itb.next() {
                     None => {
-                        dest.add(a);
+                        dest.add(a, allocation)?;
                         break;
                     }
                     Some(b) => b,
                 };
             } else if a < b {
-                dest.add(a);
+                dest.add(a, allocation)?;
                 a = match ita.next() {
                     None => break,
                     Some(a) => a,
@@ -449,7 +526,7 @@ impl StateSet {
             } else {
                 b = match itb.next() {
                     None => {
-                        dest.add(a);
+                        dest.add(a, allocation)?;
                         break;
                     }
                     Some(b) => b,
@@ -457,7 +534,8 @@ impl StateSet {
             }
         }
         for a in ita {
-            dest.add(a);
+            dest.add(a, allocation)?;
         }
+        Ok(())
     }
 }

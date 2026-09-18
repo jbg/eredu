@@ -1,8 +1,8 @@
 use eredu_nn::{
     Error,
     workspace::{
-        WorkspaceContext, WorkspaceMechanisms, WorkspaceMetadataAccount, WorkspaceMetadataFunding,
-        WorkspaceMetadataFundingError, WorkspaceOperation, WorkspaceOperationBound,
+        WorkspaceContext, WorkspaceMechanisms, HostMetadataAccount, HostMetadataFunding,
+        HostMetadataFundingError, WorkspaceOperation, WorkspaceOperationBound,
     },
 };
 use std::sync::{
@@ -16,13 +16,13 @@ pub(in crate::cache) struct AccountState {
 }
 #[derive(Debug)]
 struct Account(Arc<AccountState>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         let mut remaining = self.0.remaining.lock().unwrap();
         *remaining =
             remaining
                 .checked_sub(bytes)
-                .ok_or(WorkspaceMetadataFundingError::Capacity {
+                .ok_or(HostMetadataFundingError::Capacity {
                     required: bytes as u64,
                     available: *remaining as u64,
                 })?;
@@ -49,7 +49,7 @@ pub(in crate::cache) fn context() -> (WorkspaceContext, Arc<AccountState>) {
         remaining: Mutex::new(usize::MAX),
         retired: AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     (
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding).unwrap(),
         state,

@@ -3,7 +3,7 @@ use super::*;
 use crate::backend::runtime::cache::state::{MlxHybridState, MlxKeyValueState};
 use crate::composition::mlx::replicated_text::ResidentResetProfile;
 use eredu_runtime::working_memory::{
-    OriginalResidentResetSource, OriginalTextControlGuard, ResidentKvResetState,
+    OriginalResidentResetSource, OriginalTextControlGuard, ResidentTableResetState,
     ResidentResetSource, WorkingMemoryFundingScope,
 };
 

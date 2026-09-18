@@ -37,8 +37,8 @@ fn scheduled_decode_projection_joins_original_host_vote_callback_and_final_deliv
         let mut oracle_quota=CaptureLedger::new(source.admission());oracle_quota.begin_step();
         let ordinary_rows=prototype.producers().map(|(rank,p)|PartitionCaptureProducer{rank,projection:p.clone()}).collect();
         let oracle_limits=PartitionCaptureReceiptLimits{max_record_bytes:prototype.max_record_bytes(),..limits};
-        let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),prototype.context().clone(),ordinary_rows,4,oracle_limits,&mut oracle_quota)}
-            else{PartitionCaptureReceiptPlan::new_shared(source.clone(),prototype.context().clone(),ordinary_rows,4,oracle_limits,&mut oracle_quota)}.unwrap();
+        let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum(source.clone(),prototype.context().clone(),ordinary_rows,4,oracle_limits,&mut oracle_quota)}
+            else{PartitionCaptureReceiptPlan::new(source.clone(),prototype.context().clone(),ordinary_rows,4,oracle_limits,&mut oracle_quota)}.unwrap();
         assert_eq!(ordinary.identity(),prototype.identity());let mut ordinary=ordinary.into_delivery();
         for (rank,projection) in prototype.producers(){
             let mut fragments=vec![];

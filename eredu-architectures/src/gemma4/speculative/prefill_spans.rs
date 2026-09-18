@@ -36,7 +36,7 @@ impl<M: ExternalAssistantExecutionMechanisms<Architecture>>
             return Err(M::error("external capture spans are not contiguous".into()));
         }
         if !self.whole_prompt && !M::supports_prefill_observation(self.assistant, true) {
-            return Err(M::neural_error(eredu_nn::Error::backend_source(
+            return Err(M::neural_error(eredu_nn::Error::backend_retained_source(
                 eredu_core::speculative::SpeculativeControlError::Unsupported(
                     "observer requires explicit prompt-span and complete-context support",
                 ),
@@ -131,7 +131,7 @@ impl<M: ExternalAssistantExecutionMechanisms<Architecture>>
         let mut proofs=M::state_buffer(2,self.context)?;
         if let Some(proof)=evidence.as_ref(){proofs.try_push(proof).map_err(|_|M::state_refusal(self.context))?;}
         if let Some(proof)=state.evidence.as_ref(){proofs.try_push(proof).map_err(|_|M::state_refusal(self.context))?;}
-        let mut completion=M::submit_completion_with_sources(
+        let completion=M::submit_completion_with_sources(
             [&hidden,&state.hidden].into_iter()
                 .chain(shared_kv.iter().flat_map(|(_,k,v)|[k,v]))
                 .chain(state.shared_kv.values().flat_map(|(k,v)|[k,v]))

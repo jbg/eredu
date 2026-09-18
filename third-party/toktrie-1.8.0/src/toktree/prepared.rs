@@ -83,7 +83,7 @@ impl TokTrieConstructionRequirements {
         if count > NO_TOKEN as usize || (count == 0 && (bytes != 0 || maximum != 0)) {
             return Err(TokTrieSourceError::Vocabulary);
         }
-        if maximum > bytes || eos_count == 0 {
+        if maximum > bytes {
             return Err(TokTrieSourceError::Vocabulary);
         }
         // Offsets store all token bytes, including duplicate spellings. Each
@@ -248,7 +248,8 @@ impl<'a> TokTrieConstructionPlan<'a> {
         {
             return Err(TokTrieSourceError::Vocabulary);
         }
-        if eos.is_empty() || (original && eos.iter().any(|&id| id >= info.vocab_size)) {
+        if (eos.is_empty() && info.tok_eos != super::INVALID_TOKEN)
+            || (original && eos.iter().any(|&id| id >= info.vocab_size)) {
             return Err(TokTrieSourceError::Eos);
         }
         let mut bytes = 0;
@@ -261,7 +262,7 @@ impl<'a> TokTrieConstructionPlan<'a> {
         let requirements =
             TokTrieConstructionRequirements::for_source_geometry(count, bytes, maximum, eos.len())?;
         let mut selected = *info;
-        selected.tok_eos = eos[0];
+        selected.tok_eos = eos.first().copied().unwrap_or(super::INVALID_TOKEN);
         Ok(Self {
             words,
             info: selected,

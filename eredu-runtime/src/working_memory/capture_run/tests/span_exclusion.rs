@@ -136,7 +136,7 @@ fn reserve_sealed(
         modalities: InputModalities::TEXT,
         estimation: EstimationCompleteness::Complete,
     };
-    let (_, r, q) = plan_prefill_incremental_with_capacity(
+    let (r, q) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &cap,
@@ -492,6 +492,7 @@ fn previously_held_host_conversion_preserves_unheld_headroom_during_exclusion() 
             retained,
             protected,
             key.clone(),
+            None,
         )
         .unwrap();
         assert_eq!(headroom(&pool, &r), before.1);

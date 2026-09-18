@@ -23,7 +23,7 @@ struct RetainedRefusal {
 }
 fn error(cause: Exception) -> Error {
     match OriginalScopeObserver::try_current() {
-        Ok(None) => Error::backend_source(cause),
+        Ok(None) => Error::backend_retained_source(cause),
         _ => Error::backend_retained_source(cause),
     }
 }
@@ -185,8 +185,8 @@ pub(crate) fn control_bytes(layout: safemlx::ops::OriginalConvolutionLayout) -> 
         size_of::<Result<safemlx::DeviceType, Exception>>(),
         OriginalScopeObserver::control_bytes()?,
         Stream::device_type_control_bytes()?,
-        Error::retained_source_control_bytes::<Exception>()?,
-        Error::retained_source_control_bytes::<RetainedRefusal>()?,
+        Error::retained_source_construction_bytes::<Exception>()?,
+        Error::retained_source_construction_bytes::<RetainedRefusal>()?,
     ];
     frames
         .into_iter()

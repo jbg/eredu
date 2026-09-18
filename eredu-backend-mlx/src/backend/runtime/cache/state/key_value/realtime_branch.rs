@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::{array_copy::{OriginalCopyLayoutBuilder,RealtimeCopyPlan,RealtimeCopyContext},error::Error};
 use eredu_core::BackendFailure;
-use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataFunding};
+use eredu_nn::workspace::{WorkspaceContext,HostMetadataFunding};
 use eredu_runtime::working_memory::{OriginalRealtimeNative,OriginalRealtimeBudgetCustody,WorkingMemoryError};
 use sha2::{Digest,Sha256};
 use safemlx::{PreparedArrayClone,PreparedInputRuntime,PreparedStreamCopy,StreamCopyPlan};
@@ -17,24 +17,24 @@ pub(crate) struct RealtimeKvBranchPlan<'a> {
 }
 struct CopySources {
     _arrays:Vec<Array>,_stream:PreparedStreamCopy<OriginalRealtimeBudgetCustody>,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 #[derive(Debug,thiserror::Error)]
 #[error("realtime state branch: {cause}")]
 struct Failure {
     #[source] cause:Error,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 fn overflow()->Error {Error::PrefillControl(WorkingMemoryError::Overflow)}
 fn mismatch()->Error {Error::PrefillControl(WorkingMemoryError::IdentityMismatch)}
 fn sum(parts:&[usize])->Option<usize>{parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)}
 fn alias_bytes()->Option<usize>{PreparedArrayClone::control_bytes()?.checked_add(Array::inspection_clone_handle_bytes())}
-fn alias(source:&Array,funding:&WorkspaceMetadataFunding)->Result<Array,Error> {
+fn alias(source:&Array,funding:&HostMetadataFunding)->Result<Array,Error> {
     funding.reserve_metadata(alias_bytes().ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)?;
     let mut slot=PreparedArrayClone::try_prepare_for_inspection().map_err(Error::OriginalSamplingClone)?;
     slot.fill_for_inspection(source).map_err(Error::OriginalSamplingClone)
 }
-fn copy_callback<'a>(source:Option<&'a RealtimeKvBranchPlan<'a>>,funding:Option<&'a WorkspaceMetadataFunding>)
+fn copy_callback<'a>(source:Option<&'a RealtimeKvBranchPlan<'a>>,funding:Option<&'a HostMetadataFunding>)
     ->impl FnMut(&CopySources,&RealtimeCopyContext<'_>)->Result<MlxKeyValueTransactionBranch,Error>+'a {
     move |_,copy|source.expect("active branch source").construct(funding.expect("active branch funding"),Some(copy))
 }
@@ -112,7 +112,7 @@ impl<'a> RealtimeKvBranchPlan<'a> {
     fn fixed_bytes(&self)->Option<usize> {
         let callback=copy_callback(None,None);
         let parts=[size_of_val(&callback),size_of::<Sha256>(),size_of::<Result<Self,Error>>(),size_of::<Self>(),size_of::<MlxKeyValueState>(),size_of::<MlxKeyValueTransactionBranch>(),
-            size_of::<(&Self,&WorkspaceMetadataFunding,Option<&RealtimeCopyContext<'_>>)>(),
+            size_of::<(&Self,&HostMetadataFunding,Option<&RealtimeCopyContext<'_>>)>(),
             size_of::<Option<RealtimeCopyPlan<'_>>>(),size_of::<CopySources>(),
             size_of::<Result<MlxKeyValueTransactionBranch,Error>>(),size_of::<Failure>(),
             BackendFailure::source_retention_peak_bytes::<Failure>()?];sum(&parts)
@@ -145,7 +145,7 @@ impl<'a> RealtimeKvBranchPlan<'a> {
     pub(crate) fn copy_control_bytes(&self,plan:&RealtimeCopyPlan<'_>,runtime:&PreparedInputRuntime)->Option<usize> {
         plan.control_bytes::<CopySources,MlxKeyValueTransactionBranch>(runtime)
     }
-    fn construct(&self,funding:&WorkspaceMetadataFunding,copy:Option<&RealtimeCopyContext<'_>>)
+    fn construct(&self,funding:&HostMetadataFunding,copy:Option<&RealtimeCopyContext<'_>>)
         ->Result<MlxKeyValueTransactionBranch,Error> {
         // Revalidate the exact inspected manager frontiers before constructing
         // any branch. This source check grants no copy or mutation authority.
@@ -210,7 +210,7 @@ impl<'a> RealtimeKvBranchPlan<'a> {
     /// Uses the existing state field assembly and isolated numerical worker.
     /// Copy completion is established here, before the scheduler returns a branch.
     pub(crate) fn prepare(self,copy:Option<RealtimeCopyPlan<'_>>,claim:Option<OriginalRealtimeNative>,
-        runtime:&PreparedInputRuntime,stream:&Stream,funding:&WorkspaceMetadataFunding,
+        runtime:&PreparedInputRuntime,stream:&Stream,funding:&HostMetadataFunding,
         timeout:Option<Duration>)->Result<MlxKeyValueTransactionBranch,BackendFailure> {
         funding.reserve_metadata(self.fixed_bytes().ok_or_else(||overflow().into_backend_failure())?)
             .map_err(|cause|Error::WorkspacePlanning(cause).into_backend_failure())?;
@@ -237,3 +237,5 @@ impl<'a> RealtimeKvBranchPlan<'a> {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

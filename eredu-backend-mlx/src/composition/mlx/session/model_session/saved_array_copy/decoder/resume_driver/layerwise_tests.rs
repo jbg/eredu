@@ -310,7 +310,7 @@ fn layerwise_saved_resume_exact_budget_is_cold_and_retains_the_matching_operatio
         let mut retained_outputs = Vec::new();
         for ordinal in 0..3 {
             let output = driver.advance(&mut state).unwrap().unwrap().into_output();
-            driver.take_completed_step(&mut state).unwrap();
+            driver.take_completed_delivery(&mut state).unwrap();
             assert_eq!(output.step_receipt().unwrap().attempt(), ordinal);
             assert_eq!(output.token_id().unwrap(), expected[ordinal as usize]);
             // A completed output remains alive while the next scope reuses the

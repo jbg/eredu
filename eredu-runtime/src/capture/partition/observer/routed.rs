@@ -192,13 +192,13 @@ where
                             invocation,
                             failure.is_none(),
                         )
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                     let shape = self
                         .backend
                         .shape(invocation.input)
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                     let rows = super::super::session::routed_input_rows(&shape)
-                        .map_err(eredu_nn::Error::backend_source)?;
+                        .map_err(eredu_nn::Error::backend_retained_source)?;
                     let dtype = self
                         .backend
                         .source_dtype(invocation.input)
@@ -213,7 +213,7 @@ where
                                 .origins
                                 .map(|origins| origins.capture_coordinates()),
                         )
-                        .map_err(eredu_nn::Error::backend_source)
+                        .map_err(eredu_nn::Error::backend_retained_source)
                 })();
                 if let Err(error) = local {
                     self.session.failed_partition_source(&mut selection.work);
@@ -235,7 +235,7 @@ where
                     invocation,
                     failure.is_none(),
                 )
-                .map_err(eredu_nn::Error::backend_source);
+                .map_err(eredu_nn::Error::backend_retained_source);
                 if let Err(error) = result {
                     failure.get_or_insert(error);
                 }
@@ -281,7 +281,7 @@ where
                 }
                 let mut source = batch
                     .partition_capture_source()
-                    .map_err(eredu_nn::Error::backend_source)?;
+                    .map_err(eredu_nn::Error::backend_retained_source)?;
                 source.source.values = effective.as_ref().unwrap_or(batch.units.values);
                 let output = (self
                     .intervention_callbacks
@@ -290,7 +290,7 @@ where
                     .apply_routed)(
                     self.session, work, &mut self.backend, &source
                 )
-                .map_err(eredu_nn::Error::backend_source)?;
+                .map_err(eredu_nn::Error::backend_retained_source)?;
                 if output.is_some() {
                     effective = output;
                 }
@@ -322,7 +322,7 @@ where
                 let local = self
                     .session
                     .finish_partition_routed_capture(&mut selection.work, success && active)
-                    .map_err(eredu_nn::Error::backend_source);
+                    .map_err(eredu_nn::Error::backend_retained_source);
                 if local.is_err() {
                     self.session.failed_partition_source(&mut selection.work);
                 }
@@ -330,12 +330,12 @@ where
                     Some(hook) => self
                         .session
                         .agree_partition_hook(&mut selection.work, hook, local.is_ok())
-                        .map_err(eredu_nn::Error::backend_source)
+                        .map_err(eredu_nn::Error::backend_retained_source)
                         .and_then(|agreed| {
                             if agreed {
                                 Ok(())
                             } else {
-                                Err(eredu_nn::Error::backend_source(
+                                Err(eredu_nn::Error::backend_retained_source(
                                     PartitionCaptureObserverError::<B::Error>::HookRejected,
                                 ))
                             }
@@ -359,7 +359,7 @@ where
                     .finish_routed)(
                     self.session, work, success && active && failure.is_none()
                 )
-                .map_err(eredu_nn::Error::backend_source);
+                .map_err(eredu_nn::Error::backend_retained_source);
                 if let Err(error) = result {
                     failure.get_or_insert(error);
                 }
@@ -394,7 +394,7 @@ where
             let path = self.routed_path.as_deref().expect("active invocation");
             let source = batch
                 .partition_capture_source()
-                .map_err(eredu_nn::Error::backend_source)?;
+                .map_err(eredu_nn::Error::backend_retained_source)?;
             for selection in &mut self.selections {
                 let Some(routed) = &selection.routed else {
                     continue;
@@ -404,7 +404,7 @@ where
                 }
                 self.session
                     .observe_partition_routed_units(&mut selection.work, &mut self.backend, &source)
-                    .map_err(eredu_nn::Error::backend_source)?;
+                    .map_err(eredu_nn::Error::backend_retained_source)?;
             }
             Ok(())
         })();

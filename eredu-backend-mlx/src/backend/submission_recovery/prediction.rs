@@ -123,7 +123,13 @@ impl PredictionRole {
     }
 }
 #[derive(Debug)]
+struct SamplingRoles {
+    sampling: Option<PredictionRole>,
+    event: Option<PredictionRole>,
+}
+#[derive(Debug)]
 pub(crate) struct PredictionSet {
+    replacement: Option<SamplingRoles>,
     host_sequence: bool,
     operations: OperationRegistration,
     paged: Option<(crate::backend::nn::workspace::ProjectedPagedSources, u64)>,
@@ -136,6 +142,18 @@ pub(crate) struct PredictionSet {
     controls: OriginalTextControlGuard,
 }
 impl PredictionSet {
+    /// Both finite neutral banks have already authenticated the same active
+    /// step. Keep only the two replacement roles; model roles remain original.
+    pub(crate) fn with_sampling_replacement(mut self, mut replacement: Self)
+        -> Result<Self, eredu_runtime::working_memory::WorkingMemoryError> {
+        if self.replacement.is_some() { return Err(eredu_runtime::working_memory::WorkingMemoryError::AlreadyStarted); }
+        replacement.operations = self.operations.clone();
+        self.replacement = Some(SamplingRoles {
+            sampling: Some(replacement.take_sampling()?),
+            event: Some(replacement.take_sampling_event()?),
+        });
+        Ok(self)
+    }
     pub(crate) fn with_sampling_source(mut self, source: Option<crate::backend::runtime::distributed::topology::original_source::control::OriginalSamplingSource>) -> Self {
         self.sampling_source = source;
         self
@@ -175,6 +193,7 @@ impl PredictionSet {
         controls: OriginalTextControlGuard,
     ) -> Self {
         Self {
+            replacement: None,
             host_sequence: false,
             operations: None,
             paged: None,
@@ -216,6 +235,9 @@ impl PredictionSet {
     pub(crate) fn take_sampling(
         &mut self,
     ) -> Result<PredictionRole, eredu_runtime::working_memory::WorkingMemoryError> {
+        if let Some(replacement) = &mut self.replacement {
+            return replacement.sampling.take().ok_or(eredu_runtime::working_memory::WorkingMemoryError::AlreadyStarted);
+        }
         self.original.take_sampling().map(|original| {
             PredictionRole::new(
                 original,
@@ -232,6 +254,9 @@ impl PredictionSet {
     pub(crate) fn take_sampling_event(
         &mut self,
     ) -> Result<PredictionRole, eredu_runtime::working_memory::WorkingMemoryError> {
+        if let Some(replacement) = &mut self.replacement {
+            return replacement.event.take().ok_or(eredu_runtime::working_memory::WorkingMemoryError::AlreadyStarted);
+        }
         self.original.take_sampling_event().map(|original| {
             PredictionRole::new(
                 original,

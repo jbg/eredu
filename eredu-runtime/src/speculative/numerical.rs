@@ -5,6 +5,10 @@
 pub enum SpeculativeNumericalKind {
     /// Exact eager U32 token input, with no model or sampler callback.
     TokenIds { length: u32 },
+    /// Exact architecture-declared placeholder value and admitted extent.
+    RepeatedToken { token: u32, length: u32 },
+    /// Exact axis-one concatenation of the ordered completed token segments.
+    TokenConcatenate { parts: u32, positions: u32 },
     /// Exact sequence-preserving static view of a completed capture tensor.
     TensorRange { start: u32, end: u32 },
     /// Exact non-batch-axis static view of a completed capture tensor. The
@@ -76,11 +80,16 @@ impl SpeculativeNumericalProgram {
         kind: SpeculativeNumericalKind,
         shape: &[i32],
     ) -> Result<Self, SpeculativeNumericalError> {
-        if let SpeculativeNumericalKind::TokenIds { length } = kind {
+        if let SpeculativeNumericalKind::TokenIds { length } | SpeculativeNumericalKind::RepeatedToken { length, .. } = kind {
             let width = i32::try_from(length).map_err(|_| SpeculativeNumericalError::Shape)?;
             if width == 0 || shape != [1, width] {
                 return Err(SpeculativeNumericalError::Shape);
             }
+            return Ok(Self { kind, shape: [1, width, 1, 1], rank: 2 });
+        }
+        if let SpeculativeNumericalKind::TokenConcatenate { parts, positions } = kind {
+            let width = i32::try_from(positions).map_err(|_| SpeculativeNumericalError::Shape)?;
+            if parts == 0 || width == 0 || shape != [1, width] { return Err(SpeculativeNumericalError::Shape); }
             return Ok(Self { kind, shape: [1, width, 1, 1], rank: 2 });
         }
         if matches!(kind, SpeculativeNumericalKind::CreateKey { .. } | SpeculativeNumericalKind::NextKey | SpeculativeNumericalKind::UniformUnitInterval | SpeculativeNumericalKind::KeyAt { .. }) {
@@ -155,9 +164,10 @@ impl SpeculativeNumericalProgram {
     /// Number of actual source distributions, without callback inference.
     pub fn source_count(self) -> usize {
         match self.kind {
-            SpeculativeNumericalKind::CreateKey { .. } | SpeculativeNumericalKind::TokenIds { .. } => 0,
+            SpeculativeNumericalKind::CreateKey { .. } | SpeculativeNumericalKind::TokenIds { .. } | SpeculativeNumericalKind::RepeatedToken { .. } => 0,
             SpeculativeNumericalKind::Correction | SpeculativeNumericalKind::Categorical(_)
                 | SpeculativeNumericalKind::TensorConcatenate { .. } => 2,
+            SpeculativeNumericalKind::TokenConcatenate { parts, .. } => parts as usize,
             _ => 1,
         }
     }
@@ -167,6 +177,8 @@ impl SpeculativeNumericalProgram {
             SpeculativeNumericalKind::TensorConcatenate { right_positions } =>
                 shape.len() == usize::from(self.rank) && shape[0] == 1
                     && shape[1] == right_positions as i32 && shape[2..] == self.shape()[2..],
+            SpeculativeNumericalKind::TokenConcatenate { positions, .. } =>
+                matches!(shape, [1, width] if *width > 0 && *width as u32 <= positions),
             _ => shape == self.shape(),
         };
         if matches {

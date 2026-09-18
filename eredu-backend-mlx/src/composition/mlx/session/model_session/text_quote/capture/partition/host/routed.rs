@@ -15,7 +15,7 @@ pub(super) struct RowSource {
     index:usize, bank:RoutedUnitGeometry, source_tokens:u64, native:Vec<Native>,
     // Borrowed native source labels and immutable architecture maps remain the
     // same loaded owner. The issued runtime source copies them under its payer.
-    loaded:Arc<LoadedPartitionCapture>,
+    loaded:LoadedPartitionCapture,
 }
 impl std::fmt::Debug for RowSource {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
@@ -23,14 +23,14 @@ impl std::fmt::Debug for RowSource {
             .field("source_tokens",&self.source_tokens).field("native",&self.native).finish_non_exhaustive()
     }
 }
-fn slice(axes:[[u64;3];4],metadata:&WorkspaceMetadataFunding)->Result<ResolvedCaptureSlice,Error> {
+fn slice(axes:[[u64;3];4],metadata:&HostMetadataFunding)->Result<ResolvedCaptureSlice,Error> {
     Ok(ResolvedCaptureSlice{starts:copy(&axes[0],metadata)?,ends:copy(&axes[1],metadata)?,
         strides:copy(&axes[2],metadata)?,shape:copy(&axes[3],metadata)?})
 }
 /// Exact ordinary projection count, including permuted and strided unit maps.
 /// No projection storage or authority is issued by this borrowed traversal.
 fn fragment_limit(selected:&RoutedPartitionCaptureSource<'_>,geometry:&CaptureRoutedUnitsGeometry<'_>,
-    metadata:&WorkspaceMetadataFunding)->Result<usize,Error> {
+    metadata:&HostMetadataFunding)->Result<usize,Error> {
     let mut global=[0u64;3];
     for (out,&n) in global.iter_mut().zip(geometry.source_shape()) {*out=u64::try_from(n).map_err(|_|overflow())?;}
     let mut shape=[0u64;3];
@@ -49,8 +49,8 @@ fn fragment_limit(selected:&RoutedPartitionCaptureSource<'_>,geometry:&CaptureRo
     }
     Ok(total.max(1))
 }
-pub(super) fn prepare(loaded:&Arc<LoadedPartitionCapture>,source:&SharedCapturePlan,
-    context:&PartitionCaptureContext,index:usize,inference:InferenceGeometry,metadata:&WorkspaceMetadataFunding)
+pub(super) fn prepare(loaded:&LoadedPartitionCapture,source:&SharedCapturePlan,
+    context:&PartitionCaptureContext,index:usize,inference:InferenceGeometry,metadata:&HostMetadataFunding)
     ->Result<Prototype,Error> {
     let selection=&source.admission().plan().selections[index];
     let selected=loaded.layouts().routed_capture_source(&selection.path)
@@ -101,7 +101,7 @@ pub(super) fn prepare(loaded:&Arc<LoadedPartitionCapture>,source:&SharedCaptureP
 }
 impl RowSource {
     pub(super) fn bind(self,source:&SharedCapturePlan,rank:usize,scalar:Option<WorkspaceFloatingType>,
-        inference:InferenceGeometry,prediction:u64,metadata:&WorkspaceMetadataFunding)
+        inference:InferenceGeometry,prediction:u64,metadata:&HostMetadataFunding)
         ->Result<PreparedPartitionRoutedSource,Error> {
         let selection=source.admission().plan().selections.get(self.index).ok_or_else(unknown)?;
         let selected=self.loaded.layouts().routed_capture_source(&selection.path)
@@ -133,7 +133,7 @@ impl RowSource {
     }
 }
 pub(super) fn controls()->Option<usize> {
-    let parts=[size_of::<RowSource>()*2,size_of::<Native>()*2,size_of::<Arc<LoadedPartitionCapture>>() *2,
+    let parts=[size_of::<RowSource>()*2,size_of::<Native>()*2,size_of::<LoadedPartitionCapture>() *2,
         size_of::<Vec<Native>>(),size_of::<RoutedPartitionCaptureSource<'_>>() *2,
         size_of::<Option<RoutedPartitionCaptureRank<'_>>>() *2,size_of::<CaptureRoutedUnitsGeometry<'_>>() *2,
         size_of::<CaptureCoordinateProjectionPlan<'_>>() *2,size_of::<[[u64;3];4]>() *2,size_of::<[u64;3]>()*2,
@@ -145,10 +145,10 @@ pub(super) fn controls()->Option<usize> {
         size_of::<Result<ResolvedCaptureSlice,Error>>(),size_of::<Result<usize,Error>>(),
         size_of::<Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError>>(),
         size_of::<Result<[[u64;3];4],eredu_core::capture::RoutedUnitValidationError>>(),
-        size_of::<(&Arc<LoadedPartitionCapture>,&SharedCapturePlan,&PartitionCaptureContext,usize,InferenceGeometry,&WorkspaceMetadataFunding)>(),
-        size_of::<(RowSource,&SharedCapturePlan,usize,Option<WorkspaceFloatingType>,InferenceGeometry,u64,&WorkspaceMetadataFunding)>(),
-        size_of::<(&RoutedPartitionCaptureSource<'_>,&CaptureRoutedUnitsGeometry<'_>,&WorkspaceMetadataFunding)>(),
-        size_of::<([[u64;3];4],&WorkspaceMetadataFunding)>(),size_of::<Option<TensorDtype>>(),
+        size_of::<(&LoadedPartitionCapture,&SharedCapturePlan,&PartitionCaptureContext,usize,InferenceGeometry,&HostMetadataFunding)>(),
+        size_of::<(RowSource,&SharedCapturePlan,usize,Option<WorkspaceFloatingType>,InferenceGeometry,u64,&HostMetadataFunding)>(),
+        size_of::<(&RoutedPartitionCaptureSource<'_>,&CaptureRoutedUnitsGeometry<'_>,&HostMetadataFunding)>(),
+        size_of::<([[u64;3];4],&HostMetadataFunding)>(),size_of::<Option<TensorDtype>>(),
         size_of::<std::ops::Range<usize>>()*3,size_of::<std::slice::Iter<'_,Native>>(),
         size_of::<std::iter::Zip<std::slice::IterMut<'_,u64>,std::slice::Iter<'_,usize>>>(),
         RoutedPartitionCaptureSource::control_bytes()?,CaptureRoutedUnitsGeometry::partition_control_bytes()?,
@@ -158,3 +158,5 @@ pub(super) fn controls()->Option<usize> {
         size_of::<&eredu_core::ObservationPoint>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

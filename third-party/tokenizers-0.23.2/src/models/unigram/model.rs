@@ -1,34 +1,29 @@
-use super::{
-    lattice::Lattice,
-    trainer::UnigramTrainer,
-    trie::{Trie, TrieBuilder},
-};
+use super::{lattice::Lattice, trainer::UnigramTrainer, trie::Trie};
 use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, MAX_LENGTH};
 use std::collections::HashMap;
 
-use ahash::AHashMap;
 use std::convert::TryInto;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 
-type TokenMap = AHashMap<String, u32>;
-type Vocab = Vec<(String, f64)>;
+pub(super) type TokenMap = hashbrown::HashMap<String, u32>;
+pub(super) type Vocab = Vec<(String, f64)>;
 
 /// A `Unigram` model to encode sentences.
 pub struct Unigram {
-    token_to_ids: TokenMap,
+    pub(super) token_to_ids: TokenMap,
     pub(crate) vocab: Vocab,
-    cache: Option<Cache<String, Vec<String>>>,
-    trie: Trie<u8>,
+    pub(super) cache: Option<Cache<String, Vec<String>>>,
+    pub(super) trie: Trie<u8>,
     pub min_score: f64,
     pub(super) unk_id: Option<usize>,
     pub(super) bos_id: usize,
     pub(super) eos_id: usize,
 
-    fuse_unk: bool,
-    is_optimized: bool,
-    byte_fallback: bool,
+    pub(super) fuse_unk: bool,
+    pub(super) is_optimized: bool,
+    pub(super) byte_fallback: bool,
 
     pub alpha: Option<f64>,
     pub nbest_size: Option<usize>,
@@ -75,7 +70,7 @@ impl std::fmt::Debug for Unigram {
     }
 }
 
-static K_UNK_PENALTY: f64 = 10.0;
+pub(super) static K_UNK_PENALTY: f64 = 10.0;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UnigramError {
@@ -95,9 +90,13 @@ impl Default for Unigram {
 }
 
 impl Unigram {
+    pub(crate) fn cache_capacity(&self) -> usize {
+        self.cache.as_ref().map_or(0, |cache| cache.capacity)
+    }
+
     pub(crate) fn decode_ids(
         &self,
-    ) -> std::iter::Copied<std::collections::hash_map::Values<'_, String, u32>> {
+    ) -> std::iter::Copied<hashbrown::hash_map::Values<'_, String, u32>> {
         self.token_to_ids.values().copied()
     }
 
@@ -126,7 +125,7 @@ impl Unigram {
             vocab,
             unk_id,
             byte_fallback,
-            crate::ModelCachePolicy::Legacy,
+            crate::ModelCachePolicy::default(),
         )
     }
 
@@ -139,8 +138,8 @@ impl Unigram {
         policy: crate::ModelCachePolicy,
     ) -> Result<Self> {
         let n = vocab.len();
-        let mut token_to_ids: TokenMap = AHashMap::new();
-        let mut builder = TrieBuilder::default();
+        let mut token_to_ids = TokenMap::new();
+        let mut trie = Trie::default();
 
         if let Some(unk_id) = unk_id {
             if vocab.is_empty() {
@@ -153,15 +152,18 @@ impl Unigram {
         let bos_id = n + 1;
         let eos_id = n + 2;
 
-        let mut min_score = f64::INFINITY;
-        for (id, (token, score)) in vocab.iter().enumerate() {
-            token_to_ids.insert(token.to_string(), id as u32);
-            builder.push(token.as_bytes());
-            if score < &min_score {
-                min_score = *score;
-            }
-        }
-        let trie = builder.build();
+        let mut pending = String::new();
+        index_vocabulary(
+            &vocab,
+            &mut token_to_ids,
+            &mut trie,
+            &mut pending,
+            |out, size| out.try_reserve_exact(size),
+        )?;
+        let min_score = vocab.iter().fold(
+            f64::INFINITY,
+            |min, (_, score)| if *score < min { *score } else { min },
+        );
         let fuse_unk = true;
         let is_optimized = true;
 
@@ -174,10 +176,7 @@ impl Unigram {
             eos_id,
             unk_id,
             fuse_unk,
-            cache: match policy {
-                crate::ModelCachePolicy::Legacy => Some(Cache::default()),
-                crate::ModelCachePolicy::NoModelCaches => None,
-            },
+            cache: (policy.capacity != 0).then(|| Cache::new(policy.capacity)),
             is_optimized,
             byte_fallback,
             alpha: None,
@@ -217,13 +216,12 @@ impl Unigram {
 
             let mut has_single_node = false;
 
-            for bytes in self
+            for n in self
                 .trie
-                .common_prefix_search(lattice.sentence.bytes().skip(begin_pos))
+                .common_prefix_lengths(lattice.sentence[begin_pos..].bytes())
             {
-                let n = bytes.len();
-                let tok = String::from_utf8(bytes).unwrap();
-                let id = *self.token_to_ids.get(&tok).unwrap();
+                let tok = &lattice.sentence[begin_pos..begin_pos + n];
+                let id = *self.token_to_ids.get(tok).unwrap();
 
                 let item = &self.vocab[id as usize];
                 assert_eq!(item.0, tok);
@@ -290,94 +288,15 @@ impl Unigram {
     }
 
     fn encode_optimized(&self, sentence: &str) -> Result<Vec<String>> {
-        // https://github.com/google/sentencepiece/blob/d48247191a6d50e469ed1a4a36e877befffd1851/src/unigram_model.cc#L600
-        #[derive(Debug, Clone)]
-        struct BestPathNode {
-            /// The vocab id. (maybe UNK)
-            id: usize,
-            /// The total score of the best path ending at this node.
-            best_path_score: f64,
-            /// The starting position (in utf-8) of this node. The entire best
-            /// path can be constructed by backtracking along this link.
-            starts_at: Option<usize>,
-        }
-        impl Default for BestPathNode {
-            fn default() -> Self {
-                Self {
-                    id: 0,
-                    best_path_score: 0.0,
-                    starts_at: None,
-                }
-            }
-        }
-        let size = sentence.len();
-        let unk_score = self.min_score - K_UNK_PENALTY;
-
-        let mut best_path_ends_at = vec![BestPathNode::default(); size + 1];
-        let mut starts_at = 0;
-        while starts_at < size {
-            let best_path_score_till_here = best_path_ends_at[starts_at].best_path_score;
-            let mut has_single_node = false;
-            let mblen = sentence[starts_at..].chars().next().unwrap().len_utf8();
-            for tok_bytes in self
-                .trie
-                .common_prefix_search(sentence.bytes().skip(starts_at))
-            {
-                let key_pos = starts_at + tok_bytes.len();
-                let token: String = String::from_utf8(tok_bytes).unwrap();
-                let target_node = &mut best_path_ends_at[key_pos];
-                let length = key_pos - starts_at;
-                let id = self.token_to_ids.get(&token).unwrap();
-                let score = self.vocab.get(*id as usize).unwrap().1;
-                let candidate_best_path_score = score + best_path_score_till_here;
-                if target_node.starts_at.is_none()
-                    || candidate_best_path_score > target_node.best_path_score
-                {
-                    target_node.best_path_score = candidate_best_path_score;
-                    target_node.starts_at = Some(starts_at);
-                    target_node.id = *id as usize;
-                }
-                if !has_single_node && length == mblen {
-                    has_single_node = true;
-                }
-            }
-            if !has_single_node {
-                let target_node = &mut best_path_ends_at[starts_at + mblen];
-                let candidate_best_path_score = unk_score + best_path_score_till_here;
-                if target_node.starts_at.is_none()
-                    || candidate_best_path_score > target_node.best_path_score
-                {
-                    target_node.best_path_score = candidate_best_path_score;
-                    target_node.starts_at = Some(starts_at);
-                    target_node.id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
-                }
-            }
-            starts_at += mblen
-        }
-        let mut ends_at = size;
-        let mut results: Vec<String> = vec![];
-        let mut token = vec![];
-        while ends_at > 0 {
-            let node = &best_path_ends_at[ends_at];
-            let starts_at = node.starts_at.unwrap();
-            if self.fuse_unk && Some(node.id) == self.unk_id {
-                token.push(sentence[starts_at..ends_at].to_string());
-            } else {
-                if !token.is_empty() {
-                    token.reverse();
-                    results.push(token.concat());
-                    token = vec![];
-                }
-                results.push(sentence[starts_at..ends_at].to_string());
-            }
-            ends_at = starts_at;
-        }
-        if !token.is_empty() {
-            token.reverse();
-            results.push(token.concat());
-        }
-        results.reverse();
-        Ok(results)
+        let mut scratch = super::encode::UnigramScratch::default();
+        scratch.reserve_nodes(sentence.len() + 1)?;
+        scratch.reserve_spans(sentence.len())?;
+        scratch.encode(self, sentence)?;
+        Ok(scratch
+            .spans()
+            .iter()
+            .map(|&(start, end)| sentence[start..end].to_owned())
+            .collect())
     }
 
     fn encode_unoptimized(&self, sentence: &str) -> Result<Vec<String>> {
@@ -447,6 +366,10 @@ impl Unigram {
 
     /// Resize the cache
     pub fn resize_cache(&mut self, capacity: usize) {
+        if capacity == 0 {
+            self.cache = None;
+            return;
+        }
         if let Some(cache) = &mut self.cache {
             cache.resize(capacity);
         }
@@ -492,31 +415,10 @@ impl Model for Unigram {
         for string in str_tokens {
             let len = string.len();
             let offsets = (offset, offset + len);
-            let id: u32 = match self.token_to_ids.get(&string) {
-                Some(id) => *id,
-                None => {
-                    if self.byte_fallback {
-                        let byte_tokens: Option<Vec<_>> = string
-                            .bytes()
-                            .map(|byte| -> Option<Token> {
-                                let byte_string = format!("<0x{byte:02X}>");
-                                let id = self.token_to_ids.get(&byte_string);
-                                id.map(|id| Token::new(*id, byte_string, (offset, offset + len)))
-                            })
-                            .collect();
-                        if let Some(byte_tokens) = byte_tokens {
-                            for token in byte_tokens {
-                                tokens.push(token);
-                            }
-                            offset += len;
-                            continue;
-                        }
-                    }
-                    self.unk_id.ok_or(UnigramError::MissingUnkId)? as u32
-                }
-            };
+            self.visit_piece_ids(&string, |id, text| {
+                tokens.push(Token::new(id, text.to_owned(), offsets))
+            })?;
             offset += len;
-            tokens.push(Token::new(id, string, offsets));
         }
         Ok(tokens)
     }
@@ -705,5 +607,64 @@ mod tests {
 
         let tokens = unigram.tokenize("?é").unwrap();
         assert_eq!(tokens[0].id, 0);
+    }
+}
+
+pub(super) fn index_vocabulary(
+    vocab: &Vocab,
+    index: &mut TokenMap,
+    trie: &mut Trie<u8>,
+    pending: &mut String,
+    mut reserve: impl FnMut(
+        &mut String,
+        usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError>,
+) -> std::result::Result<(), std::collections::TryReserveError> {
+    for (id, (token, _)) in vocab.iter().enumerate() {
+        reserve(pending, token.len())?;
+        pending.push_str(token);
+        index.insert(std::mem::take(pending), id as u32);
+        trie.push(token.as_bytes());
+    }
+    Ok(())
+}
+impl Unigram {
+    pub(crate) fn same_configuration(&self, other: &Self) -> bool {
+        self.unk_id == other.unk_id
+            && self.bos_id == other.bos_id
+            && self.eos_id == other.eos_id
+            && self.fuse_unk == other.fuse_unk
+            && self.is_optimized == other.is_optimized
+            && self.byte_fallback == other.byte_fallback
+            && self.min_score.to_bits() == other.min_score.to_bits()
+            && self.alpha.map(f64::to_bits) == other.alpha.map(f64::to_bits)
+            && self.nbest_size == other.nbest_size
+            && self.token_to_ids == other.token_to_ids
+            && self.vocab.len() == other.vocab.len()
+            && self
+                .vocab
+                .iter()
+                .zip(&other.vocab)
+                .all(|((a, x), (b, y))| a == b && x.to_bits() == y.to_bits())
+    }
+    pub(crate) fn configuration_comparison_control_bytes() -> Option<usize> {
+        use std::mem::size_of;
+        [
+            size_of::<[&Self; 2]>(),
+            size_of::<[usize; 2]>(),
+            size_of::<[u64; 2]>(),
+            size_of::<
+                std::iter::Zip<
+                    std::slice::Iter<'_, (String, f64)>,
+                    std::slice::Iter<'_, (String, f64)>,
+                >,
+            >(),
+            size_of::<hashbrown::hash_map::Iter<'_, String, u32>>(),
+            size_of::<(&String, &u32)>(),
+            size_of::<bool>(),
+        ]
+        .iter()
+        .copied()
+        .try_fold(0usize, usize::checked_add)
     }
 }

@@ -203,8 +203,8 @@ not be interpreted as target kernel time.
 
 ## Inspector and controlled sessions
 
-Use the facade's `with_controlled_chat_speculative` or
-`with_controlled_text_speculative` to drive this same scheduler explicitly from a
+Use the facade's `with_controlled_prepared_chat_speculative` or
+`with_controlled_managed_plain_text_speculative` to drive this same scheduler explicitly from a
 worker command loop. Controlled step records expose tentative proposals, target
 acceptance/rejection, optimistic work and bounded prediction captures. Snapshots
 require complete canonical state and explicit resource limits; see

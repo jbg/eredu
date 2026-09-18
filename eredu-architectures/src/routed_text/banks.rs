@@ -128,16 +128,25 @@ where
         movement: Movement,
         options: eredu_runtime::ParameterBankLoadOptions,
     ) -> Result<Self, RoutedTextExecutionError> {
+        // Adapter facts must cover the entire selected local physical bank,
+        // including units absent from any one routed invocation.
+        if bytes.len() != selected.addressable_members.len()
+            || selected.addressable_members.iter().any(|member| !bytes.contains_key(&member.key()))
+        {
+            return Err(RoutedTextExecutionError::Contract(
+                "completed physical source differs from selected member identities".into(),
+            ));
+        }
         let routes = selected
             .plan
             .partition_routes(&selected.routes_by_unit, exchange);
-        Ok(match &selected.plan {
+        let provider = match &selected.plan {
             RoutedGroupedPlan::Gated(plan) => {
                 Self::Gated(PlannedAddressableGatedProduct::new_partitioned_with_routes(
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
-                    bytes,
+                    &bytes,
                     bank,
                     movement,
                     options,
@@ -149,7 +158,7 @@ where
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
-                    bytes,
+                    &bytes,
                     bank,
                     movement,
                     options,
@@ -161,14 +170,16 @@ where
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
-                    bytes,
+                    &bytes,
                     bank,
                     movement,
                     options,
                     routes,
                 )?)
             }
-        })
+        };
+        selected.complete_partition_source(bytes,options)?;
+        Ok(provider)
     }
 
     pub(super) fn from_selected(

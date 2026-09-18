@@ -60,7 +60,7 @@ enum QuoteError {
 struct QuoteFailure {
     #[source]
     cause: PreparedExecutionError<Error>,
-    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 fn with_failure<T, F: FnOnce() -> Result<T, PreparedExecutionError<Error>>>(
     context: &WorkspaceContext,
@@ -70,7 +70,7 @@ fn with_failure<T, F: FnOnce() -> Result<T, PreparedExecutionError<Error>>>(
         size_of::<F>(),
         size_of::<Result<T, PreparedExecutionError<Error>>>(),
         size_of::<QuoteFailure>(),
-        size_of::<Option<eredu_nn::workspace::WorkspaceMetadataFunding>>(),
+        size_of::<Option<eredu_nn::workspace::HostMetadataFunding>>(),
         WorkspaceContext::metadata_source_bytes::<QuoteFailure>().ok_or_else(|| {
             PreparedExecutionError::Metadata(WorkspaceMetadataError::Overflow.into())
         })?,
@@ -515,7 +515,7 @@ where
         self.context.metadata_error(message)
     }
     fn invalid(message: String) -> Error {
-        Error::backend(message)
+        Error::backend_message(message)
     }
 }
 

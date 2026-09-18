@@ -94,7 +94,7 @@ enum Failure {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     Bf16Projection(super::bf16_projection_kernel::MlxBf16ProjectionError),
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    Fp8(super::fp8_kernel::MlxFp8KernelError),
+    Fp8(crate::backend::nn::fp8::kernel::MlxFp8KernelError),
 }
 impl std::fmt::Display for MlxInputAllocatorInitializationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -189,7 +189,7 @@ pub(crate) fn prepare_admitted(
     super::bf16_projection_kernel::prepare_admitted(pool)
         .map_err(|error| MlxInputAllocatorInitializationError(Failure::Bf16Projection(error)))?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    super::fp8_kernel::prepare_admitted(pool)
+    crate::backend::nn::fp8::kernel::prepare_admitted(pool)
         .map_err(|error| MlxInputAllocatorInitializationError(Failure::Fp8(error)))?;
     if let Some(owner) = INITIALIZED.get() {
         return borrow(owner, pool, device_admitted);

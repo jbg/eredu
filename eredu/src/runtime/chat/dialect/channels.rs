@@ -77,3 +77,12 @@ pub(crate) fn control_bytes() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
 }
+
+/// Actual payload mechanism, without inferring it from model or delimiter names.
+pub(crate) fn tools(spec: &DeclarativeDialectSpec) -> Option<eredu_text::semantic_channels::tagged::ToolProgram<'static>> {
+    use eredu_text::semantic_channels::{JsonEnvelope, tagged::{ToolProgram, TaggedToolProgram}};
+    if let Some(json) = json_tools(spec) { return Some(ToolProgram::Json(json)); }
+    let super::DeclarativePayloadShape::TaggedParameters(encoding) = spec.payload_shape else { return None; };
+    Some(ToolProgram::Tagged(TaggedToolProgram { output:JsonEnvelope { prefix:spec.output.prefix, suffix:spec.output.suffix },
+        call:JsonEnvelope { prefix:spec.call.prefix, suffix:spec.call.suffix }, encoding:encoding.program() }))
+}

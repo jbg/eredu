@@ -73,7 +73,7 @@ fn every_owning_operation_preserves_options_and_borrows_actual_source_storage() 
             count: 7,
         },
         K::Elementwise("multiply"),
-        K::View("transpose"),
+        K::View("reshape"),
         K::Transpose(vec![0, 2, 1, 3]),
         K::Index { selected_axes: 3 },
         K::StaticSlice {starts:vec![0,1,2],ends:vec![2,5,8],strides:vec![1,2,3]},
@@ -136,6 +136,10 @@ fn every_owning_operation_preserves_options_and_borrows_actual_source_storage() 
         },
         K::Reduction("sum", -2, true),
         K::Normalization("rms", Some(3)),
+        K::LayerNorm { weight: false, bias: false },
+        K::LayerNorm { weight: true, bias: false },
+        K::LayerNorm { weight: false, bias: true },
+        K::LayerNorm { weight: true, bias: true },
         K::ConstructedNormalization(NormalizationConstructionSpec {
             groups: Some(3),
             dimensions: 12,
@@ -251,7 +255,7 @@ fn every_owning_operation_preserves_options_and_borrows_actual_source_storage() 
             peer_widths: vec![3, 5, 7],
         }),
     ];
-    assert_eq!(kinds.len(), 56);
+    assert_eq!(kinds.len(), 60);
     for kind in kinds {
         let view = kind.as_view();
         // Derived diagnostics expose every scalar/option, nested source identity,

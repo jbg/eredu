@@ -6,12 +6,12 @@ use eredu_core::speculative::{
 };
 use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
 
-#[path = "activations/reductions.rs"]
-mod reductions;
 #[path = "activations/control.rs"]
 mod control;
 #[path = "activations/interventions.rs"]
 mod interventions;
+#[path = "activations/reductions.rs"]
+mod reductions;
 #[path = "activations/sparse.rs"]
 mod sparse;
 
@@ -135,9 +135,7 @@ fn rows(
         assert_eq!(step.prediction_index, record.origin.prediction as u64);
         assert!(step.invocation.is_some());
         if shared {
-            let CapturedStepDelivery::Shared(frame) = &record.captures else {
-                panic!("original internal capture must escape with its paid shared owner")
-            };
+            let frame = &record.captures;
             let alias = frame.clone();
             assert!(alias.same_storage(frame));
             assert_eq!(alias.records().as_ptr(), frame.records().as_ptr());
@@ -188,7 +186,9 @@ fn rows(
     encoded.into()
 }
 
-fn selections(discovery: &eredu_core::speculative::SpeculativeActivationDiscovery) -> Vec<CaptureSelection> {
+fn selections(
+    discovery: &eredu_core::speculative::SpeculativeActivationDiscovery,
+) -> Vec<CaptureSelection> {
     let selected = [
         (
             "target residual",
@@ -286,8 +286,12 @@ fn run_configured(mode: &str, aggregates: bool, evidence: bool) -> serde_json::V
         }
     });
     result["activations"] = rows(&records, mode != "ordinary", aggregates || evidence);
-    result["reductions"] = aggregates.then(|| reductions::rows(&records, mode != "ordinary")).map_or(serde_json::Value::Null, |value| value);
-    result["interventions"] = evidence.then(|| interventions::rows(&records, mode != "ordinary")).map_or(serde_json::Value::Null, |value| value);
+    result["reductions"] = aggregates
+        .then(|| reductions::rows(&records, mode != "ordinary"))
+        .map_or(serde_json::Value::Null, |value| value);
+    result["interventions"] = evidence
+        .then(|| interventions::rows(&records, mode != "ordinary"))
+        .map_or(serde_json::Value::Null, |value| value);
     result
 }
 
@@ -297,15 +301,20 @@ fn run_plan(
     mode: &str,
     target: Fixture,
     execution: ExecutionPlan,
-    plan: impl FnOnce(&eredu_core::speculative::SpeculativeActivationDiscovery) -> SpeculativeActivationPlan,
+    plan: impl FnOnce(
+        &eredu_core::speculative::SpeculativeActivationDiscovery,
+    ) -> SpeculativeActivationPlan,
 ) -> (Vec<SpeculativeActivationCapture>, serde_json::Value) {
     let mut loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &execution)
             .unwrap_or_else(report_failure);
     let options = loaded.speculative_generation_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
-    let discovery = model.speculative_activation_discovery().unwrap_or_else(report_failure);
-    let admitted = model.prepare_speculative_activations(plan(&discovery))
+    let discovery = model
+        .speculative_activation_discovery()
+        .unwrap_or_else(report_failure);
+    let admitted = model
+        .prepare_speculative_activations(plan(&discovery))
         .unwrap_or_else(report_failure);
     drop(discovery);
     let control = ControlledSpeculativeOptions {
@@ -324,23 +333,28 @@ fn run_plan(
     let output;
     if mode == "ordinary" {
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
-                add_generation_prompt: false,
-                tool_choice: ToolChoice::None,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":PROMPT})],
+                    add_generation_prompt: false,
+                    tool_choice: ToolChoice::None,
+                    ..Default::default()
+                },
+                8 * 1024 * 1024 * 1024,
+            )
             .unwrap();
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
         let mut settings = settings(0.0);
-        settings.inference.managed_memory_capacity_bytes = None;
         output = model
-            .generate_observed_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::token_ids(&chat, ids),
+            .generate_observed_prepared_chat_speculative(
+                PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&ids),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings,
+                    settings: chat_settings(&chat, settings),
                     options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -446,9 +460,19 @@ fn native_original_qwen_internal_activations_match_ordinary_and_controlled() {
     compare_modes(CASE, RESULT, run);
 }
 fn compare_modes(case: &str, result_marker: &str, run: impl Fn(&str) -> serde_json::Value) {
-    compare_selected_modes(case, result_marker, &["ordinary", "managed", "controlled"], run)
+    compare_selected_modes(
+        case,
+        result_marker,
+        &["ordinary", "managed", "controlled"],
+        run,
+    )
 }
-fn compare_selected_modes(case: &str, result_marker: &str, modes: &[&str], run: impl Fn(&str) -> serde_json::Value) {
+fn compare_selected_modes(
+    case: &str,
+    result_marker: &str,
+    modes: &[&str],
+    run: impl Fn(&str) -> serde_json::Value,
+) {
     if let Ok(mode) = std::env::var(MODE) {
         println!("\n{result_marker}{}", run(&mode));
         return;

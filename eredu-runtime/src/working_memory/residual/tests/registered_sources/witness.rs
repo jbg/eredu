@@ -174,7 +174,7 @@ fn post_reservation_witness_does_not_retrofit_pins_into_existing_native_scopes()
     let pool = WorkingMemoryPool::new(1000, 0).unwrap();
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let quote = replacement_quote(&pool, geometry(), 0).into_incremental();
-    let (_, reservation, accepted) = reserve(
+    let (reservation, accepted) = reserve(
         &pool,
         &quote,
         200,

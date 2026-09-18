@@ -19,7 +19,7 @@ impl BoundedCompletion for Done {
     fn wait_bounded(self,_:BoundedCompletionWait)->Result<BoundedCompletionOutcome,Infallible>{Ok(BoundedCompletionOutcome::Completed)}
 }
 struct Receipts {
-    source:Vec<u8>,funding:WorkspaceMetadataFunding,reject_delivery:bool,
+    source:Vec<u8>,funding:HostMetadataFunding,reject_delivery:bool,
     calls:RefCell<Vec<PartitionCaptureFrameKind>>,
 }
 impl ConsensusTransport for Receipts {
@@ -88,7 +88,7 @@ fn scheduled_partition_exchange_keeps_decoded_h_until_final_delivery_vote() {
         let coordinates=ComponentCoordinateMap::range(shape[0] as usize,0..shape[0] as usize).unwrap();
         let projection=CaptureSlicePartition::new(&shape,&slice,0,&coordinates,1).unwrap();
         let mut quota=CaptureLedger::new(source.admission());quota.begin_step();
-        let receipt=PartitionCaptureReceiptPlan::new_shared(source.clone(),context.clone(),
+        let receipt=PartitionCaptureReceiptPlan::new(source.clone(),context.clone(),
             vec![PartitionCaptureProducer{rank:3,projection}],4,
             PartitionCaptureReceiptLimits{max_producers:1,max_fragments:1,max_record_bytes:64<<10},&mut quota).unwrap();
         let (bytes,charged,expected)=wire(frame.records()[0].clone(),&geometry,&context);
@@ -130,7 +130,7 @@ fn scheduled_partition_exchange_keeps_decoded_h_until_final_delivery_vote() {
 // One peer is sufficient to exercise the real source/final-vote transaction
 // and its failure custody. No native work or independent receipt worker runs.
 struct ProgramVotes {
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     fail_at: Option<usize>,
     participants: usize,
     calls: RefCell<Vec<PartitionCaptureFrameKind>>,

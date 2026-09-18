@@ -6,17 +6,19 @@
 use crate::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage};
 pub use eredu_checkpoint::artifact::ArtifactFile;
 use eredu_checkpoint::{
+    StoredDtype,
     artifact::{
-        fingerprint_artifact_files, ArtifactFingerprintError, ArtifactFingerprintSource,
-        ArtifactMemberFingerprint,
+        ArtifactFingerprintError, ArtifactFingerprintSource, ArtifactMemberFingerprint,
+        fingerprint_artifact_files,
     },
     safetensors::SafetensorsShards,
     store::{SharedCheckpointSource, TensorMetadata},
-    StoredDtype,
 };
 use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod identity_construction;
+pub use identity_construction::ArtifactIdentityPreparationError;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -37,6 +39,17 @@ impl ArtifactIdentity {
     pub const fn digest(self) -> [u8; 32] {
         self.0
     }
+    /// Exact canonical ASCII identity without constructing an owned String.
+    pub fn encoded(self) -> [u8; 71] {
+        let mut output = [0; 71];
+        output[..7].copy_from_slice(b"sha256:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (index, byte) in self.0.into_iter().enumerate() {
+            output[7 + index * 2] = HEX[(byte >> 4) as usize];
+            output[8 + index * 2] = HEX[(byte & 15) as usize];
+        }
+        output
+    }
 }
 
 /// Lazily computed content identity, shared across source views and discovery calls.
@@ -48,6 +61,7 @@ pub struct DeferredArtifactIdentity(Arc<DeferredArtifactIdentityInner>);
 struct DeferredArtifactIdentityInner {
     source: Option<(String, ArtifactFingerprintSource)>,
     identity: std::sync::OnceLock<Result<ArtifactIdentity, Arc<ArtifactError>>>,
+    resolving: std::sync::atomic::AtomicBool,
 }
 
 impl DeferredArtifactIdentity {
@@ -65,6 +79,7 @@ impl DeferredArtifactIdentity {
         Ok(Self(Arc::new(DeferredArtifactIdentityInner {
             source: Some((domain, ArtifactFingerprintSource::new(files)?)),
             identity: Default::default(),
+            resolving: std::sync::atomic::AtomicBool::new(false),
         })))
     }
 
@@ -100,11 +115,16 @@ impl DeferredArtifactIdentity {
         Self(Arc::new(DeferredArtifactIdentityInner {
             source: None,
             identity: std::sync::OnceLock::from(Ok(identity)),
+            resolving: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     /// Computes the content hash on first demand, retaining successes and failures.
     pub fn resolve(&self) -> Result<ArtifactIdentity, Arc<ArtifactError>> {
+        if let Some(result) = self.0.identity.get() {
+            return result.clone();
+        }
+        let _resolution = identity_construction::Resolution::claim(&self.0.resolving);
         self.0
             .identity
             .get_or_init(|| {
@@ -130,6 +150,16 @@ impl DeferredArtifactIdentity {
     /// Whether a caller has already requested the content identity.
     pub fn is_resolved(&self) -> bool {
         self.0.identity.get().is_some()
+    }
+
+    /// Borrows an already established identity without hashing, allocating or
+    /// reopening sources. An unresolved or failed identity supplies no digest.
+    pub fn resolved_identity(&self) -> Option<ArtifactIdentity> {
+        self.0
+            .identity
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .copied()
     }
 }
 
@@ -160,7 +190,7 @@ impl std::fmt::Debug for ArtifactAdmissionToken {
 
 impl std::fmt::Display for ArtifactIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "sha256:{}", hex_digest(&self.0))
+        formatter.write_str(std::str::from_utf8(&self.encoded()).expect("canonical ASCII identity"))
     }
 }
 
@@ -206,7 +236,8 @@ impl ArtifactMemberIdentity {
 
 impl From<ArtifactMemberFingerprint> for ArtifactMemberIdentity {
     fn from(member: ArtifactMemberFingerprint) -> Self {
-        Self::new(member.logical_role(), member.length(), member.digest())
+        let (role, length, digest) = member.into_parts();
+        Self::new(role, length, digest)
     }
 }
 
@@ -218,44 +249,7 @@ pub fn fingerprint_artifact(
     domain: &str,
     members: impl IntoIterator<Item = ArtifactMemberIdentity>,
 ) -> Result<ArtifactIdentity, ArtifactError> {
-    if domain.is_empty() {
-        return Err(ArtifactError::InvalidArtifactIdentity(
-            "artifact identity domain must not be empty".into(),
-        ));
-    }
-    let mut members = members.into_iter().collect::<Vec<_>>();
-    if members.is_empty() {
-        return Err(ArtifactError::InvalidArtifactIdentity(
-            "artifact identity requires at least one file".into(),
-        ));
-    }
-    if members.iter().any(|member| member.logical_role.is_empty()) {
-        return Err(ArtifactError::InvalidArtifactIdentity(
-            "artifact member has an empty logical role".into(),
-        ));
-    }
-    members.sort_unstable_by(|left, right| left.logical_role.cmp(&right.logical_role));
-    if let Some(pair) = members
-        .windows(2)
-        .find(|pair| pair[0].logical_role == pair[1].logical_role)
-    {
-        return Err(ArtifactError::InvalidArtifactIdentity(format!(
-            "duplicate artifact logical role {:?}",
-            pair[0].logical_role
-        )));
-    }
-
-    let mut hasher = sha2::Sha256::new();
-    hash_identity_component(&mut hasher, b"eredu-checkpoint-artifact-v2");
-    hash_identity_component(&mut hasher, domain.as_bytes());
-    use sha2::Digest as _;
-    hasher.update((members.len() as u64).to_le_bytes());
-    for member in members {
-        hash_identity_component(&mut hasher, member.logical_role.as_bytes());
-        hasher.update(member.length.to_le_bytes());
-        hasher.update(member.digest);
-    }
-    Ok(ArtifactIdentity(hasher.finalize().into()))
+    identity_construction::fingerprint(domain, members, identity_construction::Destination(None))
 }
 
 /// Fingerprints filesystem members through checkpoint-owned stable I/O and
@@ -1235,7 +1229,7 @@ fn resolve_gguf_companions_inner(
                         "GGUF companion {:?} requires dense F32, F16, or BF16 tensors, but all {} matching candidates are quantized",
                         requirement.role,
                         candidates.len()
-                    )))
+                    )));
                 }
                 _ => return Err(ambiguous_companion(requirement, &directories, dense.len())),
             },
@@ -1249,7 +1243,7 @@ fn resolve_gguf_companions_inner(
                             requirement,
                             &directories,
                             candidates.len(),
-                        ))
+                        ));
                     }
                 },
                 _ => return Err(ambiguous_companion(requirement, &directories, dense.len())),
@@ -1270,7 +1264,7 @@ fn resolve_gguf_companions_inner(
                     role: requirement.role.clone(),
                     filename_prefix: requirement.filename_prefix.clone(),
                     searched_directories: directories,
-                })
+                });
             }
             None => {}
         }
@@ -1407,6 +1401,24 @@ fn is_gguf(path: &Path) -> bool {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArtifactError {
+    /// The actual metadata account refused an identity source destination.
+    #[error("{0}")]
+    IdentityFunding(#[from] crate::HostMetadataFundingError),
+    /// The host allocator refused an identity destination.
+    #[error("artifact identity allocation failed: {0}")]
+    IdentityAllocation(#[source] std::collections::TryReserveError),
+    /// Identity destination or control size overflow.
+    #[error("artifact identity storage size overflow")]
+    IdentityOverflow,
+    /// The allocator supplied a different capacity.
+    #[error("artifact identity destination capacity differs from its request")]
+    IdentityCapacity,
+    /// This host's original file-open producer still needs qualification.
+    #[error("funded artifact fingerprint file opening is not yet implemented for this platform")]
+    IdentityPlatform,
+    /// An existing ordinary source failure, borrowed through its actual owner.
+    #[error("{0}")]
+    SharedIdentity(#[source] Arc<ArtifactError>),
     /// Artifact identity domain, membership, or logical roles are invalid.
     #[error("invalid artifact identity: {0}")]
     InvalidArtifactIdentity(String),
@@ -1451,7 +1463,7 @@ pub enum ArtifactError {
     #[error(transparent)]
     SafetensorsShards(#[from] eredu_checkpoint::safetensors::SafetensorsShardError),
     /// Filesystem-backed stable content fingerprinting failed.
-    #[error(transparent)]
+    #[error("{0}")]
     ArtifactFingerprint(#[from] ArtifactFingerprintError),
     /// Prepared checkpoint source validation or acquisition failed.
     #[error(transparent)]
@@ -1964,22 +1976,25 @@ mod tests {
             gguf_u32_metadata_values("tokenizer.ids", Some(&values)).unwrap(),
             vec![0, u32::MAX]
         );
-        assert!(gguf_u32_metadata_values(
-            "tokenizer.ids",
-            Some(&MetadataValue::Uint64(u64::from(u32::MAX) + 1))
-        )
-        .is_err());
+        assert!(
+            gguf_u32_metadata_values(
+                "tokenizer.ids",
+                Some(&MetadataValue::Uint64(u64::from(u32::MAX) + 1))
+            )
+            .is_err()
+        );
         assert!(
             gguf_u32_metadata_values("tokenizer.ids", Some(&MetadataValue::Int32(-1))).is_err()
         );
-        assert!(gguf_u32_metadata_values(
-            "tokenizer.ids",
-            Some(&MetadataValue::String("1".into()))
-        )
-        .is_err());
-        assert!(gguf_u32_metadata_values("tokenizer.ids", None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            gguf_u32_metadata_values("tokenizer.ids", Some(&MetadataValue::String("1".into())))
+                .is_err()
+        );
+        assert!(
+            gguf_u32_metadata_values("tokenizer.ids", None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2108,12 +2123,14 @@ mod tests {
             inspection.configuration().loading_protocol,
             LoadingProtocol::Model
         );
-        assert!(plan_model_preparation(
-            inspection,
-            PreparationPolicy::default(),
-            crate::backend::SessionCapabilities::default(),
-        )
-        .is_ok());
+        assert!(
+            plan_model_preparation(
+                inspection,
+                PreparationPolicy::default(),
+                crate::backend::SessionCapabilities::default(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ mod grammar;
 use eredu_core::{
     HostPreparationAuthority, capture::CaptureError, speculative::SpeculativeControlError,
 };
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::generation::{
     PreparedControllerError, PreparedSpeculativeController, PreparedSpeculativeSamplerCopy,
 };
@@ -26,7 +26,7 @@ struct Owner<S> {
     grammar_complete: bool,
     fixed_controller: bool,
     snapshot: Option<numerical::SnapshotContext>,
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
     // S and the refusal retire before this owner can return their host account.
     _host: HostPreparationAuthority,
 }
@@ -99,7 +99,7 @@ impl<S> Policy<S> {
             Self::Ordinary(_) => None,
         }
     }
-    fn metadata_funding(&self) -> Option<&eredu_nn::workspace::WorkspaceMetadataFunding> {
+    fn metadata_funding(&self) -> Option<&eredu_nn::workspace::HostMetadataFunding> {
         match self {
             Self::Original(source) => source.owner().funding.as_ref(),
             Self::Ordinary(_) => None,
@@ -179,7 +179,7 @@ fn copy_plan<S: SpeculativeSampler<MlxSamplingBackend>>(source: &S) -> Option<Co
 fn own_original<S>(
     source: S,
     host: HostPreparationAuthority,
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
     fixed_controller: bool,
     snapshot: Option<numerical::SnapshotContext>,
 ) -> Policy<S> {
@@ -198,7 +198,7 @@ fn own_original<S>(
 fn copy_original<S>(
     plan: CopyPlan<'_, S>,
     host: HostPreparationAuthority,
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
     snapshot: Option<numerical::SnapshotContext>,
 ) -> Result<Policy<S>, eredu_core::BackendFailure> {
     let fixed_controller = matches!(&plan, CopyPlan::Controller(_));
@@ -232,7 +232,7 @@ fn controls<S, E, L>(copy: usize) -> Option<usize> {
         adaptive::control_bytes::<S>()?,
         eredu_core::BackendFailure::source_retention_peak_bytes::<ControllerFailure>()?,
         size_of::<ControllerFailure>(),
-        size_of::<Option<eredu_nn::workspace::WorkspaceMetadataFunding>>(),
+        size_of::<Option<eredu_nn::workspace::HostMetadataFunding>>(),
         size_of::<CopyPlan<'_, S>>(),
         size_of::<Result<S, eredu_core::BackendFailure>>(),
         size_of::<Result<Policy<S>, eredu_core::BackendFailure>>(),
@@ -292,7 +292,7 @@ impl<S: SpeculativeSampler<MlxSamplingBackend>> MlxSpeculativeSampling<S> {
             .and_then(|bytes| {
                 let parts = [
                     HostPreparationAuthority::retention_bytes::<
-                        eredu_nn::workspace::WorkspaceMetadataFunding,
+                        eredu_nn::workspace::HostMetadataFunding,
                     >()?,
                     size_of::<Result<Self, Error>>(),
                     size_of::<SpeculativeExecutionStreams<'_>>(),
@@ -303,7 +303,7 @@ impl<S: SpeculativeSampler<MlxSamplingBackend>> MlxSpeculativeSampling<S> {
                     .try_fold(bytes.checked_add(size_of_val(&parts))?, usize::checked_add)
             })
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         sources
             .metadata_funding()
@@ -541,11 +541,11 @@ where
         let bytes = controls::<S, E, L>(plan.commit_metadata_bytes())
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    eredu_nn::workspace::WorkspaceMetadataFunding,
+                    eredu_nn::workspace::HostMetadataFunding,
                 >()?)
             })
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         let funding = value.validate_consumer(sources)?;
         funding
@@ -585,7 +585,7 @@ where
                 .into_iter()
                 .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?;
             funding
                 .reserve_metadata(bytes)

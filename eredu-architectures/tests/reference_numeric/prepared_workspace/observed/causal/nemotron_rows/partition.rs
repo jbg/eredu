@@ -33,8 +33,8 @@ impl ActivationObserver<NumericTensor, Error> for BodyRows {
 // The ordinary reference consumes these exact payloads, not its initialization.
 struct Populate<'a>(&'a prepared_adapter::ParameterBits);
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let canonical = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let canonical = metadata.id().as_str();
         let source = if let Some(rest) = canonical.strip_prefix("model.layers.") {
             let (layer, rest) = rest.split_once('.').unwrap();
             let rest = if rest.starts_with("norm.") {
@@ -96,8 +96,8 @@ fn nemotron_prepared_stateless_leading_tp_pp_uses_downstream_cached_attention() 
             ..Default::default()
         };
         let mut architecture = HybridModel::new(args.clone(), &context).unwrap();
-        let parameters = architecture.parameter_description(&context).unwrap();
-        let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::prefill_observation_declarations(&architecture).unwrap();
+        let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+        let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::prefill_observation_declarations(&architecture, None).unwrap();
         let paths = declarations
             .iter()
             .filter(|d| d.readout_stage() == Stage::BeforeReadout)

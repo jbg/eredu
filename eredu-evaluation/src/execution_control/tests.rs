@@ -215,7 +215,7 @@ impl TextGenerationBackend for Host {
         Ok(())
     }
 
-    fn text_sampling_control_support(_: &ModelRuntime<Self>) -> ControlSupport {
+    fn text_sampling_control_support(_: &ModelRuntime<Self>) -> ControlSupport<&'static str> {
         ControlSupport::Supported
     }
     type Prompt = Vec<u32>;
@@ -286,8 +286,11 @@ impl TextGenerationBackend for Host {
             Some((intervention, Arc::new(Records))),
         )
     }
-    fn take_text_capture(state: &mut Generation) -> Option<CapturedStep> {
-        state.capture.as_mut().and_then(CaptureSession::take_step)
+    fn try_take_text_capture(state: &mut Generation) -> Result<Option<eredu_core::capture::SharedCapturedStep>, Self::Error> {
+        Ok(state.capture.as_mut().and_then(CaptureSession::take_shared_step))
+    }
+    fn text_capture_pending(state: &Generation) -> bool {
+        state.capture.as_ref().is_some_and(CaptureSession::has_pending_step)
     }
 }
 fn estimate_copy(bytes: u64) -> Option<SnapshotEstimate> {
@@ -310,7 +313,7 @@ impl NativeTextStateBackend for Host {
             Some(256)
         })
     }
-    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport {
+    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport<&'static str> {
         ControlSupport::Supported
     }
     fn estimate_native_text_state(

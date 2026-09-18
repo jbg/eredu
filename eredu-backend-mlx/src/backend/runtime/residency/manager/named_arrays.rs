@@ -442,6 +442,7 @@ impl NameCatalogOwner {
                 } else {
                     NamedSlot::Canonical(CanonicalArrayOwner {
                         cell: Arc::new(CanonicalArray {
+                            publication: OnceLock::new(),
                             value: OnceLock::new(),
                             host_source: OnceLock::new(),
                             coordinate: table.catalog.value.units[index].names.start + offset,
@@ -573,7 +574,8 @@ impl PreparedNamedWindow {
     }
 }
 
-struct CanonicalArray {
+pub(crate) struct CanonicalArray {
+    publication: OnceLock<super::super::storage::PublishedAllocation>,
     value: OnceLock<Array>,
     // A source-backed device publication retains its actual host owner here,
     // not in Host-tier cache state. Canonical aliases inherit this same cell.
@@ -585,9 +587,66 @@ struct CanonicalArray {
 // Each physical-cell alias carries the ORIGINAL cell's custody after its Arc.
 // A later request's table guard cannot fund deallocation of an older cell.
 #[derive(Clone)]
-struct CanonicalArrayOwner {
+pub(crate) struct CanonicalArrayOwner {
     cell: Arc<CanonicalArray>,
     custody: OriginalOperationMetadataCustody,
+}
+impl CanonicalArrayOwner {
+    pub(crate) fn publication_control_bytes() -> Option<usize> {
+        use super::super::storage::{
+            PublishedAllocation, RetainedAllocationReceipt, RetainedStorageRef,
+        };
+        fn iterator_bytes<T>(_: impl FnOnce(&'static NamedArrays) -> T) -> usize {
+            size_of::<T>()
+        }
+        let frames = [
+            iterator_bytes(NamedArrays::retained_values),
+            size_of::<&Self>(),
+            size_of::<Self>(),
+            size_of::<Arc<CanonicalArray>>(),
+            size_of::<OriginalOperationMetadataCustody>(),
+            size_of::<Option<PublishedAllocation>>(),
+            size_of::<PublishedAllocation>(),
+            size_of::<&OnceLock<PublishedAllocation>>(),
+            size_of::<Option<&PublishedAllocation>>(),
+            size_of::<Result<(), PublishedAllocation>>(),
+            size_of::<bool>(),
+            size_of::<Option<RetainedAllocationReceipt<'_>>>(),
+            size_of::<&NamedArrays>(),
+            size_of::<NamedIter<'_>>(),
+            size_of::<(&str, &Array)>(),
+            size_of::<&PreparedNames>(),
+            size_of::<&NamedSlot>(),
+            size_of::<Option<&CanonicalArrayOwner>>(),
+            size_of::<RetainedStorageRef<'_>>(),
+            size_of::<Result<usize, NamedArrayError>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+
+    pub(crate) fn array(&self) -> &Array {
+        self.value.get().expect("published canonical value")
+    }
+    pub(crate) fn custody(&self) -> &OriginalOperationMetadataCustody {
+        &self.custody
+    }
+    pub(crate) fn proof(&self) -> Option<super::super::storage::PublishedAllocation> {
+        self.publication.get().copied()
+    }
+    pub(crate) fn same_cell(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cell, &other.cell) && self.custody.same_account(&other.custody)
+    }
+    pub(crate) fn record_attachment(
+        &self,
+        proof: super::super::storage::PublishedAllocation,
+    ) -> bool {
+        match self.publication.set(proof) {
+            Ok(()) => true,
+            Err(proof) => self.publication.get() == Some(&proof),
+        }
+    }
 }
 impl Deref for CanonicalArrayOwner {
     type Target = CanonicalArray;
@@ -709,6 +768,24 @@ pub(super) struct SourceArray {
 impl NamedArrays {
     pub(super) fn is_prepared(&self) -> bool {
         matches!(self, Self::Prepared(_))
+    }
+    pub(super) fn retained_values(
+        &self,
+    ) -> impl Iterator<Item = super::super::storage::RetainedStorageRef<'_>> {
+        self.iter().map(move |(name, array)| {
+            if let Self::Prepared(table) = self {
+                let row = &table.values[table.index(name).expect("retained name")];
+                let cell = match row {
+                    NamedSlot::Canonical(cell)
+                    | NamedSlot::Alias(Some(AliasArray::Canonical(cell))) => Some(cell),
+                    _ => None,
+                };
+                if let Some(cell) = cell {
+                    return super::super::storage::RetainedStorageRef::CanonicalArray(cell);
+                }
+            }
+            super::super::storage::RetainedStorageRef::Array(array)
+        })
     }
     pub(super) fn host_sources(&self) -> NamedHostIter<'_> {
         match self {
@@ -851,6 +928,9 @@ impl NamedArrays {
                 for row in &mut table.values {
                     match row {
                         NamedSlot::Canonical(cell) => {
+                            if cell.publication.get().is_some() {
+                                return Err(NamedArrayError::InvalidSource);
+                            }
                             if Arc::get_mut(&mut cell.cell).is_none() {
                                 return Err(NamedArrayError::SharedDestination);
                             }

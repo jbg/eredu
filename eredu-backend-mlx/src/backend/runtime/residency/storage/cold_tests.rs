@@ -119,6 +119,7 @@ fn retained_array_inspection_and_handle_retention_never_run_housekeeping() {
             .values()
             .next()
             .unwrap()
+            .owned().unwrap()
             .1
             .evaluated()
             .unwrap()

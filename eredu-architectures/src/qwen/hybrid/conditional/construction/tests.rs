@@ -53,15 +53,15 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(bytes)
             })
             .map(|_| ())
-            .map_err(|left| WorkspaceMetadataFundingError::Capacity {
+            .map_err(|left| HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: left as u64,
             })
@@ -74,14 +74,14 @@ impl Drop for Account {
 }
 struct Retained<T> {
     value: T,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn rows(value: &impl Parameterized<WorkspaceTensor>) -> Vec<(String, Vec<i32>, WorkspaceDtype)> {
     struct Rows(Vec<(String, Vec<i32>, WorkspaceDtype)>);
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Rows {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a WorkspaceTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
             self.0.push((
-                metadata.id.as_str().to_owned(),
+                metadata.id().as_str().to_owned(),
                 value.shape().to_vec(),
                 value.layout().dtype(),
             ));
@@ -93,19 +93,7 @@ fn rows(value: &impl Parameterized<WorkspaceTensor>) -> Vec<(String, Vec<i32>, W
 }
 #[test]
 fn retained_conditional_units_bind_real_config_and_preserve_paid_branch_retirement() {
-    let mut config = crate::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
-        "model_type":"qwen3_5", "image_token_id":60,"video_token_id":61,
-        "text_config":{"model_type":"qwen3_5_text","vocab_size":64,"hidden_size":32,
-            "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
-            "max_position_embeddings":128,"linear_conv_kernel_dim":4,"linear_key_head_dim":8,
-            "linear_value_head_dim":8,"linear_num_key_heads":2,"linear_num_value_heads":4,
-            "intermediate_size":64,"layer_types":["linear_attention","full_attention"],
-            "mtp_num_hidden_layers":2,"tie_word_embeddings":false},
-        "vision_config":{"depth":2,"hidden_size":32,"intermediate_size":64,"num_heads":4,
-            "num_position_embeddings":16,"in_channels":3,"patch_size":2,"spatial_merge_size":2,
-            "temporal_patch_size":2,"out_hidden_size":32}
-    }))
-    .unwrap();
+    let mut config = fixture_config();
     let affine = eredu_checkpoint::LinearFormat::Affine(eredu_checkpoint::AffineQuantization {
         group_size: 16,
         ..Default::default()
@@ -152,7 +140,7 @@ fn retained_conditional_units_bind_real_config_and_preserve_paid_branch_retireme
         remaining: AtomicUsize::new(usize::MAX),
         retired: AtomicBool::new(false),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     let context = WorkspaceContext::new_with_metadata_funding(Facts, funding).unwrap();
     assert!(
         wrong
@@ -195,11 +183,99 @@ fn retained_conditional_units_bind_real_config_and_preserve_paid_branch_retireme
     let refusal = first.construct_unit(1, 0, &context).err().unwrap();
     assert!(matches!(
         refusal.into_metadata_funding_error(),
-        Ok(WorkspaceMetadataFundingError::Capacity { .. })
+        Ok(HostMetadataFundingError::Capacity { .. })
     ));
     assert_eq!(context.metadata_census().unwrap().context_bytes(), consumed);
     drop((first, second, units, context));
     assert!(!state.retired.load(Ordering::SeqCst));
     drop(retained);
     assert!(state.retired.load(Ordering::SeqCst));
+}
+
+fn fixture_config() -> ParsedHybridConfig {
+    crate::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+        "model_type":"qwen3_5", "image_token_id":60,"video_token_id":61,
+        "text_config":{"model_type":"qwen3_5_text","vocab_size":64,"hidden_size":32,
+            "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+            "max_position_embeddings":128,"linear_conv_kernel_dim":4,"linear_key_head_dim":8,
+            "linear_value_head_dim":8,"linear_num_key_heads":2,"linear_num_value_heads":4,
+            "intermediate_size":64,"layer_types":["linear_attention","full_attention"],
+            "mtp_num_hidden_layers":2,"tie_word_embeddings":false},
+        "vision_config":{"depth":2,"hidden_size":32,"intermediate_size":64,"num_heads":4,
+            "num_position_embeddings":16,"in_channels":3,"patch_size":2,"spatial_merge_size":2,
+            "temporal_patch_size":2,"out_hidden_size":32}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn canonical_conditional_boundary_preserves_uneven_rows_and_every_reached_refusal() {
+    use crate::composite_execution::CompositeArchitecture;
+    use eredu_runtime::{ArchitectureBoundary, DeviceState};
+    type Model = ConditionalLayeredModel<WorkspaceBackend>;
+    type RuntimeState = DeviceState<WorkspaceBackend, eredu_runtime::working_memory::WorkspaceResidentLayerState>;
+    let ordinary = WorkspaceContext::new(Facts);
+    let model = Model::new(fixture_config(), &ordinary).unwrap();
+    for count in [0, 2] {
+        let selected = super::super::ConditionalPipelineBoundarySchema {
+            hidden_size: 32, deepstack_count: count,
+        }.wire_schema().unwrap().resolve(2, 3).unwrap();
+        for (from, to, continuation) in [(0, 0, Some((12, 32))), (0, 1, None), (1, 1, None)] {
+            crate::architecture_parameter_metadata_tests::boundary(|metadata| {
+                <Model as CompositeArchitecture<WorkspaceBackend, RuntimeState>>::partition_boundary_schema(
+                    &model, from, to, &selected, 2, 3, &[7, 3], continuation, metadata)
+            });
+            let actual = <Model as CompositeArchitecture<WorkspaceBackend, RuntimeState>>::partition_boundary_schema(
+                &model, from, to, &selected, 2, 3, &[7, 3], continuation, None).unwrap().unwrap();
+            assert_eq!(actual.primary().shape(), if from == 0 && to == 0 { vec![12, 32] } else { vec![2, 3, 32] });
+            for field in actual.auxiliary() {
+                assert_eq!(field.shape(), if from == 1 { [2, 3, 32] } else { [2, 7, 32] });
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_conditional_collective_waves_preserve_segmented_shapes_and_reached_refusals() {
+    use crate::composite_execution::{CompositeArchitecture, CompositeTensorCollective, PreparedCompositeInput};
+    use eredu_nn::Tensor;
+    use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedInputPayload, PreparedModelInput};
+    struct Inspector;
+    impl PreparedInputInspector<WorkspaceTensor> for Inspector {
+        fn identity(&self, tensor: &WorkspaceTensor) -> Result<eredu_core::InputTensorIdentity, eredu_core::PreparedInputError> {
+            eredu_core::InputTensorIdentity::new(match tensor.layout().dtype() {
+                WorkspaceDtype::Uint32 => eredu_core::checkpoint::TensorDtype::U32,
+                WorkspaceDtype::Int32 => eredu_core::checkpoint::TensorDtype::I32,
+                _ => eredu_core::checkpoint::TensorDtype::F32,
+            }, tensor.shape().iter().map(|&n|n as usize).collect())
+        }
+        fn i32_values(&self, value: &WorkspaceTensor) -> Result<Vec<i32>, eredu_core::CapabilityError> {
+            assert_eq!(value.shape(), [1,3]); Ok(vec![1,4,4])
+        }
+        fn bool_values(&self, _: &WorkspaceTensor) -> Result<Vec<bool>, eredu_core::CapabilityError> { panic!("no Boolean metadata") }
+    }
+    type Model = ConditionalLayeredModel<WorkspaceBackend>;
+    type RuntimeState = eredu_runtime::DeviceState<WorkspaceBackend, eredu_runtime::working_memory::WorkspaceResidentLayerState>;
+    let ordinary = WorkspaceContext::new(Facts);
+    let config = fixture_config();
+    let model = Model::new(config.clone(), &ordinary).unwrap();
+    let text = |n| PreparedInputPart::new(eredu_core::InputModality::Text,
+        PreparedInputPayload::TokenIds(WorkspaceTensor::full_u32(7,&[1,n],&ordinary).unwrap()),[]).unwrap();
+    let input = PreparedModelInput::new(vec![text(2),
+        PreparedInputPart::new_with_extents(eredu_core::InputModality::Image,
+            PreparedInputPayload::Tensor(WorkspaceTensor::full_f32(0.5,&[16,24],&ordinary).unwrap()),
+            [(eredu_core::InputMetadataKey::PatchGrid,WorkspaceTensor::full_i32(0,&[1,3],&ordinary).unwrap())],
+            [eredu_core::InputExtent::PatchGrid { time:1,height:4,width:4 }]).unwrap(), text(3)],
+        |tensor| Inspector.identity(tensor)).unwrap();
+    let admitted=crate::media_plan::admit_qwen_hybrid_input(&config,&input,&Inspector).unwrap();
+    let prepared=PreparedCompositeInput::new(&input,&admitted).unwrap();
+    let operation=|metadata: Option<&WorkspaceContext>| <Model as CompositeArchitecture<WorkspaceBackend,RuntimeState>>::prepared_group_collective_waves(
+        &model,0,prepared,2,2,metadata);
+    crate::architecture_parameter_metadata_tests::boundary(operation);
+    let waves=operation(None).unwrap().unwrap();
+    let shapes=waves.iter().map(|wave|wave.iter().map(|op|match op {
+        CompositeTensorCollective::Sum {shape}=>shape.clone(),
+    }).collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(shapes, [vec![vec![1,2,32],vec![1,3,32],vec![16,32],vec![16,32]],
+        vec![vec![1,2,32],vec![1,3,32],vec![16,32],vec![16,32],vec![4,32]]]);
 }

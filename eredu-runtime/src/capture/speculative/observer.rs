@@ -163,7 +163,7 @@ pub(super) fn retain_sparse<E: std::error::Error + 'static>(
             None => SpeculativeControlError::backend(std::sync::Arc::clone(&shared)),
         });
     }
-    eredu_nn::Error::backend_source(shared)
+    eredu_nn::Error::backend_retained_source(shared)
 }
 
 // Transparent error domains can skip inner variants in Error::source. Follow
@@ -229,7 +229,7 @@ mod tests {
         };
         let signal = retain_sparse::<std::io::Error>(
             &failure,
-            eredu_nn::Error::backend_source(CaptureExecutionError::<std::io::Error>::Admission(
+            eredu_nn::Error::backend_retained_source(CaptureExecutionError::<std::io::Error>::Admission(
                 limit.clone(),
             )),
         );
@@ -254,7 +254,7 @@ mod tests {
             ),
         ] {
             let partition =
-                retain_sparse::<std::io::Error>(&failure, eredu_nn::Error::backend_source(error));
+                retain_sparse::<std::io::Error>(&failure, eredu_nn::Error::backend_retained_source(error));
             assert!(
                 matches!(failure.borrow_mut().take(), Some(SpeculativeControlError::Capture(actual)) if actual == limit)
             );
@@ -263,7 +263,7 @@ mod tests {
         assert!(signal.source().is_some());
         let signal = retain_sparse::<std::io::Error>(
             &failure,
-            eredu_nn::Error::backend_source(CaptureExecutionError::Backend(std::io::Error::other(
+            eredu_nn::Error::backend_retained_source(CaptureExecutionError::Backend(std::io::Error::other(
                 "native sparse failure",
             ))),
         );

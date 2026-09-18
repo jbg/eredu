@@ -3,7 +3,7 @@ use crate::backend::nn::workspace::{MetalAllocationFacts, MlxMetalWorkspaceMecha
 use eredu_checkpoint::store::{
     CheckpointSource, MemoryWeightStore, SafetensorsWeightStore, TensorSelection,
 };
-use eredu_core::residency::OffloadConfig;
+use eredu_core::residency::{OffloadConfig, TransferDirection};
 use eredu_nn::{Parameter, ParameterSpec, Tensor};
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, ExecutionGraph, ExecutionGroupSpec, ResidencyWindowManager,
@@ -213,7 +213,7 @@ fn build(unit: &OffloadUnit, stream: &Stream) -> Result<Unit, eredu_nn::Error> {
         .map(|binding| {
             Parameter::unloaded_i32(
                 ParameterSpec::trainable(binding.name())
-                    .map_err(eredu_nn::Error::backend_source)?,
+                    .map_err(eredu_nn::Error::backend_retained_source)?,
                 &[(binding.expected_bytes() / 4) as i32],
                 stream,
             )
@@ -412,16 +412,64 @@ fn canonical_owner_full_unit_is_priced_persistent_and_aliases_share_projection()
 }
 
 #[test]
-fn unquoted_dense_execution_keeps_ordinary_roomy_cache_reuse() {
+fn ordinary_roomy_windows_evict_across_groups_and_repeated_forwards() {
     let mut f = fixture(false, 2);
-    forward(&mut f, false, false);
-    assert_eq!(resident(&f.manager), (0..5).map(id).collect());
-    let before = f.source.source_diagnostics().unwrap().physical_reads;
-    forward(&mut f, false, false);
-    assert_eq!(
-        f.source.source_diagnostics().unwrap().physical_reads,
-        before
-    );
+    let units = u64::try_from(f.definitions.len()).unwrap();
+    let bytes: u64 = f.definitions.iter().flat_map(OffloadUnit::bindings)
+        .map(WeightBinding::expected_bytes).sum();
+    for _ in 0..2 {
+        let before = f.manager.report().unwrap().offload().transfer(TransferDirection::DiskToDevice);
+        // No admitted receipt is installed: ordinary execution must enforce
+        // the same selected depth even though all five units fit the budget.
+        assert!(!f.manager.admitted_disk_route_active());
+        forward(&mut f, true, false);
+        let report = f.manager.report().unwrap();
+        assert_eq!(resident(&f.manager), BTreeSet::from([id(4)]));
+        assert!(report.active_window().is_empty());
+        assert_eq!(report.offload().peak_resident_units().get(MemoryTier::Device), 2);
+        // Direct window acquisition records each actual copy publication;
+        // it does not call the separate prefetch hit/miss producer.
+        let after = report.offload().transfer(TransferDirection::DiskToDevice);
+        assert_eq!(after.count() - before.count(), units);
+        assert_eq!(after.bytes() - before.bytes(), bytes);
+    }
+}
+
+#[test]
+fn ordinary_dense_group_switch_preserves_unconsumed_transfers_on_rejection() {
+    let mut f = fixture(false, 2);
+    let initial = MlxTensor::from_array(Array::from_slice(&[1_i32], &[1, 1]));
+    f.policy.begin(&initial, &f.stream).unwrap();
+    let mut last = None;
+    for index in 0..5 {
+        let address = f.policy.layout.address(index).unwrap();
+        let lease = f.policy.acquire(index, address,
+            |stream| build(&f.definitions[index], stream), &f.stream).unwrap();
+        let weight = parameter(&lease, "weight");
+        let output = weight.add(weight, &f.stream).unwrap();
+        assert!(output.as_array().evaluated().unwrap().as_slice::<i32>()
+            .iter().all(|value| *value == 2 * (index as i32 + 1)));
+        f.policy.complete(index, address, lease, &output,
+            std::iter::empty(), std::iter::empty(), &f.stream).unwrap();
+        if index == 0 {
+            let before = f.manager.report().unwrap();
+            let wrong_group = f.policy.layout.address(3).unwrap();
+            let result = f.policy.acquire(3, wrong_group,
+                |stream| build(&f.definitions[3], stream), &f.stream);
+            assert!(matches!(result, Err(LayerwiseAcquireError::Policy(Error::Parallel(_)))));
+            let after = f.manager.report().unwrap();
+            assert_eq!(resident(&f.manager), BTreeSet::from([id(0), id(1)]));
+            assert_eq!(after.active_window(), before.active_window());
+            assert_eq!(after.offload().transfer(TransferDirection::DiskToDevice),
+                before.offload().transfer(TransferDirection::DiskToDevice));
+            assert!(after.units().iter().find(|unit| unit.id() == &id(1)).unwrap().device_pins() > 0,
+                "the unconsumed transfer must retain its actual lease");
+        }
+        last = Some(output);
+    }
+    f.policy.finish(&last.unwrap(), &f.stream).unwrap();
+    assert_eq!(resident(&f.manager), BTreeSet::from([id(4)]));
+    assert!(f.manager.report().unwrap().active_window().is_empty());
 }
 
 #[test]
@@ -486,10 +534,12 @@ fn singleton_groups_accept_equivalent_selected_and_actual_window_depths() {
 #[test]
 fn ordinary_source_loading_keeps_unquoted_execution_and_typed_unknown_quote() {
     let mut f = fixture_with_groups(false, 2, &[3, 2], false);
-    let error = f
-        .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
-        .unwrap_err();
+    // Ordinary exact read geometry is diagnostic. It does not create the
+    // original source identity required by a paid construction context.
+    let allocation = MetalAllocationFacts::current_host().unwrap();
+    f.policy.layerwise_workspace(allocation).unwrap();
+    let context = eredu_nn::workspace::WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
+    let error = f.policy.layerwise_workspace_with_metadata(allocation, &context).unwrap_err();
     let mut current: &(dyn std::error::Error + 'static) = &error;
     loop {
         if let Some(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound) =
@@ -587,6 +637,44 @@ mod parameter_source_tests {
             .unwrap()
             .retained_bytes
             .unwrap()
+    }
+
+    #[test]
+    fn actual_host_source_retains_selected_independent_parameter_exclusions() {
+        use eredu_nn::workspace::{WorkspaceContext, WorkspaceDtype, WorkspaceTensor};
+        let f = fixture_with_host_capacity(true, 2, &[3, 2], true, 1_000_000);
+        for definition in &f.definitions {
+            drop(f.manager.acquire(definition.id(), MemoryTier::Host).unwrap());
+        }
+        let selected = MlxSelectiveUnitPopulator::new(
+            ["independent.bank".to_owned()].into());
+        let host = Policy::new(f.manager.clone(), f.source.clone(),
+            (0..5).map(id).collect(), f.policy.layout.clone(), 2,
+            selected, Vec::new(), None, false, false).unwrap();
+        let workspace = host.layerwise_workspace(MetalAllocationFacts::current_host().unwrap()).unwrap();
+        assert!(workspace.excludes_parameter("independent.bank"));
+        assert!(!workspace.excludes_parameter("missing.unit.weight"));
+        let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
+        let address = host.layout.address(0).unwrap();
+        let rows = workspace.parameters(0, address, &context).unwrap();
+        let mut module = rows.into_iter().map(|(id, value)|
+            Parameter::new(ParameterSpec::trainable(id.as_str()).unwrap(), value)
+        ).collect::<Vec<_>>();
+        let bank = WorkspaceTensor::existing(
+            context.layout(&[3], WorkspaceDtype::Float32).unwrap(), &context).unwrap();
+        module.push(Parameter::new(ParameterSpec::trainable("independent.bank").unwrap(), bank.clone()));
+        // Drop the native policy first: the source must retain its exact
+        // immutable selection, not borrow a temporary filter or infer absence.
+        drop(host);
+        assert!(workspace.excludes_parameter("independent.bank"));
+        assert!(workspace.known_retained_control_bytes(true).unwrap() > 0,
+            "ordinary source retains its exact unpriced name payload in the quote");
+        let mut projection = workspace.parameter_source().prepare_projection(&context).unwrap();
+        projection.bind(&mut module, 0, address, &context).unwrap();
+        assert_eq!(retained(&context, &[bank, module.last().unwrap().as_ref().clone()]), 12);
+        drop(projection);
+        drop(workspace);
+
     }
 
     #[test]

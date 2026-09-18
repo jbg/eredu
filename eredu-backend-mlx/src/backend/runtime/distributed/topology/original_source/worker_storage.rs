@@ -7,11 +7,11 @@ use safemlx::{Array, distributed::{GroupWorkerOperation, GroupWorkerStorage}};
 pub(crate) struct OriginalCommunicationWorkers<'a> {
     native: GroupWorkerStorage<'a>,
     source: RetainedCommunicationSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl<'a> OriginalCommunicationWorkers<'a> {
     pub(crate) fn native(&self) -> &GroupWorkerStorage<'a> { &self.native }
-    pub(super) fn funding(&self)->&WorkspaceMetadataFunding { &self._funding }
+    pub(super) fn funding(&self)->&HostMetadataFunding { &self._funding }
     pub(crate) fn source(&self) -> &RetainedCommunicationSource { &self.source }
 }
 impl<'a> OriginalCommunicationSource<'a> {
@@ -21,11 +21,11 @@ impl<'a> OriginalCommunicationSource<'a> {
             size_of::<Result<OriginalCommunicationWorkers<'b>, Error>>(),
             size_of::<(&Self,&Group,&Array,GroupWorkerOperation)>(),
             size_of::<Result<GroupWorkerStorage<'b>,safemlx::distributed::GroupStorageUnavailable>>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             group.native_group().worker_storage_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         let native = group.native_group().worker_storage(input,operation)
@@ -40,7 +40,7 @@ impl<'a> OriginalCommunicationSource<'a> {
         -> Result<OriginalCommunicationWorkers<'b>,Error> {
         self.funding.reserve_metadata(size_of::<Option<(&Group,&CommunicationGroupDescriptor,bool)>>() +
             size_of::<usize>() + size_of::<(&Self,&Array,GroupWorkerOperation)>() +
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let (group,_,_) = self.group(order).ok_or_else(||failure(Cause::Resource,&self.source,&self.funding))?;
         self.worker_storage(group,input,operation)
@@ -50,7 +50,7 @@ impl<'a> OriginalCommunicationSource<'a> {
         self.funding.reserve_metadata(size_of::<Option<(&CommunicationRouteRealization,&CommunicationRouteDescriptor,bool)>>() +
             size_of::<Result<Option<OriginalCommunicationWorkers<'b>>,Error>>() + size_of::<usize>() +
             size_of::<(&Self,&Array,GroupWorkerOperation)>() +
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         let (route,_,_) = self.route(order).ok_or_else(||failure(Cause::Resource,&self.source,&self.funding))?;

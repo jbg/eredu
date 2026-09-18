@@ -104,6 +104,7 @@ pub struct SpeculativeCaptureObserver<P: CaptureBackendProvider, F> {
     prefill_span: Option<eredu_core::speculative::SpeculativePrefillSpan>,
     reduction_geometry: Option<eredu_core::speculative::SpeculativePrefillReductionGeometry>,
     reductions: Option<reductions::WindowReductions>,
+    reduction_delivery: Option<eredu_core::speculative::PreparedSpeculativePrefillReductions>,
     held_prefill: Option<SpeculativeActivationCapture>,
     active: Option<(u64, SpeculativeActivationOrigin, SpeculativeActivationPhase)>,
     next_invocation: u64,
@@ -199,6 +200,7 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
             prefill_span: None,
             reduction_geometry: None,
             reductions: None,
+            reduction_delivery: None,
             held_prefill: None,
             active: None,
             next_invocation: 0,
@@ -327,7 +329,7 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
         });
         if let (Some(geometry), Some(span)) = (self.reduction_geometry, self.prefill_span) {
             if self.reductions.is_none() {
-                self.reductions = reductions::WindowReductions::create(
+                let group = reductions::WindowReductions::create(
                     &mut self.session,
                     &self.capture_scopes,
                     &self.intervention_scopes,
@@ -335,6 +337,16 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
                     origin,
                     self.next_invocation,
                 )?;
+                let delivery = if group.is_some() {
+                    use eredu_core::{HostPreparationAuthority, speculative::PreparedSpeculativePrefillReductions};
+                    let host = self.session.owner.retained()?;
+                    let bytes = PreparedSpeculativePrefillReductions::retained_control_bytes::<HostPreparationAuthority>()
+                        .ok_or(CaptureError::Overflow)?;
+                    self.session.ledger.reserve_quota(CaptureUsage { host_bytes: bytes, ..Default::default() })?;
+                    Some(PreparedSpeculativePrefillReductions::retain(host))
+                } else { None };
+                self.reductions = group;
+                self.reduction_delivery = delivery;
             }
             if let Some(group) = &mut self.reductions {
                 group.begin(&mut self.session, phase, span, origin, geometry)?;
@@ -421,9 +433,12 @@ where
     }
     fn finish_prefill_reductions(&mut self, success: bool) {
         let had_reductions = self.reductions.is_some();
-        let report = self.reductions.take().map(|group| group.finish(success));
+        let report = self.reductions.take().map(|group| {
+            self.reduction_delivery.take().expect("prepared reduction owner")
+                .finish(group.finish(success))
+        });
         if let Some(mut last) = self.held_prefill.take() {
-            last.prefill_reductions = report.map(Into::into);
+            last.prefill_reductions = report;
             // Capacity covers both the previous envelope and this withheld one.
             // Draining earlier records cannot shrink VecDeque capacity.
             debug_assert!(self.records.len() < self.records.capacity());
@@ -507,12 +522,10 @@ where
                 *status = CaptureTransactionStatus::Aborted;
             }
         }
-        let step = self.session.take_step();
+        let step = self.session.take_step_inner();
         if let (Some((invocation, origin, phase)), Some(mut captures)) = (self.active.take(), step)
         {
-            if !success {
-                captures.outcome = CaptureStepOutcome::Aborted;
-            }
+            if !success { captures.outcome = CaptureStepOutcome::Aborted; }
             if let Some(group) = &mut self.reductions {
                 group.finish_window(
                     &captures.records,
@@ -521,6 +534,7 @@ where
                     success,
                 );
             }
+            let captures = self.session.publish_step(captures);
             let envelope = SpeculativeActivationCapture {
                 admission_identity: self.admission_identity.clone(),
                 invocation,
@@ -528,7 +542,7 @@ where
                 phase,
                 prefill_span: self.prefill_span,
                 completed: success,
-                captures: eredu_core::capture::CapturedStepDelivery::Legacy(captures),
+                captures: captures,
                 prefill_reductions: None,
             };
             if self.reductions.is_some() {

@@ -20,7 +20,7 @@ type SpanError = ReplicatedTextSessionError<eredu_nn::Error,Error,Error>;
 fn neural(cause:Error,context:SpeculativeExecutionStreams<'_>)->eredu_nn::Error {
     match context.original_numerical() {
         Some((sources,_))=>sources.metadata_funding().metadata_source(cause),
-        None=>eredu_nn::Error::backend_source(cause),
+        None=>eredu_nn::Error::backend_retained_source(cause),
     }
 }
 fn charge(context:SpeculativeExecutionStreams<'_>,bytes:usize)->Result<(),Error>{

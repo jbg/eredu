@@ -15,20 +15,33 @@ impl Json for SerdeJson {
     type PreparedKey = String;
     type StringBuffer = Value;
 
-    fn prepare_key(key: &str) -> String {
-        key.to_owned()
+    fn prepare_key_with_allocations(
+        key: &str, allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<String, crate::KeyPreparationError> {
+        Ok(serde_json::allocation::Allocator::new(allocations).copy_string(key)?)
     }
 
-    fn with_string_node<T>(buffer: &mut Value, string: &str, f: impl FnOnce(&Value) -> T) -> T {
-        // Reuses the buffer's allocation across calls instead of building a fresh `String` per name.
+    fn prepare_value_with_allocations<'a>(
+        node: &Self::Node<'a>, _: &dyn serde_json::allocation::Allocation,
+    ) -> Result<Cow<'a, Value>, crate::KeyPreparationError> { Ok(Cow::Borrowed(*node)) }
+
+    fn prepare_string_node_with_allocations<'a>(
+        buffer: &'a mut Value, string: &'a str, allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<&'a Value, crate::KeyPreparationError> {
+        // Preserve the ordinary reusable string buffer and its reached capacity.
         if let Value::String(existing) = buffer {
-            existing.clear();
-            existing.push_str(string);
+            if string.len() > existing.capacity() {
+                let capacity = existing.capacity().checked_mul(2).ok_or(serde_json::allocation::AllocationError::SizeOverflow)?.max(string.len());
+                allocations.reserve(capacity)?;
+                existing.try_reserve_exact(capacity - existing.len()).map_err(|_| serde_json::allocation::AllocationError::HostAllocation)?;
+            }
+            existing.clear(); existing.push_str(string);
         } else {
-            *buffer = Value::String(string.to_owned());
+            *buffer = Value::String(serde_json::allocation::Allocator::new(allocations).copy_string(string)?);
         }
-        f(buffer)
+        Ok(buffer)
     }
+
 }
 
 impl JsonNumber for serde_json::Number {
@@ -310,5 +323,42 @@ mod tests {
     fn members_and_items_iterate_in_order() {
         let document = json!({"a": 1, "b": [10, 20]});
         assert_iteration_order::<SerdeJson>(&&document);
+    }
+}
+
+#[cfg(test)]
+mod string_source_tests {
+    use super::*;
+    use serde_json::allocation::{Allocation, AllocationError, Unenforced};
+    use std::cell::Cell;
+
+    struct Refuse(Cell<usize>);
+    impl Allocation for Refuse {
+        fn reserve(&self, _: usize) -> Result<(), AllocationError> {
+            self.0.set(self.0.get() + 1);
+            Err(AllocationError::Refused)
+        }
+    }
+
+    #[test]
+    fn temporary_string_growth_refuses_before_mutating_the_prior_buffer() {
+        let funding = Refuse(Cell::new(0));
+        let mut buffer = Value::Null;
+        assert!(matches!(SerdeJson::prepare_string_node_with_allocations(&mut buffer, "text", &funding),
+            Err(crate::KeyPreparationError::Allocation(AllocationError::Refused))));
+        assert_eq!(buffer, Value::Null);
+        assert_eq!(funding.0.get(), 1);
+        SerdeJson::with_string_node(&mut buffer, "initial", |node| assert_eq!(node.as_str(), Some("initial")));
+        let capacity = buffer.as_str().unwrap().len();
+        let prior = buffer.clone();
+        let long = "long".repeat(capacity + 1);
+        assert!(matches!(SerdeJson::prepare_string_node_with_allocations(&mut buffer, &long, &funding),
+            Err(crate::KeyPreparationError::Allocation(AllocationError::Refused))));
+        assert_eq!(buffer, prior);
+        assert_eq!(funding.0.get(), 2);
+        let node = SerdeJson::prepare_string_node_with_allocations(&mut buffer, "ok", &funding).unwrap();
+        assert_eq!(node.as_str(), Some("ok"));
+        assert_eq!(funding.0.get(), 2);
+        assert_eq!(SerdeJson::prepare_string_node_with_allocations(&mut buffer, &long, &Unenforced).unwrap().as_str(), Some(long.as_str()));
     }
 }

@@ -1,10 +1,10 @@
 //! One original aggregate tokenizer residence; public managed operations remain closed.
 mod encode;
 pub use encode::{OriginalEncodedTokenIds, OriginalTokenizerEncodeError};
-mod file;
-pub use file::OriginalTokenizerFileError;
+mod input;
+pub use input::{OriginalTokenizerInput, OriginalTokenizerInputError};
 mod text_source_error;
-pub use text_source_error::OriginalTextSourceError;
+pub use text_source_error::{OriginalTextSourceError, OriginalTokenizerSourceError};
 mod source_budget;
 pub use source_budget::{OriginalTextSourceBudget, OriginalTextSourceBudgetError};
 
@@ -12,7 +12,7 @@ use super::loaded_decode_source::Allowance;
 use super::{WorkingMemoryError, WorkingMemoryPool};
 use eredu_core::{BackendFailure, TokenFilter};
 use eredu_text::tokenizer_storage::{
-    PreparedTokenizer, TokenizerConstructionFailure, TokenizerPlan,
+    PreparedTokenizer, TokenizerConstructionFailure, TokenizerPlan, InputPrefixPlan, InputPrefixFailure, TokenizerSourceError,
 };
 use std::{
     alloc::Layout,
@@ -26,6 +26,7 @@ use std::{
 struct Payload {
     model: PreparedTokenizer,
     domain: Option<TokenFilter>,
+    input_prefix_root: Option<OriginalTokenizer>,
     allowance: Allowance,
 }
 
@@ -47,10 +48,36 @@ struct Payload {
 /// ```
 pub struct OriginalTokenizer(Option<Arc<Payload>>);
 impl OriginalTokenizer {
+    /// Remove input prefixes using the same immutable model and a prospectively
+    /// funded added-vocabulary/decoder projection. Identity removal aliases this
+    /// exact source. A changed source retains this original owner and payer.
+    pub fn input_prefix_normalized_source(&self) -> Result<Self, OriginalTokenizerPrefixError> {
+        let plan = self.payload().model.input_prefix_plan().map_err(|error| OriginalTokenizerError {
+            cause: Cause::Source(error), settlement: None, _completed: None, domain: None,
+            input_prefix_root: Some(self.clone()), allowance: None,
+        })?;
+        let Some(plan) = plan else { return Ok(self.clone()); };
+        let extent = match self.payload().domain.as_ref() { Some(TokenFilter::Allowed(mask)) => Some(mask.len()), None => None, _ => unreachable!("original canonical domain is a dense mask") };
+        self.pool().compile_tokenizer_inner(PrefixSourcePlan { plan, extent }, || {}, false, Some(self))
+    }
+
+    pub(super) fn tokenization_is_canonical(&self) -> bool {
+        self.payload().model.tokenization_is_canonical()
+    }
+
     /// Compares this originally constructed source with the selected loaded
     /// tokenizer without exposing or cloning its HF aggregate. No funding is granted.
     pub fn matches_configuration(&self, selected: &eredu_text::tokenizer::Tokenizer) -> bool {
         self.payload().model.matches_configuration(selected)
+    }
+
+    pub(super) fn matches_semantic_root(&self, original: &Self) -> bool {
+        self.same_source(original)
+            || self
+                .payload()
+                .input_prefix_root
+                .as_ref()
+                .is_some_and(|root| root.same_source(original))
     }
 
     /// Borrows the canonical token domain selected before this source's original
@@ -168,27 +195,44 @@ impl Drop for OriginalTokenizer {
 }
 
 #[derive(Debug)]
-enum Cause {
+enum Cause<C = TokenizerConstructionFailure> {
     Admission(WorkingMemoryError),
-    Compilation(TokenizerConstructionFailure),
+    Compilation(C),
+    Source(TokenizerSourceError),
     Domain(TryReserveError),
 }
 /// Closed terminal failure retaining the compiler prefix and original allowance.
 /// Admission rejection has no allowance. No partial/guard extraction or retry exists.
-pub struct OriginalTokenizerError {
-    cause: Cause,
+pub struct OriginalTokenizerError<C = TokenizerConstructionFailure> {
+    cause: Cause<C>,
     settlement: Option<WorkingMemoryError>,
     _completed: Option<PreparedTokenizer>,
     domain: Option<TokenFilter>,
+    input_prefix_root: Option<OriginalTokenizer>,
     allowance: Option<Allowance>,
 }
-impl OriginalTokenizerError {
-    fn rejected(cause: WorkingMemoryError) -> Self {
+/// Prefix normalization uses the same terminal custody with only its reachable
+/// projection failures; full model compiler storage cannot enter this path.
+pub type OriginalTokenizerPrefixError = OriginalTokenizerError<InputPrefixFailure>;
+impl<C: std::error::Error + Send + Sync + 'static> OriginalTokenizerError<C> {
+    /// Retains the complete compiler failure directly in the neutral envelope.
+    pub fn into_backend_failure(self) -> BackendFailure {
+        let kind = match self.accounting_failure() {
+            Some(WorkingMemoryError::Poisoned | WorkingMemoryError::IdentityMismatch) => {
+                eredu_core::BackendFailureKind::InvalidSession
+            }
+            Some(WorkingMemoryError::UnknownBound) => eredu_core::BackendFailureKind::Unsupported,
+            _ => eredu_core::BackendFailureKind::ResourceExhausted,
+        };
+        BackendFailure::new(kind, self)
+    }
+    fn rejected_with_root(cause: WorkingMemoryError, root: Option<&OriginalTokenizer>) -> Self {
         Self {
             cause: Cause::Admission(cause),
             settlement: None,
             _completed: None,
             domain: None,
+            input_prefix_root: root.cloned(),
             allowance: None,
         }
     }
@@ -197,7 +241,7 @@ impl OriginalTokenizerError {
         self.allowance.as_ref().map_or(0, |a| a.bytes())
     }
     /// Actual compiler failure from an admitted reserve attempt.
-    pub fn compiler_failure(&self) -> Option<&TokenizerConstructionFailure> {
+    pub fn compiler_failure(&self) -> Option<&C> {
         match &self.cause {
             Cause::Compilation(error) => Some(error),
             _ => None,
@@ -225,39 +269,70 @@ impl OriginalTokenizerError {
         })
     }
 }
-impl fmt::Debug for OriginalTokenizerError {
+impl<C: std::error::Error + Send + Sync + 'static> fmt::Debug for OriginalTokenizerError<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OriginalTokenizerError")
             .field("cause", &self.cause)
             .field("settlement", &self.settlement)
             .field("completed", &self._completed.is_some())
+            .field("retains_input_prefix_root", &self.input_prefix_root.is_some())
             .field("retained_bytes", &self.retained_bytes())
             .finish()
     }
 }
-impl fmt::Display for OriginalTokenizerError {
+impl<C: fmt::Display> fmt::Display for OriginalTokenizerError<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
             Cause::Admission(error) => fmt::Display::fmt(error, f),
             Cause::Compilation(error) => fmt::Display::fmt(error, f),
+            Cause::Source(error) => fmt::Display::fmt(error, f),
             Cause::Domain(error) => fmt::Display::fmt(error, f),
         }
     }
 }
-impl std::error::Error for OriginalTokenizerError {
+impl<C: std::error::Error + Send + Sync + 'static> std::error::Error for OriginalTokenizerError<C> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
             Cause::Admission(error) => Some(error),
             Cause::Compilation(error) => Some(error),
+            Cause::Source(error) => Some(error),
             Cause::Domain(error) => Some(error),
         }
     }
+}
+
+// Actual producer types select their own failure transport while sharing all
+// admission, validity-mask publication and retirement mechanics.
+trait SourcePlan: Sized {
+    type Failure: std::error::Error + Send + Sync + 'static;
+    fn required_bytes(&self) -> usize;
+    fn generation_controls() -> Option<usize>;
+    fn domain_extent(&self) -> Option<usize>;
+    fn compile(self) -> Result<PreparedTokenizer, Self::Failure>;
+}
+impl SourcePlan for TokenizerPlan<'_> {
+    type Failure = TokenizerConstructionFailure;
+    fn generation_controls() -> Option<usize> { OriginalTokenizerSourceError::tokenizer_controls() }
+    fn required_bytes(&self) -> usize { self.requirements().required_bytes() }
+    fn domain_extent(&self) -> Option<usize> { self.generation_domain_extent() }
+    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> { TokenizerPlan::compile(self) }
+}
+struct PrefixSourcePlan<'a> { plan: InputPrefixPlan<'a>, extent: Option<usize> }
+impl SourcePlan for PrefixSourcePlan<'_> {
+    type Failure = InputPrefixFailure;
+    fn generation_controls() -> Option<usize> { Some(0) }
+    fn required_bytes(&self) -> usize { self.plan.requirements().required_bytes() }
+    fn domain_extent(&self) -> Option<usize> { self.extent }
+    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> { self.plan.compile() }
 }
 
 impl WorkingMemoryPool {
     /// Actual source-derived compiler plus closed owner/error control requirements.
     /// This query grants no budget and takes no ownership of the borrowed plan.
     pub fn tokenizer_required_bytes(plan: &TokenizerPlan<'_>) -> Result<u64, WorkingMemoryError> {
+        Self::tokenizer_construction_required_bytes::<TokenizerPlan<'_>>(plan.requirements().required_bytes(), plan.generation_domain_extent())
+    }
+    fn tokenizer_construction_required_bytes<P: SourcePlan>(required: usize, domain_extent: Option<usize>) -> Result<u64, WorkingMemoryError> {
         let arc = Layout::new::<[AtomicUsize; 2]>()
             .extend(Layout::new::<Payload>())
             .map_err(|_| WorkingMemoryError::Overflow)?
@@ -272,42 +347,46 @@ impl WorkingMemoryPool {
             size_of::<Option<Arc<Payload>>>(),
             size_of::<OriginalTokenizer>(),
             size_of::<Option<OriginalTokenizer>>(),
+            size_of::<Option<&OriginalTokenizer>>(),
+            size_of::<(&OriginalTokenizer, P)>(),
+            size_of::<P>(),
+            size_of::<Result<Option<InputPrefixPlan<'_>>, TokenizerSourceError>>(),
             size_of::<Result<(), BackendFailure>>(),
             size_of::<Allowance>(),
             size_of::<Result<Allowance, WorkingMemoryError>>(),
-            size_of::<Cause>(),
+            size_of::<Cause<P::Failure>>(),
             size_of::<Option<WorkingMemoryError>>(),
             size_of::<Option<PreparedTokenizer>>(),
             size_of::<Option<TokenFilter>>(), // temporary mask before final owner
             size_of::<Vec<bool>>(),           // actual reserve target before publication
             size_of::<Result<(), TryReserveError>>(),
-            size_of::<Result<(), Cause>>(),
+            size_of::<Result<(), Cause<P::Failure>>>(),
             size_of::<Option<usize>>(), // selected domain capacity
             size_of::<usize>(),         // actual target reserve count
+            size_of::<usize>(),         // actual consistent generation-domain extent
             size_of::<Result<(), WorkingMemoryError>>(),
-            size_of::<OriginalTokenizerError>(),
-            size_of::<Result<OriginalTokenizer, OriginalTokenizerError>>(),
+            size_of::<OriginalTokenizerError<P::Failure>>(),
+            size_of::<Result<OriginalTokenizer, OriginalTokenizerError<P::Failure>>>(),
             size_of::<Result<OriginalTokenizer, BackendFailure>>(),
-            BackendFailure::source_retention_peak_bytes::<OriginalTokenizerError>()
+            BackendFailure::source_retention_peak_bytes::<OriginalTokenizerError<P::Failure>>()
                 .ok_or(WorkingMemoryError::Overflow)?,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
         .ok_or(WorkingMemoryError::Overflow)?;
-        let controls = if plan.generation_domain_extent().is_some() {
+        let controls = if domain_extent.is_some() {
             controls
                 .checked_add(
-                    OriginalTextSourceError::tokenizer_controls()
+                    P::generation_controls()
                         .ok_or(WorkingMemoryError::Overflow)?,
                 )
                 .ok_or(WorkingMemoryError::Overflow)?
         } else {
             controls
         };
-        plan.requirements()
-            .required_bytes()
+        required
             .checked_add(
-                Layout::array::<bool>(plan.generation_domain_extent().unwrap_or(0))
+                Layout::array::<bool>(domain_extent.unwrap_or(0))
                     .map_err(|_| WorkingMemoryError::Overflow)?
                     .size(),
             )
@@ -329,23 +408,22 @@ impl WorkingMemoryPool {
         plan: TokenizerPlan<'_>,
         after_admission: impl FnOnce(),
     ) -> Result<OriginalTokenizer, OriginalTokenizerError> {
-        self.compile_tokenizer_inner(plan, after_admission, false)
+        self.compile_tokenizer_inner(plan, after_admission, false, None)
     }
-    fn compile_tokenizer_inner(
+    fn compile_tokenizer_inner<P: SourcePlan>(
         &self,
-        plan: TokenizerPlan<'_>,
+        plan: P,
         after_admission: impl FnOnce(),
         fail_domain_reserve: bool,
-    ) -> Result<OriginalTokenizer, OriginalTokenizerError> {
-        let bytes =
-            Self::tokenizer_required_bytes(&plan).map_err(OriginalTokenizerError::rejected)?;
-        let mut allowance = self
-            .admit_source_compiler(bytes)
-            .map_err(OriginalTokenizerError::rejected)?;
+        root: Option<&OriginalTokenizer>,
+    ) -> Result<OriginalTokenizer, OriginalTokenizerError<P::Failure>> {
+        let rejected = |cause| OriginalTokenizerError::rejected_with_root(cause, root);
+        let bytes = Self::tokenizer_construction_required_bytes::<P>(plan.required_bytes(), plan.domain_extent()).map_err(rejected)?;
+        let mut allowance = self.admit_source_compiler(bytes).map_err(rejected)?;
         // Private test hook runs with the actual original guard installed; the
         // public entry supplies only a zero-sized no-op.
         after_admission();
-        let domain_extent = plan.generation_domain_extent();
+        let domain_extent = plan.domain_extent();
         // Inner compiler locals/prefix retire before allowance on unwind.
         let compiled = plan.compile();
         match compiled {
@@ -356,6 +434,7 @@ impl WorkingMemoryPool {
                     settlement,
                     _completed: None,
                     domain: None,
+                    input_prefix_root: root.cloned(),
                     allowance: Some(allowance),
                 })
             }
@@ -363,8 +442,13 @@ impl WorkingMemoryPool {
                 // These real completed parts remain below the original guard on
                 // error/unwind. One actual reserve, never a substitute buffer.
                 let mut domain = domain_extent.map(|_| TokenFilter::Allowed(Vec::new()));
-                let filled =
-                    fill_domain(&source, domain.as_mut(), domain_extent, fail_domain_reserve);
+                let filled = if root.is_some_and(|original| {
+                    !source.is_input_prefix_derivative_of(&original.payload().model)
+                }) {
+                    Err(Cause::Admission(WorkingMemoryError::IdentityMismatch))
+                } else {
+                    fill_domain(&source, domain.as_mut(), domain_extent, fail_domain_reserve)
+                };
                 if let Err(cause) = filled {
                     let settlement = allowance.end_compilation().err();
                     return Err(OriginalTokenizerError {
@@ -372,6 +456,7 @@ impl WorkingMemoryPool {
                         settlement,
                         _completed: Some(source),
                         domain,
+                        input_prefix_root: root.cloned(),
                         allowance: Some(allowance),
                     });
                 }
@@ -380,6 +465,7 @@ impl WorkingMemoryPool {
                 let mut owner = Arc::new(Payload {
                     model: source,
                     domain,
+                    input_prefix_root: root.cloned(),
                     allowance,
                 });
                 let settlement = Arc::get_mut(&mut owner)
@@ -392,6 +478,7 @@ impl WorkingMemoryPool {
                         let Payload {
                             model: source,
                             domain,
+                            input_prefix_root,
                             allowance,
                         } = Arc::into_inner(owner).expect("unexposed source");
                         Err(OriginalTokenizerError {
@@ -399,6 +486,7 @@ impl WorkingMemoryPool {
                             settlement: None,
                             _completed: Some(source),
                             domain,
+                            input_prefix_root,
                             allowance: Some(allowance),
                         })
                     }
@@ -407,12 +495,12 @@ impl WorkingMemoryPool {
         }
     }
 }
-fn fill_domain(
+fn fill_domain<C>(
     source: &PreparedTokenizer,
     domain: Option<&mut TokenFilter>,
     extent: Option<usize>,
     fail_reserve: bool,
-) -> Result<(), Cause> {
+) -> Result<(), Cause<C>> {
     let Some(TokenFilter::Allowed(mask)) = domain else {
         return Ok(());
     };
@@ -423,14 +511,21 @@ fn fill_domain(
         return Err(Cause::Admission(WorkingMemoryError::Overflow));
     }
     mask.resize(extent, false);
+    let mut actual_extent = 0usize;
     for id in source.ids() {
         if source.spelling(id).and_then(|text| source.token_id(text)) == Some(id) {
             let slot = mask
                 .get_mut(id as usize)
                 .ok_or(Cause::Admission(WorkingMemoryError::Overflow))?;
             *slot = true;
+            actual_extent = actual_extent.max(id as usize + 1);
         }
     }
+    // The source plan admits the maximum fresh added-token population before
+    // construction. Existing-token overlaps may leave unused trailing capacity.
+    // Logical validity ends at the last actual consistent ID, just as the
+    // ordinary vocabulary filter does; retain the original paid allocation.
+    mask.truncate(actual_extent);
     Ok(())
 }
 #[cfg(test)]
@@ -451,28 +546,37 @@ pub trait OriginalTokenizerBackend: eredu_core::TextGenerationBackend {
         Err(eredu_core::TokenInputRejection::Unsupported)
     }
 
-    /// Starts source-bound speculative semantic funding before facade births.
+    /// Starts source-bound semantic funding before facade preparation.
     /// Default refusal performs no source work or detached custody conversion.
-    fn prepare_original_speculative_semantic(
+    fn prepare_semantic_source(
         _runtime: &eredu_core::ModelRuntime<Self>,
         _source: &OriginalTokenizer,
         _capacity: u64,
-    ) -> Result<super::OriginalSpeculativeSemanticPreparation, eredu_core::SpeculativeOutputError>
-    {
+    ) -> Result<super::PreparedSemanticSource, eredu_core::SpeculativeOutputError> {
         Err(eredu_core::SpeculativeOutputError::Storage(
-            "original speculative semantic preparation is unavailable",
+            "prepared semantic source is unavailable",
         ))
     }
 
-    /// Compiles the actual original E result through original I and completed B
-    /// under the selected execution's closed preparation. Implementations must
-    /// authenticate the header and encoded source before materialization; all
-    /// wrapper/error producers use that same host account. The default performs
-    /// no input work and returns a fixed neutral refusal.
-    fn prepare_original_speculative_prompt(
+    /// Checks the exact selected execution and original tokenizer pool before
+    /// semantic preparation is associated with a model input. No work is granted.
+    fn validate_semantic_source(
         _runtime: &eredu_core::ModelRuntime<Self>,
-        _preparation: &super::OriginalSpeculativeSemanticPreparation,
-        _encoded: &OriginalEncodedTokenIds,
+        _preparation: &super::PreparedSemanticSource,
+    ) -> Result<(), eredu_core::TokenInputRejection> {
+        Err(eredu_core::TokenInputRejection::Unsupported)
+    }
+
+    /// Compiles an exact borrowed ID sequence through original I and completed B
+    /// under the selected execution's closed preparation. Implementations must
+    /// authenticate its pool/execution and tokenizer domain before materialization;
+    /// encoded callers separately authenticate their actual E source before
+    /// lending these IDs. All wrapper/error producers use the same host account.
+    /// The default performs no input work and returns a fixed neutral refusal.
+    fn prepare_semantic_prompt(
+        _runtime: &eredu_core::ModelRuntime<Self>,
+        _preparation: &super::PreparedSemanticSource,
+        _input: &eredu_core::TokenIdsInputPlan<'_>,
         _chunk: Option<std::num::NonZeroU64>,
     ) -> Result<Self::Prompt, BackendFailure> {
         Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure())
@@ -513,12 +617,13 @@ pub trait OriginalTokenizerBackend: eredu_core::TextGenerationBackend {
     ) -> Result<OriginalEncodedTokenIds, OriginalTextSourceError> {
         Err(eredu_core::TokenInputRejection::Unsupported.into())
     }
-    /// Consumes exact file bytes to construct a fresh generation-enabled C. The
-    /// default rejects without reading; a decoder-only C is never promoted.
-    fn compile_original_tokenizer_file_for_generation(
+    /// Consumes the actual file or retained configuration source to construct a
+    /// fresh generation-enabled C. The default rejects without source work; a
+    /// decoder-only C is never promoted.
+    fn compile_original_tokenizer_source_for_generation(
         _runtime: &eredu_core::ModelRuntime<Self>,
-        _read: eredu_checkpoint::artifact::PreparedArtifactFileRead,
-    ) -> Result<OriginalTokenizer, OriginalTextSourceError> {
+        _input: OriginalTokenizerInput<'_>,
+    ) -> Result<OriginalTokenizer, OriginalTokenizerSourceError> {
         Err(eredu_core::TokenInputRejection::Unsupported.into())
     }
     /// Encodes the checked identity profile under the runtime's original E allowance.

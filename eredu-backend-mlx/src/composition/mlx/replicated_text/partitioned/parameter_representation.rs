@@ -44,7 +44,7 @@ impl Collector<'_> {
         match visited {
             Ok(()) => Ok(true),
             Err(
-                eredu_nn::ParameterSourceError::Unavailable
+                eredu_nn::ParameterSourceError::UnclassifiedRetainedField
                 | eredu_nn::ParameterSourceError::UnclassifiedRetainedField,
             ) => Ok(false),
             Err(cause) => Err(self.context.metadata_source(cause)),
@@ -244,7 +244,7 @@ where
             match unit.visit_parameter_sources(visitor) {
                 Ok(()) => {}
                 Err(
-                    eredu_nn::ParameterSourceError::Unavailable
+                    eredu_nn::ParameterSourceError::UnclassifiedRetainedField
                     | eredu_nn::ParameterSourceError::UnclassifiedRetainedField,
                 ) => return Ok(false),
                 Err(cause) => return Err(context.metadata_source(cause)),

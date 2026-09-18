@@ -259,7 +259,12 @@ impl BlockwiseAttentionAccumulator {
             crate::backend::submission_recovery::Recovery::begin(Vec::<Array>::new())?;
         self.accumulate_equation_with_bias(block, additive_bias, stream)?;
         ownership.seal();
-        let status = ownership.finish();
+        let status = ownership.finish().map_err(|cause| match cause {
+            crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause::Native(cause) => cause,
+            // This ordinary Vec<Array> recovery never installs a registration.
+            // Keep fixed refusal transport local to its ordinary Exception API.
+            _ => Exception::custom("attention block ownership retirement refused"),
+        })?;
         if status.failed || status.blocked || !status.settled {
             return Err(Exception::custom(
                 "attention block native ownership did not complete successfully",

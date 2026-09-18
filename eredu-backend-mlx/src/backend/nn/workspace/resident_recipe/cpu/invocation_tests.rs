@@ -28,15 +28,15 @@ fn tensor(shape: &[i32], phase: usize) -> MlxTensor {
 }
 struct BindNative { source: Vec<(String, Array)>, ordered:bool }
 impl<'a> ParameterVisitorMut<'a,MlxTensor> for BindNative {
-    fn visit_mut(&mut self, metadata:ParameterMetadata, value:&'a mut MlxTensor) {
+    fn visit_mut(&mut self, metadata:eredu_nn::ParameterMetadataView<'_>, value:&'a mut MlxTensor) {
         // The shared-KV block visits its multiplicative layer scalar at phase
         // 11; the general signed fixture sequence is exactly zero there.
         // Preserve a nonzero residual instead of annihilating the entire block.
-        *value=if metadata.id.as_str().ends_with(".layer_scalar") {
+        *value=if metadata.id().as_str().ends_with(".layer_scalar") {
             assert_eq!(value.shape(),[1]);
             if !self.ordered {assert_eq!(self.source.len()+1,11);}
             MlxTensor::from_array(Array::from_slice(&[0.75f32],&[1]))
-        } else if metadata.id.as_str()=="masked_embedding.token_ordering" {
+        } else if metadata.id().as_str()=="masked_embedding.token_ordering" {
             assert!(self.ordered);assert_eq!(value.shape(),[32]);
             let permutation=(0..32).map(|i|(i*13+7)%32).collect::<Vec<i32>>();
             MlxTensor::from_array(Array::from_slice(&permutation,&[32]))
@@ -44,7 +44,7 @@ impl<'a> ParameterVisitorMut<'a,MlxTensor> for BindNative {
             tensor(value.shape(),self.source.len()+1)
         };
         value.as_array().evaluated().unwrap();
-        self.source.push((metadata.id.as_str().to_owned(),value.as_array().clone()));
+        self.source.push((metadata.id().as_str().to_owned(),value.as_array().clone()));
     }
 }
 struct BindQuote<'a> { sources: &'a [(String,Array)], index:usize, context:&'a WorkspaceContext }
@@ -62,9 +62,9 @@ fn project(value:&Array, context:&WorkspaceContext)->WorkspaceTensor {
         .with_representation(representation),context).unwrap()
 }
 impl<'a> ParameterVisitorMut<'a,WorkspaceTensor> for BindQuote<'_> {
-    fn visit_mut(&mut self, metadata:ParameterMetadata,value:&'a mut WorkspaceTensor) {
+    fn visit_mut(&mut self, metadata:eredu_nn::ParameterMetadataView<'_>,value:&'a mut WorkspaceTensor) {
         let (name,source)=&self.sources[self.index];self.index+=1;
-        assert_eq!(metadata.id.as_str(),name);
+        assert_eq!(metadata.id().as_str(),name);
         assert_eq!(value.shape(),source.shape());
         *value=project(source,self.context);
     }
@@ -186,6 +186,20 @@ fn complete_draft_step(ordered:bool) {
     assert!(budget.occupied_bytes()>0 && budget.occupied_bytes()<=physical);
     compare(output.as_array(),&expected);compare(actual_state.hidden.as_array(),&expected_hidden);
     scope.seal();
+    // Output/event readiness can race the CPU worker's final record-frontier
+    // update. Keep the actual observer through settlement; retirement is not
+    // an implicit progress operation. Share the existing ten-second cap with
+    // the final independently escaped logits/state owner checks below.
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        let (progress,status)=observer.progress().unwrap();
+        assert_eq!(progress,safemlx::ScopedSubmissionProgress::Observed);
+        assert!(!status.failed()&&!status.blocked(),"CPU assistant terminal observation: {status:?}");
+        if status.is_settled(){return true;}
+        assert!(std::time::Instant::now()<deadline,"CPU assistant record settlement: {status:?}");
+        false
+    });
+    assert_eq!(observer.retire_completed_records().unwrap(),safemlx::SubmissionRetirement::CompleteSnapshot);
     safemlx::try_with_submission_retirement(||drop((roots,scope,observer,failure,records,graph,budget))).unwrap();
     drop((owner,sources,module,hidden,embedding,keys,values));
     safemlx::reclaim_allocation_owners();
@@ -196,11 +210,12 @@ fn complete_draft_step(ordered:bool) {
     drop(actual_state);
     crate::backend::submission_recovery::wait_for_retirement(|| {
         // This component owns its Scope directly, without a backend Recovery
-        // node. Settled native Records still retain that Scope until the same
-        // ordinary retirement pass used by native completion fixtures runs.
-        // A busy pass releases nothing and retries within this existing limit.
+        // node. Exact record settlement/retirement was proved above; this pass
+        // now drains final array/backing custody after the escaped aliases drop.
         safemlx::try_retire_completed_submissions().unwrap();
         MlxNeuralBackend::reclaim_retired_resources();safemlx::reclaim_allocation_owners();
-        released.load(Ordering::SeqCst)
+        if released.load(Ordering::SeqCst){return true;}
+        assert!(std::time::Instant::now()<deadline,"CPU assistant final escaped owner retirement");
+        false
     });
 }

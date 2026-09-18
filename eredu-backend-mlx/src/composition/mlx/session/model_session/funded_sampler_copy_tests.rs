@@ -135,7 +135,7 @@ fn advance_twice(
     (0..2)
         .map(|_| {
             let token = driver.advance(state).unwrap().unwrap().into_output();
-            driver.take_completed_step(state).unwrap();
+            driver.take_completed_delivery(state).unwrap();
             token
         })
         .collect()
@@ -247,7 +247,7 @@ fn admitted_standard_and_mirostat_sampler_copy_accept_exact_capacity_and_reject_
             copy
         };
         let third = driver.advance(&mut state).unwrap().unwrap().into_output();
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
         assert_eq!(history(copy.as_sampler()), ids);
         drop(third);
         drop(copy);

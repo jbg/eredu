@@ -1,4 +1,6 @@
+pub use derivre::prepared_funding::{PreparedFunding, Frame, FrameError};
 mod from_guidance;
+pub(crate) use from_guidance::is_grammar_storage_failure;
 mod grammar;
 pub(crate) mod lexer;
 mod parser;
@@ -8,15 +10,15 @@ pub mod lexerspec;
 pub mod perf;
 pub mod regexvec;
 
-pub use from_guidance::ValidationResult;
+pub use from_guidance::{GrammarCompilationError, ValidationResult};
 #[allow(unused_imports)]
 pub use grammar::{
     BitIdx, CGrammar, CSymIdx, Grammar, ParamCond, ParamExpr, ParamRef, ParamValue, SymIdx,
-    SymbolProps,
+    SymbolProps, SharedGrammar, SharedGrammarFailure,
 };
 pub use parser::{BiasComputer, Parser, ParserError, ParserMetrics, ParserRecognizer, ParserStats};
 pub use slicer::source::{
-    SlicerSource, SlicerSourceDescriptor, SlicerSourceError, SlicerSourceFailure, SlicerSourcePlan,
+    SlicerSource, SlicerRecognitionError, SlicerSourceDescriptor, SlicerSourceError, SlicerSourceFailure, SlicerSourcePlan,
     SlicerSourceRequirements, SlicerSourceView,
 };
 pub use slicer::SlicedBiasComputer;
@@ -33,7 +35,7 @@ pub use lexer::{
 };
 
 pub use grammar::{
-    CompiledGrammarCopyFailure, CompiledGrammarCopyPlan, CompiledGrammarCopyRequirements,
+    CompiledGrammarCopyFailure, CompiledGrammarCopyPlan, CompiledGrammarCopyRequirements, ConditionSourceError,
 };
 
 // Narrow prepared lexical handoff for the facade-owned controller.

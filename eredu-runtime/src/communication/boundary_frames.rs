@@ -1,6 +1,6 @@
 //! Canonical boundary headers and finite source-retaining frame destinations.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding,HostMetadataFundingError};
 use std::{alloc::Layout,collections::TryReserveError,mem::{size_of,size_of_val}};
 
 /// One checked header layout. Both ordinary and prepared paths invoke its
@@ -103,7 +103,7 @@ pub enum PreparedBoundaryFrameCause {
     Contract,
     /// Exact frame storage could not be charged to the supplied account.
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     /// A prepaid vector could not be allocated.
     #[error("prepared boundary frame destination allocation failed: {0}")]
     Capacity(#[source] TryReserveError),
@@ -116,7 +116,7 @@ pub struct PreparedBoundaryFrameError {
     #[source]
     cause:PreparedBoundaryFrameCause,
     _source:RetainedCommunicationSource,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 /// Canonical in-band headers and logical tensors under one exact route source.
 /// This prices host destinations only; native graph/backing/completion and role
@@ -126,7 +126,7 @@ pub struct PreparedBoundaryFrames<T> {
     values:Vec<crate::RoleExactBoundaryValue<T>>,
     route:CommunicationRouteId,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl<T> PreparedBoundaryFrames<T> {
     /// Exact selected directed route.
@@ -136,10 +136,10 @@ impl<T> PreparedBoundaryFrames<T> {
     /// Original declaration source; equal descriptors do not replace it.
     pub fn source(&self)->&RetainedCommunicationSource{&self.source}
     /// Account which owns the finite frame and error destinations.
-    pub fn funding(&self)->&WorkspaceMetadataFunding{&self.funding}
+    pub fn funding(&self)->&HostMetadataFunding{&self.funding}
     /// Move the paid frames and custody into native completion preparation.
     /// The receiver retains both source and funding through all escaped frames.
-    pub fn into_parts(self)->(Vec<crate::RoleExactBoundaryValue<T>>,RetainedCommunicationSource,WorkspaceMetadataFunding){
+    pub fn into_parts(self)->(Vec<crate::RoleExactBoundaryValue<T>>,RetainedCommunicationSource,HostMetadataFunding){
         (self.values,self.source,self.funding)
     }
 }
@@ -148,17 +148,17 @@ impl RetainedCommunicationSource {
     /// their canonical headers in charged destinations. Every refusal keeps
     /// the same source/funding; no inference or native submission occurs here.
     pub fn prepare_boundary_frames<T>(&self,route:CommunicationRouteId,
-        actual_roles:&[BoundaryRoleContract],values:Vec<T>,funding:&WorkspaceMetadataFunding)
+        actual_roles:&[BoundaryRoleContract],values:Vec<T>,funding:&HostMetadataFunding)
         ->Result<PreparedBoundaryFrames<T>,PreparedBoundaryFrameError>
     {
         let fail=|cause|PreparedBoundaryFrameError{cause,_source:self.clone(),_funding:funding.clone()};
-        let overflow=||fail(PreparedBoundaryFrameCause::Funding(WorkspaceMetadataFundingError::Overflow));
+        let overflow=||fail(PreparedBoundaryFrameCause::Funding(HostMetadataFundingError::Overflow));
         let controls=[size_of::<PreparedBoundaryFrames<T>>(),size_of::<Result<PreparedBoundaryFrames<T>,PreparedBoundaryFrameError>>(),
             size_of::<PreparedBoundaryFrameError>(),size_of::<PreparedBoundaryFrameCause>(),Header::source_control_bytes().ok_or_else(overflow)?,
             size_of::<Result<Header<'_>,CommunicationManifestError>>(),size_of::<Vec<T>>(),
             size_of::<std::vec::IntoIter<T>>(),size_of::<crate::RoleExactBoundaryValue<T>>(),
             size_of::<Vec<u8>>(),size_of::<Result<(),TryReserveError>>(),size_of::<Layout>(),
-            size_of::<(&Self,CommunicationRouteId,&[BoundaryRoleContract],&WorkspaceMetadataFunding)>(),
+            size_of::<(&Self,CommunicationRouteId,&[BoundaryRoleContract],&HostMetadataFunding)>(),
             size_of::<(usize,usize,u32,u64)>(),size_of::<Option<usize>>()];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add).ok_or_else(overflow)?)
             .map_err(|cause|fail(PreparedBoundaryFrameCause::Funding(cause)))?;
@@ -189,7 +189,7 @@ impl RetainedCommunicationSource {
 pub struct PreparedBoundarySource {
     route:CommunicationRouteId,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl PreparedBoundarySource {
     pub(crate) fn error(&self,cause:PreparedBoundaryFrameCause)->PreparedBoundaryFrameError{
@@ -199,7 +199,7 @@ impl PreparedBoundarySource {
     /// Exact declaration source bound by the backend's selected route loan.
     pub fn source(&self)->&RetainedCommunicationSource{&self.source}
     /// Finite destination funding for this boundary attempt.
-    pub fn funding(&self)->&WorkspaceMetadataFunding{&self.funding}
+    pub fn funding(&self)->&HostMetadataFunding{&self.funding}
     /// Actual selected route descriptor.
     pub fn descriptor(&self)->&CommunicationRouteDescriptor{
         self.source.manifest().routes().iter().find(|candidate|candidate.id()==self.route)
@@ -214,14 +214,14 @@ impl PreparedBoundarySource {
 impl RetainedCommunicationSource {
     /// Own a descriptive route/account loan after the backend has authenticated
     /// its actual native resource. This creates no original submission grant.
-    pub fn prepare_boundary_source(&self,route:CommunicationRouteId,funding:&WorkspaceMetadataFunding)
+    pub fn prepare_boundary_source(&self,route:CommunicationRouteId,funding:&HostMetadataFunding)
         ->Result<PreparedBoundarySource,PreparedBoundaryFrameError>{
         let fail=|cause|PreparedBoundaryFrameError{cause,_source:self.clone(),_funding:funding.clone()};
         let parts=[size_of::<PreparedBoundarySource>(),size_of::<Result<PreparedBoundarySource,PreparedBoundaryFrameError>>(),
-            size_of::<PreparedBoundaryFrameError>(),size_of::<(&Self,CommunicationRouteId,&WorkspaceMetadataFunding)>(),
+            size_of::<PreparedBoundaryFrameError>(),size_of::<(&Self,CommunicationRouteId,&HostMetadataFunding)>(),
             size_of::<Option<&CommunicationRouteDescriptor>>()];
         let bytes=parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or_else(||fail(PreparedBoundaryFrameCause::Funding(WorkspaceMetadataFundingError::Overflow)))?;
+            .ok_or_else(||fail(PreparedBoundaryFrameCause::Funding(HostMetadataFundingError::Overflow)))?;
         funding.reserve_metadata(bytes).map_err(|cause|fail(PreparedBoundaryFrameCause::Funding(cause)))?;
         if !self.manifest().routes().iter().any(|candidate|candidate.id()==route&&candidate.boundary_contract().is_some()){
             return Err(fail(PreparedBoundaryFrameCause::Contract));
@@ -235,15 +235,15 @@ impl RetainedCommunicationSource {
     /// geometry, through the same header layout used by the wire writer. This
     /// allocates no shape or bytes and grants no native transfer authority.
     pub fn boundary_header_length(&self,route:CommunicationRouteId,ordinal:usize,shape:&[i32],
-        dtype:&TensorDtype,funding:&WorkspaceMetadataFunding)->Result<usize,PreparedBoundaryFrameError>{
+        dtype:&TensorDtype,funding:&HostMetadataFunding)->Result<usize,PreparedBoundaryFrameError>{
         let failed=|cause|PreparedBoundaryFrameError{cause,_source:self.clone(),_funding:funding.clone()};
-        let parts=[Header::source_control_bytes().ok_or_else(||failed(PreparedBoundaryFrameCause::Funding(WorkspaceMetadataFundingError::Overflow)))?,
+        let parts=[Header::source_control_bytes().ok_or_else(||failed(PreparedBoundaryFrameCause::Funding(HostMetadataFundingError::Overflow)))?,
             size_of::<Result<Header<'_>,CommunicationManifestError>>(),
             size_of::<Result<usize,PreparedBoundaryFrameError>>(),size_of::<PreparedBoundaryFrameError>(),
-            size_of::<(&Self,CommunicationRouteId,usize,&[i32],&TensorDtype,&WorkspaceMetadataFunding)>(),
+            size_of::<(&Self,CommunicationRouteId,usize,&[i32],&TensorDtype,&HostMetadataFunding)>(),
             size_of::<(u64,usize,u32)>(),size_of::<Option<u64>>()];
         let bytes=parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or_else(||failed(PreparedBoundaryFrameCause::Funding(WorkspaceMetadataFundingError::Overflow)))?;
+            .ok_or_else(||failed(PreparedBoundaryFrameCause::Funding(HostMetadataFundingError::Overflow)))?;
         funding.reserve_metadata(bytes).map_err(|cause|failed(PreparedBoundaryFrameCause::Funding(cause)))?;
         let contract=self.manifest().routes().iter().find(|value|value.id()==route)
             .and_then(CommunicationRouteDescriptor::boundary_contract)

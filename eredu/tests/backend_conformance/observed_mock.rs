@@ -1,11 +1,17 @@
 use super::*;
 use eredu_core::capture::*;
 use eredu_core::intervention::*;
+#[path = "observed_mock/funded.rs"]
+mod funded;
+pub(super) use funded::plan as funded_plan;
 
 #[derive(Default)]
 pub(super) struct State {
     pub sampling: Sampling,
+    pub original: Option<admitted_text::PreparationOwner>,
     pub capture: Option<eredu_runtime::capture::CaptureSession>,
+    pub funded: Option<eredu_runtime::capture::FundedCaptureSession>,
+    pub(super) host_mechanism: Option<funded::HostMechanism>,
 }
 
 #[derive(Clone, Default)]
@@ -13,6 +19,15 @@ pub(super) struct Sampling {
     pub temperature: f32,
     pub seed: Option<u64>,
     pub prediction: u64,
+}
+
+pub(super) fn artifact_identity() -> eredu_core::artifact::ArtifactIdentity {
+    use sha2::Digest;
+    let equations = b"prefill: token_count; decode: token+1; logits intervention: token*scale";
+    eredu_core::artifact::fingerprint_artifact("neutral-arithmetic-fixture", [
+        eredu_core::artifact::ArtifactMemberIdentity::new("equations", equations.len() as u64,
+            sha2::Sha256::digest(equations).into()),
+    ]).unwrap()
 }
 
 pub(super) fn discovery() -> CaptureDiscovery {
@@ -24,7 +39,7 @@ pub(super) fn discovery() -> CaptureDiscovery {
         conditions: vec![],
     };
     CaptureDiscovery {
-        artifact_identity: "conformance-mock-artifact".into(),
+        artifact_identity: artifact_identity().to_string(),
         catalog: eredu_core::ObservationCatalog {
             schema_version: 1,
             completeness: eredu_core::DescriptionCompleteness::Complete,
@@ -142,7 +157,7 @@ impl InternalCapture {
             sequence,
             |observer| {
                 let value = Value {
-                    shape: vec![1, sequence as u64, 1],
+                    shape: [1, sequence as u64, 1],
                     scale: 1.0,
                 };
                 eredu_runtime::observe_and_intervene(
@@ -156,15 +171,15 @@ impl InternalCapture {
     }
 }
 #[derive(Clone)]
-struct Value {
-    shape: Vec<u64>,
+pub(crate) struct Value {
+    shape: [u64; 3],
     scale: f32,
 }
 impl CaptureBackend for Mechanism {
     type Tensor = Value;
     type Error = MockError;
     fn shape(&self, tensor: &Self::Tensor) -> Result<Vec<u64>, Self::Error> {
-        Ok(tensor.shape.clone())
+        Ok(tensor.shape.to_vec())
     }
     fn estimate(
         &self,
@@ -200,6 +215,12 @@ impl CaptureBackend for Mechanism {
 }
 
 impl State {
+    pub(super) fn take_capture(&mut self) -> Result<Option<SharedCapturedStep>, MockError> {
+        match &mut self.funded {
+            Some(capture) => Ok(capture.take_shared_step()?),
+            None => Ok(self.capture.as_mut().and_then(|capture| capture.take_shared_step())),
+        }
+    }
     pub fn observe(
         &mut self,
         phase: CapturePhase,
@@ -207,10 +228,12 @@ impl State {
         token: u32,
     ) -> Result<u32, MockError> {
         let mut value = Value {
-            shape: vec![1, sequence as u64, 1],
+            shape: [1, sequence as u64, 1],
             scale: 1.0,
         };
-        if let Some(capture) = &mut self.capture {
+        if self.funded.is_some() {
+            value = self.observe_funded(value,phase)?;
+        } else if let Some(capture) = &mut self.capture {
             capture
                 .begin_step(phase, self.sampling.prediction)
                 .map_err(|e| MockError::Capture(e.to_string()))?;
@@ -236,6 +259,7 @@ impl State {
 }
 
 impl InterventionBackend for Mechanism {
+    fn matches_intervention_shape(&self, value: &Value, shape: &[u64]) -> Result<bool,MockError> { Ok(value.shape == shape) }
     fn mask_components(&mut self, _: &Value, _: &[u32], _: bool) -> Result<Value, MockError> {
         Err(MockError::Capture(
             "mock does not advertise component masks".into(),
@@ -258,7 +282,7 @@ impl InterventionBackend for Mechanism {
         slice: &ResolvedCaptureSlice,
     ) -> Result<Value, MockError> {
         Ok(Value {
-            shape: slice.shape.clone(),
+            shape: slice.shape.as_slice().try_into().map_err(|_| MockError::CaptureGeometry)?,
             scale: value.scale,
         })
     }
@@ -275,13 +299,13 @@ impl InterventionBackend for Mechanism {
     }
     fn zeros(&mut self, shape: &[u64], _: InterventionDtype) -> Result<Value, MockError> {
         Ok(Value {
-            shape: shape.to_vec(),
+            shape: shape.try_into().map_err(|_| MockError::CaptureGeometry)?,
             scale: 0.0,
         })
     }
     fn scale(&mut self, value: &Value, factor: f32) -> Result<Value, MockError> {
         if factor == 13.0 {
-            return Err(MockError::Capture("injected intervention fault".into()));
+            return Err(MockError::InjectedCapture);
         }
         Ok(Value {
             shape: value.shape.clone(),
@@ -432,13 +456,13 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .build()
         .unwrap();
     let mut tokenizer = Tokenizer::new(words);
-    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     tokenizer.with_decoder(Some(ByteLevel::default()));
     tokenizer
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-    let mut model = LoadedModel::from_runtime(
+    let mut model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -451,13 +475,16 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         },
     )
     .unwrap();
-    let chat = model
-        .prepare_chat(ChatTemplateRequest {
+    let chat = {
+        let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"token1"})],
             add_generation_prompt: true,
             ..Default::default()
-        })
-        .unwrap();
+        };
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model.chat_source(!request.tools.is_empty(), &cancellation).unwrap().unwrap();
+        model.prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation).unwrap().unwrap()
+    };
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(3),
@@ -470,161 +497,91 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         per_record_bytes: 65536,
         total_bytes: 1024 * 1024,
     };
-    let baseline = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(&chat),
-            settings,
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
-        })
-        .unwrap();
-    let prepared = model
-        .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
-        .unwrap();
-    let identity = prepared.intervention_plan().unwrap().identity().to_owned();
-    let mut predictions = Vec::new();
-    let output = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            assert_eq!(
-                record.intervention_plan_id.as_deref(),
-                Some(identity.as_str())
-            );
-            if let Event::Token {
-                captures: Some(step),
-                ..
-            } = record.event
-            {
-                assert_eq!(step.interventions[0].outcome, InterventionOutcome::Applied);
-                assert_eq!(step.interventions[0].evidence.len(), 2);
-                assert_eq!(step.step_usage.captures, 3);
-                assert_eq!(
-                    step.records[0].payload,
-                    step.interventions[0].evidence[0].payload
-                );
-                assert_eq!(
-                    step.interventions[0].evidence[0].payload,
-                    step.interventions[0].evidence[1].payload
-                );
-                predictions.push(step.prediction_index);
-            }
-            ControlFlow::Continue(())
-        })
-        .unwrap();
-    assert_eq!(output.token_ids, baseline.token_ids);
-    assert_eq!(output.finish_reason, baseline.finish_reason);
-    assert!(output.timing().time_to_first_token().is_some());
-    assert!(baseline.timing().time_to_first_token().is_some());
-    assert_eq!(predictions, [0, 1, 2]);
-    let empty = model
-        .prepare_intervened_chat(&chat, settings, plan(), InterventionPlan::none(), limits)
-        .unwrap();
-    assert!(empty.intervention_plan().is_none());
-    let unchanged = model
-        .generate_observed_chat(empty, &[], Default::default(), |record| {
-            assert!(record.intervention_plan_id.is_none());
-            if let Event::Token {
-                captures: Some(step),
-                ..
-            } = record.event
-            {
-                assert!(step.interventions.is_empty());
-                assert_eq!(step.records.len(), 1);
-            }
-            ControlFlow::Continue(())
-        })
-        .unwrap();
-    assert_eq!(unchanged.token_ids, baseline.token_ids);
-    assert_eq!(unchanged.finish_reason, baseline.finish_reason);
-    assert!(unchanged.timing().time_to_first_token().is_some());
-    assert!(baseline.timing().time_to_first_token().is_some());
-    let mut invalid = intervention_plan(1.0);
-    invalid.operations[0].target = "nonexistent".into();
-    assert!(model
-        .prepare_intervened_chat(&chat, settings, plan(), invalid, limits)
-        .is_err());
-    let prepared = model
-        .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(13.0), limits)
-        .unwrap();
-    let mut records = Vec::new();
-    assert!(model
-        .generate_observed_chat(prepared, &[], Default::default(), |r| {
-            records.push(r);
-            ControlFlow::Continue(())
-        })
-        .is_err());
-    assert!(records.iter().any(
-        |r| matches!(&r.event, Event::CaptureFailure { captures, .. }
-        if matches!(captures.interventions[0].outcome, InterventionOutcome::Failed { .. }))
-    ));
-    assert!(matches!(
-        records.last().unwrap().event,
-        Event::Failed { .. }
-    ));
-    for pre_cancel in [false, true] {
-        let prepared = model
-            .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
-            .unwrap();
+    let baseline = {
         let cancellation = eredu_core::GenerationCancellationToken::new();
-        if pre_cancel {
-            cancellation.cancel();
-        }
-        let mut closed = false;
-        let output = model
-            .generate_observed_chat(prepared, &[], cancellation, |record| {
-                assert!(!closed, "delivery after consumer Break");
-                if matches!(record.event, Event::Token { .. }) {
-                    closed = true;
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-            .unwrap();
-        assert_eq!(output.finish_reason, FinishReason::Cancelled);
-        assert_eq!(output.token_ids.len(), usize::from(!pre_cancel));
-        assert_eq!(output.timing().time_to_first_token().is_some(), !pre_cancel);
+        let mut on_event = |_| {};
+        let mut request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        request.stop_sequences = &[];
+        model.start_prepared_chat(request, &cancellation).and_then(|session|
+            session.expect("uncancelled original request").run(&cancellation, &mut on_event))
     }
-    let prepared = model
-        .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
         .unwrap();
+    let capture=plan();
+    let unchanged=intervention_plan(1.0);
+    let make_request=|intervention| {
+        let mut request=eredu::api::PreparedChatRequest::new(&chat,original_sources::settings(settings));
+        request.capture=Some(&capture);
+        request.intervention=Some(intervention);
+        request
+    };
+    let mut records=Vec::new();
+    let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(),|r| {records.push(r);std::ops::ControlFlow::Continue(())}).unwrap().unwrap();
+    session.run(|r| {records.push(r);std::ops::ControlFlow::Continue(())}).unwrap();
+    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+    assert!(session.timing().time_to_first_token().is_some());
+    let identity=match &records[0].instrumentation {eredu::api::PreparedInstrumentationRecord::Intervened{intervention_plan_id,..}=>intervention_plan_id.clone(),_=>panic!("intervention source")};
+    let mut predictions=Vec::new();
+    for record in &records {
+        assert!(matches!(&record.instrumentation,eredu::api::PreparedInstrumentationRecord::Intervened{intervention_plan_id,..} if *intervention_plan_id==identity));
+        if let Some(Event::Token{captures:Some(step),..})=record.event.progress() {
+            assert_eq!(step.interventions[0].outcome,InterventionOutcome::Applied);
+            assert_eq!(step.interventions[0].evidence.len(),2);
+            assert_eq!(step.step_usage.captures,3);
+            assert_eq!(step.records[0].payload,step.interventions[0].evidence[0].payload);
+            assert_eq!(step.interventions[0].evidence[0].payload,step.interventions[0].evidence[1].payload);
+            predictions.push(step.prediction_index);
+        }
+    }
+    assert_eq!(predictions,[0,1,2]);
+    drop(session);drop(records);
+    let empty=InterventionPlan::none();
+    let mut session=model.start_controlled_chat(make_request(&empty),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
+    session.run(|r| {
+        assert!(!matches!(r.instrumentation,eredu::api::PreparedInstrumentationRecord::Intervened{..}));
+        if let Some(Event::Token{captures:Some(step),..})=r.event.progress() {assert!(step.interventions.is_empty());assert_eq!(step.records.len(),1);}
+        ControlFlow::Continue(())
+    }).unwrap();
+    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+    drop(session);
+    let mut invalid=intervention_plan(1.0);invalid.operations[0].target="nonexistent".into();
+    assert!(model.start_controlled_chat(make_request(&invalid),limits,Default::default(), |_|panic!("invalid admission delivery")).is_err());
+    let failed=intervention_plan(13.0);
+    let mut records=Vec::new();
+    let mut session=model.start_controlled_chat(make_request(&failed),limits,Default::default(),|r|{records.push(r);ControlFlow::Continue(())}).unwrap().unwrap();
+    assert!(session.run(|r| {records.push(r);ControlFlow::Continue(())}).is_err());
+    assert!(records.iter().any(|r|matches!(r.event.progress(),Some(Event::CaptureFailure{captures,..}) if matches!(captures.interventions[0].outcome,InterventionOutcome::Failed{..}))));
+    assert!(matches!(records.last().unwrap().event.progress(),Some(Event::Failed{..})));
+    drop(session);drop(records);
+    for pre_cancel in [false,true] {
+        let control=eredu_core::execution_control::GenerationControlHandle::default();
+        if pre_cancel {control.cancel();}
+        let mut closed=false;
+        let session=model.start_controlled_chat(make_request(&unchanged),limits,control, |_|ControlFlow::Continue(())).unwrap();
+        if pre_cancel {assert!(session.is_none());continue;}
+        let mut session=session.unwrap();
+        session.run(|r| {
+            assert!(!closed,"delivery after consumer Break");
+            if matches!(r.event.progress(),Some(Event::Token{..})) {closed=true;ControlFlow::Break(())} else {ControlFlow::Continue(())}
+        }).unwrap();
+        assert_eq!(session.finish_reason(),Some(FinishReason::Cancelled));
+        assert_eq!(session.token_ids().len(),1);
+        assert!(session.timing().time_to_first_token().is_some());
+    }
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = model.generate_observed_chat(prepared, &[], Default::default(), |record| {
-            if matches!(record.event, Event::Token { .. }) {
-                panic!("consumer unwinds");
-            }
-            ControlFlow::Continue(())
-        });
-    }))
-    .is_err());
-    // Successful reuse proves no move-only submission lease escaped cancellation,
-    // failure, or consumer unwinding in this synchronous conformance backend.
-    let prepared = model
-        .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
-        .unwrap();
-    let reused = model
-        .generate_observed_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
-        .unwrap();
-    assert_eq!(reused.token_ids, baseline.token_ids);
-    assert_eq!(reused.finish_reason, baseline.finish_reason);
-    assert!(reused.timing().time_to_first_token().is_some());
-    let prepared = model
-        .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(0.0), limits)
-        .unwrap();
-    assert_eq!(
-        model
-            .generate_observed_chat(
-                prepared,
-                &[],
-                Default::default(),
-                |_| ControlFlow::Continue(())
-            )
-            .unwrap()
-            .token_ids,
-        [0, 0, 0]
-    );
+        let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
+        let _=session.run(|r| {if matches!(r.event.progress(),Some(Event::Token{..})) {panic!("consumer unwinds");} ControlFlow::Continue(())});
+    })).is_err());
+    let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
+    session.run(|_|ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+    drop(session);
+    let zero=intervention_plan(0.0);
+    let mut session=model.start_controlled_chat(make_request(&zero),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
+    session.run(|_|ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(),[0,0,0]);
 }
 
 #[test]

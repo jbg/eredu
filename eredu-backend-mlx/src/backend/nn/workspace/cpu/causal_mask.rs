@@ -24,8 +24,8 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let Some(elements)=q.checked_mul(k).filter(|&n|n<=i32::MAX as usize) else {return Ok(None)};
     let source=(|| {
         let mut p=CpuPopulation::default();
-        p.copy(OperationEvent::cpu_arange_int_layout(k,false)?,0)?;
-        p.copy(OperationEvent::cpu_arange_int_layout(q,false)?,0)?;
+        p.copy(OperationEvent::cpu_arange_int_layout(safemlx::Dtype::Int32,k,false)?,0)?;
+        p.copy(OperationEvent::cpu_arange_int_layout(safemlx::Dtype::Int32,q,false)?,0)?;
         p.copy(OperationEvent::cpu_reshape_alias_layout(1,2,false)?,1)?;
         p.copy(OperationEvent::cpu_reshape_alias_layout(1,2,false)?,1)?;
         binary(&mut p,CpuBinaryOperation::GreaterEqual,Dtype::Int32,2,elements,(2,q),(2,k))?;

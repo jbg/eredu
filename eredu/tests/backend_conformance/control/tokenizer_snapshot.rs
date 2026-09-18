@@ -19,7 +19,7 @@ fn loaded_decoder_snapshots_outlive_model_with_unicode_forks_and_special_modes()
 
     // Changing mutable template state neither changes the token configuration
     // nor invalidates decoders which already carry an incomplete UTF-8 prefix.
-    model.set_chat_template(Some("{{ messages[0].content }}".into()));
+    model.replace_template(Some("{{ messages[0].content }}".into()));
     assert_eq!(*model.tokenizer_fingerprint(), fingerprint);
     // Borrowed spelling has the same backing as the pre-load snapshot: changing
     // templates did not clone or replace the tokenizer configuration.

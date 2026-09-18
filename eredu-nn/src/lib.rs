@@ -68,15 +68,11 @@ mod retained_error;
 /// Backend operation failure.
 #[derive(Debug, Clone)]
 pub struct Error {
-    // Legacy constructors retain their exact formatting/clone behavior.
     storage: ErrorStorage,
 }
 #[derive(Debug, Clone)]
 enum ErrorStorage {
-    Legacy {
-        message: String,
-        source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
-    },
+    Message(String),
     Retained(retained_error::RetainedSource),
     WorkspaceMetadata(workspace::WorkspaceMetadataError),
 }
@@ -84,7 +80,7 @@ enum ErrorStorage {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.storage {
-            ErrorStorage::Legacy { message, .. } => f.write_str(message),
+            ErrorStorage::Message(message) => f.write_str(message),
             ErrorStorage::Retained(source) => std::fmt::Display::fmt(source, f),
             ErrorStorage::WorkspaceMetadata(cause) => std::fmt::Display::fmt(cause, f),
         }
@@ -94,7 +90,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.storage {
-            ErrorStorage::Legacy { source, .. } => source.as_deref().map(|error| error as _),
+            ErrorStorage::Message(_) => None,
             ErrorStorage::Retained(source) => Some(source.original()),
             ErrorStorage::WorkspaceMetadata(cause) => Some(cause),
         }
@@ -102,8 +98,9 @@ impl std::error::Error for Error {
 }
 
 impl Error {
-    /// Creates a backend operation failure without exposing backend-native
-    /// exception types through architecture code.
+    /// Formats an ordinary caller-owned diagnostic. This does not retain a
+    /// typed source or grant funding; typed failures use `backend_retained_source`
+    /// and checked diagnostics use the context's `metadata_error` worker.
     pub fn backend(error: impl std::fmt::Display) -> Self {
         Self::backend_message(error.to_string())
     }
@@ -112,22 +109,11 @@ impl Error {
     /// or formatting it again. The producing caller retains any required custody.
     pub fn backend_message(message: String) -> Self {
         Self {
-            storage: ErrorStorage::Legacy {
-                message,
-                source: None,
-            },
+            storage: ErrorStorage::Message(message),
         }
     }
 
-    /// Retains the original failure behind the backend-neutral error boundary.
-    pub fn backend_source(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self {
-            storage: ErrorStorage::Legacy {
-                message: error.to_string(),
-                source: Some(std::sync::Arc::new(error)),
-            },
-        }
-    }
+
 }
 
 /// One axis of a backend-neutral tensor view.
@@ -847,6 +833,10 @@ impl ParameterMetadata {
 /// Invalid stable parameter topology.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ParameterTopologyError {
+    /// The canonical source did not establish complete topology.
+    #[error(transparent)]
+    Source(#[from] ParameterSourceError),
+
     /// A parameter identity is empty.
     #[error("parameter identity must not be empty")]
     EmptyId,
@@ -871,43 +861,16 @@ pub enum ParameterTopologyError {
     },
 }
 
-/// Immutable statically dispatched parameter visitor.
+/// Immutable observer borrowing each retained parameter declaration.
 pub trait ParameterVisitor<'a, T: 'a> {
-    /// Visits one authoritative parameter slot.
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a T);
-
-    /// Visits metadata borrowed from the actual retained declaration.
-    /// Existing ordinary visitors retain their owned adapter semantics.
-    fn visit_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'a T) {
-        self.visit(metadata.to_owned(), value);
-    }
-
-    /// Requests the borrowed companion instead of an allocating legacy adapter.
-    fn requires_borrowed_metadata(&self) -> bool {
-        false
-    }
-
-    /// Reports a legacy participant without entering its allocating adapter.
-    fn borrowed_metadata_unavailable(&mut self) {}
+    /// Visits one authoritative parameter slot; retaining owned metadata is explicit.
+    fn visit(&mut self, metadata: ParameterMetadataView<'_>, value: &'a T);
 }
 
-/// Mutable statically dispatched parameter visitor.
+/// Mutable observer borrowing metadata at a quiescent replacement boundary.
 pub trait ParameterVisitorMut<'a, T: 'a> {
     /// Visits one authoritative mutable parameter slot.
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut T);
-
-    /// Visits mutable storage with its retained borrowed declaration.
-    fn visit_mut_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'a mut T) {
-        self.visit_mut(metadata.to_owned(), value);
-    }
-
-    /// Requests the borrowed companion instead of an allocating legacy adapter.
-    fn requires_borrowed_metadata(&self) -> bool {
-        false
-    }
-
-    /// Reports a legacy participant without entering its allocating adapter.
-    fn borrowed_metadata_unavailable(&mut self) {}
+    fn visit_mut(&mut self, metadata: ParameterMetadataView<'_>, value: &'a mut T);
 }
 
 /// Object-safe traversal of loaded parameter slots at a quiescent boundary.
@@ -915,7 +878,7 @@ pub trait ParameterVisitorMut<'a, T: 'a> {
 /// A transaction prepares replacements separately, then publishes infallible moves.
 pub trait ParameterSlotVisitor<T> {
     /// Visits one slot without allowing a borrowed tensor to escape traversal.
-    fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut T);
+    fn visit_slot(&mut self, metadata: ParameterMetadataView<'_>, value: &mut T);
 }
 
 /// Backend-neutral parameter topology for a module or operator.
@@ -925,22 +888,11 @@ pub trait ParameterSlotVisitor<T> {
 /// visitor replaces a parameter value; runtime binding relies on this law to
 /// validate the whole topology before publishing any replacement.
 pub trait Parameterized<T: 'static> {
-    /// Borrows named parameter metadata and all known retained numerical fields.
-    ///
-    /// The strict default does not call any ordinary allocating visitor. A child
-    /// failure prevents complete coverage, even when later known values are
-    /// visited. Consumers must not publish a complete source from partial visits.
-    /// Implementations and consumers retain their actual source/callback storage;
-    /// this traversal conveys no allocation, completion or admission authority.
-    fn visit_parameter_sources<'a, V>(
-        &'a self,
-        _visitor: &mut V,
-    ) -> Result<(), ParameterSourceError>
-    where
-        V: ParameterSourceVisitor<'a, T>,
-    {
-        Err(ParameterSourceError::Unavailable)
-    }
+    /// Borrows named declarations and all classified retained numerical fields.
+    /// Every known child must be visited even when an earlier child is incomplete.
+    /// An error prevents callers from claiming complete source coverage.
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where V: ParameterSourceVisitor<'a, T>;
 
     /// Stable maximum number of retained value visits for this actual topology.
     /// Includes optional physical fields ordinary execution can populate; aliases
@@ -953,10 +905,17 @@ pub trait Parameterized<T: 'static> {
         None
     }
 
-    /// Visits every parameter exactly once using stable identities.
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>;
+    /// Projects named parameters from the canonical source traversal.
+    /// The returned status preserves incomplete source coverage and topology errors.
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where V: ParameterVisitor<'a, T> {
+        struct Named<'v,V>(&'v mut V);
+        impl<'a,T:'a,V:ParameterVisitor<'a,T>> ParameterSourceVisitor<'a,T> for Named<'_,V> {
+            fn parameter(&mut self, metadata: ParameterMetadataView<'a>, value: &'a T) { self.0.visit(metadata,value); }
+            fn retained(&mut self, _: &'a T) {}
+        }
+        self.visit_parameter_sources(&mut Named(visitor))
+    }
 
     /// Mutably visits every parameter exactly once using stable identities.
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
@@ -976,10 +935,14 @@ pub trait Parameterized<T: 'static> {
     /// This read-only traversal must not allocate/materialize tensors, execute
     /// operators, mutate state or change parameter topology. Aliases may repeat;
     /// a backend must separately inspect and deduplicate physical backing. The
-    /// default exposes parameters but cannot certify absence of other owners.
+    /// projection uses the same source traversal and preserves its completeness status.
     fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        visit_parameter_values(self, visitor);
-        false
+        struct Values<'v,T>(&'v mut dyn FnMut(&T));
+        impl<'a,T:'a> ParameterSourceVisitor<'a,T> for Values<'_,T> {
+            fn parameter(&mut self, _: ParameterMetadataView<'a>, value: &'a T) { self.0(value); }
+            fn retained(&mut self, value: &'a T) { self.0(value); }
+        }
+        self.visit_parameter_sources(&mut Values(visitor)).is_ok()
     }
 }
 
@@ -989,14 +952,14 @@ pub trait Parameterized<T: 'static> {
 pub fn visit_parameter_values<T: 'static, M: Parameterized<T> + ?Sized>(
     module: &M,
     visitor: &mut dyn FnMut(&T),
-) {
+) -> Result<(), ParameterSourceError> {
     struct Values<'a, T>(&'a mut dyn FnMut(&T));
     impl<'a, T: 'static> ParameterVisitor<'a, T> for Values<'_, T> {
-        fn visit(&mut self, _: ParameterMetadata, value: &'a T) {
+        fn visit(&mut self, _: crate::ParameterMetadataView<'_>, value: &'a T) {
             self.0(value);
         }
     }
-    module.visit_parameters(&mut Values(visitor));
+    module.visit_parameters(&mut Values(visitor))
 }
 
 /// Collects and validates the stable parameter topology exposed by a module.
@@ -1008,13 +971,13 @@ where
 {
     struct Collector(Vec<ParameterMetadata>);
     impl<'a, T: 'a> ParameterVisitor<'a, T> for Collector {
-        fn visit(&mut self, metadata: ParameterMetadata, _value: &'a T) {
-            self.0.push(metadata);
+        fn visit(&mut self, metadata: crate::ParameterMetadataView<'_>, _value: &'a T) {
+            self.0.push(metadata.to_owned());
         }
     }
 
     let mut collector = Collector(Vec::new());
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     let mut topology = std::collections::BTreeMap::new();
     for metadata in &collector.0 {
         if topology.insert(metadata.id.clone(), metadata).is_some() {
@@ -2737,7 +2700,7 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<T, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         self.forward_grouped(input, selections, context)
     }
@@ -2768,7 +2731,7 @@ pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         self.forward_grouped_tensor_parallel(input, selections, partitions, context)
     }
@@ -2864,7 +2827,7 @@ pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<T, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         self.forward_grouped(input, selections, context)
     }
@@ -2893,7 +2856,7 @@ pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T>
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         self.forward_grouped_tensor_parallel(input, selections, partitions, context)
     }
@@ -3041,7 +3004,7 @@ pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
         observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         Self::gated_product_groups_tensor_parallel(groups, input, selections, partitions, context)
     }
@@ -3056,7 +3019,7 @@ pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
         observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
         }
         Self::relu2_groups_tensor_parallel(groups, input, selections, partitions, context)
     }
@@ -3597,7 +3560,7 @@ fn blockwise_policy_error<B: NeuralBackend>(
 ) -> Error {
     match B::construction_metadata(context) {
         Some(metadata) => metadata.metadata_source(cause),
-        None => Error::backend_source(cause),
+        None => Error::backend_retained_source(cause),
     }
 }
 
@@ -3889,8 +3852,10 @@ impl NeuralOperatorCapabilities {
     pub const MASKED_OUTPUT_PROJECTION: Self = Self(1 << 38);
     /// Tanh-capped attention scores across contiguous, sliding and paged execution.
     pub const ATTENTION_SOFTCAP: Self = Self(1 << 39);
+    /// Unsigned 32-bit integer filled tensor construction for token identities.
+    pub const FULL_U32: Self = Self(1 << 40);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 40) - 1);
+    pub const ALL: Self = Self((1 << 41) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3985,6 +3950,7 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::TO_I32_VEC, "to_i32_vec"),
             (NeuralOperatorCapabilities::FULL_F32, "full_f32"),
             (NeuralOperatorCapabilities::FULL_I32, "full_i32"),
+            (NeuralOperatorCapabilities::FULL_U32, "full_u32"),
             (NeuralOperatorCapabilities::TANH, "tanh"),
             (NeuralOperatorCapabilities::CLIP, "clip"),
             (NeuralOperatorCapabilities::SOFTMAX_AXIS, "softmax_axis"),
@@ -4030,6 +3996,7 @@ mod neural_operator_capability_tests {
             (C::TO_I32_VEC, "to_i32_vec"),
             (C::FULL_F32, "full_f32"),
             (C::FULL_I32, "full_i32"),
+            (C::FULL_U32, "full_u32"),
             (C::TANH, "tanh"),
             (C::CLIP, "clip"),
             (C::SOFTMAX_AXIS, "softmax_axis"),
@@ -5016,6 +4983,11 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "filled I32 tensor construction is not implemented by this backend",
         ))
     }
+    /// Creates an unsigned 32-bit integer tensor without changing token identity.
+    fn full_u32(value: u32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        let _ = (value, shape, context);
+        Err(Error::backend("filled U32 tensor construction is not implemented by this backend"))
+    }
     /// Elementwise addition.
     fn add(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise subtraction.
@@ -5089,7 +5061,7 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// publish exact slice source facts; the default uses the existing index
     /// worker with identical geometry, including empty intervals.
     fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &Self::Context) -> Result<Self, Error> {
-        let range = TensorAxisRange::new(self.shape(), axis, start, end).map_err(Error::backend_source)?;
+        let range = TensorAxisRange::new(self.shape(), axis, start, end).map_err(Error::backend_retained_source)?;
         self.index(&range.indexes().collect::<Vec<_>>(), context)
     }
     /// Takes rows along one axis using a backend index tensor.
@@ -5130,6 +5102,14 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         ))
     }
     /// Scatters source rows into the true entries of a boolean mask.
+    ///
+    /// The mask must exactly match the input's leading dimensions; the remaining
+    /// dimensions form one row. Source row dimensions broadcast to that suffix.
+    /// An optional leading source dimension supplies consecutive rows in logical
+    /// mask order and must cover every true entry (unused rows are ignored).
+    /// Without that dimension, one broadcast row supplies every selected entry.
+    /// Equal input/mask ranks select individual elements. Source values convert
+    /// to the input dtype; the result preserves the input shape and dtype.
     fn masked_scatter(
         &self,
         mask: &Self,
@@ -5292,7 +5272,7 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         context: &Self::Context,
     ) -> Result<(Self, Self), Error> {
         let _ = (position_ids, prepared, context);
-        Err(Error::backend_source(
+        Err(Error::backend_retained_source(
             multimodal::RotaryTableError::UnsupportedBackend,
         ))
     }
@@ -5334,6 +5314,11 @@ impl<T> Parameter<T> {
             trainable,
             value,
         }
+    }
+    /// Rebinds a construction-time parameter identity. This changes topology;
+    /// existing prepared bindings and topology measurements must be rebuilt.
+    pub fn set_identity(&mut self, id: ParameterId) {
+        self.spec.id = id;
     }
     /// Borrows the backend tensor.
     pub const fn as_ref(&self) -> &T {
@@ -5382,26 +5367,15 @@ impl<T: 'static> Parameterized<T> for Parameter<T> {
         Some(1)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        visitor(&self.value);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        visitor.visit_borrowed(
-            ParameterMetadataView::from_spec(&self.spec, self.trainable),
-            &self.value,
-        );
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, T>,
     {
-        visitor.visit_mut_borrowed(
+        visitor.visit_mut(
             ParameterMetadataView::from_spec(&self.spec, self.trainable),
             &mut self.value,
         );
@@ -5430,22 +5404,9 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Vec<M> {
         })
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        let mut complete = true;
-        for module in self {
-            complete &= module.visit_retained_values(visitor);
-        }
-        complete
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        for module in self {
-            module.visit_parameters(visitor);
-        }
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -5481,19 +5442,9 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Option<M> {
             .map_or(Some(0), <M as Parameterized<T>>::retained_value_slot_bound)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        self.as_ref()
-            .is_none_or(|module| module.visit_retained_values(visitor))
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        if let Some(module) = self {
-            module.visit_parameters(visitor);
-        }
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6009,21 +5960,9 @@ impl<T: 'static> Parameterized<T> for Linear<T> {
         Some(2)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        let weight = self.weight.visit_retained_values(visitor);
-        let bias = self.bias.visit_retained_values(visitor);
-        weight & bias
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        self.weight.visit_parameters(visitor);
-        if let Some(bias) = &self.bias {
-            bias.visit_parameters(visitor);
-        }
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6099,23 +6038,9 @@ impl<T: 'static> Parameterized<T> for LayerNorm<T> {
         Some(2)
     }
 
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        let weight = self.weight.visit_retained_values(visitor);
-        let bias = self.bias.visit_retained_values(visitor);
-        weight & bias
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        if let Some(weight) = &self.weight {
-            weight.visit_parameters(visitor);
-        }
-        if let Some(bias) = &self.bias {
-            bias.visit_parameters(visitor);
-        }
-    }
+
+
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6151,7 +6076,7 @@ mod parameter_topology_tests {
     struct DerivedModule {
         first: Parameter<i32>,
         second: Option<Parameter<i32>>,
-        #[parameter(skip)]
+        #[parameter(skip, metadata)]
         label: &'static str,
     }
 

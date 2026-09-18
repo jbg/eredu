@@ -86,7 +86,7 @@ fn bench_train_small(c: &mut Criterion) {
         DecoderWrapper,
     >;
     let mut tokenizer = Tok::new(WordPiece::default());
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     let mut group = c.benchmark_group("bert-train-small");
     let data = std::fs::read_to_string("data/small.txt").unwrap();
     group.throughput(Throughput::Bytes(data.len() as u64));
@@ -114,7 +114,7 @@ fn bench_train_big(c: &mut Criterion) {
         DecoderWrapper,
     >;
     let mut tokenizer = Tok::new(WordPiece::default());
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     let mut group = c.benchmark_group("bert-train-big");
     let data = std::fs::read_to_string("data/big.txt").unwrap();
     group.throughput(Throughput::Bytes(data.len() as u64));

@@ -11,7 +11,7 @@ impl PreparedEarleySeed {
     /// Composition retains that lexer beside this seed and supplies the same
     /// declaration; this mechanism does not grant runnable parser authority.
     /// On error the seed owns its partial rows and the caller keeps the lexer.
-    pub fn publish_initial_row<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn publish_initial_row<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         lexer: &mut PreparedLexer,
         funding: &F,
@@ -40,7 +40,7 @@ impl PreparedEarleySeed {
                 size_of::<Result<std::alloc::Layout, std::alloc::LayoutError>>(),
                 size_of::<Option<&crate::earley::regexvec::StateDesc>>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -79,7 +79,7 @@ impl PreparedEarleySeed {
                     .ok_or(Cause::Source)?
                     .possible;
                 let plan = possible.copy_plan().map_err(Cause::MaskSource)?;
-                funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+                funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
                 self.initial_selection = Some(LexemeSet::from_owned_vob(
                     plan.compile().map_err(Cause::Mask)?,
                 ));

@@ -1,6 +1,6 @@
 //! Count geometry from the selected opaque group and actual local route row.
 use super::{CollectiveGroupId, CommunicationPeerCounts, ExpertRouteCountPlan};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::CommunicationGroupDescriptor;
 use std::mem::{size_of, size_of_val};
 
@@ -21,7 +21,7 @@ pub enum ExpertRouteCountCause {
     #[error("expert route count exceeds i32 consensus geometry")]
     Encoding,
     #[error("expert route count metadata was refused: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
 }
 
 /// Geometry only: this loan grants neither communication nor native readout.
@@ -57,7 +57,7 @@ impl<'a> ExpertRouteCountSource<'a> {
             size_of::<FundedExpertRouteCounts>(),size_of::<FundedExpertRouteCountFailure>(),
             size_of::<FundedCountRow>(),size_of::<Result<FundedCountRow,FundedExpertRouteCountFailure>>(),
             size_of::<ExpertRouteCountCause>(),size_of::<[Vec<usize>;5]>(),
-            size_of::<WorkspaceMetadataFunding>(),size_of::<Result<(),WorkspaceMetadataFundingError>>(),
+            size_of::<HostMetadataFunding>(),size_of::<Result<(),HostMetadataFundingError>>(),
             size_of::<Result<FundedExpertRouteCounts,FundedExpertRouteCountFailure>>(),
             size_of::<(usize,usize,usize,usize)>(),size_of::<(&[usize],&[i32])>(),
             size_of::<(CollectiveGroupId,usize,Vec<usize>,Vec<usize>)>(),
@@ -68,10 +68,10 @@ impl<'a> ExpertRouteCountSource<'a> {
             size_of::<std::iter::Enumerate<std::slice::Iter<'_,i32>>>(),
             size_of::<std::iter::Zip<std::slice::Iter<'_,usize>,std::slice::Iter<'_,i32>>>(),
             size_of::<Result<ExpertRouteCountPlan,ExpertRouteCountCause>>(),
-            eredu_nn::Error::retained_source_control_bytes::<FundedExpertRouteCountFailure>()?];
+            eredu_nn::Error::retained_source_construction_bytes::<FundedExpertRouteCountFailure>()?];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
-    pub(super) fn prepare_row(self, funding: WorkspaceMetadataFunding)
+    pub(super) fn prepare_row(self, funding: HostMetadataFunding)
         -> Result<FundedCountRow, FundedExpertRouteCountFailure>
     {
         let result=(||{
@@ -94,7 +94,7 @@ impl<'a> ExpertRouteCountSource<'a> {
     }
     /// Borrows the actual completed matrix. No cast/evaluation or byte authority
     /// is accepted here; those remain responsibilities of the selected source.
-    pub fn prepare_i32(self, matrix: &[i32], funding: WorkspaceMetadataFunding)
+    pub fn prepare_i32(self, matrix: &[i32], funding: HostMetadataFunding)
         -> Result<FundedExpertRouteCounts, FundedExpertRouteCountFailure>
     {
         let result=(||{
@@ -126,9 +126,9 @@ impl<'a> ExpertRouteCountSource<'a> {
     }
 }
 
-pub(super) struct FundedCountRow { values: Vec<i32>, _funding: WorkspaceMetadataFunding }
+pub(super) struct FundedCountRow { values: Vec<i32>, _funding: HostMetadataFunding }
 impl FundedCountRow { pub(super) fn values(&self)->&[i32] { &self.values } }
-pub(super) fn retain(cause:ExpertRouteCountCause,funding:&WorkspaceMetadataFunding)->FundedExpertRouteCountFailure {
+pub(super) fn retain(cause:ExpertRouteCountCause,funding:&HostMetadataFunding)->FundedExpertRouteCountFailure {
     FundedExpertRouteCountFailure { cause,funding:funding.clone() }
 }
 
@@ -137,7 +137,7 @@ pub(super) fn retain(cause:ExpertRouteCountCause,funding:&WorkspaceMetadataFundi
 pub struct FundedExpertRouteCounts {
     plan: ExpertRouteCountPlan,
     completed_source: Option<eredu_core::ErasedSharedStorageOwner>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     region: Option<super::ExpertRouteRegionRows>,
     local_binding_attempted: std::cell::Cell<bool>,
 }
@@ -190,18 +190,18 @@ impl FundedExpertRouteCounts {
     pub fn forward(&self) -> &CommunicationPeerCounts { self.plan.forward() }
     pub fn reverse(&self) -> &CommunicationPeerCounts { self.plan.reverse() }
     pub fn count_matrix(&self) -> &[usize] { self.plan.count_matrix() }
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 #[derive(Debug,thiserror::Error)]
 #[error("{cause}")]
 pub struct FundedExpertRouteCountFailure {
     #[source]
     cause: ExpertRouteCountCause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl FundedExpertRouteCountFailure {
     pub fn cause(&self) -> ExpertRouteCountCause { self.cause }
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 
 pub(super) fn build(group:CollectiveGroupId, local_rank:usize,

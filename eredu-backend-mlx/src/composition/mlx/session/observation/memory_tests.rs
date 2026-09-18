@@ -141,7 +141,7 @@ impl Recorder {
             batch.source_groups,
         ] {
             self.receive(value)
-                .map_err(eredu_nn::Error::backend_source)?;
+                .map_err(eredu_nn::Error::backend_retained_source)?;
         }
         Ok(())
     }
@@ -208,7 +208,7 @@ impl RoutedUnitObserver<MlxTensor> for Recorder {
         invocation: &RoutedUnitInvocation<'_, MlxTensor>,
     ) -> Result<(), eredu_nn::Error> {
         self.receive(invocation.input)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
     fn observe(&mut self, batch: &RoutedUnitBatch<'_, MlxTensor>) -> Result<(), eredu_nn::Error> {
         self.receive_batch(batch)

@@ -45,6 +45,7 @@ struct TextArraySource {
     // Closed immutable checkpoint shares the actual cumulative source, not its
     // issuance bank or native permission. It survives every independent copy.
     capture: Option<capture::SavedCaptureCheckpoint>,
+    sampling_input: Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan>,
     // Accepted complete host-copy custody permits this paired source to be
     // revalidated after its original sequence bank has moved to the facade.
     host_preparation: Option<eredu_core::HostPreparationAuthority>,
@@ -155,6 +156,7 @@ impl TextArraySource {
             next_prediction: sampling.next_prediction,
             frontier,
             capture: capture.cloned(),
+            sampling_input: quote.saved_sampling_input(),
             host_preparation: host.cloned(),
         })
     }
@@ -553,6 +555,13 @@ pub(in crate::composition::mlx::session) struct CopiedTextSampling {
 }
 
 impl CopiedTextSampling {
+    pub(in crate::composition::mlx::session) fn sampling_state_facts(&self) -> eredu_core::SamplingStateFacts {
+        eredu_core::SamplingStateFacts {
+            temperature: self.temperature,
+            requires_positive_temperature: matches!(self.sampler.as_sampler(), eredu_runtime::ConfiguredTextSampler::MirostatV2(_)),
+            has_rng: self.arrays.key.is_some(),
+        }
+    }
     /// Saved numerical position, independent of absolute prediction ordinal.
     /// This is immutable provenance, never permission to start another request.
     pub(in crate::composition::mlx::session) fn frontier(&self) -> u64 {

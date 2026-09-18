@@ -1,15 +1,15 @@
-//! Explicit construction destination retained by an actual forward owner.
+//! Explicit metadata destination retained by an actual layered operation.
 use eredu_nn::workspace::WorkspaceContext;
 
-/// Loans the existing forward's metadata destination and preserves its typed errors.
+/// Loans an existing metadata destination and preserves its typed errors.
 /// This supplies no tensor, completion, or native submission authority.
 #[derive(Debug)]
-pub struct LayeredForwardMetadata<E> {
+pub struct LayeredMetadata<E> {
     error: fn(eredu_nn::Error) -> E,
     // Retire the destination after every caller control in this wrapper.
     context: WorkspaceContext,
 }
-impl<E> LayeredForwardMetadata<E> {
+impl<E> LayeredMetadata<E> {
     /// Shares the exact existing Context; creates no allowance or new account.
     pub fn new(context: &WorkspaceContext, error: fn(eredu_nn::Error) -> E) -> Self {
         Self {
@@ -19,7 +19,7 @@ impl<E> LayeredForwardMetadata<E> {
     }
 }
 
-pub(super) struct Destination<E>(pub Option<LayeredForwardMetadata<E>>);
+pub(super) struct Destination<E>(pub Option<LayeredMetadata<E>>);
 impl<E> Destination<E> {
     pub fn context(&self) -> Option<&WorkspaceContext> {
         self.0.as_ref().map(|source| &source.context)
@@ -37,6 +37,12 @@ impl<E> Destination<E> {
                 .charge_metadata(std::mem::size_of::<T>())
                 .map_err(|cause| self.map(cause.into())),
             None => Ok(()),
+        }
+    }
+    pub fn text(&self, args: std::fmt::Arguments<'_>) -> Result<String, E> {
+        match self.context() {
+            Some(context) => context.metadata_string(args).map_err(|cause| self.map(cause)),
+            None => Ok(args.to_string()),
         }
     }
     pub fn vector<T>(&self, count: usize) -> Result<Vec<T>, E> {

@@ -58,12 +58,17 @@ impl<const N: usize> Drop for Unit<N> {
     }
 }
 impl<const N: usize> Parameterized<FakeTensor> for Unit<N> {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, FakeTensor>>(&'a self, _: &mut V) {}
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, FakeTensor>>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
+ let mut __source_result = Ok(());
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, FakeTensor>>(&'a mut self, _: &mut V) {}
     fn set_trainable(&mut self, _: bool) {}
 }
 struct Architecture<const N: usize> {
     counts: Vec<usize>,
+    graph: ExecutionGraph,
     fault: Option<Fault>,
     events: Events,
     static_modules: FakeOperator,
@@ -72,6 +77,7 @@ impl<const N: usize> Architecture<N> {
     fn new(counts: &[usize], fault: Option<Fault>, events: &Events) -> Self {
         Self {
             counts: counts.to_vec(),
+            graph: ExecutionGraph::chain((0..counts.len()).map(|group| format!("g{group}"))).unwrap(),
             fault,
             events: events.clone(),
             static_modules: FakeOperator,
@@ -96,17 +102,18 @@ impl<const N: usize> Drop for Architecture<N> {
 }
 impl<const N: usize> ArchitectureParameters<FakeBackend> for Architecture<N> {
     type DefinitionError = Failure;
-    fn state_layout(&self) -> Result<StateLayout, Failure> {
+    fn state_layout(&self, _metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Failure> {
         unreachable!("construction does not realize state")
     }
     fn state_identity(
         &self,
         _: &eredu_runtime::PartitionState,
         _: eredu_core::cache::PromptCacheTopology,
+        _metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Failure> {
         unreachable!("construction does not derive state identity")
     }
-    fn parameter_description(&self, _: &()) -> Result<ArchitectureParameterDescription, Failure> {
+    fn parameter_description(&self, _: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Failure> {
         unreachable!("construction does not traverse parameter descriptions")
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -145,17 +152,17 @@ impl<const N: usize> LayeredArchitecture<FakeBackend, State> for Architecture<N>
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
         unreachable!("construction does not partition state")
     }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Failure> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Failure> {
         self.events.lock().unwrap().push(Event::Graph);
         self.check(Fault::Graph)?;
-        Ok(ExecutionGraph::chain((0..self.counts.len()).map(|group| format!("g{group}"))).unwrap())
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.graph))
     }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Failure> {
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Failure> {
         self.events.lock().unwrap().push(Event::Count(group));
         self.check(Fault::Count(group))?;
         Ok(self.counts[group])
     }
-    fn unit_path(&self, _: usize, _: usize) -> Result<String, Failure> {
+    fn unit_path(&self, _: usize, _: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Failure> {
         unreachable!("construction leaves unit paths to the architecture")
     }
     fn static_modules(&self) -> &FakeOperator {
@@ -252,10 +259,10 @@ struct Reference<const N: usize> {
 fn reference<const N: usize>(architecture: Architecture<N>) -> Result<Reference<N>, Failure> {
     let context = &();
     // The old constructor's graph/count/build/collect body is kept independently.
-    let graph = architecture.execution_graph()?;
+    let graph = architecture.execution_graph()?.into_owned();
     let mut units = Vec::with_capacity(graph.groups().len());
     for group in 0..graph.groups().len() {
-        let count = architecture.group_unit_count(group)?;
+        let count = architecture.group_unit_count(group, None)?;
         units.push(
             (0..count)
                 .map(|index| architecture.build_unit(group, index, context))

@@ -72,8 +72,8 @@ impl ResidencyManager {
                         visitor(RetainedStorageRef::RetainedHost(buffer))
                             .map_err(RetainedStorageVisitFailure::callback)?;
                     }
-                    for array in device.arrays.values() {
-                        visitor(RetainedStorageRef::Array(array))
+                    for array in device.arrays.retained_values() {
+                        visitor(array)
                             .map_err(RetainedStorageVisitFailure::callback)?;
                     }
                 }

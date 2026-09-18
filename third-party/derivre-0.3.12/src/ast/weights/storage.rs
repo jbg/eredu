@@ -48,14 +48,14 @@ impl std::error::Error for PreparedWeightError {
 struct Checked;
 impl Destination for Checked {
     type Error = PreparedWeightError;
-    fn push<T>(to: &mut Vec<T>, value: T) -> Result<(), Self::Error> {
+    fn push<T>(&mut self, to: &mut Vec<T>, value: T) -> Result<(), Self::Error> {
         if to.len() == to.capacity() {
             return Err(Self::Error::Capacity);
         }
         to.push(value);
         Ok(())
     }
-    fn store(cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error> {
+    fn store(&mut self, cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error> {
         *cache.get_mut(index).ok_or(Self::Error::Capacity)? = value;
         Ok(())
     }
@@ -153,8 +153,7 @@ impl Plan<'_> {
     }
     pub(crate) fn prepare(source: &ExprSet) -> Result<Plan<'_>, InitFailure> {
         let (_, nodes, encoded) = source
-            .prepared_extents()
-            .map_err(|_| failure(InitCause::Source))?;
+            .storage_extents();
         let mapped = encoded
             .checked_sub(1)
             .ok_or_else(|| failure(InitCause::Source))?;
@@ -169,8 +168,7 @@ impl Plan<'_> {
             .and_then(|n| nodes.checked_mul(n))
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| failure(InitCause::Overflow))?;
-        // Ordinary cache growth pads the historical last entry by 100; preserve
-        // that entire immutable prefix even when it exceeds the arena slots.
+        // Preserve the actual retained cache prefix, including any spare source rows.
         let slots = nodes.max(source.expr_weight.len());
         let geometry = Geometry {
             nodes,
@@ -265,7 +263,7 @@ impl Parts {
             self.nodes = nodes;
         }
         if cached(&self.cache, root).0 == 0 {
-            compute::<Checked>(&source.exprs, &mut self.cache, &mut self.scratch, root)?;
+            compute(&mut Checked, &source.exprs, &mut self.cache, &mut self.scratch, root)?;
         }
         let result = cached(&self.cache, root);
         self.failed = false;
@@ -316,21 +314,21 @@ mod tests {
     };
     #[test]
     fn owning_weights_preserve_cached_attributes_successors_threshold_and_failed_prefix() {
-        let mut source = ExprSet::new(256);
-        let byte = source.mk_byte(b'a');
-        let other = source.mk_byte(b'b');
-        let selector = source.mk_byte_set_or(&[byte, other]);
-        let repeat = source.mk_repeat(selector, 2, 12);
-        let lookahead = source.mk_lookahead(repeat, 3);
-        let complement = source.mk_not(lookahead);
-        let literal = source.mk_byte_literal(&[b'a'; 64]);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let byte = source.mk_byte(b'a').unwrap();
+        let other = source.mk_byte(b'b').unwrap();
+        let selector = source.mk_byte_set_or(&[byte, other]).unwrap();
+        let repeat = source.mk_repeat(selector, 2, 12).unwrap();
+        let lookahead = source.mk_lookahead(repeat, 3).unwrap();
+        let complement = source.mk_not(lookahead).unwrap();
+        let literal = source.mk_byte_literal(&[b'a'; 64]).unwrap();
         let mut dag = repeat;
         for _ in 0..20 {
-            dag = source.mk(Expr::Concat(ExprFlags::POSITIVE, [dag, dag]));
+            dag = source.mk(Expr::Concat(ExprFlags::POSITIVE, [dag, dag])).unwrap();
         }
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[dag; 128]));
-        let fresh = source.mk_byte(b'z');
-        let last = source.mk_not(fresh);
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[dag; 128])).unwrap();
+        let fresh = source.mk_byte(b'z').unwrap();
+        let last = source.mk_not(fresh).unwrap();
         let roots = [
             repeat,
             lookahead,
@@ -340,10 +338,10 @@ mod tests {
             declaration,
             last,
         ];
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &roots);
-        source.reserve(96);
-        assert!(source.get_weight(repeat) > 0);
-        assert!(source.attr_has_repeat(repeat));
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &roots).unwrap();
+        source.reserve(96).unwrap();
+        assert!(source.get_weight(repeat).unwrap() > 0);
+        assert!(source.attr_has_repeat(repeat).unwrap());
         let historical = source.expr_weight.clone();
         let mut ordinary = source.clone();
         let prepared = source.prepared_source_plan().unwrap().compile().unwrap();
@@ -353,7 +351,7 @@ mod tests {
         assert_eq!(&parts.cache[..historical.len()], historical.as_slice());
         assert_eq!(
             parts.attributes(prepared.source(), repeat).unwrap(),
-            ordinary.get_attrs(repeat)
+            ordinary.get_attrs(repeat).unwrap()
         );
         // A reached destination refusal keeps the successfully computed child
         // cache and exact source. It cannot silently use ordinary cache growth.
@@ -377,22 +375,22 @@ mod tests {
             .compile()
             .unwrap();
         for root in roots {
-            assert_eq!(machine.weight(root).unwrap(), ordinary.get_weight(root));
+            assert_eq!(machine.weight(root).unwrap(), ordinary.get_weight(root).unwrap());
             assert_eq!(
                 machine.has_repeat(root).unwrap(),
-                ordinary.attr_has_repeat(root)
+                ordinary.attr_has_repeat(root).unwrap()
             );
         }
         assert!(machine.weight(dag).unwrap() >= 1_000_000);
         let cost = machine.source().cost();
         let entries = machine.source().len();
-        assert_eq!(machine.weight(dag).unwrap(), ordinary.get_weight(dag));
+        assert_eq!(machine.weight(dag).unwrap(), ordinary.get_weight(dag).unwrap());
         assert_eq!(machine.source().cost(), cost);
         assert_eq!(machine.source().len(), entries);
         let mut derivative = DerivCache::new();
         let next = machine.derivative(literal, b'a').unwrap();
-        assert_eq!(next, derivative.derivative(&mut ordinary, literal, b'a'));
-        assert_eq!(machine.weight(next).unwrap(), ordinary.get_weight(next));
+        assert_eq!(next, derivative.derivative(&mut ordinary, literal, b'a').unwrap());
+        assert_eq!(machine.weight(next).unwrap(), ordinary.get_weight(next).unwrap());
         assert_eq!(machine.source().cost(), ordinary.cost());
         assert_eq!(&machine.source().expr_weight, &historical);
         let cost = machine.source().cost();

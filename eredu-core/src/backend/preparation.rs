@@ -146,6 +146,7 @@ pub(super) fn control_bytes<B: TextGenerationBackend, C: TokenFilterController>(
 // callbacks. Ordinary preparation retains its existing immutable runtime API.
 trait Route<B: TextGenerationBackend, C: TokenFilterController> {
     fn runtime(&self) -> &ModelRuntime<B>;
+    fn restores_terminal(&self) -> bool { false }
     fn requires_control(&self,_input:&Option<TextGenerationInput<B::Prompt>>)->bool { false }
     fn cancellation(&self) -> Option<&crate::GenerationCancellationToken> {
         None
@@ -393,9 +394,11 @@ struct Resume<'r, 's, B: TextResumeBackend> {
     cancellation: &'s crate::GenerationCancellationToken,
     prepared: Option<B::ResumePreparation>,
     host: Option<&'s HostPreparationAuthority>,
-    kind: OriginalTextResumeKind,
+    options: &'s OriginalTextResumeOptions<'s>,
+    displaced: &'s mut Option<B::DisplacedState>,
 }
 impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, '_, B> {
+    fn restores_terminal(&self) -> bool { self.host.is_some() && self.options.terminal }
     fn requires_control(&self,_input:&Option<TextGenerationInput<B::Prompt>>)->bool {
         self.host.is_some() && B::requires_original_preparation_control(self.runtime)
     }
@@ -416,8 +419,11 @@ impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, 
         controller: &C,
         context: &TextStepContext,
     ) -> Result<(), BackendFailure> {
+        if self.options.terminal && config.sampling().max_new_tokens != Some(0) {
+            return Err(crate::PreparedRequestRejection::RequestMismatch.into_backend_failure());
+        }
         if let Some(host)=self.host {
-            *control=match B::prepare_text_resume_control(self.runtime,self.source,config,context,host,self.kind) {
+            *control=match B::prepare_text_resume_control(self.runtime,self.source,config,context,host,self.options) {
                 Ok(source)=>source,
                 Err(error)=>{*control_failed=true;return Err(error);}
             };
@@ -427,14 +433,14 @@ impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, 
             }
         }
         self.prepared = Some(match self.host {
-            Some(host) => B::admit_original_text_resume_with_kind(
+            Some(host) => B::admit_original_text_resume(
                 self.runtime,
                 self.source,
                 config,
                 controller,
                 context,
                 host,
-                self.kind,
+                self.options,
             )?,
             None => B::admit_text_resume(self.runtime, self.source, config, controller, context)?,
         });
@@ -481,9 +487,11 @@ impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, 
         )
     }
     fn finish(&mut self, preparation: &mut Option<B::TextPreparation>) {
-        *preparation = Some(B::finish_text_resume(
+        let (finished, displaced) = B::finish_text_resume(
             self.prepared.as_mut().expect("admitted resume"),
-        ));
+        );
+        *preparation = Some(finished);
+        *self.displaced = Some(displaced);
     }
 }
 
@@ -555,7 +563,8 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         }
         // A zero-output resume is Ready/no-work, not a cancellation vote. The
         // ordinary path deliberately keeps its existing zero-output behavior.
-        if owned.route.cancellation().is_some() && config.sampling().max_new_tokens == Some(0) {
+        if owned.route.cancellation().is_some() && config.sampling().max_new_tokens == Some(0)
+            && !owned.route.restores_terminal() {
             return Ok(Some(false));
         }
         owned
@@ -670,22 +679,25 @@ pub(super) fn prepare_resume<B: TextResumeBackend, C: TokenFilterController>(
     context: &TextStepContext,
     cancellation: &crate::GenerationCancellationToken,
     host: Option<&HostPreparationAuthority>,
-    kind: OriginalTextResumeKind,
-) -> Result<Option<Prepared<B, C>>, PreparationError<B, C>> {
-    run(
+    options: &OriginalTextResumeOptions<'_>,
+) -> Result<Option<(Prepared<B, C>, B::DisplacedState)>, PreparationError<B, C>> {
+    let mut displaced = None;
+    let result = run(
         Resume {
             runtime,
             source,
             cancellation,
             prepared: None,
             host,
-            kind,
+            options,
+            displaced: &mut displaced,
         },
         None,
         config,
         controller,
         context,
-    )
+    )?;
+    Ok(result.map(|machine| (machine, displaced.expect("successful resume displaced state"))))
 }
 
 pub(super) fn resume_control_bytes<B: TextResumeBackend, C: TokenFilterController>() -> Option<usize>
@@ -701,6 +713,8 @@ pub(super) fn resume_control_bytes<B: TextResumeBackend, C: TokenFilterControlle
         size_of::<Result<B::Prompt, PreparationError<B, C>>>(),
         size_of::<Result<B::TextGenerationState, B::Error>>(),
         size_of::<Option<B::ResumePreparation>>(),
+        size_of::<Option<B::DisplacedState>>(),
+        size_of::<(Prepared<B, C>, B::DisplacedState)>(),
     ]
     .into_iter()
     .try_fold(0usize, usize::checked_add)

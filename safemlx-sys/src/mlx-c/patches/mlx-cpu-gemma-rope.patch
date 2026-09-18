@@ -373,7 +373,7 @@ diff --git a/mlx/fast.cpp b/mlx/fast.cpp
 +};
 +} // namespace
 +bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept {
-+  if(rank!=4||!dimensions||(dimensions%2)||!elements||elements>size_t(INT_MAX)||dimensions>elements)return false;
++  if((rank!=3&&rank!=4)||!dimensions||(dimensions%2)||!elements||elements>size_t(INT_MAX)||dimensions>elements)return false;
 +  const size_t parts[]={sizeof(RopeFallback),sizeof(RopeInvFrequencies),sizeof(RopeApply),
 +      sizeof(ArrayVector)*5,sizeof(Shape)*3,sizeof(array)*20,sizeof(StreamOrDevice)*3,sizeof(Stream),
 +      sizeof(std::optional<array>),sizeof(std::optional<float>),sizeof(float)*5,sizeof(int)*7,
@@ -462,7 +462,7 @@ diff --git a/mlx/fast.h b/mlx/fast.h
  #include "mlx/utils.h"
  
  namespace mlx::core::fast {
-+// Pure controls of the same CPU default full-width RoPE fallback.
++// Pure controls of the same rank-three/four full-width CPU RoPE fallback.
 +bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept;
  
  // Pure named-frame census for the existing CPU fallback; no execution authority.

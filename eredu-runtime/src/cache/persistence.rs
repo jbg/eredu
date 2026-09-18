@@ -129,7 +129,7 @@ pub enum LiveCachePublicationError {
 pub struct LiveCacheBlockSource {
     inner: Arc<LiveCacheBlockFile>,
     // Each clone retires its actual file/Arc before the final funding alias.
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 #[derive(Debug)]

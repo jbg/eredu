@@ -3,7 +3,7 @@ use super::{OriginalGrammarTokenParser, OriginalGrammarTokenParserError};
 use crate::runtime::chat::constraints::grammar_source::{
     GrammarTokenizationMode, OriginalGrammarTokenIds, OriginalGrammarTokenizationError,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use llguidance::{ForcedTokenContext, ForcedTokenSelection};
 use std::{
     alloc::Layout,
@@ -18,8 +18,8 @@ enum Cause {
     Overflow,
     #[error("original forced-token destination differs")]
     Capacity,
-    #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Allocation(#[from] TryReserveError),
     #[error(transparent)]
@@ -33,7 +33,7 @@ struct Context {
     encoded: Option<OriginalGrammarTokenIds>,
     parser: Option<OriginalGrammarTokenParser>,
     canonical: Option<bool>,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Forced IDs and prefix bytes retain the actual tokenization, mutable parser,
 /// immutable source and funding until their consumer finishes.
@@ -49,11 +49,7 @@ pub(in crate::runtime::chat::constraints) struct OriginalGrammarForcingError {
     cause: Cause,
     context: Context,
 }
-fn reserve(
-    values: &mut Vec<u8>,
-    total: usize,
-    funding: &WorkspaceMetadataFunding,
-) -> Result<(), Cause> {
+fn reserve(values: &mut Vec<u8>, total: usize, funding: &HostMetadataFunding) -> Result<(), Cause> {
     if total <= values.capacity() {
         return Ok(());
     }
@@ -210,7 +206,7 @@ impl OriginalGrammarForcedTokens {
                 size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarTokenParserError>>(),
                 size_of::<Result<OriginalGrammarTokenParser, OriginalGrammarForcingError>>(),
                 size_of::<Result<OriginalGrammarTokenParser, Cause>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<std::ops::Range<usize>>(),
                 size_of::<(&[u8], Option<u32>)>(),
             ];
@@ -365,7 +361,7 @@ fn prepare_selection(context: &mut Context, for_mask: bool) -> Result<SelectionM
         size_of::<Result<(usize, usize), Cause>>(),
         size_of::<(&mut Context, &mut Option<Cause>, bool)>(),
         size_of::<Result<(), Cause>>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
         size_of::<Result<(), TryReserveError>>(),
         size_of::<Result<Layout, std::alloc::LayoutError>>(),
         size_of::<Layout>(),
@@ -375,7 +371,7 @@ fn prepare_selection(context: &mut Context, for_mask: bool) -> Result<SelectionM
         size_of::<
             Result<(OriginalGrammarTokenParser, usize, usize), OriginalGrammarTokenParserError>,
         >(),
-        size_of::<(&mut Vec<u8>, usize, &WorkspaceMetadataFunding)>(),
+        size_of::<(&mut Vec<u8>, usize, &HostMetadataFunding)>(),
         size_of::<(usize, usize, Option<u32>, bool, bool)>(),
         size_of::<[u32; 1]>(),
     ];

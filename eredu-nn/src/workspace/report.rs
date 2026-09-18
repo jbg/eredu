@@ -356,7 +356,7 @@ impl Lifecycle {
 fn legacy(error: WorkspaceReportError) -> Error {
     match error {
         WorkspaceReportError::Overflow => workspace_overflow("workspace allocation sum overflow"),
-        _ => Error::backend_source(error),
+        _ => Error::backend_retained_source(error),
     }
 }
 impl WorkspaceContext {
@@ -401,7 +401,7 @@ impl WorkspaceContext {
                 drop(prefix);
                 return Err(match cause {
                     ConstructionCause::Layout(e) => legacy(e),
-                    ConstructionCause::Reserve { source, .. } => Error::backend_source(source),
+                    ConstructionCause::Reserve { source, .. } => Error::backend_retained_source(source),
                 });
             }
         };
@@ -480,7 +480,7 @@ impl WorkspaceContext {
             std::mem::size_of::<Result<WorkspaceTraceReport, Error>>(),
             std::mem::size_of::<Option<WorkspaceMetadataEnvelope>>(),
             std::mem::size_of::<Result<WorkspaceReportScalars, Error>>(),
-            Error::retained_source_control_bytes::<ConstructionCause>()
+            Error::retained_source_construction_bytes::<ConstructionCause>()
                 .ok_or(WorkspaceMetadataError::Overflow)?,
         ];
         parts
@@ -520,11 +520,7 @@ impl WorkspaceContext {
         let mut scratch =
             Scratch::<Rc<Storage>>::new(layout, None).map_err(|(prefix, cause)| {
                 drop(prefix);
-                if self.facts.is_some() {
-                    Error::backend_retained_source(cause)
-                } else {
-                    Error::backend_source(cause)
-                }
+                Error::backend_retained_source(cause)
             })?;
         let trace = self.trace.borrow();
         let borrowed = self.borrowed.borrow();

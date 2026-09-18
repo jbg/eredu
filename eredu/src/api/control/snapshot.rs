@@ -1,368 +1,353 @@
 use super::*;
-pub(super) mod host_copy;
-use eredu_runtime::execution_control::{
-    GenerationBoundary, SnapshotBudget, SnapshotTokenController, TextContinuationSnapshot,
-    TextSnapshotBackend,
+use crate::api::{PreparedChatResumeSettings, PreparedChatSnapshot};
+use eredu_runtime::{
+    execution_control::TextSnapshotBackend,
+    working_memory::{OriginalChatBackend, WorkspaceCopyLimits},
 };
+pub(super) mod journal;
+pub(super) use journal::{CaptureJournal, CopiedJournal, RestoreJournal, RestoredJournal};
 
-/// A delivered output prefix. Consumers retain events strictly before
-/// `next_sequence` from this run/epoch when reconciling a restore; the new stream
-/// continues with its current monotone sequence and a new epoch.
+/// Descriptive output boundary. Deserialization conveys no source authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenerationOutputCheckpoint {
-    /// Source logical run.
+pub struct GenerationOutputCheckpointData {
     pub run_id: String,
-    /// Epoch in which the prefix was delivered.
     pub epoch: u64,
-    /// Exclusive end of the delivered prefix in the run's monotone event journal.
     pub next_sequence: u64,
-    /// Next absolute prediction, including the committed inherited prefix.
     pub next_prediction: u64,
 }
-
-/// Versioned metadata for an opaque in-process continuation. Serialized metadata
-/// cannot recreate a snapshot, admission, native handle or compatibility proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenerationSnapshotMetadata {
-    /// Metadata version.
-    pub schema_version: u32,
-    /// Fresh snapshot identity.
-    pub snapshot_id: String,
-    /// Loaded session that owns the executable and prepared sources.
-    pub session_id: String,
-    /// Source artifact attribution, when present on the prepared request.
-    pub artifact_identity: Option<String>,
-    /// Immutable capture admission retained with this continuation.
-    pub capture_plan_id: String,
-    /// Immutable intervention admission retained with this continuation.
-    pub intervention_plan_id: Option<String>,
-    /// Exact immutable tokenizer fingerprint of this run.
-    pub tokenizer_identity: [u8; 32],
-    /// Initial generation policy identity, including text versus semantic mode,
-    /// constraint blueprint, termination, tokenizer and seed. Later choices are retained
-    /// exactly in the opaque saved state and attributed through control records.
-    pub configuration_identity: [u8; 32],
-    /// Prospective canonical choice saved before its ordinary commitment.
-    pub pending_forced_token: Option<u32>,
-    /// Prepared, paused, or normally completed state preserved by restoration.
-    pub status: GenerationStatus,
-    /// Delivered prefix paired with incremental semantic buffers.
-    pub output: GenerationOutputCheckpoint,
-    /// Complete charged logical native/controller/host state, excluding shared
-    /// immutable weights/tokenizer data and allocator overhead.
-    pub retained_bytes: u64,
+/// Independently escaping output checkpoint and its original construction account.
+/// The event sequence remains monotone across epochs. Fields are read-only.
+#[derive(Debug)]
+pub struct GenerationOutputCheckpoint {
+    data: GenerationOutputCheckpointData,
+    _funding: HostMetadataFunding,
 }
-
-/// Reusable deep snapshot of the ordinary native, sampler, constraint, semantic,
-/// termination, pending-input and capture/intervention continuation. It is usable
-/// only with the source logical run and loaded driver; metadata may outlive that
-/// run, but cannot authorize restoration into a new model or process.
-pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend, M: ControlRecordMode = LegacyText> {
-    pub(super) continuation: TextContinuationSnapshot<B, ControlConstraints>,
-    pub(super) cursor: CommittedGenerationCursor,
-    pub(super) pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
-    pub(super) lifecycle: GenerationBoundary,
-    pub(super) metadata: M::SnapshotMetadata,
-    pub(super) info: SnapshotInfo,
-    pub(super) semantic_prefix: Vec<SemanticEvent>,
-    pub(super) prompt: PromptRecord,
-    pub(super) host_preparation: HostPreparationAuthority,
-}
-impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationSnapshot<B, M> {
-    /// Stable metadata with no native handles.
-    pub fn metadata(&self) -> &M::SnapshotMetadata {
-        &self.metadata
+impl std::ops::Deref for GenerationOutputCheckpoint {
+    type Target = GenerationOutputCheckpointData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
     }
-    /// Exact committed canonical prefix, including any terminal special token.
+}
+impl Serialize for GenerationOutputCheckpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.serialize(serializer)
+    }
+}
+impl PartialEq for GenerationOutputCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+impl Eq for GenerationOutputCheckpoint {}
+impl GenerationOutputCheckpoint {
+    pub(super) fn prepare(
+        run_id: &str,
+        epoch: u64,
+        next_sequence: u64,
+        next_prediction: u64,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, RecordConstructionError> {
+        (|| {
+            records::construction::controls(
+                funding,
+                &[
+                    size_of::<Self>(),
+                    size_of::<Result<Self, RecordConstructionError>>(),
+                ],
+            )?;
+            let data = output_data(run_id, epoch, next_sequence, next_prediction, funding)?;
+            Ok(Self {
+                data,
+                _funding: funding.clone(),
+            })
+        })()
+        .map_err(|cause| RecordConstructionError::retain(cause, funding))
+    }
+}
+fn output_data(
+    run_id: &str,
+    epoch: u64,
+    next_sequence: u64,
+    next_prediction: u64,
+    funding: &HostMetadataFunding,
+) -> records::construction::Result<GenerationOutputCheckpointData> {
+    records::construction::controls(funding, &[size_of::<GenerationOutputCheckpointData>()])?;
+    Ok(GenerationOutputCheckpointData {
+        run_id: records::construction::string(run_id, funding)?,
+        epoch,
+        next_sequence,
+        next_prediction,
+    })
+}
+/// One canonical native/cursor/parser snapshot with its original record journal.
+pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend> {
+    pub(super) snapshot: PreparedChatSnapshot<B>,
+    pub(super) journal: CopiedJournal,
+}
+impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B> {
+    pub fn metadata(&self) -> &GenerationSnapshotMetadata {
+        &self.journal.metadata
+    }
     pub fn token_ids(&self) -> &[u32] {
-        self.cursor.token_ids()
+        self.snapshot.token_ids()
+    }
+    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
+        self.journal.prompt.prepared().attribution()
+    }
+    pub fn complete_token_ids(&self) -> Option<&[u32]> {
+        self.prompt_attribution().complete_token_ids()
     }
 }
 
-impl<B: TextGenerationBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
-    /// Current consumer checkpoint; capturing it alone does not save native state.
-    pub fn output_checkpoint(&self) -> GenerationOutputCheckpoint {
-        GenerationOutputCheckpoint {
-            run_id: self.delivery.template.run_id.clone(),
-            epoch: self.delivery.epoch,
-            next_sequence: self.delivery.sequence,
-            next_prediction: self.next_prediction(),
-        }
+pub(super) fn copy_output(
+    source: &GenerationOutputCheckpointData,
+    funding: &HostMetadataFunding,
+) -> Result<GenerationOutputCheckpointData, RecordConstructionError> {
+    output_data(
+        &source.run_id,
+        source.epoch,
+        source.next_sequence,
+        source.next_prediction,
+        funding,
+    )
+    .map_err(|cause| RecordConstructionError::retain(cause, funding))
+}
+
+pub(super) fn copy_info(
+    source: &SnapshotInfo,
+    funding: &HostMetadataFunding,
+) -> Result<SnapshotInfo, RecordConstructionError> {
+    use records::construction::{controls, optional, string};
+    (|| {
+        controls(
+            funding,
+            &[
+                size_of::<SnapshotInfo>(),
+                size_of::<GenerationOutputCheckpointData>(),
+            ],
+        )?;
+        Ok(SnapshotInfo {
+            snapshot_id: string(&source.snapshot_id, funding)?,
+            session_id: string(&source.session_id, funding)?,
+            artifact_identity: optional(&source.artifact_identity, funding)?,
+            capture_plan_id: optional(&source.capture_plan_id, funding)?,
+            intervention_plan_id: optional(&source.intervention_plan_id, funding)?,
+            tokenizer_identity: source.tokenizer_identity,
+            configuration_identity: source.configuration_identity,
+            pending_forced_token: source.pending_forced_token,
+            status: source.status,
+            output: GenerationOutputCheckpointData {
+                run_id: string(&source.output.run_id, funding)?,
+                epoch: source.output.epoch,
+                next_sequence: source.output.next_sequence,
+                next_prediction: source.output.next_prediction,
+            },
+            retained_bytes: source.retained_bytes,
+        })
+    })()
+    .map_err(|cause| RecordConstructionError::retain(cause, funding))
+}
+impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+    /// Copies a consumer checkpoint prospectively under the record producer's account.
+    pub fn output_checkpoint(&self) -> Result<GenerationOutputCheckpoint, RecordConstructionError> {
+        GenerationOutputCheckpoint::prepare(
+            &self.delivery.template.run_id,
+            self.delivery.epoch,
+            self.delivery.sequence,
+            self.next_prediction(),
+            &self.delivery.funding,
+        )
     }
-    /// Non-rewindable resource consumption, absent until limits are configured.
     pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
         self.snapshot_budget.as_ref().map(SnapshotBudget::usage)
     }
-}
-
-impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
-    /// Fresh destination admission precedes even facade metadata copies. The
-    /// neutral driver independently admits its own copies; retaining an existing
-    /// source token here cannot bypass that check.
-    pub(super) fn acquire_snapshot_host(
-        &self,
-    ) -> Result<HostPreparationAuthority, ControlledGenerationError> {
-        B::acquire_host_preparation(self.driver.runtime()).map_err(|error| {
-            eredu_runtime::execution_control::TextSnapshotError::<BackendFailure>::HostPreparation(
-                error.with_operation("prepare controlled host copy"),
-            )
-            .into()
-        })
-    }
-
-    pub(super) fn snapshot_result<T>(
-        &mut self,
-        result: Result<T, ControlledGenerationError>,
-    ) -> Result<T, ControlledGenerationError> {
-        if matches!(
-            &result,
-            Err(ControlledGenerationError::Snapshot(
-                eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(_)
-            ))
-        ) && !matches!(
-            B::estimate_native_text_state(self.driver.runtime(), None),
-            Ok(Some(_))
-        ) {
-            // Preserve known, safely completed copy failures. An unresolved or
-            // poisoned native owner must not leave a resumable facade lifecycle.
-            self.lifecycle.fail();
-        }
-        result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
-    }
-    /// Configures resource limits exactly once. Unknown required native, grammar,
-    /// or semantic storage fails explicitly before copying. Limits remain outside
-    /// snapshots and cannot be reset by pause, restore or repeated configuration.
-    pub fn enable_snapshots(
-        &mut self,
-        limits: SnapshotLimits,
-    ) -> Result<(), ControlledGenerationError> {
-        let host = self.host_preparation.clone();
-        self.enable_snapshots_retained_inner(limits)
-            .map_err(|error| M::retain_error(error, host))
-    }
-
-    fn enable_snapshots_retained_inner(
-        &mut self,
-        limits: SnapshotLimits,
-    ) -> Result<(), ControlledGenerationError> {
-        self.lifecycle.checkpoint()?;
-        if self.snapshot_budget.is_some() {
-            return Err(
-                CaptureError::Invalid("snapshot limits are already configured".into()).into(),
-            );
-        }
-        if let ControlSupport::Unsupported { reason } =
-            B::native_text_state_support(self.driver.runtime())
-        {
-            return Err(CaptureError::Unsupported(reason).into());
-        }
-        if self.state.controller().snapshot_storage_bytes().is_none() {
-            return Err(CaptureError::Unsupported(
-                "complete active grammar storage estimate is unavailable".into(),
-            )
-            .into());
-        }
-        self.semantic_snapshot_bytes()
-            .ok_or(ExecutionControlError::UnknownEstimate)?;
-        let boundary = self.state.boundary(&mut self.driver)?;
-        let (runtime, state, pending) = boundary.parts();
-        B::estimate_native_text_state(runtime, None)
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
-            .ok_or(ExecutionControlError::UnknownEstimate)?;
-        B::estimate_sampling_state(runtime, B::sampling_state(state))
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
-            .ok_or(ExecutionControlError::UnknownEstimate)?;
-        B::estimate_pending_input(runtime, pending)
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
-            .ok_or(ExecutionControlError::UnknownEstimate)?;
-        drop(boundary);
-        self.snapshot_budget = Some(SnapshotBudget::new(limits));
-        Ok(())
-    }
-
     pub(super) fn require_snapshot_budget(
         &self,
     ) -> Result<SnapshotBudget, ControlledGenerationError> {
-        self.snapshot_budget.clone().ok_or_else(|| {
-            CaptureError::Invalid("configure snapshot limits before retaining state".into()).into()
-        })
+        self.snapshot_budget
+            .clone()
+            .ok_or(ControlledGenerationError::Rejected(
+                "snapshot limits have not been admitted",
+            ))
     }
-
-    /// Captures the initial, paused or normally completed boundary. No prompt
-    /// replay, RNG draw, semantic finalization or admission reset occurs.
+}
+impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+    /// Admits the nonrefundable snapshot budget once, with explicit original host
+    /// and native destination capacities. Copy providers recheck exact geometry.
+    pub fn enable_snapshots(
+        &mut self,
+        limits: SnapshotLimits,
+        host_capacity: u64,
+        native: WorkspaceCopyLimits,
+    ) -> Result<(), ControlledGenerationError>
+    where
+        B: OriginalChatBackend
+            + TextResumeBackend<
+                ResumeSource = B::SavedTextComponents,
+                DisplacedState = <B as NativeTextStateBackend>::NativeTextState,
+            >,
+    {
+        self.require_live_control()?;
+        if self.snapshot_budget.is_some() {
+            return Err(ControlledGenerationError::Rejected(
+                "snapshot limits are already configured",
+            ));
+        }
+        self.active_mut()?.snapshot_estimate(host_capacity)?;
+        let budget = SnapshotBudget::prepare(limits, &self.delivery.funding).map_err(|cause| {
+            RecordConstructionError::retain(cause.into(), &self.delivery.funding)
+        })?;
+        self.snapshot_budget = Some(budget);
+        self.snapshot_host_capacity = host_capacity;
+        self.native_copy_limits = native;
+        self.capabilities.snapshot = ControlSupport::Supported;
+        self.capabilities.restore = ControlSupport::Supported;
+        self.capabilities.fork = ControlSupport::Supported;
+        self.capabilities.isolation = Some(SnapshotIsolation::DeepCopy);
+        Ok(())
+    }
     pub fn snapshot(
         &mut self,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B, M>, ControlledGenerationError> {
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.snapshot_inner(emit))) {
-            Ok(result) => self.snapshot_result(result),
+            Ok(result) => result,
             Err(payload) => {
-                self.lifecycle.fail();
+                self.failed = true;
                 std::panic::resume_unwind(payload)
             }
         }
     }
-
     fn snapshot_inner(
         &mut self,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B, M>, ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
-            return Err(
-                CaptureError::Invalid("cancelled generation cannot be snapshotted".into()).into(),
-            );
-        }
-        let lifecycle = self.lifecycle.checkpoint()?;
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
+        self.require_live_control()?;
+        records::construction::controls(
+            &self.delivery.funding,
+            &[
+                size_of::<CaptureJournal<'_, B>>(),
+                size_of::<CopiedJournal>(),
+                size_of::<ControlledGenerationSnapshot<B>>(),
+                size_of::<Result<ControlledGenerationSnapshot<B>, ControlledGenerationError>>(),
+            ],
+        )
+        .map_err(|cause| RecordConstructionError::retain(cause, &self.delivery.funding))?;
         let budget = self.require_snapshot_budget()?;
-        let host_preparation = HostPreparationAuthority::retain((
-            self.host_preparation.clone(),
-            self.acquire_snapshot_host()?,
-        ));
-        let host = host_copy::CaptureHost::<M>::new::<B>(
-            &self.pipeline,
-            &self.cursor,
+        let session = self.session.as_mut().expect("validated live session");
+        let journal = CaptureJournal::<B>::new(
             &self.delivery,
             self.tokenizer_identity,
-            self.pending_forced_token(),
-            self.status(),
-            self.next_prediction(),
+            session.pending_forced_token(),
+            session.status(),
+            session.next_prediction(),
         );
-        let (continuation, host) = TextContinuationSnapshot::capture_host(
-            &mut self.state.boundary(&mut self.driver)?,
+        let (snapshot, mut journal) = session.snapshot_with_host(
             &budget,
-            host,
-        )
-        .map_err(provider_snapshot_error::<B>)?;
-        let snapshot = ControlledGenerationSnapshot {
-            continuation,
-            pipeline: host.pipeline,
-            cursor: host.cursor,
-            lifecycle,
-            metadata: host.metadata,
-            info: host.info,
-            semantic_prefix: host.semantic_prefix,
-            prompt: host.prompt,
-            host_preparation,
-        };
-        let max_predictions = snapshot.cursor.max_predictions();
-        self.branch_growth_known = matches!(
-            B::text_sampling_control_support(self.driver.runtime()),
-            ControlSupport::Supported
-        ) && snapshot
-            .pipeline
-            .continuation_storage_bytes(max_predictions)
-            .is_some()
-            && snapshot
-                .continuation
-                .controller()
-                .inner()
-                .continuation_storage_bytes(max_predictions)
-                .is_some()
-            && snapshot
-                .continuation
-                .native_continuation_growth(self.driver.runtime(), max_predictions)
-                .is_ok();
+            self.snapshot_host_capacity,
+            self.native_copy_limits,
+            journal,
+        )?;
+        journal.metadata.retain_destination(
+            snapshot.host_preparation().clone(),
+            snapshot.storage_reservation().clone(),
+        );
+        let record = copy_info(&journal.info, &self.delivery.funding)?;
         self.delivery.send(
-            ControlEvent::SnapshotCreated {
-                metadata: snapshot.info.clone(),
-            },
+            ControlEvent::SnapshotCreated { metadata: record },
             &mut emit,
         );
         self.delivery_result()?;
-        Ok(snapshot)
+        Ok(ControlledGenerationSnapshot { snapshot, journal })
     }
-
-    /// Restores the same run from a reusable complete snapshot. Sequence, epoch,
-    /// capture consumption, transport and copy accounting never rewind. Consumers
-    /// reconcile to the `Restored` prefix; old text/tokens are not delivered again.
-    /// A normally completed snapshot remains terminal. Cancellation/failure cannot
-    /// be revived by restoration.
+}
+impl<B> ControlledGenerationSession<'_, B>
+where
+    B: OriginalChatBackend
+        + TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = <B as TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as NativeTextStateBackend>::NativeTextState,
+        >,
+{
+    /// Reinstalls the canonical saved boundary and copied journal. Transport and
+    /// copy consumption are cumulative; terminal snapshots remain terminal.
     pub fn restore(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B, M>,
-        emit: impl FnMut(M::Record) -> ControlFlow<()>,
+        snapshot: &ControlledGenerationSnapshot<B>,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.restore_inner(snapshot, emit)
         })) {
-            Ok(result) => self.snapshot_result(result),
+            Ok(result) => result,
             Err(payload) => {
-                self.lifecycle.fail();
+                self.failed = true;
                 std::panic::resume_unwind(payload)
             }
         }
     }
-
     fn restore_inner(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B, M>,
-        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
+        snapshot: &ControlledGenerationSnapshot<B>,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
-            return Err(
-                CaptureError::Invalid("cancelled generation cannot be restored".into()).into(),
-            );
-        }
-        self.lifecycle.validate_restore()?;
-        if snapshot.info.output.run_id != self.delivery.template.run_id
-            || snapshot.info.session_id != self.delivery.template.session_id
-            || snapshot.info.tokenizer_identity != self.tokenizer_identity
-            || snapshot.info.configuration_identity != self.delivery.configuration_identity
+        self.require_live_control()?;
+        self.require_snapshot_budget()?;
+        let info = &snapshot.journal.info;
+        if info.output.run_id != self.delivery.template.run_id
+            || info.session_id != self.delivery.template.session_id
+            || info.tokenizer_identity != self.tokenizer_identity
+            || info.configuration_identity != self.delivery.configuration_identity
         {
-            return Err(eredu_runtime::execution_control::TextSnapshotError::<
-                eredu_core::BackendFailure,
-            >::IncompatibleRun
-                .into());
+            return Err(ControlledGenerationError::Rejected(
+                "snapshot belongs to a different recorded run",
+            ));
         }
-        let budget = self.require_snapshot_budget()?;
-        let host_preparation = HostPreparationAuthority::retain((
-            self.host_preparation.clone(),
-            snapshot.host_preparation.clone(),
-            self.acquire_snapshot_host()?,
-        ));
-        let host = snapshot
-            .continuation
-            .restore_host(
-                &mut self.state.boundary(&mut self.driver)?,
-                &budget,
-                host_copy::RestoreHost { snapshot },
-            )
-            .map_err(provider_snapshot_error::<B>)?;
-        // Install custody first so an old payload destructor unwinding cannot
-        // leave a partially installed destination without its authority.
-        self.host_preparation = host_preparation;
-        self.pipeline = host.pipeline;
-        self.cursor = host.cursor;
-        self.delivery.semantic_prefix = host.semantic_prefix;
-        self.delivery.prompt = host.prompt;
-        // Validated before native installation, with no intervening transition.
-        self.lifecycle
-            .restore(&snapshot.lifecycle)
-            .expect("validated lifecycle restore");
-        self.delivery.epoch = self.lifecycle.epoch();
-        self.delivery.prediction = self.next_prediction();
-        self.delivery.send(
-            ObservedGenerationEvent::Restored {
-                snapshot_id: snapshot.info.snapshot_id.clone(),
-                output: snapshot.info.output.clone(),
+        let next_epoch = self
+            .delivery
+            .epoch
+            .checked_add(1)
+            .ok_or(ExecutionControlError::Overflow)?;
+        let event = (|| {
+            let snapshot_id =
+                records::construction::string(&info.snapshot_id, &self.delivery.funding).map_err(
+                    |cause| RecordConstructionError::retain(cause, &self.delivery.funding),
+                )?;
+            let output = copy_output(&info.output, &self.delivery.funding)?;
+            Ok::<_, ControlledGenerationError>(ObservedGenerationEvent::Restored {
+                snapshot_id,
+                output,
+            })
+        })()?;
+        let cancellation = self.delivery.control.cancellation().clone();
+        let capacity = self.snapshot_host_capacity;
+        let Some(copied) = self.active_mut()?.restore_with_host(
+            &snapshot.snapshot,
+            PreparedChatResumeSettings::default(),
+            capacity,
+            &cancellation,
+            RestoreJournal {
+                semantic_prefix: &snapshot.journal.semantic_prefix,
+                prompt: &snapshot.journal.prompt,
             },
-            &mut emit,
-        );
+        )?
+        else {
+            return Ok(());
+        };
+        let RestoredJournal {
+            semantic_prefix,
+            prompt,
+            destination,
+        } = copied;
+        // Replace the prior payloads before retiring their old destination.
+        self.delivery.semantic_prefix = semantic_prefix;
+        self.delivery.prompt = prompt;
+        self.journal_destination = Some(destination);
+        self.delivery.epoch = next_epoch;
+        self.delivery.prediction = self.next_prediction();
+        self.delivery.timing = self.active()?.timing();
+        self.delivery.send(event, &mut emit);
         self.delivery_result()
-    }
-}
-
-impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B, LegacyText> {
-    /// Exact immutable complete canonical prompt, as in the V1 API.
-    pub fn prompt_token_ids(&self) -> &[u32] {
-        self.prompt.tokens()
-    }
-}
-impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B, PreparedInputV2> {
-    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
-        self.prompt.prepared().attribution()
-    }
-    pub fn complete_token_ids(&self) -> Option<&[u32]> {
-        self.prompt_attribution().complete_token_ids()
     }
 }

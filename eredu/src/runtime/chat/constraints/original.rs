@@ -1,16 +1,19 @@
 //! Shared prepared-plan selection into actual originally funded controllers.
 use super::{
-    ConstraintController, GenerationRuntimePlan, OriginalPreparedGrammarController,
     forbidden::ForbiddenSourceError,
     grammar_source::{OriginalGrammarStartupError, OriginalPreparedGrammarControllerError},
     selection::{self, Selection},
+    ConstraintController, GenerationRuntimePlan, OriginalPreparedGrammarController,
 };
 use eredu_core::{
-    SharedControllerBytes, SharedTokenFilter, SpeculativeTokenFilterController,
     speculative::{PreparedGrammarController, PreparedGrammarInstallError},
+    SharedControllerBytes, SharedTokenFilter, SpeculativeTokenFilterController,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
-use eredu_runtime::working_memory::{OriginalChatBackend, OriginalSemanticControllerSource};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
+use eredu_runtime::working_memory::{
+    OriginalChatBackend, OriginalControllerCompilation, OriginalSemanticControllerSource,
+    OriginalTokenizer,
+};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +21,7 @@ enum Control {
     #[error("original semantic controller startup extent overflow")]
     Overflow,
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -40,12 +43,16 @@ pub(crate) struct OriginalControllerSourceError {
     failure: Option<Box<Option<Cause>>>,
     control: Option<Control>,
     source: SharedControllerBytes,
-    funding: WorkspaceMetadataFunding,
+    compilation: OriginalControllerCompilation,
+    funding: HostMetadataFunding,
 }
 impl OriginalControllerSourceError {
     fn source_cause(&self) -> &(dyn std::error::Error + 'static) {
         match self.failure.as_ref() {
-            Some(failure) => failure.as_ref().as_ref().expect("failed controller startup"),
+            Some(failure) => failure
+                .as_ref()
+                .as_ref()
+                .expect("failed controller startup"),
             None => self.control.as_ref().expect("refused startup controls"),
         }
     }
@@ -56,7 +63,9 @@ impl std::fmt::Display for OriginalControllerSourceError {
     }
 }
 impl std::error::Error for OriginalControllerSourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source_cause()) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source_cause())
+    }
 }
 impl ConstraintController {
     /// The ordinary selector chooses the actual retained controller source.
@@ -64,11 +73,40 @@ impl ConstraintController {
     #[inline(never)]
     pub(crate) fn from_original_generation_plan<B: OriginalChatBackend>(
         runtime: &eredu_core::ModelRuntime<B>,
+        tokenizer: &OriginalTokenizer,
         plan: &GenerationRuntimePlan,
+        compilation: &OriginalControllerCompilation,
         validity: SharedTokenFilter,
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalControllerSourceError> {
+        Self::from_original_generation_plan_with(
+            plan,
+            compilation,
+            validity,
+            capacity,
+            funding,
+            |validity| {
+                Self::from_original_forbidden_generation_plan::<B>(
+                    runtime, tokenizer, plan, validity, capacity, funding,
+                )
+            },
+        )
+    }
+
+    /// Shared controller construction, with only the exact tokenizer source
+    /// compiler supplied by its enclosing runtime (or neutral test source).
+    pub(super) fn from_original_generation_plan_with<F>(
+        plan: &GenerationRuntimePlan,
+        compilation: &OriginalControllerCompilation,
+        validity: SharedTokenFilter,
+        capacity: usize,
+        funding: &HostMetadataFunding,
+        forbidden: F,
+    ) -> Result<Self, OriginalControllerSourceError>
+    where
+        F: FnOnce(SharedTokenFilter) -> Result<Self, ForbiddenSourceError>,
+    {
         let controls = (|| -> Result<(), Control> {
             let parts = [
                 Selection::control_bytes().ok_or(Control::Overflow)?,
@@ -82,36 +120,64 @@ impl ConstraintController {
                 size_of::<OriginalControllerSourceError>(),
                 size_of::<Self>(),
                 size_of::<SharedControllerBytes>(),
-                size_of::<WorkspaceMetadataFunding>(),
+                size_of::<HostMetadataFunding>(),
                 size_of::<Result<Self, Cause>>(),
                 size_of::<Result<Self, OriginalControllerSourceError>>(),
                 size_of::<Result<(), Control>>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<Result<Self, ForbiddenSourceError>>(),
-                size_of::<Result<super::grammar_source::OriginalGrammarState, OriginalGrammarStartupError>>(),
-                size_of::<Result<OriginalPreparedGrammarController, OriginalPreparedGrammarControllerError>>(),
-                size_of::<Result<Self, PreparedGrammarInstallError<OriginalPreparedGrammarController>>>(),
-                size_of::<(&eredu_core::ModelRuntime<B>, &GenerationRuntimePlan,
-                    SharedTokenFilter, usize, &WorkspaceMetadataFunding)>(),
+                size_of::<
+                    Result<
+                        super::grammar_source::OriginalGrammarState,
+                        OriginalGrammarStartupError,
+                    >,
+                >(),
+                size_of::<
+                    Result<
+                        OriginalPreparedGrammarController,
+                        OriginalPreparedGrammarControllerError,
+                    >,
+                >(),
+                size_of::<
+                    Result<Self, PreparedGrammarInstallError<OriginalPreparedGrammarController>>,
+                >(),
+                size_of::<(
+                    F,
+                    &GenerationRuntimePlan,
+                    &OriginalControllerCompilation,
+                    SharedTokenFilter,
+                    usize,
+                    &HostMetadataFunding,
+                )>(),
             ];
-            funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(Control::Overflow)?)?;
+            funding.reserve_metadata(
+                parts
+                    .into_iter()
+                    .try_fold(size_of_val(&parts), usize::checked_add)
+                    .ok_or(Control::Overflow)?,
+            )?;
             Ok(())
         })();
         if let Err(control) = controls {
             return Err(OriginalControllerSourceError {
-                failure: None, control: Some(control),
-                source: plan.generation_constraint().inner.recipe.source().clone(), funding: funding.clone(),
+                failure: None,
+                control: Some(control),
+                source: plan.generation_constraint().inner.recipe.source().clone(),
+                compilation: compilation.clone(),
+                funding: funding.clone(),
             });
         }
         let mut failure = Box::new(None);
-        match construct::<B>(runtime, plan, validity, capacity, funding) {
+        match construct(plan, compilation, validity, capacity, funding, forbidden) {
             Ok(controller) => Ok(controller),
             Err(cause) => {
                 *failure = Some(cause);
                 Err(OriginalControllerSourceError {
-                    failure: Some(failure), control: None,
-                    source: plan.generation_constraint().inner.recipe.source().clone(), funding: funding.clone(),
+                    failure: Some(failure),
+                    control: None,
+                    source: plan.generation_constraint().inner.recipe.source().clone(),
+                    compilation: compilation.clone(),
+                    funding: funding.clone(),
                 })
             }
         }
@@ -126,23 +192,38 @@ impl ConstraintController {
     }
 }
 #[inline(never)]
-fn construct<B: OriginalChatBackend>(
-    runtime: &eredu_core::ModelRuntime<B>, plan: &GenerationRuntimePlan,
-    validity: SharedTokenFilter, capacity: usize, funding: &WorkspaceMetadataFunding,
-) -> Result<ConstraintController, Cause> {
+fn construct<F>(
+    plan: &GenerationRuntimePlan,
+    compilation: &OriginalControllerCompilation,
+    validity: SharedTokenFilter,
+    capacity: usize,
+    funding: &HostMetadataFunding,
+    forbidden: F,
+) -> Result<ConstraintController, Cause>
+where
+    F: FnOnce(SharedTokenFilter) -> Result<ConstraintController, ForbiddenSourceError>,
+{
     match Selection::from_plan(plan)? {
-        Selection::Forbidden(_) => Ok(ConstraintController::from_original_forbidden_generation_plan::<B>(
-            runtime, plan, validity, capacity, funding,
-        )?),
+        Selection::Forbidden(_) => Ok(forbidden(validity)?),
         Selection::Active => {
-            let state = plan.generation_constraint().inner.original_grammar_state::<B>(runtime, funding)?;
+            let state = plan
+                .generation_constraint()
+                .inner
+                .original_grammar_state(compilation, funding)?;
             let grammar = state.into_controller(capacity, validity)?;
-            Ok(ConstraintController::from_prepared_grammar(grammar, funding)?)
+            Ok(ConstraintController::from_prepared_grammar(
+                grammar, funding,
+            )?)
         }
         Selection::Auto(_) => {
-            let state = plan.generation_constraint().inner.original_grammar_state::<B>(runtime, funding)?;
+            let state = plan
+                .generation_constraint()
+                .inner
+                .original_grammar_state(compilation, funding)?;
             let grammar = state.into_auto_controller(capacity, validity)?;
-            Ok(ConstraintController::from_prepared_grammar(grammar, funding)?)
+            Ok(ConstraintController::from_prepared_grammar(
+                grammar, funding,
+            )?)
         }
     }
 }

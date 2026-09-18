@@ -54,6 +54,7 @@ pub(crate) struct ExpertLocalQuote {
     pub(crate) kernels: usize,
     pub(crate) empty: SpeculativeNumericalRecipe,
     pub(crate) selected: Option<SpeculativeNumericalRecipe>,
+    pub(crate) addressable: Option<AddressableQuoteRef>,
     pub(crate) mechanism: ResidentExecutionMechanisms,
     observation: Option<ExpertLocalObservationSource>,
     pub(crate) capture_publications: usize,
@@ -62,16 +63,16 @@ pub(crate) struct ExpertLocalQuote {
 }
 impl ExpertLocalQuote {
     pub(crate) fn prepare(source: &OriginalParallelSource, operation: WorkspaceOperationView<'_>,
-        mechanism: ResidentExecutionMechanisms) -> Result<Self, Error> {
+        mechanism: ResidentExecutionMechanisms, addressable: Option<&AddressableSources>) -> Result<Self, Error> {
         let observation=match operation.kind {
             WorkspaceOperationKindView::ExpertRegion(region)=>region.observation().map(|value|
                 ExpertLocalObservationSource::from_descriptor(value).ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)).transpose()?,
             _=>None,
         };
-        Self::prepare_with_observation(source,operation,mechanism,observation)
+        Self::prepare_with_observation(source,operation,mechanism,observation,addressable)
     }
     pub(crate) fn prepare_with_observation(source:&OriginalParallelSource,operation:WorkspaceOperationView<'_>,
-        mechanism:ResidentExecutionMechanisms,observation:Option<ExpertLocalObservationSource>)->Result<Self,Error>{
+        mechanism:ResidentExecutionMechanisms,observation:Option<ExpertLocalObservationSource>,addressable:Option<&AddressableSources>)->Result<Self,Error>{
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, source.funding().clone())?;
         context.charge_metadata(size_of::<(Self, WorkspaceContext, Result<Self, Error>,
             WorkspaceExpertRegionView<'_>, BoundaryStageCapacity, [Option<SpeculativeNumericalRecipe>; 2])>())?;
@@ -102,6 +103,10 @@ impl ExpertLocalQuote {
             if maximum_rows == 0 { for value in values { outputs.push(value.layout().clone()); } }
             Ok(())
         })?;
+        let addressable = match view.addressable {
+            Some(_) => Some(addressable.ok_or_else(invalid)?.local_quote(operation)?),
+            None => None,
+        };
         let mut selected = None;
         let runtime = source.agreement_inputs().ok_or_else(invalid)?.runtime();
         let mut capacity = boundary::capacity(empty, runtime, &context)?;
@@ -112,6 +117,19 @@ impl ExpertLocalQuote {
         context.charge_metadata(std::mem::size_of_val(&candidates)
             .checked_add(size_of::<Option<usize>>()).ok_or_else(invalid)?)?;
         let mut capture_publications=0;
+        if let Some(local) = &addressable {
+            let recipe = local.local_numerical().ok_or_else(invalid)?;
+            let native = local.native_capacity();
+            capacity.graph = capacity.graph.max(native.graph);
+            capacity.records = capacity.records.max(native.records);
+            capacity.backing = capacity.backing.max(native.backing);
+            maximum_births = maximum_births.max(recipe.storage.maximum_births());
+            controls = controls.max(recipe.controls);
+            kernels = kernels.max(recipe.kernels);
+            capture_publications = capture_publications.max(local.publications());
+            outputs.extend(local.outputs.iter().cloned());
+            selected = Some(recipe);
+        } else {
         for rows in candidates {
             if let Some(observation)=observation {
                 capture_publications=capture_publications.max(observation.publications(declaration.kernel(),rows,mechanism)?);
@@ -129,8 +147,9 @@ impl ExpertLocalQuote {
             controls = controls.max(recipe.controls);
             kernels = kernels.max(recipe.kernels);
         }
+        }
         let mut value = Self { declaration, inputs, outputs, movement: None, transport:None, aggregate:None, counts:None, provider:None, maximum_rows, capacity, maximum_births,
-            controls, kernels, empty, selected, mechanism, observation, capture_publications, observation_descriptor, source: source.clone() };
+            controls, kernels, empty, selected, addressable, mechanism, observation, capture_publications, observation_descriptor, source: source.clone() };
         value.movement = Some(ExpertMovementQuote::prepare(&value)?);
         value.transport = Some(ExpertTransportQuote::prepare(&value)?);
         value.counts = Some(ExpertCountQuote::prepare(&value)?);
@@ -154,7 +173,7 @@ impl ExpertLocalQuote {
         context.charge_metadata(size_of::<(usize, SpeculativeNumericalRecipe, BoundaryStageCapacity,
             Result<SpeculativeNumericalRecipe, Error>)>())?;
         let invalid = || context.metadata_error(format_args!("completed expert rows exceed their retained child source"));
-        if rows > self.maximum_rows || native.len().checked_add(1) != Some(self.inputs.len()) { return Err(invalid()); }
+        if (self.addressable.is_some() && rows != 0) || rows > self.maximum_rows || native.len().checked_add(1) != Some(self.inputs.len()) { return Err(invalid()); }
         let mut projection = ExistingArrayProjection::with_source_count(&context, native.len())
             .map_err(|cause| context.metadata_source(cause))?;
         let mut actual = context.metadata_vec(self.inputs.len())?;
@@ -177,11 +196,11 @@ impl ExpertLocalQuote {
     }
 }
 fn local_trace(declaration: &WorkspaceExpertRegion, source: &[WorkspaceLayout], rows: usize,
-    mechanism: ResidentExecutionMechanisms, funding: &WorkspaceMetadataFunding) -> Result<SpeculativeNumericalRecipe, Error> {
+    mechanism: ResidentExecutionMechanisms, funding: &HostMetadataFunding) -> Result<SpeculativeNumericalRecipe, Error> {
     local_trace_with_outputs(declaration, source, rows, mechanism, funding, None, |_| Ok(()))
 }
 fn local_trace_with_outputs<F>(declaration: &WorkspaceExpertRegion, source: &[WorkspaceLayout], rows: usize,
-    mechanism: ResidentExecutionMechanisms, funding: &WorkspaceMetadataFunding, observation:Option<ExpertLocalObservationSource>, outputs: F) -> Result<SpeculativeNumericalRecipe, Error>
+    mechanism: ResidentExecutionMechanisms, funding: &HostMetadataFunding, observation:Option<ExpertLocalObservationSource>, outputs: F) -> Result<SpeculativeNumericalRecipe, Error>
 where F: FnOnce(&[WorkspaceTensor])->Result<(),Error> {
     let observe_outputs = outputs;
     let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
@@ -231,3 +250,5 @@ where F: FnOnce(&[WorkspaceTensor])->Result<(),Error> {
 #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 #[path = "expert_region/census_tests.rs"]
 mod census_tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

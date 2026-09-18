@@ -149,6 +149,10 @@ pub struct WorkspaceExpertRegionView<'a> {
     pub owner_local: &'a [usize],
     pub kernel: WorkspaceExpertKernel<'a>,
     pub tensor_partitions: Option<usize>,
+    /// Exact independently cached local provider, when selected by construction.
+    /// Rows describe the finite received-row ceiling; local calls use the same
+    /// chunk width with their actual completed row count.
+    pub addressable: Option<super::WorkspaceAddressableRegionView<'a>>,
     /// Exact provider votes, in tensor/expert/pipeline-wave order.
     pub provider_tensor_group: Option<eredu_core::CollectiveGroupId>,
     pub provider_wave_group: Option<eredu_core::CollectiveGroupId>,
@@ -177,6 +181,16 @@ impl WorkspaceExpertRegionView<'_> {
             || input <= 0 || output <= 0 || self.tensor_partitions == Some(0) {
             return Err(WorkspaceMetadataError::Unqualified);
         }
+        if let Some(addressable) = self.addressable {
+            addressable.validate()?;
+            if addressable.bank != self.bank || addressable.unit != self.unit
+                || addressable.prefill != self.prefill || addressable.kernel != self.kernel
+                || addressable.tensor_partitions != self.tensor_partitions
+                || addressable.chunks.routes != 1
+                || Some(addressable.chunks.rows) != self.maximum_received_rows() {
+                return Err(WorkspaceMetadataError::Unqualified);
+            }
+        }
         self.movement.children().ok_or(WorkspaceMetadataError::Overflow)?;
         self.movement.parent_completions().ok_or(WorkspaceMetadataError::Overflow)?;
         let selected = self.selected_rows().ok_or(WorkspaceMetadataError::Overflow)?;
@@ -187,7 +201,9 @@ impl WorkspaceExpertRegionView<'_> {
     pub fn retain(self, context: &WorkspaceContext) -> Result<WorkspaceExpertRegion, Error> {
         let frames = [size_of::<Self>(), size_of::<WorkspaceExpertRegion>(),
             size_of::<Result<WorkspaceExpertRegion, Error>>(), size_of::<[Vec<usize>; 2]>(),
-            size_of::<WorkspaceGroupedBank>(), size_of::<(usize, usize, Option<usize>)>()];
+            size_of::<WorkspaceGroupedBank>(), size_of::<(usize, usize, Option<usize>)>(),
+            size_of::<(Option<super::WorkspaceAddressableRegion>, Result<Option<super::WorkspaceAddressableRegion>, Error>,
+                super::WorkspaceAddressableRegionView<'_>, Result<super::WorkspaceAddressableRegion, Error>)>()];
         context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
             .ok_or(WorkspaceMetadataError::Overflow)?)?;
         self.validate()?;
@@ -199,6 +215,7 @@ impl WorkspaceExpertRegionView<'_> {
             bank: self.bank, unit: self.unit, prefill: self.prefill, group: self.group,
             rank: self.rank, peers: self.peers, source_rows: self.source_rows,
             routes_per_row: self.routes_per_row, owners, owner_local,
+            addressable: self.addressable.map(|value| value.retain(context)).transpose()?,
             observation: None, kernel: self.kernel.retain(context)?, tensor_partitions: self.tensor_partitions, provider_tensor_group:self.provider_tensor_group, provider_wave_group:self.provider_wave_group, movement: self.movement, transfers: self.transfers,
         })
     }
@@ -218,6 +235,7 @@ pub struct WorkspaceExpertRegion {
     owners: Vec<usize>,
     owner_local: Vec<usize>,
     kernel: WorkspaceGroupedBank,
+    addressable: Option<super::WorkspaceAddressableRegion>,
     observation: Option<WorkspaceExpertObservationSource>,
     tensor_partitions: Option<usize>,
     provider_tensor_group: Option<eredu_core::CollectiveGroupId>,
@@ -235,7 +253,7 @@ impl WorkspaceExpertRegion {
                 WorkspaceGroupedBank::GatedProduct(v) => WorkspaceExpertKernel::Gated(v),
                 WorkspaceGroupedBank::Linear(v) => WorkspaceExpertKernel::Linear(v),
                 WorkspaceGroupedBank::Relu2(v) => WorkspaceExpertKernel::Relu2(v),
-            }, tensor_partitions: self.tensor_partitions, provider_tensor_group:self.provider_tensor_group, provider_wave_group:self.provider_wave_group, movement: self.movement, transfers: self.transfers,
+            }, addressable: self.addressable.as_ref().map(|value| value.as_view()), tensor_partitions: self.tensor_partitions, provider_tensor_group:self.provider_tensor_group, provider_wave_group:self.provider_wave_group, movement: self.movement, transfers: self.transfers,
         }
     }
     pub fn kernel(&self) -> &WorkspaceGroupedBank { &self.kernel }
@@ -266,12 +284,14 @@ pub fn record_expert_region_with_observation<P: crate::Parameterized<WorkspaceTe
     let geometry=ExpertRegionInputShape::inspect(original_shape,routes.group_indices().shape())?;
     let [input,ids,scores,coefficients]=geometry.normalize(input,routes.group_indices(),
         routes.selected_scores(),routes.coefficients(),context)?;
-    let slots = bank.retained_value_slot_bound().ok_or(WorkspaceMetadataError::Unqualified)?;
+    let slots = if source.addressable.is_some() { 0 } else {
+        bank.retained_value_slot_bound().ok_or(WorkspaceMetadataError::Unqualified)?
+    };
     let mut values = context.metadata_vec(slots)?;
     let mut excess = false;
-    if !bank.visit_retained_values(&mut |value| {
+    if source.addressable.is_none() && (!bank.visit_retained_values(&mut |value| {
         if values.len() == slots { excess = true; } else { values.push(value.clone()); }
-    }) || excess { return Err(WorkspaceMetadataError::Unqualified.into()); }
+    }) || excess) { return Err(WorkspaceMetadataError::Unqualified.into()); }
     let (width, output_width) = source.kernel.dimensions();
 
     let rows = input.shape().split_last().filter(|(last, _)| **last == width)

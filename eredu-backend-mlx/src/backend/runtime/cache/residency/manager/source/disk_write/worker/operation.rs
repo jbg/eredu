@@ -21,7 +21,7 @@ pub(crate) struct DiskWriteOperation {
     armed: bool,
     submitted: bool,
     committed: bool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -43,7 +43,7 @@ enum Cause {
 pub(crate) struct DiskWriteOperationFailure {
     cause: Cause,
     output: PreparedDiskWriteOutput,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for DiskWriteOperationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -121,13 +121,13 @@ impl<T: 'static> Drop for OrdinaryRetirement<T> {
 
 /// Reclaims only an already-retired snapshot, outside native/list locks.
 /// A panic retains the remaining snapshot; recursive/new work waits for a later call.
-pub(crate) fn reclaim() {
+pub(crate) fn reclaim() -> bool {
     if !safemlx::can_reclaim_submission_resources() {
-        return;
+        return false;
     }
-    let _ = RECLAIMING.try_with(|reclaiming| {
+    RECLAIMING.try_with(|reclaiming| {
         if reclaiming.replace(true) {
-            return;
+            return false;
         }
         struct Reset<'a>(&'a Cell<bool>);
         impl Drop for Reset<'_> {
@@ -146,11 +146,14 @@ pub(crate) fn reclaim() {
             .ok()
             .flatten();
         let mut pending = Queue(pending);
+        let mut reclaimed = false;
         while let Some(mut node) = pending.0.take() {
             pending.0 = node.take_next();
             node.retire();
+            reclaimed = true;
         }
-    });
+        reclaimed
+    }).unwrap_or(false)
 }
 
 /// Finishes staged destruction at an explicit synchronous host boundary.

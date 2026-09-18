@@ -150,7 +150,7 @@ fn invocation_receipts_preserve_physical_axes_and_monotone_replay_budgets() {
                                 assert_eq!(context.prediction, 4);
                                 assert_eq!(context.forward_epoch, epoch.value());
                                 assert_eq!(context.capture_plan_identity, plan.identity());
-                                let mut ordinary = CaptureSession::new((*plan).clone());
+                                let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new((*plan).clone()));
                                 ordinary
                                     .begin_invocation(
                                         CapturePhase::Decode,

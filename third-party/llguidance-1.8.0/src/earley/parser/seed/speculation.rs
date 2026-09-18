@@ -11,7 +11,7 @@ struct Walker<'a, F, E> {
     saved: Option<shared::Snapshot>,
     failure: Option<Cause<E>>,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> Walker<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Walker<'_, F, E> {
     fn finish(&mut self) {
         if let Some(saved) = self.saved.take() {
             // A failed recursive handoff may own a partially rewritten lexical
@@ -28,7 +28,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Walker<'_, F, E> {
         }
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> Recognizer for Walker<'_, F, E> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Recognizer for Walker<'_, F, E> {
     fn collapse(&mut self) {}
     fn trie_started(&mut self, _label: &str) {
         if self.failure.is_some() {
@@ -71,7 +71,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Recognizer for Walker<'_, F, E> {
     }
 }
 impl PreparedEarleySeed {
-    fn trie_controls<F: Fn(usize) -> Result<(), E>, E>(start: &[u8]) -> Option<usize> {
+    fn trie_controls<F: crate::earley::PreparedFunding<Error = E>, E>(start: &[u8]) -> Option<usize> {
         let parts = [
             Self::controls::<F, E>()?,
             TokTrie::add_bias_control_bytes::<Walker<'_, F, E>>(start)?,
@@ -101,7 +101,7 @@ impl PreparedEarleySeed {
     /// computation; numeric ranges, EOS and controller policy are added by the
     /// enclosing parser driver. `start` is an already forced byte prefix.
     /// The supplied lexer and trie must belong to this chart's retained source.
-    pub fn scan_token_mask<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn scan_token_mask<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -109,7 +109,7 @@ impl PreparedEarleySeed {
         funding: &F,
     ) -> Result<Self, PreparedEarleySeedError<E>> {
         let result = (|| {
-            funding(Self::trie_controls::<F, E>(start).ok_or(Cause::Overflow)?)
+            funding.reserve(Self::trie_controls::<F, E>(start).ok_or(Cause::Overflow)?)
                 .map_err(Cause::Funding)?;
             if !self.row_complete
                 || self.backtrack_bytes != 0
@@ -124,15 +124,16 @@ impl PreparedEarleySeed {
             // Existing masks remain owned until this independently funded mask
             // has been constructed. No observation/copy budget is refunded.
             let plan = TokenMaskConstructionPlan::for_trie(trie).map_err(Cause::MaskSource)?;
-            funding(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
+            funding.reserve(plan.requirements().required_bytes()).map_err(Cause::Funding)?;
             self.token_mask = Some(plan.compile().map_err(Cause::Mask)?);
             let mut mask = self.token_mask.take().expect("trie mask destination");
+            let scope = derivre::prepared_funding::Scope::new(funding).map_err(Cause::frame)?;
             let mut walker = Walker {
                 context: Context {
                     owner: &mut self,
                     lexer,
                     trie,
-                    funding,
+                    funding: &scope,
                 },
                 saved: None,
                 failure: None,
@@ -165,7 +166,7 @@ impl PreparedEarleySeed {
     /// Runs the ordinary token-suffix chop and extension traversal over this
     /// chart. The source token IDs and trie remain borrowed for the complete
     /// traversal; failures retain the actual speculative chart prefix.
-    pub fn chop_tokens<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn chop_tokens<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         lexer: &mut PreparedLexer,
         trie: &TokTrie,
@@ -194,7 +195,7 @@ impl PreparedEarleySeed {
                     &F,
                 )>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -215,12 +216,13 @@ impl PreparedEarleySeed {
             }
             trie.raw_token_bytes_len(&tokens[tokens.len().saturating_sub(4)..])
                 .ok_or(Cause::Overflow)?;
+            let scope = derivre::prepared_funding::Scope::new(funding).map_err(Cause::frame)?;
             let mut walker = Walker {
                 context: Context {
                     owner: &mut self,
                     lexer,
                     trie,
-                    funding,
+                    funding: &scope,
                 },
                 saved: None,
                 failure: None,

@@ -21,17 +21,6 @@ pub(in crate::working_memory) fn publish_dense_host_slots<T, K: HostSlotStorageK
     retained: u64,
     protected: u64,
     key: K,
-) -> Result<(), HostSlotAttachmentError<WorkingMemoryError>> {
-    publish_dense_host_slots_prepared(slots, custody, execution, retained, protected, key, None)
-}
-
-pub(in crate::working_memory) fn publish_dense_host_slots_prepared<T, K: HostSlotStorageKey>(
-    slots: &InitializedDenseHostSlots<T>,
-    custody: &mut WorkingMemoryDecoderHostScope,
-    execution: &InferenceExecutionIdentity,
-    retained: u64,
-    protected: u64,
-    key: K,
     host: Option<&eredu_core::HostPreparationAuthority>,
 ) -> Result<(), HostSlotAttachmentError<WorkingMemoryError>> {
     let metadata = slots.metadata();

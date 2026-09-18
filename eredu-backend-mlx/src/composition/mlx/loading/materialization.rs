@@ -66,7 +66,8 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
     let partition_prediction_visitor =
         |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| {
             binding::PartitionedPredictionBindingVisitor {
-        addressable_manager: Some(&addressable_manager),
+                layerwise_manager: Some(&layerwise_manager),
+                addressable_manager: Some(&addressable_manager),
                 stream,
                 weights_stream,
                 distributed: facts.partition().communication().clone(),
@@ -127,13 +128,15 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             PartitionedRoutedRoute::<MlxNeuralBackend, MlxHybridState, MlxPoolingAttentionState, _, _>::new(
                 stream, weights_stream,
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedRoutedDecoderBindingVisitor {
-        addressable_manager: Some(&addressable_manager),
+                    layerwise_manager: Some(&layerwise_manager),
+                    addressable_manager: Some(&addressable_manager),
                     distributed: resources.communication().clone(),
                     additional_claimed_sources: resources.extension_sources().clone(),
                     stream, weights_stream,
                 },
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedPoolingRoutedDecoderBindingVisitor {
-        addressable_manager: Some(&addressable_manager),
+                    layerwise_manager: Some(&layerwise_manager),
+                    addressable_manager: Some(&addressable_manager),
                     distributed: resources.into_communication(), stream, weights_stream,
                 },
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
@@ -144,14 +147,16 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             PartitionedCompositeRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
                 stream, weights_stream,
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedCompositeBindingVisitor {
-        addressable_manager: Some(&addressable_manager),
+                    layerwise_manager: Some(&layerwise_manager),
+                    addressable_manager: Some(&addressable_manager),
                     store: resources.target().clone(),
                     distributed: resources.into_communication(), stream, weights_stream,
                 },
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
                 materialize,
                 |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| binding::PartitionedCompositePredictionBindingVisitor {
-        addressable_manager: Some(&addressable_manager),
+                    layerwise_manager: Some(&layerwise_manager),
+                    addressable_manager: Some(&addressable_manager),
                     store: facts.partition().target().clone(),
                     distributed: facts.partition().communication().clone(),
                     selected: facts.prediction().selected().clone(),

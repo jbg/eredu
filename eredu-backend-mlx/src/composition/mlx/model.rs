@@ -12,8 +12,9 @@ use safemlx::{Array, Stream, error::Exception};
 mod loaded_helpers;
 pub(in crate::composition) use loaded_helpers::settle_loaded_numerical_values;
 mod recipe_planning;
+pub(in crate::composition::mlx) use recipe_planning::capture::CaptureRecorder;
 pub(super) use recipe_planning::{
-    FundedResidentRecipePlanning, retain_planning_error, retain_planning_error_with_kind,
+    FundedResidentRecipePlanning, RecipeWorkspace, retain_planning_error, retain_planning_error_with_kind,
     PreparedPlanningError, planning_error_has_funding,
     retain_planning_failure,
 };
@@ -246,6 +247,18 @@ impl Executable {
         self
     }
 
+    pub(crate) fn prepare_autoregressive_media_semantics(
+        &mut self,
+        source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
+        cache: &mut super::replicated_text::MlxPredictionTargetState,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        stream: &safemlx::Stream,
+    ) -> Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error> {
+        let blueprint = self.inference.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
+        self.inner.prepare_autoregressive_media_semantics(source, cache, blueprint, pool, funding, stream)
+    }
+
     pub(crate) fn inference_blueprint(
         &self,
     ) -> Option<&eredu_architectures::prepared_execution::PreparedInferenceBlueprint> {
@@ -256,6 +269,27 @@ impl Executable {
     /// has retired. A target-only publication under that authority is not enough.
     pub(crate) fn has_published_idle_storage(&self) -> bool {
         self._storage_publication.is_some() && self._memory_owner.is_none()
+    }
+
+    pub(crate) fn native_storage_mechanism(&self) -> Result<Option<crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage>, Error> {
+        Ok(self.erased().native_storage_mechanism()?.map(|mechanism| {
+            match self._storage_publication.as_ref().filter(|_| self._memory_owner.is_none()) {
+                Some(publication) => mechanism.with_initial_publication(publication.clone()),
+                None => mechanism,
+            }
+        }))
+    }
+
+    /// Borrows the actual publication retained by this executable, not an
+    /// inventory estimate or a new registration. The source remains installed
+    /// when a reset retires a later enclosing-session publication.
+    pub(crate) fn covers_nonstate_publication(
+        &self,
+        publication: &crate::backend::runtime::residency::storage::RetainedStoragePublication,
+    ) -> bool {
+        self._memory_owner.is_none()
+            && self._storage_publication.as_ref()
+                .is_some_and(|retained| publication.can_retire_with(retained))
     }
 
     pub(crate) fn has_workspace_mechanisms(&self) -> bool {
@@ -1176,6 +1210,9 @@ pub(crate) struct NativeLayerwiseParameters<'a>(
 impl eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
     for NativeLayerwiseParameters<'_>
 {
+    fn excludes_parameter(&self, name: &str) -> bool {
+        self.0.excludes_parameter(name)
+    }
     fn layout(&self) -> &eredu_runtime::ExecutionUnitLayout {
         self.0.layout()
     }

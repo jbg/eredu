@@ -14,7 +14,7 @@ fn packed(input: &str) -> BPE {
 fn legacy(input: &str) -> BPE {
     BPE::deserialize_with_cache_policy(
         &mut serde_json::Deserializer::from_str(input),
-        ModelCachePolicy::NoModelCaches,
+        ModelCachePolicy::disabled(),
     )
     .unwrap()
 }
@@ -33,9 +33,7 @@ fn parity(input: &str, words: &[&str]) -> BPE {
     model
 }
 fn capacities(model: &BPE) -> [usize; 7] {
-    let Storage::Packed(p) = &model.storage else {
-        panic!("packed model")
-    };
+    let p = &model.storage;
     [
         p.entries.capacity(),
         p.bytes.capacity(),
@@ -326,7 +324,7 @@ fn escaped_strings_field_order_and_fixed_parser_depth_preserve_values() {
 }
 
 #[test]
-fn clones_serde_save_and_owned_vocab_remain_explicit_compatibility_paths() {
+fn clones_serde_save_and_owned_vocab_preserve_tables() {
     let input = HELLO.to_owned();
     let model = packed(&input);
     drop(input);
@@ -348,14 +346,14 @@ fn clones_serde_save_and_owned_vocab_remain_explicit_compatibility_paths() {
     let files = model.save(dir.path(), Some("packed")).unwrap();
     assert_eq!(files.len(), 2);
     let restored = BPE::from_file(files[0].to_str().unwrap(), files[1].to_str().unwrap())
-        .cache_policy(ModelCachePolicy::NoModelCaches)
+        .cache_policy(ModelCachePolicy::disabled())
         .build()
         .unwrap();
     assert_eq!(restored, model);
 }
 
 #[test]
-fn existing_trainer_replaces_packed_storage_as_one_legacy_table_set() {
+fn training_installs_the_same_immutable_execution_tables() {
     let mut trainer = super::super::BpeTrainer::builder()
         .show_progress(false)
         .min_frequency(1)
@@ -370,7 +368,6 @@ fn existing_trainer_replaces_packed_storage_as_one_legacy_table_set() {
         trainer.train(&mut a).unwrap(),
         trainer.train(&mut b).unwrap()
     );
-    assert!(matches!(&a.storage, Storage::Legacy { .. }));
     assert_eq!(a, b);
     assert_eq!(
         a.tokenize("abababc").unwrap(),
@@ -401,7 +398,6 @@ fn parity_trainer_replaces_packed_storage_without_a_second_training_engine() {
         trainer.do_train(&mut a).unwrap(),
         trainer.do_train(&mut b).unwrap()
     );
-    assert!(matches!(&a.storage, Storage::Legacy { .. }));
     assert_eq!(a, b);
     assert_eq!(
         a.tokenize("aabbccdd").unwrap(),

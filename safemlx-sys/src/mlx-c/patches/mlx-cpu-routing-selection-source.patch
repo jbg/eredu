@@ -1,0 +1,176 @@
+diff --git a/mlx/backend/cpu/binary_storage.h b/mlx/backend/cpu/binary_storage.h
+--- a/mlx/backend/cpu/binary_storage.h
++++ b/mlx/backend/cpu/binary_storage.h
+@@ -4,7 +4,7 @@
+ namespace mlx::core::cpu {
+ enum class BinaryEvalKind {
+   add, subtract, multiply, divide, maximum, minimum, power,
+-  logical_and, logical_or, equal, not_equal, greater, greater_equal, less, less_equal
++  logical_and, logical_or, equal, not_equal, greater, greater_equal, less, less_equal, log_add_exp
+ };
+ struct BinaryEvalStorage : SingleOutputEvalStorage {
+   BinaryEvalKind kind{BinaryEvalKind::add};
+diff --git a/mlx/backend/cpu/binary_storage.cpp b/mlx/backend/cpu/binary_storage.cpp
+--- a/mlx/backend/cpu/binary_storage.cpp
++++ b/mlx/backend/cpu/binary_storage.cpp
+@@ -14,6 +14,7 @@
+   SIMPLE(Maximum, maximum)
+   SIMPLE(Minimum, minimum)
+   SIMPLE(Power, power)
++  SIMPLE(LogAddExp, log_add_exp)
+   SIMPLE(LogicalAnd, logical_and)
+   SIMPLE(LogicalOr, logical_or)
+   SIMPLE(NotEqual, not_equal)
+diff --git a/mlx/backend/cpu/binary.h b/mlx/backend/cpu/binary.h
+--- a/mlx/backend/cpu/binary.h
++++ b/mlx/backend/cpu/binary.h
+@@ -432,6 +432,34 @@
+ }
+ 
+ template <typename Op>
++struct BinaryFloatTask {
++  array a, b, out;
++  BinaryOpType bopt;
++  void operator()() {
++    switch (out.dtype()) {
++      case float16:
++        binary_op<float16_t, Op>(a, b, out, bopt);
++        break;
++      case float32:
++        binary_op<float, Op>(a, b, out, bopt);
++        break;
++      case float64:
++        binary_op<double, Op>(a, b, out, bopt);
++        break;
++      case bfloat16:
++        binary_op<bfloat16_t, Op>(a, b, out, bopt);
++        break;
++      case complex64:
++        binary_op<complex64_t, Op>(a, b, out, bopt);
++        break;
++      default:
++        throw std::runtime_error(
++            "[binary_float] Only supports floating point types.");
++    }
++  }
++};
++
++template <typename Op>
+ void binary_float_op_cpu(
+     const array& a,
+     const array& b,
+@@ -445,31 +473,8 @@
+   encoder.set_input_array(a);
+   encoder.set_input_array(b);
+   encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    b = array::unsafe_weak_copy(b),
+-                    out = array::unsafe_weak_copy(out),
+-                    bopt]() mutable {
+-    switch (out.dtype()) {
+-      case float16:
+-        binary_op<float16_t, Op>(a, b, out, bopt);
+-        break;
+-      case float32:
+-        binary_op<float, Op>(a, b, out, bopt);
+-        break;
+-      case float64:
+-        binary_op<double, Op>(a, b, out, bopt);
+-        break;
+-      case bfloat16:
+-        binary_op<bfloat16_t, Op>(a, b, out, bopt);
+-        break;
+-      case complex64:
+-        binary_op<complex64_t, Op>(a, b, out, bopt);
+-        break;
+-      default:
+-        throw std::runtime_error(
+-            "[binary_float] Only supports floating point types.");
+-    }
+-  });
++  encoder.dispatch(BinaryFloatTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(b), array::unsafe_weak_copy(out), bopt});
+ }
+ 
+ template <typename Op>
+diff --git a/mlx/backend/cpu/binary.cpp b/mlx/backend/cpu/binary.cpp
+--- a/mlx/backend/cpu/binary.cpp
++++ b/mlx/backend/cpu/binary.cpp
+@@ -341,6 +341,11 @@
+     size_t elements, EvalDispatchStorage& out) noexcept {
+   if (!binary_dtype(dtype)) return false;
+   switch (selected) {
++    case BinaryEvalKind::log_add_exp:
++      // This is the ordinary floating worker's exact named task, including
++      // its three weak operands and existing fixed collapse/iterator source.
++      return dtype==float32 &&
++          binary_task_storage<BinaryFloatTask<::mlx::core::detail::LogAddExp>>(rank,elements,out);
+ #define ARITHMETIC(Kind, Op) case BinaryEvalKind::Kind: return binary_task_storage<BinaryTask<::mlx::core::detail::Op>>(rank,elements,out);
+     ARITHMETIC(add, Add)
+     ARITHMETIC(subtract, Subtract)
+diff --git a/mlx/backend/cpu/indexing.cpp b/mlx/backend/cpu/indexing.cpp
+--- a/mlx/backend/cpu/indexing.cpp
++++ b/mlx/backend/cpu/indexing.cpp
+@@ -1111,7 +1111,7 @@
+       sizeof(Stream),sizeof(CommandEncoder*),sizeof(Dtype)*2,
+       sizeof(const array*)*4,sizeof(const GatherAxis*),sizeof(bool)*4,
+       sizeof(submission::GraphQuotaError),sizeof(submission::GraphFailure),
+-      sizeof(size_t)*10,sizeof(size_t*)*2,sizeof(int)};
++      sizeof(size_t)*14,sizeof(size_t*)*4,sizeof(int)};
+   size_t controls=sizeof(frames);
+   for(size_t frame:frames){if(frame>SIZE_MAX-controls)return false;controls+=frame;}
+   EvalDispatchStorage dispatch{task.task_bytes,task.task_alignment,iterator.graph_extent_sum*2,controls};
+@@ -1127,33 +1127,35 @@
+       output.dtype()!=float32||output.itemsize()!=sizeof(float))return false;
+   const auto& input=output.inputs()[0];const auto& index=output.inputs()[1];const size_t rank=input.ndim();
+   if(rank<1||rank>3||input.dtype()!=float32||input.itemsize()!=sizeof(float)||
+-      index.dtype()!=uint32||index.itemsize()!=sizeof(uint32_t)||
+-      input.shape()!=output.shape()||index.shape()!=input.shape()||
+-      input.strides().size()!=rank||index.strides().size()!=rank||
+-      !input.flags().row_contiguous)return false;
++      (index.dtype()!=uint32&&index.dtype()!=int32)||index.itemsize()!=sizeof(uint32_t)||
++      index.ndim()!=rank||output.ndim()!=rank||index.shape()!=output.shape()||
++      input.strides().size()!=rank||index.strides().size()!=rank)return false;
+   const int selected_axis=static_cast<const GatherAxis&>(output.primitive()).state();
+   if(selected_axis<0||size_t(selected_axis)>=rank)return false;
+-  size_t elements=1,source_span=1,index_span=1,compact=1;
+-  for(size_t axis=rank;axis--;) {
+-    if(input.shape(axis)<=0||input.strides()[axis]<0||index.strides()[axis]<0||
+-        (input.shape(axis)>1&&size_t(input.strides()[axis])!=compact))return false;
+-    const size_t dimension=size_t(input.shape(axis));
+-    if(elements>size_t(INT_MAX)/dimension)return false;
+-    elements*=dimension;compact=elements;
+-    // Positive physical spans include broadcast index axes with stride zero.
+-    // They prove each task read stays within the retained input backing.
++  size_t source_elements=1,index_elements=1,source_span=1,index_span=1;
++  for(size_t axis=0;axis!=rank;++axis) {
++    if(input.shape(axis)<=0||index.shape(axis)<=0||input.strides()[axis]<0||index.strides()[axis]<0||
++        (axis!=size_t(selected_axis)&&input.shape(axis)!=index.shape(axis)))return false;
++    const size_t dimensions[]={size_t(input.shape(axis)),size_t(index.shape(axis))};
+     const size_t strides[]={size_t(input.strides()[axis]),size_t(index.strides()[axis])};
++    size_t* elements[]={&source_elements,&index_elements};
+     size_t* spans[]={&source_span,&index_span};
+     for(size_t which=0;which!=2;++which) {
+-      if(strides[which]&&dimension-1>size_t(PTRDIFF_MAX)/strides[which])return false;
+-      const size_t delta=(dimension-1)*strides[which];
++      if(*elements[which]>size_t(INT_MAX)/dimensions[which])return false;
++      *elements[which]*=dimensions[which];
++      // The selected source axis and result axis have independent extents.
++      // Both exact readable spans include positive-stride views and broadcast
++      // indices. Actual queued index values retain their existing bounds check.
++      if(strides[which]&&dimensions[which]-1>size_t(PTRDIFF_MAX)/strides[which])return false;
++      const size_t delta=(dimensions[which]-1)*strides[which];
+       if(delta>size_t(PTRDIFF_MAX)-*spans[which])return false;
+       *spans[which]+=delta;
+     }
+   }
+-  if(input.size()!=elements||index.size()!=elements||output.size()!=elements||
+-      source_span>input.data_size()||index_span>index.data_size())return false;
+-  return gather_axis_row_eval_layout(rank,input.size(),output.is_tracer(),out);
++  if(input.size()!=source_elements||index.size()!=index_elements||output.size()!=index_elements||
++      source_span>input.data_size()||index_span>index.data_size()||
++      source_span>size_t(PTRDIFF_MAX)/sizeof(float)||index_span>size_t(PTRDIFF_MAX)/sizeof(uint32_t))return false;
++  return gather_axis_row_eval_layout(rank,index_elements,output.is_tracer(),out);
+ }
+ }
+ namespace mlx::core::submission {

@@ -44,6 +44,7 @@ pub(in crate::composition::mlx::session) struct LogicalResumeSource<'a> {
     pub(in crate::composition::mlx::session) pending: Option<PreparedPendingPrompt<'a>>,
     pub(in crate::composition::mlx::session) media:
         Option<&'a crate::composition::mlx::CompletedOriginalModelInput>,
+    pub(in crate::composition::mlx::session) terminal: bool,
 }
 impl CopiedTextComponents {
     pub(in crate::composition::mlx::session) fn resume_origin_control_bytes() -> Option<usize> {
@@ -131,8 +132,15 @@ impl CopiedTextComponents {
             history_bytes: history.history_bytes(),
             control_input: self.decoder.input.as_ref().map(AsRef::as_ref),
             key: self.sampling.arrays.key.as_ref(),
-            pending: self.sampling.prepare_pending_tokens().ok()?,
-            media: self.sampling.pending_media().map(|media| media.packet()),
+            pending: if config.sampling().max_new_tokens == Some(0) {
+                None
+            } else {
+                self.sampling.prepare_pending_tokens().ok()?
+            },
+            media: (config.sampling().max_new_tokens != Some(0))
+                .then(|| self.sampling.pending_media().map(|media| media.packet()))
+                .flatten(),
+            terminal: config.sampling().max_new_tokens == Some(0),
         })
     }
 }

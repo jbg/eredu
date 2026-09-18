@@ -161,6 +161,8 @@ fn actual_selected_kv_reset_exact_short_and_publication_preserve_source_then_cle
             let (mut runtime, _artifact) = runtime(&stream, &pool, route);
             let empty = runtime.session().payload.model.erased().state_snapshot();
             warm(&mut runtime, &pool, controlled);
+            assert!(runtime.session().payload.nonstate_publication.borrow().is_some(),
+                "completed generation publishes its actual retained source inventory");
             let before_values = numeric(&runtime);
             assert_eq!(
                 before_values.len(),
@@ -214,6 +216,8 @@ fn actual_selected_kv_reset_exact_short_and_publication_preserve_source_then_cle
                 "no retirement node before original acceptance"
             );
             assert_eq!(pool.used_bytes().unwrap(), before);
+            assert!(runtime.session().payload.nonstate_publication.borrow().is_some(),
+                "short reset leaves the installed publication untouched");
             assert_eq!(numeric(&runtime), before_values);
             let source = runtime
                 .session()
@@ -244,6 +248,8 @@ fn actual_selected_kv_reset_exact_short_and_publication_preserve_source_then_cle
             runtime
                 .reset_admitted(SessionResetLimits::new(before + bytes))
                 .unwrap();
+            assert!(runtime.session().payload.nonstate_publication.borrow().is_none(),
+                "initial model publication covers these unchanged resident/parameter sources");
             assert_eq!(
                 runtime.session().payload.model.erased().state_snapshot(),
                 empty

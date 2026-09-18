@@ -14,12 +14,13 @@ mod sampling;
 mod snapshot;
 pub use choice::{
     PreparedControllerCause, PreparedControllerDecision, PreparedControllerSource,
+    PreparedTokenChoiceError,
     PreparedForbiddenDecision, PreparedPlainDecision, PreparedGrammarChoice, PreparedGrammarChoiceCause, PreparedGrammarChoiceError, TokenChoiceController, TokenChoiceError,
 };
 pub use sampling::{
     SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
     ValidatedSamplingOverride, apply_prepared_sampling_override, apply_sampling_override,
-    validate_sampling_override,
+    validate_sampling_override, prepare_sampling_override,
 };
 
 /// Logical owned storage of the audited serialized intervention request DTO.
@@ -31,7 +32,7 @@ pub fn intervention_plan_storage_bytes(
 }
 pub(crate) mod storage;
 pub use snapshot::{
-    ManagedTextContinuation, PendingSnapshotResumeRetention, PreparedTextHostCopy,
+    ManagedTextContinuation, PendingSnapshotResumeRetention, PreparedTextHostCopy, PreparedTextHostJournal,
     RetainedSnapshotBackendError, SamplingCopyPolicy, SnapshotTokenController, TextBranchRequest,
     TextContinuationBranch, TextContinuationSnapshot, TextHostCopyError, TextSnapshotBackend,
     TextSnapshotError,
@@ -156,15 +157,19 @@ impl GenerationLifecycle {
         Ok(())
     }
 
-    /// Completes a cancellation observed after entering Running but before the
-    /// ordinary cursor submitted or committed any prediction. Call only after
-    /// verifying a quiescent native boundary; this never increments position.
-    pub fn cancel_without_prediction(&mut self) -> Result<(), ExecutionControlError> {
+    /// Completes termination without a newly committed prediction. Cancellation
+    /// and an already complete semantic constraint use the same transition.
+    /// Call only after verifying a completed, drained native boundary.
+    pub fn finish_without_prediction(&mut self, reason: FinishReason) -> Result<(), ExecutionControlError> {
         if self.status() != GenerationStatus::Running {
-            return Err(self.invalid(GenerationStatus::Cancelled));
+            return Err(self.invalid(GenerationStatus::Completed));
         }
-        self.boundary.status = GenerationStatus::Cancelled;
-        self.boundary.finish_reason = Some(FinishReason::Cancelled);
+        self.boundary.status = if reason == FinishReason::Cancelled {
+            GenerationStatus::Cancelled
+        } else {
+            GenerationStatus::Completed
+        };
+        self.boundary.finish_reason = Some(reason);
         Ok(())
     }
 
@@ -183,6 +188,16 @@ impl GenerationLifecycle {
             return Err(self.invalid(GenerationStatus::Paused));
         }
         Ok(self.boundary.clone())
+    }
+
+    /// Allows complete state placement after cancellation without reviving the
+    /// cancelled branch. The native owner must separately prove quiescence.
+    /// Copying or restoring a cancelled branch remains disallowed.
+    pub fn validate_placement(&self) -> Result<(), ExecutionControlError> {
+        if matches!(self.status(), GenerationStatus::Running | GenerationStatus::Failed) {
+            return Err(self.invalid(GenerationStatus::Paused));
+        }
+        Ok(())
     }
 
     /// Validates the portable restore transition before native copying begins.
@@ -244,6 +259,22 @@ impl Drop for SnapshotBudget {
 }
 
 impl SnapshotBudget {
+    /// Constructs the logical copy budget under the caller's actual original
+    /// metadata account, including its initialized synchronization owner.
+    pub fn prepare(
+        limits: SnapshotLimits,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::HostMetadataFundingError> {
+        use eredu_core::{HostMetadataFundingError as E, HostPreparationAuthority};
+        let bytes = Self::construction_bytes().ok_or(E::Unavailable)?
+            .checked_add(HostPreparationAuthority::retention_bytes::<eredu_core::HostMetadataFunding>()
+                .ok_or(E::Overflow)?)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Result<Self, E>>()))
+            .and_then(|bytes| bytes.checked_add(eredu_core::HostMetadataFunding::reservation_control_bytes()))
+            .ok_or(E::Overflow)?;
+        funding.reserve_metadata(bytes)?;
+        Ok(Self::new_with_host(limits, HostPreparationAuthority::retain(funding.clone())))
+    }
     fn inner(&self) -> &Arc<BudgetOwner> {
         self.0.as_ref().expect("live snapshot budget")
     }

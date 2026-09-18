@@ -23,15 +23,19 @@ pub(super) struct NeuralPopulation {
     pub(super) shape: NeuralSubmissionShape,
 }
 impl NeuralPopulation {
-    pub(super) fn from_layout(
-        layout: &ExecutionUnitLayout,
-        geometry: eredu_core::InferenceGeometry,
-    ) -> Result<Self, Error> {
-        Self::from_layout_with_final(layout, geometry, true)
+    pub(super) fn group_source_control_bytes() -> Option<usize> {
+        // from_forwards' selected argument and the shared neutral geometry
+        // helper's receiver, layout loan and result, including realtime calls.
+        size_of::<eredu_runtime::GroupSubmissionMechanism>().checked_add(size_of::<(
+            eredu_runtime::GroupSubmissionMechanism,
+            &ExecutionUnitLayout,
+            eredu_runtime::execution::LayerwiseSubmissionGeometry,
+        )>())
     }
-    pub(super) fn from_layout_with_final(
+    pub(super) fn from_execution(
         layout: &ExecutionUnitLayout,
         geometry: eredu_core::InferenceGeometry,
+        groups: eredu_runtime::GroupSubmissionMechanism,
         final_submission: bool,
     ) -> Result<Self, Error> {
         let prefill = PrefillControlPlan::new(geometry, true).map_err(memory)?;
@@ -40,7 +44,7 @@ impl NeuralPopulation {
             .checked_add(geometry.max_output_tokens.saturating_sub(1))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(overflow)?;
-        Self::from_forwards(layout, forwards, final_submission)
+        Self::from_forwards(layout, forwards, groups, final_submission)
     }
     /// One non-text invocation of the same selected policy. Group traversal
     /// and the concrete policy's final-output submission remain separate.
@@ -48,14 +52,16 @@ impl NeuralPopulation {
         layout: &ExecutionUnitLayout,
         final_submission: bool,
     ) -> Result<Self, Error> {
-        Self::from_forwards(layout, 1, final_submission)
+        Self::from_forwards(layout, 1, eredu_runtime::GroupSubmissionMechanism::LayeredGraph,
+            final_submission)
     }
     fn from_forwards(
         layout: &ExecutionUnitLayout,
         forwards: usize,
+        mechanism: eredu_runtime::GroupSubmissionMechanism,
         final_submission: bool,
     ) -> Result<Self, Error> {
-        let groups = layout.submission_geometry();
+        let groups = mechanism.geometry(layout);
         // Only the concrete MLX policy owns this final-output submission. The
         // neutral graph report deliberately does not include it.
         let per_forward = groups
@@ -202,6 +208,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                 self.foreground_disk_forward_population()
                     .ok_or_else(unknown)?,
                 self.foreground_disk_population().ok_or_else(unknown)?,
+                self.manager.original_foreground_workspace().ok_or_else(unknown)?.destination_device_type(),
             )?;
         }
         Ok(())
@@ -251,6 +258,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                         self.foreground_disk_forward_population()
                             .ok_or_else(unknown)?,
                         self.foreground_disk_population().ok_or_else(unknown)?,
+                        self.manager.original_foreground_workspace().ok_or_else(unknown)?.destination_device_type(),
                     ) {
                         return Err(identity());
                     }
@@ -330,6 +338,7 @@ where
     )?;
     let controls = [
         size_of::<NeuralPopulation>(),
+        NeuralPopulation::group_source_control_bytes()?,
         size_of::<NeuralNativeRequirements>(),
         size_of::<NeuralProducerFit>(),
         size_of::<PendingNeuralFit>(),

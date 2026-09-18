@@ -30,7 +30,7 @@ fn finish_prediction_state_operation<T>(
 fn finish_prediction_state_operation_with_metadata<T>(
     operation: Result<T, Error>,
     recovery: Result<(), Error>,
-    funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
 ) -> Result<T, Error> {
     match (operation, recovery) {
         (Err(operation), Err(recovery)) => {
@@ -90,24 +90,20 @@ mod recovery_tests {
     }
 }
 
-/// Shared policy-only checks. Legacy logical estimates remain in the ordinary
-/// control-support path; the cold resident plan must not run native getters.
+/// Shared allocation-free policy facts for the selected control mechanism.
 fn native_control_policy_support(
     partitioned: bool,
     distributed_agreement: bool,
     prediction_present: bool,
-) -> eredu_core::execution_control::ControlSupport {
+) -> eredu_core::execution_control::ControlSupport<&'static str> {
     use eredu_core::execution_control::ControlSupport;
     match native_control_policy_rejection(partitioned, distributed_agreement, prediction_present) {
-        Some(reason) => ControlSupport::Unsupported {
-            reason: reason.into(),
-        },
+        Some(reason) => ControlSupport::Unsupported { reason },
         None => ControlSupport::Supported,
     }
 }
 
-// Borrowed policy facts for pre-grant inspection; ordinary diagnostics above
-// keep their exact text and allocation behavior at the existing public boundary.
+// One predicate supplies both admission and independently rendered diagnostics.
 fn native_control_policy_rejection(
     partitioned: bool,
     distributed_agreement: bool,
@@ -130,7 +126,7 @@ fn require_native_control_policy(
     match native_control_policy_support(partitioned, distributed_agreement, prediction_present) {
         eredu_core::execution_control::ControlSupport::Supported => Ok(()),
         eredu_core::execution_control::ControlSupport::Unsupported { reason } => {
-            Err(Error::ArchitectureModel(reason))
+            Err(Error::ArchitectureModel(reason.into()))
         }
     }
 }
@@ -139,3 +135,5 @@ pub(crate) use mechanisms::{
     NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
     SealedOpeningRows,
 };
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

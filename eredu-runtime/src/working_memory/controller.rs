@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 mod contribution;
 mod original;
+mod prepared;
+pub use prepared::{PreparedControllerBinding, PreparedControllerBindingError};
 use super::residual::OriginalTokenDomainBinding;
 pub use contribution::{
     ControllerWorkspaceContribution, ControllerWorkspaceEstimate, ControllerWorkspaceMetadataError,
@@ -79,6 +81,7 @@ pub struct ControllerStorageContract {
     shared: BTreeMap<SharedStorageIdentity, SourceEvidence>,
     shared_bytes: u64,
     original: Option<OriginalTokenDomainBinding>,
+    semantic: Option<PreparedControllerBinding>,
 }
 
 /// Existing-only accounting custody for one exact shared-controller inventory.
@@ -152,7 +155,7 @@ impl WorkingMemoryPool {
         factory: impl FnOnce() -> Vec<u8>,
     ) -> Result<SharedControllerBytes, ControllerStorageError> {
         let ownership = self.acquire_unquoted()?;
-        let bytes = SharedControllerBytes::new(factory());
+        let bytes = SharedControllerBytes::new(factory(), eredu_core::HostPreparationAuthority::unmanaged());
         self.attach_prepared_source(SharedControllerSource::Bytes(&bytes))?;
         drop(ownership);
         Ok(bytes)
@@ -175,7 +178,7 @@ impl WorkingMemoryPool {
                 });
             }
         };
-        let declaration = SharedControllerDeclaration::new(value);
+        let declaration = SharedControllerDeclaration::new(value, eredu_core::HostPreparationAuthority::unmanaged());
         self.attach_prepared_source(SharedControllerSource::Declaration(&declaration))?;
         drop(ownership);
         Ok(declaration)
@@ -218,6 +221,7 @@ impl ControllerStorageContract {
             shared,
             shared_bytes,
             original: None,
+            semantic: None,
         })
     }
 
@@ -246,7 +250,7 @@ impl ControllerStorageContract {
         controller: &C,
     ) -> Result<(), ControllerStorageError> {
         if let Some(binding) = &self.original {
-            Self::validate_original_declaration(binding, controller.inference_storage())?;
+            self.validate_original_declaration(binding, controller.inference_storage())?;
             let maximum =
                 u64::try_from(binding.maximum()).map_err(|_| WorkingMemoryError::Overflow)?;
             let workspace = controller

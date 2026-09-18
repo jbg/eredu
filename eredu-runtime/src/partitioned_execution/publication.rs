@@ -1,6 +1,6 @@
-//! Source-funded metadata and failure destinations for the shared publisher.
+//! Shared source-funded tensor validation and communication failure destinations.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
@@ -8,28 +8,32 @@ use std::mem::{size_of, size_of_val};
 struct Failure<E: std::error::Error + 'static> {
     #[source]
     cause: E,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
+}
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WaveCause {
+    #[error(transparent)]
+    Native(eredu_core::BackendFailure),
+    #[error(transparent)]
+    Contract(PartitionExecutionError),
 }
 pub(super) struct Controls<E> {
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
+    operation: CommunicationOperation,
     marker: PhantomData<fn() -> E>,
 }
 impl<E: std::error::Error + Send + Sync + 'static> Controls<E> {
-    pub(super) fn prepare<T, C>(
-        funding: &WorkspaceMetadataFunding,
+    pub(super) fn prepare<T>(
+        funding: &HostMetadataFunding, operation: CommunicationOperation, caller_controls: usize,
     ) -> Result<Self, PartitionExecutionError> {
         let overflow = || {
-            PartitionExecutionError::PublicationMetadata(WorkspaceMetadataFundingError::Overflow)
+            PartitionExecutionError::PublicationMetadata(HostMetadataFundingError::Overflow)
         };
         let frames = [
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Result<Option<Self>, PartitionExecutionError>>(),
-            size_of::<(T, PartitionOutputPublication, DistributedExecutionPhase)>(),
-            size_of::<eredu_core::Submission<T, C>>(),
-            size_of::<Result<eredu_core::Submission<T, C>, E>>(),
-            size_of::<BoundedSubmissionOutcome<T>>(),
-            size_of::<Result<BoundedSubmissionOutcome<T>, E>>(),
+            caller_controls,
             size_of::<Result<T, PartitionExecutionError>>(),
             size_of::<Failure<E>>(),
             size_of::<eredu_core::BackendFailure>(),
@@ -58,8 +62,12 @@ impl<E: std::error::Error + Send + Sync + 'static> Controls<E> {
             .map_err(PartitionExecutionError::PublicationMetadata)?;
         Ok(Self {
             funding: funding.clone(),
+            operation,
             marker: PhantomData,
         })
+    }
+    pub(super) fn same_account(&self, funding: &HostMetadataFunding) -> bool {
+        self.funding.same_account(funding)
     }
     pub(super) fn validate<B: NeuralBackend, I: CommunicationTensorMetadata<B>>(
         &self,
@@ -85,7 +93,7 @@ impl<E: std::error::Error + Send + Sync + 'static> Controls<E> {
     ) -> PartitionExecutionError {
         // Same first-poison/disposition semantics as the ordinary authority.
         authority.mark_poisoned(CommunicationPoison {
-            operation: CommunicationOperation::Broadcast,
+            operation: self.operation,
             phase,
             route: None,
             cancellation: authority
@@ -94,7 +102,7 @@ impl<E: std::error::Error + Send + Sync + 'static> Controls<E> {
                 .cancellation(),
         });
         PartitionExecutionError::PreparedCommunication {
-            operation: CommunicationOperation::Broadcast,
+            operation: self.operation,
             phase,
             completion,
             source: eredu_core::BackendFailure::from_error(Failure {

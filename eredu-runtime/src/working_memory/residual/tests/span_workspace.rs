@@ -10,7 +10,6 @@ fn sealed_plan(
     capacity: u64,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -82,8 +81,8 @@ fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_bou
         matches!(sealed_plan(&pool,&quote,exact-1),Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==quote.incremental_bytes() && available_bytes+1==required_bytes)
     );
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (admission, reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
-    assert_eq!(admission.state, *quote.state());
+    let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    assert_eq!(reservation.admission().state, *quote.state());
     assert_eq!(pool.used_bytes().unwrap(), exact);
     let association = accepted.reserved_span_workspace(&reservation).unwrap();
     assert!(association
@@ -113,7 +112,7 @@ fn equal_independent_seals_and_unsealed_reservations_cannot_rebind_candidate_ide
     let a = original.clone().with_span_workspace().unwrap();
     let b = original.clone().with_span_workspace().unwrap();
     assert_eq!(a.state(), b.state());
-    let (_, reservation, accepted) = sealed_plan(&pool, &a, 1_000_000).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &a, 1_000_000).unwrap();
     assert!(b.reserved_span_workspace(&reservation).is_err());
     assert!(a
         .clone()
@@ -125,13 +124,13 @@ fn equal_independent_seals_and_unsealed_reservations_cannot_rebind_candidate_ide
         .unwrap()
         .validate_request(&request)
         .unwrap();
-    let (_, other, _) = sealed_plan(&pool, &b, 1_000_000).unwrap();
+    let (other, _) = sealed_plan(&pool, &b, 1_000_000).unwrap();
     assert!(accepted
         .reserved_span_workspace(&reservation)
         .unwrap()
         .validate_request(&InferenceRequest::from(&other))
         .is_err());
-    let (_, raw, _) = sealed_plan(&pool, &original, 1_000_000).unwrap();
+    let (raw, _) = sealed_plan(&pool, &original, 1_000_000).unwrap();
     assert!(a.reserved_span_workspace(&raw).is_err());
     drop((
         request,
@@ -199,7 +198,7 @@ fn reservation_keeps_only_identity_after_diagnostics_retire_and_funding_conversi
         .into_incremental()
         .with_span_workspace()
         .unwrap();
-    let (_, reservation, accepted) = sealed_plan(&pool, &quote, 1_000_000).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &quote, 1_000_000).unwrap();
     let diagnostic = accepted.span_workspace().plan().clone();
     let owners = diagnostic.strong_owner_count();
     let (reservation, run) = reservation.into_funding().unwrap();

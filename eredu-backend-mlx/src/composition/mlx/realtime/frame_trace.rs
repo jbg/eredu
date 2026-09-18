@@ -233,3 +233,5 @@ fn transition_source<E,F>(inner:E,observe:F,context:&WorkspaceContext)->Result<T
         size_of::<Result<TransitionSource<E,F>,eredu_nn::Error>>()])?;
     Ok(TransitionSource{inner,observe})
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

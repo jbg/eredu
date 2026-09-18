@@ -98,9 +98,15 @@ pub enum CheckpointMaterializationError {
     /// Original native fixed cause, without a formatted key/error shell.
     #[error("original checkpoint operation: {0}")]
     OriginalNative(#[source] safemlx::error::Exception),
+    /// Exact post-payload registered-role retirement refusal.
+    #[error("original checkpoint retirement: {0}")]
+    OriginalRetirement(#[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause),
     /// Explicit original operation did not match its registered current role.
     #[error("original checkpoint operation domain mismatch")]
     OriginalOperationDomain,
+    /// Consuming finish kept the same node in recovery without proving retirement.
+    #[error("original checkpoint operation retention transferred to recovery")]
+    OriginalOperationRetirementTransferred,
     /// A selected prepared payload cannot hold the actual operation inputs.
     #[error("original {family} payload needs {required} rows but prepared {capacity}")]
     OriginalPayloadCapacity {

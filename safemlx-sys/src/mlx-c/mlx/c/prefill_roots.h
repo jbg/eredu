@@ -27,6 +27,8 @@ unsigned mlx_prefill_roots_layout_for(mlx_prefill_roots_layout* out, size_t capa
 unsigned mlx_prefill_roots_new(mlx_prefill_roots* out, size_t capacity,
                              mlx_submission_graph_quota graph);
 unsigned mlx_prefill_roots_append(mlx_prefill_roots roots, mlx_array value);
+// Exact same-scope completed root; spent append capacity is never refunded.
+unsigned mlx_prefill_roots_retire_completed_current(mlx_prefill_roots roots, mlx_array value);
 /* Original validation append authenticates the descriptor's Graph domain and
  * retains each descriptor once. Ordinary arbitrary append has no such bound. */
 unsigned mlx_prefill_roots_append_validation(mlx_prefill_roots roots, mlx_array value);

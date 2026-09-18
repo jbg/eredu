@@ -296,11 +296,15 @@ where
         crate::media_plan::admission::inkling(config, input, inspector, context)
     }
 
-    fn prepared_prediction_token_ids(
+    fn visit_prepared_prediction_tokens(
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        B::Tensor::concatenate(&prepared_semantic_tokens(input, context)?, 1, context)
+        visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        crate::composite_execution::prediction_tokens::visit(input, |plan| match plan {
+            InklingInputPartPlan::TextTokens { .. } => None,
+            InklingInputPartPlan::Projected { placeholder_token_id, positions, .. } => Some((*placeholder_token_id, *positions)),
+            InklingInputPartPlan::Media { ingress, .. } => Some((ingress.placeholder_token_id, ingress.placeholder_count)),
+        }, visitor)
     }
 
     fn should_execute_prepared_group(
@@ -495,22 +499,29 @@ where
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
         pipeline_stages: usize,
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, Error>
     {
         // Inkling's hMLP units and projector are replicated equations even
         // when their parameters are selected with TP-local ownership. The
         // explicit empty schedule prevents the generic driver from inventing
         // row reductions for this group.
-        Ok((group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
-            .then(|| vec![Vec::new(); pipeline_stages]))
+        let destination=crate::composite_execution::graph::Destination(context);
+        destination.controls::<(&Self,usize,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
+            usize,usize,Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>)>()?;
+        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 { return Ok(None); }
+        destination.collect((0..pipeline_stages).map(|_| Vec::new())).map(Some)
     }
 
     fn prepared_primary_ingress_collectives(
         &self,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
-    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
-        crate::composite_execution::segmented_token_ingress_collectives(
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
+        let destination=crate::composite_execution::graph::Destination(context);
+        destination.controls::<(&Self,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,usize)>()?;
+        crate::composite_execution::segmented_token_ingress_collectives_in(
             input
                 .admitted()
                 .legacy()
@@ -525,6 +536,7 @@ where
                 }),
             self.args.text_config.hidden_size,
             tensor_partitions,
+            destination,
         )
     }
 
@@ -580,6 +592,21 @@ where
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+    fn build_execution_graph(
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<ExecutionGraph, Error> {
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<ExecutionGraph>()?;
+        let mut groups = destination.vector(3)?;
+        groups.push(destination.group(VISION_EXECUTION_GROUP, &[])?);
+        groups.push(destination.group(AUDIO_EXECUTION_GROUP, &[])?);
+        groups.push(destination.group(
+            TEXT_EXECUTION_GROUP,
+            &[VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+        )?);
+        destination.finish(groups, TEXT_EXECUTION_GROUP)
+    }
+
     fn hmlp_cut_shape(&self, patches: i32, end: usize) -> Result<[i32; 5], Error> {
         let vision = self
             .args
@@ -873,6 +900,7 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     parallel_geometry: Option<Arc<LocalGeometry>>,
     partition_state_offset: usize,
     expert_realization: Option<Arc<crate::ExpertRealizationPlan<super::ExpertBankRealization>>>,
+    execution_graph: ExecutionGraph,
 }
 
 /// Architecture-owned target, embedded-prediction, and composite state geometry.
@@ -953,26 +981,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.state_layouts()?.composite().clone())
-    }
 
-    fn state_layout_with_metadata(
+    fn state_layout(
         &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<StateLayout, Self::DefinitionError> {
+match context { Some(context) => {
         self.checked_units(context)?
             .layouts
             .composite()
             .clone_workspace(context)
-    }
+    }, None => {
+        Ok(self.state_layouts()?.composite().clone())
+    } }
+}
 
-    fn state_identity_with_metadata(
+    fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: PromptCacheTopology,
-        context: &eredu_nn::workspace::WorkspaceContext,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+match context { Some(context) => {
         let source = self.checked_units(context)?;
         state_identity_with_count(
             &self.args,
@@ -982,34 +1012,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             source.global_state_layers,
             crate::decoder::identity::Metadata::new(Some(context)),
         )
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: PromptCacheTopology,
-    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+    }, None => {
         state_identity(
             &self.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
         )
-    }
+    } }
+}
+
+
 
     fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        if B::construction_metadata(context)
-            .is_some_and(|metadata| metadata.uses_checked_metadata())
-        {
-            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
-        }
-        self.parameter_description_impl(context)
-    }
-
-    fn parameter_description_with_metadata(
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
@@ -1024,7 +1039,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             )?;
             return Ok(std::borrow::Cow::Borrowed(&source.description));
         }
-        self.parameter_description(context)
+        (|| {
+        if B::construction_metadata(context)
+            .is_some_and(|metadata| metadata.uses_checked_metadata())
+        {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        self.parameter_description_impl(context)
+    })()
             .map(std::borrow::Cow::Owned)
     }
 
@@ -1197,6 +1219,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let args = source.args().clone();
         Ok(Self {
             args,
+            execution_graph: Self::build_execution_graph(B::construction_metadata(context))?,
             construction: source,
             static_modules,
             parallel_geometry: geometry,
@@ -1276,18 +1299,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
+        let graph = match B::construction_metadata(context) { Some(context) => self.execution_graph.clone_with_metadata(context)?, None => self.execution_graph.clone() };
         let counts = [
             self.args
                 .vision_config
@@ -2067,49 +2079,55 @@ where
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
     fn media_prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // The validated ingress preserves media offsets and causal hMLP/attention state; encoder rows are not declared.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2)?;
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::media_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)),
-        )?;
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)), metadata_context)?;
         // The retained-media ingress changes decoder inputs and positions, but
         // executes the same row-local routed banks as the ordinary target.
         // Reuse those exact architecture declarations; encoder hooks remain
         // outside this decoder contract.
-        declarations.extend(
-            <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(self)?
-                .into_iter()
-                .filter(|declaration| declaration.flattens_batch_tokens()),
-        );
+        let ordinary=<Self as LayeredArchitecture<B,S>>::prefill_observation_declarations(self,metadata_context)?;
+        metadata.controls::<(Vec<eredu_runtime::layered::PrefillObservationDeclaration>,usize)>()?;
+        let selected = ordinary.iter().filter(|declaration| declaration.flattens_batch_tokens());
+        metadata.borrowed_controls(&selected)?;
+        let count = selected.count();
+        if let Some(context) = metadata.context() { context.reserve_metadata_vec(&mut declarations, count)?; }
+        let selected = ordinary.into_iter().filter(|declaration| declaration.flattens_batch_tokens());
+        metadata.borrowed_controls(&selected)?;
+        declarations.extend(selected);
         Ok(declarations)
     }
 
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+
         // The ordinary target uses four causal convolutions and learned-relative
         // attention at each layer's absolute cache offset. Media and prediction
         // invocations receive no row proof from this target-group declaration.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2)?;
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)),
-            true,
-        )?;
-        declarations.push(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)),
+            true, metadata_context)?;
+        { if let Some(context)=metadata.context(){context.reserve_metadata_vec(&mut declarations,1)?;} declarations.push(
             eredu_runtime::layered::PrefillObservationDeclaration::causal_ordinary_text(
                 "readout.scaled".into(),
                 1,
                 eredu_runtime::layered::PrefillReadoutStage::ReadoutInput,
             ),
-        );
+        ); };
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
-            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index)?;
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)?;
             if self.args.text_config.layer_schedule.get(index).is_some_and(|policy| policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe) {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.routing"));
-                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.shared.routing"));
+                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.routing"))?, metadata_context)?;
+                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.shared.routing"))?, metadata_context)?;
             }
         }
         Ok(declarations)
@@ -2172,46 +2190,22 @@ where
         crate::transport::pipeline_with_output_state(2, target_layers, layout)
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
-    }
-
-    fn execution_graph_with_metadata(
-        &self,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
-            self.checked_units(context)?.description.graph(),
+            &self.execution_graph,
         ))
     }
 
-    fn group_unit_count_with_metadata(
-        &self,
-        group: usize,
-        context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<usize, Self::Error> {
-        self.checked_units(context)?
-            .description
-            .unit_layout()
-            .group_range(group)
-            .map(|range| range.len())
-            .ok_or_else(|| {
-                context.metadata_error(format_args!("Inkling group is outside retained source"))
-            })
-    }
 
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        if let Some(context) = metadata_context {
+            return self.checked_units(context)?.description.unit_layout().group_range(group)
+                .map(|range| range.len()).ok_or_else(|| metadata.error(format_args!("Inkling group is outside retained source")));
+        }
         match group {
             0 => Ok(self
                 .args
@@ -2220,11 +2214,14 @@ where
                 .map_or(0, |vision| vision.num_hidden_layers as usize)),
             1 => Ok(0),
             2 => Ok(self.args.text_config.num_hidden_layers as usize),
-            _ => Err(Error::backend("Inkling has three execution groups")),
+            _ => Err(metadata.error(format_args!("{}", "Inkling has three execution groups"))),
         }
     }
 
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
         let count = match group {
             0 => self
                 .args
@@ -2233,26 +2230,32 @@ where
                 .map_or(0, |vision| vision.num_hidden_layers as usize),
             1 => 0,
             2 => self.args.text_config.num_hidden_layers as usize,
-            _ => return Err(Error::backend("Inkling has three execution groups")),
+            _ => return Err(metadata.error(format_args!("{}", "Inkling has three execution groups"))),
         };
         if index >= count {
-            return Err(Error::backend("Inkling unit is outside its group"));
+            return Err(metadata.error(format_args!("{}", "Inkling unit is outside its group")));
         }
         match group {
-            0 => Ok(format!("visual.layers.{index}")),
-            2 => Ok(format!("model.layers.{index}")),
+            0 => metadata.text(format_args!("visual.layers.{index}")),
+            2 => metadata.text(format_args!("model.layers.{index}")),
             _ => unreachable!(),
         }
     }
 
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        metadata.optional_path((group == 2).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH))
     }
 
-    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        Ok(match group {
-            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
-            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+
+        metadata.optional_path(match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH),
             _ => None,
         })
     }
@@ -2910,7 +2913,14 @@ where
 
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary, Result<Self::Boundary, Self::Error>,
+            )>())?;
+        }
+
         Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
             self.args().text_config.hidden_size,
         ))

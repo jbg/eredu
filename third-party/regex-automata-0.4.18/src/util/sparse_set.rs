@@ -17,7 +17,10 @@ determinization.
 
 use alloc::{vec, vec::Vec};
 
-use crate::util::primitives::StateID;
+use crate::util::{
+    allocation::{Allocation, AllocationError, Allocator, Unenforced},
+    primitives::StateID,
+};
 
 /// A pair of sparse sets.
 ///
@@ -43,10 +46,17 @@ impl SparseSets {
     ///
     /// This panics if the capacity given is bigger than `StateID::LIMIT`.
     pub(crate) fn new(capacity: usize) -> SparseSets {
-        SparseSets {
-            set1: SparseSet::new(capacity),
-            set2: SparseSet::new(capacity),
-        }
+        Self::new_with_allocations(capacity, &Unenforced).expect("sparse sets allocation")
+    }
+
+    pub(crate) fn new_with_allocations(
+        capacity: usize,
+        funding: &dyn Allocation,
+    ) -> Result<Self, AllocationError> {
+        Ok(Self {
+            set1: SparseSet::new_with_allocations(capacity, funding)?,
+            set2: SparseSet::new_with_allocations(capacity, funding)?,
+        })
     }
 
     /// Resizes these sparse sets to have the new capacity given.
@@ -56,8 +66,17 @@ impl SparseSets {
     /// This panics if the capacity given is bigger than `StateID::LIMIT`.
     #[inline]
     pub(crate) fn resize(&mut self, new_capacity: usize) {
-        self.set1.resize(new_capacity);
-        self.set2.resize(new_capacity);
+        self.resize_with_allocations(new_capacity, &Unenforced)
+            .expect("sparse sets allocation")
+    }
+
+    pub(crate) fn resize_with_allocations(
+        &mut self,
+        new_capacity: usize,
+        funding: &dyn Allocation,
+    ) -> Result<(), AllocationError> {
+        self.set1.resize_with_allocations(new_capacity, funding)?;
+        self.set2.resize_with_allocations(new_capacity, funding)
     }
 
     /// Clear both sparse sets.
@@ -115,9 +134,7 @@ impl SparseSet {
     /// This panics if the capacity given is bigger than `StateID::LIMIT`.
     #[inline]
     pub(crate) fn new(capacity: usize) -> SparseSet {
-        let mut set = SparseSet { len: 0, dense: vec![], sparse: vec![] };
-        set.resize(capacity);
-        set
+        Self::new_with_allocations(capacity, &Unenforced).expect("sparse set allocation")
     }
 
     /// Resizes this sparse set to have the new capacity given.
@@ -127,14 +144,38 @@ impl SparseSet {
     /// This panics if the capacity given is bigger than `StateID::LIMIT`.
     #[inline]
     pub(crate) fn resize(&mut self, new_capacity: usize) {
+        self.resize_with_allocations(new_capacity, &Unenforced)
+            .expect("sparse set allocation")
+    }
+
+    pub(crate) fn new_with_allocations(
+        capacity: usize,
+        funding: &dyn Allocation,
+    ) -> Result<Self, AllocationError> {
+        let mut set = Self {
+            len: 0,
+            dense: vec![],
+            sparse: vec![],
+        };
+        set.resize_with_allocations(capacity, funding)?;
+        Ok(set)
+    }
+
+    pub(crate) fn resize_with_allocations(
+        &mut self,
+        new_capacity: usize,
+        funding: &dyn Allocation,
+    ) -> Result<(), AllocationError> {
+        let allocation = Allocator::new(funding);
         assert!(
             new_capacity <= StateID::LIMIT,
             "sparse set capacity cannot exceed {:?}",
             StateID::LIMIT
         );
         self.clear();
-        self.dense.resize(new_capacity, StateID::ZERO);
-        self.sparse.resize(new_capacity, StateID::ZERO);
+        allocation.resize_copy(&mut self.dense, new_capacity, StateID::ZERO)?;
+        allocation.resize_copy(&mut self.sparse, new_capacity, StateID::ZERO)?;
+        Ok(())
     }
 
     // The closed PikeVM workspace reserves both actual buffers once, then

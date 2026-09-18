@@ -151,7 +151,7 @@ where
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
@@ -168,7 +168,7 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(recipe.plan().geometry(), None)?
+                            .original_operation_plan(recipe.plan().geometry(), None, D::group_submission_mechanism(runtime))?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()
@@ -209,7 +209,7 @@ where
                 }
                 D::resident_policy(runtime).or_else(|| D::bounded_policy(runtime))
                     .ok_or(Error::PrefillScopeUnavailable)?
-                    .original_operation_plan(geometry, source)?
+                    .original_operation_plan(geometry, source, D::group_submission_mechanism(runtime))?
                     .with_selected_stream(&mechanisms.stream)
             })
             .map_err(Error::RuntimeInspection)?
@@ -218,7 +218,7 @@ where
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         recipe: &mut crate::backend::nn::workspace::AutoregressiveEquationRecipe,
     ) -> Result<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>), Error>
     where
@@ -267,7 +267,7 @@ where
         session:&ReplicatedTextSession<A,MlxNeuralBackend,Self,D>,
         source:Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding:&eredu_nn::workspace::HostMetadataFunding,
         recipe:&mut crate::backend::nn::workspace::EmbeddedEquationRecipe,
     )->Result<(u64,Option<eredu_runtime::working_memory::HostSourceConstructionFacts>),Error>
     where D:eredu_runtime::ReplicatedTextExecutionStrategy<A,MlxNeuralBackend,S,
@@ -298,7 +298,7 @@ where
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
     ) -> Result<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>), Error>
     where D: eredu_runtime::ReplicatedTextExecutionStrategy<A, MlxNeuralBackend, S,
@@ -351,7 +351,7 @@ where
         native_root_capacity: Option<u64>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Option<eredu_runtime::working_memory::TextPrefillScopeFacts>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
@@ -419,7 +419,7 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(geometry, retained_sources)?
+                            .original_operation_plan(geometry, retained_sources, D::group_submission_mechanism(runtime))?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()?;
@@ -476,7 +476,7 @@ where
         host_destinations: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
         retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         Option<crate::backend::runtime::execution::generic::OriginalOperationBankOwner>,
         Error,
@@ -504,7 +504,7 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(geometry, retained_sources)?
+                            .original_operation_plan(geometry, retained_sources, D::group_submission_mechanism(runtime))?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()?;
@@ -623,7 +623,7 @@ where
         drop(expired);
         Ok(())
     }
-    pub(crate) fn retire_session_prefill_controls<D>(
+    pub(crate) fn retire_session_controls<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
     ) -> Result<(), Error>
     where
@@ -641,15 +641,25 @@ where
                     .prefill_controls
                     .try_borrow_mut()
                     .map_err(|_| Error::PrefillScopeReentrant)?;
-                Ok::<_, Error>(if slot.as_ref().is_some_and(|view| !view.is_live()) {
+                let mut parallel = mechanisms
+                    .parallel_control
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?;
+                // The parallel slot owns its own raw host custody even though
+                // its request reference is weak. Paid reset can reach this idle
+                // boundary without beginning another ordinary operation.
+                let expired_prefill = if slot.as_ref().is_some_and(|view| !view.is_live()) {
                     slot.take()
                 } else {
                     None
-                })
+                };
+                let expired_parallel = crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection::take_inactive(&mut parallel);
+                Ok::<_, Error>((expired_prefill, expired_parallel))
             })
             .map_err(Error::RuntimeInspection)??;
-        // Removing an expired weak view is housekeeping, not completion proof.
-        // Native source/root owners were independently retired by Recovery.
+        // Removing expired weak/lexical views is housekeeping, not completion
+        // proof. Recovery and escaped aliases keep their independent custody.
+        // Both slot and session loans ended before either final owner drops.
         drop(expired);
         Ok(())
     }
@@ -658,6 +668,7 @@ where
     pub(crate) fn inspection_adapters_for_test<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         geometry: eredu_core::InferenceGeometry,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
@@ -676,15 +687,14 @@ where
                 Ok::<_, Error>(())
             })
             .map_err(Error::RuntimeInspection)??;
-        let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let graph = std::num::NonZeroU64::new(4 << 20).unwrap();
         assert!(Self::session_prefill_control_facts(
-            session, &pool, geometry, graph, None, None, None, None
+            session, pool, geometry, graph, None, None, None, None
         )?
         .is_some());
         let overflow = Self::session_prefill_control_facts(
             session,
-            &pool,
+            pool,
             eredu_core::InferenceGeometry {
                 input_positions: u64::MAX / 2,
                 prefill_chunk_positions: 1,
@@ -706,7 +716,7 @@ where
             .is::<eredu_runtime::working_memory::WorkingMemoryError>());
         let invalid = Self::session_prefill_control_facts(
             session,
-            &pool,
+            pool,
             eredu_core::InferenceGeometry {
                 batch_size: 0,
                 ..geometry
@@ -734,15 +744,21 @@ where
                     Err(Error::PrefillScopeReentrant)
                 ));
                 assert!(matches!(
-                    Self::retire_session_prefill_controls(session),
+                    Self::retire_session_controls(session),
                     Err(Error::PrefillScopeReentrant)
                 ));
                 drop(slot);
+                let parallel = mechanisms.parallel_control.borrow_mut();
+                assert!(matches!(
+                    Self::retire_session_controls(session),
+                    Err(Error::PrefillScopeReentrant)
+                ));
+                drop(parallel);
                 Ok::<_, Error>(())
             })
             .map_err(Error::RuntimeInspection)??;
         Self::install_session_prefill_controls(session, None)?;
-        Self::retire_session_prefill_controls(session)
+        Self::retire_session_controls(session)
     }
     #[cfg(test)]
     pub(crate) fn prefill_status_for_test<D>(

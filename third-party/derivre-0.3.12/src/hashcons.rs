@@ -1,8 +1,6 @@
 mod growth;
 mod source_copy;
-pub use growth::{
-    HashConsFundingFailure, HashConsFundingPreparationError, PreparedHashConsFunding,
-};
+use crate::{ParserAllocationFailure, ParserAllocationFunding};
 use hashbrown::hash_table::Entry;
 use std::{
     collections::TryReserveError,
@@ -281,7 +279,7 @@ pub enum HashConsCapacityError {
     /// Allocating hash-table storage during preparation failed.
     TableAllocation(hashbrown::TryReserveError),
     /// The actual retained backing-growth account refused the next allocation.
-    Funding(HashConsFundingFailure),
+    Funding(ParserAllocationFailure),
     /// A new vector would exceed the prepared payload-word allowance.
     WordsExceeded {
         required_words: usize,
@@ -358,6 +356,12 @@ impl fmt::Display for HashConsCapacityError {
     }
 }
 
+impl From<ParserAllocationFailure> for HashConsCapacityError {
+    fn from(error: ParserAllocationFailure) -> Self {
+        Self::Funding(error)
+    }
+}
+
 impl std::error::Error for HashConsCapacityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -385,7 +389,7 @@ pub struct PreparedVecHashCons {
     max_entries: usize,
     max_encoded_words: usize,
     insertion_active: bool,
-    backing_funding: Option<PreparedHashConsFunding>,
+    backing_funding: Option<ParserAllocationFunding>,
 }
 
 impl PreparedVecHashCons {

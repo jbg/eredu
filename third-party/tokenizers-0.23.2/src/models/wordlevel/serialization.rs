@@ -1,4 +1,4 @@
-use super::{super::OrderedVocabIter, WordLevel, WordLevelBuilder};
+use super::{ReverseVocabulary, WordLevel, WordLevelBuilder};
 use ahash::AHashSet;
 use serde::{
     de::{MapAccess, Visitor},
@@ -6,16 +6,40 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+pub(crate) struct Serialization<'a> {
+    source: &'a WordLevel,
+    entries: Entries<'a>,
+}
+impl WordLevel {
+    pub(crate) fn serialization_with_allocations<'a>(
+        &'a self,
+        policy: &dyn serde_json::allocation::Allocation,
+    ) -> std::result::Result<Serialization<'a>, serde_json::allocation::AllocationError> {
+        let allocator = serde_json::allocation::Allocator::new(policy);
+        allocator.reserve(
+            std::mem::size_of::<Serialization<'_>>()
+                + std::mem::size_of::<std::slice::Iter<'_, (&u32, &String)>>(),
+        )?;
+        let entries = prepare_entries(&self.vocab_r, policy)?;
+        Ok(Serialization {
+            source: self,
+            entries,
+        })
+    }
+}
 impl Serialize for WordLevel {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialization_with_allocations(&serde_json::allocation::Unenforced)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+impl Serialize for Serialization<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut model = serializer.serialize_struct("WordLevel", 3)?;
-        let ordered_vocab = OrderedVocabIter::new(&self.vocab_r);
         model.serialize_field("type", "WordLevel")?;
-        model.serialize_field("vocab", &ordered_vocab)?;
-        model.serialize_field("unk_token", &self.unk_token)?;
+        model.serialize_field("vocab", &self.entries)?;
+        model.serialize_field("unk_token", &self.source.unk_token)?;
         model.end()
     }
 }
@@ -123,5 +147,50 @@ mod tests {
             .unwrap_err()
             .to_string()
             .starts_with("invalid value: string \"WordPiece\", expected WordLevel"));
+    }
+}
+
+enum Entries<'a> {
+    Dense(&'a ReverseVocabulary),
+    Sparse(Vec<(&'a u32, &'a String)>),
+}
+impl Serialize for Entries<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Dense(vocabulary) => serializer.collect_map((0..vocabulary.len()).map(|id| {
+                let id = id as u32;
+                (vocabulary.get(&id).expect("checked dense vocabulary"), id)
+            })),
+            Self::Sparse(entries) => {
+                serializer.collect_map(entries.iter().map(|(id, token)| (token, id)))
+            }
+        }
+    }
+}
+fn prepare_entries<'a>(
+    vocabulary: &'a ReverseVocabulary,
+    policy: &dyn serde_json::allocation::Allocation,
+) -> std::result::Result<Entries<'a>, serde_json::allocation::AllocationError> {
+    // Distinct keys whose count is n and every value is below n are exactly
+    // 0..n. Both policies use the same source-derived storage choice.
+    if vocabulary
+        .keys()
+        .all(|&id| (id as usize) < vocabulary.len())
+    {
+        return Ok(Entries::Dense(vocabulary));
+    }
+    let mut entries = Vec::new();
+    serde_json::allocation::Allocator::new(policy).grow(&mut entries, vocabulary.len())?;
+    entries.extend(vocabulary.iter());
+    entries.sort_unstable_by_key(|(id, _)| **id);
+    Ok(Entries::Sparse(entries))
+}
+/// Serialization visits the actual sparse IDs rather than traversing holes.
+pub(super) struct OrderedVocabulary<'a>(pub &'a ReverseVocabulary);
+impl Serialize for OrderedVocabulary<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        prepare_entries(self.0, &serde_json::allocation::Unenforced)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
     }
 }

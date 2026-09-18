@@ -668,12 +668,13 @@ fn one_rank_cancellation_stops_every_rank_at_the_same_completed_boundary() {
         type Output = Vec<f64>;
         type Completion = NativeCompletion;
         type Error = std::io::Error;
-        fn agree_cancellation(
+        fn agree_cancellation_at(
             &mut self,
-            local: bool,
+            _: eredu_runtime::prefill::PrefillBoundary,
+            cancellation: &GenerationCancellationToken,
             _: InferenceRequest,
         ) -> Result<bool, Self::Error> {
-            self.any_cancelled.fetch_or(local, Ordering::SeqCst);
+            self.any_cancelled.fetch_or(cancellation.is_cancelled(), Ordering::SeqCst);
             self.barrier.wait();
             let cancelled = self.any_cancelled.load(Ordering::SeqCst);
             self.barrier.wait();

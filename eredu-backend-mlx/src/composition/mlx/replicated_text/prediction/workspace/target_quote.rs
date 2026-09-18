@@ -29,7 +29,7 @@ use eredu_architectures::prepared_execution::{
 };
 use eredu_nn::{
     Parameterized, Tensor,
-    workspace::{WorkspaceContext, WorkspaceDtype, WorkspaceMetadataFunding, WorkspaceTensor},
+    workspace::{WorkspaceContext, WorkspaceDtype, HostMetadataFunding, WorkspaceTensor},
 };
 use eredu_runtime::{
     LayeredArchitecture, ReplicatedTextExecutionStrategy, ReplicatedTextSession,
@@ -59,7 +59,7 @@ pub(in crate::composition::mlx::replicated_text) struct TargetEquationQuoteParts
     pub context: WorkspaceContext,
     pub bindings: SourceBindings,
     // Native projection witnesses and metadata containers retire first.
-    pub funding: WorkspaceMetadataFunding,
+    pub funding: HostMetadataFunding,
 }
 impl<'source> PreparedTargetEquationQuote<'source> {
     #[allow(clippy::too_many_arguments)]
@@ -71,12 +71,13 @@ impl<'source> PreparedTargetEquationQuote<'source> {
             D,
         >,
         tokens: &'source MlxTensor,
+        prefill: Option<&crate::composition::mlx::prepared_speculative::OriginalEmbeddedPrefillInput>,
         workspace: EmbeddedInvocationWorkspace,
         sources: &'source OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         observation: Option<super::capture::CaptureWorkspaceInput<'_, '_>>,
-        bind_sources: impl FnOnce(&WorkspaceContext, &[&ProjectedNativeStorage]) -> Result<SourceBindings, Error>,
+        bind_sources: impl FnOnce(&WorkspaceContext, &[&ProjectedNativeStorage], Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>) -> Result<SourceBindings, Error>,
     ) -> Result<Self, Error>
     where
         S: MlxStateMechanisms,
@@ -135,7 +136,7 @@ impl<'source> PreparedTargetEquationQuote<'source> {
                 EmbeddedInvocationWorkspace,
                 &OriginalSpeculativeNumericalSources,
                 &OriginalCopyEnvironment<'_>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
                 Option<super::capture::CaptureWorkspaceInput<'_, '_>>,
             )>(),
         ];
@@ -179,7 +180,8 @@ impl<'source> PreparedTargetEquationQuote<'source> {
         if !inputs.is_complete() {
             return Err(sources.retain_startup_error(WorkingMemoryError::UnknownBound));
         }
-        let bindings = bind_sources(&context, &[&target.storage, &inputs])?;
+        let media = prefill.map(|source| source.project_media(&context, sources)).transpose()?.flatten();
+        let bindings = bind_sources(&context, &[&target.storage, &inputs], media.as_ref().map(|input| input.source_storage()))?;
         let mut recorder =
             mechanism.recorder(workspace.geometry(), &context)
                 .map_err(|cause| sources.retain_startup_error(cause))?;
@@ -233,6 +235,7 @@ impl<'source> PreparedTargetEquationQuote<'source> {
             .quote_embedded_target_invocation(
                 workspace,
                 input.layout().dtype(),
+                media,
                 &target.state,
                 &context,
                 None,

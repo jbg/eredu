@@ -192,7 +192,8 @@ impl TokTrie {
 
     pub fn from(info: &TokRxInfo, words: &[Vec<u8>]) -> Self {
         let eos = [info.tok_eos];
-        prepared::TokTrieConstructionPlan::from_vecs(info, words, &eos)
+        let eos = if info.tok_eos == INVALID_TOKEN { &[][..] } else { &eos[..] };
+        prepared::TokTrieConstructionPlan::from_vecs(info, words, eos)
             .expect("valid token trie source")
             .compile()
             .expect("token trie construction")
@@ -210,7 +211,6 @@ impl TokTrie {
     }
 
     pub fn with_eos_tokens(&self, eos_tokens: &[TokenId]) -> Self {
-        assert!(!eos_tokens.is_empty(), "eos_tokens must not be empty");
         let vocab = self.vocab_size() as u32;
         for &tok in eos_tokens {
             assert!(
@@ -219,7 +219,7 @@ impl TokTrie {
             );
         }
         let mut r = self.clone();
-        r.info.tok_eos = eos_tokens[0];
+        r.info.tok_eos = eos_tokens.first().copied().unwrap_or(INVALID_TOKEN);
         r.eos_tokens = eos_tokens.to_vec();
         r
     }
@@ -227,12 +227,15 @@ impl TokTrie {
     pub fn with_info(&self, info: TokRxInfo) -> Self {
         let mut r = self.clone();
         r.info = info;
-        r.eos_tokens = vec![info.tok_eos];
+        r.eos_tokens = if info.tok_eos == INVALID_TOKEN { Vec::new() } else { vec![info.tok_eos] };
         r
     }
 
     pub fn build_chat_mode_trie(&self) -> Self {
-        self.with_eos_token(self.info.tok_end_of_turn.unwrap_or(self.info.tok_eos))
+        match self.info.tok_end_of_turn {
+            Some(eos) => self.with_eos_token(eos),
+            None => self.clone(),
+        }
     }
 
     fn node_offset(&self, n: &TrieNode) -> usize {
@@ -1451,6 +1454,30 @@ mod tests {
         let trie = make_test_trie(2);
         assert_eq!(trie.eos_token(), 2);
         assert_eq!(trie.eos_tokens(), &[2]);
+    }
+
+    #[test]
+    fn absent_eos_keeps_zero_as_text_through_original_filter_and_metadata() {
+        let info = TokRxInfo::new(2, INVALID_TOKEN);
+        let words = vec![b"a".to_vec(), b"b".to_vec()];
+        let ordinary = TokTrie::from(&info, &words);
+        let slices = words.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let original = prepared::TokTrieConstructionPlan::prepare(&info, &slices, &[])
+            .unwrap().compile().unwrap();
+        for trie in [&ordinary, &original] {
+            assert_eq!(trie.eos_token(), INVALID_TOKEN);
+            assert!(trie.eos_tokens().is_empty());
+            assert_eq!(trie.token(0), b"a");
+            assert!(!trie.eos_token_set().is_allowed(0));
+            let mut allowed = trie.alloc_token_set();
+            allowed.allow_token(0);
+            let filtered = trie.filter(&allowed);
+            assert!(filtered.eos_tokens().is_empty());
+            assert_eq!(filtered.token(0), b"a");
+        }
+        assert!(ordinary.with_eos_tokens(&[1]).with_eos_tokens(&[]).eos_tokens().is_empty());
+        assert!(ordinary.with_info(info).eos_tokens().is_empty());
+        assert!(ordinary.build_chat_mode_trie().eos_tokens().is_empty());
     }
 
     #[test]

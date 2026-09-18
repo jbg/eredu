@@ -23,6 +23,7 @@ type NativeCompositePartitionStrategy<A> = eredu_runtime::PartitionedTextExecuti
 >;
 
 pub(crate) struct PartitionedCompositeBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) store: eredu_checkpoint::store::RetainedCheckpointSource,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
@@ -162,6 +163,7 @@ impl
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
             self.addressable_manager,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )
     }
 
@@ -191,12 +193,14 @@ impl
             self.weights_stream,
             Default::default(),
             self.addressable_manager,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )?;
         Ok(Box::new(completed.with_media_prefill()))
     }
 }
 
 pub(crate) struct PartitionedCompositePredictionBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub store: eredu_checkpoint::store::RetainedCheckpointSource,
     pub distributed: crate::backend::distributed::MlxDistributedSession,
@@ -252,6 +256,7 @@ impl
                 capability: self.capability,
             },
             self.addressable_manager,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )
     }
 }
@@ -264,6 +269,7 @@ pub(crate) fn bind_prepared_partitioned_composite<A, G, W, F>(
     weights_stream: &Stream,
     mut finalizer: F,
     addressable_manager: Option<&AddressableManagerSlot>,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -285,8 +291,9 @@ where
         stream,
         weights_stream,
         residency,
-            addressable_manager,
-        )?;
+        addressable_manager,
+        layerwise_manager,
+    )?;
     finalizer.finish(completed)
 }
 
@@ -298,6 +305,7 @@ fn complete_prepared_partitioned_composite<A, G, W>(
     weights_stream: &Stream,
     prediction_residency: crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
     addressable_manager: Option<&AddressableManagerSlot>,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
 ) -> Result<CompletedComposite<A, NativeCompositePartitionStrategy<A>>, Error>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -357,6 +365,7 @@ where
         PreparedCompositeArchitecture<A>,
         MlxHybridState,
     > = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     mechanisms.set_prediction_residency(prediction_residency);
     mechanisms.set_ignored_checkpoint_sources(prepared.unowned_expert_checkpoint_sources());
     let mut distributed = Some(distributed);

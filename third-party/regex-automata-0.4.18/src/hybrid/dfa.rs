@@ -9,6 +9,7 @@ This module also contains a [`hybrid::dfa::Builder`](Builder) and a
 
 use core::{iter, mem::size_of};
 
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 use alloc::vec::Vec;
 
 use crate::{
@@ -24,9 +25,7 @@ use crate::{
         empty,
         prefilter::Prefilter,
         primitives::{PatternID, StateID as NFAStateID},
-        search::{
-            Anchored, HalfMatch, Input, MatchError, MatchKind, PatternSet,
-        },
+        search::{Anchored, HalfMatch, Input, MatchError, MatchKind, PatternSet},
         sparse_set::SparseSets,
         start::{self, Start, StartByteMap},
     },
@@ -344,7 +343,7 @@ impl DFA {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset_cache(&self, cache: &mut Cache) {
-        Lazy::new(self, cache).reset_cache()
+        cache.reset(self)
     }
 
     /// Returns the total number of patterns compiled into this lazy DFA.
@@ -591,8 +590,18 @@ impl DFA {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Result<Option<HalfMatch>, MatchError> {
+        self.try_search_fwd_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Run the original lazy search with prospective cache funding.
+    pub fn try_search_fwd_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        let hm = match search::find_fwd(self, cache, input)? {
+        let hm = match search::find_fwd(self, cache, input, funding)? {
             None => return Ok(None),
             Some(hm) if !utf8empty => return Ok(Some(hm)),
             Some(hm) => hm,
@@ -612,7 +621,7 @@ impl DFA {
         // invalid UTF-8. But doing so is documented to result in unspecified
         // behavior.
         empty::skip_splits_fwd(input, hm, hm.offset(), |input| {
-            let got = search::find_fwd(self, cache, input)?;
+            let got = search::find_fwd(self, cache, input, funding)?;
             Ok(got.map(|hm| (hm, hm.offset())))
         })
     }
@@ -792,14 +801,24 @@ impl DFA {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Result<Option<HalfMatch>, MatchError> {
+        self.try_search_rev_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Run the original lazy search with prospective cache funding.
+    pub fn try_search_rev_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<Option<HalfMatch>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        let hm = match search::find_rev(self, cache, input)? {
+        let hm = match search::find_rev(self, cache, input, funding)? {
             None => return Ok(None),
             Some(hm) if !utf8empty => return Ok(Some(hm)),
             Some(hm) => hm,
         };
         empty::skip_splits_rev(input, hm, hm.offset(), |input| {
-            let got = search::find_rev(self, cache, input)?;
+            let got = search::find_rev(self, cache, input, funding)?;
             Ok(got.map(|hm| (hm, hm.offset())))
         })
     }
@@ -899,18 +918,33 @@ impl DFA {
         input: &Input<'_>,
         state: &mut OverlappingState,
     ) -> Result<(), MatchError> {
+        self.try_search_overlapping_fwd_with_allocations(cache, input, state, &Unenforced)
+    }
+
+    /// Run the original lazy search with prospective cache funding.
+    pub fn try_search_overlapping_fwd_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        state: &mut OverlappingState,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        // A failed growth may have invalidated the caller's saved state ID.
+        // Starting a fresh overlap search permits resetting the cache below.
+        if state.id.is_some() {
+            if let Some(error) = cache.allocation_failure {
+                return Err(error.into());
+            }
+        }
+
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        search::find_overlapping_fwd(self, cache, input, state)?;
+        search::find_overlapping_fwd(self, cache, input, state, funding)?;
         match state.get_match() {
             None => Ok(()),
             Some(_) if !utf8empty => Ok(()),
-            Some(_) => skip_empty_utf8_splits_overlapping(
-                input,
-                state,
-                |input, state| {
-                    search::find_overlapping_fwd(self, cache, input, state)
-                },
-            ),
+            Some(_) => skip_empty_utf8_splits_overlapping(input, state, |input, state| {
+                search::find_overlapping_fwd(self, cache, input, state, funding)
+            }),
         }
     }
 
@@ -1043,18 +1077,33 @@ impl DFA {
         input: &Input<'_>,
         state: &mut OverlappingState,
     ) -> Result<(), MatchError> {
+        self.try_search_overlapping_rev_with_allocations(cache, input, state, &Unenforced)
+    }
+
+    /// Run the original lazy search with prospective cache funding.
+    pub fn try_search_overlapping_rev_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        state: &mut OverlappingState,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        // A failed growth may have invalidated the caller's saved state ID.
+        // Starting a fresh overlap search permits resetting the cache below.
+        if state.id.is_some() {
+            if let Some(error) = cache.allocation_failure {
+                return Err(error.into());
+            }
+        }
+
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        search::find_overlapping_rev(self, cache, input, state)?;
+        search::find_overlapping_rev(self, cache, input, state, funding)?;
         match state.get_match() {
             None => Ok(()),
             Some(_) if !utf8empty => Ok(()),
-            Some(_) => skip_empty_utf8_splits_overlapping(
-                input,
-                state,
-                |input, state| {
-                    search::find_overlapping_rev(self, cache, input, state)
-                },
-            ),
+            Some(_) => skip_empty_utf8_splits_overlapping(input, state, |input, state| {
+                search::find_overlapping_rev(self, cache, input, state, funding)
+            }),
         }
     }
 
@@ -1131,9 +1180,20 @@ impl DFA {
         input: &Input<'_>,
         patset: &mut PatternSet,
     ) -> Result<(), MatchError> {
+        self.try_which_overlapping_matches_with_allocations(cache, input, patset, &Unenforced)
+    }
+
+    /// Run the original lazy search with prospective cache funding.
+    pub fn try_which_overlapping_matches_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        patset: &mut PatternSet,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         let mut state = OverlappingState::start();
         while let Some(m) = {
-            self.try_search_overlapping_fwd(cache, input, &mut state)?;
+            self.try_search_overlapping_fwd_with_allocations(cache, input, &mut state, funding)?;
             state.get_match()
         } {
             let _ = patset.try_insert(m.pattern());
@@ -1218,6 +1278,20 @@ impl DFA {
         current: LazyStateID,
         input: u8,
     ) -> Result<LazyStateID, CacheError> {
+        self.next_state_with_allocations(cache, current, input, &Unenforced)
+    }
+
+    /// Execute the original lazy-DFA worker with prospective storage admission.
+    pub fn next_state_with_allocations(
+        &self,
+        cache: &mut Cache,
+        current: LazyStateID,
+        input: u8,
+        funding: &dyn Allocation,
+    ) -> Result<LazyStateID, CacheError> {
+        if let Some(error) = cache.allocation_failure {
+            return Err(error.into());
+        }
         let class = usize::from(self.classes.get(input));
         let offset = current.as_usize_untagged() + class;
         let sid = cache.trans[offset];
@@ -1225,7 +1299,12 @@ impl DFA {
             return Ok(sid);
         }
         let unit = alphabet::Unit::u8(input);
-        Lazy::new(self, cache).cache_next_state(current, unit)
+        let result =
+            Lazy::new(self, cache, Allocator::new(funding)).cache_next_state(current, unit);
+        if let Err(ref error) = result {
+            cache.allocation_failure = error.allocation_error();
+        }
+        result
     }
 
     /// Transitions from the current state to the next state, given the next
@@ -1508,6 +1587,19 @@ impl DFA {
         cache: &mut Cache,
         current: LazyStateID,
     ) -> Result<LazyStateID, CacheError> {
+        self.next_eoi_state_with_allocations(cache, current, &Unenforced)
+    }
+
+    /// Execute the original lazy-DFA worker with prospective storage admission.
+    pub fn next_eoi_state_with_allocations(
+        &self,
+        cache: &mut Cache,
+        current: LazyStateID,
+        funding: &dyn Allocation,
+    ) -> Result<LazyStateID, CacheError> {
+        if let Some(error) = cache.allocation_failure {
+            return Err(error.into());
+        }
         let eoi = self.classes.eoi().as_usize();
         let offset = current.as_usize_untagged() + eoi;
         let sid = cache.trans[offset];
@@ -1515,7 +1607,12 @@ impl DFA {
             return Ok(sid);
         }
         let unit = self.classes.eoi();
-        Lazy::new(self, cache).cache_next_state(current, unit)
+        let result =
+            Lazy::new(self, cache, Allocator::new(funding)).cache_next_state(current, unit);
+        if let Err(ref error) = result {
+            cache.allocation_failure = error.allocation_error();
+        }
+        result
     }
 
     /// Return the ID of the start state for this lazy DFA for the given
@@ -1556,6 +1653,21 @@ impl DFA {
         cache: &mut Cache,
         config: &start::Config,
     ) -> Result<LazyStateID, StartError> {
+        self.start_state_with_allocations(cache, config, &Unenforced)
+    }
+
+    /// Execute the original lazy-DFA worker with prospective storage admission.
+    pub fn start_state_with_allocations(
+        &self,
+        cache: &mut Cache,
+        config: &start::Config,
+        funding: &dyn Allocation,
+    ) -> Result<LazyStateID, StartError> {
+        if cache.allocation_failure.is_some() {
+            cache
+                .reset_with_allocations(self, funding)
+                .map_err(StartError::cache)?;
+        }
         let lazy = LazyRef::new(self, cache);
         let anchored = config.get_anchored();
         let start = match config.get_look_behind() {
@@ -1571,7 +1683,12 @@ impl DFA {
         if !start_id.is_unknown() {
             return Ok(start_id);
         }
-        Lazy::new(self, cache).cache_start_group(anchored, start)
+        let result =
+            Lazy::new(self, cache, Allocator::new(funding)).cache_start_group(anchored, start);
+        if let Err(StartError::Cache { ref err }) = result {
+            cache.allocation_failure = err.allocation_error();
+        }
+        result
     }
 
     /// Return the ID of the start state for this lazy DFA when executing a
@@ -1595,20 +1712,32 @@ impl DFA {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Result<LazyStateID, MatchError> {
+        self.start_state_forward_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Execute the original lazy-DFA worker with prospective storage admission.
+    pub fn start_state_forward_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<LazyStateID, MatchError> {
         let config = start::Config::from_input_forward(input);
-        self.start_state(cache, &config).map_err(|err| match err {
-            StartError::Cache { .. } => MatchError::gave_up(input.start()),
-            StartError::Quit { byte } => {
-                let offset = input
-                    .start()
-                    .checked_sub(1)
-                    .expect("no quit in start without look-behind");
-                MatchError::quit(byte, offset)
-            }
-            StartError::UnsupportedAnchored { mode } => {
-                MatchError::unsupported_anchored(mode)
-            }
-        })
+        self.start_state_with_allocations(cache, &config, funding)
+            .map_err(|err| match err {
+                StartError::Cache { err } => err
+                    .allocation_error()
+                    .map(MatchError::from)
+                    .unwrap_or_else(|| MatchError::gave_up(input.start())),
+                StartError::Quit { byte } => {
+                    let offset = input
+                        .start()
+                        .checked_sub(1)
+                        .expect("no quit in start without look-behind");
+                    MatchError::quit(byte, offset)
+                }
+                StartError::UnsupportedAnchored { mode } => MatchError::unsupported_anchored(mode),
+            })
     }
 
     /// Return the ID of the start state for this lazy DFA when executing a
@@ -1632,17 +1761,29 @@ impl DFA {
         cache: &mut Cache,
         input: &Input<'_>,
     ) -> Result<LazyStateID, MatchError> {
+        self.start_state_reverse_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Execute the original lazy-DFA worker with prospective storage admission.
+    pub fn start_state_reverse_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        funding: &dyn Allocation,
+    ) -> Result<LazyStateID, MatchError> {
         let config = start::Config::from_input_reverse(input);
-        self.start_state(cache, &config).map_err(|err| match err {
-            StartError::Cache { .. } => MatchError::gave_up(input.end()),
-            StartError::Quit { byte } => {
-                let offset = input.end();
-                MatchError::quit(byte, offset)
-            }
-            StartError::UnsupportedAnchored { mode } => {
-                MatchError::unsupported_anchored(mode)
-            }
-        })
+        self.start_state_with_allocations(cache, &config, funding)
+            .map_err(|err| match err {
+                StartError::Cache { err } => err
+                    .allocation_error()
+                    .map(MatchError::from)
+                    .unwrap_or_else(|| MatchError::gave_up(input.end())),
+                StartError::Quit { byte } => {
+                    let offset = input.end();
+                    MatchError::quit(byte, offset)
+                }
+                StartError::UnsupportedAnchored { mode } => MatchError::unsupported_anchored(mode),
+            })
     }
 
     /// Returns the total number of patterns that match in this state.
@@ -1738,12 +1879,7 @@ impl DFA {
     /// match index is correct, then this routine always produces a valid
     /// `PatternID`.
     #[inline]
-    pub fn match_pattern(
-        &self,
-        cache: &Cache,
-        id: LazyStateID,
-        match_index: usize,
-    ) -> PatternID {
+    pub fn match_pattern(&self, cache: &Cache, id: LazyStateID, match_index: usize) -> PatternID {
         // This is an optimization for the very common case of a DFA with a
         // single pattern. This conditional avoids a somewhat more costly path
         // that finds the pattern ID from the corresponding `State`, which
@@ -1775,6 +1911,8 @@ impl DFA {
 /// or incorrect results.
 #[derive(Clone, Debug)]
 pub struct Cache {
+    // A refused mutation requires reset before a new search can reuse IDs.
+    allocation_failure: Option<AllocationError>,
     // N.B. If you're looking to understand how determinization works, it
     // is probably simpler to first grok src/dfa/determinize.rs, since that
     // doesn't have the "laziness" component.
@@ -1873,12 +2011,19 @@ impl Cache {
     /// If you want to reuse the cache for another DFA, then you must call
     /// [`Cache::reset`] with that DFA.
     pub fn new(dfa: &DFA) -> Cache {
+        Self::new_with_allocations(dfa, &Unenforced).expect("ordinary lazy cache allocation")
+    }
+
+    /// Create the original adaptive cache after admitting each reached destination.
+    pub fn new_with_allocations(dfa: &DFA, funding: &dyn Allocation) -> Result<Cache, CacheError> {
+        let allocation = Allocator::new(funding);
         let mut cache = Cache {
+            allocation_failure: None,
             trans: alloc::vec![],
             starts: alloc::vec![],
             states: alloc::vec![],
             states_to_id: StateMap::new(),
-            sparses: SparseSets::new(dfa.get_nfa().states().len()),
+            sparses: SparseSets::new_with_allocations(dfa.get_nfa().states().len(), funding)?,
             stack: alloc::vec![],
             scratch_state_builder: StateBuilderEmpty::new(),
             state_saver: StateSaver::none(),
@@ -1888,9 +2033,15 @@ impl Cache {
             progress: None,
         };
         debug!("pre-init lazy DFA cache size: {}", cache.memory_usage());
-        Lazy { dfa, cache: &mut cache }.init_cache();
+        let dead = State::dead_with_allocations(funding)?;
+        Lazy {
+            dfa,
+            cache: &mut cache,
+            allocation,
+        }
+        .init_cache(dead)?;
         debug!("post-init lazy DFA cache size: {}", cache.memory_usage());
-        cache
+        Ok(cache)
     }
 
     /// Reset this cache such that it can be used for searching with the given
@@ -1938,7 +2089,19 @@ impl Cache {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset(&mut self, dfa: &DFA) {
-        Lazy::new(dfa, self).reset_cache()
+        self.reset_with_allocations(dfa, &Unenforced)
+            .expect("lazy DFA cache allocation")
+    }
+
+    /// Reset through the same cache worker with prospective allocation funding.
+    pub fn reset_with_allocations(
+        &mut self,
+        dfa: &DFA,
+        funding: &dyn Allocation,
+    ) -> Result<(), CacheError> {
+        let result = Lazy::new(dfa, self, Allocator::new(funding)).reset_cache();
+        self.allocation_failure = result.as_ref().err().and_then(CacheError::allocation_error);
+        result
     }
 
     /// Initializes a new search starting at the given position.
@@ -1971,8 +2134,10 @@ impl Cache {
     /// This panics if no search has been started by [`Cache::search_start`].
     #[inline]
     pub fn search_update(&mut self, at: usize) {
-        let p =
-            self.progress.as_mut().expect("no in-progress search to update");
+        let p = self
+            .progress
+            .as_mut()
+            .expect("no in-progress search to update");
         p.at = at;
     }
 
@@ -1983,8 +2148,10 @@ impl Cache {
     /// This panics if no search has been started by [`Cache::search_start`].
     #[inline]
     pub fn search_finish(&mut self, at: usize) {
-        let mut p =
-            self.progress.take().expect("no in-progress search to finish");
+        let mut p = self
+            .progress
+            .take()
+            .expect("no in-progress search to finish");
         p.at = at;
         self.bytes_searched += p.len();
     }
@@ -2064,29 +2231,29 @@ impl SearchProgress {
     }
 }
 
-/// A map from states to state identifiers. When using std, we use a standard
-/// hashmap, since it's a bit faster for this use case. (Other maps, like
-/// one's based on FNV, have not yet been benchmarked.)
+/// A map from states to state identifiers with prospective table growth.
 ///
 /// The main purpose of this map is to reuse states where possible. This won't
 /// fully minimize the DFA, but it works well in a lot of cases.
-#[cfg(feature = "std")]
-type StateMap = std::collections::HashMap<State, LazyStateID>;
-#[cfg(not(feature = "std"))]
-type StateMap = alloc::collections::BTreeMap<State, LazyStateID>;
+type StateMap = hashbrown::HashMap<State, LazyStateID>;
 
 /// A type that groups methods that require the base NFA/DFA and writable
 /// access to the cache.
 #[derive(Debug)]
-struct Lazy<'i, 'c> {
+struct Lazy<'i, 'c, 'p> {
+    allocation: Allocator<'p>,
     dfa: &'i DFA,
     cache: &'c mut Cache,
 }
 
-impl<'i, 'c> Lazy<'i, 'c> {
+impl<'i, 'c, 'p> Lazy<'i, 'c, 'p> {
     /// Creates a new 'Lazy' wrapper for a DFA and its corresponding cache.
-    fn new(dfa: &'i DFA, cache: &'c mut Cache) -> Lazy<'i, 'c> {
-        Lazy { dfa, cache }
+    fn new(dfa: &'i DFA, cache: &'c mut Cache, allocation: Allocator<'p>) -> Lazy<'i, 'c, 'p> {
+        Lazy {
+            dfa,
+            cache,
+            allocation,
+        }
     }
 
     /// Return an immutable view by downgrading a writable cache to a read-only
@@ -2123,7 +2290,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
     ) -> Result<LazyStateID, CacheError> {
         let stride2 = self.dfa.stride2();
         let empty_builder = self.get_state_builder();
-        let builder = determinize::next(
+        let builder = determinize::next_with_allocations(
             self.dfa.get_nfa(),
             self.dfa.get_config().get_match_kind(),
             &mut self.cache.sparses,
@@ -2131,7 +2298,8 @@ impl<'i, 'c> Lazy<'i, 'c> {
             &self.cache.states[current.as_usize_untagged() >> stride2],
             unit,
             empty_builder,
-        );
+            self.allocation.policy(),
+        )?;
         // This is subtle, but if we *might* clear the cache, then we should
         // try to save the current state so that we can re-map its ID after
         // cache clearing. We *might* clear the cache when either the new
@@ -2213,34 +2381,28 @@ impl<'i, 'c> Lazy<'i, 'c> {
         nfa_start_id: NFAStateID,
         start: Start,
     ) -> Result<LazyStateID, CacheError> {
-        let mut builder_matches = self.get_state_builder().into_matches();
-        determinize::set_lookbehind_from_start(
-            self.dfa.get_nfa(),
-            &start,
-            &mut builder_matches,
-        );
+        let mut builder_matches = self
+            .get_state_builder()
+            .into_matches_with_allocations(self.allocation.policy())?;
+        determinize::set_lookbehind_from_start(self.dfa.get_nfa(), &start, &mut builder_matches);
         self.cache.sparses.set1.clear();
-        determinize::epsilon_closure(
+        determinize::epsilon_closure_with_allocations(
             self.dfa.get_nfa(),
             nfa_start_id,
             builder_matches.look_have(),
             &mut self.cache.stack,
             &mut self.cache.sparses.set1,
-        );
+            self.allocation.policy(),
+        )?;
         let mut builder = builder_matches.into_nfa();
-        determinize::add_nfa_states(
+        determinize::add_nfa_states_with_allocations(
             &self.dfa.get_nfa(),
             &self.cache.sparses.set1,
             &mut builder,
-        );
+            self.allocation.policy(),
+        )?;
         let tag_starts = self.dfa.get_config().get_specialize_start_states();
-        self.add_builder_state(builder, |id| {
-            if tag_starts {
-                id.to_start()
-            } else {
-                id
-            }
-        })
+        self.add_builder_state(builder, |id| if tag_starts { id.to_start() } else { id })
     }
 
     /// Either add the given builder state to this cache, or return an ID to an
@@ -2259,15 +2421,20 @@ impl<'i, 'c> Lazy<'i, 'c> {
         builder: StateBuilderNFA,
         idmap: impl Fn(LazyStateID) -> LazyStateID,
     ) -> Result<LazyStateID, CacheError> {
-        if let Some(&cached_id) =
-            self.cache.states_to_id.get(builder.as_bytes())
-        {
+        if let Some(&cached_id) = self.cache.states_to_id.get(builder.as_bytes()) {
             // Since we have a cached state, put the constructed state's
             // memory back into our scratch space, so that it can be reused.
             self.put_state_builder(builder);
             return Ok(cached_id);
         }
-        let result = self.add_state(builder.to_state(), idmap);
+        let state = match builder.to_state_with_allocations(self.allocation.policy()) {
+            Ok(state) => state,
+            Err(error) => {
+                self.put_state_builder(builder);
+                return Err(error.into());
+            }
+        };
+        let result = self.add_state(state, idmap);
         self.put_state_builder(builder);
         result
     }
@@ -2300,9 +2467,15 @@ impl<'i, 'c> Lazy<'i, 'c> {
         }
         // Add room in the transition table. Since this is a fresh state, all
         // of its transitions are unknown.
-        self.cache.trans.extend(
-            iter::repeat(self.as_ref().unknown_id()).take(self.dfa.stride()),
-        );
+        // Admit all replacement destinations before publishing a new state ID.
+        self.allocation
+            .grow(&mut self.cache.trans, self.dfa.stride())?;
+        self.allocation.grow(&mut self.cache.states, 1)?;
+        self.allocation
+            .prepare_insert(&mut self.cache.states_to_id, &state)?;
+        self.cache
+            .trans
+            .extend(iter::repeat(self.as_ref().unknown_id()).take(self.dfa.stride()));
         // When we add a sentinel state, we never want to set any quit
         // transitions. Technically, this is harmless, since sentinel states
         // have all of their transitions set to loop back to themselves. But
@@ -2363,8 +2536,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
             if self.cache.clear_count >= min_count {
                 if let Some(min_bytes_per) = c.get_minimum_bytes_per_state() {
                     let len = self.cache.search_total_len();
-                    let min_bytes =
-                        min_bytes_per.saturating_mul(self.cache.states.len());
+                    let min_bytes = min_bytes_per.saturating_mul(self.cache.states.len());
                     // If we've searched 0 bytes then probably something has
                     // gone wrong and the lazy DFA search implementation isn't
                     // correctly updating the search progress state.
@@ -2422,7 +2594,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
                 }
             }
         }
-        self.clear_cache();
+        self.clear_cache()?;
         Ok(())
     }
 
@@ -2433,15 +2605,18 @@ impl<'i, 'c> Lazy<'i, 'c> {
     /// Note that the caller may reset a cache with a different DFA than what
     /// it was created from. In which case, the cache can now be used with the
     /// new DFA (and not the old DFA).
-    fn reset_cache(&mut self) {
+    fn reset_cache(&mut self) -> Result<(), CacheError> {
         self.cache.state_saver = StateSaver::none();
-        self.clear_cache();
+        self.clear_cache()?;
         // If a new DFA is used, it might have a different number of NFA
         // states, so we need to make sure our sparse sets have the appropriate
         // size.
-        self.cache.sparses.resize(self.dfa.get_nfa().states().len());
+        self.cache
+            .sparses
+            .resize_with_allocations(self.dfa.get_nfa().states().len(), self.allocation.policy())?;
         self.cache.clear_count = 0;
         self.cache.progress = None;
+        Ok(())
     }
 
     /// Clear the cache used by this lazy DFA.
@@ -2454,7 +2629,13 @@ impl<'i, 'c> Lazy<'i, 'c> {
     ///
     /// Otherwise, any lazy state ID generated by the cache prior to resetting
     /// it is invalid after the reset.
-    fn clear_cache(&mut self) {
+    fn clear_cache(&mut self) -> Result<(), CacheError> {
+        // The three sentinels share this immutable empty powerset. Reuse it
+        // across clears instead of allocating an identical Arc every time.
+        let dead = match self.cache.states.first() {
+            Some(dead) => dead.clone(),
+            None => State::dead_with_allocations(self.allocation.policy())?,
+        };
         self.cache.trans.clear();
         self.cache.starts.clear();
         self.cache.states.clear();
@@ -2469,7 +2650,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
             "lazy DFA cache has been cleared (count: {})",
             self.cache.clear_count
         );
-        self.init_cache();
+        self.init_cache(dead)?;
         // If the state we want to save is one of the sentinel
         // (unknown/dead/quit) states, then 'init_cache' adds those back, and
         // their identifier values remains invariant. So there's no need to add
@@ -2486,24 +2667,20 @@ impl<'i, 'c> Lazy<'i, 'c> {
                 !self.as_ref().is_sentinel(old_id),
                 "cannot save sentinel state"
             );
-            let new_id = self
-                .add_state(state, |id| {
-                    if old_id.is_start() {
-                        // We don't need to consult the
-                        // 'specialize_start_states' config knob here, because
-                        // if it's disabled, old_id.is_start() will never
-                        // return true.
-                        id.to_start()
-                    } else {
-                        id
-                    }
-                })
-                // The unwrap here is OK because lazy DFA creation ensures that
-                // we have room in the cache to add MIN_STATES states. Since
-                // 'init_cache' above adds 3, this adds a 4th.
-                .expect("adding one state after cache clear must work");
+            let new_id = self.add_state(state, |id| {
+                if old_id.is_start() {
+                    // We don't need to consult the
+                    // 'specialize_start_states' config knob here, because
+                    // if it's disabled, old_id.is_start() will never
+                    // return true.
+                    id.to_start()
+                } else {
+                    id
+                }
+            })?;
             self.cache.state_saver = StateSaver::Saved(new_id);
         }
+        Ok(())
     }
 
     /// Initialize this cache from emptiness to a place where it can be used
@@ -2514,21 +2691,29 @@ impl<'i, 'c> Lazy<'i, 'c> {
     ///
     /// Primarily, this adds the three sentinel states and allocates some
     /// initial memory.
-    fn init_cache(&mut self) {
+    fn init_cache(&mut self, dead: State) -> Result<(), CacheError> {
         // Why multiply by 2 here? Because we make room for both the unanchored
         // and anchored start states. Unanchored is first and then anchored.
-        let mut starts_len = Start::len().checked_mul(2).unwrap();
+        let mut starts_len = Start::len()
+            .checked_mul(2)
+            .ok_or(AllocationError::SizeOverflow)?;
         // ... but if we also want start states for every pattern, we make room
         // for that too.
         if self.dfa.get_config().get_starts_for_each_pattern() {
-            starts_len += Start::len() * self.dfa.pattern_len();
+            starts_len = starts_len
+                .checked_add(
+                    Start::len()
+                        .checked_mul(self.dfa.pattern_len())
+                        .ok_or(AllocationError::SizeOverflow)?,
+                )
+                .ok_or(AllocationError::SizeOverflow)?;
         }
+        self.allocation.grow(&mut self.cache.starts, starts_len)?;
         self.cache
             .starts
             .extend(iter::repeat(self.as_ref().unknown_id()).take(starts_len));
         // This is the set of NFA states that corresponds to each of our three
         // sentinel states: the empty set.
-        let dead = State::dead();
         // This sets up some states that we use as sentinels that are present
         // in every DFA. While it would be technically possible to implement
         // this DFA without explicitly putting these states in the transition
@@ -2542,10 +2727,9 @@ impl<'i, 'c> Lazy<'i, 'c> {
         // search routine must explicitly check for these state types. (Sans
         // `unknown`, since that is only used internally to represent missing
         // states.)
-        let unk_id =
-            self.add_state(dead.clone(), |id| id.to_unknown()).unwrap();
-        let dead_id = self.add_state(dead.clone(), |id| id.to_dead()).unwrap();
-        let quit_id = self.add_state(dead.clone(), |id| id.to_quit()).unwrap();
+        let unk_id = self.add_state(dead.clone(), |id| id.to_unknown())?;
+        let dead_id = self.add_state(dead.clone(), |id| id.to_dead())?;
+        let quit_id = self.add_state(dead.clone(), |id| id.to_quit())?;
         assert_eq!(unk_id, self.as_ref().unknown_id());
         assert_eq!(dead_id, self.as_ref().dead_id());
         assert_eq!(quit_id, self.as_ref().quit_id());
@@ -2568,6 +2752,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
         // dead or not, and thus, whether to stop the search. Having a bunch of
         // distinct dead states would be quite wasteful!
         self.cache.states_to_id.insert(dead, dead_id);
+        Ok(())
     }
 
     /// Save the state corresponding to the ID given such that the state
@@ -2604,16 +2789,10 @@ impl<'i, 'c> Lazy<'i, 'c> {
     /// This panics if either 'from' or 'to' is invalid.
     ///
     /// All unit values are OK.
-    fn set_transition(
-        &mut self,
-        from: LazyStateID,
-        unit: alphabet::Unit,
-        to: LazyStateID,
-    ) {
+    fn set_transition(&mut self, from: LazyStateID, unit: alphabet::Unit, to: LazyStateID) {
         assert!(self.as_ref().is_valid(from), "invalid 'from' id: {from:?}");
         assert!(self.as_ref().is_valid(to), "invalid 'to' id: {to:?}");
-        let offset =
-            from.as_usize_untagged() + self.dfa.classes.get_by_unit(unit);
+        let offset = from.as_usize_untagged() + self.dfa.classes.get_by_unit(unit);
         self.cache.trans[offset] = to;
     }
 
@@ -2622,12 +2801,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
     ///
     /// This panics if 'id' is not valid or if a pattern ID is given and
     /// 'starts_for_each_pattern' is not enabled.
-    fn set_start_state(
-        &mut self,
-        anchored: Anchored,
-        start: Start,
-        id: LazyStateID,
-    ) {
+    fn set_start_state(&mut self, anchored: Anchored, start: Start, id: LazyStateID) {
         assert!(self.as_ref().is_valid(id));
         let start_index = start.as_usize();
         let index = match anchored {
@@ -2664,10 +2838,7 @@ impl<'i, 'c> Lazy<'i, 'c> {
     /// Note that building a 'State' from a builder always creates a new alloc,
     /// so callers should always put the builder back.
     fn put_state_builder(&mut self, builder: StateBuilderNFA) {
-        let _ = core::mem::replace(
-            &mut self.cache.scratch_state_builder,
-            builder.clear(),
-        );
+        let _ = core::mem::replace(&mut self.cache.scratch_state_builder, builder.clear());
     }
 }
 
@@ -2706,9 +2877,7 @@ impl<'i, 'c> LazyRef<'i, 'c> {
                 if pid.as_usize() >= self.dfa.pattern_len() {
                     return Ok(self.dead_id());
                 }
-                (2 * Start::len())
-                    + (Start::len() * pid.as_usize())
-                    + start_index
+                (2 * Start::len()) + (Start::len() * pid.as_usize()) + start_index
             }
         };
         Ok(self.cache.starts[index])
@@ -2770,8 +2939,8 @@ impl<'i, 'c> LazyRef<'i, 'c> {
 
     /// Returns true if adding the state given would fit in this cache.
     fn state_fits_in_cache(&self, state: &State) -> bool {
-        let needed = self.cache.memory_usage()
-            + self.memory_usage_for_one_more_state(state.memory_usage());
+        let needed =
+            self.cache.memory_usage() + self.memory_usage_for_one_more_state(state.memory_usage());
         trace!(
             "lazy DFA cache capacity state check: {:?} ?<=? {:?}",
             needed,
@@ -2796,10 +2965,7 @@ impl<'i, 'c> LazyRef<'i, 'c> {
     /// Returns the additional memory usage, in bytes, required to add one more
     /// state to this cache. The given size should be the heap size, in bytes,
     /// that would be used by the new state being added.
-    fn memory_usage_for_one_more_state(
-        &self,
-        state_heap_size: usize,
-    ) -> usize {
+    fn memory_usage_for_one_more_state(&self, state_heap_size: usize) -> usize {
         const ID_SIZE: usize = size_of::<LazyStateID>();
         const STATE_SIZE: usize = size_of::<State>();
 
@@ -3091,8 +3257,7 @@ impl Config {
     pub fn prefilter(mut self, pre: Option<Prefilter>) -> Config {
         self.pre = Some(pre);
         if self.specialize_start_states.is_none() {
-            self.specialize_start_states =
-                Some(self.get_prefilter().is_some());
+            self.specialize_start_states = Some(self.get_prefilter().is_some());
         }
         self
     }
@@ -3815,10 +3980,7 @@ impl Config {
     /// the instructions used in the given NFA. For example, if the NFA has a
     /// Unicode word boundary but this configuration does not enable heuristic
     /// support for Unicode word boundaries.
-    pub fn get_minimum_cache_capacity(
-        &self,
-        nfa: &thompson::NFA,
-    ) -> Result<usize, BuildError> {
+    pub fn get_minimum_cache_capacity(&self, nfa: &thompson::NFA) -> Result<usize, BuildError> {
         let quitset = self.quit_set_from_nfa(nfa)?;
         let classes = self.byte_classes_from_nfa(nfa, &quitset);
         let starts = self.get_starts_for_each_pattern();
@@ -3829,11 +3991,7 @@ impl Config {
     ///
     /// If byte classes are disabled on this configuration, then a map is
     /// returned that puts each byte in its own equivalent class.
-    fn byte_classes_from_nfa(
-        &self,
-        nfa: &thompson::NFA,
-        quit: &ByteSet,
-    ) -> ByteClasses {
+    fn byte_classes_from_nfa(&self, nfa: &thompson::NFA, quit: &ByteSet) -> ByteClasses {
         if !self.get_byte_classes() {
             // The lazy DFA will always use the equivalence class map, but
             // enabling this option is useful for debugging. Namely, this will
@@ -3863,10 +4021,7 @@ impl Config {
     /// This may return an error if the NFA is incompatible with this
     /// configuration's quit set. For example, if the NFA has a Unicode word
     /// boundary and the quit set doesn't include non-ASCII bytes.
-    fn quit_set_from_nfa(
-        &self,
-        nfa: &thompson::NFA,
-    ) -> Result<ByteSet, BuildError> {
+    fn quit_set_from_nfa(&self, nfa: &thompson::NFA) -> Result<ByteSet, BuildError> {
         let mut quit = self.quitset.unwrap_or(ByteSet::empty());
         if nfa.look_set_any().contains_word_unicode() {
             if self.get_unicode_word_boundary() {
@@ -3880,9 +4035,7 @@ impl Config {
                 // DFA to quit on at least all non-ASCII bytes, then that's all
                 // we need for heuristic support to work.
                 if !quit.contains_range(0x80, 0xFF) {
-                    return Err(
-                        BuildError::unsupported_dfa_word_boundary_unicode(),
-                    );
+                    return Err(BuildError::unsupported_dfa_word_boundary_unicode());
                 }
             }
         }
@@ -3897,17 +4050,11 @@ impl Config {
         Config {
             match_kind: o.match_kind.or(self.match_kind),
             pre: o.pre.or_else(|| self.pre.clone()),
-            starts_for_each_pattern: o
-                .starts_for_each_pattern
-                .or(self.starts_for_each_pattern),
+            starts_for_each_pattern: o.starts_for_each_pattern.or(self.starts_for_each_pattern),
             byte_classes: o.byte_classes.or(self.byte_classes),
-            unicode_word_boundary: o
-                .unicode_word_boundary
-                .or(self.unicode_word_boundary),
+            unicode_word_boundary: o.unicode_word_boundary.or(self.unicode_word_boundary),
             quitset: o.quitset.or(self.quitset),
-            specialize_start_states: o
-                .specialize_start_states
-                .or(self.specialize_start_states),
+            specialize_start_states: o.specialize_start_states.or(self.specialize_start_states),
             cache_capacity: o.cache_capacity.or(self.cache_capacity),
             skip_cache_capacity_check: o
                 .skip_cache_capacity_check
@@ -3915,9 +4062,7 @@ impl Config {
             minimum_cache_clear_count: o
                 .minimum_cache_clear_count
                 .or(self.minimum_cache_clear_count),
-            minimum_bytes_per_state: o
-                .minimum_bytes_per_state
-                .or(self.minimum_bytes_per_state),
+            minimum_bytes_per_state: o.minimum_bytes_per_state.or(self.minimum_bytes_per_state),
         }
     }
 }
@@ -4018,20 +4163,24 @@ impl Builder {
     /// When matches are returned, the pattern ID corresponds to the index of
     /// the pattern in the slice given.
     #[cfg(feature = "syntax")]
-    pub fn build_many<P: AsRef<str>>(
+    pub fn build_many<P: AsRef<str>>(&self, patterns: &[P]) -> Result<DFA, BuildError> {
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Compile through the original Thompson producer with allocation funding.
+    #[cfg(feature = "syntax")]
+    pub fn build_many_with_allocations<P: AsRef<str>>(
         &self,
         patterns: &[P],
+        funding: &dyn Allocation,
     ) -> Result<DFA, BuildError> {
         let nfa = self
             .thompson
-            .clone()
+            .fresh()
             // We can always forcefully disable captures because DFAs do not
             // support them.
-            .configure(
-                thompson::Config::new()
-                    .which_captures(thompson::WhichCaptures::None),
-            )
-            .build_many(patterns)
+            .configure(thompson::Config::new().which_captures(thompson::WhichCaptures::None))
+            .build_many_with_allocations(patterns, funding)
             .map_err(BuildError::nfa)?;
         self.build_from_nfa(nfa)
     }
@@ -4069,10 +4218,7 @@ impl Builder {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn build_from_nfa(
-        &self,
-        nfa: thompson::NFA,
-    ) -> Result<DFA, BuildError> {
+    pub fn build_from_nfa(&self, nfa: thompson::NFA) -> Result<DFA, BuildError> {
         let quitset = self.config.quit_set_from_nfa(&nfa)?;
         let classes = self.config.byte_classes_from_nfa(&nfa, &quitset);
         // Check that we can fit at least a few states into our cache,
@@ -4085,11 +4231,8 @@ impl Builder {
         // to be careful not to panic in other areas of the code (the cache
         // clearing and init code) that tend to assume some minimum useful
         // cache capacity.
-        let min_cache = minimum_cache_capacity(
-            &nfa,
-            &classes,
-            self.config.get_starts_for_each_pattern(),
-        );
+        let min_cache =
+            minimum_cache_capacity(&nfa, &classes, self.config.get_starts_for_each_pattern());
         let mut cache_capacity = self.config.get_cache_capacity();
         if cache_capacity < min_cache {
             // When the caller has asked us to skip the cache capacity check,
@@ -4144,10 +4287,7 @@ impl Builder {
     /// These settings only apply when constructing a lazy DFA directly from a
     /// pattern.
     #[cfg(feature = "syntax")]
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Builder {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Builder {
         self.thompson.syntax(config);
         self
     }
@@ -4298,9 +4438,7 @@ where
 /// It's not likely for this to have any impact 32-bit systems (or higher), but
 /// on 16-bit systems, the lazy state ID space is quite constrained and thus
 /// may be insufficient if our MIN_STATES value is (for some reason) too high.
-fn minimum_lazy_state_id(
-    classes: &ByteClasses,
-) -> Result<LazyStateID, LazyStateIDError> {
+fn minimum_lazy_state_id(classes: &ByteClasses) -> Result<LazyStateID, LazyStateIDError> {
     let stride = 1 << classes.stride2();
     let min_state_index = MIN_STATES.checked_sub(1).unwrap();
     LazyStateID::new(min_state_index * stride)
@@ -4356,7 +4494,10 @@ fn minimum_cache_capacity(
     // loop where we try to add a 5th state, which gets rejected, which clears
     // the cache, which adds back a saved state (4th total state) which then
     // tries to add the 5th state again.
-    assert!(MIN_STATES >= 5, "minimum number of states has to be at least 5");
+    assert!(
+        MIN_STATES >= 5,
+        "minimum number of states has to be at least 5"
+    );
     // The minimum number of non-sentinel states. We consider this separately
     // because sentinel states are much smaller in that they contain no NFA
     // states. Given our aggressive calculation here, it's worth being more
@@ -4382,13 +4523,7 @@ fn minimum_cache_capacity(
     let stack = states_len * NFAStateID::SIZE;
     let scratch_state_builder = max_state_size;
 
-    trans
-        + starts
-        + states
-        + states_to_sid
-        + sparses
-        + stack
-        + scratch_state_builder
+    trans + starts + states + states_to_sid + sparses + stack + scratch_state_builder
 }
 
 #[cfg(all(test, feature = "syntax"))]
@@ -4430,5 +4565,17 @@ mod tests {
         let expected = MatchError::quit(0xCE, 3);
         let got = dfa.try_search_rev(&mut cache, &input);
         assert_eq!(Err(expected), got);
+    }
+}
+
+#[cfg(all(test, feature = "syntax"))]
+mod allocation_tests;
+
+impl DFA {
+    /// Visit shared immutable NFA and prefilter ownership, excluding caches.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        self.nfa.visit_source_storage(visitor)?;
+        if let Some(pre) = self.config.get_prefilter() { pre.visit_source_storage(visitor)?; }
+        Ok(())
     }
 }

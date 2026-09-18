@@ -172,7 +172,7 @@ pub use draft::{DraftGroupExecutionError, DraftStateTransaction, execute_draft_g
 pub use execution::{
     ArchitectureExecutionGraph, ExecutionGraph, ExecutionGraphError, ExecutionGroupId,
     ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,
-    ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
+    ExecutionUnitLayout, ExecutionUnitLayoutError, GroupSubmissionMechanism, ReadyGroupState,
 };
 pub use execution_plan::{
     ExecutionPlanLoadError, ResidencyDiagnostics, execution_plan_quantization,
@@ -242,11 +242,11 @@ pub use mechanism_synthesis::{
     synthesize_replicated_text_capabilities,
 };
 pub use parallel::{
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError, PartitionChunkRangeError, ParallelLayoutStorageError,
     ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
     TensorPlacement, aligned_partition_units, aligned_partition_units_with_metadata,
     aligned_partition_units_with_tail, derive_transform_source_layout,
-    expand_linear_format_parameter_groups, module_parameter_group,
+    expand_linear_format_parameter_groups, expand_linear_format_parameter_groups_with_metadata, module_parameter_group,
     module_parameter_group_with_metadata, partition_chunk_range, partition_parameter_group_chunks,
     partition_parameter_group_chunks_with_metadata, partition_parameter_group_chunks_with_source,
     partitioned_module_parameter_group, partitioned_module_parameter_group_with_metadata,
@@ -357,6 +357,7 @@ pub use replicated_session::{
     DirectReplicatedTextExecution, DistributedSessionCheckpoint, DistributedStateCheckpoint,
     PartitionedRuntimeConstructionError, PartitionedSessionFactoryInput,
     PartitionedSessionPreparationError, PartitionedUnitScope, PredictionTargetOperation,
+    PredictionStateLoanError,
     PreparedContractMaterialization, PreparedPartitionedRuntimeComponents,
     PreparedPartitionedSessionRuntime, PreparedReplicatedTextContract,
     PreparedReplicatedTextExecutionGeometry, PreparedSessionObservationError,

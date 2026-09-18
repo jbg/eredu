@@ -53,15 +53,15 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(bytes)
             })
             .map(|_| ())
-            .map_err(|left| WorkspaceMetadataFundingError::Capacity {
+            .map_err(|left| HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: left as u64,
             })
@@ -74,14 +74,14 @@ impl Drop for Account {
 }
 struct Retained<T> {
     value: T,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn rows(value: &impl Parameterized<WorkspaceTensor>) -> Vec<(String, Vec<i32>, WorkspaceDtype)> {
     struct Rows(Vec<(String, Vec<i32>, WorkspaceDtype)>);
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Rows {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a WorkspaceTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
             self.0.push((
-                metadata.id.as_str().to_owned(),
+                metadata.id().as_str().to_owned(),
                 value.shape().to_vec(),
                 value.layout().dtype(),
             ));
@@ -120,7 +120,7 @@ fn args(fused: bool) -> V4Args {
 fn auxiliary_count(module: &impl Parameterized<WorkspaceTensor>) -> usize {
     struct P(Vec<*const WorkspaceTensor>);
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for P {
-        fn visit(&mut self, _: ParameterMetadata, v: &'a WorkspaceTensor) {
+        fn visit(&mut self, _: eredu_nn::ParameterMetadataView<'_>, v: &'a WorkspaceTensor) {
             self.0.push(v);
         }
     }
@@ -211,7 +211,7 @@ fn retained_v4_factories_preserve_pooling_hyper_dspark_and_original_copy_retirem
             remaining: AtomicUsize::new(usize::MAX),
             retired: AtomicBool::new(false),
         });
-        let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+        let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
         let context = WorkspaceContext::new_with_metadata_funding(Facts, funding).unwrap();
         let units = specs
             .iter()
@@ -286,7 +286,7 @@ fn retained_v4_factories_preserve_pooling_hyper_dspark_and_original_copy_retirem
                 .err()
                 .unwrap()
                 .into_metadata_funding_error(),
-            Ok(WorkspaceMetadataFundingError::Capacity { .. })
+            Ok(HostMetadataFundingError::Capacity { .. })
         ));
         assert_eq!(context.metadata_census().unwrap().context_bytes(), consumed);
         drop((specs, target_specs, strategy, context));
@@ -302,24 +302,30 @@ fn routed_v4_metadata_preserves_pooling_segments_identity_and_group_order() {
         let args = args(fused);
         let expected = state_layout(&args).unwrap();
         let expected_identity = state_identity(&args, &expected, 0, Default::default()).unwrap();
-        let expected_graph = super::super::prediction_groups(&args, None).unwrap().execution_graph().unwrap();
+        let expected_graph = super::super::prediction_groups(&args, None).unwrap().execution_graph().unwrap().into_owned();
         let state = Arc::new(State {
             remaining: AtomicUsize::new(usize::MAX),
             retired: AtomicBool::new(false),
         });
-        let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+        let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
         let context = WorkspaceContext::new_with_metadata_funding(Facts, funding.clone()).unwrap();
         let before = state.remaining.load(Ordering::SeqCst);
         let actual = super::super::state_layout_with_metadata(&args, &context).unwrap();
         let actual_identity = super::super::state_identity_with_metadata(
             &args, &actual, 0, Default::default(), &context).unwrap();
         let groups = super::super::prediction_groups(&args, Some(&context)).unwrap();
-        let graph = groups.execution_graph_with_metadata(&context).unwrap().into_owned().unwrap();
+        let declaration_budget = state.remaining.load(Ordering::SeqCst);
+        let declaration = groups.execution_graph().unwrap();
+        let second_declaration = groups.execution_graph().unwrap();
+        assert!(std::ptr::eq(declaration.group_id(0).unwrap(), second_declaration.group_id(0).unwrap()));
+        assert_eq!(state.remaining.load(Ordering::SeqCst), declaration_budget);
+        let graph = declaration.into_owned_with_metadata(&context).unwrap();
+        assert!(state.remaining.load(Ordering::SeqCst) < declaration_budget);
         assert_eq!(actual, expected);
         assert_eq!(actual_identity, expected_identity);
         assert_eq!(graph, expected_graph);
-        assert_eq!(groups.unit_path(0, 2).unwrap(), "layers.2");
-        assert_eq!(groups.unit_path(3, 0).unwrap(), "mtp.2");
+        assert_eq!(groups.unit_path(0, 2, None).unwrap(), "layers.2");
+        assert_eq!(groups.unit_path(3, 0, None).unwrap(), "mtp.2");
         assert!(state.remaining.load(Ordering::SeqCst) < before);
         let retained = Retained { value: (actual, actual_identity, groups, graph), _funding: funding };
         drop(context);
@@ -332,7 +338,7 @@ fn routed_v4_metadata_preserves_pooling_segments_identity_and_group_order() {
         remaining: AtomicUsize::new(usize::MAX), retired: AtomicBool::new(false),
     });
     let context = WorkspaceContext::new_with_metadata_funding(Facts,
-        WorkspaceMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
+        HostMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
     state.remaining.store(0, Ordering::SeqCst);
     assert!(super::super::state_layout_with_metadata(&args(true), &context).is_err());
     assert_eq!(state.remaining.load(Ordering::SeqCst), 0);
@@ -354,7 +360,7 @@ fn retained_v4_target_source_preserves_local_pooling_hyper_and_companions() {
     model.install_construction_units(Some(source)).unwrap();
     let state = Arc::new(State { remaining: AtomicUsize::new(usize::MAX), retired: AtomicBool::new(false) });
     let context = WorkspaceContext::new_with_metadata_funding(Facts,
-        WorkspaceMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
+        HostMetadataFunding::new(Account(state.clone())).unwrap()).unwrap();
     let units = (0..3).map(|index| model.construct_unit(0,index,&context).unwrap()).collect::<Vec<_>>();
     assert_eq!(units.iter().map(rows).collect::<Vec<_>>(), expected);
     assert_eq!(units.iter().map(auxiliary_count).collect::<Vec<_>>(), vec![1,3,2]);

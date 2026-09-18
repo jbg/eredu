@@ -1,3 +1,4 @@
+use crate::util::allocation::{AllocationError, Allocator};
 /*
 I've called the primary data structure in this module a "range trie." As far
 as I can tell, there is no prior art on a data structure like this, however,
@@ -220,31 +221,32 @@ struct Transition {
 impl RangeTrie {
     /// Create a new empty range trie.
     pub fn new() -> RangeTrie {
-        let mut trie = RangeTrie {
+        RangeTrie {
             states: vec![],
             free: vec![],
             iter_stack: RefCell::new(vec![]),
             iter_ranges: RefCell::new(vec![]),
             dupe_stack: vec![],
             insert_stack: vec![],
-        };
-        trie.clear();
-        trie
+        }
     }
 
     /// Clear this range trie such that it is empty. Clearing a range trie
     /// and reusing it can beneficial because this may reuse allocations.
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self, allocation: Allocator<'_>) -> Result<(), AllocationError> {
+        allocation.grow(&mut self.free, self.states.len())?;
         self.free.append(&mut self.states);
-        self.add_empty(); // final
-        self.add_empty(); // root
+        self.add_empty(allocation)?; // final
+        self.add_empty(allocation)?; // root
+        Ok(())
     }
 
     /// Iterate over all of the sequences of byte ranges in this trie, and
     /// call the provided function for each sequence. Iteration occurs in
     /// lexicographic order.
-    pub fn iter<E, F: FnMut(&[Utf8Range]) -> Result<(), E>>(
+    pub fn iter<E: From<AllocationError>, F: FnMut(&[Utf8Range]) -> Result<(), E>>(
         &self,
+        allocation: Allocator<'_>,
         mut f: F,
     ) -> Result<(), E> {
         let mut stack = self.iter_stack.borrow_mut();
@@ -255,8 +257,18 @@ impl RangeTrie {
         // We do iteration in a way that permits us to use a single buffer
         // for our keys. We iterate in a depth first fashion, while being
         // careful to expand our frontier as we move deeper in the trie.
-        stack.push(NextIter { state_id: ROOT, tidx: 0 });
-        while let Some(NextIter { mut state_id, mut tidx }) = stack.pop() {
+        allocation.push(
+            &mut stack,
+            NextIter {
+                state_id: ROOT,
+                tidx: 0,
+            },
+        )?;
+        while let Some(NextIter {
+            mut state_id,
+            mut tidx,
+        }) = stack.pop()
+        {
             // This could be implemented more simply without an inner loop
             // here, but at the cost of more stack pushes.
             loop {
@@ -269,7 +281,7 @@ impl RangeTrie {
                 }
 
                 let t = &state.transitions[tidx];
-                ranges.push(t.range);
+                allocation.push(&mut ranges, t.range)?;
                 if t.next_id == FINAL {
                     f(&ranges)?;
                     ranges.pop();
@@ -277,7 +289,13 @@ impl RangeTrie {
                 } else {
                     // Expand our frontier. Once we come back to this state
                     // via the stack, start in on the next transition.
-                    stack.push(NextIter { state_id, tidx: tidx + 1 });
+                    allocation.push(
+                        &mut stack,
+                        NextIter {
+                            state_id,
+                            tidx: tidx + 1,
+                        },
+                    )?;
                     // Otherwise, move to the first transition of the next
                     // state.
                     state_id = t.next_id;
@@ -292,14 +310,18 @@ impl RangeTrie {
     ///
     /// The sequence given must be non-empty and must not have a length
     /// exceeding 4.
-    pub fn insert(&mut self, ranges: &[Utf8Range]) {
+    pub fn insert(
+        &mut self,
+        ranges: &[Utf8Range],
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
         assert!(!ranges.is_empty());
         assert!(ranges.len() <= 4);
 
         let mut stack = core::mem::replace(&mut self.insert_stack, vec![]);
         stack.clear();
 
-        stack.push(NextInsert::new(ROOT, ranges));
+        allocation.push(&mut stack, NextInsert::new(ROOT, ranges))?;
         while let Some(next) = stack.pop() {
             let (state_id, ranges) = (next.state_id(), next.ranges());
             assert!(!ranges.is_empty());
@@ -316,8 +338,8 @@ impl RangeTrie {
             // In this case, there is no overlap *and* the new range is greater
             // than all existing ranges. So we can just add it to the end.
             if i == self.state(state_id).transitions.len() {
-                let next_id = NextInsert::push(self, &mut stack, rest);
-                self.add_transition(state_id, new, next_id);
+                let next_id = NextInsert::push(self, &mut stack, rest, allocation)?;
+                self.add_transition(state_id, new, next_id, allocation)?;
                 continue;
             }
 
@@ -332,8 +354,8 @@ impl RangeTrie {
                 let split = match Split::new(old.range, new) {
                     Some(split) => split,
                     None => {
-                        let next_id = NextInsert::push(self, &mut stack, rest);
-                        self.add_transition_at(i, state_id, new, next_id);
+                        let next_id = NextInsert::push(self, &mut stack, rest, allocation)?;
+                        self.add_transition_at(i, state_id, new, next_id, allocation)?;
                         continue;
                     }
                 };
@@ -344,7 +366,7 @@ impl RangeTrie {
                 if splits.len() == 1 {
                     // ... but only if we have anything left to do.
                     if !rest.is_empty() {
-                        stack.push(NextInsert::new(old.next_id, rest));
+                        allocation.push(&mut stack, NextInsert::new(old.next_id, rest))?;
                     }
                     break;
                 }
@@ -358,13 +380,14 @@ impl RangeTrie {
                 // insert. After that, we're forced to do expensive inserts.
                 let mut first = true;
                 let mut add_trans =
-                    |trie: &mut RangeTrie, pos, from, range, to| {
+                    |trie: &mut RangeTrie, pos, from, range, to| -> Result<(), AllocationError> {
                         if first {
                             trie.set_transition_at(pos, from, range, to);
                             first = false;
                         } else {
-                            trie.add_transition_at(pos, from, range, to);
+                            trie.add_transition_at(pos, from, range, to, allocation)?;
                         }
+                        Ok(())
                     };
                 for (j, &srange) in splits.iter().enumerate() {
                     match srange {
@@ -376,8 +399,8 @@ impl RangeTrie {
                             // via the 'both' partition to impact the part of
                             // the transition that doesn't overlap with the
                             // new range.
-                            let dup_id = self.duplicate(old.next_id);
-                            add_trans(self, i, state_id, r, dup_id);
+                            let dup_id = self.duplicate(old.next_id, allocation)?;
+                            add_trans(self, i, state_id, r, dup_id)?;
                         }
                         SplitRange::New(r) => {
                             // This is a bit subtle, but if this happens to be
@@ -400,18 +423,17 @@ impl RangeTrie {
                             // ... otherwise, setup exploration for a new
                             // empty state and add a brand new transition for
                             // this new range.
-                            let next_id =
-                                NextInsert::push(self, &mut stack, rest);
-                            add_trans(self, i, state_id, r, next_id);
+                            let next_id = NextInsert::push(self, &mut stack, rest, allocation)?;
+                            add_trans(self, i, state_id, r, next_id)?;
                         }
                         SplitRange::Both(r) => {
                             // Continue adding the remaining ranges on this
                             // path and update the transition with the new
                             // range.
                             if !rest.is_empty() {
-                                stack.push(NextInsert::new(old.next_id, rest));
+                                allocation.push(&mut stack, NextInsert::new(old.next_id, rest))?;
                             }
-                            add_trans(self, i, state_id, r, old.next_id);
+                            add_trans(self, i, state_id, r, old.next_id)?;
                         }
                     }
                     i += 1;
@@ -423,9 +445,10 @@ impl RangeTrie {
             }
         }
         self.insert_stack = stack;
+        Ok(())
     }
 
-    pub fn add_empty(&mut self) -> StateID {
+    pub fn add_empty(&mut self, allocation: Allocator<'_>) -> Result<StateID, AllocationError> {
         let id = match StateID::try_from(self.states.len()) {
             Ok(id) => id,
             Err(_) => {
@@ -433,18 +456,23 @@ impl RangeTrie {
                 // only ever used to compile a single sequence of Unicode
                 // scalar values. If we ever got to this point, we would, at
                 // *minimum*, be using 96GB in just the range trie alone.
-                panic!("too many sequences added to range trie");
+                return Err(AllocationError::SizeOverflow);
             }
         };
         // If we have some free states available, then use them to avoid
         // more allocations.
         if let Some(mut state) = self.free.pop() {
             state.clear();
-            self.states.push(state);
+            allocation.push(&mut self.states, state)?;
         } else {
-            self.states.push(State { transitions: vec![] });
+            allocation.push(
+                &mut self.states,
+                State {
+                    transitions: vec![],
+                },
+            )?;
         }
-        id
+        Ok(id)
     }
 
     /// Performs a deep clone of the given state and returns the duplicate's
@@ -463,38 +491,45 @@ impl RangeTrie {
     /// There's one exception: if old_id is the final state, then it is not
     /// duplicated and the same final state is returned. This is because all
     /// final states in this trie are equivalent.
-    fn duplicate(&mut self, old_id: StateID) -> StateID {
+    fn duplicate(
+        &mut self,
+        old_id: StateID,
+        allocation: Allocator<'_>,
+    ) -> Result<StateID, AllocationError> {
         if old_id == FINAL {
-            return FINAL;
+            return Ok(FINAL);
         }
 
         let mut stack = mem::replace(&mut self.dupe_stack, vec![]);
         stack.clear();
 
-        let new_id = self.add_empty();
+        let new_id = self.add_empty(allocation)?;
         // old_id is the state we're cloning and new_id is the ID of the
         // duplicated state for old_id.
-        stack.push(NextDupe { old_id, new_id });
+        allocation.push(&mut stack, NextDupe { old_id, new_id })?;
         while let Some(NextDupe { old_id, new_id }) = stack.pop() {
             for i in 0..self.state(old_id).transitions.len() {
                 let t = self.state(old_id).transitions[i].clone();
                 if t.next_id == FINAL {
                     // All final states are the same, so there's no need to
                     // duplicate it.
-                    self.add_transition(new_id, t.range, FINAL);
+                    self.add_transition(new_id, t.range, FINAL, allocation)?;
                     continue;
                 }
 
-                let new_child_id = self.add_empty();
-                self.add_transition(new_id, t.range, new_child_id);
-                stack.push(NextDupe {
-                    old_id: t.next_id,
-                    new_id: new_child_id,
-                });
+                let new_child_id = self.add_empty(allocation)?;
+                self.add_transition(new_id, t.range, new_child_id, allocation)?;
+                allocation.push(
+                    &mut stack,
+                    NextDupe {
+                        old_id: t.next_id,
+                        new_id: new_child_id,
+                    },
+                )?;
             }
         }
         self.dupe_stack = stack;
-        new_id
+        Ok(new_id)
     }
 
     /// Adds the given transition to the given state.
@@ -506,10 +541,12 @@ impl RangeTrie {
         from_id: StateID,
         range: Utf8Range,
         next_id: StateID,
-    ) {
-        self.state_mut(from_id)
-            .transitions
-            .push(Transition { range, next_id });
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
+        allocation.push(
+            &mut self.state_mut(from_id).transitions,
+            Transition { range, next_id },
+        )
     }
 
     /// Like `add_transition`, except this inserts the transition just before
@@ -520,10 +557,12 @@ impl RangeTrie {
         from_id: StateID,
         range: Utf8Range,
         next_id: StateID,
-    ) {
-        self.state_mut(from_id)
-            .transitions
-            .insert(i, Transition { range, next_id });
+        allocation: Allocator<'_>,
+    ) -> Result<(), AllocationError> {
+        let transitions = &mut self.state_mut(from_id).transitions;
+        allocation.grow(transitions, 1)?;
+        transitions.insert(i, Transition { range, next_id });
+        Ok(())
     }
 
     /// Overwrites the transition at position i with the given transition.
@@ -648,7 +687,11 @@ impl NextInsert {
 
         let mut tmp = [Utf8Range { start: 0, end: 0 }; 4];
         tmp[..len].copy_from_slice(ranges);
-        NextInsert { state_id, ranges: tmp, len: u8::try_from(len).unwrap() }
+        NextInsert {
+            state_id,
+            ranges: tmp,
+            len: u8::try_from(len).unwrap(),
+        }
     }
 
     /// Push a new empty state to visit along with any remaining ranges that
@@ -659,13 +702,14 @@ impl NextInsert {
         trie: &mut RangeTrie,
         stack: &mut Vec<NextInsert>,
         ranges: &[Utf8Range],
-    ) -> StateID {
+        allocation: Allocator<'_>,
+    ) -> Result<StateID, AllocationError> {
         if ranges.is_empty() {
-            FINAL
+            Ok(FINAL)
         } else {
-            let next_id = trie.add_empty();
-            stack.push(NextInsert::new(next_id, ranges));
-            next_id
+            let next_id = trie.add_empty(allocation)?;
+            allocation.push(stack, NextInsert::new(next_id, ranges))?;
+            Ok(next_id)
         }
     }
 
@@ -843,19 +887,28 @@ impl Split {
     fn parts1(r1: SplitRange) -> Split {
         // This value doesn't matter since it is never accessed.
         let nada = SplitRange::Old(Utf8Range { start: 0, end: 0 });
-        Split { partitions: [r1, nada, nada], len: 1 }
+        Split {
+            partitions: [r1, nada, nada],
+            len: 1,
+        }
     }
 
     /// Create a new split with two partitions.
     fn parts2(r1: SplitRange, r2: SplitRange) -> Split {
         // This value doesn't matter since it is never accessed.
         let nada = SplitRange::Old(Utf8Range { start: 0, end: 0 });
-        Split { partitions: [r1, r2, nada], len: 2 }
+        Split {
+            partitions: [r1, r2, nada],
+            len: 2,
+        }
     }
 
     /// Create a new split with three partitions.
     fn parts3(r1: SplitRange, r2: SplitRange, r3: SplitRange) -> Split {
-        Split { partitions: [r1, r2, r3], len: 3 }
+        Split {
+            partitions: [r1, r2, r3],
+            len: 3,
+        }
     }
 
     /// Return the partitions in this split as a slice.
@@ -918,20 +971,17 @@ mod tests {
     use super::*;
 
     fn r(range: RangeInclusive<u8>) -> Utf8Range {
-        Utf8Range { start: *range.start(), end: *range.end() }
+        Utf8Range {
+            start: *range.start(),
+            end: *range.end(),
+        }
     }
 
-    fn split_maybe(
-        old: RangeInclusive<u8>,
-        new: RangeInclusive<u8>,
-    ) -> Option<Split> {
+    fn split_maybe(old: RangeInclusive<u8>, new: RangeInclusive<u8>) -> Option<Split> {
         Split::new(r(old), r(new))
     }
 
-    fn split(
-        old: RangeInclusive<u8>,
-        new: RangeInclusive<u8>,
-    ) -> Vec<SplitRange> {
+    fn split(old: RangeInclusive<u8>, new: RangeInclusive<u8>) -> Vec<SplitRange> {
         split_maybe(old, new).unwrap().as_slice().to_vec()
     }
 

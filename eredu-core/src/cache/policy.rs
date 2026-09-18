@@ -498,7 +498,7 @@ impl LayerCachePolicy {
     /// Runs the same constructor with a caller-owned diagnostic destination.
     pub fn fixed_only_with_diagnostic<E>(
         tensors: Vec<StateTensorPolicy>,
-        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+        error: impl FnMut(std::fmt::Arguments<'_>) -> E,
     ) -> Result<Self, E> {
         let policy = Self::FixedState { tensors };
         policy.validate_with_diagnostic(error)?;

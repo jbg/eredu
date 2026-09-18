@@ -95,24 +95,18 @@ impl Clone for ExecutionGraph {
 
 /// Actual architecture-owned graph used for allocation-free geometry comparison.
 /// A single-group declaration validates its own identifier; the selected graph is
-/// only the comparison operand. Owned is the compatibility path for existing producers.
+/// only the comparison operand. Owning callers explicitly copy this declaration.
 pub struct ArchitectureExecutionGraph<'a>(ArchitectureExecutionGraphKind<'a>);
 enum ArchitectureExecutionGraphKind<'a> {
     /// A validated graph retained by the actual architecture.
     Borrowed(&'a ExecutionGraph),
     /// One validated source group with no dependencies.
     Single(&'a str),
-    /// The existing owned graph producer.
-    Owned(ExecutionGraph),
 }
 impl<'a> ArchitectureExecutionGraph<'a> {
     /// Borrows a validated graph retained by the actual architecture.
     pub fn borrowed(graph: &'a ExecutionGraph) -> Self {
         Self(ArchitectureExecutionGraphKind::Borrowed(graph))
-    }
-    /// Retains the compatibility producer's existing owned graph.
-    pub fn owned(graph: ExecutionGraph) -> Self {
-        Self(ArchitectureExecutionGraphKind::Owned(graph))
     }
     /// Validates the same single root identifier accepted by ExecutionGraph::chain.
     pub fn single(id: &'a str) -> Result<Self, ExecutionGraphError> {
@@ -126,14 +120,21 @@ impl<'a> ArchitectureExecutionGraph<'a> {
         match &self.0 {
             ArchitectureExecutionGraphKind::Single(_) => 1,
             ArchitectureExecutionGraphKind::Borrowed(graph) => graph.groups.len(),
-            ArchitectureExecutionGraphKind::Owned(graph) => graph.groups.len(),
+
+        }
+    }
+    /// Borrows a source group identifier without constructing owning output.
+    pub fn group_id(&self, group: usize) -> Option<&str> {
+        match &self.0 {
+            ArchitectureExecutionGraphKind::Borrowed(graph) => graph.groups.get(group).map(ExecutionGroupSpec::id),
+            ArchitectureExecutionGraphKind::Single(id) => (group == 0).then_some(*id),
         }
     }
     /// Borrows the retained dependency indices without materializing a graph copy.
     pub fn dependencies(&self, group:usize)->Option<&[usize]> {
         match &self.0 {
             ArchitectureExecutionGraphKind::Borrowed(graph)=>graph.dependencies(group),
-            ArchitectureExecutionGraphKind::Owned(graph)=>graph.dependencies(group),
+
             ArchitectureExecutionGraphKind::Single(_)=>(group==0).then_some(&[]),
         }
     }
@@ -141,7 +142,7 @@ impl<'a> ArchitectureExecutionGraph<'a> {
     pub fn matches(&self, expected: &ExecutionGraph) -> bool {
         match &self.0 {
             ArchitectureExecutionGraphKind::Borrowed(graph) => *graph == expected,
-            ArchitectureExecutionGraphKind::Owned(graph) => graph == expected,
+
             ArchitectureExecutionGraphKind::Single(id) => {
                 expected.groups.len() == 1
                     && expected.groups[0].id == *id
@@ -163,7 +164,7 @@ impl<'a> ArchitectureExecutionGraph<'a> {
     ) -> Result<ExecutionGraph, eredu_nn::Error> {
         match self.0 {
             ArchitectureExecutionGraphKind::Borrowed(graph) => graph.clone_with_metadata(context),
-            ArchitectureExecutionGraphKind::Owned(graph) => Ok(graph),
+
             ArchitectureExecutionGraphKind::Single(id) => {
                 construction::single(id, construction::Destination(Some(context)))
                     .map_err(construction::Failure::metadata)
@@ -172,13 +173,13 @@ impl<'a> ArchitectureExecutionGraph<'a> {
     }
 
     /// Materializes the same declaration for an ordinary owning caller.
-    pub fn into_owned(self) -> Result<ExecutionGraph, ExecutionGraphError> {
+    pub fn into_owned(self) -> ExecutionGraph {
         match self.0 {
-            ArchitectureExecutionGraphKind::Borrowed(graph) => Ok(graph.clone()),
-            ArchitectureExecutionGraphKind::Owned(graph) => Ok(graph),
+            ArchitectureExecutionGraphKind::Borrowed(graph) => graph.clone(),
+
             ArchitectureExecutionGraphKind::Single(id) => {
                 construction::single(id, construction::Destination(None))
-                    .map_err(construction::Failure::graph)
+                    .unwrap_or_else(|_| unreachable!("single declaration was validated before publication"))
             }
         }
     }
@@ -207,6 +208,27 @@ impl ExecutionUnitAddress {
         Self {
             group: self.group,
             index,
+        }
+    }
+}
+
+/// Group-completion protocol selected by the actual forward executor.
+/// This fact does not lend a policy or authorize submission.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GroupSubmissionMechanism {
+    /// The ordinary layered driver submits the initial value and group exits.
+    LayeredGraph,
+    /// A manual traversal invokes policy begin/complete/finish, but never
+    /// submits the ordinary layered driver's graph boundaries.
+    PolicyOnly,
+}
+
+impl GroupSubmissionMechanism {
+    /// Exact graph-boundary population; policy-owned final completion is separate.
+    pub fn geometry(self, layout: &ExecutionUnitLayout) -> LayerwiseSubmissionGeometry {
+        match self {
+            Self::LayeredGraph => layout.submission_geometry(),
+            Self::PolicyOnly => LayerwiseSubmissionGeometry::single_group(),
         }
     }
 }
@@ -577,7 +599,7 @@ pub struct ExecutionGroupSchedule<'a> {
     started: Vec<bool>,
     remaining_consumers: Vec<usize>,
     // All schedule slots retire before their paying destination.
-    _metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    _metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl<'a> ExecutionGroupSchedule<'a> {

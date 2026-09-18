@@ -107,7 +107,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 },
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let shared =
             self.forward_shared(input, context, &mut ComponentInstrumentation::disabled())?;
         routed.add(&shared, context)
@@ -215,7 +215,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let shared =
             self.forward_shared(input, context, &mut ComponentInstrumentation::disabled())?;
         Self::combine_tensor_parallel(routed, shared, parallel, context)

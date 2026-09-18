@@ -111,7 +111,7 @@ fn verify_additive_component_interventions(
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
-                    (token, generation.take_captured_step().unwrap().unwrap())
+                    (token, generation.take_captured_delivery().unwrap().unwrap())
                 })
                 .collect::<Vec<_>>()
         };
@@ -242,7 +242,7 @@ fn verify_additive_component_transforms(
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
-                    (token, generation.take_captured_step().unwrap().unwrap())
+                    (token, generation.take_captured_delivery().unwrap().unwrap())
                 })
                 .collect::<Vec<_>>()
         };

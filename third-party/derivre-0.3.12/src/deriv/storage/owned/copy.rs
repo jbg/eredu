@@ -3,7 +3,7 @@ use super::PreparedExpressionMachine;
 use crate::{
     ast::{ExprSet, ExprSetCopyFailure, ExprSetPreparedSourcePlan, PreparedExprSet, PreparedExprError},
     copy_storage as storage,
-    hashcons::PreparedHashConsFunding,
+    ParserAllocationFunding,
 };
 use std::{fmt, mem::{size_of, size_of_val}};
 #[derive(Debug)]
@@ -25,7 +25,7 @@ enum Pending {
 pub struct PreparedExpressionCopyFailure<E> {
     cause: Cause<E>,
     pending: Pending,
-    backing: Option<PreparedHashConsFunding>,
+    backing: Option<ParserAllocationFunding>,
 }
 impl<E: fmt::Debug> fmt::Debug for PreparedExpressionCopyFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,7 +56,7 @@ impl PreparedExpressionMachine {
                 ExprSet::prepared_source_inspection_control_bytes()?,
                 size_of::<Self>(), size_of::<&Self>(), size_of::<Pending>(), size_of::<Cause<E>>(),
                 size_of::<PreparedExpressionCopyFailure<E>>(),
-                size_of::<Option<PreparedHashConsFunding>>(),
+                size_of::<Option<ParserAllocationFunding>>(),
                 size_of::<Result<Self, PreparedExpressionCopyFailure<E>>>(),
                 size_of::<Result<(), Cause<E>>>(), size_of::<Result<(), E>>(),
                 size_of::<Result<ExprSetPreparedSourcePlan<'_>, ExprSetCopyFailure>>(),
@@ -92,7 +92,7 @@ impl PreparedExpressionMachine {
     /// The old backing authority is never copied: future growth requires the
     /// explicitly supplied new account; None leaves the independent copy fixed.
     pub fn try_copy<F: Fn(usize) -> Result<(), E>, E>(
-        &self, backing: Option<PreparedHashConsFunding>, funding: &F,
+        &self, backing: Option<ParserAllocationFunding>, funding: &F,
     ) -> Result<Self, PreparedExpressionCopyFailure<E>> {
         let mut pending = Pending::Empty;
         let result = (|| -> Result<(), Cause<E>> {

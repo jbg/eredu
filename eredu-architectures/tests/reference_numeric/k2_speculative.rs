@@ -88,9 +88,9 @@ impl AutoregressiveMechanisms for Mechanisms {
         };
         let execution = InferenceExecutionIdentity::default();
         let request = InferenceRequest::without_memory_budget(&execution, geometry)
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let mut driver = PrefillDriver::new(&execution, request, geometry, cancellation.clone())
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let mut executor = NumericPrefill {
             model,
             input,
@@ -100,7 +100,7 @@ impl AutoregressiveMechanisms for Mechanisms {
         };
         let (outcome, logits) = driver
             .run_final(&mut executor)
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         Ok(match outcome {
             PrefillOutcome::Cancelled => SpeculativePrefillOutcome::Cancelled {
                 evaluated_tokens: driver.completed_positions() as usize,

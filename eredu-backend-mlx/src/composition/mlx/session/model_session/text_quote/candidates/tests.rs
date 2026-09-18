@@ -141,6 +141,7 @@ fn candidate(
         // enters that protocol; unknown operation facts remain in the trace.
         context.begin_state_span(std::iter::empty::<&WorkspaceTensor>())?;
         let rows = match span {
+            InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };

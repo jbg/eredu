@@ -16,7 +16,7 @@ pub struct MlxGroupedLinear {
     affine_bias: Option<Parameter<MlxTensor>>,
     bias: Option<Parameter<MlxTensor>>,
     #[parameter(skip, metadata)]
-    construction_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    construction_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl MlxGroupedLinear {

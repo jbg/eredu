@@ -9,7 +9,7 @@ pub(crate) struct PreparedBackgroundHostWindow {
     host_requested: usize,
     source: ForegroundDiskDescriptors,
     custody: OriginalHostSourceCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum WindowCause {
@@ -63,7 +63,7 @@ impl PreparedBackgroundHostWindow {
             size_of::<OriginalHostPublicationSlots<'_>>(),
             OriginalResidencySlots::control_bytes()?,
             usize::try_from(ResidentTransfer::original_retirement_control_bytes()?).ok()?,
-            size_of::<(&ResidencyManager, &ForegroundDiskWindowPlan, &ForegroundDiskWindowPlan, &str, &[OffloadUnitId], usize, &OriginalHostSourceCustody, &WorkspaceMetadataFunding)>(),
+            size_of::<(&ResidencyManager, &ForegroundDiskWindowPlan, &ForegroundDiskWindowPlan, &str, &[OffloadUnitId], usize, &OriginalHostSourceCustody, &HostMetadataFunding)>(),
             size_of::<(&mut Self, &ResidencyManager, &BackgroundHostReadService, &[(OffloadUnitId, u64)], &mut OriginalResidencySlots<'_>, &mut OriginalResidencySlots<'_>, &safemlx::OriginalScopeObserver)>(),
         ];
         let mut bytes = fixed.into_iter().try_fold(size_of_val(&fixed), usize::checked_add)?;
@@ -79,7 +79,7 @@ impl PreparedBackgroundHostWindow {
         active: &[OffloadUnitId],
         host_requested: usize,
         custody: OriginalHostSourceCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, BackgroundHostReadFailure> {
         let fail = |cause| BackgroundHostReadFailure::Source { cause, custody: custody.clone(), funding: funding.clone() };
         if !host.matches_manager(manager) || !device.matches_manager(manager)

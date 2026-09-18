@@ -21,7 +21,7 @@ use crate::backend::runtime::cache::state::{
 use eredu_runtime::replicated_session::ReplicatedTextControlOrigin;
 use eredu_runtime::working_memory::WorkingMemoryStorage;
 use eredu_runtime::{SharedHostMetadata, SharedPreparedInputCacheIdentity};
-pub(in crate::composition::mlx::session) use resume_quote::PreparedSavedTextResumeQuote;
+pub(in crate::composition::mlx::session) use resume_quote::{PreparedSavedTextResumeQuote, ResumeCapture};
 
 /// Temporary access custody. The saved result never retains a live executable.
 #[derive(Clone)]
@@ -549,7 +549,7 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             .original
             .map(|requirements| {
                 requirements.validate_native(native_plan.as_ref())?;
-                requirements.publication_plan(&plan)
+                requirements.publication_plan()
             })
             .transpose()
             .map_err(memory)?;
@@ -807,7 +807,7 @@ fn copy_native<'a>(
         Ok(())
     };
     let native =
-        plan.copy_retained_with_preparation(slots, stream, roots, &mut observed, &mut observe_host, host)?;
+        plan.copy_retained_with_host(slots, stream, roots, &mut observed, &mut observe_host)?;
     let mut failure = None;
     let mut retain = |array: &Array| {
         if failure.is_none() {

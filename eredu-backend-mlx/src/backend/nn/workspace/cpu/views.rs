@@ -1,10 +1,10 @@
-//! Views retain source identity; a proved reshape copy uses the shared General worker.
+//! Typed views retain source identity; reshape uses the shared alias/General worker.
 use super::*;
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
     let name=match operation.kind {
         WorkspaceOperationKindView::Transpose(_)=>"transpose",
-        WorkspaceOperationKindView::View(name@("reshape"|"expand_dims"|"squeeze"|"transpose"))=>name,
+        WorkspaceOperationKindView::View(name@("reshape"|"expand_dims"|"squeeze"))=>name,
         _=>return Ok(None),
     };
     if operation.inputs.len()!=1||operation.outputs.len()!=1 {
@@ -13,44 +13,46 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let input=operation.inputs.get(0).expect("view source");
     let output=operation.outputs.get(0).expect("view output");
     let (rank,output_rank)=(input.shape().len(),output.shape().len());
-    if rank>4||output_rank>4||input.dtype()!=WorkspaceDtype::Float32||output.dtype()!=input.dtype()||
-        input.shape().iter().chain(output.shape()).any(|&n|n<=0) {return Ok(None);}
-    let Some(representation)=input.representation() else{return Ok(None)};
-    // The shared native alias, unit-axis and reshape sources validate F16
-    // item size and actual strides alongside F32/BF16; preserve that dtype.
-    if (name!="transpose"&&name!="reshape"&&!representation.row_contiguous())||!matches!(representation.dtype(),WorkspaceFloatingType::Float32|WorkspaceFloatingType::Float16|WorkspaceFloatingType::Bfloat16) {
-        return Ok(None);
-    }
-    if input.elements()?!=output.elements()? {return Err(MlxWorkspaceFactError::descriptor("CPU row view changes element count"));}
-    if input.elements()?>i32::MAX as u64 {return Ok(None);}
+    if rank>4||output_rank>4||output.dtype()!=input.dtype()||
+        input.shape().iter().chain(output.shape()).any(|&n|n<0) {return Ok(None);}
+    let representation=input.representation();
+    let integer=matches!(input.dtype(),WorkspaceDtype::Int32|WorkspaceDtype::Uint32);
+    let dtype=if integer {
+        if representation.is_some()||output.representation().is_some(){return Ok(None);}
+        // This private plan field does not grant a floating representation.
+        WorkspaceFloatingType::Float32
+    } else {
+        if input.dtype()!=WorkspaceDtype::Float32{return Ok(None);}
+        let Some(representation)=representation else{return Ok(None)};
+        if !matches!(representation.dtype(),WorkspaceFloatingType::Float32|WorkspaceFloatingType::Float16|WorkspaceFloatingType::Bfloat16) {
+            return Ok(None);
+        }
+        representation.dtype()
+    };
+    let elements=input.elements()?;
+    if elements!=output.elements()? {return Err(MlxWorkspaceFactError::descriptor("CPU row view changes element count"));}
+    if elements>i32::MAX as u64 || (elements==0&&!matches!(name,"reshape"|"squeeze")) {return Ok(None);}
+    // Integer descriptors carry no stride evidence. Unit-axis aliases inspect
+    // their actual readable native span; an arbitrary reshape reserves the
+    // existing General-copy branch instead of inventing row order.
+    if !integer&&name!="transpose"&&name!="reshape"&&
+        !representation.is_some_and(|r|r.row_contiguous()) {return Ok(None);}
     if name!="reshape"&&name!="transpose"&&(!input.shape().iter().filter(|&&n|n!=1).eq(output.shape().iter().filter(|&&n|n!=1))||
         (name=="expand_dims"&&rank>=output_rank)||(name=="squeeze"&&rank<=output_rank)) {
         return Err(MlxWorkspaceFactError::descriptor("CPU unit-axis view changes nonunit geometry"));
     }
-    if name=="transpose" {
-        if rank!=output_rank {return Err(MlxWorkspaceFactError::descriptor("CPU transpose rank differs"));}
-        if let WorkspaceOperationKindView::Transpose(axes)=operation.kind {
-            if axes.len()!=rank || axes.iter().enumerate().any(|(i,&axis)|axis>=rank ||
-                axes[..i].contains(&axis) || output.shape()[i]!=input.shape()[axis]) {
-                return Err(MlxWorkspaceFactError::descriptor("CPU transpose permutation differs"));
-            }
-        }
-        // Legacy shapes omit the permutation. Equal multiset geometry permits every
-        // actual native transpose, whose source validates axes and readable
-        // strides. It does not prove row-contiguous output.
-        for &extent in input.shape() {
-            let mut source_count=0usize;let mut output_count=0usize;
-            for &value in input.shape(){source_count+=usize::from(value==extent);}
-            for &value in output.shape(){output_count+=usize::from(value==extent);}
-            if source_count!=output_count{
-                return Err(MlxWorkspaceFactError::descriptor("CPU transpose extents differ"));
-            }
+    if let WorkspaceOperationKindView::Transpose(axes)=operation.kind {
+        if rank!=output_rank || axes.len()!=rank || axes.iter().enumerate().any(|(i,&axis)|axis>=rank ||
+            axes[..i].contains(&axis) || output.shape()[i]!=input.shape()[axis]) {
+            return Err(MlxWorkspaceFactError::descriptor("CPU transpose permutation differs"));
         }
     }
     let source=match name {
-        "reshape"=>if representation.row_contiguous() {
+        "reshape"=>if elements==0||elements==1||representation.is_some_and(|r|r.row_contiguous()) {
             OperationEvent::cpu_reshape_alias_layout(rank,output_rank,false)
-        } else {reshape_source(input,output,representation)},
+        } else if integer {
+            OperationEvent::cpu_reshape_copy_layout(rank,output_rank,false)
+        } else {reshape_source(input,output,representation.expect("qualified floating reshape"))},
         "expand_dims"=>OperationEvent::cpu_expand_dims_alias_layout(rank,output_rank,false),
         "squeeze"=>OperationEvent::cpu_squeeze_layout(rank,false),
         "transpose"=>OperationEvent::cpu_transpose_alias_layout(rank,false),
@@ -60,14 +62,14 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let mut population=CpuPopulation::default();
     let copied=name=="reshape"&&source.backing_births()==1;
     if (source.backing_births()!=0&&!copied)||population.copy(source,1).is_none() {return Ok(None);}
-    let frames=[if name=="reshape" && !representation.row_contiguous() {physical_stride_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?}else{0},
+    let frames=[if name=="reshape" && !integer && elements!=0 && !representation.is_some_and(|r|r.row_contiguous()) {physical_stride_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?}else{0},
         size_of::<WorkspaceOperationView<'_>>(),size_of::<WorkspaceLayoutView<'_>>()*2,
         size_of::<OperationPlan>(),size_of::<Option<OperationPlan>>(),size_of::<CpuPopulation>(),
         size_of::<CpuCopyEvalLayout>(),size_of::<Option<CpuCopyEvalLayout>>(),size_of::<(usize,usize)>(),
         size_of::<&str>(),size_of::<WorkspaceRepresentation>(),size_of::<Option<WorkspaceRepresentation>>(),
         size_of::<std::slice::Iter<i32>>()*2,size_of::<u64>()*2,size_of::<bool>(),size_of::<std::iter::Enumerate<std::slice::Iter<i32>>>(),
         size_of::<(usize,&i32)>(),size_of::<&[i32]>(),
-        size_of::<usize>()*4,size_of::<i32>()*2,size_of::<Option<usize>>()*2,
+        size_of::<usize>()*2,size_of::<Option<usize>>()*2,
         size_of::<std::slice::Iter<usize>>(),size_of::<std::iter::Enumerate<std::slice::Iter<usize>>>(),
         size_of::<(usize,&usize)>(),size_of::<&[usize]>(),size_of::<bool>()*2,
         size_of::<(WorkspaceOperationView<'_>,WorkspaceRepresentation)>(),size_of::<WorkspaceRepresentation>(),
@@ -77,51 +79,49 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
         size_of::<(WorkspaceLayoutView<'_>,WorkspaceLayoutView<'_>,WorkspaceRepresentation)>(),
         size_of::<Option<[i64;4]>>(),size_of::<[u64;1]>(),size_of::<Option<u64>>(),
         size_of::<(WorkspaceOperationView<'_>,WorkspaceRepresentation)>(),size_of::<u64>(),
-        size_of::<std::iter::Take<std::iter::Enumerate<std::slice::IterMut<'_,i64>>>>()];
+        size_of::<std::iter::Take<std::iter::Enumerate<std::slice::IterMut<'_,i64>>>>(),
+        size_of::<WorkspaceDtype>(),size_of::<WorkspaceFloatingType>(),size_of::<bool>()*3,
+        size_of::<u64>(),size_of::<facts::FactResult<Option<OperationPlan>>>(),
+        size_of::<MlxCpuWorkspaceMechanisms>(),
+        size_of::<std::iter::Chain<std::slice::Iter<'_,i32>,std::slice::Iter<'_,i32>>>()];
     population.controls=frames.into_iter().try_fold(population.controls.checked_add(size_of_val(&frames))
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,|n,b|n.checked_add(b).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW))?;
     let output_bytes=if copied {mechanism.allocation.fixed_buffer_capacity(output.bytes()?)?} else {0};
-    Ok(Some(OperationPlan{dtype:representation.dtype(),population,alias_input:if copied {None}else{Some(0)},output_bytes,
+    Ok(Some(OperationPlan{dtype,population,alias_input:if copied {None}else{Some(0)},output_bytes,
         scratch_bytes:0,rank:rank.max(output_rank),parameter_shells:0,seeds:0,validations:0}))
 }
 
-/// Only dimensions and an existing row-contiguous source can prove this
-/// property. Repeated nonunit extents conceal a possible axis exchange.
+/// Preserve only layout properties established by the exact retained axis
+/// permutation and the actual input representation.
 pub(super) fn transpose_representation(operation:WorkspaceOperationView<'_>,input:WorkspaceRepresentation)->WorkspaceRepresentation {
     let source=operation.inputs.get(0).expect("qualified transpose input");
-    let output=operation.outputs.get(0).expect("qualified transpose output");
-    if let WorkspaceOperationKindView::Transpose(axes)=operation.kind {
-        // An exact permutation preserves row order iff the nonunit source axes
-        // remain increasing. Repeated dimensions no longer hide an exchange.
-        let mut previous=None;let mut rows=input.row_contiguous();
-        for &axis in axes {
-            if source.shape()[axis]>1 {
-                if previous.is_some_and(|p|p>=axis){rows=false;}
-                previous=Some(axis);
-            }
+    let WorkspaceOperationKindView::Transpose(axes)=operation.kind else {
+        unreachable!("qualified transpose retains its exact axes")
+    };
+    // An exact permutation preserves row order iff the nonunit source axes
+    // remain increasing. Repeated dimensions no longer hide an exchange.
+    let mut previous=None;let mut rows=input.row_contiguous();
+    for &axis in axes {
+        if source.shape()[axis]>1 {
+            if previous.is_some_and(|p|p>=axis){rows=false;}
+            previous=Some(axis);
         }
-        let last=axes.last().copied();
-        let last_contiguous=last.is_none_or(|axis|source.shape()[axis]==1) ||
-            (last==source.shape().len().checked_sub(1)&&input.last_axis_contiguous()) ||
-            (input.row_contiguous()&&last.is_some_and(|axis|
-                source.shape()[axis+1..].iter().all(|&n|n==1)));
-        let mut representation=WorkspaceRepresentation::new(input.dtype(),rows)
-            .with_last_axis_contiguous(last_contiguous);
-        let rank=source.shape().len();let mut order=[0usize;4];let mut dense=true;
-        for position in 0..rank {
-            let Some(source_axis)=input.dense_axis_at(rank,position) else {dense=false;break;};
-            let Some(output_axis)=axes.iter().position(|&axis|axis==source_axis) else {dense=false;break;};
-            order[position]=output_axis;
-        }
-        if dense {representation=representation.with_dense_axis_order(&order[..rank]).expect("qualified permutation");}
-        return representation;
     }
-    let mut rows=input.row_contiguous()&&source.shape().iter().filter(|&&n|n!=1)
-        .eq(output.shape().iter().filter(|&&n|n!=1));
-    for (axis,&extent) in source.shape().iter().enumerate(){
-        if extent!=1&&source.shape()[..axis].contains(&extent){rows=false;}
+    let last=axes.last().copied();
+    let last_contiguous=last.is_none_or(|axis|source.shape()[axis]==1) ||
+        (last==source.shape().len().checked_sub(1)&&input.last_axis_contiguous()) ||
+        (input.row_contiguous()&&last.is_some_and(|axis|
+            source.shape()[axis+1..].iter().all(|&n|n==1)));
+    let mut representation=WorkspaceRepresentation::new(input.dtype(),rows)
+        .with_last_axis_contiguous(last_contiguous);
+    let rank=source.shape().len();let mut order=[0usize;4];let mut dense=true;
+    for position in 0..rank {
+        let Some(source_axis)=input.dense_axis_at(rank,position) else {dense=false;break;};
+        let Some(output_axis)=axes.iter().position(|&axis|axis==source_axis) else {dense=false;break;};
+        order[position]=output_axis;
     }
-    WorkspaceRepresentation::new(input.dtype(),rows)
+    if dense {representation=representation.with_dense_axis_order(&order[..rank]).expect("qualified permutation");}
+    representation
 }
 
 /// Derive physical strides only from exact row-major/permutation evidence,
@@ -157,6 +157,7 @@ pub(super) fn physical_strides(input:WorkspaceLayoutView<'_>,representation:Work
 pub(super) fn reshape_representation(operation:WorkspaceOperationView<'_>,input:WorkspaceRepresentation)->WorkspaceRepresentation {
     let source=operation.inputs.get(0).expect("qualified reshape source");
     let output=operation.outputs.get(0).expect("qualified reshape output");
+    if output.shape().contains(&0){return WorkspaceRepresentation::new(input.dtype(),true);}
     if source.shape()==output.shape(){return input;}
     if output.shape().len()==1 {
         let strides=physical_strides(source,input).expect("qualified reshape strides");
@@ -176,3 +177,7 @@ pub(super) fn physical_stride_control_bytes()->Option<usize> {
         size_of::<(usize,&mut i64)>(),size_of::<std::iter::Rev<std::ops::Range<usize>>>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
+
+#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[path = "views/source_tests.rs"]
+mod source_tests;

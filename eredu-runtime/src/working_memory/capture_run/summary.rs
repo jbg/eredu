@@ -1,5 +1,8 @@
 //! Fixed scalar summary receipts from the existing original capture schedule.
 use super::*;
+mod host;
+pub use host::CaptureHostF32;
+
 
 /// Pure layout of one immutable summary selection and its fixed receipt/error.
 #[derive(Debug)]
@@ -18,6 +21,7 @@ impl<'a> CaptureSummaryHostPlan<'a> {
             size_of::<ScheduledCaptureSummaryTransfer<'a, 'a, 'a, u8>>(),
             size_of::<CaptureSummary>(),
             size_of::<crate::capture::reduction::Summary>(),
+            host::control_bytes().ok_or(WorkingMemoryError::Overflow)?,
             size_of::<Result<ClaimedCaptureSummary, CaptureSummaryFailure>>(),
         ];
         let peak = frames
@@ -57,7 +61,7 @@ impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
     /// Native completion and all-rank delivery agreement are separate obligations.
     pub fn decode_partition_receipt(
         self, bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<ClaimedCaptureSummary, PartitionCaptureTensorDecodeError> {
         let custody = self.identity.custody.share_scheduled();
         let value = claims::decode_summary_receipt(bytes, expected, self.geometry(), &custody, funding)?;

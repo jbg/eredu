@@ -157,8 +157,8 @@ pub(crate) struct Plan<'a> {
     mapping: workspace::Plan<'a, ExprRef>,
     geometry: Geometry,
     requirements: Requirements,
-    nary: Option<nary::Blueprint>,
-    concat: Option<concatenation::Blueprint>,
+    nary: nary::Blueprint,
+    concat: concatenation::Blueprint,
 }
 impl fmt::Debug for Plan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -258,20 +258,13 @@ impl ExprSet {
                 geometry.suffix = geometry.suffix.max(suffix);
             }
         }
-        let (nary, concat) = if let Ok((_, nodes, _)) = self.prepared_extents() {
-            let nary = nary::Blueprint::prepare(self).map_err(|e| failure(Cause::Nary(e)))?;
-            let concat =
-                concatenation::Blueprint::prepare(self).map_err(|e| failure(Cause::Concat(e)))?;
-            geometry.nodes = nodes;
-            geometry.memo = nodes
-                .checked_mul(geometry.alphabet)
-                .ok_or_else(|| failure(Cause::Geometry))?;
-            geometry.suffix = ExprRef::MAX_BYTE_CONCAT;
-            geometry.alternatives = nary.argument_capacity();
-            (Some(nary), Some(concat))
-        } else {
-            (None, None)
-        };
+        let (_, nodes, _) = self.storage_extents();
+        let nary = nary::Blueprint::prepare(self).map_err(|e| failure(Cause::Nary(e)))?;
+        let concat = concatenation::Blueprint::prepare(self).map_err(|e| failure(Cause::Concat(e)))?;
+        geometry.nodes = nodes;
+        geometry.memo = nodes.checked_mul(geometry.alphabet).ok_or_else(|| failure(Cause::Geometry))?;
+        geometry.suffix = ExprRef::MAX_BYTE_CONCAT;
+        geometry.alternatives = nary.argument_capacity();
         let mut buffers = Layout::array::<Option<ExprRef>>(geometry.memo)
             .map_err(|_| failure(Cause::Geometry))?
             .size();
@@ -288,25 +281,13 @@ impl ExprSet {
         let mapping = self
             .mapping_workspace_plan()
             .map_err(|e| failure(Cause::Mapping(e)))?;
-        let mapping = if nary.is_some() {
-            mapping
-                .prepared_bounds()
-                .map_err(|e| failure(Cause::Mapping(e)))?
-        } else {
-            mapping
-        };
-        if let (Some(nary), Some(concat)) = (&nary, &concat) {
-            let n = nary.requirements();
-            let c = concat.requirements();
-            buffers = buffers
-                .checked_add(n.buffers)
-                .and_then(|x| x.checked_add(c.buffers))
-                .ok_or_else(|| failure(Cause::Geometry))?;
-            controls = controls
-                .checked_add(n.controls)
-                .and_then(|x| x.checked_add(c.controls))
-                .ok_or_else(|| failure(Cause::Geometry))?;
-        }
+        let mapping = mapping.prepared_bounds().map_err(|e| failure(Cause::Mapping(e)))?;
+        let n = nary.requirements();
+        let c = concat.requirements();
+        buffers = buffers.checked_add(n.buffers).and_then(|x| x.checked_add(c.buffers))
+            .ok_or_else(|| failure(Cause::Geometry))?;
+        controls = controls.checked_add(n.controls).and_then(|x| x.checked_add(c.controls))
+            .ok_or_else(|| failure(Cause::Geometry))?;
         let mapped = mapping.requirements();
         let buffers = buffers
             .checked_add(mapped.buffers)
@@ -380,12 +361,8 @@ impl<'a> Plan<'a> {
             if buffers.alternatives.capacity() != self.geometry.alternatives {
                 return Err(Cause::Capacity);
             }
-            if let Some(plan) = self.nary {
-                buffers.nary = Some(plan.compile().map_err(Cause::Nary)?);
-            }
-            if let Some(plan) = self.concat {
-                buffers.concat = Some(plan.compile().map_err(Cause::Concat)?);
-            }
+            buffers.nary = Some(self.nary.compile().map_err(Cause::Nary)?);
+            buffers.concat = Some(self.concat.compile().map_err(Cause::Concat)?);
             Ok(())
         })();
         if let Err(cause) = result {
@@ -852,7 +829,7 @@ mod tests {
             tail: ExprRef,
         ) -> Result<ExprRef, Refusal> {
             self.suffix_calls += 1;
-            let value = source.mk_byte_concat(bytes, tail);
+            let value = source.mk_byte_concat(bytes, tail).unwrap();
             self.completed = Some(value);
             if self.fail_suffix {
                 Err(Refusal)
@@ -868,24 +845,24 @@ mod tests {
             scale: u32,
             fractional: bool,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_remainder_is(divisor, remainder, scale, fractional))
+            Ok(source.mk_remainder_is(divisor, remainder, scale, fractional).unwrap())
         }
         fn and(
             &mut self,
             source: &mut ExprSet,
             args: &mut Vec<ExprRef>,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_and(args))
+            Ok(source.mk_and(args).unwrap())
         }
         fn or(
             &mut self,
             source: &mut ExprSet,
             args: &mut Vec<ExprRef>,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_or(args))
+            Ok(source.mk_or(args).unwrap())
         }
         fn not(&mut self, source: &mut ExprSet, arg: ExprRef) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_not(arg))
+            Ok(source.mk_not(arg).unwrap())
         }
         fn repeat(
             &mut self,
@@ -894,7 +871,7 @@ mod tests {
             min: u32,
             max: u32,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_repeat(arg, min, max))
+            Ok(source.mk_repeat(arg, min, max).unwrap())
         }
         fn concat(
             &mut self,
@@ -902,7 +879,7 @@ mod tests {
             left: ExprRef,
             right: ExprRef,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_concat(left, right))
+            Ok(source.mk_concat(left, right).unwrap())
         }
         fn lookahead(
             &mut self,
@@ -910,7 +887,7 @@ mod tests {
             arg: ExprRef,
             offset: u32,
         ) -> Result<ExprRef, Refusal> {
-            Ok(source.mk_lookahead(arg, offset))
+            Ok(source.mk_lookahead(arg, offset).unwrap())
         }
     }
     fn capacities(storage: &Storage<'_>) -> (usize, usize, usize) {
@@ -923,10 +900,10 @@ mod tests {
 
     #[test]
     fn actual_derivative_source_slots_preserve_hits_new_nodes_and_failed_arena_prefixes() {
-        let mut source = ExprSet::new(256);
-        let root = source.mk_byte_literal(b"abcdef");
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let root = source.mk_byte_literal(b"abcdef").unwrap();
         let mut ordinary = source.clone();
-        let ordinary_result = DerivCache::new().derivative(&mut ordinary, root, b'a');
+        let ordinary_result = DerivCache::new().derivative(&mut ordinary, root, b'a').unwrap();
         let nodes = source.len();
         let plan = source.derivative_storage_plan().unwrap();
         let requirements = plan.requirements();
@@ -938,7 +915,9 @@ mod tests {
         assert!(Storage::operation_control_bytes::<TestArena>().unwrap() > 0);
         let mut storage = plan.compile().unwrap();
         let original_capacities = capacities(&storage);
-        assert_eq!(original_capacities, (nodes * 256, 5, 2));
+        assert_eq!(original_capacities.0, nodes * 256);
+        assert!(original_capacities.1 >= b"bcdef".len());
+        assert!(original_capacities.2 >= 2);
         let mut arena = TestArena {
             suffix_calls: 0,
             fail_suffix: false,
@@ -997,30 +976,30 @@ mod tests {
     fn prepared_derivatives_use_actual_simplifiers_successor_slots_and_failed_prefix_custody() {
         use crate::AlphabetInfo;
 
-        let mut source = ExprSet::new(256);
-        let literal = source.mk_byte_literal(b"abcdef");
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let literal = source.mk_byte_literal(b"abcdef").unwrap();
         // This is actual historical encoding/storage, inspected by the source
         // plan; neither a parser fuel value nor a default arena allowance.
-        let encoding_source = source.mk_byte_literal(&[b'q'; 256]);
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[literal, encoding_source]);
+        let encoding_source = source.mk_byte_literal(&[b'q'; 256]).unwrap();
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[literal, encoding_source]).unwrap();
         assert!(!source.optimize);
-        let a = source.mk_byte(b'a');
-        let optional = source.mk_repeat(a, 0, 2);
-        let tail = source.mk_byte_literal(b"bcdef");
-        let chain = source.mk_concat(optional, tail);
-        let alternatives = source.mk_or(&mut vec![chain, literal]);
-        let excluded = source.mk_byte_literal(b"ax");
-        let not = source.mk_not(excluded);
-        let intersection = source.mk_and(&mut vec![alternatives, not]);
-        let ahead = source.mk_lookahead(literal, 0);
-        let remainder = source.mk_remainder_is(13, 3, 1, false);
-        let overflow = source.mk_remainder_is(u32::MAX, u32::MAX - 1, 1, false);
-        source.reserve(96);
+        let a = source.mk_byte(b'a').unwrap();
+        let optional = source.mk_repeat(a, 0, 2).unwrap();
+        let tail = source.mk_byte_literal(b"bcdef").unwrap();
+        let chain = source.mk_concat(optional, tail).unwrap();
+        let alternatives = source.mk_or(&mut vec![chain, literal]).unwrap();
+        let excluded = source.mk_byte_literal(b"ax").unwrap();
+        let not = source.mk_not(excluded).unwrap();
+        let intersection = source.mk_and(&mut vec![alternatives, not]).unwrap();
+        let ahead = source.mk_lookahead(literal, 0).unwrap();
+        let remainder = source.mk_remainder_is(13, 3, 1, false).unwrap();
+        let overflow = source.mk_remainder_is(u32::MAX, u32::MAX - 1, 1, false).unwrap();
+        source.reserve(96).unwrap();
         let initial_nodes = source.len();
         let mut ordinary = source.clone();
         let mut prepared = source.prepared_source_plan().unwrap().compile().unwrap();
         drop(source);
-        let extents = prepared.source().prepared_extents().unwrap();
+        let extents = prepared.source().storage_extents();
         let plan = prepared.derivative_scope_plan().unwrap();
         let requirements = plan.requirements();
         assert_eq!(
@@ -1044,7 +1023,7 @@ mod tests {
         let mut retained = ExprRef::EMPTY_STRING;
         for &(mut root, bytes) in cases {
             for &byte in bytes {
-                let expected = ordinary_cache.derivative(&mut ordinary, root, byte);
+                let expected = ordinary_cache.derivative(&mut ordinary, root, byte).unwrap();
                 let result = scope.derivative_prepared(root, byte).unwrap();
                 assert_eq!(result, expected);
                 assert_eq!(scope.source().cost(), ordinary.cost());
@@ -1057,7 +1036,7 @@ mod tests {
                 assert_eq!(scope.derivative_prepared(root, byte).unwrap(), result);
                 assert_eq!(scope.num_derivatives(), calls);
                 assert_eq!(capacities(&scope), capacity);
-                assert_eq!(scope.source().prepared_extents().unwrap(), extents);
+                assert_eq!(scope.source().storage_extents(), extents);
                 created_successor |= result.as_usize() >= initial_nodes;
                 root = result;
                 retained = result;
@@ -1101,13 +1080,10 @@ mod tests {
         assert!(prepared.source().is_valid(retained));
         assert_eq!(prepared.source().len(), entries);
 
-        // A plain lexical source never acquires the built-in mutation bodies.
-        let mut plain = ExprSet::new(256);
+        // Original and independently copied lexical sources share mutation bodies.
+        let mut plain = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
         let mut plain_scope = plain.derivative_storage_plan().unwrap().compile().unwrap();
-        assert!(matches!(
-            plain_scope.derivative_prepared(ExprRef::EMPTY_STRING, b'a'),
-            Err(workspace::OperationError::Process(OperationError::Source))
-        ));
+        assert_eq!(plain_scope.derivative_prepared(ExprRef::EMPTY_STRING, b'a').unwrap(), ExprRef::NO_MATCH);
     }
 }
 

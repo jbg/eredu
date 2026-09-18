@@ -36,6 +36,7 @@ enum Held {
 fn retain(value: RetainedStorageRef<'_>) -> Held {
     match value {
         RetainedStorageRef::Array(value) => Held::Array(value.try_clone_for_inspection().unwrap()),
+        RetainedStorageRef::CanonicalArray(_) => panic!("cache has no canonical parameter cells"),
         RetainedStorageRef::Host(value) => Held::Host(Arc::clone(value)),
         RetainedStorageRef::RetainedHost(_) => panic!("cache has no residency-manager host owner"),
         RetainedStorageRef::Bytes(value) => Held::Bytes(Arc::clone(value)),

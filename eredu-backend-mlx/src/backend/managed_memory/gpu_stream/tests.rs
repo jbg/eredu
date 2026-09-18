@@ -184,7 +184,7 @@ fn retained_copy_environment_outlives_backend_and_keeps_exact_pool_and_host() {
         let ceiling = baseline.checked_add(1 << 24).unwrap();
         let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), ceiling).unwrap();
         funding.reserve_metadata(HostPreparationAuthority::retention_bytes::<
-            eredu_nn::workspace::WorkspaceMetadataFunding>().unwrap()).unwrap();
+            eredu_nn::workspace::HostMetadataFunding>().unwrap()).unwrap();
         let host = HostPreparationAuthority::retain(funding.clone());
         let environment = backend.original_copy_environment().unwrap();
         let source_index = environment.stream().get_index().unwrap();
@@ -261,6 +261,7 @@ fn cpu_factory_retains_selected_matmul_context_and_exact_copy_account() {
             +streams.worker.worker_owner().original_bytes();
         assert_eq!(pool.used_bytes().unwrap(),before+held);
         let selected=safemlx::StreamCopyPlan::<()>::capture(streams.execution()).unwrap();
+        let retiring=execution.wrapper_control_bytes();
         assert_eq!(selected.cpu_matmul(),safemlx::CpuMatmulKernel::Float32Tiles);
         assert_eq!(safemlx::StreamCopyPlan::<()>::capture(streams.source()).unwrap().cpu_matmul(),safemlx::CpuMatmulKernel::PlatformDefault);
         streams.observe_idle(&pool).unwrap();
@@ -271,6 +272,7 @@ fn cpu_factory_retains_selected_matmul_context_and_exact_copy_account() {
         assert!(selected.matches_source(environment.stream()));
         assert_eq!(safemlx::StreamCopyPlan::<()>::capture(environment.stream()).unwrap().cpu_matmul(),safemlx::CpuMatmulKernel::Float32Tiles);
         drop(environment);drop(backend);safemlx::reclaim_allocation_owners();
-        assert!(pool.used_bytes().unwrap()<before+held,"selected wrapper/account retires independently of registered CPU worker");
+        assert_eq!(pool.used_bytes().unwrap(),before+held-retiring,
+            "both local wrapper accounts retire; registered CPU stream and worker accounts survive");
     });
 }

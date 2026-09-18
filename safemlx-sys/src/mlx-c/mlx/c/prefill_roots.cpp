@@ -28,6 +28,7 @@ struct Roots final {
   ArrayVector submitted;
   Completion completion;
   size_t capacity;
+  size_t appended{0};
   State state{State::filling};
   FailureCarrierRef failure;
   uint64_t scope_identity{0};
@@ -74,7 +75,11 @@ bool layout(size_t capacity, mlx_prefill_roots_layout& out) noexcept {
       sizeof(submission::Scope*) * 2 + sizeof(mlx_submission_scope) + sizeof(Stream) +
       sizeof(ScopedEvaluation) + sizeof(submission::ScopedProgress) + sizeof(unsigned) +
       sizeof(const mlx_operation_eval_traversal_limits*) +
-      sizeof(CompletionEvalTraversalLimits) + sizeof(CompletionEvalTraversalLayout),
+      sizeof(CompletionEvalTraversalLimits) + sizeof(CompletionEvalTraversalLayout) +
+      // Completed-root retirement arguments, lookup and exact scope validation.
+      sizeof(mlx_prefill_roots) + sizeof(mlx_array) + sizeof(Roots*) +
+      sizeof(submission::Scope*) + sizeof(mlx_submission_scope) + sizeof(array*) +
+      sizeof(size_t) + sizeof(ArrayVector::iterator) * 2 + sizeof(ScopedEvaluation),
       descriptor_minimum};
   return true;
 }
@@ -117,7 +122,8 @@ extern "C" unsigned mlx_prefill_roots_append(mlx_prefill_roots roots, mlx_array 
   auto* owner = get(roots);
   if (!owner || !value.ctx) return 1;
   if (owner->state != State::filling) return 5;
-  if (owner->retained.size() >= owner->capacity ||
+  if (owner->appended >= owner->capacity ||
+      owner->retained.size() >= owner->capacity ||
       owner->submitted.size() >= owner->capacity) return 2;
   // Both capacity checks precede either copy. These copies cannot allocate,
   // destroy existing elements, call user hooks or export an owning C handle.
@@ -125,6 +131,7 @@ extern "C" unsigned mlx_prefill_roots_append(mlx_prefill_roots roots, mlx_array 
   if (!source.id()) return 1;
   owner->retained.emplace_back(source);
   owner->submitted.emplace_back(source);
+  ++owner->appended;
   return 0;
 }
 extern "C" unsigned mlx_prefill_roots_append_validation(mlx_prefill_roots roots, mlx_array value) {
@@ -237,6 +244,29 @@ extern "C" unsigned mlx_prefill_roots_bind(
       owner->retained.get_allocator().resource() != scope->graph_quota()) return 4;
   if (!scope->bind_failure(owner->failure)) return 4;
   owner->scope_identity = scope->identity();
+  return 0;
+}
+extern "C" unsigned mlx_prefill_roots_retire_completed_current(
+    mlx_prefill_roots roots, mlx_array value) {
+  auto* owner = get(roots);
+  const mlx_submission_scope raw{submission::current_scope()};
+  auto* scope = bound_scope(owner, raw);
+  if (!scope || !value.ctx) return 4;
+  if (owner->state != State::filling) return 5;
+  if (owner->retained.size() != owner->submitted.size()) return 1;
+  auto& source = mlx_array_get_(value);
+  size_t index = 0;
+  while (index < owner->retained.size() &&
+         owner->retained[index].id() != source.id()) ++index;
+  if (index == owner->retained.size() ||
+      owner->submitted[index].id() != source.id()) return 1;
+  // The existing validator never evaluates or waits. Only its exact completed
+  // scope observation permits removal; all refusal paths retain both aliases.
+  const auto ready = validate_scoped_array(source, *scope);
+  if (ready != ScopedEvaluation::complete) return static_cast<unsigned>(ready);
+  owner->retained.erase(owner->retained.begin() + index);
+  owner->submitted.erase(owner->submitted.begin() + index);
+  // appended is cumulative: neither capacity nor the one submission is reset.
   return 0;
 }
 extern "C" unsigned mlx_prefill_roots_submit_scoped(

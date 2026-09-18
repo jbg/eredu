@@ -227,7 +227,7 @@ impl RoutedPredictionTargetVisitor<WorkspaceBackend, ResidentState, ProjectionMa
     fn visit<A>(
         self,
         prepared: PreparedRoutedTextArchitecture<A>,
-        extension: <A as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<
+        _extension: <A as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<
             ProjectionMaterializer,
         >,
         _: RetainedCheckpointSource,
@@ -255,7 +255,7 @@ impl CompositeTextArchitectureVisitor<WorkspaceBackend, ResidentState> for Addre
 
     fn visit<A>(
         self,
-        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        _prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
         _: RetainedCheckpointSource,
     ) -> Result<Self::Output, Error>
     where
@@ -291,8 +291,8 @@ impl CompositePredictionTargetVisitor<WorkspaceBackend, ResidentState, Projectio
     type Error = Error;
     fn visit<A>(
         self,
-        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
+        _prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        _extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
         _: RetainedCheckpointSource,
     ) -> Result<Self::Output, Error>
     where
@@ -310,7 +310,7 @@ impl CompositePredictionTargetVisitor<WorkspaceBackend, ResidentState, Projectio
     fn visit_routed<A>(
         self,
         prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
+        _extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
         _: RetainedCheckpointSource,
     ) -> Result<Self::Output, Error>
     where
@@ -344,7 +344,7 @@ impl
             G,
             <A as eredu_runtime::PartitionedLayeredArchitecture<WorkspaceBackend, ResidentState>>::Boundary,
         >,
-        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        _store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Option<AddressableBindingDestinations>, Error>
     where
         A: TextPartitionArchitecture<WorkspaceBackend, ResidentState>
@@ -381,10 +381,10 @@ impl
             G,
             <A as eredu_runtime::PartitionedLayeredArchitecture<WorkspaceBackend, ResidentState>>::Boundary,
         >,
-        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<
+        _extension: <A as crate::prediction_extension::MaterializedPredictionTarget<
             WorkspaceBackend,
         >>::Extension<ProjectionMaterializer>,
-        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        _store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Option<AddressableBindingDestinations>, Error>
     where
         A: TextPartitionArchitecture<WorkspaceBackend, ResidentState>
@@ -448,7 +448,7 @@ impl
     fn visit<A, G, W>(
         self,
         prepared: crate::composite_partitioned::PreparedCompositePartition<A, G, W>,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
+        _extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<WorkspaceBackend>>::Extension<ProjectionMaterializer>,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<
@@ -471,3 +471,6 @@ impl
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -203,8 +203,8 @@ fn runtime_stamp_invalidation_never_mutates_the_shared_source() {
     let source = source();
     let mut first = ObservationBinding::new();
     let second = ObservationBinding::new();
-    let prepared = first.prepare(source.clone());
-    let rebound = second.prepare(source.clone());
+    let prepared = first.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let rebound = second.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
     first.validate::<Infallible>(&prepared).unwrap();
     assert!(matches!(
         second.validate::<Infallible>(&prepared),
@@ -217,7 +217,7 @@ fn runtime_stamp_invalidation_never_mutates_the_shared_source() {
         first.validate::<Infallible>(&prepared),
         Err(PreparedLayeredObservationError::BindingMismatch)
     ));
-    let fresh = first.prepare(source.clone());
+    let fresh = first.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
     first.validate::<Infallible>(&fresh).unwrap();
     second.validate::<Infallible>(&rebound).unwrap();
     assert!(fresh.source().same_storage(prepared.source()));
@@ -336,22 +336,22 @@ mod fragments;
 fn original_fingerprint_rejects_foreign_runtime_and_same_source_rebinding() {
     let source = source();
     let mut original = ObservationBinding::new();
-    let token = original.prepare(source.clone());
+    let token = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
     let fingerprint = token.binding_identity();
     assert!(fingerprint.matches(&token));
     for _ in 0..4 {
-        let same = original.prepare(source.clone());
+        let same = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
         original.validate::<Infallible>(&same).unwrap();
         assert!(fingerprint.matches(&same));
     }
     let foreign = ObservationBinding::new();
-    let foreign_token = foreign.prepare(source.clone());
+    let foreign_token = foreign.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
     foreign.validate::<Infallible>(&foreign_token).unwrap();
     assert!(foreign_token.source().same_storage(token.source()));
     assert!(!fingerprint.matches(&foreign_token));
     original.invalidate();
     assert!(original.validate::<Infallible>(&token).is_err());
-    let rebound = original.prepare(source);
+    let rebound = original.prepare(source, &metadata::Destination::<Infallible>(None)).unwrap();
     original.validate::<Infallible>(&rebound).unwrap();
     assert!(!fingerprint.matches(&rebound));
 }
@@ -360,13 +360,13 @@ fn original_fingerprint_rejects_foreign_runtime_and_same_source_rebinding() {
 fn fingerprint_keeps_only_original_control_block_not_prepared_runtime_alive() {
     let source = source();
     let mut original = ObservationBinding::new();
-    let token = original.prepare(source.clone());
+    let token = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
     let fingerprint = token.binding_identity();
     assert_eq!(fingerprint.runtime.strong_count(), 2);
     original.invalidate();
     drop(token);
     assert_eq!(fingerprint.runtime.strong_count(), 0);
-    let rebound = original.prepare(source);
+    let rebound = original.prepare(source, &metadata::Destination::<Infallible>(None)).unwrap();
     assert!(!fingerprint.matches(&rebound));
 }
 

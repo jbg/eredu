@@ -51,6 +51,7 @@ impl PreparedInferenceBlueprint {
         &self,
         workspace: EmbeddedInvocationWorkspace,
         input_dtype: WorkspaceDtype,
+        media: Option<OriginalMediaWorkspaceInput>,
         state: &ResidentState,
         context: &WorkspaceContext,
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
@@ -131,6 +132,10 @@ impl PreparedInferenceBlueprint {
                 .map_err(PreparedExecutionError::Backend)?;
         }
         let trace = RefCell::new(trace);
+        context.charge_metadata(std::mem::size_of::<RefCell<Option<OriginalMediaWorkspaceInput>>>())
+            .map_err(|cause| PreparedExecutionError::Metadata(cause.into()))?;
+        let has_media = media.is_some();
+        let media = RefCell::new(media);
         self.quote_text_with_target_capture(
             geometry,
             state,
@@ -142,6 +147,7 @@ impl PreparedInferenceBlueprint {
             Some(input_dtype),
             true,
             None,
+            has_media.then_some(MediaEquationRef { input: &media, intervals: None }),
         )
         .map(|(report, _)| report)
     }

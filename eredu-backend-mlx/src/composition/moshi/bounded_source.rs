@@ -57,6 +57,6 @@ pub(super) fn prepare(prepared:&moshi::PreparedMoshiRealtimeSource,
     let units=ordered_units(layout,unit_bindings)?;
     let declarations=prepare_layerwise_declarations(prepared.source().clone(),residency,|_|false,
         layout,static_bindings,units,Vec::new())?;
-    prepare_manager_from_declarations(declarations,residency,layout,backend.memory_pool(),
+    prepare_manager_from_declarations(declarations,residency,layout,&std::collections::BTreeSet::new(),None,backend.memory_pool(),
         backend.weights_stream(),backend.stream())
 }

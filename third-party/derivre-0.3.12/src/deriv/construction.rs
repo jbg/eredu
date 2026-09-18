@@ -3,7 +3,7 @@
 //! This interface supplies no storage or execution authority. Original callers
 //! must qualify every constructor, including its scratch and expression growth.
 use crate::ast::{Expr, ExprRef, ExprSet};
-use std::convert::Infallible;
+use crate::ParserError as ConstructionError;
 
 pub(crate) trait Construction {
     type Error;
@@ -125,29 +125,31 @@ pub(super) struct Ordinary<'a> {
     pub(super) alternatives: &'a mut Vec<ExprRef>,
 }
 impl Construction for Ordinary<'_> {
-    type Error = Infallible;
+    type Error = ConstructionError;
     fn source(&self) -> &ExprSet {
         self.expressions
     }
-    fn multiply(&mut self, left: u32, right: u32) -> Result<u32, Infallible> {
-        Ok(left * right)
+    fn multiply(&mut self, left: u32, right: u32) -> Result<u32, ConstructionError> {
+        Ok(left.checked_mul(right).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn add(&mut self, left: u32, right: u32) -> Result<u32, Infallible> {
-        Ok(left + right)
+    fn add(&mut self, left: u32, right: u32) -> Result<u32, ConstructionError> {
+        Ok(left.checked_add(right).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn power10(&mut self, scale: u32) -> Result<u32, Infallible> {
-        Ok(10u32.pow(scale))
+    fn power10(&mut self, scale: u32) -> Result<u32, ConstructionError> {
+        Ok(10u32.checked_pow(scale).ok_or(crate::raw::PreparedExprError::Source)?)
     }
-    fn modulo(&mut self, value: u32, divisor: u32) -> Result<u32, Infallible> {
-        Ok(value % divisor)
+    fn modulo(&mut self, value: u32, divisor: u32) -> Result<u32, ConstructionError> {
+        Ok(value.checked_rem(divisor).ok_or(crate::raw::PreparedExprError::Source)?)
     }
 
-    fn byte_suffix(&mut self, root: ExprRef, tail: ExprRef) -> Result<ExprRef, Infallible> {
+    fn byte_suffix(&mut self, root: ExprRef, tail: ExprRef) -> Result<ExprRef, ConstructionError> {
         let Expr::ByteConcat(_, bytes, _) = self.expressions.get(root) else {
             unreachable!("derivative byte suffix requires its source node")
         };
-        let copy = bytes[1..].to_vec();
-        Ok(self.expressions.mk_byte_concat(&copy, tail))
+        let mut copy = [0; ExprRef::MAX_BYTE_CONCAT];
+        let len = bytes.len() - 1;
+        copy[..len].copy_from_slice(&bytes[1..]);
+        Ok(self.expressions.mk_byte_concat(&copy[..len], tail)?)
     }
     fn remainder(
         &mut self,
@@ -155,34 +157,33 @@ impl Construction for Ordinary<'_> {
         remainder: u32,
         scale: u32,
         fractional: bool,
-    ) -> Result<ExprRef, Infallible> {
+    ) -> Result<ExprRef, ConstructionError> {
         Ok(self
             .expressions
-            .mk_remainder_is(divisor, remainder, scale, fractional))
+            .mk_remainder_is(divisor, remainder, scale, fractional)?)
     }
-    fn and(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_and(args))
+    fn and(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_and(args)?)
     }
-    fn or(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_or(args))
+    fn or(&mut self, args: &mut Vec<ExprRef>) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_or(args)?)
     }
-    fn not(&mut self, arg: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_not(arg))
+    fn not(&mut self, arg: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_not(arg)?)
     }
-    fn repeat(&mut self, arg: ExprRef, min: u32, max: u32) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_repeat(arg, min, max))
+    fn repeat(&mut self, arg: ExprRef, min: u32, max: u32) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_repeat(arg, min, max)?)
     }
-    fn concat(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_concat(left, right))
+    fn concat(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_concat(left, right)?)
     }
-    fn alternatives(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, Infallible> {
+    fn alternatives(&mut self, left: ExprRef, right: ExprRef) -> Result<ExprRef, ConstructionError> {
         self.alternatives.clear();
-        self.alternatives.push(left);
-        self.alternatives.push(right);
-        Ok(self.expressions.mk_or(self.alternatives))
+        self.expressions.construction_funding()?.try_extend_copy(self.alternatives, &[left, right])?;
+        Ok(self.expressions.mk_or(self.alternatives)?)
     }
-    fn lookahead(&mut self, arg: ExprRef, offset: u32) -> Result<ExprRef, Infallible> {
-        Ok(self.expressions.mk_lookahead(arg, offset))
+    fn lookahead(&mut self, arg: ExprRef, offset: u32) -> Result<ExprRef, ConstructionError> {
+        Ok(self.expressions.mk_lookahead(arg, offset)?)
     }
 }
 
@@ -209,7 +210,7 @@ mod tests {
                 }
                 let value = match self.ordinary.$name($($arg),*) {
                     Ok(value) => value,
-                    Err(never) => match never {},
+                    Err(error) => panic!("unenforced fixture constructor: {error}"),
                 };
                 self.completed = Some(value);
                 Ok(value)
@@ -247,9 +248,9 @@ mod tests {
 
     #[test]
     fn shared_derivative_preserves_partial_constructors_nullable_order_and_actual_suffix() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let repeat = source.mk_repeat(a, 2, 4);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let repeat = source.mk_repeat(a, 2, 4).unwrap();
         let before = source.len();
         let mut alternatives = Vec::new();
         let mut derivatives = vec![ExprRef::EMPTY_STRING];
@@ -274,13 +275,13 @@ mod tests {
         assert_eq!(derivatives, vec![ExprRef::EMPTY_STRING]);
         assert!(alternatives.is_empty());
         assert_eq!(
-            DerivCache::new().derivative(&mut source, repeat, b'a'),
+            DerivCache::new().derivative(&mut source, repeat, b'a').unwrap(),
             tail
         );
 
-        let nullable = source.mk_repeat(a, 0, 2);
-        let c = source.mk_byte(b'c');
-        let concat = source.mk(Expr::Concat(ExprFlags::POSITIVE, [nullable, c]));
+        let nullable = source.mk_repeat(a, 0, 2).unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let concat = source.mk(Expr::Concat(ExprFlags::POSITIVE, [nullable, c])).unwrap();
         let before = source.len();
         let mut derivatives = vec![a, ExprRef::EMPTY_STRING];
         let error = node(
@@ -304,14 +305,14 @@ mod tests {
         assert_eq!(derivatives, vec![a, ExprRef::EMPTY_STRING]);
         assert!(alternatives.is_empty());
 
-        let literal = source.mk_byte_literal(b"abc");
-        let suffix = DerivCache::new().derivative(&mut source, literal, b'a');
+        let literal = source.mk_byte_literal(b"abc").unwrap();
+        let suffix = DerivCache::new().derivative(&mut source, literal, b'a').unwrap();
         assert!(
             matches!(source.get(suffix), Expr::ByteConcat(_, bytes, tail)
             if bytes == b"bc" && tail == ExprRef::EMPTY_STRING)
         );
         assert_eq!(
-            DerivCache::new().derivative(&mut source, literal, b'x'),
+            DerivCache::new().derivative(&mut source, literal, b'x').unwrap(),
             ExprRef::NO_MATCH
         );
         assert!(surely_no_match(&source, literal, b'x'));

@@ -1,5 +1,5 @@
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataAccount;
+use eredu_nn::workspace::HostMetadataAccount;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,13 +14,13 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         self.0.last.store(bytes, Ordering::SeqCst);
         let available = self.0.remaining.load(Ordering::SeqCst);
         let next = available
             .checked_sub(bytes)
-            .ok_or(WorkspaceMetadataFundingError::Capacity {
+            .ok_or(HostMetadataFundingError::Capacity {
                 required: bytes as u64,
                 available: available as u64,
             })?;
@@ -47,10 +47,10 @@ impl Drop for Cause {
         self.0.dropped.fetch_add(1, Ordering::SeqCst);
     }
 }
-fn funding() -> (Arc<State>, WorkspaceMetadataFunding) {
+fn funding() -> (Arc<State>, HostMetadataFunding) {
     let state = Arc::new(State::default());
     state.remaining.store(1 << 20, Ordering::SeqCst);
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     (state, funding)
 }
 
@@ -78,7 +78,7 @@ fn embedded_neural_error_keeps_typed_source_funding_and_exact_refusal() {
     let required = state.last.load(Ordering::SeqCst) as u64;
     assert!(required > 0);
     assert!(
-        matches!(error.into_metadata_funding_error(),Ok(WorkspaceMetadataFundingError::Capacity {required:actual,available:0}) if actual==required)
+        matches!(error.into_metadata_funding_error(),Ok(HostMetadataFundingError::Capacity {required:actual,available:0}) if actual==required)
     );
     assert_eq!(state.dropped.load(Ordering::SeqCst), 1);
     assert!(!state.retired.load(Ordering::SeqCst));
@@ -117,7 +117,7 @@ fn prepared_session_error_keeps_original_budget_after_funding_exhaustion() {
     let (state, funding) = self::funding();
     state.remaining.store(0, Ordering::SeqCst);
     assert!(matches!(prepare_session_funding::<Error>(&funding, Some(0)),
-        Err(WorkspaceMetadataFundingError::Capacity { available: 0, .. })));
+        Err(HostMetadataFundingError::Capacity { available: 0, .. })));
     // A refused preparation returns before there is an operation/cause to lose.
     drop(funding);
     assert!(state.retired.load(Ordering::SeqCst));

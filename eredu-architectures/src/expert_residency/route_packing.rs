@@ -1,6 +1,6 @@
 //! One retained semantic owner table and one ordinary/paid packing worker.
 use super::{ExpertRealizationPlan, ExpertRoutePackingPlan};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 /// Exact architecture ownership borrowed from the selected constructor.
@@ -63,14 +63,14 @@ pub enum ExpertRoutePackingCause {
     Overflow,
     /// The exact host metadata account refused construction.
     #[error("expert route metadata destination was refused: {0}")]
-    Funding(#[source] WorkspaceMetadataFundingError),
+    Funding(#[source] HostMetadataFundingError),
 }
 
 /// Move-only metadata result. Fields retire the packed arrays before funding.
 #[derive(Debug)]
 pub struct FundedExpertRoutePacking {
     plan: ExpertRoutePackingPlan,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl FundedExpertRoutePacking {
     pub(crate) fn borrowed_plan(&self) -> &ExpertRoutePackingPlan { &self.plan }
@@ -83,9 +83,9 @@ impl FundedExpertRoutePacking {
             let frames = [size_of::<Vec<i32>>(), size_of::<(&Self, &[i32], i32)>(),
                 size_of::<Result<Vec<i32>, FundedExpertRoutePackingFailure>>(),
                 size_of::<FundedExpertRoutePackingFailure>(),
-                size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+                size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<(usize, Option<usize>)>(),
-                eredu_nn::Error::retained_source_control_bytes::<FundedExpertRoutePackingFailure>()
+                eredu_nn::Error::retained_source_construction_bytes::<FundedExpertRoutePackingFailure>()
                     .ok_or(ExpertRoutePackingCause::Overflow)?];
             let controls = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
                 .ok_or(ExpertRoutePackingCause::Overflow)?;
@@ -117,7 +117,7 @@ impl FundedExpertRoutePacking {
     /// Owner-local expert for each destination-major row.
     pub fn packed_owner_local_experts(&self) -> &[usize] { self.plan.packed_owner_local_experts() }
     /// The actual retained account, without creating another allowance.
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 
 /// A refused attempt retains every prior reservation on its original account.
@@ -126,13 +126,13 @@ impl FundedExpertRoutePacking {
 pub struct FundedExpertRoutePackingFailure {
     #[source]
     cause: ExpertRoutePackingCause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl FundedExpertRoutePackingFailure {
     /// Fixed source of the refusal.
     pub const fn cause(&self) -> ExpertRoutePackingCause { self.cause }
     /// Retained cumulative account; refusing an attempt does not refund it.
-    pub fn funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub fn funding(&self) -> &HostMetadataFunding { &self.funding }
 }
 
 #[derive(Clone, Copy)]
@@ -221,8 +221,8 @@ impl<'source> ExpertRoutePackingSource<'source> {
             size_of::<Result<FundedExpertRoutePacking, FundedExpertRoutePackingFailure>>(),
             size_of::<Result<ExpertRoutePackingGeometry, ExpertRoutePackingCause>>(),
             size_of::<Result<(), ExpertRoutePackingCause>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-            size_of::<WorkspaceMetadataFunding>(), size_of::<&[usize]>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
+            size_of::<HostMetadataFunding>(), size_of::<&[usize]>(),
             size_of::<RouteIndices<'_>>(),
             size_of::<PackingBuffers>(), size_of::<PackingCursor>(),
             size_of::<(Self, ExpertRoutePackingGeometry, RouteIndices<'_>)>(),
@@ -236,7 +236,7 @@ impl<'source> ExpertRoutePackingSource<'source> {
     /// The account pays before validation/work, and remains attached on failure.
     /// This supplies no native readout, collective, or numerical storage grant.
     pub fn prepare(self, source_tokens: usize, routes_per_token: usize,
-        global_experts: &[usize], funding: WorkspaceMetadataFunding)
+        global_experts: &[usize], funding: HostMetadataFunding)
         -> Result<FundedExpertRoutePacking, FundedExpertRoutePackingFailure>
     {
         self.prepare_indices(source_tokens, routes_per_token, RouteIndices::Host(global_experts), funding)
@@ -244,14 +244,14 @@ impl<'source> ExpertRoutePackingSource<'source> {
 
     /// Uses the exact completed native i32 ID slice without making a converted copy.
     pub fn prepare_i32(self, source_tokens: usize, routes_per_token: usize,
-        global_experts: &[i32], funding: WorkspaceMetadataFunding)
+        global_experts: &[i32], funding: HostMetadataFunding)
         -> Result<FundedExpertRoutePacking, FundedExpertRoutePackingFailure>
     {
         self.prepare_indices(source_tokens, routes_per_token, RouteIndices::Native(global_experts), funding)
     }
 
     fn prepare_indices(self, source_tokens: usize, routes_per_token: usize,
-        global_experts: RouteIndices<'_>, funding: WorkspaceMetadataFunding)
+        global_experts: RouteIndices<'_>, funding: HostMetadataFunding)
         -> Result<FundedExpertRoutePacking, FundedExpertRoutePackingFailure>
     {
         let build = || {

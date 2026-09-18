@@ -1,5 +1,5 @@
+use crate::tokenizer::pattern::{coverage, Pattern};
 use crate::tokenizer::Decoder;
-use crate::tokenizer::pattern::{Pattern, coverage};
 use crate::tokenizer::{NormalizedString, Normalizer, Result};
 use crate::utils::SysRegex;
 use serde::{Deserialize, Serialize};
@@ -110,19 +110,7 @@ impl Pattern for Matches<'_> {
         let ReplacePattern::String(pattern) = &self.0.pattern else {
             unreachable!("regex replacement retains its matcher")
         };
-        let matches = inside
-            .match_indices(pattern.as_str())
-            .map(|(start, matched)| {
-                Ok::<_, std::convert::Infallible>((start, start + matched.len()))
-            });
-        let mut spans = Vec::with_capacity(inside.len());
-        for item in coverage(inside.len(), matches) {
-            match item {
-                Ok(item) => spans.push(item),
-                Err(never) => match never {},
-            }
-        }
-        Ok(spans)
+        Ok(LiteralSpans::new(pattern, inside).collect())
     }
 }
 
@@ -229,5 +217,94 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+struct LiteralMatches<'a>(std::str::MatchIndices<'a, &'a str>);
+impl Iterator for LiteralMatches<'_> {
+    type Item = std::result::Result<crate::Offsets, std::convert::Infallible>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0
+            .next()
+            .map(|(at, matched)| Ok((at, at + matched.len())))
+    }
+}
+struct LiteralSpans<'a>(crate::tokenizer::pattern::Coverage<LiteralMatches<'a>>);
+impl<'a> LiteralSpans<'a> {
+    fn new(pattern: &'a str, input: &'a str) -> Self {
+        Self(coverage(
+            input.len(),
+            LiteralMatches(input.match_indices(pattern)),
+        ))
+    }
+}
+impl Iterator for LiteralSpans<'_> {
+    type Item = (crate::Offsets, bool);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|result| match result {
+            Ok(value) => value,
+            Err(never) => match never {},
+        })
+    }
+}
+impl Replace {
+    pub(crate) fn literal_parts(&self) -> Option<(&str, &str)> {
+        match &self.pattern {
+            ReplacePattern::String(pattern) => Some((pattern, &self.content)),
+            _ => None,
+        }
+    }
+    pub(crate) fn literal_bound(input: usize, pattern: usize, content: usize) -> Option<usize> {
+        if input == 0 {
+            return Some(0);
+        }
+        if pattern == 0 {
+            return input.checked_add(input.checked_add(1)?.checked_mul(content)?);
+        }
+        input.checked_add((input / pattern).checked_mul(content.saturating_sub(pattern))?)
+    }
+    pub(crate) fn literal_control_bytes() -> usize {
+        use std::mem::size_of;
+        size_of::<LiteralSpans<'_>>()
+            + size_of::<LiteralMatches<'_>>()
+            + size_of::<(crate::Offsets, bool, usize, usize, usize)>()
+            + size_of::<std::str::CharIndices<'_>>()
+            + size_of::<std::str::Chars<'_>>()
+            + size_of::<(&str, &str, &mut String)>()
+            + size_of::<Option<(usize, char)>>()
+    }
+    /// Same literal coverage as ordinary normalization. The returned boundary
+    /// contains output aligned to original byte zero, including replacement
+    /// insertions aligned to the last removed scalar by NormalizedString.
+    pub(crate) fn write_literal(&self, input: &str, out: &mut String) -> usize {
+        let first_end = input.chars().next().map_or(0, char::len_utf8);
+        self.write_literal_with_initial_origin(input, first_end, out)
+    }
+    pub(crate) fn write_literal_with_initial_origin(
+        &self,
+        input: &str,
+        first_end: usize,
+        out: &mut String,
+    ) -> usize {
+        let (pattern, content) = self.literal_parts().expect("checked literal normalizer");
+        let mut initial_end = 0;
+        out.clear();
+        for ((start, end), matched) in LiteralSpans::new(pattern, input) {
+            if matched {
+                out.push_str(content);
+                // At byte zero ordinary insertion has alignment (0, 0), even
+                // when an earlier stage removed the first original scalar.
+                if end == 0 || end <= first_end && first_end != 0 {
+                    initial_end = out.len();
+                }
+            } else {
+                let before = out.len();
+                out.push_str(&input[start..end]);
+                if start < first_end {
+                    initial_end = before + (end.min(first_end) - start);
+                }
+            }
+        }
+        initial_end
     }
 }

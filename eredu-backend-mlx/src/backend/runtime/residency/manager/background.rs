@@ -1,7 +1,7 @@
 //! Paid host-only handoff for the existing bounded background worker.
 //! Thread/PAL admission and native publication remain the caller's boundaries.
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
     BackgroundPrefetchFailure, BackgroundPrefetchPanic, PrefetchStoragePreparationError,
     PreparedPrefetchStorage,
@@ -37,7 +37,7 @@ struct Data {
     ids: Vec<OffloadUnitId>,
     custody: OriginalHostSourceCustody,
     // Last: all jobs, complete buffers, IDs and the shared header retire first.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// A closed host-only alias. No manager, tensor, budget, native observer or
 /// stream crosses into the worker. No raw Arc or Weak is exposed.
@@ -92,7 +92,7 @@ pub(crate) enum BackgroundHostReadFailure {
         #[source]
         cause: Cause,
         custody: OriginalHostSourceCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     },
     #[error("{0}")]
     Panic(#[source] BackgroundPrefetchPanic),
@@ -186,7 +186,7 @@ impl PreparedBackgroundHostReads {
                 &OriginalHostSourceCustody,
                 Option<&WorkingMemoryReservation>,
                 &ForegroundDiskSourceCapacity,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             usize::try_from(plan.attempt_control_bytes()?).ok()?,
         ];
@@ -214,7 +214,7 @@ impl PreparedBackgroundHostReads {
         custody: OriginalHostSourceCustody,
         reservation: Option<&WorkingMemoryReservation>,
         capacity: &ForegroundDiskSourceCapacity,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         queue_capacity: usize,
     ) -> Result<Self, BackgroundHostPreparationError> {
         let fail = |cause| BackgroundHostReadFailure::Source {

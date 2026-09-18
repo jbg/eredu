@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::properties::{BigValidatorsMap, PropertiesValidatorsMap};
 use crate::{
     compiler,
     error::ValidationError,
@@ -12,7 +13,6 @@ use crate::{
     validator::{EvaluationResult, Validate, ValidationContext},
     Json, Node, Object, SerdeJson,
 };
-use crate::properties::{BigValidatorsMap, PropertiesValidatorsMap};
 use referencing::Uri;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -43,17 +43,20 @@ impl SmallPropertiesValidator {
         ctx: &compiler::Context<F>,
         map: &'a Map<String, Value>,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("properties");
-        let mut properties = Vec::with_capacity(map.len());
+        let ctx = ctx.new_at_location("properties")?;
+        let mut properties = Vec::new();
+        ctx.funding().grow(&mut properties, map.len())?;
         for (key, subschema) in map {
-            let ctx = ctx.new_at_location(key.as_str());
+            let ctx = ctx.new_at_location(key.as_str())?;
             properties.push((
-                key.clone(),
-                F::prepare_key(key),
+                ctx.funding().copy_str(key)?,
+                ctx.funding().key::<F>(key)?,
                 compiler::compile(&ctx, ctx.as_resource_ref(subschema))?,
             ));
         }
-        Ok(Box::new(SmallPropertiesValidator { properties }))
+        Ok(ctx
+            .funding()
+            .boxed(SmallPropertiesValidator { properties })?)
     }
 }
 
@@ -63,16 +66,18 @@ impl BigPropertiesValidator {
         ctx: &compiler::Context<F>,
         map: &'a Map<String, Value>,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("properties");
-        let mut properties = BigValidatorsMap::<F>::with_capacity_and_hasher(map.len(), ahash::RandomState::default());
+        let ctx = ctx.new_at_location("properties")?;
+        let mut properties = BigValidatorsMap::<F>::with_hasher(ahash::RandomState::default());
+        ctx.funding().reserve_map(&mut properties, map.len())?;
         for (key, subschema) in map {
-            let pctx = ctx.new_at_location(key.as_str());
-            properties.insert(
-                key.clone(),
+            let pctx = ctx.new_at_location(key.as_str())?;
+            ctx.funding().insert(
+                &mut properties,
+                ctx.funding().copy_str(key)?,
                 compiler::compile(&pctx, pctx.as_resource_ref(subschema))?,
-            );
+            )?;
         }
-        Ok(Box::new(BigPropertiesValidator { properties }))
+        Ok(ctx.funding().boxed(BigPropertiesValidator { properties })?)
     }
 }
 
@@ -84,44 +89,61 @@ impl SmallPropertiesWithRequired2Validator {
         first: String,
         second: String,
     ) -> CompilationResult<'a, F> {
-        let pctx = ctx.new_at_location("properties");
-        let mut properties = Vec::with_capacity(map.len());
+        let pctx = ctx.new_at_location("properties")?;
+        let mut properties = Vec::new();
+        ctx.funding().grow(&mut properties, map.len())?;
         for (key, subschema) in map {
-            let kctx = pctx.new_at_location(key.as_str());
+            let kctx = pctx.new_at_location(key.as_str())?;
             properties.push((
-                key.clone(),
-                F::prepare_key(key),
+                ctx.funding().copy_str(key)?,
+                ctx.funding().key::<F>(key)?,
                 compiler::compile(&kctx, kctx.as_resource_ref(subschema))?,
             ));
         }
-        let required_location = ctx.location().join("required");
-        let required_absolute_location = ctx.absolute_location(&required_location);
-        Ok(Box::new(SmallPropertiesWithRequired2Validator {
+        let required_location = ctx
+            .location()
+            .join_with_funding("required", ctx.funding())?;
+        let required_absolute_location = ctx.absolute_location(&required_location)?;
+        Ok(ctx.funding().boxed(SmallPropertiesWithRequired2Validator {
             properties,
-            first_key: F::prepare_key(&first),
-            second_key: F::prepare_key(&second),
+            first_key: ctx.funding().key::<F>(&first)?,
+            second_key: ctx.funding().key::<F>(&second)?,
             first,
             second,
             required_location,
             required_absolute_location,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for SmallPropertiesValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.vector(&self.properties)?; for (name, key, node) in &self.properties { source.string(name)?; source.key(key)?; source.node(node)?; } Ok(())
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.properties)?;
+        for (name, key, node) in &self.properties {
+            source.string(name)?;
+            source.key(key)?;
+            source.node(node)?;
+        }
+        Ok(())
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>>(),
+            std::mem::size_of::<
+                std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>,
+            >(),
             std::mem::size_of::<(&str, &str, &F::PreparedKey, &crate::node::SchemaNode<F>)>(),
             std::mem::size_of::<ahash::AHasher>(),
             std::mem::size_of::<(bool, bool)>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         let Some(object) = instance.as_object() else {
             return true;
@@ -151,7 +173,7 @@ impl<F: Json> Validate<F> for SmallPropertiesValidator<F> {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -181,7 +203,7 @@ impl<F: Json> Validate<F> for SmallPropertiesValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -253,19 +275,38 @@ impl<F: Json> Validate<F> for SmallPropertiesValidator<F> {
 }
 
 impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.vector(&self.properties)?; for (name, key, node) in &self.properties { source.string(name)?; source.key(key)?; source.node(node)?; } source.string(&self.first)?; source.key(&self.first_key)?; source.string(&self.second)?; source.key(&self.second_key)?; source.uri(&self.required_absolute_location)?; source.location(&self.required_location)
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.vector(&self.properties)?;
+        for (name, key, node) in &self.properties {
+            source.string(name)?;
+            source.key(key)?;
+            source.node(node)?;
+        }
+        source.string(&self.first)?;
+        source.key(&self.first_key)?;
+        source.string(&self.second)?;
+        source.key(&self.second_key)?;
+        source.uri(&self.required_absolute_location)?;
+        source.location(&self.required_location)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>>(),
+            std::mem::size_of::<
+                std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>,
+            >(),
             std::mem::size_of::<(&str, &str, &F::PreparedKey, &crate::node::SchemaNode<F>)>(),
             std::mem::size_of::<ahash::AHasher>(),
             std::mem::size_of::<(bool, bool)>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         let Some(object) = instance.as_object() else {
             return true;
@@ -309,7 +350,7 @@ impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -317,24 +358,20 @@ impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(object) = instance.as_object() {
-            // Check required first
-            if object.get(&self.first_key).is_none() {
-                return Err(ValidationError::required(
-                    self.required_location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.required_location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                return Err(ValidationError::required(
-                    self.required_location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.required_location),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
+            crate::keywords::required::required_errors::<F>(
+                [
+                    (self.first.as_str(), &self.first_key),
+                    (self.second.as_str(), &self.second_key),
+                ],
+                &self.required_location,
+                instance,
+                location,
+                tracker,
+                ctx,
+                None,
+            )?;
+            if ctx.workspace.failed() {
+                return Ok(());
             }
             if object.len() <= self.properties.len() {
                 for (name, value) in object.members() {
@@ -357,7 +394,7 @@ impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -369,25 +406,20 @@ impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
             return;
         };
         {
-            // Check required
-            let eval_path = crate::paths::capture_evaluation_path(tracker, &self.required_location);
-            if object.get(&self.first_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.required_location.clone(),
-                    eval_path.clone(),
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.first.clone()),
-                ));
-            }
-            if object.get(&self.second_key).is_none() {
-                errors.push(ValidationError::required(
-                    self.required_location.clone(),
-                    eval_path,
-                    location.into(),
-                    instance.to_value(),
-                    Value::String(self.second.clone()),
-                ));
+            let _ = crate::keywords::required::required_errors::<F>(
+                [
+                    (self.first.as_str(), &self.first_key),
+                    (self.second.as_str(), &self.second_key),
+                ],
+                &self.required_location,
+                instance,
+                location,
+                tracker,
+                ctx,
+                Some(&mut *errors),
+            );
+            if ctx.workspace.failed() {
+                return;
             }
             if object.len() <= self.properties.len() {
                 for (name, value) in object.members() {
@@ -492,20 +524,30 @@ impl<F: Json> Validate<F> for SmallPropertiesWithRequired2Validator<F> {
 }
 
 impl<F: Json> Validate<F> for BigPropertiesValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         self.properties.original_source(source)
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[
-            self.properties.original_lookup_controls().ok_or(crate::validator::workspace::Error::Overflow)?,
-            std::mem::size_of::<std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>>(),
+            self.properties
+                .original_lookup_controls()
+                .ok_or(crate::validator::workspace::Error::Overflow)?,
+            std::mem::size_of::<
+                std::slice::Iter<'_, (String, F::PreparedKey, crate::node::SchemaNode<F>)>,
+            >(),
             std::mem::size_of::<(&str, &str, &F::PreparedKey, &crate::node::SchemaNode<F>)>(),
             std::mem::size_of::<ahash::AHasher>(),
             std::mem::size_of::<(bool, bool)>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
             // Iterate over instance properties and look up in schema's HashMap
@@ -522,7 +564,7 @@ impl<F: Json> Validate<F> for BigPropertiesValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -539,7 +581,7 @@ impl<F: Json> Validate<F> for BigPropertiesValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -627,14 +669,20 @@ pub(crate) fn compile<'a, F: Json>(
                     Some(BigPropertiesValidator::compile(ctx, map))
                 }
             } else {
-                let location = ctx.location().join("properties");
-                Some(Err(ValidationError::single_type_error(
-                    location.clone(),
-                    location,
-                    Location::new(),
-                    Cow::Borrowed(schema),
-                    JsonType::Object,
-                )))
+                let location = crate::keywords::try_compile!(ctx
+                    .location()
+                    .join_with_funding("properties", ctx.funding()));
+                Some(Err(crate::keywords::try_compile!(
+                    ValidationError::single_type_error_with_funding(
+                        location.clone(),
+                        location,
+                        crate::keywords::try_compile!(Location::new_with_funding(ctx.funding())),
+                        Cow::Borrowed(schema),
+                        JsonType::Object,
+                        ctx.funding()
+                    )
+                )
+                .into()))
             }
         }
     }

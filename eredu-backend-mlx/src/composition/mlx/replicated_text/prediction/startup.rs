@@ -20,11 +20,11 @@ use eredu_architectures::prediction_extension::{
     MaterializedPredictionExecutor, PredictionExtensionMaterializer, PredictionStateStartupFactory,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     SelectedSpeculativeRealization, SpeculativeStrategyClass,
     replicated_session::{PreparedControlBindingError, ReplicatedTextControlOrigin},
-    working_memory::{OriginalSpeculativeSemanticPreparation, WorkingMemoryError},
+    working_memory::{PreparedSemanticSource, WorkingMemoryError},
 };
 use safemlx::{PrefillRootsRuntime, Stream, StreamCopyCause, StreamCopyPlan, StreamCopyError};
 use std::{
@@ -42,7 +42,7 @@ pub(crate) struct OriginalPredictionLane {
     pub(super) depth: usize,
     pub(super) class: SpeculativeStrategyClass,
     pub(super) proposal_capacity: usize,
-    pub(super) preparation: OriginalSpeculativeSemanticPreparation,
+    pub(super) preparation: PreparedSemanticSource,
     pub(super) shape: eredu_runtime::speculative::embedded_occurrence::EmbeddedPredictionShape,
     pub(super) alignment: eredu_core::speculative::PredictionPrefillAlignment,
     pub(super) initial_frontier: u64,
@@ -110,7 +110,7 @@ struct Failure {
     #[source]
     cause: StartupCause,
     // BackendFailure frees its erasure shell before this retained source/account.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn memory(cause: WorkingMemoryError) -> StartupCause {
     Error::PrefillControl(cause).into()
@@ -127,7 +127,7 @@ pub(crate) struct OriginalPredictionStartupContext<'a> {
     environment: &'a OriginalCopyEnvironment<'a>,
     initialized: PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    preparation: &'a OriginalSpeculativeSemanticPreparation,
+    preparation: &'a PreparedSemanticSource,
     host: HostPreparationAuthority,
 }
 impl<'a> OriginalPredictionStartupContext<'a> {
@@ -140,7 +140,7 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             size_of::<Result<OriginalPredictionLane, StartupCause>>(),
             size_of::<StartupCause>(),
             size_of::<Failure>(),
-            size_of::<OriginalSpeculativeSemanticPreparation>(),
+            size_of::<PreparedSemanticSource>(),
             size_of::<ReplicatedTextControlOrigin>(),
             size_of::<Result<ReplicatedTextControlOrigin, PreparedControlBindingError>>(),
             size_of::<StreamCopyPlan<()>>(),
@@ -148,9 +148,9 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             size_of::<PrefillRootsRuntime>(),
             size_of::<Result<PrefillRootsRuntime, Error>>(),
             size_of::<Option<MlxMetalWorkspaceMechanisms>>(),
-            size_of::<WorkspaceMetadataFunding>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()?,
+            size_of::<HostMetadataFunding>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()?,
             BackendFailure::source_retention_peak_bytes::<Failure>()?,
         ];
         frames
@@ -159,7 +159,7 @@ impl<'a> OriginalPredictionStartupContext<'a> {
     }
     pub(crate) fn copy_error_control_bytes() -> Option<usize> {
         let parts = [size_of::<StartupCause>(), size_of::<Failure>(),
-            size_of::<Error>(), size_of::<WorkspaceMetadataFunding>(),
+            size_of::<Error>(), size_of::<HostMetadataFunding>(),
             BackendFailure::source_retention_peak_bytes::<Failure>()?];
         parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
     }
@@ -169,7 +169,7 @@ impl<'a> OriginalPredictionStartupContext<'a> {
         environment: &'a OriginalCopyEnvironment<'a>,
         initialized: PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
-        preparation: &'a OriginalSpeculativeSemanticPreparation,
+        preparation: &'a PreparedSemanticSource,
     ) -> Self {
         Self {
             environment,
@@ -180,7 +180,7 @@ impl<'a> OriginalPredictionStartupContext<'a> {
         }
     }
     pub(crate) fn failure(
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         cause: StartupCause,
     ) -> Error {
         Error::StorageSource(BackendFailure::from_error(Failure {

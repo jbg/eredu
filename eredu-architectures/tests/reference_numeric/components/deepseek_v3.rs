@@ -28,8 +28,8 @@ fn v3_config(query_rank: Option<i32>) -> serde_json::Value {
 #[derive(Default)]
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-        self.0.insert(metadata.id.as_str().into(), value.clone());
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+        self.0.insert(metadata.id().as_str().into(), value.clone());
     }
 }
 
@@ -1063,8 +1063,8 @@ fn assert_write(
 fn v3_rotary_positions_are_independent_of_heads_and_prefill_chunking() {
     struct IdenticalHeads;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for IdenticalHeads {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let name = metadata.id().as_str();
             if value.shape.len() == 2 {
                 for value in &mut value.data {
                     *value *= 6.0;

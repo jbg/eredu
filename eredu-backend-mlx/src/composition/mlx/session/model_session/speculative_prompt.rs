@@ -1,14 +1,14 @@
-//! Source-explicit speculative token input through the existing I/full-B compiler.
+//! Exact borrowed token input through the existing source-bound I/full-B compiler.
 use super::{MlxBackend, MlxModelInput, MlxPreparedInputMaterializer, MlxPreparedModelInputError};
 use eredu_core::{BackendFailure, BackendFailureKind, ModelRuntime, TokenInputRejection};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     input::host::{
         HostInputPart, HostInputPlanError, HostTensorValues, HostTensorView, PreparedHostInputPlan,
     },
     working_memory::{
-        OriginalEncodedTokenIds, OriginalPreparedHostInput, OriginalPreparedHostInputError,
-        OriginalSpeculativeSemanticPreparation, WorkingMemoryError,
+        OriginalPreparedHostInput, OriginalPreparedHostInputError,
+        PreparedSemanticSource, WorkingMemoryError,
     },
 };
 use std::{
@@ -26,7 +26,7 @@ struct Failure<E: std::error::Error> {
     #[source]
     cause: E,
     // The erased shell and every concrete cause retire before the caller H.
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn failure_controls<E: std::error::Error + Send + Sync + 'static>() -> Option<usize> {
     size_of::<Failure<E>>()
@@ -36,7 +36,7 @@ fn failure_controls<E: std::error::Error + Send + Sync + 'static>() -> Option<us
 fn failure<E: std::error::Error + Send + Sync + 'static>(
     cause: E,
     kind: BackendFailureKind,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> BackendFailure {
     BackendFailure::new(
         kind,
@@ -86,7 +86,8 @@ fn control_bytes() -> Option<usize> {
         size_of::<MlxModelInput>(),
         size_of::<Result<MlxModelInput, BackendFailure>>(),
         size_of::<Option<NonZeroU64>>(),
-        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+        size_of::<(&eredu_core::TokenIdsInputPlan<'_>, &[u32])>(),
+        size_of::<Result<(), HostMetadataFundingError>>(),
     ];
     parts
         .into_iter()
@@ -95,12 +96,13 @@ fn control_bytes() -> Option<usize> {
 
 pub(super) fn prepare(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    preparation: &OriginalSpeculativeSemanticPreparation,
-    encoded: &OriginalEncodedTokenIds,
+    preparation: &PreparedSemanticSource,
+    input: &eredu_core::TokenIdsInputPlan<'_>,
     chunk: Option<NonZeroU64>,
 ) -> Result<MlxModelInput, BackendFailure> {
-    // All source checks are allocation-free. The exact E source must match C;
-    // equal IDs, a common pool or another selected executable are insufficient.
+    // These checks lend the actual prepared source, not caller-authorized
+    // storage. Text encoding has already authenticated its E source; explicit
+    // IDs still need this selected tokenizer's exact generation domain.
     if !runtime.session().matches_healthy_backend(runtime.backend()) {
         return Err(TokenInputRejection::IdentityMismatch.into_backend_failure());
     }
@@ -116,21 +118,20 @@ pub(super) fn prepare(
     preparation
         .validate(pool, model.erased().inference_execution_identity())
         .map_err(|_| TokenInputRejection::IdentityMismatch.into_backend_failure())?;
-    if !encoded.matches_source(preparation.tokenizer()) {
-        return Err(TokenInputRejection::IdentityMismatch.into_backend_failure());
-    }
-    let ids = encoded.ids();
-    if ids.is_empty() {
-        return Err(TokenInputRejection::Empty.into_backend_failure());
+    let domain = preparation.tokenizer().generation_domain()
+        .ok_or_else(|| TokenInputRejection::IdentityMismatch.into_backend_failure())?;
+    let ids = input.tokens();
+    if ids.iter().any(|&id| !domain.allows(id)) {
+        return Err(TokenInputRejection::InvalidToken.into_backend_failure());
     }
     i32::try_from(ids.len()).map_err(|_| TokenInputRejection::Overflow.into_backend_failure())?;
     let funding = preparation.metadata_funding();
     funding
         .reserve_metadata(
             control_bytes()
-                .ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?,
+                .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?,
         )
-        .map_err(WorkspaceMetadataFundingError::into_backend_failure)?;
+        .map_err(HostMetadataFundingError::into_backend_failure)?;
 
     // This reuses the actual admitted singleton; it never promotes ordinary
     // initialization. The header's existing domain ceiling also constrains I/B.

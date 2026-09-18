@@ -5,6 +5,8 @@
 //! projection names, attention geometry, or other model-family semantics.
 
 mod construction;
+mod linear_expansion;
+pub use linear_expansion::expand_linear_format_parameter_groups_with_metadata;
 pub use construction::{
     aligned_partition_units_with_metadata, module_parameter_group_with_metadata,
     partition_parameter_group_chunks_with_metadata,
@@ -13,12 +15,12 @@ pub use construction::{
 };
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ops::Range,
 };
 
 use eredu_checkpoint::LinearFormat;
-use eredu_nn::{LinearFormatSpec, ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
+use eredu_nn::{LinearFormatSpec, ParameterMetadataView, ParameterVisitor, Parameterized, Tensor};
 
 /// Architecture-neutral information for one rank-local parallel model.
 #[derive(Debug, Clone)]
@@ -270,6 +272,11 @@ pub struct ParameterGroupSpec {
 }
 
 impl ParameterGroupSpec {
+    /// Copies this already validated immutable declaration through exact owned destinations.
+    pub fn clone_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)->Result<Self,eredu_nn::Error>{
+        linear_expansion::copy_group(self,context)
+    }
+
     /// Creates a non-empty logical group.
     pub fn new(
         logical_name: impl Into<String>,
@@ -292,6 +299,17 @@ impl ParameterGroupSpec {
             ));
         }
         Self::build(logical_name.into(), role, Some(units), members)
+    }
+
+    /// Validates and moves already funded declarations through the shared group worker.
+    pub fn from_owned_with_metadata(
+        logical_name: String,
+        role: ParameterRole,
+        units: Option<usize>,
+        members: Vec<ParameterMemberSpec>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        construction::finish_owned(logical_name, role, units, members, context)
     }
 
     /// Reuses this group's owned metadata with an exact shared partition.
@@ -363,7 +381,7 @@ pub fn module_parameter_group<T, M>(
     logical_name: impl Into<String>,
     role: ParameterRole,
     module: &M,
-    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+    mut sharding: impl FnMut(ParameterMetadataView<'_>, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError>
 where
     T: Tensor,
@@ -378,17 +396,17 @@ where
     impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
     where
         T: Tensor,
-        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+        F: FnMut(ParameterMetadataView<'_>, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
     {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'tensor T) {
             if self.error.is_some() {
                 return;
             }
             match construction::member(
-                construction::MemberSource::ordinary(&metadata),
+                construction::MemberSource::borrowed(metadata),
                 value.shape(),
                 construction::Ordinary,
-                |shape| (self.sharding)(&metadata, shape),
+                |shape| (self.sharding)(metadata, shape),
             ) {
                 Ok(member) => self.members.push(member),
                 Err(cause) => self.error = Some(cause),
@@ -401,7 +419,7 @@ where
         sharding: &mut sharding,
         error: None,
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     if let Some(error) = collector.error {
         return Err(error);
     }
@@ -414,7 +432,7 @@ pub fn partitioned_module_parameter_group<T, M>(
     role: ParameterRole,
     preferred_units: usize,
     module: &M,
-    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+    mut sharding: impl FnMut(ParameterMetadataView<'_>, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError>
 where
     T: Tensor,
@@ -433,17 +451,17 @@ where
     impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
     where
         T: Tensor,
-        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+        F: FnMut(ParameterMetadataView<'_>, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
     {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'tensor T) {
             if self.error.is_some() {
                 return;
             }
             match construction::member(
-                construction::MemberSource::ordinary(&metadata),
+                construction::MemberSource::borrowed(metadata),
                 value.shape(),
                 construction::Ordinary,
-                |shape| (self.sharding)(&metadata, shape),
+                |shape| (self.sharding)(metadata, shape),
             ) {
                 Ok(member) => self.members.push(member),
                 Err(cause) => self.error = Some(cause),
@@ -455,7 +473,7 @@ where
         sharding: &mut sharding,
         error: None,
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     if let Some(error) = collector.error {
         return Err(error);
     }
@@ -474,7 +492,7 @@ where
     M: Parameterized<T>,
 {
     module_parameter_group(logical_name, role, module, |metadata, shape| {
-        construction::projection_sharding(placement, metadata.id.as_str(), shape)
+        construction::projection_sharding(placement, metadata.id().as_str(), shape)
             .map_err(construction::GroupIssue::ordinary)
     })
 }
@@ -664,29 +682,36 @@ pub fn partition_parameter_group_chunks_with_source(
     construction::apply_chunk_widths(group, widths).into_partitioned(units)
 }
 
+/// Fixed physical-chunk validation failure; no diagnostic allocation occurs.
+#[derive(Debug,Clone,Copy,Eq,PartialEq,thiserror::Error)]
+pub enum PartitionChunkRangeError {
+    /// The physical extent, width or interval is invalid.
+    #[error("invalid physical chunk range")] Invalid,
+    /// The logical interval exceeds the physical chunk population.
+    #[error("logical chunk range exceeds physical extent")] Extent,
+    /// A physical boundary cannot be represented.
+    #[error("physical chunk boundary overflows")] Overflow,
+}
+
 /// Maps a logical chunk interval to exact physical coordinates without padding.
 pub fn partition_chunk_range(
     extent: usize,
     chunk_size: usize,
     logical: Range<usize>,
-) -> Result<Range<usize>, ParallelPlanError> {
+) -> Result<Range<usize>, PartitionChunkRangeError> {
     if extent == 0 || chunk_size == 0 || logical.start > logical.end {
-        return Err(ParallelPlanError::InvalidTensor(
-            "invalid physical chunk range".into(),
-        ));
+        return Err(PartitionChunkRangeError::Invalid);
     }
     let units = extent.div_ceil(chunk_size);
     if logical.end > units {
-        return Err(ParallelPlanError::InvalidTensor(
-            "logical chunk range exceeds physical extent".into(),
-        ));
+        return Err(PartitionChunkRangeError::Extent);
     }
     let boundary = |index: usize| {
         if index == units {
             Ok(extent)
         } else {
             index.checked_mul(chunk_size).ok_or_else(|| {
-                ParallelPlanError::InvalidTensor("physical chunk boundary overflows".into())
+                PartitionChunkRangeError::Overflow
             })
         }
     };
@@ -700,27 +725,7 @@ pub fn expand_linear_format_parameter_groups(
     groups: Vec<ParameterGroupSpec>,
     declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    groups
-        .into_iter()
-        .map(|group| {
-            let mut members = Vec::new();
-            for source in group.members() {
-                members.extend(match declaration(source)? {
-                    Some(declaration) => expand_linear_format_member(source, &declaration)?,
-                    None => vec![source.clone()],
-                });
-            }
-            match group.partition_units() {
-                Some(units) => partitioned_group_with_preferred_units(
-                    group.logical_name(),
-                    group.role(),
-                    units,
-                    members,
-                ),
-                None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
-            }
-        })
-        .collect()
+    linear_expansion::ordinary(groups, declaration)
 }
 
 fn partitioned_group_with_preferred_units(
@@ -732,307 +737,6 @@ fn partitioned_group_with_preferred_units(
     let units = construction::preferred_units(&members, preferred_units)
         .map_err(construction::GroupIssue::ordinary)?;
     ParameterGroupSpec::partitioned(logical_name, role, units, members)
-}
-
-fn remap_linear_segments(
-    sharding: &MemberSharding,
-    axis: usize,
-    divisor: usize,
-    name: &str,
-) -> Result<MemberSharding, ParallelPlanError> {
-    let remap = |segments: &[Range<usize>]| {
-        segments
-            .iter()
-            .map(|segment| {
-                if !segment.start.is_multiple_of(divisor) || !segment.end.is_multiple_of(divisor) {
-                    return Err(ParallelPlanError::InvalidTensor(format!(
-                        "packed companion {name} segment {segment:?} is not aligned to {divisor}"
-                    )));
-                }
-                Ok(segment.start / divisor..segment.end / divisor)
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
-    match sharding {
-        MemberSharding::PartitionedChunks {
-            axis: selected,
-            chunk_size,
-        } if *selected == axis => {
-            if *chunk_size == 0 || !chunk_size.is_multiple_of(divisor) {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "packed companion {name} chunk width {chunk_size} is not aligned to {divisor}"
-                )));
-            }
-            Ok(MemberSharding::PartitionedChunks {
-                axis,
-                chunk_size: chunk_size / divisor,
-            })
-        }
-        MemberSharding::PartitionedChunkSegments {
-            axis: selected,
-            segments,
-            chunk_size,
-        } if *selected == axis => {
-            if *chunk_size == 0 || !chunk_size.is_multiple_of(divisor) {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "packed companion {name} chunk width {chunk_size} is not aligned to {divisor}"
-                )));
-            }
-            Ok(MemberSharding::PartitionedChunkSegments {
-                axis,
-                segments: remap(segments)?,
-                chunk_size: chunk_size / divisor,
-            })
-        }
-        MemberSharding::PartitionedSegments {
-            axis: selected,
-            segments,
-        } if *selected == axis => Ok(MemberSharding::PartitionedSegments {
-            axis: *selected,
-            segments: remap(segments)?,
-        }),
-        MemberSharding::Segmented {
-            axis: selected,
-            segments,
-        } if *selected == axis => Ok(MemberSharding::Segmented {
-            axis: *selected,
-            segments: remap(segments)?,
-        }),
-        other => Ok(other.clone()),
-    }
-}
-
-fn remap_fp8_rows(
-    source: &ParameterMemberSpec,
-    layout: eredu_nn::LinearRowLayout,
-    block: usize,
-) -> Result<MemberSharding, ParallelPlanError> {
-    let row_axis = source.global_shape().len() - 2;
-    if layout == eredu_nn::LinearRowLayout::Contiguous {
-        return remap_linear_segments(source.sharding(), row_axis, block, source.target());
-    }
-    let rows = source.global_shape()[row_axis];
-    let remap = |segments: &[Range<usize>]| {
-        segments
-            .iter()
-            .map(|segment| {
-                let boundary = |value| {
-                    layout
-                        .block_boundary(rows, block, value)
-                        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))
-                };
-                Ok(boundary(segment.start)?..boundary(segment.end)?)
-            })
-            .collect::<Result<Vec<_>, ParallelPlanError>>()
-    };
-    match source.sharding() {
-        MemberSharding::PartitionedSegments { axis, segments } if *axis == row_axis => {
-            Ok(MemberSharding::PartitionedSegments {
-                axis: *axis,
-                segments: remap(segments)?,
-            })
-        }
-        MemberSharding::Segmented { axis, segments } if *axis == row_axis => {
-            Ok(MemberSharding::Segmented {
-                axis: *axis,
-                segments: remap(segments)?,
-            })
-        }
-        MemberSharding::PartitionedChunkSegments {
-            axis,
-            segments,
-            chunk_size,
-        } if *axis == row_axis => {
-            if *chunk_size == 0 || !chunk_size.is_multiple_of(block) {
-                return Err(ParallelPlanError::InvalidTensor(
-                    "FP8 row chunk splits a scale block".into(),
-                ));
-            }
-            Ok(MemberSharding::PartitionedChunkSegments {
-                axis: *axis,
-                segments: remap(segments)?,
-                chunk_size: chunk_size / block,
-            })
-        }
-        MemberSharding::Partitioned { axis }
-        | MemberSharding::PartitionedChunks { axis, .. }
-        | MemberSharding::Equal { axis }
-        | MemberSharding::Balanced { axis }
-            if *axis == row_axis =>
-        {
-            Err(ParallelPlanError::InvalidTensor(
-                "independent FP8 row blocks require explicit segment placement".into(),
-            ))
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-fn expand_linear_format_member(
-    source: &ParameterMemberSpec,
-    declaration: &LinearFormatSpec,
-) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
-    let name = source.target();
-    let shape = source.global_shape();
-    let format = declaration.encoding();
-    if format == LinearFormat::Dense {
-        return if declaration.scale().is_none() && declaration.affine_bias().is_none() {
-            Ok(vec![source.clone()])
-        } else {
-            Err(ParallelPlanError::InvalidGroup(format!(
-                "dense linear parameter {name} declares physical companions"
-            )))
-        };
-    }
-    if shape.len() < 2 {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "encoded linear parameter {name} must have at least two dimensions"
-        )));
-    }
-    let row_axis = shape.len() - 2;
-    let column_axis = shape.len() - 1;
-    let invalid = |detail: String| ParallelPlanError::InvalidTensor(detail);
-    match format {
-        LinearFormat::Dense => unreachable!(),
-        LinearFormat::E4M3BlockFp8(fp8) => {
-            let Some(scale) = declaration.scale() else {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "block-FP8 linear parameter {name} must declare exactly one scale companion"
-                )));
-            };
-            if declaration.affine_bias().is_some() {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "block-FP8 linear parameter {name} must not declare an affine-bias companion"
-                )));
-            }
-            fp8.validate().map_err(|error| invalid(error.to_string()))?;
-            let rows = usize::try_from(fp8.block_rows)
-                .map_err(|_| invalid(format!("invalid block rows for {name}")))?;
-            let columns = usize::try_from(fp8.block_columns)
-                .map_err(|_| invalid(format!("invalid block columns for {name}")))?;
-            let mut scale_shape = shape.to_vec();
-            scale_shape[row_axis] = declaration
-                .row_layout()
-                .scale_rows(shape[row_axis], rows)
-                .map_err(|error| invalid(error.to_string()))?;
-            scale_shape[column_axis] = scale_shape[column_axis].div_ceil(columns);
-            let scale_sharding = remap_fp8_rows(source, declaration.row_layout(), rows)
-                .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
-            Ok(vec![
-                source
-                    .clone()
-                    .with_linear_row_layout(declaration.row_layout()),
-                ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding)
-                    .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
-            ])
-        }
-        LinearFormat::GgufIQuant { ggml_type, .. } => {
-            if declaration.scale().is_some() || declaration.affine_bias().is_some() {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "GGUF linear parameter {name} must not declare companion tensors"
-                )));
-            }
-            let (block_values, block_bytes) = ggml_type
-                .block_and_bytes()
-                .map_err(|error| invalid(error.to_string()))?;
-            let block_values = usize::try_from(block_values)
-                .map_err(|_| invalid(format!("GGUF block width for {name} exceeds usize")))?;
-            let block_bytes = usize::try_from(block_bytes)
-                .map_err(|_| invalid(format!("GGUF block bytes for {name} exceeds usize")))?;
-            let input = shape[column_axis];
-            if !input.is_multiple_of(block_values) {
-                return Err(invalid(format!(
-                    "GGUF matrix {name} input {input} is not aligned to block {block_values}"
-                )));
-            }
-            let mut packed = shape.to_vec();
-            packed[column_axis] = input / block_values * block_bytes;
-            let sharding =
-                remap_linear_segments(source.sharding(), column_axis, block_values, name)?;
-            // Chunk coordinates above are in encoded blocks. GGUF stores byte
-            // rows, so retain byte widths and segment offsets in the placement.
-            let bytes = |blocks: usize| {
-                blocks
-                    .checked_mul(block_bytes)
-                    .ok_or_else(|| invalid(format!("GGUF chunk coordinates for {name} overflow")))
-            };
-            let sharding = match sharding {
-                MemberSharding::PartitionedChunks { axis, chunk_size } if axis == column_axis => {
-                    MemberSharding::PartitionedChunks {
-                        axis,
-                        chunk_size: bytes(chunk_size)?,
-                    }
-                }
-                MemberSharding::PartitionedChunkSegments {
-                    axis,
-                    segments,
-                    chunk_size,
-                } if axis == column_axis => MemberSharding::PartitionedChunkSegments {
-                    axis,
-                    segments: segments
-                        .into_iter()
-                        .map(|segment| Ok(bytes(segment.start)?..bytes(segment.end)?))
-                        .collect::<Result<Vec<_>, ParallelPlanError>>()?,
-                    chunk_size: bytes(chunk_size)?,
-                },
-                other => other,
-            };
-            Ok(vec![ParameterMemberSpec::new(name, packed, sharding)])
-        }
-        LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
-            let quantization = format.weight_quantization().expect("packed format");
-            let Some(scale) = declaration.scale() else {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "packed linear parameter {name} must declare a scale companion"
-                )));
-            };
-            let bias = declaration.affine_bias();
-            if quantization.has_biases() != bias.is_some() {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "packed linear parameter {name} declares companions inconsistent with its format"
-                )));
-            }
-            let bits = usize::try_from(quantization.bits())
-                .map_err(|_| invalid(format!("packed bit width for {name} exceeds usize")))?;
-            let group = usize::try_from(quantization.group_size())
-                .map_err(|_| invalid(format!("packed group width for {name} exceeds usize")))?;
-            let input = shape[column_axis];
-            let packed_bits = input
-                .checked_mul(bits)
-                .ok_or_else(|| invalid(format!("packed matrix {name} overflows")))?;
-            if group == 0 || !input.is_multiple_of(group) || !packed_bits.is_multiple_of(32) {
-                return Err(invalid(format!(
-                    "packed matrix {name} input {input} is incompatible with group {group} and {bits} bits"
-                )));
-            }
-            let mut packed = shape.to_vec();
-            packed[column_axis] = packed_bits / 32;
-            let mut companion = shape.to_vec();
-            companion[column_axis] = input / group;
-            let mut members = vec![ParameterMemberSpec::new(
-                name,
-                packed,
-                remap_linear_segments(source.sharding(), column_axis, 32 / bits, name)?,
-            )];
-            let companion_sharding =
-                remap_linear_segments(source.sharding(), column_axis, group, name)?;
-            members.push(
-                ParameterMemberSpec::new(
-                    scale.id.as_str(),
-                    companion.clone(),
-                    companion_sharding.clone(),
-                )
-                .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
-            );
-            if let Some(bias) = bias {
-                members.push(
-                    ParameterMemberSpec::new(bias.id.as_str(), companion, companion_sharding)
-                        .with_linear_companion(eredu_nn::LinearCompanionRole::AffineBias, name),
-                );
-            }
-            Ok(members)
-        }
-    }
 }
 
 const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
@@ -1093,6 +797,17 @@ pub enum TensorPlacement {
         /// Distinct source indices in local output order.
         indices: Vec<usize>,
     },
+}
+
+/// Fixed admission/capacity failures and the actual host vector refusal.
+#[derive(Debug,thiserror::Error)]
+pub enum ParallelLayoutStorageError {
+    /// The original construction account refused a producer.
+    #[error("{0}")] Funding(#[from] eredu_core::HostMetadataFundingError),
+    /// The host allocator refused the admitted vector layout.
+    #[error("parallel layout allocation: {0}")] Allocation(#[from] std::collections::TryReserveError),
+    /// The actual vector capacity differs from the qualified request.
+    #[error("parallel layout capacity differs from its request")] Capacity,
 }
 
 /// Rank-local shape and placement for one planned physical tensor.
@@ -1174,9 +889,34 @@ impl<P> LocalTensorLayout<P> {
 
     /// Adds one exact checkpoint-global selection preceding the primary
     /// placement.
-    pub fn with_additional_placement(mut self, placement: TensorPlacement) -> Self {
+    pub fn with_additional_placement(self, placement: TensorPlacement) -> Self {
+        self.additional_placement(placement, None).expect("ordinary additional placement allocation")
+    }
+
+    /// Adds one selection through the same vector producer with prospective
+    /// backing/control funding. The source's enclosing owner retains the payer.
+    pub fn try_with_additional_placement(self, placement: TensorPlacement, funding: &eredu_core::HostMetadataFunding)
+        -> Result<Self, ParallelLayoutStorageError> {
+        self.additional_placement(placement, Some(funding))
+    }
+    fn additional_placement(mut self, placement: TensorPlacement, funding: Option<&eredu_core::HostMetadataFunding>)
+        -> Result<Self, ParallelLayoutStorageError> {
+        use eredu_core::HostMetadataFundingError as E;
+        let required = self.additional_placements.len().checked_add(1).ok_or(E::Overflow)?;
+        if let Some(funding) = funding {
+            funding.reserve_metadata(std::mem::size_of::<(Self, TensorPlacement, Option<&eredu_core::HostMetadataFunding>,
+                usize, Result<Self,ParallelLayoutStorageError>, std::collections::TryReserveError)>())?;
+        }
+        if required > self.additional_placements.capacity() {
+            let target = required.max(4).checked_next_power_of_two().ok_or(E::Overflow)?;
+            if let Some(funding) = funding {
+                funding.reserve_metadata(std::alloc::Layout::array::<TensorPlacement>(target).map_err(|_|E::Overflow)?.size())?;
+            }
+            self.additional_placements.try_reserve_exact(target-self.additional_placements.len())?;
+            if self.additional_placements.capacity()!=target {return Err(ParallelLayoutStorageError::Capacity);}
+        }
         self.additional_placements.push(placement);
-        self
+        Ok(self)
     }
 
     /// Returns the rank-local range in the parameter group's semantic domain.
@@ -1242,7 +982,7 @@ impl<P> LocalTensorLayout<P> {
 /// Complete rank-local model geometry produced alongside checkpoint placement.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalModelLayout<P = TensorPlacement> {
-    tensors: BTreeMap<String, LocalTensorLayout<P>>,
+    tensors: eredu_collections::ordered_map::Map<String, LocalTensorLayout<P>>,
 }
 
 mod transform_source;
@@ -1251,7 +991,7 @@ pub use transform_source::derive_transform_source_layout;
 impl<P> Default for LocalModelLayout<P> {
     fn default() -> Self {
         Self {
-            tensors: BTreeMap::new(),
+            tensors: eredu_collections::ordered_map::Map::new(),
         }
     }
 }
@@ -1265,6 +1005,20 @@ impl<P> LocalModelLayout<P> {
     /// Inserts one planner-produced physical layout.
     pub fn insert(&mut self, target: String, layout: LocalTensorLayout<P>) {
         self.tensors.insert(target, layout);
+    }
+
+    /// Inserts a source-produced row after admitting its exact ordered node.
+    /// Nested target/layout storage and the enclosing source custody belong to
+    /// the caller. Existing rows are replaced without allocating another node.
+    pub fn try_insert_with_funding(&mut self, target: String, layout: LocalTensorLayout<P>,
+        funding: &eredu_core::HostMetadataFunding) -> Result<(), eredu_core::HostMetadataFundingError> {
+        use eredu_core::HostMetadataFundingError as E;
+        funding.reserve_metadata(self.tensors.insertion_control_bytes(&target).ok_or(E::Overflow)?)?;
+        self.tensors.try_insert_with(target, layout, |layout| funding.reserve_metadata(layout.size()))
+            .map(|_|()).map_err(|cause| match cause {
+                eredu_collections::ordered_map::TryInsertError::SizeOverflow=>E::Overflow,
+                eredu_collections::ordered_map::TryInsertError::Funding(cause)=>cause,
+            })
     }
 
     /// Returns one physical tensor layout by rewritten target name.
@@ -1293,6 +1047,14 @@ impl<P> LocalModelLayout<P> {
 /// Invalid architecture-declared parallel semantics.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ParallelPlanError {
+    /// Exact physical-chunk failure from the allocation-free source worker.
+    #[error("{0}")]
+    Chunk(#[from] PartitionChunkRangeError),
+
+    /// Canonical source traversal could not establish complete parameter coverage.
+    #[error(transparent)]
+    Source(#[from] eredu_nn::ParameterSourceError),
+
     /// A logical group is empty, ambiguous, or internally inconsistent.
     #[error("{0}")]
     InvalidGroup(String),

@@ -135,7 +135,7 @@ impl Lexer {
                 self.lexer.dfa.set_fuel(fuel);
             }
             fn weight(&mut self, lexeme: LexemeIdx) -> Result<u32> {
-                Ok(self.lexer.dfa.lexeme_weight(lexeme))
+                self.lexer.dfa.lexeme_weight(lexeme)
             }
             fn precompute(&mut self, lexeme: LexemeIdx) -> Result<()> {
                 let mut allowed = self.lexer.spec.alloc_lexeme_set();
@@ -229,7 +229,7 @@ impl Lexer {
     }
 
     pub fn lexemes_from_idx(&self, idx: MatchingLexemesIdx) -> &MatchingLexemes {
-        matching(&self.spec, idx, |state| Some(self.dfa.state_desc(state)))
+        matching(&self.spec.lexemes, idx, |state| Some(self.dfa.state_desc(state)))
             .expect("matching lexical source")
     }
 

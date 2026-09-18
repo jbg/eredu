@@ -9,7 +9,7 @@ fn width_one_direct_parallel_consumers_preserve_local_recurrence_and_kv() {
         let config = hybrid::model_args_from_config_value(&value).unwrap().text;
         let context = NumericContext::default();
         let architecture = HybridModel::new(config.clone(), &context).unwrap();
-        let parameters = architecture.parameter_description(&context).unwrap();
+        let parameters = architecture.parameter_description(&context).unwrap().into_owned();
         let groups = parameters
             .groups()
             .iter()

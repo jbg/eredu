@@ -8,6 +8,7 @@ use eredu_runtime::{
 pub(crate) struct OriginalPreparedArrayCopySource<'a> {
     array: &'a Array,
     prepared: &'a PreparedModelInputOwner<crate::MlxTensor>,
+    index: usize,
 }
 impl<'a> OriginalPreparedArrayCopySource<'a> {
     /// Both views were produced by the same original B compiler. Callers cannot
@@ -28,7 +29,19 @@ impl<'a> OriginalPreparedArrayCopySource<'a> {
         Ok(Self {
             array: part.payload().value(),
             prepared,
+            index: 0,
         })
+    }
+    /// Lends only a payload physically retained by this completed original
+    /// owner. Equal descriptors or an unrelated tensor cannot select a source.
+    pub(crate) fn from_payload(
+        prepared: &'a PreparedModelInputOwner<crate::MlxTensor>,
+        payload: &'a crate::MlxTensor,
+    ) -> Result<Self, WorkingMemoryError> {
+        if prepared.original_source().is_none() { return Err(WorkingMemoryError::IdentityMismatch); }
+        let index = prepared.parts().iter().position(|part| std::ptr::eq(part.payload().value(), payload))
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        Ok(Self { array: payload.as_array(), prepared, index })
     }
     pub(crate) fn control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
@@ -54,6 +67,6 @@ impl<'a> OriginalPreparedArrayCopySource<'a> {
         &self,
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<(WorkspaceTensor, OriginalPreparedWorkspaceSource), eredu_nn::Error> {
-        self.prepared.project_single_payload_with_metadata(context)
+        self.prepared.project_payload_with_metadata(self.index, context)
     }
 }

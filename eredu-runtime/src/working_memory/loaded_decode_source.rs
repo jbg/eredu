@@ -6,7 +6,7 @@ use std::{
     alloc::Layout,
     fmt,
     mem::size_of,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,22 @@ impl Allowance {
     }
     pub(super) fn pool(&self) -> &WorkingMemoryPool {
         &self.pool
+    }
+
+    /// Admit a reached input producer while retaining the complete prior prefix.
+    /// Only the active original compiler may extend its own charge.
+    pub(super) fn reserve_more(&mut self, bytes: u64) -> Result<(), WorkingMemoryError> {
+        if self.phase != Phase::Compiling {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        self.pool.charge_source_compiler(bytes, false)?;
+        // No fallible operation follows the ledger commit before ownership update.
+        self.bytes = total;
+        Ok(())
     }
 
     pub(super) fn end_compilation(&mut self) -> Result<(), WorkingMemoryError> {
@@ -239,43 +255,45 @@ impl WorkingMemoryPool {
             bytes,
             phase: Phase::Uncharged,
         };
-        {
-            let mut usage = self
-                .0
-                .usage
-                .lock()
-                .map_err(|_| WorkingMemoryError::Poisoned)?;
-            if usage.unquoted_owners != 0 {
-                return Err(WorkingMemoryError::UnknownBound);
-            }
-            let available = self.0.available(&usage, None)?;
-            if bytes > available {
-                return Err(WorkingMemoryError::BudgetExceeded {
-                    required_bytes: bytes,
-                    available_bytes: available,
-                });
-            }
-            let reservations = usage
-                .reservations
-                .checked_add(1)
-                .ok_or(WorkingMemoryError::Overflow)?;
-            let reserved = usage
-                .reserved
-                .checked_add(bytes)
-                .ok_or(WorkingMemoryError::Overflow)?;
-            let used = self
-                .0
-                .existing
-                .checked_add(usage.registered)
-                .and_then(|b| b.checked_add(reserved))
-                .ok_or(WorkingMemoryError::Overflow)?;
-            usage.reservations = reservations;
-            usage.reserved = reserved;
-            usage.peak = usage.peak.max(used);
-            // No fallible operation between commit and installing this guard.
-            allowance.phase = Phase::Compiling;
-        }
+        self.charge_source_compiler(bytes, true)?;
+        // No fallible operation between commit and installing this guard.
+        allowance.phase = Phase::Compiling;
         Ok(allowance)
+    }
+    fn charge_source_compiler(&self, bytes: u64, starting: bool) -> Result<(), WorkingMemoryError> {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        if usage.unquoted_owners != 0 {
+            return Err(WorkingMemoryError::UnknownBound);
+        }
+        let available = self.0.available(&usage, None)?;
+        if bytes > available {
+            return Err(WorkingMemoryError::BudgetExceeded {
+                required_bytes: bytes,
+                available_bytes: available,
+            });
+        }
+        let reservations = usage
+            .reservations
+            .checked_add(usize::from(starting))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let reserved = usage
+            .reserved
+            .checked_add(bytes)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let used = self
+            .0
+            .existing
+            .checked_add(usage.registered)
+            .and_then(|n| n.checked_add(reserved))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        usage.reservations = reservations;
+        usage.reserved = reserved;
+        usage.peak = usage.peak.max(used);
+        Ok(())
     }
     /// Admits before the first compiler reserve and consumes the actual plan once.
     /// Terminal compilation ends only its active count; every byte remains held

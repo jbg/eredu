@@ -5,7 +5,7 @@ pub(crate) struct OriginalGroupExchange<'a> {
     plan: LogicalExchangePlan<'a>,
     order: usize,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalCommunicationSource<'_> {
     pub(crate) fn group_exchange(
@@ -23,7 +23,7 @@ impl OriginalCommunicationSource<'_> {
                 >,
             >(),
             failure_control_bytes().ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
         ];
         self.funding
@@ -32,7 +32,7 @@ impl OriginalCommunicationSource<'_> {
                     .into_iter()
                     .try_fold(size_of_val(&controls), usize::checked_add)
                     .ok_or(Error::WorkspacePlanning(
-                        WorkspaceMetadataFundingError::Overflow,
+                        HostMetadataFundingError::Overflow,
                     ))?,
             )
             .map_err(Error::WorkspacePlanning)?;
@@ -125,8 +125,8 @@ impl OriginalCommunicationSource<'_> {
     }
 }
 
-fn overflow() -> Error { Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow) }
-fn reserve(funding: &WorkspaceMetadataFunding, parts: &[usize]) -> Result<(), Error> {
+fn overflow() -> Error { Error::WorkspacePlanning(HostMetadataFundingError::Overflow) }
+fn reserve(funding: &HostMetadataFunding, parts: &[usize]) -> Result<(), Error> {
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts), usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }

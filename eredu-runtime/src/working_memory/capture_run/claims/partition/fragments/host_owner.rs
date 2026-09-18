@@ -19,7 +19,7 @@ impl FragmentHostStorage {
         ->PreparedPartitionFragmentDestinations {
         let mut identity=[0;64];identity.copy_from_slice(receipt.identity().as_bytes());
         PreparedPartitionFragmentDestinations{rows:self.rows,routed_merge:self.routed_merge,identity,allowance,
-            source:receipt.shared_plan_source().expect("checked shared receipt").clone(),scratch:self.scratch,
+            source:receipt.shared_plan_source().clone(),scratch:self.scratch,
             prefill:self.prefill,custody:self.custody}
     }
 }

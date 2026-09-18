@@ -28,7 +28,7 @@ pub struct PreparedPartitionContiguousSource {
     producers:OwnedProducers,ranks:Vec<PartitionCaptureRankSource>,native:Vec<NativeSource>,
     local:Option<LocalSource>,await_vote:bool,
     pub(in crate::capture::partition::funded) evidence_budget:Option<super::super::receipt::EvidenceBudgetSource>,
-    source:SharedCapturePlan,metadata:WorkspaceMetadataFunding,
+    source:SharedCapturePlan,metadata:HostMetadataFunding,
 }
 /// A typed pre-native refusal. The original Host remains in the cause, even
 /// when the shared policy elects to coordinate a skipped observation.
@@ -55,14 +55,14 @@ impl PreparedPartitionContiguousSource {
     pub fn new(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureContiguousProducer],dtypes:&[Option<TensorDtype>],
         native:&[PartitionCaptureFragmentSource<'_>],combination:PartitionCaptureCombination,
-        inference:InferenceGeometry,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        inference:InferenceGeometry,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::new_sources(source,index,axis,ProducerSources::Contiguous(producers),dtypes,voted::Sources::Typed(native),combination,
             Coordinate::Prefill(inference),None,metadata)
     }
     fn new_sources(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:ProducerSources<'_>,dtypes:&[Option<TensorDtype>],
         native:voted::Sources<'_,'_>,combination:PartitionCaptureCombination,coordinate:Coordinate,
-        local:Option<PartitionCaptureLocalSource<'_>>,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        local:Option<PartitionCaptureLocalSource<'_>>,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         let error=|cause|PartitionCaptureProgramError{cause,_source:source.clone(),_metadata:metadata.clone()};
         let frames=[coordinates::control_bytes().ok_or_else(||error(Cause::Source("component controls overflow")))?,Coordinate::control_bytes().ok_or_else(||error(Cause::Source("coordinate controls overflow")))?,size_of::<voted::Sources<'_,'_>>(),size_of::<voted::Source<'_>>(),size_of::<Option<PartitionCaptureLocalSource<'_>>>(),
             size_of::<Option<LocalSource>>(),size_of::<std::ops::Range<usize>>(),size_of::<Self>()*2,size_of::<NativeSource>()*2,size_of::<ResolvedCaptureSlice>()*2,
@@ -71,16 +71,16 @@ impl PreparedPartitionContiguousSource {
             size_of::<CaptureTransform>(),size_of::<Option<TensorDtype>>(),size_of::<TensorDtype>(),
             size_of::<Vec<NativeSource>>(),size_of::<Vec<PartitionCaptureContiguousProducer>>(),size_of::<Vec<PartitionCaptureRankSource>>(),
             size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureContiguousProducer],&[Option<TensorDtype>],
-                &[PartitionCaptureFragmentSource<'_>],PartitionCaptureCombination,InferenceGeometry,&WorkspaceMetadataFunding)>(),
+                &[PartitionCaptureFragmentSource<'_>],PartitionCaptureCombination,InferenceGeometry,&HostMetadataFunding)>(),
             size_of::<(&SharedCapturePlan,usize,usize,&[PartitionCaptureContiguousProducer],&[Option<TensorDtype>],
-                voted::Sources<'_,'_>,PartitionCaptureCombination,Coordinate,Option<PartitionCaptureLocalSource<'_>>,&WorkspaceMetadataFunding)>(),
-            size_of::<(&WorkspaceMetadataFunding,&[u64])>(),size_of::<Result<Vec<u64>,eredu_nn::Error>>(),
+                voted::Sources<'_,'_>,PartitionCaptureCombination,Coordinate,Option<PartitionCaptureLocalSource<'_>>,&HostMetadataFunding)>(),
+            size_of::<(&HostMetadataFunding,&[u64])>(),size_of::<Result<Vec<u64>,eredu_nn::Error>>(),
             size_of::<std::slice::Iter<'_,PartitionCaptureFragmentSource<'_>>>(),
             size_of::<std::iter::Zip<std::slice::Iter<'_,PartitionCaptureContiguousProducer>,std::slice::Iter<'_,Option<TensorDtype>>>>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_,PartitionCaptureContiguousProducer>>>(),
             size_of::<std::slice::Iter<'_,PartitionCaptureContiguousProducer>>(),
             size_of::<std::slice::Iter<'_,u64>>(),size_of::<[usize;4]>(),
-            size_of::<std::array::IntoIter<usize,4>>(),size_of::<(&WorkspaceMetadataFunding,)>(),
+            size_of::<std::array::IntoIter<usize,4>>(),size_of::<(&HostMetadataFunding,)>(),
             size_of::<usize>()*4,size_of::<bool>()*3];
         metadata.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or_else(||error(Cause::Source("contiguous source controls overflow")))?).map_err(|e|error(e.into()))?;
@@ -135,7 +135,7 @@ impl PreparedPartitionContiguousSource {
     pub fn new_local(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureContiguousProducer],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        inference:InferenceGeometry,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        inference:InferenceGeometry,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::new_local_coordinate(source,index,axis,producers,native,local,combination,Coordinate::Prefill(inference),metadata)
     }
     /// Retain one real decode invocation, with no fabricated prefill geometry.
@@ -144,13 +144,13 @@ impl PreparedPartitionContiguousSource {
     pub fn new_local_decode(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureContiguousProducer],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        prediction:u64,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         Self::new_local_coordinate(source,index,axis,producers,native,local,combination,Coordinate::Decode(prediction),metadata)
     }
     fn new_local_coordinate(source:&SharedCapturePlan,index:usize,axis:usize,
         producers:&[PartitionCaptureContiguousProducer],native:&[PartitionCaptureFragmentGeometry<'_>],
         local:Option<PartitionCaptureLocalSource<'_>>,combination:PartitionCaptureCombination,
-        coordinate:Coordinate,metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
+        coordinate:Coordinate,metadata:&HostMetadataFunding)->Result<Self,PartitionCaptureProgramError> {
         let error=|cause|PartitionCaptureProgramError{cause,_source:source.clone(),_metadata:metadata.clone()};
         metadata.reserve_metadata(voted::construction_controls().ok_or_else(||error(Cause::Source("local source controls overflow")))?)
             .map_err(|e|error(e.into()))?;
@@ -305,7 +305,7 @@ pub(crate) struct PreparedPartitionContiguousRow<'t,T:PartitionCaptureTransport>
     pending:Option<voted::Pending>,local_source:Option<LocalSource>,
     routed:bool,routed_source:Option<routed::LocalSource>,
     active:bool,present:bool,local:usize,local_dtype:Option<TensorDtype>,next:u64,last_epoch:Option<DistributedCommitEpoch>,
-    coordinate:Coordinate,usage:CaptureUsage,source:SharedCapturePlan,metadata:WorkspaceMetadataFunding,
+    coordinate:Coordinate,usage:CaptureUsage,source:SharedCapturePlan,metadata:HostMetadataFunding,
 }
 impl<'t,T:PartitionCaptureTransport> PreparedPartitionContiguousRow<'t,T>
 where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
@@ -441,9 +441,11 @@ fn preparation_controls<T:PartitionCaptureTransport>()->Option<usize> {
             RowFunding<'_>,PartitionCaptureReceiptLimits,&mut CaptureLedger)>(),
         size_of::<(PreparedPartitionContiguousSource,&T,&PartitionCaptureContext,DistributedCommitEpoch,
             &mut Option<RowFunding<'_>>,PartitionCaptureReceiptLimits,&mut CaptureLedger,CaptureUsage)>(),
-        size_of::<(usize,CaptureUsage)>(),size_of::<Option<(usize,CaptureUsage)>>(),size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>(),
+        size_of::<(usize,CaptureUsage)>(),size_of::<Option<(usize,CaptureUsage)>>(),size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>(),
         size_of::<std::slice::Iter<'_,PartitionCaptureContiguousProducer>>(),
         size_of::<std::slice::Iter<'_,NativeSource>>(),size_of::<Option<usize>>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<HeldPreparation>()?];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

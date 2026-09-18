@@ -53,7 +53,7 @@ pub enum OriginalBufferCause {
     InvalidStatus(u32),
 }
 impl OriginalBufferCause {
-    pub(super) fn check(status: u32) -> Result<(), Self> {
+    pub(crate) fn check(status: u32) -> Result<(), Self> {
         use safemlx_sys::*;
         Err(match status {
             MLX_ORIGINAL_BUFFER_OK => return Ok(()),

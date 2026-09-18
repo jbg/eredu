@@ -421,7 +421,7 @@ impl<'a,'c> CaptureTokenScoreClaim<'a,'c> {
     /// Fill the original fixed slots from one authenticated complete-producer receipt.
     /// Invalid receipts retain their initialized prefix and the spent original account.
     pub fn decode_partition_receipt(self,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,
-        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)->Result<ClaimedCaptureTokenScores,PartitionCaptureTensorDecodeError> {
+        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<ClaimedCaptureTokenScores,PartitionCaptureTensorDecodeError> {
         let custody=self.identity.custody.share_scheduled();claims::prepare_vocabulary_decoder(&custody,funding)?;
         let mut destination=self.prepare(None).map_err(|cause|claims::histogram_preparation_failure(cause,&custody,funding))?;
         let (source,index,_,_,shape)=destination.partition_source();

@@ -153,7 +153,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         Ok(Self {
             layer,
             observation: args
-                .routed_observation_points(&format!("model.layers.{layer}"), layer)
+                .routed_observation_points(&format!("model.layers.{layer}"), layer, None)?
                 .ok_or_else(|| Error::backend("Kimi sparse unit has no routing declaration"))?,
             router,
             experts,
@@ -390,7 +390,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
             |bank, request, context| {
                 provider
                     .forward_grouped(bank, request, context)
-                    .map_err(Error::backend_source)
+                    .map_err(Error::backend_retained_source)
             },
         )
     }
@@ -425,7 +425,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                         B::parallel_size(parallel),
                         context,
                     )
-                    .map_err(Error::backend_source)?;
+                    .map_err(Error::backend_retained_source)?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             },
         )

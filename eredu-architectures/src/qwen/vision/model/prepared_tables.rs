@@ -33,7 +33,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                     .context()
                 {
                     Some(context) => context.metadata_source(cause),
-                    None => Error::backend_source(cause),
+                    None => Error::backend_retained_source(cause),
                 })?
         {
             return Err(metadata.error(format_args!(
@@ -123,6 +123,31 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             sequence,
             None,
             VisionStateTables::Original(source.clone()),
+            || rotary::<B::Tensor>(&tables, context),
+            context,
+            metadata.context(),
+        )
+        .map(|(_, state)| state)
+    }
+
+    /// Workspace receivers borrow the same original tables as the first
+    /// encoder partition, retaining their source through continuation state.
+    pub(crate) fn continuation_state_with_projected_tables(
+        &self,
+        source: &eredu_runtime::input::OriginalEncoderTableProjection,
+        sequence: i32,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<VisionState<B::Tensor>, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(
+            metadata.or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(VisionStateTables<B::Tensor>, VisionState<B::Tensor>)>()?;
+        let tables = self.checked_table_view(source.tables(), sequence, metadata)?;
+        self.reorder_continuation(
+            sequence,
+            None,
+            VisionStateTables::Projected(source.clone()),
             || rotary::<B::Tensor>(&tables, context),
             context,
             metadata.context(),

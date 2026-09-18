@@ -8,14 +8,14 @@ pub(crate) struct PinnedCacheBlock {
     id: CacheBlockId,
     manager: CacheResidencyManager,
     generation: u64,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 /// One actual demand access to an already pinned canonical source. The owner
 /// stays in the enclosing Q program until its numerical use has completed.
 pub(crate) struct PinnedCacheBlockLease {
     id: CacheBlockId,
     manager: CacheResidencyManager,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl CacheBlockSourceLoan<'_> {
     /// The scan's source program prepays fixed_controls before native entry.
@@ -23,7 +23,7 @@ impl CacheBlockSourceLoan<'_> {
     pub(crate) fn pin_prepared_block(
         &mut self,
         id: &CacheBlockId,
-        funding: Option<WorkspaceMetadataFunding>,
+        funding: Option<HostMetadataFunding>,
     ) -> Result<PinnedCacheBlock, CacheSourceError> {
         if !self.blocks().any(|block| block.id() == id) {
             return Err(CacheSourceError::Identity);
@@ -87,7 +87,7 @@ impl PinnedCacheBlock {
             size_of::<(
                 &mut CacheBlockSourceLoan<'_>,
                 &CacheBlockId,
-                Option<WorkspaceMetadataFunding>,
+                Option<HostMetadataFunding>,
             )>(),
             size_of::<Result<Self, CacheSourceError>>(),
             size_of::<Result<PinnedCacheBlockLease, CacheSourceError>>(),

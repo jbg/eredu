@@ -112,6 +112,19 @@ fn bytes<T>(len: usize) -> Result<usize, Cause> {
         .map_err(|_| Cause::Overflow)
 }
 impl ExprSet {
+    /// Actual retained source buffers. This is inspection, not a construction
+    /// bound or permission to allocate a copy.
+    pub fn retained_capacity_bytes(&self) -> Option<usize> {
+        let mut bytes = self.exprs.retained_capacity_bytes().ok()?
+            .checked_add(self.pp.retained_capacity_bytes())?
+            .checked_add(self.unicode_cache.allocation_size())?
+            .checked_add(self.expr_weight.capacity().checked_mul(size_of::<(u32, u32)>())?)?;
+        for key in self.unicode_cache.keys() {
+            bytes = bytes.checked_add(key.capacity().checked_mul(size_of::<(char, char)>())?)?;
+        }
+        Some(bytes)
+    }
+
     /// Complete existing fixed source-copy and prepared-table inspection frames,
     /// without walking the source or allocating a destination.
     pub fn prepared_source_inspection_control_bytes() -> Option<usize> {
@@ -268,7 +281,7 @@ impl<'a> ExprSetPreparedSourcePlan<'a> {
         let table = self.table;
         let inner = self
             .copy
-            .compile_with_storage(|_| table.compile().map(ExpressionStorage::Prepared))?;
+            .compile_with_storage(|_| table.compile().map(ExpressionStorage))?;
         Ok(PreparedExprSet { inner })
     }
 }
@@ -347,7 +360,12 @@ impl<'a> ExprSetCopyPlan<'a> {
     }
     /// Runs the same fallible constructor used by ordinary Clone.
     pub fn compile(self) -> Result<ExprSet, ExprSetCopyFailure> {
-        self.compile_with_storage(|plan| plan.compile().map(ExpressionStorage::Ordinary))
+        self.compile_with_funding(crate::ParserAllocationFunding::unenforced())
+    }
+    pub(crate) fn compile_with_funding(self, funding: crate::ParserAllocationFunding) -> Result<ExprSet, ExprSetCopyFailure> {
+        let words = self.source.exprs.0.max_words();
+        let encoding = self.source.exprs.0.max_encoded_words();
+        self.compile_with_storage(|plan| plan.compile().map(|source| ExpressionStorage::copied(source, words, encoding, funding)))
     }
     fn compile_with_storage(
         self,
@@ -435,7 +453,7 @@ mod tests {
     use crate::RegexBuilder;
     #[test]
     fn prepared_expression_copy_keeps_finite_table_on_late_metadata_refusal() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(crate::ParserAllocationFunding::unenforced()).unwrap();
         builder.mk_regex("[α-ω]+").unwrap();
         builder.mk_regex("[Ж-Я]+").unwrap();
         let source = builder.into_exprset();
@@ -470,7 +488,7 @@ mod tests {
         let partial = failure.partial.as_ref().unwrap();
         assert!(matches!(
             partial.exprs,
-            Some(ExpressionStorage::Prepared(_))
+            Some(ExpressionStorage(_))
         ));
         assert_eq!(partial.exprs.as_ref().unwrap().len(), entries);
         assert_eq!(partial.unicode.len(), 1);
@@ -478,7 +496,7 @@ mod tests {
     }
     #[test]
     fn expression_source_copy_retains_ids_mapping_and_partial_unicode_key_population() {
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(crate::ParserAllocationFunding::unenforced()).unwrap();
         builder.mk_regex("[α-ω]+").unwrap();
         builder.mk_regex("[Ж-Я]+").unwrap();
         let source = builder.into_exprset();

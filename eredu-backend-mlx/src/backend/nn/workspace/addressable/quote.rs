@@ -7,10 +7,27 @@ use crate::backend::runtime::residency::parameter_bank::{
 use eredu_runtime::expert::AddressableChunkCensus;
 use eredu_runtime::working_memory::{HostSourceConstructionFacts, WorkingMemoryPool};
 
+#[derive(Debug)]
+pub(crate) struct RetainedAddressableDeclaration {
+    value: std::rc::Rc<WorkspaceAddressableRegion>,
+    rows: usize,
+}
+impl RetainedAddressableDeclaration {
+    pub(crate) fn as_view(&self) -> WorkspaceAddressableRegionView<'_> {
+        let mut view = self.value.as_view();
+        view.chunks.rows = self.rows;
+        view
+    }
+    fn observation(&self) -> Option<WorkspaceAddressableObservationSource> { self.value.observation() }
+}
 pub(crate) struct AddressableQuote {
-    pub(crate) declaration: WorkspaceAddressableRegion,
+    pub(crate) declaration: RetainedAddressableDeclaration,
     pub(crate) inputs: Vec<WorkspaceLayout>,
     pub(crate) outputs: Vec<WorkspaceLayout>,
+    /// Completed equation before separately scoped source-copy producers.
+    /// Local row alternatives compose this population, then join the actual
+    /// admitted maximum residency source once.
+    pub(super) equation: SpeculativeNumericalRecipe,
     pub(crate) numerical: SpeculativeNumericalRecipe,
     pub(crate) capacity: BoundaryStageCapacity,
     pub(crate) host_bytes: u64,
@@ -18,7 +35,7 @@ pub(crate) struct AddressableQuote {
     pub(crate) constructor_facts: HostSourceConstructionFacts,
     pub(crate) read_facts: Option<HostSourceConstructionFacts>,
     pub(crate) residency: IndexedResidencyPlan,
-    parameters: ParameterRows,
+    parameters: std::rc::Rc<ParameterRows>,
     mechanism: ResidentExecutionMechanisms,
 }
 impl std::fmt::Debug for AddressableQuote {
@@ -37,7 +54,7 @@ impl AddressableQuote {
         mechanism: ResidentExecutionMechanisms,
         runtime: &safemlx::PreparedInputRuntime,
         pool: Option<&WorkingMemoryPool>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
         let invalid = || {
@@ -50,6 +67,7 @@ impl AddressableQuote {
             WorkspaceContext,
             Result<Self, Error>,
             AddressableNumericalPopulation,
+            SpeculativeNumericalRecipe,
             AddressableParentSource,
             AddressableChildSource,
             IndexedChunkLayout,
@@ -257,7 +275,8 @@ impl AddressableQuote {
         host_bytes = host_bytes
             .checked_add(parent.report.host_workspace_bytes.ok_or_else(invalid)?)
             .ok_or_else(invalid)?;
-        let numerical = population.finish_with_residency(roles, id_completions, &residency, &context)?;
+        let equation = population.finish(roles, id_completions, &context)?;
+        let numerical = equation.with_indexed_source(&residency, &context)?;
         let backing = safemlx::OriginalBufferBudget::metal_population_layout(
             runtime,
             usize::try_from(numerical.storage.mutable_bytes()).map_err(|_| invalid())?,
@@ -275,16 +294,20 @@ impl AddressableQuote {
             }
         }
         let mut value=Self {
-            declaration: declaration.retain(&context)?,
+            declaration: {
+                context.charge_metadata(super::sources::shared_bytes::<WorkspaceAddressableRegion>().ok_or_else(invalid)?)?;
+                RetainedAddressableDeclaration { value: std::rc::Rc::new(declaration.retain(&context)?), rows: source.chunks.rows }
+            },
             inputs,
             outputs: parent.output_layouts,
+            equation,
             numerical,
             capacity,
             host_bytes,capture_publications,
             constructor_facts,
             read_facts,
             residency,
-            parameters,
+            parameters: { context.charge_metadata(super::sources::shared_bytes::<ParameterRows>().ok_or_else(invalid)?)?; std::rc::Rc::new(parameters) },
             mechanism,
         };
         let native=crate::backend::submission_recovery::addressable::control_bytes(&value)
@@ -294,6 +317,57 @@ impl AddressableQuote {
         value.host_bytes=value.host_bytes.checked_add(u64::try_from(native).map_err(|_|invalid())?)
             .and_then(|n|n.checked_add(u64::try_from(callback).ok()?)).ok_or_else(invalid)?;
         Ok(value)
+    }
+    fn specialization_frames() -> Option<usize> {
+        let frames = [size_of::<(Self, Result<Self, Error>, &Self, usize, &super::sources::LocalEnvelope)>(),
+            size_of::<WorkspaceAddressableRegionView<'_>>(), size_of::<RetainedAddressableDeclaration>(),
+            size_of::<[i32; 2]>(), size_of::<Vec<WorkspaceLayout>>() * 2,
+            size_of::<std::iter::Enumerate<std::slice::Iter<'_, WorkspaceLayout>>>(),
+            size_of::<std::slice::Iter<'_, WorkspaceLayout>>(), size_of::<HostMetadataFunding>(),
+            size_of::<HostSourceConstructionFacts>(), size_of::<Option<HostSourceConstructionFacts>>(),
+            size_of::<(&AddressableQuoteRef, usize, &HostMetadataFunding, AddressableQuoteRef, Result<AddressableQuoteRef, Error>)>()];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    pub(crate) fn specialization_control_bytes(&self) -> Option<usize> {
+        let roles = self.outputs.len();
+        let frames = [Self::specialization_frames()?,
+            WorkspaceContext::construction_bytes::<ResidentExecutionMechanisms>()?,
+            WorkspaceLayout::construction_bytes(2)?.checked_mul(4usize.checked_add(roles)?)?,
+            super::sources::shared_bytes::<Self>()?,
+            self.residency.for_rows_control_bytes()?,
+            WorkspaceContext::metadata_vec_bytes::<WorkspaceLayout>(4)?,
+            WorkspaceContext::metadata_vec_bytes::<WorkspaceLayout>(roles)?];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    /// Selects only row geometry from a previously qualified local envelope.
+    /// Physical parameter rows remain shared; no numerical constructor or
+    /// admission policy is replayed at execution time.
+    pub(super) fn for_rows(&self, rows: usize, envelope: &super::sources::LocalEnvelope, funding: &HostMetadataFunding) -> Result<Self, Error> {
+        let context = WorkspaceContext::new_with_metadata_funding(self.mechanism, funding.clone())?;
+        let invalid = || context.metadata_error(format_args!("local indexed rows exceed their retained source"));
+        context.charge_metadata(Self::specialization_frames().ok_or_else(invalid)?)?;
+        let mut source = self.declaration.as_view();
+        if rows == 0 || rows > source.chunks.rows { return Err(invalid()); }
+        source.chunks.rows = rows;
+        let declaration = RetainedAddressableDeclaration { value: self.declaration.value.clone(), rows };
+        let mut inputs = context.metadata_vec(self.inputs.len())?;
+        let mut outputs = context.metadata_vec(self.outputs.len())?;
+        for (index, layout) in self.inputs.iter().enumerate() {
+            inputs.push(context.layout(&[i32::try_from(rows).map_err(|_| invalid())?,
+                if index == 0 { source.kernel.dimensions().0 } else { 1 }], layout.dtype())?
+                .with_representation(layout.representation()));
+        }
+        for layout in &self.outputs {
+            outputs.push(context.layout(&[i32::try_from(rows).map_err(|_| invalid())?, source.kernel.dimensions().1], layout.dtype())?
+                .with_representation(layout.representation()));
+        }
+        let residency = self.residency.for_rows(rows, funding).map_err(|cause| context.metadata_source(cause))?;
+        let constructor_facts = residency.constructor_facts().ok_or_else(invalid)?;
+        let read_facts = residency.read_facts();
+        Ok(Self { declaration, inputs, outputs, equation: envelope.equation,
+            numerical: envelope.numerical, capacity: envelope.capacity,
+            host_bytes: envelope.host_bytes, capture_publications: envelope.capture_publications,
+            constructor_facts, read_facts, residency, parameters: self.parameters.clone(), mechanism: self.mechanism })
     }
     pub(crate) fn matches(&self, operation: WorkspaceOperationView<'_>) -> bool {
         matches!(operation.kind,WorkspaceOperationKindView::AddressableRegion(value) if value.as_view()==self.declaration.as_view() && value.observation()==self.declaration.observation())
@@ -324,7 +398,7 @@ pub(super) fn normalized_inputs(
     inputs: &[WorkspaceLayout],
     rows: usize,
     mechanism: ResidentExecutionMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     owner: &WorkspaceContext,
 ) -> Result<Vec<WorkspaceLayout>, Error> {
     let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
@@ -370,3 +444,5 @@ pub(super) fn normalized_inputs(
     }
     Ok(output)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -1,4 +1,8 @@
-use crate::{hybrid::id::LazyStateIDError, nfa, util::search::Anchored};
+use crate::{
+    hybrid::id::LazyStateIDError,
+    nfa,
+    util::{allocation::AllocationError, search::Anchored},
+};
 
 /// An error that occurs when initial construction of a lazy DFA fails.
 ///
@@ -33,22 +37,27 @@ enum BuildErrorKind {
 }
 
 impl BuildError {
-    pub(crate) fn nfa(err: nfa::thompson::BuildError) -> BuildError {
-        BuildError { kind: BuildErrorKind::NFA(err) }
+    /// Return the fixed allocation cause from the original source compiler.
+    pub fn allocation_error(&self) -> Option<AllocationError> {
+        match &self.kind {
+            BuildErrorKind::NFA(error) => error.allocation_error(),
+            _ => None,
+        }
     }
 
-    pub(crate) fn insufficient_cache_capacity(
-        minimum: usize,
-        given: usize,
-    ) -> BuildError {
+    pub(crate) fn nfa(err: nfa::thompson::BuildError) -> BuildError {
+        BuildError {
+            kind: BuildErrorKind::NFA(err),
+        }
+    }
+
+    pub(crate) fn insufficient_cache_capacity(minimum: usize, given: usize) -> BuildError {
         BuildError {
             kind: BuildErrorKind::InsufficientCacheCapacity { minimum, given },
         }
     }
 
-    pub(crate) fn insufficient_state_id_capacity(
-        err: LazyStateIDError,
-    ) -> BuildError {
+    pub(crate) fn insufficient_state_id_capacity(err: LazyStateIDError) -> BuildError {
         BuildError {
             kind: BuildErrorKind::InsufficientStateIDCapacity { err },
         }
@@ -59,7 +68,9 @@ impl BuildError {
                    boundaries; switch to ASCII word boundaries, or \
                    heuristically enable Unicode word boundaries or use a \
                    different regex engine";
-        BuildError { kind: BuildErrorKind::Unsupported(msg) }
+        BuildError {
+            kind: BuildErrorKind::Unsupported(msg),
+        }
     }
 }
 
@@ -84,9 +95,7 @@ impl core::fmt::Display for BuildError {
                      minimum required ({minimum})",
                 )
             }
-            BuildErrorKind::InsufficientStateIDCapacity { ref err } => {
-                err.fmt(f)
-            }
+            BuildErrorKind::InsufficientStateIDCapacity { ref err } => err.fmt(f),
             BuildErrorKind::Unsupported(ref msg) => {
                 write!(f, "unsupported regex feature for DFAs: {msg}")
             }
@@ -162,17 +171,16 @@ impl std::error::Error for StartError {
 impl core::fmt::Display for StartError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
-            StartError::Cache { .. } => write!(
-                f,
-                "error computing start state because of cache inefficiency"
-            ),
+            StartError::Cache { ref err } => write!(f, "error computing start state: {err}"),
             StartError::Quit { byte } => write!(
                 f,
                 "error computing start state because the look-behind byte \
                  {:?} triggered a quit state",
                 crate::util::escape::DebugByte(byte),
             ),
-            StartError::UnsupportedAnchored { mode: Anchored::Yes } => {
+            StartError::UnsupportedAnchored {
+                mode: Anchored::Yes,
+            } => {
                 write!(
                     f,
                     "error computing start state because \
@@ -219,15 +227,26 @@ impl core::fmt::Display for StartError {
 /// When the `std` feature is enabled, this implements the `std::error::Error`
 /// trait.
 #[derive(Clone, Debug)]
-pub struct CacheError(());
+pub struct CacheError(Option<AllocationError>);
+
+impl From<AllocationError> for CacheError {
+    fn from(error: AllocationError) -> Self {
+        Self(Some(error))
+    }
+}
 
 impl CacheError {
+    /// Return a prospective storage refusal, distinct from cache inefficiency.
+    pub fn allocation_error(&self) -> Option<AllocationError> {
+        self.0
+    }
+
     pub(crate) fn too_many_cache_clears() -> CacheError {
-        CacheError(())
+        CacheError(None)
     }
 
     pub(crate) fn bad_efficiency() -> CacheError {
-        CacheError(())
+        CacheError(None)
     }
 }
 
@@ -236,6 +255,9 @@ impl std::error::Error for CacheError {}
 
 impl core::fmt::Display for CacheError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "lazy DFA cache has been cleared too many times")
+        match self.0 {
+            Some(error) => error.fmt(f),
+            None => write!(f, "lazy DFA cache has been cleared too many times"),
+        }
     }
 }

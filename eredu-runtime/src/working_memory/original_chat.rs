@@ -4,9 +4,11 @@ mod operation;
 mod profile;
 mod render;
 pub use file::OriginalChatFileError;
-pub use operation::{OriginalChatBackend, OriginalChatOperationError};
+pub use operation::{OriginalChatBackend, OriginalChatSourceError, OriginalChatRenderOperationError};
 pub use profile::{OriginalChatProfileError, OriginalChatProfilePreparation};
-pub use render::{OriginalChatRenderError, OriginalRenderedChat};
+mod controller;
+pub use controller::{ControllerCompilationOutput, ControllerCompilationSources, OriginalControllerCompiler, OriginalControllerCompilation, OriginalControllerCompilationError};
+pub use render::{OriginalChatRenderError, OriginalRenderedChat, OriginalChatConsumer, OriginalChatConsumerError};
 
 use super::loaded_decode_source::Allowance;
 use super::{WorkingMemoryError, WorkingMemoryPool};
@@ -51,6 +53,12 @@ impl OriginalChatTemplate {
         values: &serde_json::Map<String, serde_json::Value>,
     ) -> bool {
         self.payload().source.accepts_default_variables(values)
+    }
+    /// Authenticates the exact request's ordinary named-template selection.
+    pub fn matches_selection(
+        &self, template: &eredu_text::tokenizer::ModelChatTemplate, model_id: &str, has_tools: bool,
+    ) -> bool {
+        self.payload().source.matches_selection(template, model_id, has_tools)
     }
     /// Entire original allowance, retained through final source/control retirement.
     pub fn original_bytes(&self) -> u64 {
@@ -174,7 +182,7 @@ impl WorkingMemoryPool {
         plan: &ChatTemplatePlan<'_>,
     ) -> Result<u64, WorkingMemoryError> {
         let controls = [
-            OriginalChatOperationError::source_controls().ok_or(WorkingMemoryError::Overflow)?,
+            OriginalChatSourceError::source_controls().ok_or(WorkingMemoryError::Overflow)?,
             arc_bytes::<SourcePayload>()?,
             size_of::<SourcePayload>(),
             size_of::<Option<SourcePayload>>(),

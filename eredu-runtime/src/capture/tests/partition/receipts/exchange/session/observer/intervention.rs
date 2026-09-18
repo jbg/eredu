@@ -605,7 +605,7 @@ fn global_interventions_preserve_order_evidence_replicas_and_inactive_pipeline_m
             }
             if committed {
                 let (capture, plan) = plans(0, evidence.clone(), false);
-                let mut ordinary = CaptureSession::new(capture);
+                let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
                 ordinary
                     .enable_interventions(plan, Arc::new(Estimates))
                     .unwrap();

@@ -48,7 +48,7 @@ fn lfm2_prepared_transforms_retain_source_layout_across_residency_and_parallelis
             )
             .unwrap()
             .parameter_description(&NumericContext::default())
-            .unwrap();
+            .unwrap().into_owned();
             let mut topologies = vec![(2, 1, 1), (1, 2, 1), (2, 2, 1)];
             if routed {
                 topologies.extend([(1, 1, 2), (2, 1, 2), (1, 2, 2), (2, 2, 2)]);
@@ -88,7 +88,7 @@ fn lfm2_prepared_transforms_retain_source_layout_across_residency_and_parallelis
                             assert!(selected.parameters().iter().any(|p| matches!(p.lowering(), eredu_runtime::WeightLoweringKind::Transform | eredu_runtime::WeightLoweringKind::DerivedTransform)));
                             let target_args = family::with_checkpoint_formats(args, selected.parameters().iter().filter_map(|p| p.executable().weight_quantization().map(|format| (p.name().to_owned(), format))).collect()).unwrap();
                             let target = family::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
-                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
+                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap().into_owned();
                             let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                             let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
                             let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();

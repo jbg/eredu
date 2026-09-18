@@ -202,6 +202,52 @@ pub struct GroupSelectionOutput {
 }
 
 impl TopKGroupSelector {
+    /// Fixed Rust transports for the positive, unpartitioned CPU selector.
+    /// Native constructor/Eval sources are composed separately by the caller.
+    pub(crate) fn cpu_selection_control_bytes(supplied: bool) -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        type Value = Result<Array, Exception>;
+        type Output = Result<GroupSelectionOutput, Exception>;
+        let entry = if supplied {
+            // select_indices: logits, scores, reshaped IDs and completed output.
+            size_of::<(&mut Self, &Array, &Array, &Stream)>()
+                .checked_add(size_of::<(Array, Array, Array, GroupSelectionOutput, Output)>())?
+        } else {
+            // select_with_selection_bias: logits, scores, choice, IDs and output.
+            size_of::<(&mut Self, &Array, Option<&Array>, &Stream)>()
+                .checked_add(size_of::<(Array, Array, Array, Array, GroupSelectionOutput, Output)>())?
+        };
+        let frames = [
+            size_of::<bool>(), size_of::<usize>(), entry,
+            // project_logits: flat, floating flag, pre/post-bias logits and return.
+            size_of::<(&Self, &Array, &Stream, Array, bool, Array, Array, Value)>(),
+            // Selected F32 casts, transposed weight and dense product transports.
+            size_of::<(Array, Array, Array, Value, Value, Value, Value)>(),
+            // transform_input: flat, epsilon, variance, normalized and scaled values.
+            size_of::<(&Self, &Array, &Stream, Array, f32, Array, Array, Array, Value)>(),
+            size_of::<(Array, Array, Array, Value, Value, Value)>(),
+            // apply_scores and TopKGroupScoring::apply retain their moved input.
+            size_of::<(&Self, Array, Dtype, &Stream, Value)>(),
+            size_of::<(TopKGroupScoring, Array, &Stream, Value)>(),
+            // weights_for_indices and its optional denominator/learned-scale values.
+            size_of::<(&Self, &Array, Array, &Stream, Array, Array, Array, Output)>(),
+            size_of::<(Array, Value, Value)>(),
+            // routing_sum_last: dtype, work, sum and final cast result.
+            size_of::<(&Array, &Stream, Dtype, Array, Array, Value)>(),
+            // topk_indices delegates this positive unpartitioned branch.
+            size_of::<(&Self, &Array, &Stream, Value)>(),
+            // largest_indices retains the real observer and optional CPU stream
+            // loan even when the CPU branch never opens a GPU tie fallback.
+            size_of::<(&Array, i32, &Stream, Option<safemlx::OriginalScopeObserver>,
+                Option<&Stream>, Array, Array, Value)>(),
+            // Both routing_dtype calls and fixed index descriptor transports.
+            size_of::<(RoutingPrecision, Dtype, Dtype, Dtype)>() * 3,
+            size_of::<[i32; 2]>(),
+            size_of::<(std::ops::RangeFull, std::ops::RangeTo<i32>)>(),
+            size_of::<Option<usize>>(),
+        ];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
     /// Creates an unloaded dense or affine-packed selector.
     pub fn new_with_quantization(
         config: TopKGroupSelectorConfig,

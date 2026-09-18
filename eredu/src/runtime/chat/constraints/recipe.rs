@@ -1,7 +1,7 @@
 //! Closed immutable reconstruction data for one constraint configuration.
 
 use super::super::tokenizer_env::recipe::FrozenGrammarTokenizer;
-use eredu_core::{BackendFailure, ModelRuntime, SharedControllerBytes, TextGenerationBackend};
+use eredu_core::SharedControllerBytes;
 use llguidance::{
     api::TopLevelGrammar,
     earley::{SlicerSource, SlicerSourceDescriptor, SlicerSourceView},
@@ -9,6 +9,19 @@ use llguidance::{
 };
 use serde_json::Value;
 use std::fmt;
+use eredu_core::HostPreparationAuthority;
+use llguidance::derivre::ParserAllocationFunding;
+mod serialization;
+use serialization::Cause;
+
+/// Serialization failures retain their original source-construction payer.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub(crate) struct RecipeBuildError {
+    #[source]
+    cause: Cause,
+    funding: ParserAllocationFunding,
+}
 
 // Version 4 also retains exact ordinary slicer recognition records.
 // Version 3 also retains the exact prefix-normalized tokenizer source.
@@ -46,7 +59,7 @@ struct Strings {
 }
 
 impl Strings {
-    fn plan(cursor: &mut usize, strings: &[String]) -> Result<Self, String> {
+    fn plan(cursor: &mut usize, strings: &[String]) -> Result<Self, Cause> {
         let count = strings.len();
         let directory = count
             .checked_add(1)
@@ -121,31 +134,9 @@ struct Layout {
     trigger: Option<Span>,
 }
 
-fn overflow() -> String {
-    "constraint recipe exceeds host storage limits".to_owned()
-}
+fn overflow() -> Cause { Cause::Overflow }
 
-fn canonicalize_tools(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.sort_keys();
-            object.values_mut().for_each(canonicalize_tools);
-        }
-        Value::Array(values) => values.iter_mut().for_each(canonicalize_tools),
-        Value::Number(number) => {
-            // Float -0.0 and +0.0 compare equal with the ordinary Number
-            // representation. Compare first so arbitrary_precision's distinct
-            // textual numbers retain their existing equality semantics too.
-            let zero = serde_json::Number::from_f64(0.0).expect("finite zero");
-            if *number == zero {
-                *number = zero;
-            }
-        }
-        _ => {}
-    }
-}
-
-fn take_span(cursor: &mut usize, size: usize) -> Result<Span, String> {
+fn take_span(cursor: &mut usize, size: usize) -> Result<Span, Cause> {
     let end = cursor.checked_add(size).ok_or_else(overflow)?;
     u64::try_from(end).map_err(|_| overflow())?;
     if end > isize::MAX as usize {
@@ -159,7 +150,7 @@ fn take_span(cursor: &mut usize, size: usize) -> Result<Span, String> {
     Ok(span)
 }
 
-fn token_bytes(count: usize) -> Result<usize, String> {
+fn token_bytes(count: usize) -> Result<usize, Cause> {
     count.checked_mul(TOKEN_BYTES).ok_or_else(overflow)
 }
 
@@ -193,14 +184,23 @@ fn tokens(span: Span, bytes: &[u8]) -> impl ExactSizeIterator<Item = u32> + '_ {
 pub(crate) struct ConstraintRecipe {
     bytes: SharedControllerBytes,
     layout: Layout,
+    original_trie: Option<eredu_runtime::working_memory::OriginalTokenTrieSource>,
 }
 
 impl ConstraintRecipe {
-    /// Creates a recipe under the caller's already acquired host authority.
-    /// Serialization and temporary copies allocate; no finite bound is claimed.
-    /// Production recipes contain the complete frozen tokenizer JSON. `None`
-    /// exists solely for explicitly synthetic test blueprints; it is not a
-    /// production reconstruction fallback.
+    pub(super) fn bind_original_trie(
+        &mut self,
+        source: Option<&eredu_runtime::working_memory::OriginalTokenTrieSource>,
+    ) {
+        self.original_trie = source.cloned();
+    }
+
+    pub(super) fn original_trie(&self) -> Option<&eredu_runtime::working_memory::OriginalTokenTrieSource> {
+        self.original_trie.as_ref()
+    }
+
+    /// Synthetic fixtures use the same serializer with explicit unenforced accounting.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tokenizer_json: Option<&[u8]>,
@@ -211,7 +211,7 @@ impl ConstraintRecipe {
         structural_ids: &[u32],
         stops: &[String],
         trigger: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, RecipeBuildError> {
         Self::build(
             tokenizer_json,
             grammar,
@@ -224,6 +224,8 @@ impl ConstraintRecipe {
             None,
             None,
             None,
+            &ParserAllocationFunding::unenforced(),
+            &HostPreparationAuthority::unmanaged(),
         )
     }
 
@@ -241,7 +243,9 @@ impl ConstraintRecipe {
         trie_info: TokRxInfo,
         grammar_tokenizer: Option<&FrozenGrammarTokenizer>,
         slicer_source: Option<&SlicerSource>,
-    ) -> Result<Self, String> {
+        funding: &ParserAllocationFunding,
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, RecipeBuildError> {
         Self::build(
             tokenizer_json,
             grammar,
@@ -254,6 +258,8 @@ impl ConstraintRecipe {
             Some(trie_info),
             grammar_tokenizer,
             slicer_source,
+            funding,
+            authority,
         )
     }
 
@@ -270,17 +276,27 @@ impl ConstraintRecipe {
         trie_info: Option<TokRxInfo>,
         grammar_tokenizer: Option<&FrozenGrammarTokenizer>,
         slicer_source: Option<&SlicerSource>,
-    ) -> Result<Self, String> {
+        funding: &ParserAllocationFunding,
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, RecipeBuildError> {
+        let result = (|| -> Result<Self, Cause> {
+        let controls = [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<Layout>(),
+            std::mem::size_of::<RecipeBuildError>(),
+            std::mem::size_of::<Result<Self, RecipeBuildError>>(),
+            std::mem::size_of::<serialization::Count>(),
+            SharedControllerBytes::source_shell_bytes().ok_or(Cause::Overflow)?,
+        ];
+        funding.reserve(controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or(Cause::Overflow)?)?;
         if structural_spellings.len() != structural_ids.len() {
-            return Err("constraint recipe structural token names and IDs differ in length".into());
+            return Err(Cause::Structural);
         }
-        let grammar_json = serde_json::to_vec(grammar).map_err(|error| error.to_string())?;
-        // Preserve the original tools, separately from any chosen/fallback
-        // grammar. Canonical object key ordering preserves Value equality even
-        // with serde_json/preserve_order and permits allocation-free comparison.
-        let mut original_tools = Value::Array(tools.to_vec());
-        canonicalize_tools(&mut original_tools);
-        let tools_json = serde_json::to_vec(&original_tools).map_err(|error| error.to_string())?;
+        let mut grammar_json = serialization::Count::default();
+        serialization::value(&mut grammar_json, grammar, funding)?;
+        let mut tools_json = serialization::Count::default();
+        serialization::tools(&mut tools_json, tools, funding)?;
         let mut total = HEADER_BYTES;
         let mut layout = Layout {
             tokenizer: tokenizer_json
@@ -291,7 +307,7 @@ impl ConstraintRecipe {
                 .map(|source| {
                     let root = take_span(&mut total, source.bytes().len())?;
                     let range = source.object_range();
-                    Ok::<_, String>(GrammarTokenizer {
+                    Ok::<_, Cause>(GrammarTokenizer {
                         root,
                         object: Span {
                             start: root.start.checked_add(range.start).ok_or_else(overflow)?,
@@ -304,7 +320,7 @@ impl ConstraintRecipe {
                 .transpose()?,
             slicer: slicer_source
                 .map(|source| {
-                    Ok::<_, String>(SlicerLayout {
+                    Ok::<_, Cause>(SlicerLayout {
                         bytes: take_span(&mut total, source.as_bytes().len())?,
                         descriptor: source.descriptor(),
                     })
@@ -313,9 +329,9 @@ impl ConstraintRecipe {
             trie_info: trie_info
                 .map(|_| take_span(&mut total, 10 * TOKEN_BYTES))
                 .transpose()?,
-            grammar: take_span(&mut total, grammar_json.len())?,
+            grammar: take_span(&mut total, grammar_json.bytes())?,
             max_tokens: grammar.max_tokens,
-            tools: take_span(&mut total, tools_json.len())?,
+            tools: take_span(&mut total, tools_json.bytes())?,
             eos: take_span(&mut total, token_bytes(eos.len())?)?,
             structural_ids: take_span(&mut total, token_bytes(structural_ids.len())?)?,
             structural_spellings: Strings::plan(&mut total, structural_spellings)?,
@@ -333,9 +349,7 @@ impl ConstraintRecipe {
             }
         }
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total)
-            .map_err(|error| error.to_string())?;
+        funding.try_grow_vec(&mut bytes, total)?;
         bytes.resize(total, 0);
         bytes[..MAGIC.len()].copy_from_slice(MAGIC);
         bytes[MAGIC.len()..HEADER_BYTES].copy_from_slice(&VERSION.to_le_bytes());
@@ -371,8 +385,12 @@ impl ConstraintRecipe {
                 ],
             );
         }
-        layout.grammar.write(&mut bytes, &grammar_json);
-        layout.tools.write(&mut bytes, &tools_json);
+        let mut grammar_destination = &mut bytes[layout.grammar.start..layout.grammar.end];
+        serialization::value(&mut grammar_destination, grammar, funding)?;
+        if !grammar_destination.is_empty() { return Err(Cause::Destination); }
+        let mut tools_destination = &mut bytes[layout.tools.start..layout.tools.end];
+        serialization::tools(&mut tools_destination, tools, funding)?;
+        if !tools_destination.is_empty() { return Err(Cause::Destination); }
         write_tokens(layout.eos, &mut bytes, eos);
         write_tokens(layout.structural_ids, &mut bytes, structural_ids);
         layout
@@ -383,9 +401,23 @@ impl ConstraintRecipe {
             span.write(&mut bytes, trigger.as_bytes());
         }
         Ok(Self {
-            bytes: SharedControllerBytes::new(bytes),
+            bytes: SharedControllerBytes::new(bytes, authority.clone()),
             layout,
+            original_trie: None,
         })
+        })();
+        result.map_err(|cause| RecipeBuildError { cause, funding: funding.clone() })
+    }
+
+    pub(super) fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"[");
+        digest.update(self.layout.grammar.bytes(self.bytes.as_ref()));
+        digest.update(b",");
+        digest.update(self.layout.tools.bytes(self.bytes.as_ref()));
+        digest.update(b"]");
+        digest.finalize().into()
     }
 
     pub(crate) fn tokenizer_json(&self) -> Option<&[u8]> {
@@ -447,7 +479,8 @@ impl ConstraintRecipe {
     }
     /// Actual non-serde HF special-splitting policy retained by `freeze`.
     pub(crate) fn grammar_tokenizer_is_canonical(&self) -> Option<bool> {
-        self.layout.grammar_tokenizer.map(|source| source.canonical)
+        self.original_trie.as_ref().map(|source| source.tokenization_is_canonical())
+            .or_else(|| self.layout.grammar_tokenizer.map(|source| source.canonical))
     }
 
     pub(crate) fn grammar_encode_special_tokens(&self) -> Option<bool> {
@@ -524,26 +557,6 @@ impl ConstraintRecipe {
 
     pub(crate) fn source(&self) -> &SharedControllerBytes {
         &self.bytes
-    }
-
-    /// Publishes an independent byte owner through the exact runtime's backend.
-    /// The caller replaces every unregistered alias before returning a prepared
-    /// runtime plan. This method cannot revoke preexisting source aliases.
-    pub(crate) fn register<B: TextGenerationBackend>(
-        &self,
-        runtime: &ModelRuntime<B>,
-    ) -> Result<Self, BackendFailure> {
-        let bytes = B::prepare_shared_controller_bytes(runtime, || self.bytes.as_ref().to_vec())?;
-        Ok(Self {
-            bytes,
-            layout: self.layout,
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) fn register_in_pool(&self, pool: &eredu_runtime::working_memory::WorkingMemoryPool) -> Result<Self, BackendFailure> {
-        let bytes = pool.prepare_shared_controller_bytes(|| self.bytes.as_ref().to_vec()).map_err(BackendFailure::from_error)?;
-        Ok(Self { bytes, layout: self.layout })
     }
 
     /// Matches the semantic plan's tools, resolved structural tokens, and stops.

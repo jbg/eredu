@@ -138,33 +138,6 @@ pub(crate) enum NormalizationName {
     Attention,
     FeedForward,
 }
-/// The exact actual declaration borrowed by either parameter visitor.
-#[derive(Clone, Copy)]
-pub(crate) enum DeclarationParameter<'a> {
-    Ordinary(&'a eredu_nn::ParameterMetadata),
-    Borrowed(eredu_nn::ParameterMetadataView<'a>),
-}
-impl<'a> DeclarationParameter<'a> {
-    pub(crate) fn id(self) -> &'a eredu_nn::ParameterId {
-        match self {
-            Self::Ordinary(value) => &value.id,
-            Self::Borrowed(value) => value.id(),
-        }
-    }
-    pub(crate) fn companion(self) -> Option<eredu_nn::LinearCompanionRole> {
-        match self {
-            Self::Ordinary(value) => value.linear_companion,
-            Self::Borrowed(value) => value.linear_companion(),
-        }
-    }
-    pub(crate) fn companion_of(self) -> Option<&'a eredu_nn::ParameterId> {
-        match self {
-            Self::Ordinary(value) => value.linear_companion_of.as_ref(),
-            Self::Borrowed(value) => value.linear_companion_of(),
-        }
-    }
-}
-
 impl DeclarationDestination<'_> {
     pub(crate) fn normalization_name(
         self,
@@ -254,6 +227,9 @@ impl DeclarationDestination<'_> {
         }
         Ok(())
     }
+    pub(crate) fn controls_of<T>(self, _: &T) -> Result<(), ParameterGroupError> {
+        self.controls::<T>()
+    }
     pub(crate) fn controls<T>(self) -> Result<(), ParameterGroupError> {
         if let Some(context) = self.0 {
             let parts = [
@@ -324,11 +300,11 @@ impl DeclarationDestination<'_> {
         units: usize,
         module: &M,
         mut sharding: impl FnMut(
-            DeclarationParameter<'_>,
+            eredu_nn::ParameterMetadataView<'_>,
             &[usize],
         ) -> Result<MemberSharding, ParameterGroupError>,
     ) -> Result<ParameterGroupSpec, ParameterGroupError> {
-        self.controls::<(DeclarationParameter<'_>, MemberSharding)>()?;
+        self.controls::<(eredu_nn::ParameterMetadataView<'_>, MemberSharding)>()?;
         match self.0 {
             Some(context) => {
                 eredu_runtime::partitioned_module_parameter_group_with_metadata::<T, M>(
@@ -338,7 +314,7 @@ impl DeclarationDestination<'_> {
                     module,
                     context,
                     |metadata, shape| {
-                        sharding(DeclarationParameter::Borrowed(metadata), shape)
+                        sharding(metadata, shape)
                             .map_err(ParameterGroupError::into_neural)
                     },
                 )
@@ -350,7 +326,7 @@ impl DeclarationDestination<'_> {
                 units,
                 module,
                 |metadata, shape| {
-                    sharding(DeclarationParameter::Ordinary(metadata), shape)
+                    sharding(metadata, shape)
                         .map_err(ParameterGroupError::ordinary)
                 },
             )

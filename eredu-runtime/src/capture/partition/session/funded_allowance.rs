@@ -1,6 +1,6 @@
 //! The ordinary global receipt equation, lent as one local original allowance.
 use super::*;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
@@ -8,7 +8,7 @@ enum Cause {
     #[error("partition capture allowance source: {0}")]
     Source(&'static str),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Capture(#[from] CaptureError),
 }
@@ -19,8 +19,8 @@ enum Cause {
 pub struct PartitionCaptureAllowanceError {
     #[source]
     cause: Cause,
-    _source: Option<SharedCapturePlan>,
-    _metadata: WorkspaceMetadataFunding,
+    _source: SharedCapturePlan,
+    _metadata: HostMetadataFunding,
 }
 
 /// Local move-only credits cut from the same complete global receipt equation
@@ -38,7 +38,7 @@ pub struct PreparedPartitionCaptureAllowance {
     estimate: PartitionCaptureNativeEstimate,
     remote_attempted: bool,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 impl PreparedPartitionCaptureAllowance {
     /// Reserve the existing common exchange/delivery/evidence and producer
@@ -47,13 +47,13 @@ impl PreparedPartitionCaptureAllowance {
     /// this structured diagnostic does not certify a native operation.
     pub fn prepare<T: PartitionCaptureTransport>(
         transport: &T, receipt: &mut PartitionCaptureReceiptPlan,
-        estimate: PartitionCaptureNativeEstimate, metadata: &WorkspaceMetadataFunding,
+        estimate: PartitionCaptureNativeEstimate, metadata: &HostMetadataFunding,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureAllowanceError>
     where T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
-        let source = receipt.shared_plan_source().cloned();
+        let source = receipt.shared_plan_source().clone();
         let error = |cause| PartitionCaptureAllowanceError {
             cause, _source: source.clone(), _metadata: metadata.clone(),
         };
@@ -68,7 +68,7 @@ impl PreparedPartitionCaptureAllowance {
             size_of::<Result<PreparedPartitionRemoteCharge<'_>, PartitionCaptureAllowanceError>>(),
             size_of::<CaptureUsage>() * 8, size_of::<PartitionCaptureNativeEstimate>() * 2,
             size_of::<Sha256>(), size_of::<sha2::digest::Output<Sha256>>(),
-            size_of::<(&T, &PartitionCaptureReceiptPlan, &WorkspaceMetadataFunding,
+            size_of::<(&T, &PartitionCaptureReceiptPlan, &HostMetadataFunding,
                 &mut dyn CaptureReservation, &SharedCapturePlan)>(),
             size_of::<Option<(usize, &CaptureSlicePartition)>>(),
             size_of::<std::slice::Iter<'_, CaptureFragmentGeometry>>(),
@@ -77,7 +77,7 @@ impl PreparedPartitionCaptureAllowance {
         let controls = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or_else(|| error(Cause::Source("constructor controls overflow")))?;
         metadata.reserve_metadata(controls).map_err(|cause| error(cause.into()))?;
-        let retained = source.as_ref().ok_or_else(|| error(Cause::Source("receipt has no shared admission")))?;
+        let retained = &source;
         let mut producers = receipt.producers();
         let (producer, projection) = producers.next().ok_or_else(|| error(Cause::Source("receipt has no producer")))?;
         if producers.next().is_some() || receipt.combination() != PartitionCaptureCombination::Disjoint
@@ -111,7 +111,7 @@ impl PreparedPartitionCaptureAllowance {
     /// Original shared admission; source equality is physical, not label-only.
     pub fn source(&self) -> &SharedCapturePlan { &self.source }
     /// Metadata custody remains attached until the local allowance retires.
-    pub fn metadata(&self) -> &WorkspaceMetadataFunding { &self.metadata }
+    pub fn metadata(&self) -> &HostMetadataFunding { &self.metadata }
 }
 
 /// A one-use acknowledgment of an already globally charged remote producer.
@@ -129,11 +129,11 @@ impl PreparedPartitionCaptureAllowance {
             + size_of::<Result<PreparedPartitionRemoteCharge<'_>, PartitionCaptureAllowanceError>>()
             + size_of::<PartitionCaptureAllowanceError>() + size_of::<&mut Self>();
         self.metadata.reserve_metadata(controls).map_err(|cause| PartitionCaptureAllowanceError {
-            cause: cause.into(), _source: Some(self.source.clone()), _metadata: self.metadata.clone(),
+            cause: cause.into(), _source: self.source.clone(), _metadata: self.metadata.clone(),
         })?;
         if self.remote_attempted || self.local_rank == self.producer {
             return Err(PartitionCaptureAllowanceError { cause: Cause::Source("remote reservation is unavailable or spent"),
-                _source: Some(self.source.clone()), _metadata: self.metadata.clone() });
+                _source: self.source.clone(), _metadata: self.metadata.clone() });
         }
         // Claim before any downstream validation. Dropping the token cannot
         // make the same global charge available for another local progress row.

@@ -277,7 +277,7 @@ mod v4_components {
     pub(super) fn verify_partitioned_readout(
         runtime: &mut ModelRuntime<MlxBackend<'_>>,
         readout: &eredu_core::component::ComponentReadoutEquation,
-        steps: &[CapturedStep],
+        steps: &[SharedCapturedStep],
     ) {
         let facts = MlxBackend::parameter_discovery(runtime).unwrap();
         // Each query exchanges the complete catalog before reading its selected
@@ -735,7 +735,7 @@ mod v4_components {
             let mut steps = Vec::new();
             for prediction in 0..3 {
                 generation.next().unwrap().unwrap();
-                let step = generation.take_captured_step().unwrap().unwrap();
+                let step = generation.take_captured_delivery().unwrap().unwrap();
                 let tokens = if prediction == 0 { 3 } else { 1 };
                 let channels = tensor(&step, &group.effective_activation);
                 let input = tensor(&step, &factor.input);

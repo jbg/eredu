@@ -1,0 +1,151 @@
+diff --git a/mlx/backend/cpu/alias_storage.h b/mlx/backend/cpu/alias_storage.h
+--- a/mlx/backend/cpu/alias_storage.h
++++ b/mlx/backend/cpu/alias_storage.h
+@@ -5,6 +5,9 @@
+ // Common alias workers inspect only fixed inline shape/stride state. These
+ // queries grant neither source storage nor permission to evaluate a primitive.
+ MLX_API bool alias_input_geometry(const array&, size_t& elements) noexcept;
++// Empty structural aliases read no elements but retain the complete source Data.
++MLX_API bool empty_alias_input_geometry(const array&) noexcept;
++MLX_API size_t empty_alias_input_geometry_control_bytes() noexcept;
+ MLX_API bool is_alias_eval_primitive(const array&) noexcept;
+ MLX_API bool alias_eval_layout(AliasOperation, size_t rank, size_t output_rank,
+     bool tracer, CopyEvalStorage&) noexcept;
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -37,6 +37,19 @@
+   }
+   return span<=input.data_size()&&product(span,size_t(input.itemsize()),bytes)&&
+       product(elements,size_t(input.itemsize()),bytes);
++}
++bool empty_alias_input_geometry(const array& input) noexcept {
++  if(input.ndim()>5||input.strides().size()!=input.ndim()||input.size()!=0)return false;
++  size_t elements=1;
++  for(int extent:input.shape())
++    if(extent<0||!product(elements,size_t(extent),elements))return false;
++  // No address is dereferenced. In particular, zero logical size is not proof
++  // of zero physical capacity: shared_buffer_reshape/Squeeze preserve Data.
++  return elements==0;
++}
++size_t empty_alias_input_geometry_control_bytes() noexcept {
++  return sizeof(const array*)+sizeof(size_t)+sizeof(int)+sizeof(Shape::const_iterator)*2+
++      sizeof(size_t)*2+sizeof(size_t*)+sizeof(bool);
+ }
+ bool is_alias_eval_primitive(const array& out) noexcept {
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -18,12 +18,13 @@
+ bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
+   if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   CopyEvalStorage value;
+-  // Actual prepare_reshape takes the row-contiguous branch, copies at most
++  // Actual prepare_reshape takes the empty or row-contiguous branch, copies at most
+   // five inline strides and delegates the same shared_buffer_reshape worker.
+   // No Data, output backing, copy task or collapse scratch is produced.
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+-  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(out)+
++  const size_t controls=empty_alias_input_geometry_control_bytes()+sizeof(bool)+sizeof(size_t)+
++      sizeof(value)+sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(out)+
+       sizeof(FixedReshapePlan)+sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*5+sizeof(const Reshape*)+sizeof(size_t)*8+
+       sizeof(int)*2+sizeof(bool)*4+sizeof(Shape::const_iterator)+
+@@ -37,7 +38,7 @@
+   if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   CopyEvalStorage value;
+   if(!copy_eval_layout(std::max(rank,output_rank),1,true,tracer,value))return false;
+-  const size_t controls=fixed_reshape_plan_control_bytes()+sizeof(FixedReshapePlan)+sizeof(value)+sizeof(out)+
++  const size_t controls=sizeof(bool)+sizeof(size_t)+fixed_reshape_plan_control_bytes()+sizeof(FixedReshapePlan)+sizeof(value)+sizeof(out)+
+       sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(std::pair<bool,Strides>)+sizeof(Strides)+
+       sizeof(const array*)*2+sizeof(bool)+sizeof(const int*)*2+sizeof(const int64_t*)+
+       sizeof(size_t)*2+sizeof(bool)+sizeof(CopyEvalStorage*);
+@@ -68,7 +69,7 @@
+   const auto& input=output.inputs()[0];const auto& shape=static_cast<const Reshape&>(output.primitive()).shape_ref();
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+   if(rank>5||output_rank>5||shape.size()!=output_rank||
+-      input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
++      input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+         (input.dtype()==uint8&&input.itemsize()==sizeof(uint8_t))||
+         (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))||
+@@ -78,26 +79,30 @@
+   size_t source_elements=0;
+   // Broadcasts may repeat a smaller backing. The shared geometry proof checks
+   // the exact readable stride span; logical element count is not backing size.
+-  if(!alias_input_geometry(input,source_elements))return false;
++  const bool empty=input.size()==0;
++  if(!(empty?empty_alias_input_geometry(input):alias_input_geometry(input,source_elements)))return false;
+   size_t input_elements=1,output_elements=1,bytes=0;
+   for(size_t i=0;i!=rank;++i)
+-    if(input.shape(i)<=0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;
++    if(input.shape(i)<0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;
+   // Reshape stores the requested shape, while ops::reshape resolves its one
+-  // optional -1 in the output array. Exact positive dimensions and the checked
++  // optional -1 in the output array. Exact nonnegative dimensions and the checked
+   // total product below prove the same unique inferred extent without creating
+   // a second Shape or entering the ordinary throwing shape constructor.
+-  bool inferred=false;
++  bool inferred=false;size_t requested_elements=1;
+   for(size_t i=0;i!=output_rank;++i) {
+-    if(output.shape(i)<=0)return false;
++    if(output.shape(i)<0)return false;
+     if(shape[i]==-1) {
+       if(inferred)return false;
+       inferred=true;
+-    } else if(shape[i]<=0||shape[i]!=output.shape(i))return false;
++    } else {
++      if(shape[i]<0||shape[i]!=output.shape(i)||
++          !product(requested_elements,size_t(shape[i]),requested_elements))return false;
++    }
+     if(!product(output_elements,size_t(output.shape(i)),output_elements))return false;
+   }
+-  if(input_elements!=input.size()||output_elements!=output.size()||input_elements!=output_elements||
++  if((inferred&&requested_elements==0)||input_elements!=input.size()||output_elements!=output.size()||input_elements!=output_elements||
+       !product(input_elements,size_t(input.itemsize()),bytes))return false;
+-  if(input.flags().row_contiguous)return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);
++  if(empty||input.flags().row_contiguous)return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);
+   return reshape_eval_layout(input.shape().data(),input.strides().data(),rank,
+       output.shape().data(),output_rank,output.is_tracer(),out);
+ }
+diff --git a/mlx/backend/cpu/greedy_storage.cpp b/mlx/backend/cpu/greedy_storage.cpp
+--- a/mlx/backend/cpu/greedy_storage.cpp
++++ b/mlx/backend/cpu/greedy_storage.cpp
+@@ -33,7 +33,7 @@
+   CopyEvalStorage value;
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+-  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(tracer)+sizeof(out)+sizeof(Strides)+sizeof(array::Flags)+
++  const size_t controls=empty_alias_input_geometry_control_bytes()+sizeof(value)+sizeof(rank)+sizeof(tracer)+sizeof(out)+sizeof(Strides)+sizeof(array::Flags)+
+       sizeof(const Shape*)+sizeof(int)*3+sizeof(size_t)*5+sizeof(const array*)*3+sizeof(const Squeeze*)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+@@ -43,10 +43,10 @@
+ bool greedy_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_greedy_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];const size_t rank=input.ndim();
+-  if(rank<1||rank>5||!input.size()||!output.size())return false;
++  if(rank<1||rank>5)return false;
+   if(typeid(output.primitive())==typeid(ArgReduce)) {
+     const auto [kind,axis]=static_cast<const ArgReduce&>(output.primitive()).state();
+-    if(rank>4||(kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
++    if(!input.size()||!output.size()||rank>4||(kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
+         input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=uint32||
+         output.itemsize()!=sizeof(uint32_t)||output.ndim()!=rank)return false;
+     if(input.strides().size()!=rank)return false;
+@@ -65,10 +65,11 @@
+   if(axes.empty()||axes.size()>rank||output.ndim()!=rank-axes.size()||input.dtype()!=output.dtype()||
+       (input.dtype()!=bool_&&input.dtype()!=int32&&input.dtype()!=uint32&&input.dtype()!=float32&&input.dtype()!=float16&&input.dtype()!=bfloat16)||
+       input.itemsize()!=output.itemsize()||input.size()!=output.size())return false;
+-  size_t elements=0;if(!alias_input_geometry(input,elements))return false;
++  size_t elements=0;
++  if(!(input.size()==0?empty_alias_input_geometry(input):alias_input_geometry(input,elements)))return false;
+   size_t selected=0,target=0;
+   for(size_t i=0;i!=rank;++i) {
+-    if(input.shape(i)<=0)return false;
++    if(input.shape(i)<0)return false;
+     if(selected<axes.size()&&axes[selected]==int(i)) {
+       if(input.shape(i)!=1)return false;++selected;
+     } else {

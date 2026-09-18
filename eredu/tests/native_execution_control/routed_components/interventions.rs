@@ -15,7 +15,7 @@ fn row_values(row: &RoutedUnitCaptureRow) -> &[f32] {
     };
     values
 }
-fn payloads(steps: &[CapturedStep]) -> Vec<Vec<Option<CapturePayload>>> {
+fn payloads(steps: &[SharedCapturedStep]) -> Vec<Vec<Option<CapturePayload>>> {
     steps
         .iter()
         .map(|s| s.records.iter().map(|r| r.payload.clone()).collect())
@@ -96,7 +96,7 @@ fn verify(device: LocalDevice) {
             );
         }
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
+            .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user","content":"left right"})],
                 add_generation_prompt: true,
                 ..Default::default()
@@ -227,31 +227,40 @@ fn verify(device: LocalDevice) {
                 schema_version: 1,
                 operations,
             };
-            let prepared = model
-                .prepare_intervened_token_ids(
-                    &chat,
-                    prefix.clone(),
-                    settings,
-                    capture.clone(),
-                    plan.clone(),
-                    trace,
-                )
-                .unwrap();
+            let prepared_prefix = prefix.clone();
+            let prepared_capture = capture.clone();
+            let prepared_trace = trace;
+            let prepared_intervention = plan.clone();
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+            prepared.output_mode = PreparedChatOutputMode::Text;
+            prepared.capture = Some(&prepared_capture);
+            prepared.intervention = Some(&prepared_intervention);
             let mut steps = vec![];
-            model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if let ObservedGenerationEvent::Token {
+            (|| -> Result<_, ControlledGenerationError> {
+                let mut emit = |record: ControlledGenerationRecord| {
+                    if let Some(ObservedGenerationEvent::Token {
                         forced,
                         captures: Some(step),
                         ..
-                    } = record.event
+                    }) = record.event.progress()
                     {
                         assert!(!forced);
-                        steps.push(step);
+                        steps.push(step.clone());
                     }
                     ControlFlow::Continue(())
-                })
-                .unwrap();
+                };
+                let mut run = model
+                    .start_controlled_chat(
+                        prepared,
+                        prepared_trace,
+                        GenerationControlHandle::new(Default::default()),
+                        &mut emit,
+                    )?
+                    .expect("live fixture control");
+                run.run(&mut emit)
+            })()
+            .unwrap();
             assert_eq!(steps.len(), 3);
             for step in &steps {
                 for group in &graph.routed_components {
@@ -346,39 +355,43 @@ fn verify(device: LocalDevice) {
         }
         // Same admitted path under explicit advancement, replay and isolated fork.
         model.reset().unwrap();
-        let prepared = model
-            .prepare_intervened_token_ids(
-                &chat,
-                prefix,
-                settings,
-                capture.clone(),
-                keep_plan.unwrap(),
-                trace,
-            )
-            .unwrap();
+        let prepared_prefix = prefix;
+        let prepared_capture = capture.clone();
+        let prepared_trace = trace;
+        let prepared_intervention = keep_plan.unwrap();
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+        prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+        prepared.output_mode = PreparedChatOutputMode::Text;
+        prepared.capture = Some(&prepared_capture);
+        prepared.intervention = Some(&prepared_intervention);
         let mut steps = vec![];
         {
             let mut emit = |record: ControlledGenerationRecord| {
-                if let ObservedGenerationEvent::Token {
+                if let Some(ObservedGenerationEvent::Token {
                     forced,
                     captures: Some(step),
                     ..
-                } = record.generation.event
+                }) = record.event.progress()
                 {
                     assert!(!forced);
-                    steps.push(step);
+                    steps.push(step.clone());
                 }
                 ControlFlow::Continue(())
             };
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), &mut emit)
+                .start_controlled_chat(prepared, prepared_trace, Default::default(), &mut emit)
+                .unwrap()
                 .unwrap();
-            run.enable_snapshots(SnapshotLimits {
-                max_snapshots: 2,
-                max_branches: 1,
-                retained_bytes: 512 << 20,
-                cumulative_copy_bytes: 2 << 30,
-            })
+            run.enable_snapshots(
+                SnapshotLimits {
+                    max_snapshots: 2,
+                    max_branches: 1,
+                    retained_bytes: 512 << 20,
+                    cumulative_copy_bytes: 2 << 30,
+                },
+                ORIGINAL_CAPACITY,
+                copy_limits(),
+            )
             .unwrap();
             let initial = run.snapshot(&mut emit).unwrap();
             run.run(&mut emit).unwrap();

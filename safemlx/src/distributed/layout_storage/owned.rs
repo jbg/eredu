@@ -107,7 +107,7 @@ impl OwnedGroupCpuLayoutStorage {
     pub fn bind_actual<'a>(
         &'a self,
         input: &'a Array,
-    ) -> Result<GroupCpuOperationStorage<'a>, GroupStorageUnavailable> {
+    ) -> Result<GroupCpuOperationStorage<'a>, GroupCpuBindingError> {
         self.view().bind_actual(input)
     }
 }

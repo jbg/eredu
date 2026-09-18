@@ -1,3 +1,5 @@
+#[cfg(feature = "alloc")]
+use crate::util::allocation::{Allocation, AllocationError};
 use crate::util::{
     prefilter::PrefilterI,
     search::{MatchKind, Span},
@@ -36,13 +38,15 @@ pub(crate) struct Teddy {
 }
 
 impl Teddy {
-    pub(crate) fn new<B: AsRef<[u8]>>(
+    #[cfg(feature = "alloc")]
+    pub(crate) fn new_with_allocations<B: AsRef<[u8]>>(
         kind: MatchKind,
         needles: &[B],
-    ) -> Option<Teddy> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<Teddy>, AllocationError> {
         #[cfg(not(feature = "perf-literal-multisubstring"))]
         {
-            None
+            Ok(None)
         }
         #[cfg(feature = "perf-literal-multisubstring")]
         {
@@ -62,25 +66,59 @@ impl Teddy {
                     aho_corasick::MatchKind::LeftmostFirst,
                 ),
             };
-            let minimum_len =
-                needles.iter().map(|n| n.as_ref().len()).min().unwrap_or(0);
+            crate::util::allocation::Allocator::new(funding).reserve(
+                core::mem::size_of::<aho_corasick::packed::Builder>()
+                    + core::mem::size_of::<aho_corasick::dfa::Builder>(),
+            )?;
+            let minimum_len = needles.iter().map(|n| n.as_ref().len()).min().unwrap_or(0);
             let packed = aho_corasick::packed::Config::new()
                 .match_kind(packed_match_kind)
                 .builder()
-                .extend(needles)
-                .build()?;
+                .extend_with_allocations(needles, &super::funding::Funding(funding))
+                .map_err(super::funding::aho)?
+                .build_with_allocations(&super::funding::Funding(funding))
+                .map_err(super::funding::aho)?;
+            let Some(packed) = packed else {
+                return Ok(None);
+            };
             let anchored_ac = aho_corasick::dfa::DFA::builder()
                 .match_kind(ac_match_kind)
                 .start_kind(aho_corasick::StartKind::Anchored)
                 .prefilter(false)
-                .build(needles)
-                .ok()?;
-            Some(Teddy { searcher: packed, anchored_ac, minimum_len })
+                .build_with_allocations(needles, &super::funding::Funding(funding));
+            let anchored_ac = match anchored_ac {
+                Ok(ac) => ac,
+                Err(error) => match error.allocation_error() {
+                    Some(error) => return Err(super::funding::aho(error)),
+                    None => return Ok(None),
+                },
+            };
+            Ok(Some(Teddy {
+                searcher: packed,
+                anchored_ac,
+                minimum_len,
+            }))
         }
     }
 }
 
 impl PrefilterI for Teddy {
+    #[cfg(feature = "alloc")]
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "perf-literal-multisubstring")]
+        {
+            use aho_corasick::automaton::Automaton;
+            self.searcher
+                .visit_source_storage(&mut |id, bytes| visitor.visit(id, bytes));
+            self.anchored_ac
+                .visit_source_storage(&mut |id, bytes| visitor.visit(id, bytes));
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "teddy"
     }
@@ -92,11 +130,14 @@ impl PrefilterI for Teddy {
         }
         #[cfg(feature = "perf-literal-multisubstring")]
         {
-            let ac_span =
-                aho_corasick::Span { start: span.start, end: span.end };
-            self.searcher
-                .find_in(haystack, ac_span)
-                .map(|m| Span { start: m.start(), end: m.end() })
+            let ac_span = aho_corasick::Span {
+                start: span.start,
+                end: span.end,
+            };
+            self.searcher.find_in(haystack, ac_span).map(|m| Span {
+                start: m.start(),
+                end: m.end(),
+            })
         }
     }
 
@@ -115,7 +156,10 @@ impl PrefilterI for Teddy {
                 .try_find(&input)
                 // OK because we build the DFA with anchored support.
                 .expect("aho-corasick DFA should never fail")
-                .map(|m| Span { start: m.start(), end: m.end() })
+                .map(|m| Span {
+                    start: m.start(),
+                    end: m.end(),
+                })
         }
     }
 

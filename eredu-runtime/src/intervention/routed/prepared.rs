@@ -2,7 +2,7 @@
 use super::*;
 use crate::working_memory::OriginalInterventionSource;
 use eredu_nn::workspace::{
-    WorkspaceContext, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    WorkspaceContext, HostMetadataFunding, HostMetadataFundingError,
 };
 use std::mem::{size_of, size_of_val};
 use worker::{Allocation, RoutedInterventionLoweringError as Geometry, RowKey};
@@ -18,7 +18,7 @@ enum Cause {
     #[error(transparent)]
     Window(#[from] CaptureWindowSourceError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Metadata(#[from] eredu_nn::Error),
 }
@@ -30,7 +30,7 @@ pub struct PreparedRoutedInterventionError {
     #[source]
     cause: Cause,
     _declaration: OriginalInterventionSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 /// Fixed coordinate destination for one actual serial provider chunk. Source
 /// authentication, progress, receipt spending and native completion stay with the
@@ -49,7 +49,7 @@ pub struct PreparedRoutedInterventionRows {
     phase: CapturePhase,
     prediction: u64,
     declaration: OriginalInterventionSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Completed native-row-order recipe with its exact one-dimensional selected
 /// action. Both the immutable declaration and paid destination survive aliases
@@ -64,9 +64,9 @@ pub struct PreparedRoutedIntervention {
     phase: CapturePhase,
     prediction: u64,
     declaration: OriginalInterventionSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
-struct Paid<'a>(&'a WorkspaceMetadataFunding);
+struct Paid<'a>(&'a HostMetadataFunding);
 impl Allocation for Paid<'_> {
     type Error = Cause;
     fn vector<T>(&mut self, capacity: usize) -> Result<Vec<T>, Cause> {
@@ -87,7 +87,7 @@ impl PreparedRoutedInterventionRows {
         source_tokens: u64,
         source_range: [u64; 2],
         actual_rows: usize,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, PreparedRoutedInterventionError> {
         let result: Result<_, Cause> = (|| {
             funding.reserve_metadata(Self::control_bytes().ok_or(Geometry::Overflow)?)?;
@@ -361,7 +361,7 @@ impl PreparedRoutedInterventionRows {
     pub fn control_bytes() -> Option<usize> {
         let parts = [
             worker::selection_control_bytes()?,
-            size_of::<(&WorkspaceMetadataFunding, usize)>(),
+            size_of::<(&HostMetadataFunding, usize)>(),
             size_of::<Result<ResolvedCaptureSlice, Cause>>(),
             size_of::<(&OriginalInterventionSource, usize, usize)>(),
             size_of::<std::ops::Range<usize>>(),
@@ -371,7 +371,7 @@ impl PreparedRoutedInterventionRows {
             size_of::<PreparedRoutedInterventionError>(),
             size_of::<Cause>(),
             size_of::<OriginalInterventionSource>(),
-            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<HostMetadataFunding>(),
             size_of::<Result<Self, PreparedRoutedInterventionError>>(),
             size_of::<Result<PreparedRoutedIntervention, PreparedRoutedInterventionError>>(),
             size_of::<ResolvedCaptureSlice>(),
@@ -394,7 +394,7 @@ impl PreparedRoutedInterventionRows {
                 u64,
                 [u64; 2],
                 usize,
-                WorkspaceMetadataFunding,
+                HostMetadataFunding,
             )>(),
             size_of::<(
                 RoutedUnitGeometry,
@@ -418,7 +418,7 @@ impl PreparedRoutedInterventionRows {
                 >,
             >(),
             size_of::<Result<(), InterventionGeometryError>>(),
-            size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+            size_of::<Result<(), HostMetadataFundingError>>(),
             size_of::<std::slice::Windows<'_, RowKey>>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, RoutedUnitLocation>>>(),
             size_of::<std::ops::Range<u64>>(),
@@ -444,7 +444,7 @@ fn gather_controls<T>() -> usize {
         + size_of::<T>()
 }
 fn slice_destination(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     rank: usize,
 ) -> Result<ResolvedCaptureSlice, Cause> {
     let vector = || -> Result<Vec<u64>, Cause> {
@@ -480,3 +480,5 @@ impl PreparedRoutedIntervention {
         &self.local
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

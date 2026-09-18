@@ -23,14 +23,16 @@ impl AdditionalItemsObjectValidator {
         items_count: usize,
     ) -> CompilationResult<'a, F> {
         let node = compiler::compile(ctx, ctx.as_resource_ref(schema))?;
-        Ok(Box::new(AdditionalItemsObjectValidator {
-            node,
-            items_count,
-        }))
+        Ok(ctx
+            .funding()
+            .boxed(AdditionalItemsObjectValidator { node, items_count })?)
     }
 }
 impl<F: Json> Validate<F> for AdditionalItemsObjectValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
 
@@ -38,11 +40,15 @@ impl<F: Json> Validate<F> for AdditionalItemsObjectValidator<F> {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             array
@@ -54,7 +60,7 @@ impl<F: Json> Validate<F> for AdditionalItemsObjectValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -70,7 +76,7 @@ impl<F: Json> Validate<F> for AdditionalItemsObjectValidator<F> {
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -95,17 +101,21 @@ pub(crate) struct AdditionalItemsBooleanValidator {
 impl AdditionalItemsBooleanValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(
+        ctx: &crate::compiler::Context<F>,
         items_count: usize,
         location: Location,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(AdditionalItemsBooleanValidator {
+        Ok(ctx.funding().boxed(AdditionalItemsBooleanValidator {
             items_count,
             location,
-        }))
+        })?)
     }
 }
 impl<F: Json> Validate<F> for AdditionalItemsBooleanValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
 
@@ -113,11 +123,15 @@ impl<F: Json> Validate<F> for AdditionalItemsBooleanValidator {
         crate::validator::workspace::body_controls::<F, Self>(&[
             std::mem::size_of::<std::slice::Iter<'_, crate::node::SchemaNode<F>>>(),
             std::mem::size_of::<(&crate::node::SchemaNode<F>, usize, u64, bool)>(),
-            std::mem::size_of::<Option<f64>>(), std::mem::size_of::<Option<i64>>(),
+            std::mem::size_of::<Option<f64>>(),
+            std::mem::size_of::<Option<i64>>(),
             std::mem::size_of::<Option<u64>>(),
         ])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(array) = instance.as_array() {
             if array.len() > self.items_count {
@@ -127,22 +141,20 @@ impl<F: Json> Validate<F> for AdditionalItemsBooleanValidator {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
         tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+        ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(array) = instance.as_array() {
             if array.len() > self.items_count {
-                return Err(ValidationError::additional_items(
-                    self.location.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &self.location),
-                    location.into(),
-                    instance.to_value(),
-                    self.items_count,
-                ));
+                return ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                    Ok(crate::error::ValidationErrorKind::AdditionalItems {
+                        limit: self.items_count,
+                    })
+                });
             }
         }
         Ok(())
@@ -158,7 +170,10 @@ pub(crate) fn compile<'a, F: Json>(
     if let Some(items) = parent.get("items") {
         match items {
             Value::Array(items) => {
-                let kctx = ctx.new_at_location("additionalItems");
+                let kctx = (match ctx.new_at_location("additionalItems") {
+                    Ok(context) => context,
+                    Err(error) => return Some(Err(error.into())),
+                });
                 let items_count = items.len();
                 match schema {
                     Value::Object(_) => Some(AdditionalItemsObjectValidator::compile(
@@ -167,6 +182,7 @@ pub(crate) fn compile<'a, F: Json>(
                         items_count,
                     )),
                     Value::Bool(false) => Some(AdditionalItemsBooleanValidator::compile(
+                        ctx,
                         items_count,
                         kctx.location().clone(),
                     )),
@@ -174,13 +190,19 @@ pub(crate) fn compile<'a, F: Json>(
                     // Anything else is not a schema; fail the build like `additionalProperties`.
                     _ => {
                         let location = kctx.location().clone();
-                        Some(Err(ValidationError::multiple_type_error(
-                            location.clone(),
-                            location,
-                            Location::new(),
-                            Cow::Borrowed(schema),
-                            JsonTypeSet::from(JsonType::Object).insert(JsonType::Boolean),
-                        )))
+                        Some(Err(crate::keywords::try_compile!(
+                            ValidationError::multiple_type_error_with_funding(
+                                location.clone(),
+                                location,
+                                crate::keywords::try_compile!(Location::new_with_funding(
+                                    ctx.funding()
+                                )),
+                                Cow::Borrowed(schema),
+                                JsonTypeSet::from(JsonType::Object).insert(JsonType::Boolean),
+                                ctx.funding()
+                            )
+                        )
+                        .into()))
                     }
                 }
             }

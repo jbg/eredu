@@ -88,6 +88,8 @@ impl<'a> Metadata<'a> {
             size_of::<&WorkspaceTraceReport>(),
             size_of::<Metadata<'_>>(),
             size_of::<InferenceWorkspaceReport>(),
+            size_of::<Option<WorkspaceBorrowedStorage>>(),
+            size_of::<std::cell::Ref<'static, Option<WorkspaceBorrowedStorage>>>(),
             size_of::<InferenceWorkspaceError<E>>(),
             size_of::<Result<InferenceWorkspaceReport, InferenceWorkspaceError<E>>>(),
             size_of::<Result<PrefillOutcome, PrefillError<InferenceWorkspaceError<E>, Infallible>>>(

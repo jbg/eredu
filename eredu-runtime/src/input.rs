@@ -1,7 +1,9 @@
 //! Backend-neutral ownership of prepared multimodal tensors.
 pub mod host;
 mod original_preparation;
-pub use original_preparation::{OriginalModelInput, OriginalModelInputBackend, OriginalModelInputPublicationError};
+pub use original_preparation::{OriginalModelInput, OriginalModelInputBackend, OriginalModelInputCustody, OriginalModelInputPublicationError};
+mod chat_binding;
+pub use chat_binding::{prepare_original_chat_model_input, ChatInputPartCoordinate, PreparedChatInputBinding, PreparedChatInputError, PreparedChatInputRejection};
 
 use std::collections::BTreeMap;
 

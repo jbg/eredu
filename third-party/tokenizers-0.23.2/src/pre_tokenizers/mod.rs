@@ -1,9 +1,5 @@
 pub mod bert;
 pub mod byte_level;
-#[cfg(feature = "fancy-regex")]
-pub mod compiled_byte_level;
-#[cfg(feature = "fancy-regex")]
-pub mod compiled_split;
 pub mod delimiter;
 pub mod digits;
 pub mod fixed_length;
@@ -39,10 +35,6 @@ pub enum PreTokenizerWrapper {
     Whitespace(Whitespace),
     Sequence(Sequence),
     Split(Split),
-    #[cfg(feature = "fancy-regex")]
-    CompiledRegexSplit(compiled_split::CompiledRegexSplit),
-    #[cfg(feature = "fancy-regex")]
-    CompiledByteLevel(compiled_byte_level::CompiledByteLevel),
     Punctuation(Punctuation),
     WhitespaceSplit(WhitespaceSplit),
     Digits(Digits),
@@ -61,10 +53,6 @@ impl PreTokenizer for PreTokenizerWrapper {
             Self::Punctuation(tok) => tok.pre_tokenize(normalized),
             Self::Sequence(tok) => tok.pre_tokenize(normalized),
             Self::Split(tok) => tok.pre_tokenize(normalized),
-            #[cfg(feature = "fancy-regex")]
-            Self::CompiledRegexSplit(tok) => tok.pre_tokenize(normalized),
-            #[cfg(feature = "fancy-regex")]
-            Self::CompiledByteLevel(tok) => tok.pre_tokenize(normalized),
             Self::WhitespaceSplit(wspt) => wspt.pre_tokenize(normalized),
             Self::Digits(wspt) => wspt.pre_tokenize(normalized),
             Self::UnicodeScripts(us) => us.pre_tokenize(normalized),

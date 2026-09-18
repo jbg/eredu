@@ -11,7 +11,7 @@ pub(crate) struct OriginalWorkspaceSum<'a> {
     native:GroupCpuLayoutStorage<'a>,
     persistent:OriginalCommunicatorPersistent<'a>,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl OriginalCommunicationSource<'_> {
     pub(crate) fn sum_workspace_storage<'a>(&'a self,id:CollectiveGroupId,equation:WorkspaceOperationView<'a>)
@@ -25,7 +25,7 @@ impl OriginalCommunicationSource<'_> {
             return Err(failure(Cause::Resource,&self.source,&self.funding));
         }
         self.funding.reserve_metadata(group.native_group().cpu_layout_storage_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let native=group.native_group().cpu_layout_storage(input.shape(),dtype,GroupWorkerOperation::Sum)
             .map_err(|_|failure(Cause::Resource,&self.source,&self.funding))?;
         Ok(OriginalWorkspaceSum{native,persistent,source:self.source.clone(),funding:self.funding.clone()})
@@ -38,18 +38,18 @@ impl<'a> OriginalWorkspaceSum<'a> {
         let parts=[size_of::<Self>(),size_of::<OriginalCommunicationOperation<'a>>(),
             size_of::<Result<OriginalCommunicationOperation<'a>,Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&Array)>(),
-            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            self.native.binding_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         source.validate()?;
         if !self.source.same_source(source.source()) {return Err(failure(Cause::Identity,&self.source,&self.funding));}
-        let native=self.native.bind_actual(input).map_err(|_|failure(Cause::Resource,&self.source,&self.funding))?;
+        let native=self.native.bind_actual(input).map_err(|cause|failure(Cause::NativeBinding { index:None,ordinal:None,cause },&self.source,&self.funding))?;
         Ok(OriginalCommunicationOperation::from_layout_binding(native,self.persistent,self.source,self.funding))
     }
 }
 
-pub(super) fn sum_layout<'a>(source:&RetainedCommunicationSource,funding:&WorkspaceMetadataFunding,
+pub(super) fn sum_layout<'a>(source:&RetainedCommunicationSource,funding:&HostMetadataFunding,
     id:CollectiveGroupId,equation:WorkspaceOperationView<'a>)
     ->Result<(usize,eredu_nn::workspace::WorkspaceLayoutView<'a>,safemlx::Dtype),Error> {
     let (order,input,dtype,operation)=parallel_layout(source,funding,id,equation)?;
@@ -57,14 +57,14 @@ pub(super) fn sum_layout<'a>(source:&RetainedCommunicationSource,funding:&Worksp
     Ok((order,input,dtype))
 }
 
-pub(super) fn parallel_layout<'a>(source:&RetainedCommunicationSource,funding:&WorkspaceMetadataFunding,
+pub(super) fn parallel_layout<'a>(source:&RetainedCommunicationSource,funding:&HostMetadataFunding,
     id:CollectiveGroupId,equation:WorkspaceOperationView<'a>)
     ->Result<(usize,eredu_nn::workspace::WorkspaceLayoutView<'a>,safemlx::Dtype,GroupWorkerOperation),Error> {
         let parts=[size_of::<Option<(usize,&[usize])>>(),size_of::<GroupWorkerOperation>(),
             size_of::<(usize,eredu_nn::workspace::WorkspaceLayoutView<'a>,safemlx::Dtype,GroupWorkerOperation)>(),
             size_of::<[Option<usize>;5]>(),size_of::<[usize;6]>(),size_of::<std::slice::Iter<'_,usize>>(),
             size_of::<OriginalWorkspaceSum<'a>>(),size_of::<Result<OriginalWorkspaceSum<'a>,Error>>(),
-            size_of::<(&RetainedCommunicationSource,&WorkspaceMetadataFunding,CollectiveGroupId,WorkspaceOperationView<'a>)>(),
+            size_of::<(&RetainedCommunicationSource,&HostMetadataFunding,CollectiveGroupId,WorkspaceOperationView<'a>)>(),
             size_of::<eredu_nn::workspace::WorkspaceLayoutView<'a>>()*2,
             size_of::<Option<usize>>(),size_of::<Option<([eredu_nn::workspace::WorkspaceLayoutView<'a>;1],[eredu_nn::workspace::WorkspaceLayoutView<'a>;1])>>(),
             size_of::<Option<(&Group,&CommunicationGroupDescriptor,bool)>>(),
@@ -73,12 +73,12 @@ pub(super) fn parallel_layout<'a>(source:&RetainedCommunicationSource,funding:&W
             size_of::<std::array::IntoIter<bool,2>>(),size_of::<[bool;2]>(),
             size_of::<Option<eredu_nn::workspace::WorkspaceRepresentation>>(),
             size_of::<Option<WorkspaceFloatingType>>(),size_of::<TensorDtype>(),size_of::<safemlx::Dtype>(),
-            CommunicationManifest::group_operation_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            CommunicationManifest::group_operation_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             CommunicationOperationRequirement::tensor_metadata_control_bytes().and_then(|n|n.checked_mul(2))
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let (operation,native,partitions,rank,wire)=match equation.kind {
             WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum{partitions,rank})=>
                 (CommunicationOperation::AllReduceSum,GroupWorkerOperation::Sum,partitions,rank,None),
@@ -125,7 +125,11 @@ pub(super) fn parallel_layout<'a>(source:&RetainedCommunicationSource,funding:&W
                 Some(WorkspaceFloatingType::Float32)=>safemlx::Dtype::Float32,
                 Some(WorkspaceFloatingType::Float16)=>safemlx::Dtype::Float16,
                 Some(WorkspaceFloatingType::Bfloat16)=>safemlx::Dtype::Bfloat16,
-                None=>return Err(failure(Cause::WorkspaceRepresentation,source,funding)),
+                None=>return Err(failure(Cause::WorkspaceRepresentation {
+                    operation, group: id, rank, partitions,
+                    input_rank: input.shape().len(), input_width: input.shape().last().copied(),
+                    input_elements: input.elements().ok(),
+                },source,funding)),
             },
             WorkspaceDtype::Int32=>safemlx::Dtype::Int32,WorkspaceDtype::Bool=>safemlx::Dtype::Bool,
             WorkspaceDtype::Uint8=>safemlx::Dtype::Uint8,WorkspaceDtype::Uint32=>safemlx::Dtype::Uint32,

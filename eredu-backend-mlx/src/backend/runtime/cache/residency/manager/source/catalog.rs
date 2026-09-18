@@ -16,7 +16,7 @@ pub(crate) struct PreparedManagerCatalog {
     logical: Option<PreparedCacheLifecycle>,
     telemetry: Option<PreparedCacheTelemetry>,
     current_rows: Option<CacheTelemetryRows>,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 struct RetiredCatalog {
     _physical: CacheRecordTable<CacheBlockId, CacheBlockRecord>,
@@ -31,7 +31,7 @@ pub(crate) struct InstalledManagerCatalog {
     manager: CacheResidencyManager,
     generation: u64,
     publication_controls: usize,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl InstalledManagerCatalog {
     pub(crate) fn manager(&self) -> &CacheResidencyManager {

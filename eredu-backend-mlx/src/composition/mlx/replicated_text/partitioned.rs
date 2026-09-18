@@ -60,7 +60,7 @@ impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeu
             .as_array()
             .as_dtype(dtype, context)
             .map(MlxTensor::from_array)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 
     fn tensor_placeholder(
@@ -73,7 +73,7 @@ impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeu
         let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
         safemlx::ops::zeros_dtype(shape, dtype, context)
             .map(MlxTensor::from_array)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -175,6 +175,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         retained_sources: Option<
             &'source crate::backend::runtime::execution::generic::LayerwiseWorkspace,
         >,
+        groups: eredu_runtime::GroupSubmissionMechanism,
     ) -> Result<
         crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan<'source, U>,
         Error,
@@ -182,7 +183,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         let selected = self.operation_policy()?;
         match &*selected {
             MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => policy
-                .original_operation_plan(geometry, retained_sources)
+                .original_operation_plan(geometry, retained_sources, groups)
                 .map(crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan::Bounded),
             MlxSelectedLayerwisePolicyInner::Resident(policy) => {
                 if retained_sources.is_some() {
@@ -191,7 +192,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
                     ));
                 }
                 policy
-                    .original_neural_plan(geometry)
+                    .original_neural_plan(geometry, groups)
                     .map(crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan::Resident)
             }
         }

@@ -1,7 +1,7 @@
 //! Actual loaded declaration loan with a freshly paid session identity.
 use super::*;
 use eredu_architectures::prepared_sources::PreparedModelDiscovery;
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     replicated_session::ReplicatedTextControlOrigin, working_memory::WorkingMemoryError,
 };
@@ -15,28 +15,82 @@ use std::{
 /// native transport is adopted. Fresh String/control births use actual source H.
 pub(crate) struct OriginalInterventionDeclaration {
     prepared: Arc<PreparedModelDiscovery>,
-    partition: Option<Arc<partition_capture::LoadedPartitionCapture>>,
+    partition: Option<partition_capture::LoadedPartitionCapture>,
     session: String,
     origin: ReplicatedTextControlOrigin,
     activation_execution: Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution>,
     active_overlay: Option<String>,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 impl OriginalInterventionDeclaration {
     /// Paid projection of the actual loaded declaration for the outer control
     /// observer. Catalog and origin remain exact aliases; only identity text is
     /// copied. No session, transport, native root or callback is retained.
-    pub(crate) fn copy_for_control(&self, funding: &WorkspaceMetadataFunding) -> Result<Self, Error> {
+    pub(crate) fn copy_for_control(&self, funding: &HostMetadataFunding) -> Result<Self, Error> {
         let parts = [size_of::<Self>(), size_of::<Result<Self, Error>>(),
-            size_of::<(&Self, &WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &HostMetadataFunding)>(),
             size_of::<Option<String>>(), size_of::<Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution>>()];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let session = copy_identity_text(&self.session, funding)?;
         let active_overlay = self.active_overlay.as_deref().map(|text| copy_identity_text(text, funding)).transpose()?;
         Ok(Self { prepared: self.prepared.clone(), partition: self.partition.clone(), session, origin: self.origin.clone(),
             activation_execution: self.activation_execution.clone(), active_overlay, _funding: funding.clone() })
+    }
+    /// Admit a fresh logical declaration from the loaded source and the
+    /// actual absolute capture geometry. The intermediate and its diagnostics
+    /// remain under this declaration's actual planning account until the
+    /// immutable source compiler has produced its independent retained owner.
+    pub(crate) fn compile_source(
+        &self,
+        raw: &eredu_core::intervention::InterventionPlan,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        session_id: &str,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Result<eredu_runtime::working_memory::OriginalInterventionSource, Error> {
+        use eredu_core::{HostPreparationAuthority, intervention::{
+            PreparedInterventionAdmission, PreparedInterventionPlanCopy,
+            InterventionAdmissionError, AdmittedInterventionPlan,
+        }};
+        use eredu_runtime::{inspection::FundedInterventionDiscovery,
+            working_memory::{OriginalInterventionSource, OriginalInterventionSourceError}};
+        let funding = &self._funding;
+        let err = |cause| crate::composition::mlx::model::retain_planning_error(cause, funding.clone());
+        let controls = [
+            PreparedInterventionAdmission::inspection_control_bytes(),
+            PreparedInterventionPlanCopy::inspection_control_bytes(),
+            Self::validation_control_bytes(),
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>(),
+            Some(size_of::<(FundedInterventionDiscovery, HostPreparationAuthority,
+                AdmittedInterventionPlan, PreparedInterventionPlanCopy<'_>,
+                OriginalInterventionSource, Result<OriginalInterventionSource, Error>)>()),
+            eredu_core::BackendFailure::source_retention_peak_bytes::<InterventionAdmissionError>(),
+            eredu_core::BackendFailure::source_retention_peak_bytes::<OriginalInterventionSourceError>(),
+        ];
+        let bytes = controls.into_iter().try_fold(size_of_val(&controls), |sum, part|
+            sum.checked_add(part?)).ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
+        funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
+        let facts = super::super::intervention::mechanism_facts();
+        let discovery = match &self.partition {
+            Some(partition) => {
+                let (_, execution, _) = partition.source_labels();
+                self.prepared.prepare_partitioned_intervention_discovery(raw, facts, &self.session,
+                    partition.layouts(), &partition.discovery, execution, funding)
+            }
+            None => self.prepared.prepare_intervention_discovery(raw, facts, &self.session, funding),
+        }.map_err(|cause| crate::composition::mlx::model::retain_planning_error(cause, funding.clone()))?;
+        let plan = PreparedInterventionAdmission::inspect(raw, discovery.discovery(), capture.request(),
+            capture.invocation_bounds(), capture.text_origin().unwrap_or_default(), session_id)
+            .map_err(|cause| crate::composition::mlx::model::retain_planning_error(cause, funding.clone()))?;
+        funding.reserve_metadata(plan.required_bytes()).map_err(Error::WorkspacePlanning)?;
+        let host = HostPreparationAuthority::retain(funding.clone());
+        let admitted = plan.construct(&host)
+            .map_err(|cause| crate::composition::mlx::model::retain_planning_error(cause, funding.clone()))?;
+        self.validate(&admitted)?;
+        let copy = PreparedInterventionPlanCopy::inspect(&admitted).map_err(err)?;
+        pool.compile_intervention_source(copy)
+            .map_err(|cause| crate::composition::mlx::model::retain_planning_error(cause, funding.clone()))
     }
     pub(crate) fn matches_origin(&self, origin: &ReplicatedTextControlOrigin) -> bool {
         self.origin.same_origin(origin)
@@ -86,12 +140,12 @@ impl OriginalInterventionDeclaration {
 impl MlxModelSession {
     pub(crate) fn original_intervention_declaration(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Option<OriginalInterventionDeclaration>, Error> {
         let frames = [
             size_of::<OriginalInterventionDeclaration>(),
-            size_of::<Option<Arc<partition_capture::LoadedPartitionCapture>>>(),
-            size_of::<Option<&Arc<partition_capture::LoadedPartitionCapture>>>(),
+            size_of::<Option<partition_capture::LoadedPartitionCapture>>(),
+            size_of::<Option<&partition_capture::LoadedPartitionCapture>>(),
             size_of::<(&str,&str,eredu_runtime::CommunicationSessionIdentity)>(),
             size_of::<Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution>>(),
             size_of::<Option<String>>(),
@@ -105,13 +159,13 @@ impl MlxModelSession {
                 std::collections::TryReserveError,
             >()
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
             eredu_core::BackendFailure::source_retention_peak_bytes::<
                 eredu_runtime::replicated_session::PreparedControlBindingError,
             >()
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
             size_of::<
                 Result<
@@ -128,14 +182,14 @@ impl MlxModelSession {
                 >,
             >(),
             eredu_core::BackendFailure::source_retention_peak_bytes::<Error>().ok_or(
-                Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
             )?,
         ];
         let bytes = frames
             .into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)
@@ -145,12 +199,12 @@ impl MlxModelSession {
         let Some(prepared) = &self.capture_discovery else {
             return Ok(None);
         };
-        // Public admission already resolved this exact loaded source. Keep its
-        // immutable layouts/support owner; never rebuild discovery under quote.
+        // Compile this exact loaded source under its original account if it is
+        // still cold, then retain the immutable layouts/support owner for quote.
         let partition=match &self.payload.distributed {
             None=>None,
             Some(transport)=>{
-                let loaded=self.partition_capture.get().and_then(|source|source.as_ref().ok())
+                let loaded=self.original_partition_capture(funding)?
                     .ok_or_else(||err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)))?;
                 let (_,execution,setup)=loaded.source_labels();
                 if setup!=transport.session_identity() || setup.participant_count()!=loaded.layouts().topology().world_size()
@@ -186,17 +240,17 @@ impl MlxModelSession {
     }
 }
 
-fn copy_identity_text(source: &str, funding: &WorkspaceMetadataFunding) -> Result<String, Error> {
+fn copy_identity_text(source: &str, funding: &HostMetadataFunding) -> Result<String, Error> {
     let frames = [
         size_of::<Vec<u8>>(), size_of::<String>(),
         size_of::<Result<(), std::collections::TryReserveError>>(),
         size_of::<Result<String, std::string::FromUtf8Error>>(),
         size_of::<Result<String, Error>>(),
-        size_of::<(&str, &WorkspaceMetadataFunding)>(),
+        size_of::<(&str, &HostMetadataFunding)>(),
     ];
     let bytes = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
         .and_then(|n| n.checked_add(source.len()))
-        .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
     let mut text = Vec::new();
     text.try_reserve_exact(source.len()).map_err(|cause|

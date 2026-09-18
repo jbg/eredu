@@ -248,7 +248,7 @@ impl SourceControl {
         std::alloc::Layout::new::<ControlBody<C>>()
     }
     pub(crate) fn owner_control_bytes<C>() -> Option<usize> {
-        use std::mem::{size_of, size_of_val};
+        use std::mem::size_of;
         let controls = [
             size_of::<ControlBody<C>>(),
             size_of::<Option<ControlBody<C>>>(),
@@ -288,7 +288,7 @@ impl<T> std::ops::Deref for SourceHandle<T> {
 }
 impl<T: Any + Send + Sync> SourceHandle<T> {
     pub(crate) fn owner_control_bytes() -> Option<usize> {
-        use std::mem::{size_of, size_of_val};
+        use std::mem::size_of;
         let controls = [
             size_of::<Self>(),
             size_of::<Arc<T>>(),

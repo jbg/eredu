@@ -80,11 +80,11 @@ impl Backend {
                 ))
             ));
             assert!(pending.is_some());
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Original(self.opening_failure_identity.clone()),
             )));
         }
-        result.map_err(|e| FundedCaptureError::Backend(Error::backend_source(e)))?;
+        result.map_err(|e| FundedCaptureError::Backend(Error::backend_retained_source(e)))?;
         assert!(pending.is_none());
         let mut duplicate = Some(self.groups.last().unwrap().clone());
         assert!(matches!(

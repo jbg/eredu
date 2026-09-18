@@ -13,13 +13,26 @@ fn saved(
     crate::working_memory::WorkingMemoryFundingScope,
     WorkingMemoryStorage<u32>,
 ) {
+    saved_with_capacity(pool, adaptive, 8192)
+}
+
+fn saved_with_capacity(
+    pool: &WorkingMemoryPool,
+    adaptive: bool,
+    capacity: u64,
+) -> (
+    FundedSamplerCopy,
+    WorkspaceCopyCustody,
+    crate::working_memory::WorkingMemoryFundingScope,
+    WorkingMemoryStorage<u32>,
+) {
     let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (mut original, preparation, run) = source(pool, 8192, 8, adaptive);
+    let (mut original, preparation, run) = source(pool, capacity, 8, adaptive);
     grow(&mut original, &[3, 11, 7, 19, 5]);
     let (sampler, arrays) = pool
         .copy_sampling_components(
             joint(pool, original.borrow_funded()),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(capacity),
         )
         .unwrap();
     let (custody, scope) = arrays.into_parts();

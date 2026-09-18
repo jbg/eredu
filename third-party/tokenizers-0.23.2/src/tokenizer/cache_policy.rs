@@ -8,14 +8,23 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// Selects model-cache construction before BPE/Unigram are built.
 /// Regex/global state and tokenization itself may still allocate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelCachePolicy {
-    /// Preserve each model's ordinary cache defaults.
-    #[default]
-    Legacy,
-    /// Construct BPE/Unigram without model-cache storage.
-    NoModelCaches,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCachePolicy {
+    /// Maximum entries in each model cache. Zero constructs no cache.
+    /// This limits entry count, not allocator bytes or process-wide memory.
+    pub capacity: usize,
+}
+impl Default for ModelCachePolicy {
+    fn default() -> Self {
+        Self {
+            capacity: crate::utils::cache::DEFAULT_CACHE_CAPACITY,
+        }
+    }
+}
+impl ModelCachePolicy {
+    pub const fn disabled() -> Self {
+        Self { capacity: 0 }
+    }
 }
 
 /// Concrete tokenizer deserialization with an explicit model-cache policy.
@@ -61,15 +70,17 @@ impl Tokenizer {
         Ok(tokenizer)
     }
 
-    /// Reports current model-cache storage, not construction provenance or
-    /// allocation authority. Models with no cache report NoModelCaches.
+    /// Reports current model-cache capacity, not construction provenance or
+    /// allocation authority. Thread-local storage from retired cache generations
+    /// is outside this model-local configuration report. Models without a cache report zero capacity.
     /// HF serialization omits this choice; reconstruction must supply it again.
     pub fn model_cache_policy(&self) -> ModelCachePolicy {
-        match self.get_model() {
-            ModelWrapper::BPE(model) if model.cache_is_enabled() => ModelCachePolicy::Legacy,
-            ModelWrapper::Unigram(model) if model.cache_is_enabled() => ModelCachePolicy::Legacy,
-            _ => ModelCachePolicy::NoModelCaches,
-        }
+        let capacity = match self.get_model() {
+            ModelWrapper::BPE(model) => model.cache_capacity(),
+            ModelWrapper::Unigram(model) => model.cache_capacity(),
+            _ => 0,
+        };
+        ModelCachePolicy { capacity }
     }
 }
 

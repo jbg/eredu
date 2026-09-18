@@ -20,30 +20,39 @@ impl IfThenValidator<SerdeJson> {
         schema: &'a Value,
         then_schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(IfThenValidator {
+        Ok(ctx.funding().boxed(IfThenValidator {
             schema: {
-                let ctx = ctx.new_at_location("if");
+                let ctx = ctx.new_at_location("if")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(schema))?
             },
             then_schema: {
-                let ctx = ctx.new_at_location("then");
+                let ctx = ctx.new_at_location("then")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(then_schema))?
             },
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for IfThenValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.schema)?; source.node(&self.then_schema)?; Ok(())
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.schema)?;
+        source.node(&self.then_schema)?;
+        Ok(())
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<(&crate::node::SchemaNode<F>, bool)>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            &crate::node::SchemaNode<F>,
+            bool,
+        )>()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if self.schema.is_valid(instance, ctx) {
             self.then_schema.is_valid(instance, ctx)
@@ -52,7 +61,7 @@ impl<F: Json> Validate<F> for IfThenValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -66,7 +75,7 @@ impl<F: Json> Validate<F> for IfThenValidator<F> {
         }
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -113,30 +122,39 @@ impl IfElseValidator<SerdeJson> {
         schema: &'a Value,
         else_schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(IfElseValidator {
+        Ok(ctx.funding().boxed(IfElseValidator {
             schema: {
-                let ctx = ctx.new_at_location("if");
+                let ctx = ctx.new_at_location("if")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(schema))?
             },
             else_schema: {
-                let ctx = ctx.new_at_location("else");
+                let ctx = ctx.new_at_location("else")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(else_schema))?
             },
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for IfElseValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.schema)?; source.node(&self.else_schema)?; Ok(())
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.schema)?;
+        source.node(&self.else_schema)?;
+        Ok(())
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<(&crate::node::SchemaNode<F>, bool)>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            &crate::node::SchemaNode<F>,
+            bool,
+        )>()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if self.schema.is_valid(instance, ctx) {
             true
@@ -145,7 +163,7 @@ impl<F: Json> Validate<F> for IfElseValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -159,7 +177,7 @@ impl<F: Json> Validate<F> for IfElseValidator<F> {
         }
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -208,34 +226,44 @@ impl IfThenElseValidator<SerdeJson> {
         then_schema: &'a Value,
         else_schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        Ok(Box::new(IfThenElseValidator {
+        Ok(ctx.funding().boxed(IfThenElseValidator {
             schema: {
-                let ctx = ctx.new_at_location("if");
+                let ctx = ctx.new_at_location("if")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(schema))?
             },
             then_schema: {
-                let ctx = ctx.new_at_location("then");
+                let ctx = ctx.new_at_location("then")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(then_schema))?
             },
             else_schema: {
-                let ctx = ctx.new_at_location("else");
+                let ctx = ctx.new_at_location("else")?;
                 compiler::compile(&ctx, ctx.as_resource_ref(else_schema))?
             },
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for IfThenElseValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
-        source.node(&self.schema)?; source.node(&self.then_schema)?; source.node(&self.else_schema)?; Ok(())
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
+        source.node(&self.schema)?;
+        source.node(&self.then_schema)?;
+        source.node(&self.else_schema)?;
+        Ok(())
     }
 
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
-        crate::validator::workspace::body_controls::<F, Self>(&[
-            std::mem::size_of::<(&crate::node::SchemaNode<F>, bool)>(),
-        ])
+        crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<(
+            &crate::node::SchemaNode<F>,
+            bool,
+        )>()])
     }
 
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if self.schema.is_valid(instance, ctx) {
             self.then_schema.is_valid(instance, ctx)
@@ -244,7 +272,7 @@ impl<F: Json> Validate<F> for IfThenElseValidator<F> {
         }
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -258,7 +286,7 @@ impl<F: Json> Validate<F> for IfThenElseValidator<F> {
         }
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,

@@ -67,7 +67,7 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
-    let graph = architecture.execution_graph()?;
+    let graph = architecture.execution_graph()?.into_owned();
     construct_with_graph(
         architecture,
         ResidentGraph::Constructed(graph),
@@ -89,7 +89,7 @@ where
 {
     let mut units = storage.groups(graph.groups().len())?;
     for group in 0..graph.groups().len() {
-        let count = architecture.group_unit_count(group)?;
+        let count = architecture.group_unit_count(group, B::construction_metadata(context))?;
         let mut group_units = storage.units(count)?;
         for index in 0..count {
             // Ordinary construction still builds before growing its Vec. The
@@ -265,7 +265,7 @@ where
         context.charge_metadata(
             Self::workspace_unit_storage_control_bytes().ok_or(WorkspaceMetadataError::Overflow)?,
         )?;
-        let graph = architecture.execution_graph_with_metadata(context)?
+        let graph = architecture.execution_graph()?
             .into_owned_with_metadata(context)?;
         construct_with_graph(architecture, ResidentGraph::Constructed(graph), context, Metadata(context))
     }
@@ -333,9 +333,9 @@ where
             size_of::<(&crate::ExecutionUnitLayout,&WorkspaceContext)>(),size_of::<usize>()];
         context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or(WorkspaceMetadataError::Overflow)?)?;
-        let graph=architecture.execution_graph_with_metadata(context)?.into_owned_with_metadata(context)?;
+        let graph=architecture.execution_graph()?.into_owned_with_metadata(context)?;
         let mut counts=context.metadata_vec(graph.groups().len())?;
-        for group in 0..graph.groups().len() { counts.push(architecture.group_unit_count(group)?); }
+        for group in 0..graph.groups().len() { counts.push(architecture.group_unit_count(group, Some(context))?); }
         let geometry=crate::PreparedReplicatedTextExecutionGeometry::from_workspace_units(graph,&counts,context)?;
         let policy=prepare(geometry.units())?;
         Ok(Self::new_with_prepared_geometry(architecture,policy,geometry))

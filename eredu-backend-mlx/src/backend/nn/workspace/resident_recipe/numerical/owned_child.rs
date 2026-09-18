@@ -45,6 +45,10 @@ impl SpeculativeNumericalRecipe {
             ResidentExecutionMechanisms::Cpu{ordinary,cpu}=>ResidentRecipeRecorder::with_cpu_context(geometry,ordinary,cpu,context)?,
         };
         if let Some(source)=layerwise {recorder.bind_layerwise_constructor_source(source)?;}
+        // This child owns a complete model equation, including construction of
+        // its unloaded slots. Sampling spans on the enclosing recorder do not;
+        // keep this comparison at equation entries, before shared reduction.
+        recorder.validate_layerwise_constructor_trace(report)?;
         let reduced=recorder.reduce_trace_with_parallel(report,None,0,outputs,parallel)?;
         if reduced.first_missing_operation.is_some()||reduced.unqualified_kernel_owner.is_some(){
             return Err(context.metadata_error(format_args!(

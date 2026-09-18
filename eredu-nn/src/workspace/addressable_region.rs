@@ -3,7 +3,7 @@ use super::*;
 use crate::{GroupSelection, Tensor, TensorParallelGroupedOutput};
 use std::{mem::{size_of, size_of_val}, ops::Range};
 
-mod observation;
+pub(super) mod observation;
 pub use observation::{WorkspaceAddressableObservationSource, WorkspaceAddressableObservationView, WorkspaceAddressableObservationLayout};
 
 /// Exact scalar projection of the runtime's retained compact iteration plan.

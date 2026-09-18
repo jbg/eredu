@@ -1,66 +1,64 @@
 //! Shared expression-weight traversal and equations; storage owns growth policy.
 pub(crate) mod storage;
 use super::{storage::ExpressionStorage, Expr, ExprRef, ATTR_HAS_REPEAT};
-use std::convert::Infallible;
+use super::PreparedExprError;
+use crate::ParserAllocationFunding;
 type Attrs = (u32, u32);
 pub(crate) struct Scratch {
     todo: Vec<ExprRef>,
     mapped: Vec<Attrs>,
 }
 impl Scratch {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             todo: Vec::new(),
             mapped: Vec::new(),
         }
     }
-    pub(super) fn ordinary(root: ExprRef) -> Self {
-        Self {
-            todo: vec![root],
-            mapped: Vec::with_capacity(32),
-        }
-    }
+
 }
 pub(super) trait Destination {
     type Error;
-    fn push<T>(to: &mut Vec<T>, value: T) -> Result<(), Self::Error>;
-    fn store(cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error>;
+    fn push<T>(&mut self, to: &mut Vec<T>, value: T) -> Result<(), Self::Error>;
+    fn store(&mut self, cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error>;
     fn add(left: u32, right: u32) -> Result<u32, Self::Error>;
     fn sum(values: &[Attrs]) -> Result<u32, Self::Error> {
         values.iter().try_fold(0, |sum, v| Self::add(sum, v.0))
     }
 }
-pub(super) struct Ordinary;
-impl Destination for Ordinary {
-    type Error = Infallible;
-    fn push<T>(to: &mut Vec<T>, value: T) -> Result<(), Self::Error> {
-        to.push(value);
+pub(super) struct Growing<'a>(pub(super) &'a ParserAllocationFunding);
+impl Destination for Growing<'_> {
+    type Error = PreparedExprError;
+    fn push<T>(&mut self, to: &mut Vec<T>, value: T) -> Result<(), Self::Error> {
+        self.0.try_push(to, value)?;
         Ok(())
     }
-    fn store(cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error> {
-        if index >= cache.len() {
-            cache.resize(index + 100, (0, 0));
-        }
+    fn store(&mut self, cache: &mut Vec<Attrs>, index: usize, value: Attrs) -> Result<(), Self::Error> {
+        let required = index.checked_add(1).ok_or_else(|| self.0.storage_overflow())?;
+        self.0.try_grow_vec(cache, required)?;
+        if cache.len() < required { cache.resize(required, (0, 0)); }
         cache[index] = value;
         Ok(())
     }
     fn add(left: u32, right: u32) -> Result<u32, Self::Error> {
-        Ok(left + right)
+        left.checked_add(right).ok_or(PreparedExprError::Cost)
     }
 }
+
 fn cached(cache: &[Attrs], id: ExprRef) -> Attrs {
     cache.get(id.as_usize()).copied().unwrap_or((0, 0))
 }
 /// Same child push order, deferred parent, inherited attributes and large-DAG
 /// depth threshold for ordinary and finite prepared storage.
 pub(super) fn compute<D: Destination>(
+    destination: &mut D,
     expressions: &ExpressionStorage,
     cache: &mut Vec<Attrs>,
     scratch: &mut Scratch,
     root: ExprRef,
 ) -> Result<(), D::Error> {
     scratch.todo.clear();
-    D::push(&mut scratch.todo, root)?;
+    destination.push(&mut scratch.todo, root)?;
     while let Some(node) = scratch.todo.pop() {
         if cached(cache, node).0 != 0 {
             continue;
@@ -74,12 +72,12 @@ pub(super) fn compute<D: Destination>(
             flags |= attrs.1;
             if attrs.0 == 0 {
                 if !needs_more_work {
-                    D::push(&mut scratch.todo, node)?;
+                    destination.push(&mut scratch.todo, node)?;
                     needs_more_work = true;
                 }
-                D::push(&mut scratch.todo, child)?;
+                destination.push(&mut scratch.todo, child)?;
             } else {
-                D::push(&mut scratch.mapped, attrs)?;
+                destination.push(&mut scratch.mapped, attrs)?;
             }
         }
         if needs_more_work {
@@ -114,7 +112,7 @@ pub(super) fn compute<D: Destination>(
                 _ => weight,
             })
         };
-        D::store(cache, node.as_usize(), (weight, flags))?;
+        destination.store(cache, node.as_usize(), (weight, flags))?;
     }
     Ok(())
 }

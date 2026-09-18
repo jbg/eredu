@@ -6,6 +6,7 @@ use eredu_runtime::working_memory::{
 
 fn coordinates(record: &InferenceSpanWorkspaceRecord) -> Option<(i64, i64)> {
     let (start, length) = match record.span() {
+        InferenceWorkspaceSpan::Sampling(_) => return None,
         InferenceWorkspaceSpan::Prefill(chunk) => (
             chunk.position,
             chunk.input.end.checked_sub(chunk.input.start)?,

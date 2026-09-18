@@ -99,7 +99,7 @@ fn complete_decoder_rows_follow_composite_invocations_and_all_replicas() {
         let mut layouts = Vec::new();
         for rank in 0..topology.world_size() {
             let topology = ParallelRankTopology::new(topology, rank).unwrap();
-            let mut observations = BTreeMap::new();
+            let mut observations = SourceMap::new();
             register(&mut observations, &descriptor, &parameters, |owner| {
                 local(owner, topology.pipeline_parallel_rank(), count / 2)
             })
@@ -151,10 +151,12 @@ fn complete_decoder_rows_follow_composite_invocations_and_all_replicas() {
                 );
             }
             // No traversal into child operators or prediction subtrees.
-            assert!(descriptor
-                .components
-                .iter()
-                .all(|c| !observations.contains_key(&c.activation)));
+            assert!(
+                descriptor
+                    .components
+                    .iter()
+                    .all(|c| !observations.contains_key(&c.activation))
+            );
             assert!(observations.keys().all(|path| {
                 let point = descriptor.observations.get(path).unwrap();
                 descriptor.node(&point.node_id).unwrap().kind == ArchitectureNodeKind::DecoderBlock
@@ -167,10 +169,10 @@ fn complete_decoder_rows_follow_composite_invocations_and_all_replicas() {
             }));
             layouts.push(ComponentPartitionLayout {
                 topology,
-                groups: BTreeMap::new(),
-                paths: BTreeMap::new(),
+                groups: SourceMap::new(),
+                paths: SourceMap::new(),
                 observations,
-                routed: BTreeMap::new(),
+                routed: SourceMap::new(),
             });
         }
         let layouts = ComponentPartitionLayouts::new(topology, layouts).unwrap();
@@ -206,10 +208,12 @@ fn complete_decoder_rows_keep_shared_physical_passes_as_distinct_logical_invocat
     let mut descriptor = describe(&value);
     assert_eq!(descriptor.layer_groups[0].physical_layer_count, 2);
     assert_eq!(descriptor.layer_groups[0].passes.len(), 2);
-    assert!(descriptor
-        .parameter_groups
-        .iter()
-        .any(|g| g.shared_with.is_some()));
+    assert!(
+        descriptor
+            .parameter_groups
+            .iter()
+            .any(|g| g.shared_with.is_some())
+    );
     // A descriptor-only node, even with plausible geometry and an actual source
     // prefix, is not an executed layer merely because it is a DecoderBlock.
     let mut unexecuted = descriptor.node("decoder.layers.0").unwrap().clone();
@@ -225,7 +229,7 @@ fn complete_decoder_rows_keep_shared_physical_passes_as_distinct_logical_invocat
     descriptor.nodes.push(unexecuted);
     descriptor.observations.points.push(point);
     for stage in 0..2 {
-        let mut observations = BTreeMap::new();
+        let mut observations = SourceMap::new();
         register(&mut observations, &descriptor, &parameters, |o| {
             local(o, stage, 2)
         })
@@ -263,7 +267,7 @@ fn complete_decoder_rows_preserve_v4_stream_axes_and_existing_stream_placements(
         .as_ref()
         .unwrap();
     for stage in 0..2 {
-        let mut observations = BTreeMap::new();
+        let mut observations = SourceMap::new();
         streams::register(
             &mut observations,
             &descriptor,
@@ -309,8 +313,8 @@ fn complete_decoder_rows_preserve_v4_stream_axes_and_existing_stream_placements(
                 let shape = [1, 3, 2, 8];
                 if let Some(coordinates) = placement.coordinates() {
                     use eredu_core::capture::{
-                        resolve_slice, CaptureSchedule, CaptureSelection, CaptureSlicePartition,
-                        CaptureTransform,
+                        CaptureSchedule, CaptureSelection, CaptureSlicePartition, CaptureTransform,
+                        resolve_slice,
                     };
                     let selection = CaptureSelection {
                         id: path.clone(),
@@ -334,7 +338,7 @@ fn complete_decoder_rows_preserve_v4_stream_axes_and_existing_stream_placements(
 fn complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner() {
     let (descriptor, parameters) = gemma();
     let path = "model.language_model.layers.0.input";
-    let mut observations = BTreeMap::new();
+    let mut observations = SourceMap::new();
     register(&mut observations, &descriptor, &parameters, |_| true).unwrap();
     observations.get_mut(path).unwrap().site = ObservationHookSite::Readout;
     assert!(
@@ -349,7 +353,7 @@ fn complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner
         .unwrap()
         .node_id = "decoder.1".into();
     assert!(matches!(
-        register(&mut BTreeMap::new(), &foreign, &parameters, |_| true),
+        register(&mut SourceMap::new(), &foreign, &parameters, |_| true),
         Err(ComponentPartitionError::Capture(CaptureError::Invalid(_)))
     ));
     let mut owned = parameters.groups().to_vec();
@@ -369,7 +373,7 @@ fn complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner
     )
     .unwrap();
     assert!(matches!(
-        register(&mut BTreeMap::new(), &descriptor, &foreign, |_| true),
+        register(&mut SourceMap::new(), &descriptor, &foreign, |_| true),
         Err(ComponentPartitionError::Capture(CaptureError::Invalid(_)))
     ));
     let mut unbound = descriptor.clone();
@@ -380,7 +384,7 @@ fn complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner
         .unwrap()
         .observation_paths
         .retain(|p| p != "model.language_model.layers.0.input.effective");
-    let mut exact = BTreeMap::new();
+    let mut exact = SourceMap::new();
     register(&mut exact, &unbound, &parameters, |_| true).unwrap();
     assert!(exact.contains_key(path));
     assert!(
@@ -395,7 +399,17 @@ fn complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner
             node_id: "decoder.0".into(),
             scope: SpeculativeCaptureScope::Prediction { depth: 0 },
         });
-    let mut observations = BTreeMap::new();
+    let mut observations = SourceMap::new();
     register(&mut observations, &scoped, &parameters, |_| true).unwrap();
     assert!(!observations.contains_key(path));
+}
+
+#[test]
+fn decoder_source_refuses_each_scratch_node_and_observation_destination() {
+    let (descriptor, parameters) = gemma();
+    construction::tests::verify(|allocation| {
+        let mut result = SourceMap::new();
+        worker(&mut result, &descriptor, &parameters, |_| true, allocation)?;
+        Ok(result)
+    });
 }

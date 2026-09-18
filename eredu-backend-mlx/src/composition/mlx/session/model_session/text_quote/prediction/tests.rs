@@ -601,7 +601,7 @@ fn original_prediction_scoped_busy_cause_retains_carrier_after_scope_and_run_ret
         escaped = Some(error);
     });
     active.seal();
-    let status = active.finish();
+    let status = active.finish().unwrap();
     assert!(status.settled && !status.failed && !status.blocked);
     assert!(observed.get() > 0);
     drop(observer);

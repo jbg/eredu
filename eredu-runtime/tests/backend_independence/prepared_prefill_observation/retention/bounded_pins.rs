@@ -311,7 +311,7 @@ impl ScheduledCaptureBackend for Backend {
         }
         let mut attempt = match self.slots.begin(context, scope, segment) {
             Ok(value) => value,
-            Err(error) => return Err(FundedCaptureError::Backend(Error::backend_source(error))),
+            Err(error) => return Err(FundedCaptureError::Backend(Error::backend_retained_source(error))),
         };
         let empty_probe = self.mode == Mode::RegistryPanic && context.chunk().input.start == 0;
         if self.mode != Mode::Empty && !empty_probe {
@@ -393,7 +393,7 @@ impl ScheduledCaptureBackend for Backend {
             }
             Err(error) => {
                 self.failure = Some(error);
-                Err(FundedCaptureError::Backend(Error::backend_source(
+                Err(FundedCaptureError::Backend(Error::backend_retained_source(
                     Original(Arc::new(())),
                 )))
             }
@@ -404,7 +404,7 @@ impl ScheduledCaptureBackend for Backend {
         ticket: SettledPrefillChunkRetention,
     ) -> Result<(), FundedCaptureError<Error>> {
         if self.opening_mode == Some(OpeningMode::Abandon) {
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Original(self.opening_failure_identity.clone()),
             )));
         }
@@ -575,7 +575,7 @@ fn exercise_pins_retirement(
         |_| Ok(q.clone())
     )
     .is_err());
-    let (_, r, accepted) = plan_prefill_incremental_with_capacity(
+    let (r, accepted) = plan_prefill_incremental_with_capacity(
         session.inference_execution_identity(),
         &pool,
         &caps,
@@ -617,7 +617,7 @@ fn exercise_pins_retirement(
         funded.with_prefill_observer(
             &mut backend,
             bound,
-            &|e| Error::backend_source(e),
+            &|e| Error::backend_retained_source(e),
             |observer| {
                 let mut driver = eredu_runtime::prefill::PrefillDriver::new(
                     session.inference_execution_identity(),

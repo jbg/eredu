@@ -103,12 +103,38 @@ impl ParserFactory {
         self
     }
 
-    pub fn extra_lexemes(&self) -> Vec<String> {
+    pub fn extra_lexemes(&self) -> &[String] {
         self.slicer.extra_lexemes()
     }
 
     pub fn slicer(&self) -> Arc<SlicedBiasComputer> {
         self.slicer.clone()
+    }
+
+    /// Compile only immutable declarations through the same grammar worker used
+    /// by parser initialization. No parser rows, token masks or matcher are built.
+    pub fn compile_grammar(&self, grammar: TopLevelGrammar) -> Result<crate::earley::CGrammar> {
+        Ok(GrammarInit::Serialized(grammar).to_cgrammar(
+            Some(self.tok_env.tok_trie()),
+            &mut Logger::new(self.buffer_log_level, self.stderr_log_level),
+            self.limits.clone(),
+            self.extra_lexemes(),
+            derivre::ParserAllocationFunding::unenforced(),
+        )?)
+    }
+
+    /// Initialize mutable parser state from an already compiled declaration.
+    pub fn create_parser_from_compiled(
+        &self,
+        grammar: crate::earley::SharedGrammar,
+        max_tokens: Option<usize>,
+    ) -> Result<TokenParser> {
+        self.limits.validate_lexer_state_limit()?;
+        TokenParser::from_compiled(
+            self, grammar, max_tokens.unwrap_or(usize::MAX),
+            Logger::new(self.buffer_log_level, self.stderr_log_level),
+            self.inference_caps.clone(), self.limits.clone(),
+        )
     }
 
     pub fn create_parser(&self, grammar: TopLevelGrammar) -> Result<TokenParser> {

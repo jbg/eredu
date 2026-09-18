@@ -2,14 +2,14 @@
 use super::*;
 use eredu_architectures::{external_assistant::ExternalOperationResult,
     speculative_execution::PreparedEmbeddedEvidence};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::WorkingMemoryError;
 use crate::backend::runtime::cache::state::CompletedResidentSource;
 use std::mem::{size_of,size_of_val};
 
 fn invalid() -> Error { Error::PrefillControl(WorkingMemoryError::IdentityMismatch) }
-fn overflow() -> Error { Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow) }
-fn charge(funding:&WorkspaceMetadataFunding,parts:&[usize])->Result<(),Error>{
+fn overflow() -> Error { Error::WorkspacePlanning(HostMetadataFundingError::Overflow) }
+fn charge(funding:&HostMetadataFunding,parts:&[usize])->Result<(),Error>{
     funding.reserve_metadata(parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }
@@ -17,9 +17,9 @@ fn charge(funding:&WorkspaceMetadataFunding,parts:&[usize])->Result<(),Error>{
 #[error("{cause}")]
 struct CloneFailure {
     #[source] cause:safemlx::PreparedArrayCloneCause,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
-fn clone(value:&MlxTensor,funding:&WorkspaceMetadataFunding)->Result<MlxTensor,Error>{
+fn clone(value:&MlxTensor,funding:&HostMetadataFunding)->Result<MlxTensor,Error>{
     charge(funding,&[safemlx::PreparedArrayClone::control_bytes().ok_or_else(overflow)?,
         Array::inspection_clone_handle_bytes(),size_of::<CloneFailure>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<CloneFailure>().ok_or_else(overflow)?,
@@ -55,7 +55,7 @@ pub(super) fn join_at(mut visit:impl FnMut(&mut dyn FnMut(&MlxTensor)),
         charge(funding,&[size_of_val(&visit),size_of::<Vec<&CompletedResidentSource>>(),size_of::<Option<Error>>(),
             size_of::<Result<bool,Error>>(),size_of::<std::slice::Iter<'_,&PreparedEmbeddedEvidence>>(),
             size_of::<(&mut dyn FnMut(&MlxTensor),&mut dyn FnMut(&Array))>(),
-            size_of::<(&mut Option<Error>,&[&PreparedEmbeddedEvidence],&WorkspaceMetadataFunding)>(),
+            size_of::<(&mut Option<Error>,&[&PreparedEmbeddedEvidence],&HostMetadataFunding)>(),
             size_of::<Result<Option<PreparedEmbeddedEvidence>,Error>>(),
             size_of::<(&[&PreparedEmbeddedEvidence],ExternalAssistantTensorPlacement,SpeculativeExecutionStreams<'_>)>()])?;
         let selected=match placement {
@@ -216,11 +216,11 @@ pub(super) fn dimension(value:&MlxTensor,axis:usize,context:SpeculativeExecution
     run().map_err(|cause|match context.original_numerical(){Some((sources,_))=>sources.retain_error(cause),None=>cause})
 }
 
-fn retain_registered(proof:super::super::RegisteredTensorSource,funding:&WorkspaceMetadataFunding)->Result<PreparedEmbeddedEvidence,Error>{
+fn retain_registered(proof:super::super::RegisteredTensorSource,funding:&HostMetadataFunding)->Result<PreparedEmbeddedEvidence,Error>{
     charge(funding,&[size_of::<super::super::RegisteredTensorSource>(),
         size_of::<PreparedEmbeddedEvidence>(),size_of::<Result<PreparedEmbeddedEvidence,Error>>(),
         PreparedEmbeddedEvidence::retained_control_bytes::<super::super::RegisteredTensorSource>().ok_or_else(overflow)?,
-        eredu_core::HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().ok_or_else(overflow)?])?;
+        eredu_core::HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().ok_or_else(overflow)?])?;
     Ok(PreparedEmbeddedEvidence::from_prepared(proof,eredu_core::HostPreparationAuthority::retain(funding.clone())))
 }
 /// Same independently admitted copy worker as the existing tensor provider.
@@ -280,3 +280,5 @@ pub(super) fn copy_between(value:&MlxTensor,evidence:Option<&PreparedEmbeddedEvi
     };
     run().map_err(|cause|sources.retain_error(cause))
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

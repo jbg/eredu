@@ -53,7 +53,7 @@ fn run_with_limit(
         factor: -0.5,
     };
     operations.operations.push(second);
-    let mut run = CaptureSession::new(capture);
+    let mut run = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     run.enable_interventions(
         operations
             .admit_invocations(&edits, bounds(), "session")

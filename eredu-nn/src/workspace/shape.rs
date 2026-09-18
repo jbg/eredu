@@ -33,6 +33,41 @@ impl WorkspaceShapeError {
     }
 }
 
+/// Fixed geometry failure for row scatter, independent of mask values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceScatterShapeError {
+    /// A row-selection mask must exactly name the leading input dimensions.
+    #[error("workspace scatter mask must match the input's leading dimensions")]
+    MaskPrefix,
+    /// Source rows cannot broadcast to the unmasked input dimensions.
+    #[error("workspace scatter source cannot broadcast to the input row dimensions")]
+    SourceRows,
+}
+
+/// Validates row-scatter geometry without inspecting mask values or allocating.
+/// The mask exactly matches the input prefix. Source dimensions broadcast to
+/// the remaining row dimensions, optionally preceded by a source-row count.
+/// Whether that count covers the true mask entries is a numerical precondition
+/// and cannot be established by a metadata-only trace.
+pub fn validate_masked_scatter_shapes(
+    input: &[i32], mask: &[i32], source: &[i32],
+) -> Result<(), WorkspaceScatterShapeError> {
+    if mask.len() > input.len() || input[..mask.len()] != *mask {
+        return Err(WorkspaceScatterShapeError::MaskPrefix);
+    }
+    let row = &input[mask.len()..];
+    if source.len() > row.len() + 1 {
+        return Err(WorkspaceScatterShapeError::SourceRows);
+    }
+    let source_row = if source.len() > row.len() { &source[1..] } else { source };
+    let shape = WorkspaceBroadcastShape::new(row, source_row)
+        .map_err(|_| WorkspaceScatterShapeError::SourceRows)?;
+    if !shape.dimensions().eq(row.iter().copied()) {
+        return Err(WorkspaceScatterShapeError::SourceRows);
+    }
+    Ok(())
+}
+
 /// A broadcast equation borrowing both operands, without a result allocation.
 ///
 /// This validates compatibility, exactly as the ordinary tensor shape helper

@@ -5,14 +5,16 @@
 
 use eredu::{
     api::{
-        local_device_plan, LoadedModel, LocalDevice, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput,
+        ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
+        PreparedChatRequest, TokenizerSourceInput, local_device_plan,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{ExecutionPlan, FinishReason, ResidencyPlan, SemanticEvent};
 use serde_json::json;
+
+const CAPACITY: u64 = 64 * 1024 * 1024 * 1024;
 
 fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
     identity.starts_with("google.gemma4.")
@@ -69,18 +71,37 @@ fn smoke_with_tool(
     let planned = LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)
         .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let (mut model, _) = planned.into_parts();
+    let cancellation = eredu_core::GenerationCancellationToken::new();
+    let tokenizer = model
+        .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+        .unwrap();
+    let source = model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            true,
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
     // Tool declarations must also prepare for an ordinary text request.
     model
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![json!({"role": "user", "content": "Hello."})],
-            tools: vec![tool.clone()],
-            tool_choice: ToolChoice::Auto,
-            add_generation_prompt: true,
-            ..Default::default()
-        })
+        .prepare_chat(
+            &source,
+            &ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "Hello."})],
+                tools: vec![tool.clone()],
+                tool_choice: ToolChoice::Auto,
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            CAPACITY,
+            &cancellation,
+        )
+        .unwrap()
         .unwrap();
     let prepared = model
-        .prepare_chat(ChatTemplateRequest {
+        .prepare_chat(&source, &ChatTemplateRequest {
             messages: vec![json!({
                 "role": "user",
                 "content": format!("Call {tool_name} exactly once with {expected_arguments}. Do not answer with text.")
@@ -92,8 +113,9 @@ fn smoke_with_tool(
             enable_thinking: Some(false),
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
-        })
-        .unwrap_or_else(|error| panic!("failed to prepare {environment}={path:?}: {error}"));
+        }, CAPACITY, &cancellation)
+        .unwrap_or_else(|error| panic!("failed to prepare {environment}={path:?}: {error}"))
+        .unwrap();
 
     assert!(
         matches!(prepared.native_tool_support(), NativeToolSupport::Supported),
@@ -114,22 +136,27 @@ fn smoke_with_tool(
     );
 
     let mut events = Vec::new();
-    let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(&prepared),
-            settings: PreparedChatGenerationSettings {
-                overrides: eredu_core::GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    max_new_tokens: Some(256),
-                    ..Default::default()
-                },
-                seed: 0,
-                ..Default::default()
-            },
-            caller_stop_sequences: &[],
-            cancellation: eredu_core::GenerationCancellationToken::new(),
-            on_event: |event| events.push(event),
+    let settings = PreparedChatGenerationSettings {
+        overrides: eredu_core::GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(256),
+            ..Default::default()
+        },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
+            ..Default::default()
+        },
+        seed: 0,
+        ..Default::default()
+    };
+    let session = model
+        .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)
+        .unwrap_or_else(|error| {
+            panic!("failed to start {environment}={path:?} ({profile_identity}): {error}")
         })
+        .unwrap();
+    let output = session
+        .run(&cancellation, &mut |event| events.push(event))
         .unwrap_or_else(|error| {
             panic!("failed to generate from {environment}={path:?} ({profile_identity}): {error}")
         });
@@ -336,7 +363,7 @@ fn nemotron_real_checkpoint_native_tool_smoke() {
 #[ignore = "requires EREDU_NANBEIGE_CHECKPOINT and an MLX Metal device"]
 fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
     use eredu::api::{ControlledGenerationRecord, ObservedGenerationEvent, TraceLimits};
-    use eredu_core::{capture::CapturePlan, GenerationConfigOverrides};
+    use eredu_core::GenerationConfigOverrides;
     use std::ops::ControlFlow;
 
     let path = std::env::var("EREDU_NANBEIGE_CHECKPOINT").unwrap();
@@ -355,6 +382,10 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
             max_new_tokens: Some(512),
             ..Default::default()
         },
+        inference: eredu_core::TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(CAPACITY),
+            ..Default::default()
+        },
         seed: 0,
         ..Default::default()
     };
@@ -365,14 +396,38 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
             "required":["content"], "additionalProperties":false}
     }});
     let cases = [
-        (tool, "Call lookup with value 7. Then reply with only the secret word returned by the tool.".to_owned(), json!({"value":7})),
-        (todo_tool, format!("Use todo__todo_write to save exactly this list:\n{todo_content}\nThen reply with only the secret receipt word returned by the tool."), json!({"content":todo_content})),
+        (
+            tool,
+            "Call lookup with value 7. Then reply with only the secret word returned by the tool."
+                .to_owned(),
+            json!({"value":7}),
+        ),
+        (
+            todo_tool,
+            format!(
+                "Use todo__todo_write to save exactly this list:\n{todo_content}\nThen reply with only the secret receipt word returned by the tool."
+            ),
+            json!({"content":todo_content}),
+        ),
     ];
     for (tool, prompt, expected_arguments) in cases {
         let tool_name = tool["function"]["name"].as_str().unwrap();
         for thinking in [false, true] {
             for controlled in [false, true] {
                 model.reset().unwrap();
+                let cancellation = eredu_core::GenerationCancellationToken::new();
+                let tokenizer = model
+                    .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+                    .unwrap();
+                let source = model
+                    .compile_managed_chat_source(
+                        &tokenizer,
+                        ChatSourceInput::RetainedConfiguration,
+                        true,
+                        &cancellation,
+                    )
+                    .unwrap()
+                    .unwrap();
                 let mut messages = vec![
                     json!({"role":"system", "content":"You are a concise assistant. Follow the user's instructions and use tools when requested."}),
                     json!({"role":"user", "content":prompt}),
@@ -380,14 +435,20 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                 let mut executions = 0;
                 for turn in 0..2 {
                     let prepared = model
-                        .prepare_chat(ChatTemplateRequest {
-                            messages: messages.clone(),
-                            tools: vec![tool.clone()],
-                            tool_choice: ToolChoice::Auto,
-                            enable_thinking: Some(thinking),
-                            add_generation_prompt: true,
-                            ..Default::default()
-                        })
+                        .prepare_chat(
+                            &source,
+                            &ChatTemplateRequest {
+                                messages: messages.clone(),
+                                tools: vec![tool.clone()],
+                                tool_choice: ToolChoice::Auto,
+                                enable_thinking: Some(thinking),
+                                add_generation_prompt: true,
+                                ..Default::default()
+                            },
+                            CAPACITY,
+                            &cancellation,
+                        )
+                        .unwrap()
                         .unwrap();
                     assert!(matches!(
                         prepared.native_tool_support(),
@@ -395,41 +456,40 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                     ));
                     let mut events = Vec::new();
                     let ids = if controlled {
-                        let observed = model
-                            .prepare_observed_chat(
-                                &prepared,
-                                settings,
-                                CapturePlan::none(),
-                                TraceLimits {
-                                    per_record_bytes: 65536,
-                                    total_bytes: 4 << 20,
-                                },
-                            )
-                            .unwrap();
                         let mut collect = |record: ControlledGenerationRecord| {
-                            if let ObservedGenerationEvent::Semantic { event, .. } =
-                                record.generation.event
+                            if let Some(ObservedGenerationEvent::Semantic { event, .. }) =
+                                record.event.progress()
                             {
-                                events.push(event);
+                                events.push(event.clone());
                             }
                             ControlFlow::Continue(())
                         };
                         let mut session = model
-                            .start_controlled_chat(observed, &[], Default::default(), &mut collect)
+                            .start_controlled_chat(
+                                PreparedChatRequest::new(&prepared, settings),
+                                TraceLimits {
+                                    per_record_bytes: 65536,
+                                    total_bytes: 4 << 20,
+                                },
+                                Default::default(),
+                                &mut collect,
+                            )
+                            .unwrap()
                             .unwrap();
                         session.run(&mut collect).unwrap();
                         session.token_ids().to_vec()
                     } else {
                         model
-                            .generate_prepared_chat(PreparedChatGenerationRequest {
-                                input: PreparedChatInput::rendered_prompt(&prepared),
-                                settings,
-                                caller_stop_sequences: &[],
-                                cancellation: Default::default(),
-                                on_event: |e| events.push(e),
-                            })
+                            .start_prepared_chat(
+                                PreparedChatRequest::new(&prepared, settings),
+                                &cancellation,
+                            )
+                            .unwrap()
+                            .unwrap()
+                            .run(&cancellation, &mut |event| events.push(event))
                             .unwrap()
                             .token_ids
+                            .to_vec()
                     };
                     let decoded = model.decode(&ids, false).unwrap();
                     eprintln!(
@@ -501,9 +561,11 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                             })
                             .collect::<String>();
                         assert_eq!(text.trim(), "cobalt", "{events:?}");
-                        assert!(!events
-                            .iter()
-                            .any(|e| matches!(e, SemanticEvent::ToolCallEnd)));
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|e| matches!(e, SemanticEvent::ToolCallEnd))
+                        );
                     }
                 }
                 assert_eq!(executions, 1);

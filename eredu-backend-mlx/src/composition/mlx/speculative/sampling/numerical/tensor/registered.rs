@@ -17,7 +17,7 @@ pub(crate) struct RegisteredTensorSource {
     bytes: usize,
     stream: StreamCopyPlan<()>,
     copy: RegisteredArrayCopyCustody,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 enum Cause {
@@ -31,9 +31,9 @@ enum Cause {
 struct Failure {
     #[source]
     cause: Cause,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
-fn controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
+fn controls(funding: &HostMetadataFunding) -> Result<(), Error> {
     let parts = [
         size_of::<RegisteredTensorSource>(),
         size_of::<Option<safemlx::AllocationInfo>>(),
@@ -54,7 +54,7 @@ fn controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
         )
         .map_err(Error::WorkspacePlanning)
 }
-fn failure(cause: impl Into<Cause>, funding: &WorkspaceMetadataFunding) -> Error {
+fn failure(cause: impl Into<Cause>, funding: &HostMetadataFunding) -> Error {
     Error::StorageSource(BackendFailure::from_error(Failure {
         cause: cause.into(),
         _funding: funding.clone(),
@@ -72,7 +72,7 @@ impl RegisteredTensorSource {
         copy: &RegisteredArrayCopyCustody,
         identity: OriginalSpeculativeSourceIdentity,
         stream: &Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         controls(funding)?;
         copy.copy_retention()
@@ -135,7 +135,7 @@ impl RegisteredTensorSource {
         copy: &RegisteredArrayCopy,
         identity: OriginalSpeculativeSourceIdentity,
         stream: &Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
         copy.validate_completed_stream(stream, funding)?;
         Self::capture(copy.array(), copy.custody(), identity, stream, funding)
@@ -144,7 +144,7 @@ impl RegisteredTensorSource {
         &self,
         request: &OriginalSpeculativeRequest,
         stream: &Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         controls(funding)?;
         funding
@@ -162,9 +162,9 @@ impl RegisteredTensorSource {
     /// Descriptive completed placement only. Request and backing validation
     /// remain separate, and no destination completion can be inferred here.
     pub(crate) fn matches_completed_stream(&self, stream: &Stream,
-        funding: &WorkspaceMetadataFunding) -> Result<bool, Error> {
+        funding: &HostMetadataFunding) -> Result<bool, Error> {
         controls(funding)?;
-        let parts = [size_of::<(&Self, &Stream, &WorkspaceMetadataFunding)>(),
+        let parts = [size_of::<(&Self, &Stream, &HostMetadataFunding)>(),
             size_of::<Result<bool, Error>>(),
             self.stream.source_comparison_control_bytes().ok_or_else(model::overflow)?];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
@@ -174,7 +174,7 @@ impl RegisteredTensorSource {
     pub(crate) fn validate_stream(
         &self,
         stream: &Stream,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         controls(funding)?;
         funding
@@ -193,7 +193,7 @@ impl RegisteredTensorSource {
             .map_err(Error::PrefillControl)
     }
     /// Exact descriptive lookup; a different backing is not a failed source.
-    pub(crate) fn matches_array(&self,array:&Array,funding:&WorkspaceMetadataFunding)->Result<bool,Error>{
+    pub(crate) fn matches_array(&self,array:&Array,funding:&HostMetadataFunding)->Result<bool,Error>{
         controls(funding)?;
         let info=array.try_allocation_info().map_err(|cause|failure(cause,funding))?.ok_or_else(invalid)?;
         Ok(info.identity()==self.allocation && info.bytes()==self.bytes)
@@ -204,7 +204,7 @@ impl RegisteredTensorSource {
     pub(crate) fn validate_array(
         &self,
         array: &Array,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         controls(funding)?;
         let info = array
@@ -222,7 +222,7 @@ impl RegisteredTensorSource {
     pub(crate) fn validate_selected_projection(
         &self,
         native: &crate::backend::nn::workspace::ProjectedNativeStorage,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         controls(funding)?;
         funding.reserve_metadata(size_of::<Option<&Array>>())

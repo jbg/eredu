@@ -80,11 +80,14 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                 let generation = loaded.speculative_generation_options().unwrap().unwrap();
                 let (mut model, _) = loaded.into_parts();
                 let chat = model
-                    .prepare_chat(ChatTemplateRequest {
-                        messages: vec![serde_json::json!({"role":"user","content":"hello"})],
-                        add_generation_prompt: true,
-                        ..Default::default()
-                    })
+                    .source_chat_with_capacity(
+                        ChatTemplateRequest {
+                            messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+                            add_generation_prompt: true,
+                            ..Default::default()
+                        },
+                        ORIGINAL_CAPACITY,
+                    )
                     .unwrap();
                 let usage = CaptureUsage {
                     captures: 4096,
@@ -149,19 +152,24 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                     seed: 17,
                     ..Default::default()
                 };
-                let request = |chunk| PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::token_ids(
-                        &chat,
-                        [1, 3, 2, 4, 5, 6][..total as usize].to_vec(),
+                let request = |chunk| PreparedChatSpeculativeRequest {
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(
+                        &[1, 3, 2, 4, 5, 6][..total as usize],
                     ),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     drafting: eredu_core::SpeculativeDraft::Embedded,
-                    settings: PreparedChatGenerationSettings {
-                        inference: eredu_core::TextInferencePolicy {
-                            prefill_chunk_positions: chunk,
-                            ..Default::default()
+                    settings: chat_settings(
+                        &chat,
+                        PreparedChatGenerationSettings {
+                            inference: eredu_core::TextInferencePolicy {
+                                prefill_chunk_positions: chunk,
+                                ..Default::default()
+                            },
+                            ..settings
                         },
-                        ..settings
-                    },
+                    ),
                     options: generation.clone(),
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -179,14 +187,18 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                 };
                 let mut full_records = Vec::new();
                 let full = model
-                    .generate_observed_text_speculative(request(None), control.clone(), |step| {
-                        full_records.extend(step.activations.iter().cloned());
-                        ControlFlow::Continue(())
-                    })
+                    .generate_observed_prepared_chat_speculative(
+                        request(None),
+                        control.clone(),
+                        |step| {
+                            full_records.extend(step.activations.iter().cloned());
+                            ControlFlow::Continue(())
+                        },
+                    )
                     .unwrap();
                 let mut records = Vec::new();
                 let chunked = model
-                    .generate_observed_text_speculative(
+                    .generate_observed_prepared_chat_speculative(
                         request(std::num::NonZeroU64::new(2)),
                         control.clone(),
                         |step| {
@@ -224,7 +236,9 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                         .iter()
                         .find(|r| r.phase == entry.phase)
                         .unwrap()
-                        .captures.as_step().records
+                        .captures
+                        .as_step()
+                        .records
                         .iter()
                         .find(|r| r.selection_id == entry.record.selection_id)
                         .unwrap();
@@ -239,19 +253,24 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                 }
                 for physical in records.iter().filter(|r| r.prefill_span.is_some()) {
                     assert!(physical.captures.as_step().invocation.unwrap().sequence <= 2);
-                    assert!(physical
-                        .captures.as_step().records
-                        .iter()
-                        .filter(|r| r.payload.is_some())
-                        .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2));
+                    assert!(
+                        physical
+                            .captures
+                            .as_step()
+                            .records
+                            .iter()
+                            .filter(|r| r.payload.is_some())
+                            .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2)
+                    );
                 }
                 let mut controlled_records = Vec::new();
                 let controlled = model
-                    .with_controlled_text_speculative(
+                    .with_controlled_prepared_chat_speculative(
                         request(std::num::NonZeroU64::new(2)),
                         control,
                         |session| {
-                            controlled_records.extend(session.step()?.unwrap().activations.iter().cloned());
+                            controlled_records
+                                .extend(session.step()?.unwrap().activations.iter().cloned());
                             let saved = session.snapshot()?;
                             while let Some(step) = session.step()? {
                                 controlled_records.extend(step.activations.iter().cloned());

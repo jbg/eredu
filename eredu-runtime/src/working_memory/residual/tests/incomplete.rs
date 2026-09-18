@@ -80,6 +80,7 @@ fn equations(
     let report = quote_inference_workspace(g, |span| {
         context.begin_state_span([&old])?;
         let positions = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };
@@ -141,7 +142,6 @@ fn candidate_plan(
     quote: impl FnMut(InferenceGeometry) -> Result<IncrementalInferenceQuote, PrefillPlanningError>,
 ) -> Result<
     (
-        Admission,
         WorkingMemoryReservation,
         IncrementalInferenceQuote,
     ),
@@ -166,7 +166,7 @@ fn incomplete_larger_equations_retry_for_full_and_registered_decoder_quotes() {
         let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
         let original = pool.register_storage([(1u32, 64)]).unwrap();
         let mut attempted = Vec::new();
-        let (admission, reservation, quote) = candidate_plan(&pool, capacity, |g| {
+        let (reservation, quote) = candidate_plan(&pool, capacity, |g| {
             attempted.push(g.prefill_chunk_positions);
             assert_eq!(
                 used(&pool),
@@ -189,7 +189,7 @@ fn incomplete_larger_equations_retry_for_full_and_registered_decoder_quotes() {
                 .unwrap(),
             Some(12)
         );
-        assert_eq!(admission.incremental_required_bytes, capacity - 64);
+        assert_eq!(reservation.admission().incremental_required_bytes, capacity - 64);
         assert_eq!(used(&pool), (capacity, capacity));
         drop((reservation, quote, original));
         assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -201,7 +201,7 @@ fn numerical_gaps_and_capacity_rejections_keep_descending_candidate_order() {
     let pool = WorkingMemoryPool::new(76, 0).unwrap();
     let original = pool.register_storage([(1u32, 64)]).unwrap();
     let mut attempted = Vec::new();
-    let (_, reservation, accepted) = candidate_plan(&pool, 76, |g| {
+    let (reservation, accepted) = candidate_plan(&pool, 76, |g| {
         attempted.push(g.prefill_chunk_positions);
         assert_eq!(used(&pool), (64, 64));
         // Four is unpriced; three is complete but needs sixteen new bytes;

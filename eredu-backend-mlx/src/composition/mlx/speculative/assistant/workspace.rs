@@ -17,7 +17,7 @@ use eredu_nn::{
     Error, ParameterId, ParameterMetadataView, ParameterSourceVisitor, Parameterized,
     workspace::{
         WorkspaceBackend, WorkspaceContext, WorkspaceFloatingType, WorkspaceMetadataError,
-        WorkspaceMetadataFunding, WorkspaceParameterRepresentation, WorkspaceRepresentation,
+        HostMetadataFunding, WorkspaceParameterRepresentation, WorkspaceRepresentation,
         WorkspaceTensor, WorkspaceTraceReport,
     },
 };
@@ -49,7 +49,7 @@ pub(crate) struct AssistantEquationParts<B, C = ()> {
     pub(crate) closing_roots: usize,
     pub(crate) context: WorkspaceContext,
     // Native projection and all report/source destinations retire before H.
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 impl<A: ExternalAssistantArchitecture, B, C> AssistantEquationQuote<'_, A, B, C> {
     pub(crate) fn into_parts(self) -> AssistantEquationParts<B, C> {
@@ -61,7 +61,7 @@ impl<A: ExternalAssistantArchitecture, B, C> AssistantEquationQuote<'_, A, B, C>
 struct Failure {
     #[source]
     cause: Error,
-    _funding: Option<WorkspaceMetadataFunding>,
+    _funding: Option<HostMetadataFunding>,
 }
 fn controls(context: &WorkspaceContext, parts: &[usize]) -> Result<(), Error> {
     context.charge_metadata(
@@ -299,7 +299,7 @@ where
         // Source selection precedes every placeholder/module constructor.
         context.install_parameter_representations(source.representations)?;
         let mut module = I::workspace_module(&assistant.config, context)?;
-        bind_prepared_workspace_parameters(&mut module, &mut source.rows, context)?;
+        bind_prepared_workspace_parameters(&mut module, &mut source.rows, context, |_| false)?;
 
         let mut recorder = mechanism.recorder(geometry, context)?;
         let mut executed = false;
@@ -395,3 +395,5 @@ where
 
 #[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
 mod cpu_tests;
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

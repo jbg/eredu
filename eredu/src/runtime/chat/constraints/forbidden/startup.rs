@@ -1,5 +1,5 @@
-//! Actual prepared-plan trigger and historical tokenizer into original source.
-use super::super::{GenerationRuntimePlan, selection::Selection};
+//! Selected trigger and retained tokenizer into a funded forbidden source.
+use super::super::{selection::Selection, GenerationRuntimePlan};
 use super::*;
 use eredu_runtime::working_memory::{OriginalChatBackend, OriginalForbiddenSource};
 
@@ -7,45 +7,42 @@ impl ConstraintController {
     /// Borrow the actual original source after the same controller constructor.
     pub(crate) fn original_forbidden_inputs(&self) -> Option<&OriginalForbiddenSource> {
         match &self.runtime {
-            ConstraintRuntime::PreparedForbidden { original, .. } => original.as_ref(),
+            ConstraintRuntime::PreparedForbidden { original, .. } => Some(original),
             _ => None,
         }
     }
 
-    /// Builds the same ToolChoice::None branch from its exact prepared recipe.
-    /// The historical tokenizer is compiled through the existing original root
-    /// worker; current loaded tokenizer changes cannot substitute another vocab.
+    /// Builds the ToolChoice::None branch from the retained tokenizer and the
+    /// selected policy trigger. Startup never serializes or reconstructs a tokenizer.
     pub(crate) fn from_original_forbidden_generation_plan<B: OriginalChatBackend>(
         runtime: &eredu_core::ModelRuntime<B>,
+        tokenizer: &eredu_runtime::working_memory::OriginalTokenizer,
         plan: &GenerationRuntimePlan,
         validity: SharedTokenFilter,
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, ForbiddenSourceError> {
-        Self::from_original_generation_plan_with(
+        Self::from_original_forbidden_generation_plan_with(
             plan,
             validity,
             capacity,
             funding,
-            |json, trigger| {
-                let tokenizer_plan =
-                    eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(json)?;
-                let tokenizer = B::compile_original_tokenizer(runtime, tokenizer_plan)?;
+            |trigger| {
                 Ok(B::compile_original_forbidden_tokenizer_source(
-                    runtime, &tokenizer, trigger,
+                    runtime, tokenizer, trigger,
                 )?)
             },
         )
     }
-    pub(in super::super) fn from_original_generation_plan_with<F>(
+    pub(in super::super) fn from_original_forbidden_generation_plan_with<F>(
         plan: &GenerationRuntimePlan,
         validity: SharedTokenFilter,
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         compile: F,
     ) -> Result<Self, ForbiddenSourceError>
     where
-        F: FnOnce(&[u8], &[u8]) -> Result<OriginalForbiddenSource, Cause>,
+        F: FnOnce(&[u8]) -> Result<OriginalForbiddenSource, Cause>,
     {
         let retain = |cause| ForbiddenSourceError {
             cause,
@@ -66,29 +63,15 @@ impl ConstraintController {
                     eredu_runtime::working_memory::OriginalForbiddenSourceError,
                 >,
             >(),
-            size_of::<eredu_runtime::working_memory::OriginalTokenizer>(),
-            size_of::<
-                Result<
-                    eredu_runtime::working_memory::OriginalTokenizer,
-                    eredu_core::BackendFailure,
-                >,
-            >(),
-            size_of::<eredu_text::tokenizer_storage::TokenizerPlan<'_>>(),
-            size_of::<
-                Result<
-                    eredu_text::tokenizer_storage::TokenizerPlan<'_>,
-                    eredu_text::tokenizer_storage::TokenizerSourceError,
-                >,
-            >(),
             size_of::<(
                 &GenerationRuntimePlan,
                 SharedTokenFilter,
                 usize,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             PlainControllerHistory::copy_metadata_bytes(capacity)
                 .ok_or_else(|| retain(Cause::Overflow))?,
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                 .ok_or_else(|| retain(Cause::Overflow))?,
         ];
         funding
@@ -103,13 +86,7 @@ impl ConstraintController {
             let Selection::Forbidden(trigger) = Selection::from_plan(plan)? else {
                 return Err(Cause::GrammarSource);
             };
-            let json = plan
-                .generation_constraint()
-                .inner
-                .recipe
-                .tokenizer_object_json()
-                .ok_or(Cause::TokenizerRecipe)?;
-            let original = compile(json, trigger)?;
+            let original = compile(trigger)?;
             let authority = HostPreparationAuthority::retain(funding.clone());
             let committed_tokens =
                 PlainControllerHistory::default().copy_prepared(capacity, authority.clone())?;
@@ -117,11 +94,12 @@ impl ConstraintController {
                 runtime: ConstraintRuntime::PreparedForbidden {
                     inputs: original.inputs().clone(),
                     pending: TriggerPrefix::default(),
-                    original: Some(original),
+                    original,
                 },
                 committed_tokens,
                 validity,
                 authority,
+                preparation: None,
             })
         })();
         result.map_err(retain)

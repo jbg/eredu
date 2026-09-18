@@ -20,7 +20,7 @@ fn sources() -> (Fixture, Fixture) {
             .build()
             .unwrap();
         let mut tokenizer = Tokenizer::new(words);
-        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
         tokenizer.with_decoder(Some(ByteLevel::default()));
         tokenizer.save(root.join("tokenizer.json"), false).unwrap();
         std::fs::write(
@@ -177,11 +177,14 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
     let options = loaded.speculative_generation_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
-            add_generation_prompt: true,
-            ..Default::default()
-        })
+        .source_chat_with_capacity(
+            ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            ORIGINAL_CAPACITY,
+        )
         .unwrap();
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -194,16 +197,22 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
     };
     macro_rules! request {
         ($chunk:expr, $cancel:expr) => {
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5, 6]),
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[1, 3, 2, 4, 5, 6]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings: PreparedChatGenerationSettings {
-                    inference: eredu_core::TextInferencePolicy {
-                        prefill_chunk_positions: $chunk,
-                        ..Default::default()
+                settings: chat_settings(
+                    &chat,
+                    PreparedChatGenerationSettings {
+                        inference: eredu_core::TextInferencePolicy {
+                            prefill_chunk_positions: $chunk,
+                            ..Default::default()
+                        },
+                        ..settings
                     },
-                    ..settings
-                },
+                ),
                 options: options.clone(),
                 caller_stop_sequences: &[],
                 cancellation: $cancel,
@@ -244,7 +253,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
     };
     let mut baseline_scores = Vec::new();
     let baseline = model
-        .generate_observed_text_speculative(
+        .generate_observed_prepared_chat_speculative(
             request!(None, Default::default()),
             control.clone(),
             |step| {
@@ -272,7 +281,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
         .unwrap();
     let mut observed_scores = Vec::new();
     let selected = model
-        .generate_observed_text_speculative(
+        .generate_observed_prepared_chat_speculative(
             request!(std::num::NonZeroU64::new(2), Default::default()),
             control.clone(),
             |step| {
@@ -336,7 +345,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
         .unwrap();
     let mut default_scores = Vec::new();
     let default = model
-        .generate_observed_text_speculative(
+        .generate_observed_prepared_chat_speculative(
             request!(None, Default::default()),
             control.clone(),
             |step| {
@@ -368,10 +377,12 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
             .collect::<Vec<_>>();
         assert_eq!(rows, [(0, 1)]);
         assert!(!trace.context.is_empty());
-        assert!(trace
-            .context
-            .iter()
-            .all(|(end, _, shape)| *end == 6 && shape[2] == 6));
+        assert!(
+            trace
+                .context
+                .iter()
+                .all(|(end, _, shape)| *end == 6 && shape[2] == 6)
+        );
     }
     for supported in [true, false] {
         let trace = Rc::new(RefCell::new(Trace::default()));
@@ -394,7 +405,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
             )
             .unwrap();
         let mut captures = Vec::new();
-        let result = model.generate_observed_text_speculative(
+        let result = model.generate_observed_prepared_chat_speculative(
             request!(std::num::NonZeroU64::new(2), cancellation),
             control.clone(),
             |step| {
@@ -428,7 +439,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
         if supported {
             install.unwrap();
             let retry = model
-                .generate_prepared_text_speculative(request!(
+                .generate_prepared_chat_speculative(request!(
                     std::num::NonZeroU64::new(2),
                     Default::default()
                 ))

@@ -143,8 +143,8 @@ fn check_saved_capture_run(
     );
     let cancellation = GenerationCancellationToken::new();
     let mut original_frames = Vec::new();
-    let mut original_observer = |_: Option<u32>, frame: Option<CapturedStepDelivery>, _: f64| {
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+    let mut original_observer = |_: Option<u32>, frame: Option<SharedCapturedStep>, _: f64| {
+        let Some(frame) = frame else {
             panic!("expected the admitted shared capture owner");
         };
         original_frames.push(frame);
@@ -198,8 +198,8 @@ fn check_saved_capture_run(
     resume.overrides.max_new_tokens = Some(2);
     resume.inference.managed_memory_capacity_bytes = Some(capacity);
     let mut restored_frames = Vec::new();
-    let mut restored_observer = |_: Option<u32>, frame: Option<CapturedStepDelivery>, _: f64| {
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+    let mut restored_observer = |_: Option<u32>, frame: Option<SharedCapturedStep>, _: f64| {
+        let Some(frame) = frame else {
             panic!("restoration must deliver its saved capture source");
         };
         restored_frames.push(frame);
@@ -241,8 +241,8 @@ fn check_saved_capture_run(
     // A separately admitted branch starts at the immutable saved usage, so the
     // first resumed value is available even after the parent spent its limit.
     let mut branch_frames = Vec::new();
-    let mut branch_observer = |_: Option<u32>, frame: Option<CapturedStepDelivery>, _: f64| {
-        let Some(CapturedStepDelivery::Shared(frame)) = frame else {
+    let mut branch_observer = |_: Option<u32>, frame: Option<SharedCapturedStep>, _: f64| {
+        let Some(frame) = frame else {
             panic!("branch must deliver its independent saved capture source");
         };
         branch_frames.push(frame);

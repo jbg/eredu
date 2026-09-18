@@ -148,6 +148,15 @@ impl PreparedPartitionBanks {
         self.resident_source.as_ref().ok_or(crate::RoutedTextExecutionError::ResidentSourceUnavailable)
     }
 
+    pub(crate) fn adopt_execution_sources(&mut self,
+        plans: &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>) -> Result<(), String> {
+        if self.banks.keys().ne(plans.keys()) || self.banks.iter().any(|(id, bank)| bank.plan() != &plans[id]) {
+            return Err("retained composite bank execution differs".into());
+        }
+        for (id, bank) in &mut self.banks { bank.adopt_execution_source(&plans[id])?; }
+        Ok(())
+    }
+
     /// The selected immutable-weight cache policy.
     pub const fn residency(&self) -> ParameterBankResidency {
         self.residency
@@ -248,6 +257,12 @@ where
         > = if bank.plan().local_global_group_indices().is_empty()
             || bank.addressable_members().is_empty()
         {
+            if !bank.addressable_members().is_empty() {
+                return Err(PreparedExecutionError::Architecture(
+                    "empty partition provider retains nonempty physical members".into()));
+            }
+            bank.complete_partition_source(BTreeMap::new(), options)
+                .map_err(|cause| PreparedExecutionError::Architecture(cause.to_string()))?;
             Box::new(EmptyPartitionRoutedExpertProvider)
         } else {
             let mechanism = mechanisms.remove(id).ok_or_else(|| {

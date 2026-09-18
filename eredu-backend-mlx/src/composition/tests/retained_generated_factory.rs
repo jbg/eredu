@@ -154,10 +154,13 @@ fn managed_neutral_adapter_forwards_retained_roots_and_preserves_original_error_
                 Err(e) => e,
                 Ok(()) => panic!("original retention failure must propagate"),
             };
-            assert_eq!(
-                error.to_string(),
-                "retained generated activation observation failed"
-            );
+            // The typed native cause is retained directly; construction and
+            // cloning must not invoke Original's deliberately panicking Display.
+            let alias = error.clone();
+            let original_source = std::error::Error::source(&error).unwrap();
+            let alias_source = std::error::Error::source(&alias).unwrap();
+            assert!(original_source.is::<MlxError>());
+            assert!(std::ptr::eq(original_source, alias_source));
             let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
             let sentinel = loop {
                 let current = cause.expect("typed original cause");

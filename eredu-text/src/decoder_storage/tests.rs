@@ -557,3 +557,4 @@ mod pipelines;
 mod owned;
 
 mod compiler;
+mod metaspace;

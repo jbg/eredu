@@ -18,7 +18,7 @@ pub(in crate::working_memory) struct AccountNode {
     phase: Phase,
     state: FundingState,
     next: Option<Box<AccountNode>>,
-    planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl AccountNode {
     // Ordinary paths use their existing owner. Original requests use an accepted
@@ -27,7 +27,7 @@ impl AccountNode {
         Self::empty_with_planning(None)
     }
     pub(in crate::working_memory) fn empty_with_planning(
-        planning_metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
     ) -> Box<Self> {
         Box::new(Self {
             id: 0,
@@ -54,17 +54,6 @@ pub(in crate::working_memory) struct AccountLedger {
     head: Option<Box<AccountNode>>,
 }
 impl AccountLedger {
-    // Temporary reached-failure attribution; removed after the ownership diagnosis.
-    pub(in crate::working_memory) fn trace_accounts(&self) {
-        for node in self.nodes() {
-            let state = &node.state;
-            if state.remaining >= (1 << 20) {
-                eprintln!("WORKSPACE_LEDGER_ACCOUNT id={} phase={:?} remaining={} host={} native={:?} scopes={} native_scopes={} run_open={} metadata_live={} quarantined={}",
-                    node.id,node.phase,state.remaining,state.host_held,state.native_held,
-                    state.scopes,state.native_scopes,state.run_open,state.metadata_live,state.quarantined);
-            }
-        }
-    }
     fn nodes(&self) -> impl Iterator<Item = &AccountNode> {
         let mut next = self.head.as_deref();
         std::iter::from_fn(move || {

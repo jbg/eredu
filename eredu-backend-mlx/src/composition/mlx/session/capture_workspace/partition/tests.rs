@@ -20,8 +20,8 @@ fn projected_prefill_quotes_actual_local_sources_and_preserves_raw_additive_redu
             capture_plan_identity:source.admission().identity().into(),selection_index:0,phase:CapturePhase::Prefill,prediction:0,forward_epoch:1,invocation:None};
         let mut ledger=CaptureLedger::new(source.admission());ledger.begin_step();
         let limits=PartitionCaptureReceiptLimits{max_producers:2,max_fragments:2,max_record_bytes:64<<10};
-        let receipt=if sum{PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),context,producers,2,limits,&mut ledger)}
-            else{PartitionCaptureReceiptPlan::new_shared(source.clone(),context,producers,2,limits,&mut ledger)}.unwrap();
+        let receipt=if sum{PartitionCaptureReceiptPlan::new_sum(source.clone(),context,producers,2,limits,&mut ledger)}
+            else{PartitionCaptureReceiptPlan::new(source.clone(),context,producers,2,limits,&mut ledger)}.unwrap();
         let inference=InferenceGeometry{batch_size:1,cached_positions:2,input_positions:3,max_output_tokens:4,prefill_chunk_positions:1,output:OutputDemand::LastPosition};
         let context=WorkspaceContext::new(cpu);let equation=PartitionPrefillEquation::prepare(&receipt,0,0,inference,&context).unwrap();
         let native=equation.native_source(eredu_core::checkpoint::TensorDtype::F32);
@@ -38,7 +38,7 @@ fn projected_prefill_quotes_actual_local_sources_and_preserves_raw_additive_redu
             assert_eq!(population.publications==0,k==0);assert_eq!(roots.is_empty(),k==0);
             if k!=0{assert!(population.completions>0);assert!(!report.operations.is_empty());}
         }
-        assert!(std::ptr::eq(equation.source.admission(),receipt.shared_plan_source().unwrap().admission()));
+        assert!(std::ptr::eq(equation.source.admission(),receipt.shared_plan_source().admission()));
         assert!(std::ptr::eq(equation.source.projection(),receipt.producer(0).unwrap()));
     }}
 }

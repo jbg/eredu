@@ -1418,11 +1418,36 @@ impl std::fmt::Display for PromptCacheArchitectureFingerprint {
 
 /// Hashes exact prefix token IDs as little-endian `u32` values.
 pub fn prompt_cache_token_fingerprint(tokens: &[u32]) -> String {
+    let mut encoded = String::with_capacity(64);
+    assert!(prompt_cache_token_fingerprint_into(tokens, &mut encoded));
+    encoded
+}
+
+/// Named hashing/hexadecimal controls for the fixed 64-byte token fingerprint.
+/// The caller separately funds the destination before invoking the writer.
+pub const fn prompt_cache_token_fingerprint_control_bytes() -> usize {
+    std::mem::size_of::<Sha256>()
+        + std::mem::size_of::<[u8; 32]>()
+        + std::mem::size_of::<[u8; 4]>()
+        + std::mem::size_of::<std::slice::Iter<'static, u32>>()
+        + std::mem::size_of::<std::slice::Iter<'static, u8>>()
+        + std::mem::size_of::<(&[u32], &mut String)>()
+        + std::mem::size_of::<(u8, usize, char, bool)>()
+}
+
+/// Appends the ordinary token fingerprint into an already prepared destination.
+/// Returns false before hashing or mutation unless 64 spare bytes are present.
+/// This worker never grows the destination or acquires source authority.
+pub fn prompt_cache_token_fingerprint_into(tokens: &[u32], encoded: &mut String) -> bool {
+    if encoded.capacity().saturating_sub(encoded.len()) < 64 {
+        return false;
+    }
     let mut hasher = Sha256::new();
     for token in tokens {
         hasher.update(token.to_le_bytes());
     }
-    hex(hasher.finalize())
+    append_hex(hasher.finalize(), encoded);
+    true
 }
 
 fn hash_component(hasher: &mut Sha256, value: &[u8]) {
@@ -1431,13 +1456,17 @@ fn hash_component(hasher: &mut Sha256, value: &[u8]) {
 }
 
 fn hex(digest: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
+    append_hex(digest, &mut encoded);
+    encoded
+}
+
+fn append_hex(digest: impl AsRef<[u8]>, encoded: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in digest.as_ref() {
         encoded.push(HEX[usize::from(byte >> 4)] as char);
         encoded.push(HEX[usize::from(byte & 0x0f)] as char);
     }
-    encoded
 }
 
 /// Invalid reusable prompt-cache identity, schema, or catalog.

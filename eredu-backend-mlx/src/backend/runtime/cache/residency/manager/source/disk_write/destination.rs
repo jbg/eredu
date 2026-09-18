@@ -23,7 +23,7 @@ pub(crate) struct PreparedDiskWriteDestination {
     id: CacheBlockId,
     generation: u64,
     context: WorkspaceContext,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl CacheBlockSourceLoan<'_> {
     /// Uses the exact selected retained/future page declaration. Header layout,
@@ -384,3 +384,5 @@ fn control_bytes() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

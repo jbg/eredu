@@ -48,7 +48,7 @@ fn prefill_original_exact_and_short_admission_preserve_single_hold_and_residual_
         matches!(sealed_plan(&pool,&quote,exact-1),Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==available_bytes+1)
     );
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (_, reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
         .into_funded_text_span_workspace(&run, &reservation)

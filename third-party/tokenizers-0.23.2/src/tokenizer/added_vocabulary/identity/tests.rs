@@ -226,10 +226,7 @@ fn actual_normalizer_and_word_strip_profiles_stay_rejected_and_callback_errors_p
             .is_none()
     );
     actual.with_normalizer(Some(n)).unwrap();
-    assert!(matches!(
-        EncodeIdsPlan::prepare(&actual, "Mathias", false),
-        Err(crate::EncodeIdsError::PipelineProfile)
-    ));
+    assert_eq!(EncodeIdsPlan::prepare(&actual, "Mathias", false).unwrap().encode().unwrap().ids(), actual.encode("Mathias", false).unwrap().get_ids());
     for flag in ["single_word", "lstrip", "rstrip"] {
         let mut value = source();
         value["added_tokens"][3][flag] = json!(true);

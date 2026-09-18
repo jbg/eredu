@@ -90,20 +90,16 @@ pub(super) fn begin_original_with_model<T: PredictionRetention>(
             drop(custody);
             Error::PredictionScope(cause)
         })?;
-        let active = pending.try_begin().map_err(|error| {
+        let mut active = pending.try_begin().map_err(|error| {
             let PreparedRecoveryError { cause, pending } = error;
             drop(pending);
             Error::PredictionScope(cause)
         })?;
         if let Some((registration, request)) = operations {
-            registration.register(
+            let node = active.node.as_mut().expect("accepted host prediction node").node_mut();
+            node.registration = registration.register_for_retirement(
                 &request,
-                active
-                    .node
-                    .as_ref()
-                    .expect("accepted host prediction node")
-                    .node()
-                    .probe
+                node.probe
                     .as_ref()
                     .expect("accepted host prediction scope"),
             )?;
@@ -169,12 +165,12 @@ pub(super) fn begin_original_with_model<T: PredictionRetention>(
             return Err(Error::PredictionScope(cause).into());
         }
     };
-    let scope = active
+    let node = active
         .node
         .as_mut()
         .expect("accepted prediction node")
-        .node_mut()
-        .probe
+        .node_mut();
+    let scope = node.probe
         .as_mut()
         .expect("accepted prediction scope");
     scope
@@ -200,7 +196,7 @@ pub(super) fn begin_original_with_model<T: PredictionRetention>(
     // Registration sees only this already configured original Scope. Failure
     // leaves the same active empty node on its existing safe Drop path.
     if let Some((registration, request)) = &operations {
-        registration.register(request, scope)?;
+        node.registration = registration.register_for_retirement(request, scope)?;
     }
     if let Some(model) = &model {
         model.begin_host(scope)?;
@@ -235,6 +231,8 @@ pub(super) fn control_bytes() -> Option<u64> {
         size_of::<Result<(), ScopedSubmissionProgress>>(),
         size_of::<Result<(), OriginalNativeControlError>>(),
         size_of::<super::OperationRegistration>(),
+        size_of::<Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>>(),
+        size_of::<Result<Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>, Error>>(),
     ]
     .into_iter()
     .try_fold(0usize, usize::checked_add)?;

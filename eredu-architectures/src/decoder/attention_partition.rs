@@ -121,7 +121,7 @@ impl AttentionPartition {
             false,
         )
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        eredu_runtime::partition_chunk_range(self.heads, self.heads_per_chunk, logical)
+        eredu_runtime::partition_chunk_range(self.heads, self.heads_per_chunk, logical).map_err(Into::into)
     }
 
     /// Applies the same head ownership to projections, per-head parameters and

@@ -1,14 +1,27 @@
 //! Fresh HF and compiled-decode aggregate, without an account or raw HF escape.
 mod encode;
+mod prefix;
 pub use encode::{
     EncodeIdsError, EncodeIdsFailure, EncodeIdsPlan, EncodedTokenIds, NormalizationBuffer,
+};
+pub use prefix::{InputPrefixFailure, InputPrefixPlan};
+
+/// Complete retained-configuration serialization through the canonical HF workers.
+pub use tokenizers::source_serialization::{
+    Error as TokenizerSerializationError, Failure as TokenizerSerializationFailure,
+    serialize as serialize_configuration,
 };
 
 use crate::decoder_storage::{
     DecodeCompileFailure, DecodeCompilePlan, DecodeCompileRequirements, DecodeSourceError,
     PreparedDecodeSource, compiler,
 };
-use std::{fmt, mem::size_of};
+use std::{
+    alloc::Layout,
+    fmt,
+    mem::size_of,
+    sync::{Arc, atomic::AtomicUsize},
+};
 use tokenizers::{TokenizerCompileError, TokenizerCompileFailure, TokenizerCompilePlan};
 
 /// Fixed root/profile error returned before any destination reserve.
@@ -90,6 +103,8 @@ impl<'a> TokenizerPlan<'a> {
             tokenizers::Tokenizer::configuration_comparison_control_bytes()
                 .ok_or_else(TokenizerSourceError::overflow)?,
             decoder.control_bytes(),
+            size_of::<Root>(),
+            size_of::<Arc<Root>>(),
             size_of::<Self>(),
             size_of::<(Self, bool)>(),
             size_of::<Result<Self, TokenizerSourceError>>(),
@@ -110,6 +125,7 @@ impl<'a> TokenizerPlan<'a> {
         let buffers = facts
             .buffer_bytes()
             .checked_add(decoder.buffer_bytes())
+            .and_then(|n| n.checked_add(root_shell_bytes()?))
             .ok_or_else(TokenizerSourceError::overflow)?;
         let total = buffers
             .checked_add(controls)
@@ -180,6 +196,17 @@ impl<'a> TokenizerPlan<'a> {
         self.root = self.root.fail_regex_construction(target);
         self
     }
+    #[cfg(feature = "tokenizer-compiler-test-support")]
+    #[doc(hidden)]
+    /// Development-only failure in an actual ordered source regex constructor.
+    pub fn fail_regex_construction_at(
+        mut self,
+        ordinal: usize,
+        target: RegexConstructionFailure,
+    ) -> Self {
+        self.root = self.root.fail_regex_construction_at(ordinal, target);
+        self
+    }
     /// Constructs fresh HF and its decoder program, preserving all partial failures.
     pub fn compile(self) -> Result<PreparedTokenizer, TokenizerConstructionFailure> {
         let tokenizer = self
@@ -206,7 +233,14 @@ impl<'a> TokenizerPlan<'a> {
             plan.compile().map_err(Cause::Decode)
         })();
         match result {
-            Ok(decoder) => Ok(PreparedTokenizer { tokenizer, decoder }),
+            Ok(decoder) => Ok(PreparedTokenizer {
+                root: Some(Arc::new(Root {
+                    tokenizer,
+                    decoder,
+                    envelope: self.decoder,
+                })),
+                projection: None,
+            }),
             Err(cause) => Err(TokenizerConstructionFailure {
                 cause,
                 tokenizer: Some(tokenizer),
@@ -218,6 +252,13 @@ impl<'a> TokenizerPlan<'a> {
     /// Development-only capacity overflow on the actual selected reserve.
     pub fn fail_pipeline_reservation(mut self, stage: usize) -> Self {
         self.root = self.root.fail_reservation(stage);
+        self
+    }
+    /// Development-only refusal at the normalizer's actual source destination.
+    #[cfg(feature = "tokenizer-compiler-test-support")]
+    #[doc(hidden)]
+    pub fn fail_normalizer_reservation(mut self, stage: usize) -> Self {
+        self.root = self.root.fail_normalizer_reservation(stage);
         self
     }
     #[cfg(feature = "tokenizer-compiler-test-support")]
@@ -240,10 +281,51 @@ impl<'a> TokenizerPlan<'a> {
 /// fn copy(value:PreparedTokenizer){let _=value.clone();}
 /// ```
 pub struct PreparedTokenizer {
+    projection: Option<Box<prefix::Projection>>,
+    root: Option<Arc<Root>>,
+}
+#[derive(Debug)]
+struct Root {
     tokenizer: tokenizers::Tokenizer,
     decoder: PreparedDecodeSource,
+    envelope: DecodeCompileRequirements,
+}
+fn root_shell_bytes() -> Option<usize> {
+    Some(
+        Layout::array::<AtomicUsize>(2)
+            .ok()?
+            .extend(Layout::new::<Root>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size(),
+    )
+}
+impl Drop for PreparedTokenizer {
+    fn drop(&mut self) {
+        drop(self.projection.take());
+        if let Some(root) = self.root.take() {
+            drop(Arc::into_inner(root));
+        }
+    }
 }
 impl PreparedTokenizer {
+    fn root(&self) -> &Root {
+        self.root.as_deref().expect("live tokenizer root")
+    }
+    fn input_view(&self) -> tokenizers::tokenizer::TokenizerInput<'_> {
+        let root = self.root();
+        if let Some(projection) = &self.projection {
+            root.tokenizer.input_prefix_view(
+                projection
+                    .added
+                    .as_ref()
+                    .unwrap_or_else(|| root.tokenizer.get_added_vocabulary()),
+            )
+        } else {
+            (&root.tokenizer).into()
+        }
+    }
     /// Plans the exact lexical token bytes used by semantic token constraints.
     /// This borrows the source, creates no trie, and grants no allocation credit.
     pub fn token_byte_vocabulary(
@@ -252,7 +334,7 @@ impl PreparedTokenizer {
     {
         crate::token_bytes::PackedTokenBytePlan::prepare(
             self,
-            crate::token_bytes::TokenByteEncoding::inspect(self.tokenizer.get_decoder())?,
+            crate::token_bytes::TokenByteEncoding::inspect(self.root().tokenizer.get_decoder())?,
         )
     }
     /// Plans actual trie-input bytes, preserving special-token markers and
@@ -263,44 +345,100 @@ impl PreparedTokenizer {
     {
         crate::token_bytes::PackedTokenBytePlan::prepare_trie(
             self,
-            crate::token_bytes::TokenByteEncoding::inspect(self.tokenizer.get_decoder())?,
+            crate::token_bytes::TokenByteEncoding::inspect(self.root().tokenizer.get_decoder())?,
         )
     }
     /// Authenticates the actual compiled configuration against an immutable loaded
     /// tokenizer by borrow. This creates no tokenizer, map, string or cache.
     pub fn matches_configuration(&self, selected: &crate::tokenizer::Tokenizer) -> bool {
-        self.tokenizer.matches_compiled_configuration(selected)
+        self.input_view().matches_compiled_configuration(selected)
+    }
+
+    /// Checks a closed projection's exact retained root, or full configuration
+    /// equality for independently compiled sources where removal is the identity.
+    /// No source identity or account authority is created by this comparison.
+    pub fn is_input_prefix_derivative_of(&self, original: &Self) -> bool {
+        if self.projection.is_some()
+            && Arc::ptr_eq(
+                self.root.as_ref().expect("live source"),
+                original.root.as_ref().expect("live original"),
+            )
+        {
+            return true;
+        }
+        self.input_prefix_removal_is_identity()
+            && original.input_prefix_removal_is_identity()
+            && self
+                .input_view()
+                .matches_compiled_configuration(&original.root().tokenizer)
+    }
+
+    /// Checks the concrete component profile on which input-prefix removal is
+    /// the identity. New component support must extend this explicit check.
+    pub fn input_prefix_removal_is_identity(&self) -> bool {
+        if self.projection.is_some() {
+            return true;
+        }
+        use tokenizers::{NormalizerWrapper as N, PreTokenizerWrapper as P};
+        fn leaf(value: &P) -> bool {
+            matches!(
+                value,
+                P::ByteLevel(_) | P::Digits(_) | P::Split(_) | P::Whitespace(_)
+            ) || matches!(value, P::Metaspace(meta) if meta.get_prepend_scheme() == tokenizers::pre_tokenizers::metaspace::PrependScheme::Never)
+        }
+        matches!(
+            self.root().tokenizer.get_normalizer(),
+            None | Some(N::NFC(_)) | Some(N::Replace(_))
+        ) && match self.root().tokenizer.get_pre_tokenizer() {
+            None => true,
+            Some(P::Sequence(value)) => value.as_ref().iter().all(leaf),
+            Some(value) => leaf(value),
+        }
+    }
+
+    /// The actual model produces deterministic canonical BPE tokenizations;
+    /// stochastic dropout and other future model mechanisms do not gain this fact.
+    pub fn tokenization_is_canonical(&self) -> bool {
+        match self.root().tokenizer.get_model() {
+            tokenizers::ModelWrapper::BPE(model) => model.dropout.is_none(),
+            tokenizers::ModelWrapper::WordLevel(_) => true,
+            tokenizers::ModelWrapper::Unigram(model) => {
+                model.alpha.is_none() || model.alpha == Some(0.0)
+            }
+            _ => false,
+        }
     }
 
     /// Looks up an exact spelling without allocating.
     pub fn token_id(&self, token: &str) -> Option<u32> {
-        self.tokenizer.token_to_id(token)
+        self.input_view().token_to_id(token)
     }
     /// Exact added-token membership without allocating or inferring special status.
     pub fn added_token_id(&self, token: &str) -> Option<u32> {
-        self.tokenizer
-            .get_added_vocabulary()
+        self.input_view()
+            .added_vocabulary()
             .get_vocab()
             .get(token)
             .copied()
     }
     /// Borrows the canonical added-first decoding spelling.
     pub fn spelling(&self, id: u32) -> Option<&str> {
-        self.tokenizer.decode_vocabulary().id_to_token(id)
+        self.input_view().decode_vocabulary().id_to_token(id)
     }
     /// Borrows model-plus-added ID visits, retaining duplicate visits.
     pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.tokenizer.decode_vocabulary().ids()
+        self.input_view().decode_vocabulary().ids()
     }
     /// Tests actual special membership by spelling.
     pub fn is_special(&self, token: &str) -> bool {
-        self.tokenizer
-            .get_added_vocabulary()
-            .is_special_token(token)
+        self.input_view().added_vocabulary().is_special_token(token)
     }
     /// Borrows the fresh immutable program for the existing fixed decoder.
     pub fn decode_source(&self) -> &PreparedDecodeSource {
-        &self.decoder
+        self.projection
+            .as_ref()
+            .and_then(|p| p.decoder.as_ref())
+            .unwrap_or(&self.root().decoder)
     }
 }
 impl fmt::Debug for PreparedTokenizer {
@@ -374,6 +512,5 @@ pub use tokenizers::{
     TokenizerRegexBuffer as RegexBuffer,
     TokenizerRegexConstructionFailure as RegexConstructionFailure,
     TokenizerRegexDelegateBuffer as RegexDelegateBuffer,
-    TokenizerRegexScratchBuffer as RegexScratchBuffer,
     TokenizerRegexWorkspaceFailure as RegexWorkspaceFailure,
 };

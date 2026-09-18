@@ -260,8 +260,10 @@ fn control_bytes<T:PartitionCaptureTransport>()->Option<usize>{
         size_of::<crate::capture::CapturePrefillObservationPolicy<'_>>(),size_of::<crate::capture::CapturePrefillObservationRow<'_>>(),
         size_of::<eredu_core::capture::CapturePrefillTransformFragment<'_,'_>>(),size_of::<Option<&eredu_core::capture::CapturePrefillTransformPlan<'_>>>(),
         size_of::<Option<TensorDtype>>(),size_of::<CaptureUsage>(),size_of::<PartitionCaptureProgramError>(),
-        size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>(),size_of::<(&SharedCapturePlan,&WorkspaceMetadataFunding)>(),
+        size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>(),size_of::<(&SharedCapturePlan,&HostMetadataFunding)>(),
         size_of::<eredu_core::capture::CapturePrefillFragment<'_,'_>>(),
         size_of::<crate::capture::CapturePrefillProgressError>()];
     parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

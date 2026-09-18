@@ -63,6 +63,11 @@ impl HostCopyWorkspace {
             size_of::<HostCopyWorkspace>(),
             size_of::<HostCopyWorkspaceData>(),
             size_of::<HostCopyWorkspaceError>(),
+            safemlx::StreamCopyPlan::<()>::capture_control_bytes()
+                .map_err(HostCopyWorkspaceError::StreamCopy)?,
+            size_of::<safemlx::StreamCopyPlan<()>>(),
+            size_of::<Result<safemlx::StreamCopyPlan<()>, safemlx::StreamCopyCause>>(),
+            size_of::<(safemlx::DeviceType, &[i32], std::slice::Iter<'_, i32>, Option<i32>, bool)>(),
             size_of::<Result<HostCopyWorkspace, HostCopyWorkspaceError>>(),
             size_of::<HostCopyUnit>(),
             size_of::<HostCopyBinding>(),

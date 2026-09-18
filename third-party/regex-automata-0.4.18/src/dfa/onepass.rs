@@ -41,10 +41,14 @@ configuring a one-pass DFA.
 
 use alloc::{vec, vec::Vec};
 
+#[cfg(all(test, feature = "syntax"))]
+mod allocation_tests;
+
 use crate::{
     dfa::{remapper::Remapper, DEAD},
     nfa::thompson::{self, NFA},
     util::{
+        allocation::{Allocation, AllocationError, Allocator, Unenforced},
         alphabet::ByteClasses,
         captures::Captures,
         escape::DebugByte,
@@ -270,9 +274,7 @@ impl Config {
     pub(crate) fn overwrite(&self, o: Config) -> Config {
         Config {
             match_kind: o.match_kind.or(self.match_kind),
-            starts_for_each_pattern: o
-                .starts_for_each_pattern
-                .or(self.starts_for_each_pattern),
+            starts_for_each_pattern: o.starts_for_each_pattern.or(self.starts_for_each_pattern),
             byte_classes: o.byte_classes.or(self.byte_classes),
             size_limit: o.size_limit.or(self.size_limit),
         }
@@ -362,12 +364,11 @@ impl Builder {
     /// When matches are returned, the pattern ID corresponds to the index of
     /// the pattern in the slice given.
     #[cfg(feature = "syntax")]
-    pub fn build_many<P: AsRef<str>>(
-        &self,
-        patterns: &[P],
-    ) -> Result<DFA, BuildError> {
-        let nfa =
-            self.thompson.build_many(patterns).map_err(BuildError::nfa)?;
+    pub fn build_many<P: AsRef<str>>(&self, patterns: &[P]) -> Result<DFA, BuildError> {
+        let nfa = self
+            .thompson
+            .build_many(patterns)
+            .map_err(BuildError::nfa)?;
         self.build_from_nfa(nfa)
     }
 
@@ -393,6 +394,15 @@ impl Builder {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn build_from_nfa(&self, nfa: NFA) -> Result<DFA, BuildError> {
+        self.build_from_nfa_with_allocations(nfa, &Unenforced)
+    }
+
+    /// Construct the same one-pass DFA after admitting each reached destination.
+    pub fn build_from_nfa_with_allocations(
+        &self,
+        nfa: NFA,
+        funding: &dyn Allocation,
+    ) -> Result<DFA, BuildError> {
         // Why take ownership if we're just going to pass a reference to the
         // NFA to our internal builder? Well, the first thing to note is that
         // an NFA uses reference counting internally, so either choice is going
@@ -410,7 +420,7 @@ impl Builder {
         // things inside the NFA while borrowing the builder as mutable because
         // we know the NFA cannot be mutated. So TL;DR --- this weirdness is
         // "because borrow checker."
-        InternalBuilder::new(self.config.clone(), &nfa).build()
+        InternalBuilder::new(self.config.clone(), &nfa, Allocator::new(funding))?.build()
     }
 
     /// Apply the given one-pass DFA configuration options to this builder.
@@ -428,10 +438,7 @@ impl Builder {
     /// These settings only apply when constructing a one-pass DFA directly
     /// from a pattern.
     #[cfg(feature = "syntax")]
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Builder {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Builder {
         self.thompson.syntax(config);
         self
     }
@@ -472,7 +479,8 @@ impl Builder {
 /// of the DFA, even though we aren't mutating those parts. We only do this
 /// because the duplication is cheap.
 #[derive(Debug)]
-struct InternalBuilder<'a> {
+struct InternalBuilder<'a, 'p> {
+    allocation: Allocator<'p>,
     /// The DFA we're building.
     dfa: DFA,
     /// An unordered collection of NFA state IDs that we haven't yet tried to
@@ -519,9 +527,13 @@ struct InternalBuilder<'a> {
     classes: ByteClasses,
 }
 
-impl<'a> InternalBuilder<'a> {
+impl<'a, 'p> InternalBuilder<'a, 'p> {
     /// Create a new builder with an initial empty DFA.
-    fn new(config: Config, nfa: &'a NFA) -> InternalBuilder<'a> {
+    fn new(
+        config: Config,
+        nfa: &'a NFA,
+        allocation: Allocator<'p>,
+    ) -> Result<InternalBuilder<'a, 'p>, BuildError> {
         let classes = if !config.get_byte_classes() {
             // A one-pass DFA will always use the equivalence class map, but
             // enabling this option is useful for debugging. Namely, this will
@@ -560,17 +572,20 @@ impl<'a> InternalBuilder<'a> {
             // OK because PatternID::MAX*2 is guaranteed not to overflow.
             explicit_slot_start: nfa.pattern_len().checked_mul(2).unwrap(),
         };
-        InternalBuilder {
+        let mut nfa_to_dfa_id = Vec::new();
+        allocation.resize_copy(&mut nfa_to_dfa_id, nfa.states().len(), DEAD)?;
+        Ok(InternalBuilder {
+            allocation,
             dfa,
             uncompiled_nfa_ids: vec![],
-            nfa_to_dfa_id: vec![DEAD; nfa.states().len()],
+            nfa_to_dfa_id,
             stack: vec![],
-            seen: SparseSet::new(nfa.states().len()),
+            seen: SparseSet::new_with_allocations(nfa.states().len(), allocation.policy())?,
             matched: false,
             config,
             nfa,
             classes,
-        }
+        })
     }
 
     /// Build the DFA from the NFA given to this builder. If the NFA is not
@@ -579,7 +594,10 @@ impl<'a> InternalBuilder<'a> {
     /// used, are configurable. Others, like the total patterns or slots, are
     /// hard-coded based on representational limitations.)
     fn build(mut self) -> Result<DFA, BuildError> {
-        self.nfa.look_set_any().available().map_err(BuildError::word)?;
+        self.nfa
+            .look_set_any()
+            .available()
+            .map_err(BuildError::word)?;
         for look in self.nfa.look_set_any().iter() {
             // This is a future incompatibility check where if we add any
             // more look-around assertions, then the one-pass DFA either
@@ -590,8 +608,7 @@ impl<'a> InternalBuilder<'a> {
                 return Err(BuildError::unsupported_look(look));
             }
         }
-        if self.nfa.pattern_len().as_u64() > PatternEpsilons::PATTERN_ID_LIMIT
-        {
+        if self.nfa.pattern_len().as_u64() > PatternEpsilons::PATTERN_ID_LIMIT {
             return Err(BuildError::too_many_patterns(
                 PatternEpsilons::PATTERN_ID_LIMIT,
             ));
@@ -610,10 +627,7 @@ impl<'a> InternalBuilder<'a> {
         self.add_start_state(None, self.nfa.start_anchored())?;
         if self.config.get_starts_for_each_pattern() {
             for pid in self.nfa.patterns() {
-                self.add_start_state(
-                    Some(pid),
-                    self.nfa.start_pattern(pid).unwrap(),
-                )?;
+                self.add_start_state(Some(pid), self.nfa.start_pattern(pid).unwrap())?;
             }
         }
         // NOTE: One wonders what the effects of treating 'uncompiled_nfa_ids'
@@ -721,9 +735,9 @@ impl<'a> InternalBuilder<'a> {
                 }
             }
         }
-        self.shuffle_states();
-        self.dfa.starts.shrink_to_fit();
-        self.dfa.table.shrink_to_fit();
+        self.shuffle_states()?;
+        self.allocation.shrink(&mut self.dfa.starts)?;
+        self.allocation.shrink(&mut self.dfa.table)?;
         Ok(self.dfa)
     }
 
@@ -736,23 +750,24 @@ impl<'a> InternalBuilder<'a> {
     /// permits us to check it by simply comparing two state identifiers, as
     /// opposed to looking for the pattern ID in the state's `PatternEpsilons`.
     /// (Which requires a memory load and some light arithmetic.)
-    fn shuffle_states(&mut self) {
-        let mut remapper = Remapper::new(&self.dfa);
+    fn shuffle_states(&mut self) -> Result<(), BuildError> {
+        let mut remapper = Remapper::new_with_allocations(&self.dfa, self.allocation.policy())?;
         let mut next_dest = self.dfa.last_state_id();
         for i in (0..self.dfa.state_len()).rev() {
             let id = StateID::must(i);
-            let is_match =
-                self.dfa.pattern_epsilons(id).pattern_id().is_some();
+            let is_match = self.dfa.pattern_epsilons(id).pattern_id().is_some();
             if !is_match {
                 continue;
             }
             remapper.swap(&mut self.dfa, next_dest, id);
             self.dfa.min_match_id = next_dest;
-            next_dest = self.dfa.prev_state_id(next_dest).expect(
-                "match states should be a proper subset of all states",
-            );
+            next_dest = self
+                .dfa
+                .prev_state_id(next_dest)
+                .expect("match states should be a proper subset of all states");
         }
-        remapper.remap(&mut self.dfa);
+        remapper.remap_with_allocations(&mut self.dfa, self.allocation.policy())?;
+        Ok(())
     }
 
     /// Compile the given NFA transition into the DFA state given.
@@ -779,8 +794,7 @@ impl<'a> InternalBuilder<'a> {
             .filter_map(|r| r.as_u8())
         {
             let oldtrans = self.dfa.transition(dfa_id, byte);
-            let newtrans =
-                Transition::new(self.matched, next_dfa_id, epsilons);
+            let newtrans = Transition::new(self.matched, next_dfa_id, epsilons);
             // If the old transition points to the DEAD state, then we know
             // 'byte' has not been mapped to any transition for this DFA state
             // yet. So set it unconditionally. Otherwise, we require that the
@@ -789,9 +803,7 @@ impl<'a> InternalBuilder<'a> {
             if oldtrans.state_id() == DEAD {
                 self.dfa.set_transition(dfa_id, byte, newtrans);
             } else if oldtrans != newtrans {
-                return Err(BuildError::not_one_pass(
-                    "conflicting transition",
-                ));
+                return Err(BuildError::not_one_pass("conflicting transition"));
             }
         }
         Ok(())
@@ -821,7 +833,7 @@ impl<'a> InternalBuilder<'a> {
             Some(pid) => assert!(self.dfa.starts.len() == pid.one_more()),
         }
         let dfa_id = self.add_dfa_state_for_nfa_state(nfa_id)?;
-        self.dfa.starts.push(dfa_id);
+        self.allocation.push(&mut self.dfa.starts, dfa_id)?;
         Ok(dfa_id)
     }
 
@@ -835,10 +847,7 @@ impl<'a> InternalBuilder<'a> {
     /// for a sub-graph of the NFA, where all states in the sub-graph are
     /// reachable via epsilon transitions (conditional or unconditional). That
     /// sub-graph of NFA states is ultimately what produces a single DFA state.
-    fn add_dfa_state_for_nfa_state(
-        &mut self,
-        nfa_id: StateID,
-    ) -> Result<StateID, BuildError> {
+    fn add_dfa_state_for_nfa_state(&mut self, nfa_id: StateID) -> Result<StateID, BuildError> {
         // If we've already built a DFA state for the given NFA state, then
         // just return that. We definitely do not want to have more than one
         // DFA state in existence for the same NFA state, since all but one of
@@ -852,7 +861,7 @@ impl<'a> InternalBuilder<'a> {
         // NFA state to the list of states to explore.
         let dfa_id = self.add_empty_state()?;
         self.nfa_to_dfa_id[nfa_id] = dfa_id;
-        self.uncompiled_nfa_ids.push(nfa_id);
+        self.allocation.push(&mut self.uncompiled_nfa_ids, nfa_id)?;
         Ok(dfa_id)
     }
 
@@ -872,14 +881,15 @@ impl<'a> InternalBuilder<'a> {
         // normal DFA anyway, so an extra multiplication to compute a state
         // transition doesn't seem like a huge deal.
         let next_id = self.dfa.table.len() >> self.dfa.stride2();
-        let id = StateID::new(next_id)
-            .map_err(|_| BuildError::too_many_states(state_limit))?;
+        let id = StateID::new(next_id).map_err(|_| BuildError::too_many_states(state_limit))?;
         if id.as_u64() > Transition::STATE_ID_LIMIT {
             return Err(BuildError::too_many_states(state_limit));
         }
+        let stride = self.dfa.stride();
+        self.allocation.grow(&mut self.dfa.table, stride)?;
         self.dfa
             .table
-            .extend(core::iter::repeat(Transition(0)).take(self.dfa.stride()));
+            .extend(core::iter::repeat(Transition(0)).take(stride));
         // The default empty value for 'PatternEpsilons' is sadly not all
         // zeroes. Instead, a special sentinel is used to indicate that there
         // is no pattern. So we need to explicitly set the pattern epsilons to
@@ -900,11 +910,7 @@ impl<'a> InternalBuilder<'a> {
     /// If the given NFA state ID has already been pushed on to the stack, then
     /// it indicates the regex is not one-pass and this correspondingly returns
     /// an error.
-    fn stack_push(
-        &mut self,
-        nfa_id: StateID,
-        epsilons: Epsilons,
-    ) -> Result<(), BuildError> {
+    fn stack_push(&mut self, nfa_id: StateID, epsilons: Epsilons) -> Result<(), BuildError> {
         // If we already have seen a match and we are compiling a leftmost
         // first DFA, then we shouldn't add any more states to look at. This is
         // effectively how preference order and non-greediness is implemented.
@@ -918,7 +924,7 @@ impl<'a> InternalBuilder<'a> {
                 "multiple epsilon transitions to same state",
             ));
         }
-        self.stack.push((nfa_id, epsilons));
+        self.allocation.push(&mut self.stack, (nfa_id, epsilons))?;
         Ok(())
     }
 }
@@ -1536,8 +1542,7 @@ impl DFA {
     pub fn memory_usage(&self) -> usize {
         use core::mem::size_of;
 
-        self.table.len() * size_of::<Transition>()
-            + self.starts.len() * size_of::<StateID>()
+        self.table.len() * size_of::<Transition>() + self.starts.len() * size_of::<StateID>()
     }
 }
 
@@ -1620,16 +1625,14 @@ impl DFA {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn is_match<'h, I: Into<Input<'h>>>(
-        &self,
-        cache: &mut Cache,
-        input: I,
-    ) -> bool {
+    pub fn is_match<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> bool {
         let mut input = input.into().earliest(true);
         if matches!(input.get_anchored(), Anchored::No) {
             input.set_anchored(Anchored::Yes);
         }
-        self.try_search_slots(cache, &input, &mut []).unwrap().is_some()
+        self.try_search_slots(cache, &input, &mut [])
+            .unwrap()
+            .is_some()
     }
 
     /// Executes an anchored leftmost forward search, and returns a `Match` if
@@ -1691,19 +1694,14 @@ impl DFA {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn find<'h, I: Into<Input<'h>>>(
-        &self,
-        cache: &mut Cache,
-        input: I,
-    ) -> Option<Match> {
+    pub fn find<'h, I: Into<Input<'h>>>(&self, cache: &mut Cache, input: I) -> Option<Match> {
         let mut input = input.into();
         if matches!(input.get_anchored(), Anchored::No) {
             input.set_anchored(Anchored::Yes);
         }
         if self.get_nfa().pattern_len() == 1 {
             let mut slots = [None, None];
-            let pid =
-                self.try_search_slots(cache, &input, &mut slots).unwrap()?;
+            let pid = self.try_search_slots(cache, &input, &mut slots).unwrap()?;
             let start = slots[0].unwrap().get();
             let end = slots[1].unwrap().get();
             return Some(Match::new(pid, Span { start, end }));
@@ -1975,7 +1973,15 @@ impl DFA {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Result<Option<PatternID>, MatchError> {
+    ) -> Result<Option<PatternID>, MatchError> { self.try_search_slots_with_allocations(cache, input, slots, &Unenforced) }
+
+    /// Search with the original one-pass worker and funded auxiliary slots.
+    pub fn try_search_slots_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        slots: &mut [Option<NonMaxUsize>],
+     funding: &dyn Allocation) -> Result<Option<PatternID>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
         if !utf8empty {
             return self.try_search_slots_imp(cache, input, slots);
@@ -1993,7 +1999,8 @@ impl DFA {
             slots.copy_from_slice(&enough[..slots.len()]);
             return Ok(got);
         }
-        let mut enough = vec![None; min];
+        let mut enough = Vec::new();
+        Allocator::new(funding).resize_copy(&mut enough, min, None)?;
         let got = self.try_search_slots_imp(cache, input, &mut enough)?;
         // This is OK because we know `enough_slots` is strictly bigger than
         // `slots`, otherwise this special case isn't reached.
@@ -2134,15 +2141,12 @@ impl DFA {
                 // If the regex is itself always anchored, then we're fine,
                 // even if the search is configured to be unanchored.
                 if !self.nfa.is_always_start_anchored() {
-                    return Err(MatchError::unsupported_anchored(
-                        Anchored::No,
-                    ));
+                    return Err(MatchError::unsupported_anchored(Anchored::No));
                 }
                 self.start()
             }
         };
-        let leftmost_first =
-            matches!(self.config.get_match_kind(), MatchKind::LeftmostFirst);
+        let leftmost_first = matches!(self.config.get_match_kind(), MatchKind::LeftmostFirst);
         for at in input.start()..input.end() {
             let sid = next_sid;
             let trans = self.transition(sid, input.haystack()[at]);
@@ -2150,9 +2154,7 @@ impl DFA {
             let epsilons = trans.epsilons();
             if sid >= self.min_match_id {
                 if self.find_match(cache, input, at, sid, slots, &mut pid) {
-                    if input.get_earliest()
-                        || (leftmost_first && trans.match_wins())
-                    {
+                    if input.get_earliest() || (leftmost_first && trans.match_wins()) {
                         return Ok(pid);
                     }
                 }
@@ -2170,14 +2172,7 @@ impl DFA {
             epsilons.slots().apply(at, cache.explicit_slots());
         }
         if next_sid >= self.min_match_id {
-            self.find_match(
-                cache,
-                input,
-                input.end(),
-                next_sid,
-                slots,
-                &mut pid,
-            );
+            self.find_match(cache, input, input.end(), next_sid, slots, &mut pid);
         }
         Ok(pid)
     }
@@ -2204,11 +2199,10 @@ impl DFA {
         let pateps = self.pattern_epsilons(sid);
         let epsilons = pateps.epsilons();
         if !epsilons.looks().is_empty()
-            && !self.nfa.look_matcher().matches_set_inline(
-                epsilons.looks(),
-                input.haystack(),
-                at,
-            )
+            && !self
+                .nfa
+                .look_matcher()
+                .matches_set_inline(epsilons.looks(), input.haystack(), at)
         {
             return false;
         }
@@ -2234,9 +2228,10 @@ impl DFA {
             // are in the compiled regex. In which case, we limit the
             // length of `slots` to what we actually have.
             let cache_slots = cache.explicit_slots();
-            slots[self.explicit_slot_start..][..cache_slots.len()]
-                .copy_from_slice(cache_slots);
-            epsilons.slots().apply(at, &mut slots[self.explicit_slot_start..]);
+            slots[self.explicit_slot_start..][..cache_slots.len()].copy_from_slice(cache_slots);
+            epsilons
+                .slots()
+                .apply(at, &mut slots[self.explicit_slot_start..]);
         }
         *matched_pid = Some(pid);
         true
@@ -2255,9 +2250,7 @@ impl DFA {
     /// not in this DFA, then `Ok(None)` is returned.
     fn start_pattern(&self, pid: PatternID) -> Result<StateID, MatchError> {
         if !self.config.get_starts_for_each_pattern() {
-            return Err(MatchError::unsupported_anchored(Anchored::Pattern(
-                pid,
-            )));
+            return Err(MatchError::unsupported_anchored(Anchored::Pattern(pid)));
         }
         // 'starts' always has non-zero length. The first entry is always the
         // anchored starting state for all patterns, and the following entries
@@ -2327,7 +2320,9 @@ impl DFA {
         } else {
             // CORRECTNESS: Since 'id' is not the first state, subtracting 1
             // is always valid.
-            Some(StateID::new_unchecked(id.as_usize().checked_sub(1).unwrap()))
+            Some(StateID::new_unchecked(
+                id.as_usize().checked_sub(1).unwrap(),
+            ))
         }
     }
 
@@ -2339,9 +2334,7 @@ impl DFA {
         // least contains a DEAD state. Since every state has the same stride,
         // we can just compute what the "next" state ID would have been and
         // then subtract 1 from it.
-        StateID::new_unchecked(
-            (self.table.len() >> self.stride2()).checked_sub(1).unwrap(),
-        )
+        StateID::new_unchecked((self.table.len() >> self.stride2()).checked_sub(1).unwrap())
     }
 
     /// Move the transitions from 'id1' to 'id2' and vice versa.
@@ -2380,20 +2373,13 @@ impl core::fmt::Debug for DFA {
             dfa: &DFA,
             sid: StateID,
         ) -> core::fmt::Result {
-            for (i, (start, end, trans)) in
-                dfa.sparse_transitions(sid).enumerate()
-            {
+            for (i, (start, end, trans)) in dfa.sparse_transitions(sid).enumerate() {
                 let next = trans.state_id();
                 if i > 0 {
                     write!(f, ", ")?;
                 }
                 if start == end {
-                    write!(
-                        f,
-                        "{:?} => {:?}",
-                        DebugByte(start),
-                        next.as_usize(),
-                    )?;
+                    write!(f, "{:?} => {:?}", DebugByte(start), next.as_usize(),)?;
                 } else {
                     write!(
                         f,
@@ -2437,12 +2423,7 @@ impl core::fmt::Debug for DFA {
             if i == 0 {
                 writeln!(f, "START(ALL): {:?}", sid.as_usize())?;
             } else {
-                writeln!(
-                    f,
-                    "START(pattern: {:?}): {:?}",
-                    i - 1,
-                    sid.as_usize(),
-                )?;
+                writeln!(f, "START(pattern: {:?}): {:?}", i - 1, sid.as_usize(),)?;
             }
         }
         writeln!(f, "state length: {:?}", self.state_len())?;
@@ -2529,9 +2510,20 @@ impl Cache {
     /// If you want to reuse the returned `Cache` with some other one-pass DFA,
     /// then you must call [`Cache::reset`] with the desired one-pass DFA.
     pub fn new(re: &DFA) -> Cache {
-        let mut cache = Cache { explicit_slots: vec![], explicit_slot_len: 0 };
-        cache.reset(re);
-        cache
+        Self::new_with_allocations(re, &Unenforced).expect("ordinary one-pass cache allocation")
+    }
+
+    /// Construct caller-owned search slots through their original producer.
+    pub fn new_with_allocations(
+        re: &DFA,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, AllocationError> {
+        let mut cache = Cache {
+            explicit_slots: vec![],
+            explicit_slot_len: 0,
+        };
+        cache.reset_with_allocations(re, funding)?;
+        Ok(cache)
     }
 
     /// Reset this cache such that it can be used for searching with a
@@ -2575,9 +2567,20 @@ impl Cache {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn reset(&mut self, re: &DFA) {
+        self.reset_with_allocations(re, &Unenforced)
+            .expect("ordinary one-pass cache allocation")
+    }
+
+    /// Reset caller-owned slots after admitting any actual replacement.
+    pub fn reset_with_allocations(
+        &mut self,
+        re: &DFA,
+        funding: &dyn Allocation,
+    ) -> Result<(), AllocationError> {
         let explicit_slot_len = re.get_nfa().group_info().explicit_slot_len();
-        self.explicit_slots.resize(explicit_slot_len, None);
+        Allocator::new(funding).resize_copy(&mut self.explicit_slots, explicit_slot_len, None)?;
         self.explicit_slot_len = explicit_slot_len;
+        Ok(())
     }
 
     /// Returns the heap memory usage, in bytes, of this cache.
@@ -2616,8 +2619,11 @@ impl Transition {
 
     /// Return a new transition to the given state ID with the given epsilons.
     fn new(match_wins: bool, sid: StateID, epsilons: Epsilons) -> Transition {
-        let match_wins =
-            if match_wins { 1 << Transition::MATCH_WINS_SHIFT } else { 0 };
+        let match_wins = if match_wins {
+            1 << Transition::MATCH_WINS_SHIFT
+        } else {
+            0
+        };
         let sid = sid.as_u64() << Transition::STATE_ID_SHIFT;
         Transition(sid | match_wins | epsilons.0)
     }
@@ -2645,9 +2651,7 @@ impl Transition {
         // construction. The cast to usize is also correct, even on 16-bit
         // targets because, again, we know the upper bits is a valid StateID,
         // which can never overflow usize on any supported target.
-        StateID::new_unchecked(
-            (self.0 >> Transition::STATE_ID_SHIFT).as_usize(),
-        )
+        StateID::new_unchecked((self.0 >> Transition::STATE_ID_SHIFT).as_usize())
     }
 
     /// Set the "next" state ID in this transition.
@@ -2707,10 +2711,7 @@ impl PatternEpsilons {
     /// Return a new empty pattern epsilons that has no pattern ID and has no
     /// epsilons. This is suitable for non-match states.
     fn empty() -> PatternEpsilons {
-        PatternEpsilons(
-            PatternEpsilons::PATTERN_ID_NONE
-                << PatternEpsilons::PATTERN_ID_SHIFT,
-        )
+        PatternEpsilons(PatternEpsilons::PATTERN_ID_NONE << PatternEpsilons::PATTERN_ID_SHIFT)
     }
 
     /// Whether this pattern epsilons is empty or not. It's empty when it has
@@ -2825,23 +2826,19 @@ impl Epsilons {
 
     /// Set the slot epsilon transitions.
     fn set_slots(self, slots: Slots) -> Epsilons {
-        Epsilons(
-            (u64::from(slots.0) << Epsilons::SLOT_SHIFT)
-                | (self.0 & Epsilons::LOOK_MASK),
-        )
+        Epsilons((u64::from(slots.0) << Epsilons::SLOT_SHIFT) | (self.0 & Epsilons::LOOK_MASK))
     }
 
     /// Return the set of look-around assertions in these epsilon transitions.
     fn looks(self) -> LookSet {
-        LookSet { bits: (self.0 & Epsilons::LOOK_MASK).low_u32() }
+        LookSet {
+            bits: (self.0 & Epsilons::LOOK_MASK).low_u32(),
+        }
     }
 
     /// Set the look-around assertions on these epsilon transitions.
     fn set_looks(self, look_set: LookSet) -> Epsilons {
-        Epsilons(
-            (self.0 & Epsilons::SLOT_MASK)
-                | (u64::from(look_set.bits) & Epsilons::LOOK_MASK),
-        )
+        Epsilons((self.0 & Epsilons::SLOT_MASK) | (u64::from(look_set.bits) & Epsilons::LOOK_MASK))
     }
 }
 
@@ -2935,11 +2932,7 @@ impl Slots {
     /// The slice *must* correspond only to the explicit slots and the first
     /// element of the slice must always correspond to the first explicit slot
     /// in the corresponding NFA.
-    fn apply(
-        self,
-        at: usize,
-        caller_explicit_slots: &mut [Option<NonMaxUsize>],
-    ) {
+    fn apply(self, at: usize, caller_explicit_slots: &mut [Option<NonMaxUsize>]) {
         if self.is_empty() {
             return;
         }
@@ -3007,6 +3000,7 @@ pub struct BuildError {
 /// The kind of error that occurred during the construction of a one-pass DFA.
 #[derive(Clone, Debug)]
 enum BuildErrorKind {
+    Allocation(AllocationError),
     NFA(crate::nfa::thompson::BuildError),
     Word(UnicodeWordBoundaryError),
     TooManyStates { limit: u64 },
@@ -3016,33 +3010,64 @@ enum BuildErrorKind {
     NotOnePass { msg: &'static str },
 }
 
+impl From<AllocationError> for BuildError {
+    fn from(error: AllocationError) -> Self {
+        Self {
+            kind: BuildErrorKind::Allocation(error),
+        }
+    }
+}
+
 impl BuildError {
+    /// Return the fixed cause of a refused original construction producer.
+    pub fn allocation_error(&self) -> Option<AllocationError> {
+        match self.kind {
+            BuildErrorKind::Allocation(error) => Some(error),
+            BuildErrorKind::NFA(ref error) => error.allocation_error(),
+            _ => None,
+        }
+    }
+
     fn nfa(err: crate::nfa::thompson::BuildError) -> BuildError {
-        BuildError { kind: BuildErrorKind::NFA(err) }
+        BuildError {
+            kind: BuildErrorKind::NFA(err),
+        }
     }
 
     fn word(err: UnicodeWordBoundaryError) -> BuildError {
-        BuildError { kind: BuildErrorKind::Word(err) }
+        BuildError {
+            kind: BuildErrorKind::Word(err),
+        }
     }
 
     fn too_many_states(limit: u64) -> BuildError {
-        BuildError { kind: BuildErrorKind::TooManyStates { limit } }
+        BuildError {
+            kind: BuildErrorKind::TooManyStates { limit },
+        }
     }
 
     fn too_many_patterns(limit: u64) -> BuildError {
-        BuildError { kind: BuildErrorKind::TooManyPatterns { limit } }
+        BuildError {
+            kind: BuildErrorKind::TooManyPatterns { limit },
+        }
     }
 
     fn unsupported_look(look: Look) -> BuildError {
-        BuildError { kind: BuildErrorKind::UnsupportedLook { look } }
+        BuildError {
+            kind: BuildErrorKind::UnsupportedLook { look },
+        }
     }
 
     fn exceeded_size_limit(limit: usize) -> BuildError {
-        BuildError { kind: BuildErrorKind::ExceededSizeLimit { limit } }
+        BuildError {
+            kind: BuildErrorKind::ExceededSizeLimit { limit },
+        }
     }
 
     fn not_one_pass(msg: &'static str) -> BuildError {
-        BuildError { kind: BuildErrorKind::NotOnePass { msg } }
+        BuildError {
+            kind: BuildErrorKind::NotOnePass { msg },
+        }
     }
 }
 
@@ -3053,6 +3078,7 @@ impl std::error::Error for BuildError {
 
         match self.kind {
             NFA(ref err) => Some(err),
+            Allocation(ref err) => Some(err),
             Word(ref err) => Some(err),
             _ => None,
         }
@@ -3064,6 +3090,7 @@ impl core::fmt::Display for BuildError {
         use self::BuildErrorKind::*;
 
         match self.kind {
+            Allocation(error) => error.fmt(f),
             NFA(_) => write!(f, "error building NFA"),
             Word(_) => write!(f, "NFA contains Unicode word boundary"),
             TooManyStates { limit } => write!(
@@ -3076,10 +3103,9 @@ impl core::fmt::Display for BuildError {
                 "one-pass DFA exceeded a limit of {limit:?} \
                  for number of patterns",
             ),
-            UnsupportedLook { look } => write!(
-                f,
-                "one-pass DFA does not support the {look:?} assertion",
-            ),
+            UnsupportedLook { look } => {
+                write!(f, "one-pass DFA does not support the {look:?} assertion",)
+            }
             ExceededSizeLimit { limit } => write!(
                 f,
                 "one-pass DFA exceeded size limit of {limit:?} during building",
@@ -3110,9 +3136,7 @@ mod tests {
 
     #[test]
     fn fail_multiple_epsilon() {
-        let predicate = |err: &str| {
-            err.contains("multiple epsilon transitions to same state")
-        };
+        let predicate = |err: &str| err.contains("multiple epsilon transitions to same state");
 
         let err = DFA::new(r"(^|$)a").unwrap_err().to_string();
         assert!(predicate(&err), "{err}");
@@ -3120,9 +3144,7 @@ mod tests {
 
     #[test]
     fn fail_multiple_match() {
-        let predicate = |err: &str| {
-            err.contains("multiple epsilon transitions to match state")
-        };
+        let predicate = |err: &str| err.contains("multiple epsilon transitions to match state");
 
         let err = DFA::new_many(&[r"^", r"$"]).unwrap_err().to_string();
         assert!(predicate(&err), "{err}");
@@ -3204,5 +3226,14 @@ mod tests {
     #[test]
     fn is_not_one_pass_bigger() {
         assert!(DFA::new(r"\w*\s").is_err());
+    }
+}
+
+impl DFA {
+    /// Visit this DFA's actual table capacities and separately shared NFA.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        crate::util::source_storage::vector(&self.table, visitor);
+        crate::util::source_storage::vector(&self.starts, visitor);
+        self.nfa.visit_source_storage(visitor)
     }
 }

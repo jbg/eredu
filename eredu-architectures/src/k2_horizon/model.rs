@@ -471,8 +471,7 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
                 points: <ModelArgs as decoder::Config>::routed_observation_points(
                     global,
                     &format!("model.layers.{layer}"),
-                    layer,
-                ),
+                    layer, None)?,
                 values,
                 feed_forward,
             },

@@ -1,38 +1,83 @@
 //! Coordinates of declared intermediate read stages, before the terminal read.
 
 use super::*;
-use eredu_core::{component::ComponentInputProjection, SymbolicDimension};
+use eredu_core::{SymbolicDimension, component::ComponentInputProjection};
 
 pub(super) fn insert_observation(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     stage: &ComponentInputProjection,
     tensor: Option<&LocalTensorLayout>,
 ) -> Result<(), ComponentPartitionError> {
-    insert_row_output(
+    stage_worker(observations, descriptor, stage, tensor, Destination(None))
+}
+pub(super) fn insert_read_output(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    read: &eredu_core::component::ComponentRead,
+    tensor: Option<&LocalTensorLayout>,
+) -> Result<(), ComponentPartitionError> {
+    read_worker(observations, descriptor, read, tensor, Destination(None))
+}
+#[cfg(test)]
+fn derive_row_coordinates(
+    weight: &str,
+    selected: &std::ops::Range<usize>,
+    tensor: &LocalTensorLayout,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    coordinates_worker(weight, selected, tensor, Destination(None))
+}
+pub(super) fn stage_worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
+    descriptor: &ArchitectureDescriptor,
+    stage: &ComponentInputProjection,
+    tensor: Option<&LocalTensorLayout>,
+    allocation: Destination<'_>,
+) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &str,
+        &std::ops::Range<usize>,
+        Option<&LocalTensorLayout>,
+        PartitionedObservation,
+        ComponentPartitionError,
+    )>()?;
+    row_output_worker(
         observations,
         descriptor,
         &stage.weight,
         &stage.rows,
         &stage.output,
         tensor,
+        allocation,
     )
 }
 
 /// Registers an actual affine read output independently of later normalization.
-pub(super) fn insert_read_output(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+pub(super) fn read_worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     read: &eredu_core::component::ComponentRead,
     tensor: Option<&LocalTensorLayout>,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &str,
+        &std::ops::Range<usize>,
+        Option<&LocalTensorLayout>,
+        PartitionedObservation,
+        ComponentPartitionError,
+    )>()?;
     let Some(path) = &read.projection_output else {
         return Ok(());
     };
     let point = descriptor
         .observations
         .get(path)
-        .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.clone()))?;
+        .ok_or_else(|| allocation.capture_missing(path))?;
     let width = point
         .axes
         .as_ref()
@@ -41,42 +86,51 @@ pub(super) fn insert_read_output(
             SymbolicDimension::Known(width) => Some(width),
             _ => None,
         })
-        .ok_or_else(|| ComponentPartitionError::InvalidPlacement(read.weight.clone()))?;
+        .ok_or_else(|| allocation.invalid(&read.weight))?;
     if point.position != eredu_core::ObservationPosition::ReadOnly
         || tensor.is_some_and(|tensor| tensor.global_shape().first() != Some(&width))
     {
-        return Err(ComponentPartitionError::InvalidPlacement(
-            read.weight.clone(),
-        ));
+        return Err(allocation.invalid(&read.weight));
     }
-    insert_row_output(
+    row_output_worker(
         observations,
         descriptor,
         &read.weight,
         &(0..width),
         path,
         tensor,
+        allocation,
     )
 }
 
-fn insert_row_output(
-    observations: &mut BTreeMap<String, PartitionedObservation>,
+fn row_output_worker(
+    observations: &mut SourceMap<String, PartitionedObservation>,
     descriptor: &ArchitectureDescriptor,
     weight: &str,
     rows: &std::ops::Range<usize>,
     output: &str,
     tensor: Option<&LocalTensorLayout>,
+    allocation: Destination<'_>,
 ) -> Result<(), ComponentPartitionError> {
+    allocation.controls::<(
+        &mut SourceMap<String, PartitionedObservation>,
+        &ArchitectureDescriptor,
+        &str,
+        &std::ops::Range<usize>,
+        Option<&LocalTensorLayout>,
+        PartitionedObservation,
+        ComponentPartitionError,
+    )>()?;
     let width = rows
         .end
         .checked_sub(rows.start)
         .filter(|n| *n > 0)
-        .ok_or_else(|| ComponentPartitionError::InvalidPlacement(weight.to_owned()))?;
+        .ok_or_else(|| allocation.invalid(&weight))?;
     let coordinates = tensor
-        .map(|tensor| derive_row_coordinates(weight, rows, tensor))
+        .map(|tensor| coordinates_worker(weight, rows, tensor, allocation))
         .transpose()?;
     let placement = PartitionedObservation {
-        axis: "hidden".into(),
+        axis: allocation.text("hidden")?,
         coordinates,
         exports: tensor.is_some(),
         site: ObservationHookSite::Unit,
@@ -90,7 +144,7 @@ fn insert_row_output(
             .points
             .iter()
             .find(|point| point.path == path)
-            .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.into()))?;
+            .ok_or_else(|| allocation.capture_missing(path))?;
         let mut axes = point
             .axes
             .iter()
@@ -101,11 +155,56 @@ fn insert_row_output(
             .is_some_and(|axis| axis.dimension == SymbolicDimension::Known(width))
             || axes.next().is_some()
         {
-            return Err(ComponentPartitionError::InvalidPlacement(weight.to_owned()));
+            return Err(allocation.invalid(&weight));
         }
-        super::insert_observation(observations, path, placement.clone())?;
+        observations::insert(
+            observations,
+            path,
+            allocation.observation(&placement)?,
+            allocation,
+        )?;
     }
     Ok(())
+}
+
+fn coordinates_worker(
+    weight: &str,
+    selected: &std::ops::Range<usize>,
+    tensor: &LocalTensorLayout,
+    allocation: Destination<'_>,
+) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
+    allocation.controls::<(
+        &str,
+        &std::ops::Range<usize>,
+        &LocalTensorLayout,
+        ComponentCoordinateMap,
+        Vec<usize>,
+        usize,
+    )>()?;
+    let invalid = || allocation.invalid(&weight);
+    let count = *tensor.global_shape().first().ok_or_else(invalid)?;
+    if selected.start >= selected.end || selected.end > count {
+        return Err(invalid());
+    }
+    // Output rows are scalar coordinates even if the input columns are packed.
+    // Column-sharded partial products and multiple physical placements need an
+    // explicit complete-output contract; they cannot masquerade as row shards.
+    let rows = coordinates::matrix_worker(weight, count, tensor, 0, allocation)?;
+    let width = selected.end - selected.start;
+    if let Some(range) = rows.contiguous_range() {
+        let start = range.start.clamp(selected.start, selected.end) - selected.start;
+        let end = range.end.clamp(selected.start, selected.end) - selected.start;
+        ComponentCoordinateMap::range(width, start..end).map_err(Into::into)
+    } else {
+        let mut values = Vec::new();
+        for row in (0..rows.local_count())
+            .filter_map(|index| rows.local_to_global(index))
+            .filter(|row| selected.contains(row))
+        {
+            allocation.push(&mut values, row - selected.start)?;
+        }
+        allocation.indices(width, values)
+    }
 }
 
 #[cfg(test)]
@@ -114,38 +213,6 @@ fn derive_coordinates(
     tensor: &LocalTensorLayout,
 ) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
     derive_row_coordinates(&stage.weight, &stage.rows, tensor)
-}
-
-fn derive_row_coordinates(
-    weight: &str,
-    selected: &std::ops::Range<usize>,
-    tensor: &LocalTensorLayout,
-) -> Result<ComponentCoordinateMap, ComponentPartitionError> {
-    let invalid = || ComponentPartitionError::InvalidPlacement(weight.to_owned());
-    let count = *tensor.global_shape().first().ok_or_else(invalid)?;
-    if selected.start >= selected.end || selected.end > count {
-        return Err(invalid());
-    }
-    // Output rows are scalar coordinates even if the input columns are packed.
-    // Column-sharded partial products and multiple physical placements need an
-    // explicit complete-output contract; they cannot masquerade as row shards.
-    let rows = derive_matrix_axis_coordinates(weight, count, tensor, 0)?;
-    let width = selected.end - selected.start;
-    if let Some(range) = rows.contiguous_range() {
-        let start = range.start.clamp(selected.start, selected.end) - selected.start;
-        let end = range.end.clamp(selected.start, selected.end) - selected.start;
-        ComponentCoordinateMap::range(width, start..end).map_err(Into::into)
-    } else {
-        ComponentCoordinateMap::indices(
-            width,
-            (0..rows.local_count())
-                .filter_map(|index| rows.local_to_global(index))
-                .filter(|row| selected.contains(row))
-                .map(|row| row - selected.start)
-                .collect(),
-        )
-        .map_err(Into::into)
-    }
 }
 
 #[cfg(test)]
@@ -196,14 +263,14 @@ mod tests {
                 Some(width / 2..width),
                 false,
             );
-            let mut observations = BTreeMap::new();
+            let mut observations = SourceMap::new();
             insert_read_output(&mut observations, &descriptor, read, Some(&tensor)).unwrap();
             assert_eq!(
                 observations[path].coordinates().unwrap().contiguous_range(),
                 Some(width / 2..width)
             );
             assert!(observations[path].exports());
-            let mut absent = BTreeMap::new();
+            let mut absent = SourceMap::new();
             insert_read_output(&mut absent, &descriptor, read, None).unwrap();
             assert!(absent[path].coordinates().is_none());
             assert!(!absent[path].exports());
@@ -222,7 +289,7 @@ mod tests {
                 false,
             );
             assert!(
-                insert_read_output(&mut BTreeMap::new(), &descriptor, read, Some(&partial))
+                insert_read_output(&mut SourceMap::new(), &descriptor, read, Some(&partial))
                     .is_err()
             );
             let mut stale = descriptor.clone();
@@ -233,7 +300,9 @@ mod tests {
                 .find(|point| &point.path == path)
                 .unwrap()
                 .position = eredu_core::ObservationPosition::BeforeIntervention;
-            assert!(insert_read_output(&mut BTreeMap::new(), &stale, read, Some(&tensor)).is_err());
+            assert!(
+                insert_read_output(&mut SourceMap::new(), &stale, read, Some(&tensor)).is_err()
+            );
         }
     }
 

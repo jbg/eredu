@@ -6,7 +6,7 @@ use eredu_nn::{ParameterVisitorMut,ParameterMetadata,Tensor,CpuMatmulImplementat
 use eredu_nn::workspace::{WorkspaceDtype,WorkspaceMechanisms};
 struct Bind<'a>(&'a WorkspaceContext);
 impl<'a> ParameterVisitorMut<'a,WorkspaceTensor> for Bind<'_> {
-    fn visit_mut(&mut self,_:ParameterMetadata,value:&'a mut WorkspaceTensor) {
+    fn visit_mut(&mut self,_:eredu_nn::ParameterMetadataView<'_>,value:&'a mut WorkspaceTensor) {
         *value=represented(value.shape(),self.0);
     }
 }

@@ -24,34 +24,91 @@ impl Literal {
     /// Copy a source literal during the caller's paid/cold construction.
     #[must_use]
     pub fn from_value(value: &Value) -> Self {
-        match value {
+        Self::from_value_with_allocations(value, &serde_json::allocation::Unenforced)
+            .expect("ordinary literal allocation")
+    }
+    /// Copy the same literal with reservations before each reached allocation.
+    pub fn from_value_with_allocations(
+        value: &Value,
+        allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<Self, serde_json::allocation::AllocationError> {
+        let allocator = serde_json::allocation::Allocator::new(allocations);
+        Ok(match value {
             Value::Null => Self::Null,
             Value::Bool(value) => Self::Bool(*value),
-            Value::Number(value) => Self::Number(value.clone()),
-            Value::String(value) => Self::String(value.clone()),
-            Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
-            Value::Object(values) => Self::from_object(values),
-        }
+            Value::Number(value) => Self::Number(value.try_clone_with_allocations(allocations)?),
+            Value::String(value) => Self::String(allocator.copy_string(value)?),
+            Value::Array(values) => {
+                let mut output = Vec::new();
+                allocator.grow(&mut output, values.len())?;
+                for value in values {
+                    output.push(Self::from_value_with_allocations(value, allocations)?);
+                }
+                Self::Array(output)
+            }
+            Value::Object(values) => Self::from_object_with_allocations(values, allocations)?,
+        })
     }
-
     /// Copy object members directly, without an intermediate serde map.
     #[must_use]
     pub fn from_object(values: &Map<String, Value>) -> Self {
-        Self::Object(values.iter().map(|(key, value)| (key.clone(), Self::from_value(value))).collect())
+        Self::from_object_with_allocations(values, &serde_json::allocation::Unenforced)
+            .expect("ordinary object literal allocation")
+    }
+    /// Copy object members through the same producer with explicit allocation funding.
+    pub fn from_object_with_allocations(
+        values: &Map<String, Value>,
+        allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<Self, serde_json::allocation::AllocationError> {
+        let allocator = serde_json::allocation::Allocator::new(allocations);
+        let mut output = Vec::new();
+        allocator.grow(&mut output, values.len())?;
+        for (key, value) in values {
+            output.push((
+                allocator.copy_string(key)?,
+                Self::from_value_with_allocations(value, allocations)?,
+            ));
+        }
+        Ok(Self::Object(output))
     }
 
-    /// Reconstruct ordinary diagnostic metadata. This allocating conversion is
-    /// not an original-validation operation or an execution authority.
+    /// Reconstruct diagnostic metadata through the same source producer.
     #[must_use]
     pub fn to_value(&self) -> Value {
-        match self {
+        self.to_value_with_allocations(&serde_json::allocation::Unenforced)
+            .expect("ordinary literal diagnostic conversion")
+    }
+    /// Reconstruct the actual diagnostic JSON tree with prospective allocation.
+    pub fn to_value_with_allocations(
+        &self,
+        allocations: &dyn serde_json::allocation::Allocation,
+    ) -> Result<Value, serde_json::allocation::AllocationError> {
+        let allocator = serde_json::allocation::Allocator::new(allocations);
+        Ok(match self {
             Self::Null => Value::Null,
             Self::Bool(value) => Value::Bool(*value),
-            Self::Number(value) => Value::Number(value.clone()),
-            Self::String(value) => Value::String(value.clone()),
-            Self::Array(values) => Value::Array(values.iter().map(Self::to_value).collect()),
-            Self::Object(values) => Value::Object(values.iter().map(|(key, value)| (key.clone(), value.to_value())).collect()),
-        }
+            Self::Number(value) => Value::Number(value.try_clone_with_allocations(allocations)?),
+            Self::String(value) => Value::String(allocator.copy_string(value)?),
+            Self::Array(values) => {
+                let mut output = Vec::new();
+                allocator.grow(&mut output, values.len())?;
+                for value in values {
+                    output.push(value.to_value_with_allocations(allocations)?);
+                }
+                Value::Array(output)
+            }
+            Self::Object(values) => {
+                let mut output = Map::new();
+                for (key, value) in values {
+                    output.try_insert_with_allocations(
+                        allocator.copy_string(key)?,
+                        value.to_value_with_allocations(allocations)?,
+                        allocations,
+                    )?;
+                }
+                Value::Object(output)
+            }
+        })
     }
 }
 
@@ -65,7 +122,9 @@ pub(crate) enum View<'a, E: Expected + 'a> {
     Object(E::Members<'a>),
 }
 pub(crate) trait Expected: Sized {
-    type Members<'a>: ExactSizeIterator<Item = (&'a str, &'a Self)> where Self: 'a;
+    type Members<'a>: ExactSizeIterator<Item = (&'a str, &'a Self)>
+    where
+        Self: 'a;
     fn view(&self) -> View<'_, Self>;
 }
 
@@ -76,7 +135,10 @@ fn literal_member((key, value): &(String, Literal)) -> (&str, &Literal) {
     (key.as_str(), value)
 }
 impl Expected for Value {
-    type Members<'a> = std::iter::Map<serde_json::map::Iter<'a>, fn((&'a String, &'a Value)) -> (&'a str, &'a Value)>;
+    type Members<'a> = std::iter::Map<
+        serde_json::map::Iter<'a>,
+        fn((&'a String, &'a Value)) -> (&'a str, &'a Value),
+    >;
     fn view(&self) -> View<'_, Self> {
         match self {
             Self::Null => View::Null,
@@ -89,7 +151,10 @@ impl Expected for Value {
     }
 }
 impl Expected for Literal {
-    type Members<'a> = std::iter::Map<std::slice::Iter<'a, (String, Literal)>, fn(&'a (String, Literal)) -> (&'a str, &'a Literal)>;
+    type Members<'a> = std::iter::Map<
+        std::slice::Iter<'a, (String, Literal)>,
+        fn(&'a (String, Literal)) -> (&'a str, &'a Literal),
+    >;
     fn view(&self) -> View<'_, Self> {
         match self {
             Self::Null => View::Null,

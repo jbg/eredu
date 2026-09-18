@@ -133,7 +133,10 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
                     assert_eq!(value.source_shape, original.source_shape);
                     assert_eq!(value.source_dtype, original.source_dtype);
                     assert_eq!(value.selected_shape, original.selected_shape);
-                    assert!(value.charged.captures > 0, "physical capture owns its charge");
+                    assert!(
+                        value.charged.captures > 0,
+                        "physical capture owns its charge"
+                    );
                     transformed.push(validate(value, kind, values));
                 } else {
                     assert_eq!(value.outcome, original.outcome);
@@ -164,9 +167,7 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
     );
     let delivery = envelope.prefill_reductions.as_ref().unwrap();
     if shared {
-        let report = delivery
-            .shared()
-            .expect("original aggregate keeps paid custody");
+        let report = delivery;
         let alias = report.clone();
         assert!(alias.same_storage(report));
         assert_eq!(
@@ -238,14 +239,23 @@ pub(super) fn rows(records: &[SpeculativeActivationCapture], shared: bool) -> se
                 Some([1, sequence, 8].as_slice())
             );
             assert_eq!(entry.record.selected_shape, entry.record.source_shape);
-            let physical_captures: u64 = records.iter()
+            let physical_captures: u64 = records
+                .iter()
                 .filter(|record| record.phase == phase)
-                .map(|record| record.captures.as_step().records[entry.selection_index].charged.captures)
+                .map(|record| {
+                    record.captures.as_step().records[entry.selection_index]
+                        .charged
+                        .captures
+                })
                 .sum();
-            assert_eq!(entry.record.charged.captures, physical_captures,
-                "logical record attributes its physical contributors");
-            assert_eq!(report.charged.captures, 0,
-                "aggregate delivery adds no physical capture spending");
+            assert_eq!(
+                entry.record.charged.captures, physical_captures,
+                "logical record attributes its physical contributors"
+            );
+            assert_eq!(
+                report.charged.captures, 0,
+                "aggregate delivery adds no physical capture spending"
+            );
             logical.push(serde_json::json!({"phase":phase,"selection":entry.selection_index,
                 "windows":entry.windows,"logical_sequence":entry.logical_sequence,"covered_sequence":entry.covered_sequence,
                 "first":entry.first_invocation,"last":entry.last_invocation,"status":entry.status,

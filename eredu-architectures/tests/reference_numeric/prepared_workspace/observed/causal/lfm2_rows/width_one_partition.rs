@@ -32,8 +32,8 @@ impl ActivationObserver<NumericTensor, Error> for BodyRows {
 // Populate the reference from the same original LFM2 checkpoint payload.
 struct Populate<'a>(&'a prepared_adapter::ParameterBits);
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let (shape, bits) = &self.0[metadata.id.as_str()];
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let (shape, bits) = &self.0[metadata.id().as_str()];
         assert_eq!(&value.shape, shape);
         value.data = bits.iter().map(|bits| f32::from_bits(*bits)).collect();
         assert!(value.data.iter().all(|v| v.is_finite()));
@@ -64,8 +64,8 @@ fn lfm2_width_one_prepared_leading_and_trailing_tp_pp_use_actual_local_attention
                 ..Default::default()
             };
             let mut architecture = HybridModel::new(args.clone(), &context).unwrap();
-            let parameters = architecture.parameter_description(&context).unwrap();
-            let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::prefill_observation_declarations(&architecture).unwrap();
+            let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+            let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::prefill_observation_declarations(&architecture, None).unwrap();
             let paths = declarations
                 .iter()
                 .filter(|d| d.readout_stage() == Stage::BeforeReadout)

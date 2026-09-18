@@ -152,8 +152,7 @@ impl Plan {
             cache: Vec::new(),
         };
         let (_, nodes, _) = source
-            .prepared_extents()
-            .map_err(|_| fail(InitCause::Source))?;
+            .storage_extents();
         if source.len() > nodes || u32::try_from(nodes).is_err() {
             return Err(fail(InitCause::Source));
         }
@@ -542,22 +541,22 @@ mod tests {
     use std::cell::Cell;
     #[test]
     fn owning_relevance_walk_preserves_shared_search_fuel_cache_and_failed_destinations() {
-        let mut source = ExprSet::new(256);
-        let a = source.mk_byte(b'a');
-        let b = source.mk_byte(b'b');
-        let c = source.mk_byte(b'c');
-        let ab = source.mk_byte_set_or(&[a, b]);
-        let bc = source.mk_byte_set_or(&[b, c]);
-        let xy = source.mk_byte_literal(b"xy");
-        let xz = source.mk_byte_literal(b"xz");
-        let left = source.mk_concat(ab, xy);
-        let right_empty = source.mk_concat(bc, xz);
-        let right_full = source.mk_concat(bc, xy);
-        let empty = source.mk_and(&mut vec![left, right_empty]);
-        let full = source.mk_and(&mut vec![left, right_full]);
-        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[empty; 128]));
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[empty, full, declaration]);
-        source.reserve(128);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let a = source.mk_byte(b'a').unwrap();
+        let b = source.mk_byte(b'b').unwrap();
+        let c = source.mk_byte(b'c').unwrap();
+        let ab = source.mk_byte_set_or(&[a, b]).unwrap();
+        let bc = source.mk_byte_set_or(&[b, c]).unwrap();
+        let xy = source.mk_byte_literal(b"xy").unwrap();
+        let xz = source.mk_byte_literal(b"xz").unwrap();
+        let left = source.mk_concat(ab, xy).unwrap();
+        let right_empty = source.mk_concat(bc, xz).unwrap();
+        let right_full = source.mk_concat(bc, xy).unwrap();
+        let empty = source.mk_and(&mut vec![left, right_empty]).unwrap();
+        let full = source.mk_and(&mut vec![left, right_full]).unwrap();
+        let declaration = source.mk(Expr::Or(ExprFlags::POSITIVE, &[empty; 128])).unwrap();
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[empty, full, declaration]).unwrap();
+        source.reserve(128).unwrap();
         assert!(!source.is_positive(empty));
         assert!(!source.is_positive(full));
         let mut ordinary = source.clone();

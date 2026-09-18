@@ -4,7 +4,8 @@ use derivre::StateID;
 
 pub(super) trait Context {
     type Error;
-    fn enter(&mut self) -> Result<(), Self::Error>;
+    type Frame;
+    fn enter(&mut self) -> Result<Self::Frame, Self::Error>;
     fn within_items(&self) -> bool;
     fn make_lexeme(&mut self, byte: Option<u8>, pre: PreLexeme) -> Result<Lexeme, Self::Error>;
     fn scan_or_cached(&mut self, lexeme: &Lexeme) -> Result<bool, Self::Error>;
@@ -41,7 +42,7 @@ pub(super) trait Context {
 
 #[inline(never)]
 pub(super) fn run<C: Context>(context: &mut C, pre: PreLexeme) -> Result<bool, C::Error> {
-    context.enter()?;
+    let _frame = context.enter()?;
     if !context.within_items() {
         return Ok(false);
     }
@@ -87,7 +88,7 @@ pub(super) fn hidden<C: Context>(
     last: Option<u8>,
     pre: PreLexeme,
 ) -> Result<bool, C::Error> {
-    context.enter()?;
+    let _frame = context.enter()?;
     let start = context.added_start();
     let lexeme = context.hidden_lexeme(last, pre)?;
     let bytes = lexeme.hidden_bytes();
@@ -195,6 +196,7 @@ pub(super) fn definitive<C: Context>(
 
 impl Context for super::ParserState {
     type Error = anyhow::Error;
+    type Frame = ();
     fn enter(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }

@@ -8,7 +8,7 @@ use std::mem::{size_of,size_of_val};
 struct CoordinateCapacity;
 fn error(cause:impl std::error::Error+Send+Sync+'static)->Error {
     match safemlx::OriginalScopeObserver::try_current() {
-        Ok(None)=>Error::backend_source(cause),
+        Ok(None)=>Error::backend_retained_source(cause),
         _=>Error::backend_retained_source(cause),
     }
 }
@@ -41,9 +41,10 @@ pub(super) fn execute(input:&MlxTensor,axis:usize,start:i32,end:i32,stream:&Stre
 /// rank exceeds the inline source domain. This is only a layout; the ordinary
 /// Slice/identity constructor, CPU/Metal worker and completion sources remain
 /// separately required. Workspace StaticSlice may be invoked by either the
-/// direct capture caller or this adapter, so its bound covers both callers.
+/// direct capture caller, this adapter, or rank-preserving Tensor::index, so
+/// its bound covers the same native Slice reached through every caller.
 pub(crate) fn control_bytes(rank:usize)->Option<usize>{
-    let frames=[size_of::<TensorAxisRange<'_>>(),size_of::<Result<TensorAxisRange<'_>,TensorAxisRangeError>>(),
+    let frames=[range_index_control_bytes(rank)?, size_of::<TensorAxisRange<'_>>(),size_of::<Result<TensorAxisRange<'_>,TensorAxisRangeError>>(),
         size_of::<(&MlxTensor,usize,i32,i32,&Stream)>()*2,size_of::<[i32;4]>()*3,
         size_of::<[Vec<i32>;3]>(),size_of::<[&mut Vec<i32>;3]>(),
         size_of::<std::array::IntoIter<&mut Vec<i32>,3>>(),size_of::<usize>(),
@@ -54,12 +55,34 @@ pub(crate) fn control_bytes(rank:usize)->Option<usize>{
         size_of::<safemlx::OriginalScopeObserver>(),
         size_of::<Result<Option<safemlx::OriginalScopeObserver>,safemlx::error::Exception>>(),
         safemlx::OriginalScopeObserver::control_bytes()?,
-        Error::retained_source_control_bytes::<safemlx::error::Exception>()?,
-        Error::retained_source_control_bytes::<TensorAxisRangeError>()?,
-        Error::retained_source_control_bytes::<std::collections::TryReserveError>()?,
-        Error::retained_source_control_bytes::<CoordinateCapacity>()?];
+        Error::retained_source_construction_bytes::<safemlx::error::Exception>()?,
+        Error::retained_source_construction_bytes::<TensorAxisRangeError>()?,
+        Error::retained_source_construction_bytes::<std::collections::TryReserveError>()?,
+        Error::retained_source_construction_bytes::<CoordinateCapacity>()?];
     frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)?
         .checked_add(if rank>4{rank.checked_mul(3)?.checked_mul(size_of::<i32>())?}else{0})
+}
+
+/// The existing Tensor::index frontend collects at most one declaration per
+/// axis into SmallVec<[ArrayIndexOp;5]>. Its exact-size iterator reserves once;
+/// the pinned SmallVec grower chooses next_power_of_two above inline capacity.
+/// The native tuple paging caller has at most four inline declarations and is
+/// covered by the same basic-worker control census.
+fn range_index_control_bytes(rank: usize) -> Option<usize> {
+    let frames = [
+        safemlx::ops::indexing::basic_range_index_control_bytes(rank)?,
+        size_of::<(&MlxTensor, &[Index], &Stream)>(),
+        size_of::<SmallVec<[ArrayIndexOp<'_>; 5]>>(),
+        size_of::<std::slice::Iter<'_, Index>>(), size_of::<&Index>(),
+        size_of::<ArrayIndexOp<'_>>(), size_of::<std::ops::Range<i32>>(),
+        size_of::<Result<MlxTensor, Error>>(),
+        size_of::<Result<Array, safemlx::error::Exception>>(),
+        size_of::<usize>() * 3,
+    ];
+    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)?
+        .checked_add(if rank > 5 {
+            rank.checked_next_power_of_two()?.checked_mul(size_of::<ArrayIndexOp<'_>>())?
+        } else { 0 })
 }
 
 #[cfg(test)]
@@ -92,6 +115,6 @@ mod tests {
                 assert!(input.narrow_axis(axis,start,end,&stream).is_err());
             }
         }
-        assert_eq!(control_bytes(5).unwrap()-control_bytes(4).unwrap(),3*5*size_of::<i32>());
+        assert_eq!(control_bytes(5).unwrap()-control_bytes(4).unwrap(),2*3*5*size_of::<i32>());
     }
 }

@@ -1,7 +1,7 @@
 //! Direct canonical receipt decoding into one already spent scheduled tensor.
 use super::*;
 use eredu_core::capture::{PartitionCaptureContext, CaptureUsage};
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use serde_json::bounded_events::{Event, Plan, PlanError, Sink};
 use std::mem::{size_of, size_of_val};
 mod reader;
@@ -37,7 +37,7 @@ enum Cause {
     #[error(transparent)]
     Plan(#[from] PlanError),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Host(#[from] CaptureRunHostError),
     #[error(transparent)]
@@ -66,7 +66,7 @@ pub struct PartitionCaptureTensorDecodeError {
     _histogram: Option<CaptureHistogram>,
     _vocabulary: Option<VocabularyFailure>,
     _custody: CaptureTensorCustody,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
     /// Fill this exact scheduled F32 destination from a completed canonical
@@ -77,12 +77,12 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
         self,
         bytes: &[u8],
         expected: PartitionCaptureTensorReceipt<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<ClaimedCaptureTensor, PartitionCaptureTensorDecodeError> {
         self.decode_partition_receipt_combined(bytes,expected,funding,eredu_core::capture::PartitionCaptureCombination::Disjoint)
     }
     pub(in crate::working_memory::capture_run) fn decode_partition_receipt_combined(
-        self,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,funding:&WorkspaceMetadataFunding,
+        self,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,funding:&HostMetadataFunding,
         combination:eredu_core::capture::PartitionCaptureCombination,
     )->Result<ClaimedCaptureTensor,PartitionCaptureTensorDecodeError> {
         let custody = self.identity.custody.share_scheduled();
@@ -96,7 +96,7 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
             size_of::<(usize, usize, &CaptureTensorGeometry<'_>, &AdmittedCapturePlan)>(),
             size_of::<PartitionCaptureTensorDecodeError>(), size_of::<Cause>(),
             size_of::<Result<ClaimedCaptureTensor, PartitionCaptureTensorDecodeError>>(),
-            size_of::<(&[u8], &WorkspaceMetadataFunding, bool)>(),
+            size_of::<(&[u8], &HostMetadataFunding, bool)>(),
             size_of::<eredu_core::capture::PartitionCaptureCombination>(),
         ];
         let controls = controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
@@ -129,7 +129,9 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
         funding.reserve_metadata(parser.required_bytes()).map_err(|cause|error(cause.into()))?;
         let mut destination = self.prepare().map_err(|cause|error(cause.into()))?;
         let mut reader = TensorReader::new(&mut destination, expected, source, index, source_shape, selected_shape, source_rank).combined(combination);
-        let parsed = plan.parse(&mut reader);
+        let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
+        let parsed = plan.parse(&mut reader,&allocation);
+        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
         let valid = reader.complete();
         let memory = reader.take_memory();
         drop(reader);
@@ -141,7 +143,7 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
 }
 
 impl ScheduledCaptureStep<'_> {
-    pub(crate) fn prepare_partition_evidence(&mut self, funding: &WorkspaceMetadataFunding)
+    pub(crate) fn prepare_partition_evidence(&mut self, funding: &HostMetadataFunding)
         -> Result<(), CaptureRunHostError>
     { self.frame.prepare_partition_evidence(funding).map_err(Into::into) }
     pub(crate) fn record_partition_evidence(&mut self,
@@ -160,7 +162,7 @@ impl ScheduledCaptureStep<'_> {
 pub(in crate::working_memory::capture_run) fn decode_summary_receipt(
     bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
     geometry: &CaptureSummaryGeometry<'_>, custody: &CaptureTensorCustody,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<CaptureSummary, PartitionCaptureTensorDecodeError> {
     let error = |cause| PartitionCaptureTensorDecodeError { cause, _histogram: None, _vocabulary: None,
         _custody: custody.share_scheduled(), _metadata: funding.clone() };
@@ -169,7 +171,7 @@ pub(in crate::working_memory::capture_run) fn decode_summary_receipt(
         size_of::<[[usize; 32]; 2]>(), size_of::<(usize, usize, &CaptureSummaryGeometry<'_>, &AdmittedCapturePlan)>(),
         size_of::<PartitionCaptureTensorDecodeError>(), size_of::<Cause>(),
         size_of::<Result<CaptureSummary, PartitionCaptureTensorDecodeError>>(),
-        size_of::<(&[u8], &CaptureTensorCustody, &WorkspaceMetadataFunding, bool)>(),
+        size_of::<(&[u8], &CaptureTensorCustody, &HostMetadataFunding, bool)>(),
     ];
     funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
         .ok_or_else(|| error(Cause::Source("summary decoder controls overflow")))?)
@@ -196,7 +198,9 @@ pub(in crate::working_memory::capture_run) fn decode_summary_receipt(
     let mut value = crate::capture::reduction::Summary::default().value();
     let mut reader = TensorReader::new_summary(&mut value, expected, geometry.admission(),
         geometry.selection_index(), source_shape, selected_shape, rank);
-    let parsed = plan.parse(&mut reader);
+    let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
+        let parsed = plan.parse(&mut reader,&allocation);
+        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
     let valid = reader.complete();
     let memory = reader.take_memory();
     drop(reader);
@@ -208,14 +212,14 @@ pub(in crate::working_memory::capture_run) fn decode_summary_receipt(
 impl PartitionCaptureTensorDecodeError {
     pub(in crate::working_memory::capture_run) fn retaining_summary_failure(
         cause: CaptureSummaryFailure, custody: CaptureTensorCustody,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Self { Self { cause: Cause::Summary(cause), _histogram: None, _vocabulary: None, _custody: custody, _metadata: funding.clone() } }
 }
 
 pub(in crate::working_memory::capture_run) fn decode_histogram_receipt(
     value: &mut CaptureHistogram, bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
     geometry: &CaptureHistogramGeometry<'_>, custody: &CaptureTensorCustody,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<(), PartitionCaptureTensorDecodeError> {
     let error = |cause| PartitionCaptureTensorDecodeError { cause, _histogram: None, _vocabulary: None,
         _custody: custody.share_scheduled(), _metadata: funding.clone() };
@@ -224,7 +228,7 @@ pub(in crate::working_memory::capture_run) fn decode_histogram_receipt(
         size_of::<[[usize; 32]; 2]>(), size_of::<(usize, usize, &CaptureHistogramGeometry<'_>, &AdmittedCapturePlan)>(),
         size_of::<PartitionCaptureTensorDecodeError>(), size_of::<Cause>(),
         size_of::<Result<(), PartitionCaptureTensorDecodeError>>(),
-        size_of::<(&[u8], &CaptureTensorCustody, &WorkspaceMetadataFunding, bool)>(),
+        size_of::<(&[u8], &CaptureTensorCustody, &HostMetadataFunding, bool)>(),
     ];
     funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
         .ok_or_else(|| error(Cause::Source("histogram decoder controls overflow")))?)
@@ -250,7 +254,9 @@ pub(in crate::working_memory::capture_run) fn decode_histogram_receipt(
     funding.reserve_metadata(parser.required_bytes()).map_err(|cause| error(cause.into()))?;
     let mut reader = TensorReader::new_histogram(value, expected, geometry.admission(),
         geometry.selection_index(), source_shape, selected_shape, rank);
-    let parsed = plan.parse(&mut reader);
+    let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
+        let parsed = plan.parse(&mut reader,&allocation);
+        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
     let valid = reader.complete();
     let memory = reader.take_memory();
     drop(reader);
@@ -264,28 +270,28 @@ impl PartitionCaptureTensorDecodeError {
         self._histogram=Some(value);self
     }
     pub(in crate::working_memory::capture_run) fn retaining_histogram_failure(
-        cause: CaptureHistogramFailure, custody: CaptureTensorCustody, funding: &WorkspaceMetadataFunding,
+        cause: CaptureHistogramFailure, custody: CaptureTensorCustody, funding: &HostMetadataFunding,
     ) -> Self { Self { cause: Cause::Histogram(cause), _histogram: None, _vocabulary: None, _custody: custody, _metadata: funding.clone() } }
 }
 
 pub(in crate::working_memory::capture_run) fn histogram_preparation_failure(
-    cause: CaptureRunHostError, custody: &CaptureTensorCustody, funding: &WorkspaceMetadataFunding,
+    cause: CaptureRunHostError, custody: &CaptureTensorCustody, funding: &HostMetadataFunding,
 ) -> PartitionCaptureTensorDecodeError {
     PartitionCaptureTensorDecodeError {cause:Cause::Host(cause),_histogram: None, _vocabulary: None,
         _custody:custody.share_scheduled(),_metadata:funding.clone()}
 }
 
 pub(in crate::working_memory::capture_run) fn prepare_histogram_decoder(
-    custody: &CaptureTensorCustody, funding: &WorkspaceMetadataFunding,
+    custody: &CaptureTensorCustody, funding: &HostMetadataFunding,
 ) -> Result<(),PartitionCaptureTensorDecodeError> {
     let error=|cause|PartitionCaptureTensorDecodeError {cause,_histogram: None, _vocabulary: None,
         _custody:custody.share_scheduled(),_metadata:funding.clone()};
     let frames=[size_of::<CaptureHistogramClaim<'_, '_>>(),size_of::<ScheduledCaptureHistogram<'_, '_>>(),
         size_of::<PartitionCaptureTensorDecodeError>(),size_of::<Cause>(),
         size_of::<Result<ClaimedCaptureHistogram,PartitionCaptureTensorDecodeError>>(),
-        size_of::<(&[u8],PartitionCaptureTensorReceipt<'_>,&WorkspaceMetadataFunding)>(),
+        size_of::<(&[u8],PartitionCaptureTensorReceipt<'_>,&HostMetadataFunding)>(),
         size_of::<CaptureTensorCustody>(),size_of::<(u64,u64,u64)>(),
-        size_of::<(&CaptureTensorCustody,&WorkspaceMetadataFunding)>(),size_of::<Result<(),PartitionCaptureTensorDecodeError>>()];
+        size_of::<(&CaptureTensorCustody,&HostMetadataFunding)>(),size_of::<Result<(),PartitionCaptureTensorDecodeError>>()];
     funding.reserve_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
         .ok_or_else(||error(Cause::Source("histogram claim decoder controls overflow")))?)
         .map_err(|cause|error(cause.into()))?;
@@ -301,10 +307,10 @@ impl PartitionCaptureTensorDecodeError {
     pub(in crate::working_memory::capture_run) fn retaining_scores(mut self,value:CaptureTokenScoreFailure)->Self {
         self._vocabulary=Some(VocabularyFailure::Scores(value));self
     }
-    pub(in crate::working_memory::capture_run) fn candidate_failure(value:CaptureCandidateFailure,custody:CaptureTensorCustody,funding:&WorkspaceMetadataFunding)->Self {
+    pub(in crate::working_memory::capture_run) fn candidate_failure(value:CaptureCandidateFailure,custody:CaptureTensorCustody,funding:&HostMetadataFunding)->Self {
         Self {cause:Cause::Candidates(value),_histogram:None,_vocabulary:None,_custody:custody,_metadata:funding.clone()}
     }
-    pub(in crate::working_memory::capture_run) fn score_failure(value:CaptureTokenScoreFailure,custody:CaptureTensorCustody,funding:&WorkspaceMetadataFunding)->Self {
+    pub(in crate::working_memory::capture_run) fn score_failure(value:CaptureTokenScoreFailure,custody:CaptureTensorCustody,funding:&HostMetadataFunding)->Self {
         Self {cause:Cause::Scores(value),_histogram:None,_vocabulary:None,_custody:custody,_metadata:funding.clone()}
     }
 }

@@ -1,6 +1,8 @@
 //! Validated global identities for a local component axis.
 
-use std::{collections::BTreeMap, ops::Range};
+use crate::{HostMetadataFunding, HostMetadataFundingError};
+use eredu_collections::ordered_map::{Map, TryInsertError};
+use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 mod index_projection;
@@ -9,19 +11,14 @@ pub use index_projection::{ComponentIndexProjectionError, ComponentIndexProjecti
 /// A local scalar axis in global component coordinates. This map describes
 /// coordinates only; it does not authorize observation, intervention or storage.
 /// Empty local selections are permitted and do not imply missing global values.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(try_from = "WireMap", into = "WireMap")]
 pub struct ComponentCoordinateMap {
     global_count: usize,
     selection: Selection,
-    inverse: Inverse,
+    inverse: Map<usize, usize>,
 }
 
-#[derive(Debug, Clone)]
-enum Inverse {
-    Ordinary(BTreeMap<usize, usize>),
-    Prepared(Vec<(usize, usize)>),
-}
 impl PartialEq for ComponentCoordinateMap {
     fn eq(&self, other: &Self) -> bool {
         // Both constructors derive the inverse from this exact validated source.
@@ -31,15 +28,20 @@ impl PartialEq for ComponentCoordinateMap {
 }
 impl Eq for ComponentCoordinateMap {}
 
-/// A destination is not the empty, sufficient storage required by a source copy.
-/// This describes host construction only and grants no allocation authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ComponentCoordinateCopyError {
-    /// Supplied storage already contains values from another construction.
-    #[error("coordinate copy destination is not empty")]
-    NonEmpty,
-    /// Either coordinate or inverse destination lacks the exact source population.
-    #[error("coordinate copy destination is too small")]
+/// A coordinate source constructor's fixed refusal or semantic validation error.
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentCoordinateConstructionError {
+    /// The original coordinate declaration is invalid.
+    #[error("{0}")]
+    Coordinates(#[from] ComponentCoordinateError),
+    /// The actual source account refused a producer before allocation.
+    #[error("{0}")]
+    Funding(#[from] HostMetadataFundingError),
+    /// The selected host allocator refused the actual vector request.
+    #[error("coordinate source allocation: {0}")]
+    Allocation(#[from] std::collections::TryReserveError),
+    /// The selected allocator returned an unqualified capacity.
+    #[error("coordinate source capacity differs from its request")]
     Capacity,
 }
 
@@ -98,7 +100,7 @@ impl ComponentCoordinateMap {
                 start: range.start,
                 end: range.end,
             },
-            inverse: Inverse::Ordinary(BTreeMap::new()),
+            inverse: Map::new(),
         })
     }
 
@@ -107,25 +109,52 @@ impl ComponentCoordinateMap {
         global_count: usize,
         indices: Vec<usize>,
     ) -> Result<Self, ComponentCoordinateError> {
-        if global_count == 0 {
-            return Err(ComponentCoordinateError::EmptyGlobalAxis);
+        match Self::indices_worker(global_count, indices, None) {
+            Ok(value) => Ok(value),
+            Err(ComponentCoordinateConstructionError::Coordinates(error)) => Err(error),
+            Err(_) => {
+                unreachable!("ordinary coordinate allocation")
+            }
         }
-        let mut inverse = BTreeMap::new();
+    }
+
+    /// Builds the same inverse with exact prospective node and control funding.
+    /// The caller must retain this account with the resulting source or error;
+    /// the supplied indices must already have their own construction custody.
+    pub fn indices_with_funding(
+        global_count: usize,
+        indices: Vec<usize>,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, ComponentCoordinateConstructionError> {
+        Self::indices_worker(global_count, indices, Some(funding))
+    }
+
+    fn indices_worker(
+        global_count: usize,
+        indices: Vec<usize>,
+        funding: Option<&HostMetadataFunding>,
+    ) -> Result<Self, ComponentCoordinateConstructionError> {
+        controls(funding, Self::copy_control_bytes())?;
+        if global_count == 0 {
+            return Err(ComponentCoordinateError::EmptyGlobalAxis.into());
+        }
+        let mut inverse = Map::new();
         for (local, global) in indices.iter().copied().enumerate() {
             if global >= global_count {
                 return Err(ComponentCoordinateError::OutOfRange {
                     index: global,
                     count: global_count,
-                });
+                }
+                .into());
             }
-            if inverse.insert(global, local).is_some() {
-                return Err(ComponentCoordinateError::Duplicate(global));
+            if insert(&mut inverse, global, local, funding)?.is_some() {
+                return Err(ComponentCoordinateError::Duplicate(global).into());
             }
         }
         Ok(Self {
             global_count,
             selection: Selection::Indices { indices },
-            inverse: Inverse::Ordinary(inverse),
+            inverse,
         })
     }
 
@@ -154,45 +183,67 @@ impl ComponentCoordinateMap {
         Self::range(global_count, range.start * width..range.end * width)
     }
 
-    /// Exact number of elements required in each destination of a prepared
-    /// copy. Contiguous sources need no vector backing; explicit maps retain
-    /// their existing local order and a separately sorted inverse table.
-    pub fn copy_storage_elements(&self) -> usize {
-        match &self.selection { Selection::Range { .. } => 0, Selection::Indices { indices } => indices.len() }
-    }
-
-    /// Fixed source/copy/lookup controls; the two vector backings are separate.
+    /// Fixed source/copy/lookup controls; vector and tree node backing are separate.
     pub fn copy_control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
-        let parts=[size_of::<Self>()*2,size_of::<Selection>(),size_of::<Inverse>(),
-            size_of::<Vec<usize>>(),size_of::<Vec<(usize,usize)>>(),
-            size_of::<std::collections::btree_map::Iter<'_,usize,usize>>(),
-            size_of::<std::slice::Iter<'_,(usize,usize)>>(),size_of::<[usize;4]>(),
-            size_of::<Result<Self,ComponentCoordinateCopyError>>()];
-        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+        let parts = [
+            size_of::<Self>() * 2,
+            size_of::<Selection>(),
+            size_of::<Map<usize, usize>>(),
+            size_of::<Vec<usize>>(),
+            size_of::<eredu_collections::ordered_map::Iter<'_, usize, usize>>(),
+            size_of::<std::slice::Iter<'_, usize>>(),
+            size_of::<[usize; 4]>(),
+            size_of::<Option<&HostMetadataFunding>>(),
+            size_of::<Result<Self, ComponentCoordinateConstructionError>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
-    /// Copy the already validated source into caller-owned empty destinations.
-    /// The ordinary map lookup contract and wire representation are unchanged.
-    /// No allocation or capacity growth occurs; the caller must establish the
-    /// ownership and funding of both vectors before lending them here.
-    pub fn copy_with_storage(&self, mut indices: Vec<usize>, mut inverse: Vec<(usize, usize)>)
-        -> Result<Self, ComponentCoordinateCopyError> {
-        if !indices.is_empty() || !inverse.is_empty() { return Err(ComponentCoordinateCopyError::NonEmpty); }
-        let count = self.copy_storage_elements();
-        if indices.capacity() < count || inverse.capacity() < count { return Err(ComponentCoordinateCopyError::Capacity); }
+    /// Copies through the same source representation used by ordinary `Clone`.
+    /// The enclosing caller retains `funding` with every escaping source/error.
+    pub fn try_clone_with_funding(
+        &self,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, ComponentCoordinateConstructionError> {
+        self.clone_worker(Some(funding))
+    }
+
+    fn clone_worker(
+        &self,
+        funding: Option<&HostMetadataFunding>,
+    ) -> Result<Self, ComponentCoordinateConstructionError> {
+        controls(funding, Self::copy_control_bytes())?;
         let selection = match &self.selection {
-            Selection::Range { start, end } => Selection::Range { start: *start, end: *end },
+            Selection::Range { start, end } => Selection::Range {
+                start: *start,
+                end: *end,
+            },
             Selection::Indices { indices: source } => {
-                indices.extend_from_slice(source);
-                match &self.inverse {
-                    Inverse::Ordinary(source) => inverse.extend(source.iter().map(|(global, local)| (*global, *local))),
-                    Inverse::Prepared(source) => inverse.extend_from_slice(source),
+                let bytes = std::alloc::Layout::array::<usize>(source.len())
+                    .map_err(|_| HostMetadataFundingError::Overflow)?
+                    .size();
+                controls(funding, Some(bytes))?;
+                let mut indices = Vec::new();
+                indices.try_reserve_exact(source.len())?;
+                if indices.capacity() != source.len() {
+                    return Err(ComponentCoordinateConstructionError::Capacity);
                 }
+                indices.extend_from_slice(source);
                 Selection::Indices { indices }
             }
         };
-        Ok(Self { global_count: self.global_count, selection, inverse: Inverse::Prepared(inverse) })
+        let mut inverse = Map::new();
+        for (&global, &local) in self.inverse.iter() {
+            insert(&mut inverse, global, local, funding)?;
+        }
+        Ok(Self {
+            global_count: self.global_count,
+            selection,
+            inverse,
+        })
     }
 
     /// Complete global component count.
@@ -222,11 +273,7 @@ impl ComponentCoordinateMap {
             Selection::Range { start, end } => {
                 (*start..*end).contains(&global).then(|| global - start)
             }
-            Selection::Indices { .. } => match &self.inverse {
-                Inverse::Ordinary(inverse) => inverse.get(&global).copied(),
-                Inverse::Prepared(inverse) => inverse.binary_search_by_key(&global, |(key, _)| *key)
-                    .ok().map(|index| inverse[index].1),
-            },
+            Selection::Indices { .. } => self.inverse.get(&global).copied(),
         }
     }
 
@@ -243,15 +290,51 @@ impl ComponentCoordinateMap {
     /// keep set zeros the local axis, while an empty delete set leaves it intact.
     pub fn localize_indices(&self, indices: &[u32]) -> Result<Vec<u32>, ComponentCoordinateError> {
         let mut scratch = vec![(0, 0); indices.len()];
-        let plan = ComponentIndexProjectionPlan::prepare(self, indices, &mut scratch)
-            .map_err(|cause| match cause {
+        let plan = ComponentIndexProjectionPlan::prepare(self, indices, &mut scratch).map_err(
+            |cause| match cause {
                 ComponentIndexProjectionError::Coordinates(cause) => cause,
-                ComponentIndexProjectionError::Storage { .. } => unreachable!("exact scratch extent"),
-            })?;
+                ComponentIndexProjectionError::Storage { .. } => {
+                    unreachable!("exact scratch extent")
+                }
+            },
+        )?;
         let mut local = vec![0; plan.local_count()];
-        plan.write(&mut local).expect("validated exact local destination");
+        plan.write(&mut local)
+            .expect("validated exact local destination");
         Ok(local)
     }
+}
+
+impl Clone for ComponentCoordinateMap {
+    fn clone(&self) -> Self {
+        self.clone_worker(None)
+            .expect("ordinary coordinate allocation")
+    }
+}
+fn controls(
+    funding: Option<&HostMetadataFunding>,
+    bytes: Option<usize>,
+) -> Result<(), HostMetadataFundingError> {
+    let bytes = bytes.ok_or(HostMetadataFundingError::Overflow)?;
+    if let Some(funding) = funding {
+        funding.reserve_metadata(bytes)?;
+    }
+    Ok(())
+}
+fn insert(
+    map: &mut Map<usize, usize>,
+    global: usize,
+    local: usize,
+    funding: Option<&HostMetadataFunding>,
+) -> Result<Option<usize>, HostMetadataFundingError> {
+    controls(funding, map.insertion_control_bytes(&global))?;
+    map.try_insert_with(global, local, |layout| {
+        controls(funding, Some(layout.size()))
+    })
+    .map_err(|error| match error {
+        TryInsertError::SizeOverflow => HostMetadataFundingError::Overflow,
+        TryInsertError::Funding(error) => error,
+    })
 }
 
 /// Invalid component coordinate declaration or mask selection.
@@ -299,24 +382,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_coordinate_copy_keeps_permuted_lookup_wire_identity_and_empty_owners() {
-        for source in [ComponentCoordinateMap::range(12, 3..8).unwrap(),
+    fn coordinate_clone_keeps_permuted_lookup_wire_identity_and_empty_owners() {
+        for source in [
+            ComponentCoordinateMap::range(12, 3..8).unwrap(),
             ComponentCoordinateMap::range(12, 8..8).unwrap(),
-            ComponentCoordinateMap::indices(12, vec![9,2,7]).unwrap(),
-            ComponentCoordinateMap::indices(12, vec![]).unwrap()] {
-            let n=source.copy_storage_elements();
-            let indices=Vec::with_capacity(n);let inverse=Vec::with_capacity(n);
-            let pointers=(indices.as_ptr(),inverse.as_ptr());
-            let prepared=source.copy_with_storage(indices,inverse).unwrap();
-            assert_eq!(prepared,source);
-            assert_eq!(serde_json::to_string(&prepared).unwrap(),serde_json::to_string(&source).unwrap());
-            for global in 0..=source.global_count() {assert_eq!(prepared.global_to_local(global),source.global_to_local(global));}
-            for local in 0..=source.local_count() {assert_eq!(prepared.local_to_global(local),source.local_to_global(local));}
-            if let Selection::Indices{indices}= &prepared.selection {assert_eq!(indices.as_ptr(),pointers.0);}
-            let Inverse::Prepared(inverse)= &prepared.inverse else{panic!("prepared inverse")};
-            assert_eq!(inverse.as_ptr(),pointers.1);
-            if n!=0 {assert_eq!(source.copy_with_storage(Vec::new(),Vec::with_capacity(n)).unwrap_err(),ComponentCoordinateCopyError::Capacity);}
-            assert_eq!(source.copy_with_storage(vec![0],Vec::new()).unwrap_err(),ComponentCoordinateCopyError::NonEmpty);
+            ComponentCoordinateMap::indices(12, vec![9, 2, 7]).unwrap(),
+            ComponentCoordinateMap::indices(12, vec![]).unwrap(),
+        ] {
+            let copied = source.clone();
+            assert_eq!(copied, source);
+            assert_eq!(
+                serde_json::to_string(&copied).unwrap(),
+                serde_json::to_string(&source).unwrap()
+            );
+            for global in 0..=source.global_count() {
+                assert_eq!(
+                    copied.global_to_local(global),
+                    source.global_to_local(global)
+                );
+            }
+            for local in 0..=source.local_count() {
+                assert_eq!(copied.local_to_global(local), source.local_to_global(local));
+            }
         }
     }
 
@@ -361,5 +448,108 @@ mod tests {
         let huge = ComponentCoordinateMap::partition_units(usize::MAX, 1, 0..1).unwrap();
         assert_eq!(huge.local_to_global(usize::MAX - 1), Some(usize::MAX - 1));
         assert_eq!(huge.local_to_global(usize::MAX), None);
+    }
+}
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+    use crate::HostMetadataAccount;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    #[derive(Debug)]
+    struct State {
+        calls: AtomicUsize,
+        stop: AtomicUsize,
+    }
+    #[derive(Debug)]
+    struct Account(Arc<State>);
+    impl HostMetadataAccount for Account {
+        fn reserve_metadata(&self, _: usize) -> Result<(), HostMetadataFundingError> {
+            let call = self.0.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                call <= self.0.stop.load(Ordering::SeqCst),
+                "producer reached after refusal"
+            );
+            if call == self.0.stop.load(Ordering::SeqCst) {
+                Err(HostMetadataFundingError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn account(stop: usize) -> (HostMetadataFunding, Arc<State>) {
+        let state = Arc::new(State {
+            calls: AtomicUsize::new(0),
+            stop: AtomicUsize::new(usize::MAX),
+        });
+        let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
+        state.calls.store(0, Ordering::SeqCst);
+        state.stop.store(stop, Ordering::SeqCst);
+        (funding, state)
+    }
+    #[test]
+    fn inverse_construction_preserves_original_validation_and_each_refusal() {
+        for indices in [vec![], vec![9, 2, 7], vec![2, 2], vec![4, 12]] {
+            let expected = ComponentCoordinateMap::indices(12, indices.clone());
+            let (funding, state) = account(usize::MAX);
+            let actual =
+                ComponentCoordinateMap::indices_with_funding(12, indices.clone(), &funding);
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => {
+                    assert_eq!(expected, actual);
+                    for global in 0..13 {
+                        assert_eq!(
+                            expected.global_to_local(global),
+                            actual.global_to_local(global)
+                        );
+                    }
+                }
+                (Err(expected), Err(ComponentCoordinateConstructionError::Coordinates(actual))) => {
+                    assert_eq!(expected, actual)
+                }
+                value => panic!("coordinate semantics changed: {value:?}"),
+            }
+            for stop in 0..state.calls.load(Ordering::SeqCst) {
+                let (funding, state) = account(stop);
+                assert!(matches!(
+                    ComponentCoordinateMap::indices_with_funding(12, indices.clone(), &funding),
+                    Err(ComponentCoordinateConstructionError::Funding(
+                        HostMetadataFundingError::Unavailable
+                    ))
+                ));
+                assert_eq!(state.calls.load(Ordering::SeqCst), stop + 1);
+            }
+        }
+    }
+    #[test]
+    fn source_clone_uses_one_inverse_representation_and_preserves_source_on_refusal() {
+        for source in [
+            ComponentCoordinateMap::range(12, 2..8).unwrap(),
+            ComponentCoordinateMap::indices(12, vec![]).unwrap(),
+            ComponentCoordinateMap::indices(12, vec![9, 2, 7]).unwrap(),
+        ] {
+            let original_wire = serde_json::to_string(&source).unwrap();
+            let (funding, state) = account(usize::MAX);
+            let copied = source.try_clone_with_funding(&funding).unwrap();
+            assert_eq!(original_wire, serde_json::to_string(&copied).unwrap());
+            assert_eq!(source, copied);
+            for stop in 0..state.calls.load(Ordering::SeqCst) {
+                let (funding, state) = account(stop);
+                let error = source.try_clone_with_funding(&funding).unwrap_err();
+                assert!(matches!(
+                    error,
+                    ComponentCoordinateConstructionError::Funding(
+                        HostMetadataFundingError::Unavailable
+                    )
+                ));
+                assert!(std::error::Error::source(&error)
+                    .unwrap()
+                    .is::<HostMetadataFundingError>());
+                assert_eq!(state.calls.load(Ordering::SeqCst), stop + 1);
+                assert_eq!(original_wire, serde_json::to_string(&source).unwrap());
+            }
+        }
     }
 }

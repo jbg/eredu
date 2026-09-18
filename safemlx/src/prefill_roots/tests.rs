@@ -242,3 +242,55 @@ fn prepared_roots_keep_filling_after_refusal_and_close_selected_stream() {
         }
     }
 }
+
+#[test]
+fn completed_root_retirement_keeps_append_debit_and_rejects_foreign_or_pending_roots() {
+    use crate::{Device, DeviceType, OriginalScopeObserver, PreparedSubmissionRecordQuota, Stream, SubmissionRetirement};
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+    let identity = Array::try_from_slice(&[2.0f32, -3.0, 7.0], &[3]).unwrap();
+    let unrelated = Array::try_from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+    let failure = PreparedPrefillFailure::try_new(()).unwrap().try_allocate().unwrap();
+    let graph = PreparedSubmissionGraphQuota::try_new(1 << 20, ()).unwrap().try_allocate().unwrap();
+    let records = PreparedSubmissionRecordQuota::try_new(1 << 20, ()).unwrap().try_allocate().unwrap();
+    let mut roots = PrefillRoots::new_retained(&runtime, 2, &graph, &failure).unwrap();
+    let mut scope = SubmissionScope::try_begin_retaining(PreparedSubmissionScopeOwner::try_new(()).unwrap()
+        .with_record_quota(records.clone()).with_graph_quota(graph.clone())).unwrap();
+    scope.enable_scoped_observation().unwrap();
+    scope.require_original_native_controls().unwrap();
+    roots.bind_scope(&scope).unwrap();
+    scope.enable_original_native_controls().unwrap();
+    let observer = OriginalScopeObserver::require_current().unwrap();
+    let parent = crate::transforms::async_eval_with_original_operation_event_on_stream([&identity], &observer, &stream).unwrap();
+    parent.synchronize().unwrap();
+    roots.append(&identity).unwrap();
+    {
+        let mut child = SubmissionScope::try_begin().unwrap();
+        assert!(matches!(roots.retire_completed_current(&identity), Err(PrefillRootsError::Refused(PrefillRootsCause::Domain))));
+        assert_eq!(roots.len(), 1);
+        child.seal();
+    }
+    assert!(roots.retire_completed_current(&unrelated).is_err());
+    assert_eq!(roots.len(), 1);
+    roots.retire_completed_current(&identity).unwrap();
+    assert!(roots.is_empty());
+    assert!(roots.retire_completed_current(&identity).is_err());
+    let pending = identity.add(&identity, &stream).unwrap();
+    roots.append(&pending).unwrap();
+    assert!(roots.retire_completed_current(&pending).is_err());
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots.append(&identity), Err(PrefillRootsCause::Capacity));
+    // Retiring one completed root never refunded its slot. Final completion
+    // still evaluates the remaining pending root through the same worker.
+    roots.complete_current_scope_on_stream(&stream).unwrap();
+    assert_eq!(pending.completed_in_original_scope(&observer).unwrap().as_slice::<f32>(), &[4.0, -6.0, 14.0]);
+    assert!(matches!(roots.retire_completed_current(&pending), Err(PrefillRootsError::Refused(PrefillRootsCause::Spent))));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !observer.progress().unwrap().1.is_settled() {
+        assert!(Instant::now() < deadline); std::thread::yield_now();
+    }
+    drop((parent, pending, roots));
+    assert_eq!(observer.retire_completed_records().unwrap(), SubmissionRetirement::CompleteSnapshot);
+    scope.seal();
+    drop((observer, scope, graph, records, failure));
+}

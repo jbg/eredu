@@ -23,7 +23,7 @@ struct Batch {
     envelope: SparseScalarEnvelope,
     // Finite source-derived lowering/index/error storage, prepaid before the
     // enclosing original quote seals. The counter cannot create native credit.
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(super) struct Edit {
     bank: RoutedUnitGeometry,
@@ -255,14 +255,14 @@ fn native_error_controls() -> Option<usize> {
         .checked_mul(4)?.checked_add(size_of::<NativeFailure>())?
         .checked_add(size_of::<FundedCaptureError<Failure>>())
 }
-fn prepaid(bytes: usize, context: &WorkspaceContext) -> Result<WorkspaceMetadataFunding, eredu_nn::Error> {
+fn prepaid(bytes: usize, context: &WorkspaceContext) -> Result<HostMetadataFunding, eredu_nn::Error> {
     let parent = context.metadata_funding().ok_or(WorkspaceMetadataError::Unqualified)?;
     let limit = bytes.checked_add(eredu_core::HostMetadataFunding::prepaid_control_bytes().ok_or(WorkspaceMetadataError::Overflow)?)
         .ok_or(WorkspaceMetadataError::Overflow)?;
-    context.charge_metadata(limit.checked_add(eredu_core::HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
+    context.charge_metadata(limit.checked_add(eredu_core::HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
         .ok_or(WorkspaceMetadataError::Overflow)?).ok_or(WorkspaceMetadataError::Overflow)?)?;
     eredu_core::HostMetadataFunding::from_prepaid(limit, eredu_core::HostPreparationAuthority::retain(parent))
-        .map(WorkspaceMetadataFunding::from).map_err(WorkspaceMetadataError::from).map_err(eredu_nn::Error::from)
+        .map(HostMetadataFunding::from).map_err(WorkspaceMetadataError::from).map_err(eredu_nn::Error::from)
 }
 pub(super) fn control_bytes() -> Option<usize> {
     let frames = [size_of::<Edit>(), size_of::<Batch>(), size_of::<Option<Batch>>(),
@@ -274,9 +274,11 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<[Option<u64>; 2]>(), size_of::<Option<usize>>(),
         size_of::<Result<Option<usize>, eredu_runtime::intervention::RoutedInterventionLoweringError>>(),
         size_of::<Result<(Option<WorkspaceTensor>, CaptureNativePopulation), eredu_nn::Error>>(),
-        size_of::<Result<WorkspaceMetadataFunding, eredu_nn::Error>>(),
+        size_of::<Result<HostMetadataFunding, eredu_nn::Error>>(),
         SparseScalarEnvelope::control_bytes()?, native_error_controls()?,
         eredu_runtime::intervention::routed_intervention_full_component_count_control_bytes()?,
     ];
     frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

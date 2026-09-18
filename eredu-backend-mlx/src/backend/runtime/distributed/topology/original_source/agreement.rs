@@ -19,7 +19,7 @@ struct PreparedNativeAgreement<'a> {
     runtime:&'a PreparedInputRuntime,
     backing:usize,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 pub(crate) struct PreparedOriginalAgreement<'a>{kind:PreparedAgreementKind<'a>}
 enum PreparedAgreementKind<'a>{Native(PreparedNativeAgreement<'a>),Chain(chain::PreparedStatusAgreement<'a>)}
@@ -143,8 +143,8 @@ impl PreparedNativeAgreement<'_> {
         Ok((result,completion.into()))
     }
 }
-fn overflow()->Error {Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
-fn reserve(funding:&WorkspaceMetadataFunding,bytes:&[usize])->Result<(),Error> {
+fn overflow()->Error {Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
+fn reserve(funding:&HostMetadataFunding,bytes:&[usize])->Result<(),Error> {
     funding.reserve_metadata(bytes.iter().copied().try_fold(std::mem::size_of_val(bytes),usize::checked_add)
         .ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)
 }

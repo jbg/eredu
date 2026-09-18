@@ -50,7 +50,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
                 usize::try_from(left.elements()?)?,usize::try_from(right.elements()?)?,false) else{return Ok(None)};
             // Same U8 dtype makes both ordinary AsType calls identity. The
             // shared Concatenate owns exactly two copy jobs and one output.
-            if source.backing_births()!=1||population.copy(source,2).is_none(){return Ok(None);}
+            if source.backing_births()!=1||population.concatenate(source,2).is_none(){return Ok(None);}
         }
         3=>{
             if !basic::is_static_slice(operation){return Err(MlxWorkspaceFactError::descriptor("CPU byte slice coordinates differ"));}
@@ -60,7 +60,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
             alias=Some(0);
             if input.shape()==output.shape(){shells=1;}
             else {
-                let Some(source)=OperationEvent::cpu_slice_layout(rank,false) else{return Ok(None)};
+                let Some(source)=OperationEvent::cpu_slice_layout(rank, false, false) else{return Ok(None)};
                 if source.backing_births()!=0||population.copy(source,1).is_none(){return Ok(None);}
             }
         }

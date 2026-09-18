@@ -63,6 +63,9 @@ impl eredu_nn::Tensor for ReferenceTensor {
     fn full_i32(_: i32, shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
+    fn full_u32(_: u32, shape: &[i32], _: &()) -> Result<Self, Error> {
+        Ok(Self(shape.to_vec()))
+    }
     fn add(&self, _: &Self, _: &()) -> Result<Self, Error> {
         Ok(self.clone())
     }
@@ -271,11 +274,11 @@ impl eredu_nn::Tensor for ReferenceTensor {
     }
 }
 
-fn visit_parameter<'a, V>(metadata: &ParameterMetadata, value: &'a ReferenceTensor, visitor: &mut V)
+fn visit_parameter<'a, V>(metadata: &'a ParameterMetadata, value: &'a ReferenceTensor, visitor: &mut V)
 where
-    V: ParameterVisitor<'a, ReferenceTensor>,
+    V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
 {
-    visitor.visit(metadata.clone(), value);
+    visitor.parameter(metadata.as_view(), value);
 }
 
 fn visit_parameter_mut<'a, V>(
@@ -285,7 +288,7 @@ fn visit_parameter_mut<'a, V>(
 ) where
     V: ParameterVisitorMut<'a, ReferenceTensor>,
 {
-    visitor.visit_mut(metadata.clone(), value);
+    visitor.visit_mut(metadata.as_view(), value);
 }
 
 #[derive(Debug, Clone)]
@@ -299,20 +302,21 @@ struct ReferenceLinear {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceLinear {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, ReferenceTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit_parameter(&self.metadata, &self.weight, visitor);
         if let Some((bias, metadata)) = &self.bias {
             visit_parameter(metadata, bias, visitor);
         }
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
@@ -439,17 +443,18 @@ struct ReferenceEmbedding {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceEmbedding {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, ReferenceTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit_parameter(&self.metadata, &self.weight, visitor);
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
@@ -494,17 +499,18 @@ struct ReferenceNorm {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceNorm {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, ReferenceTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
     {
+ let mut __source_result = Ok(());
+
         visit_parameter(&self.metadata, &self.weight, visitor);
-    }
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
@@ -526,16 +532,17 @@ impl NormalizationOperator<ReferenceTensor> for ReferenceNorm {
 struct ReferenceRotary;
 
 impl Parameterized<ReferenceTensor> for ReferenceRotary {
-    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
-        eredu_nn::visit_parameter_values(self, visitor);
-        true
-    }
 
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
+
+    fn visit_parameter_sources<'a, V>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
     where
-        V: ParameterVisitor<'a, ReferenceTensor>,
+        V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
     {
-    }
+ let mut __source_result = Ok(());
+
+
+ __source_result
+}
     fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
@@ -574,26 +581,27 @@ struct ReferenceHyperHead {
 macro_rules! impl_reference_hyper_parameters {
     ($name:ty) => {
         impl Parameterized<ReferenceTensor> for $name {
-            fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
-                eredu_nn::visit_parameter_values(self, visitor);
-                true
-            }
 
-            fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+
+            fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
             where
-                V: ParameterVisitor<'a, ReferenceTensor>,
+                V: eredu_nn::ParameterSourceVisitor<'a, ReferenceTensor>,
             {
+ let mut __source_result = Ok(());
+
                 for (value, metadata) in &self.parameters {
-                    visitor.visit(metadata.clone(), value);
+                    visitor.parameter(metadata.as_view(), value);
                 }
-            }
+
+ __source_result
+}
 
             fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
             where
                 V: ParameterVisitorMut<'a, ReferenceTensor>,
             {
                 for (value, metadata) in &mut self.parameters {
-                    visitor.visit_mut(metadata.clone(), value);
+                    visitor.visit_mut(metadata.as_view(), value);
                 }
             }
 

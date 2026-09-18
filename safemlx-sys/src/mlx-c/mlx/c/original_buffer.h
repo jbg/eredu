@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "mlx/c/array.h"
+#include "mlx/c/host_transfer.h"
 #include "mlx/c/prepared_input.h"
 #include "mlx/c/submission.h"
 #ifdef __cplusplus
@@ -67,13 +68,36 @@ unsigned mlx_immutable_source_array_info(uint32_t* kind,
 unsigned mlx_immutable_source_array_attach(mlx_array,
     const mlx_original_buffer_info*, void* node, void* payload, void (*release)(void*));
 
+// Positive immutable Host constructor provenance. Neither kind authorizes a birth.
+typedef struct mlx_immutable_host_transfer_info {
+  mlx_original_buffer_info backing;
+  bool prepared_source;
+} mlx_immutable_host_transfer_info;
+unsigned mlx_immutable_host_transfer_inspect(mlx_immutable_host_transfer_info*, mlx_host_transfer_buffer);
+unsigned mlx_immutable_host_transfer_attach(mlx_host_transfer_buffer,
+    const mlx_immutable_host_transfer_info*, void* node, void* payload, void (*release)(void*));
+size_t mlx_immutable_host_transfer_control_bytes(void);
+
 // Settled Host-transfer aliases retain their separate Host allocation namespace.
 // No source account is granted: publication requires the existing exact prepaid
 // immutable source. Every failed attachment preserves both exclusive nodes.
-unsigned mlx_host_transfer_array_alias_info(mlx_original_buffer_info*, mlx_array);
+unsigned mlx_host_transfer_array_alias_info(mlx_immutable_host_transfer_info*, mlx_array);
 unsigned mlx_host_transfer_array_alias_attach(mlx_array,
-    const mlx_original_buffer_info*, void* node, void* payload, void (*release)(void*));
+    const mlx_immutable_host_transfer_info*, void* node, void* payload, void (*release)(void*));
 size_t mlx_host_transfer_array_alias_control_bytes(void);
+
+// Exact completed native Data view of a certified Host-transfer backing. The
+// nonrecycled Data generation distinguishes independent reload wrappers of the
+// same immutable Host allocation. A view attachment follows this Data and its
+// shared views/recovery pins, not unrelated owners of the immutable Host buffer.
+typedef struct mlx_host_transfer_view_info {
+  mlx_original_buffer_info backing;
+  uint64_t view_identity;
+} mlx_host_transfer_view_info;
+unsigned mlx_host_transfer_array_view_info(mlx_host_transfer_view_info*, mlx_array);
+unsigned mlx_host_transfer_array_view_attach(mlx_array,
+    const mlx_host_transfer_view_info*, void* node, void* payload, void (*release)(void*));
+size_t mlx_host_transfer_array_view_control_bytes(void);
 
 // Pure owner/transport layouts; excludes physical capacity and Graph births.
 unsigned mlx_original_buffer_layout_for(mlx_original_buffer_layout*);

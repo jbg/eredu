@@ -73,7 +73,7 @@ impl<'de> Deserialize<'de> for ModelWrapper {
     where
         D: Deserializer<'de>,
     {
-        ModelSeed(crate::ModelCachePolicy::Legacy).deserialize(deserializer)
+        ModelSeed(crate::ModelCachePolicy::default()).deserialize(deserializer)
     }
 }
 
@@ -104,18 +104,7 @@ impl<'de> DeserializeSeed<'de> for ModelSeed {
         #[serde(untagged)]
         pub enum ModelHelper {
             Tagged(Tagged),
-            Legacy(serde_json::Value),
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        pub enum ModelUntagged {
-            BPE(BPE),
-            // WordPiece must stay before WordLevel here for deserialization (for retrocompatibility
-            // with the versions not including the "type"), since WordLevel is a subset of WordPiece
-            WordPiece(WordPiece),
-            WordLevel(WordLevel),
-            Unigram(Unigram),
+            Untagged(serde_json::Value),
         }
 
         let helper = ModelHelper::deserialize(deserializer)?;
@@ -136,33 +125,22 @@ impl<'de> DeserializeSeed<'de> for ModelSeed {
                         .map_err(serde::de::Error::custom)?,
                 ),
             },
-            ModelHelper::Legacy(value) => {
-                if self.0 == crate::ModelCachePolicy::NoModelCaches {
-                    // Same legacy probe order. Each model is constructed with
-                    // its policy, never constructed cached and converted later.
-                    if let Ok(model) = BPE::deserialize_with_cache_policy(&value, self.0) {
-                        return Ok(ModelWrapper::BPE(model));
-                    }
-                    if let Ok(model) = WordPiece::deserialize(&value) {
-                        return Ok(ModelWrapper::WordPiece(model));
-                    }
-                    if let Ok(model) = WordLevel::deserialize(&value) {
-                        return Ok(ModelWrapper::WordLevel(model));
-                    }
-                    if let Ok(model) = Unigram::deserialize_with_cache_policy(&value, self.0) {
-                        return Ok(ModelWrapper::Unigram(model));
-                    }
-                    return Err(serde::de::Error::custom(
-                        "data did not match any variant of untagged enum ModelUntagged",
-                    ));
+            ModelHelper::Untagged(value) => {
+                // Untagged input is a supported format. All probes receive the
+                // same cache policy before construction, in model-specificity order.
+                if let Ok(model) = BPE::deserialize_with_cache_policy(&value, self.0) {
+                    return Ok(ModelWrapper::BPE(model));
                 }
-                let untagged = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-                match untagged {
-                    ModelUntagged::BPE(bpe) => ModelWrapper::BPE(bpe),
-                    ModelUntagged::WordPiece(bpe) => ModelWrapper::WordPiece(bpe),
-                    ModelUntagged::WordLevel(bpe) => ModelWrapper::WordLevel(bpe),
-                    ModelUntagged::Unigram(bpe) => ModelWrapper::Unigram(bpe),
+                if let Ok(model) = WordPiece::deserialize(&value) {
+                    return Ok(ModelWrapper::WordPiece(model));
                 }
+                if let Ok(model) = WordLevel::deserialize(&value) {
+                    return Ok(ModelWrapper::WordLevel(model));
+                }
+                if let Ok(model) = Unigram::deserialize_with_cache_policy(&value, self.0) {
+                    return Ok(ModelWrapper::Unigram(model));
+                }
+                return Err(serde::de::Error::custom("unrecognized tokenizer model"));
             }
         })
     }
@@ -245,8 +223,8 @@ impl ModelWrapper {
         match self {
             Self::BPE(model) => ModelIds::Bpe(model.decode_ids()),
             Self::WordPiece(model) => ModelIds::Map(model.decode_ids()),
-            Self::WordLevel(model) => ModelIds::Map(model.decode_ids()),
-            Self::Unigram(model) => ModelIds::Map(model.decode_ids()),
+            Self::WordLevel(model) => ModelIds::Table(model.decode_ids()),
+            Self::Unigram(model) => ModelIds::Table(model.decode_ids()),
         }
     }
 
@@ -417,6 +395,7 @@ mod tests {
 }
 
 pub(crate) enum ModelIds<'a> {
+    Table(std::iter::Copied<hashbrown::hash_map::Values<'a, String, u32>>),
     Bpe(bpe::BpeIds<'a>),
     Map(std::iter::Copied<std::collections::hash_map::Values<'a, String, u32>>),
 }
@@ -426,6 +405,7 @@ impl Iterator for ModelIds<'_> {
         match self {
             Self::Bpe(i) => i.next(),
             Self::Map(i) => i.next(),
+            Self::Table(i) => i.next(),
         }
     }
 }

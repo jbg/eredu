@@ -33,7 +33,7 @@ impl WorkspaceMechanisms for Facts {
         {
             return Ok(None);
         }
-        let alias = matches!(op.kind, WorkspaceOperationKind::Index { .. });
+        let alias = matches!(op.kind, WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. });
         Ok(Some(WorkspaceOperationBound {
             outputs: op
                 .outputs

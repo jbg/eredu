@@ -517,8 +517,7 @@ fn prepared_capture_checkpoint_authenticates_same_run_and_derived_child_not_equa
     assert_eq!(run.cumulative_usage(), usage);
     assert!(!child
         .shared_plan_source()
-        .unwrap()
-        .same_storage(run.shared_plan_source().unwrap()));
+        .same_storage(run.shared_plan_source()));
 }
 
 #[test]
@@ -682,11 +681,7 @@ trait RetainedDrain {
 }
 impl RetainedDrain for CaptureSession {
     fn take_test_frame(&mut self) -> Option<RetainedFrame> {
-        assert!(
-            self.take_step().is_none(),
-            "raw drain cannot consume retained custody"
-        );
-        self.take_ordinary_shared_step().map(RetainedFrame)
+        self.take_shared_step().map(RetainedFrame)
     }
 }
 mod frame_custody;

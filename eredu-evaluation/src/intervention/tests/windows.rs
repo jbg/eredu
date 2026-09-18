@@ -144,7 +144,7 @@ fn session(stage: RoutingScoreStage) -> CaptureSession {
     }
     .admit_invocations(&discovery, bounds, "session")
     .unwrap();
-    let mut session = CaptureSession::new(capture);
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture));
     session.enable_interventions(plan, Arc::new(Facts)).unwrap();
     session
 }
@@ -244,7 +244,7 @@ fn run(
         ids.extend_from_slice(&selected.group_indices().values);
         weights.extend_from_slice(&selected.coefficients().values);
         session.finish_interventions().unwrap();
-        let step = session.take_step().unwrap();
+        let step = session.take_shared_step().unwrap().as_step().clone();
         assert_eq!(
             step.interventions[0].outcome,
             if split && (a == 0 || a == 4) {

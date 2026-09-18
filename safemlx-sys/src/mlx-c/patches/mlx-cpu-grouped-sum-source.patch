@@ -1,0 +1,139 @@
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -25,6 +25,8 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+       if(rows!=1)return false;break;
+     case ReductionEvalKind::Float32Rows:break;
++    case ReductionEvalKind::Float32StridedRows:
++      if(rank<2||width<=1)return false;break;
+     case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
+       if(width<=1)return false;break;
+     case ReductionEvalKind::Float32All:if(rank<2||rows!=1||width<=1)return false;break;
+@@ -46,7 +48,12 @@
+       sizeof(size_t)*15+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+sizeof(Dtype)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+-  if(!add(value.named_control_bytes,controls))return false;
++  // The nonfinal source additionally checks its one selected axis and the
++  // compact physical stride product before entering the same Reduce task.
++  const size_t nonfinal_controls=kind==ReductionEvalKind::Float32StridedRows
++      ? sizeof(size_t)*3+sizeof(int)+sizeof(bool)*2 : 0;
++  if(!add(value.named_control_bytes,controls)||
++      !add(value.named_control_bytes,nonfinal_controls))return false;
+   out=value;return true;
+ }
+ bool reduction_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+@@ -103,6 +110,24 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
+     selected=ReductionEvalKind::Float32All;
++  } else if(kind==Reduce::Sum&&rank>1&&axes.size()==1&&
++      axes[0]>=0&&axes[0]<int(rank)-1) {
++    // An exact compact, nonfinal axis has one nonunit plan entry. It selects
++    // ContiguousStridedReduce, or ContiguousReduce when the suffix is all
++    // singletons. Neither branch enters nd_loop or scratch construction.
++    if(input.dtype()!=float32||output.dtype()!=float32||
++        input.itemsize()!=sizeof(float)||output.itemsize()!=sizeof(float)||
++        !input.flags().row_contiguous||span!=elements)return false;
++    const size_t selected_axis=size_t(axes[0]);
++    width=size_t(input.shape(selected_axis));rows=elements/width;
++    if(width<=1||output.size()!=rows)return false;
++    size_t compact=1;
++    for(size_t axis=rank;axis--;) {
++      if((input.shape(axis)>1&&size_t(input.strides()[axis])!=compact)||
++          output.shape(axis)!=(axis==selected_axis?1:input.shape(axis))||
++          !product(compact,size_t(input.shape(axis)),compact))return false;
++    }
++    selected=ReductionEvalKind::Float32StridedRows;
+   } else if(kind==Reduce::Sum||kind==Reduce::Min||kind==Reduce::Max) {
+     if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=float32||
+         output.itemsize()!=sizeof(float)||
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -657,11 +657,11 @@
+   }
+ };
+ namespace cpu {
+-// Exact typed locals of the existing contiguous half SumReduce worker.
++// Exact typed locals of the existing contiguous SumReduce worker.
+ // A complete last axis produces ContiguousAllReduce or a one-row
+ // ContiguousReduce plan, so neither strided_reduce nor nd_loop is reachable.
+ template <typename T>
+-constexpr size_t half_row_sum_controls() noexcept {
++constexpr size_t contiguous_row_sum_controls() noexcept {
+   constexpr int lanes=simd::max_size<T>;
+   return sizeof(ReductionPlan)*2+sizeof(Shape)*2+sizeof(Strides)*2+
+       sizeof(AxisView)*3+sizeof(SumReduce)*3+sizeof(simd::Simd<T,lanes>)*6+
+@@ -676,7 +676,8 @@
+     case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:
+     case ReductionEvalKind::Float32All:case ReductionEvalKind::Uint32FlatSum:
+     case ReductionEvalKind::Float32FlatMaximum:case ReductionEvalKind::Float32MaximumRows:
+-    case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:break;
++    case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
++    case ReductionEvalKind::Float32StridedRows:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+@@ -687,6 +688,7 @@
+   // early F32 sum cascade, a general unit-stride final row, or a last-axis
+   // F32 minimum whose reduction plan has one contiguous row. The exact general
+   // Sum plan is built directly by the shared get_reduction_plan worker.
++  // The nonfinal compact source has one strided (or unit-stride) plan entry.
+   // None enters nd_loop/std::function or scratch vectors.
+   // Minimum preserves the existing SIMD comparison, NaN and tail order.
+   const size_t cascade=sizeof(float[4][4][4])+sizeof(size_t)*12+sizeof(float);
+@@ -719,6 +721,16 @@
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(float)*6+
+       sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*12+sizeof(size_t)*8+
+       sizeof(Shape::const_iterator)*2+sizeof(Strides::const_iterator)*2;
++  // The actual one-axis ContiguousStridedReduce branch initializes each
++  // output suffix with fill_n and calls strided_reduce<float,float,SumReduce>.
++  // Count the plan/inline shape owners, argument/local pointers and counters,
++  // SIMD load/accumulate/store values, and scalar tail separately. All storage
++  // is fixed; the reduction width changes iterations, not these destinations.
++  const size_t strided_rows=sizeof(ReductionPlan)*2+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(AxisView)*3+sizeof(SumReduce)*3+sizeof(simd::Simd<float,minimum_lanes>)*6+
++      sizeof(float)*6+sizeof(const float*)*3+sizeof(float*)*5+
++      sizeof(int)*8+sizeof(size_t)*8;
++  const size_t nonfinal_rows=std::max(strided_rows,contiguous_row_sum_controls<float>());
+   // Same complete-axis integer SumReduce body: uint32 input loads, int32
+   // accumulator/output representation as selected by reduce_dispatch_sum_prod.
+   // No value rewrite, scalar download, general nd_loop or alternate kernel.
+@@ -730,19 +742,20 @@
+   const size_t maximum=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(MaxReduce)*3+
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(simd::Simd<bool,minimum_lanes>)*2+
+       sizeof(float)*6+sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
+-  const size_t half_rows=kind==ReductionEvalKind::Float16Rows?half_row_sum_controls<float16_t>():
+-      kind==ReductionEvalKind::Bfloat16Rows?half_row_sum_controls<bfloat16_t>():0;
++  const size_t half_rows=kind==ReductionEvalKind::Float16Rows?contiguous_row_sum_controls<float16_t>():
++      kind==ReductionEvalKind::Bfloat16Rows?contiguous_row_sum_controls<bfloat16_t>():0;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+       half_rows?half_rows:kind==ReductionEvalKind::Float32Rows?std::max(cascade,sum_rows):
+           kind==ReductionEvalKind::Float32MinimumRows?minimum:
+           kind==ReductionEvalKind::Float32MaximumRows?std::max(maximum_rows,maximum):
+           kind==ReductionEvalKind::Float32All?sum_all:
++          kind==ReductionEvalKind::Float32StridedRows?nonfinal_rows:
+           kind==ReductionEvalKind::Uint32FlatSum?uint_sum:
+           kind==ReductionEvalKind::Float32FlatMaximum?maximum:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)+sizeof(strided_rows)+sizeof(nonfinal_rows)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;

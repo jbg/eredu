@@ -5,17 +5,19 @@ use eredu_core::{
     HostPreparationAuthority, SpeculativeBuffer, SharedBackendFailure, BackendFailure, BackendFailureKind,
     generation::{SemanticEvent, SemanticText},
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_text::semantic_channels::{self as channels, ChannelKind, Next, State};
 use std::mem::{size_of, size_of_val};
 use channels::JsonFrame;
+use channels::tagged::{TaggedCall, TaggedFrame};
+mod tagged;
 use tool_call::Call;
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error(transparent)]
     Tool(#[from] SharedBackendFailure),
     #[error(transparent)]
-    Funding(#[from] WorkspaceMetadataFundingError),
+    Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Buffer(#[from] eredu_core::SpeculativeBufferAllocationError),
     #[error(transparent)]
@@ -35,7 +37,7 @@ enum Cause {
 pub struct OriginalSemanticChannelParserError {
     #[source]
     cause: Cause,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalSemanticChannelParserError {
     pub(super) fn into_output(self) -> eredu_core::SpeculativeOutputError {
@@ -67,6 +69,8 @@ pub struct OriginalSemanticChannelParser {
     pending: SpeculativeBuffer<u8>,
     events: SpeculativeBuffer<SemanticEvent>,
     call: Option<Call>,
+    tagged: Option<TaggedCall>,
+    tagged_authority: HostPreparationAuthority,
     tool_index: usize,
     used: usize,
     fed: usize,
@@ -75,11 +79,12 @@ pub struct OriginalSemanticChannelParser {
     ended: bool,
     failed: bool,
     source: OriginalSemanticChannelSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 #[derive(Debug, Clone, Copy)]
 enum Cursor {
     Tool(JsonFrame),
+    Tagged(TaggedFrame),
     Prefilled(ChannelKind),
     Outside,
     Channel(ChannelKind),
@@ -94,7 +99,7 @@ impl Cursor {
     }
     fn kind(self) -> Option<ChannelKind> {
         match self {
-            Self::Tool(_) => None,
+            Self::Tool(_) | Self::Tagged(_) => None,
             Self::Outside => Some(ChannelKind::Text),
             Self::Prefilled(k) | Self::Channel(k) => Some(k),
         }
@@ -110,7 +115,7 @@ impl Cursor {
             ChannelKind::Text => program.text_channel.expect("retained text channel").suffix,
         };
         match self {
-            Self::Tool(_) => unreachable!("tool state uses the shared JSON worker"),
+            Self::Tool(_) | Self::Tagged(_) => unreachable!("tool state uses the shared JSON worker"),
             Self::Outside => State::Outside,
             Self::Prefilled(kind) => State::Prefilled {
                 kind,
@@ -135,6 +140,7 @@ impl OriginalSemanticChannelParser {
             channels::control_bytes()?,
             channels::json_frame_control_bytes()?,
             tool::control_bytes()?,
+            tagged::controls()?,
             size_of::<Option<Call>>(), size_of::<JsonFrame>(),
             OriginalSemanticChannelSource::control_bytes()?,
             size_of::<Self>(),
@@ -146,7 +152,7 @@ impl OriginalSemanticChannelParser {
             size_of::<(
                 &OriginalSemanticChannelSource,
                 usize,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
             size_of::<(&mut Self, &str)>(),
             size_of::<std::str::Utf8Error>(),
@@ -164,16 +170,16 @@ impl OriginalSemanticChannelParser {
     }
     fn buffer<T>(
         capacity: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<SpeculativeBuffer<T>, Cause> {
         let bytes = SpeculativeBuffer::<T>::retained_control_bytes(capacity)
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .and_then(|n| n.checked_add(size_of::<Result<SpeculativeBuffer<T>, Cause>>()))
-            .and_then(|n| n.checked_add(size_of::<(usize, &WorkspaceMetadataFunding)>()))
+            .and_then(|n| n.checked_add(size_of::<(usize, &HostMetadataFunding)>()))
             .ok_or(Cause::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(SpeculativeBuffer::try_new_retained(
@@ -187,7 +193,7 @@ impl OriginalSemanticChannelParser {
     pub fn prepare(
         source: &OriginalSemanticChannelSource,
         input_bytes: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalSemanticChannelParserError> {
         let retain = |cause| OriginalSemanticChannelParserError {
             cause,
@@ -201,7 +207,7 @@ impl OriginalSemanticChannelParser {
     fn create(
         source: &OriginalSemanticChannelSource,
         input_bytes: usize,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Cause> {
         let mut pending = Self::buffer(input_bytes, funding)?;
         pending
@@ -212,6 +218,8 @@ impl OriginalSemanticChannelParser {
             pending,
             events,
             call: None,
+            tagged: None,
+            tagged_authority: HostPreparationAuthority::unmanaged(),
             tool_index: 0,
             used: 0,
             fed: 0,
@@ -248,7 +256,7 @@ impl OriginalSemanticChannelParser {
         let bytes = SemanticText::retained_control_bytes(count)
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .ok_or(Cause::Overflow)?;
@@ -270,6 +278,10 @@ impl OriginalSemanticChannelParser {
         loop {
             if let Cursor::Tool(frame) = self.state {
                 if self.process_tool(frame)? { return Ok(()); }
+                continue;
+            }
+            if let Cursor::Tagged(frame) = self.state {
+                if self.process_tagged(frame)? { return Ok(()); }
                 continue;
             }
             let pending = std::str::from_utf8(&self.pending[..self.used])
@@ -294,9 +306,10 @@ impl OriginalSemanticChannelParser {
                 match next {
                     Ok(state) => self.state = state,
                     Err(()) => {
-                        let tools = self.source.json_tools().ok_or(Cause::ToolPayload)?;
                         if self.source.tool_validation().is_none() { return Err(Cause::ToolPayload); }
-                        self.state = Cursor::Tool(JsonFrame::after_channel(tools));
+                        self.state = if let Some(tools) = self.source.json_tools() { Cursor::Tool(JsonFrame::after_channel(tools)) }
+                        else if let Some(tools) = self.source.tagged_tools() { Cursor::Tagged(TaggedFrame::after_channel(tools)) }
+                        else { return Err(Cause::ToolPayload); };
                     },
                 }
             }
@@ -345,7 +358,12 @@ impl OriginalSemanticChannelParser {
                 Some(kind) => self.emit(kind, self.used),
                 // Same ordinary finish semantics: an incomplete JSON envelope
                 // produces no fabricated ToolCallEnd or visible text.
-                None => Ok(()),
+                None => {
+                    if matches!(self.state, Cursor::Tagged(TaggedFrame::Payload | TaggedFrame::AfterPayload))
+                        || (matches!(self.state, Cursor::Tagged(TaggedFrame::AfterEnvelope)) && self.used != 0) {
+                        Err(self.tool_failure(tool::ToolCause::Incomplete))
+                    } else { Ok(()) }
+                },
             });
         self.ended = true;
         self.failed = result.is_err();
@@ -364,6 +382,7 @@ impl OriginalSemanticChannelParser {
         let parts = [
             Self::frames()?,
             self.call.as_ref().map_or(Some(0), Call::copy_bytes)?,
+            self.tagged.as_ref().map_or(Some(0), TaggedCall::copy_bytes)?,
             SpeculativeBuffer::<u8>::retained_control_bytes(self.limit)?,
             SpeculativeBuffer::<SemanticEvent>::retained_control_bytes(self.limit.checked_add(1)?)?,
         ];
@@ -374,7 +393,7 @@ impl OriginalSemanticChannelParser {
     /// Independent mutable state, charged to the supplied original metadata account.
     pub fn copy(
         &self,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalSemanticChannelParserError> {
         let retain = |cause| OriginalSemanticChannelParserError {
             cause,
@@ -384,7 +403,7 @@ impl OriginalSemanticChannelParser {
             .copy_bytes()
             .and_then(|n| {
                 n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    WorkspaceMetadataFunding,
+                    HostMetadataFunding,
                 >()?)
             })
             .ok_or_else(|| retain(Cause::Overflow))?;
@@ -416,13 +435,18 @@ impl OriginalSemanticChannelParser {
                     .try_extend(self.events.iter().cloned())
                     .map_err(|_| Cause::Capacity)?;
             }
-            let call = self.call.as_ref().map(|call| call.copy_prepaid(host, &self.funding))
+            let call = self.call.as_ref().map(|call| call.copy_prepaid(host.clone(), &self.funding))
                 .transpose().map_err(|cause| tool::retained(tool::ToolCause::Call(cause),
-                    SpeculativeBuffer::default(), None, &self.source, &self.funding))?;
+                    SpeculativeBuffer::default(), None, None, HostPreparationAuthority::unmanaged(), &self.source, &self.funding))?;
+            let tagged = self.tagged.as_ref().map(tagged::copy_prepaid).transpose()
+                .map_err(|cause| tool::retained(tool::ToolCause::JsonAllocation(cause),
+                    SpeculativeBuffer::default(), None, None, HostPreparationAuthority::unmanaged(), &self.source, &self.funding))?;
             Ok(Self {
                 pending,
                 events,
                 call,
+                tagged,
+                tagged_authority: host,
                 tool_index: self.tool_index,
                 used: self.used,
                 fed: self.fed,

@@ -8,7 +8,7 @@ use eredu_runtime::capture::partition::{PartitionCaptureContiguousProducer,
     PartitionPrefillCaptureGeometry, PartitionInvocationCaptureGeometry, PreparedPartitionContiguousSource};
 use eredu_runtime::working_memory::{PartitionFragmentHostPlan, PreparedPartitionFragmentHostFunding,
     WorkingMemoryReservation};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 
 #[derive(Debug)]
 struct NativeRow {
@@ -50,7 +50,7 @@ pub(in super::super) struct HostAdmission {
     geometry: InferenceGeometry,
     bytes: u64,
     source: SharedCapturePlan,
-    metadata: WorkspaceMetadataFunding,
+    metadata: HostMetadataFunding,
 }
 /// One original fragment Host owner and its exact architecture-derived source.
 #[derive(Debug)]
@@ -66,11 +66,11 @@ pub(in super::super) struct HostRows {
     frames: Vec<Frame<HostRow>>,
     source: SharedCapturePlan,
     geometry: InferenceGeometry,
-    _metadata: WorkspaceMetadataFunding,
+    _metadata: HostMetadataFunding,
 }
 
 fn overflow() -> Error { memory(WorkingMemoryError::Overflow) }
-fn copy(values: &[u64], metadata: &WorkspaceMetadataFunding) -> Result<Vec<u64>, Error> {
+fn copy(values: &[u64], metadata: &HostMetadataFunding) -> Result<Vec<u64>, Error> {
     let mut output = metadata.metadata_vec(values.len())?;
     output.extend_from_slice(values);
     Ok(output)
@@ -101,10 +101,10 @@ fn controls() -> Option<usize> {
         size_of::<Vec<Option<Prototype>>>(), size_of::<Vec<Option<HostRow>>>(),
         size_of::<Vec<NativeRow>>(), size_of::<Vec<PartitionCaptureContiguousProducer>>(),
         size_of::<Vec<PartitionCaptureFragmentGeometry<'_>>>(), size_of::<Option<Vec<u64>>>(),
-        size_of::<(&MlxModelSession,&SharedCapturePlan,InferenceGeometry,u64,&WorkspaceMetadataFunding)>(),
-        size_of::<(&[u64],&WorkspaceMetadataFunding)>(),
+        size_of::<(&MlxModelSession,&SharedCapturePlan,InferenceGeometry,u64,&HostMetadataFunding)>(),
+        size_of::<(&[u64],&HostMetadataFunding)>(),
         size_of::<(HostAdmission,&WorkingMemoryFundingRun,&WorkingMemoryReservation)>(),
-        size_of::<(HostRow,&SharedCapturePlan,usize,Option<WorkspaceFloatingType>,&WorkspaceMetadataFunding)>(),
+        size_of::<(HostRow,&SharedCapturePlan,usize,Option<WorkspaceFloatingType>,&HostMetadataFunding)>(),
         size_of::<(&mut HostRows,&SharedCapturePlan,InferenceGeometry,u64)>(),
         size_of::<std::slice::Iter<'_,eredu_core::capture::CaptureSelection>>(),
         size_of::<std::slice::Iter<'_,NativeRow>>(),size_of::<std::vec::IntoIter<Option<Prototype>>>(),
@@ -119,10 +119,10 @@ fn controls() -> Option<usize> {
 
 impl HostAdmission {
     pub(in super::super) fn prepare(session:&MlxModelSession,source:&SharedCapturePlan,
-        geometry:InferenceGeometry,first_prediction:u64,metadata:&WorkspaceMetadataFunding)
+        geometry:InferenceGeometry,first_prediction:u64,metadata:&HostMetadataFunding)
         ->Result<Option<Self>,Error> {
         let Some(distributed)=session.payload.distributed.as_ref() else{return Ok(None)};
-        let loaded=session.partition_capture.get().and_then(|v|v.as_ref().ok()).ok_or_else(unknown)?;
+        let loaded=session.partition_capture_source().ok_or_else(unknown)?;
         metadata.reserve_metadata(controls().ok_or_else(overflow)?)?;
         let admission=source.admission();
         if first_prediction>=admission.request().max_predictions{return Err(memory(WorkingMemoryError::IdentityMismatch));}
@@ -151,7 +151,7 @@ impl HostAdmission {
                 || loaded.layouts().complete_capture_source(&selection.path).is_some(){rows.push(None);continue}
             if matches!(selection.transform,CaptureTransform::RoutedUnits) {
                 context.selection_index=index;
-                let prototype=routed::prepare(loaded,source,&context,index,geometry,metadata)?;
+                let prototype=routed::prepare(&loaded,source,&context,index,geometry,metadata)?;
                 let host=if prediction==0 {PartitionFragmentHostPlan::prepare_prefill(&prototype.receipt,geometry)}
                     else{PartitionFragmentHostPlan::prepare(&prototype.receipt)}
                     .map_err(|cause|Error::Neural(metadata.metadata_source(cause)))?;
@@ -249,7 +249,7 @@ impl HostRow {
     /// Original receipt limit, retained separately from its actual fragment population.
     pub(super) const fn fragment_limit(&self)->usize {self.fragments}
     pub(super) fn bind(self,source:&SharedCapturePlan,rank:usize,scalar:Option<WorkspaceFloatingType>,
-        metadata:&WorkspaceMetadataFunding)->Result<(BoundSource,PreparedPartitionFragmentHostFunding),Error>{
+        metadata:&HostMetadataFunding)->Result<(BoundSource,PreparedPartitionFragmentHostFunding),Error>{
         let source_row=match self.source {
             RowSource::Contiguous(row)=>row,
             RowSource::Evidence(row)=>return row.bind(source,rank,scalar,self.geometry,self.prediction,metadata)
@@ -280,3 +280,5 @@ impl HostRow {
         Ok((BoundSource::Contiguous(prepared),self.host))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

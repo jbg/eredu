@@ -1,10 +1,10 @@
 //! Exact count scalar edits on real sparse target-provider rows.
 use super::*;
 use eredu_core::{
+    ObservationPosition, TensorObservationData,
     capture::{RoutedUnitCapture, RoutedUnitCaptureRow},
     intervention::*,
     speculative::SpeculativeActivationDiscovery,
-    ObservationPosition, TensorObservationData,
 };
 
 const CASE: &str = "managed_plain::embedded::activations::sparse::native_original_sparse_model_interventions_match_ordinary_and_controlled";
@@ -174,9 +174,11 @@ fn inspect(
         .iter()
         .filter(|record| SpeculativeCaptureScope::Target.applies(record.phase))
         .collect();
-    assert!(target
-        .iter()
-        .any(|record| record.phase == SpeculativeActivationPhase::Verification));
+    assert!(
+        target
+            .iter()
+            .any(|record| record.phase == SpeculativeActivationPhase::Verification)
+    );
     assert_eq!(
         target
             .iter()
@@ -200,15 +202,15 @@ fn inspect(
     let mut previous = CaptureUsage::default();
     for envelope in target {
         assert!(envelope.completed);
-        assert!(envelope
-            .admission_identity
-            .as_deref()
-            .is_some_and(|id| !id.is_empty()));
+        assert!(
+            envelope
+                .admission_identity
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        );
         let step = envelope.captures.as_step();
         if shared {
-            let CapturedStepDelivery::Shared(owner) = &envelope.captures else {
-                panic!("original paid frame")
-            };
+            let owner = &envelope.captures;
             let alias = owner.clone();
             assert!(alias.same_storage(owner));
             assert_eq!(alias.as_ref().records.as_ptr(), step.records.as_ptr());
@@ -269,11 +271,13 @@ fn inspect(
             geometry.batch * geometry.sequence * 2
         );
         assert_eq!(original.rows.len(), effective.rows.len());
-        assert!(original
-            .rows
-            .iter()
-            .flat_map(values)
-            .any(|value| value.abs() > 1e-6));
+        assert!(
+            original
+                .rows
+                .iter()
+                .flat_map(values)
+                .any(|value| value.abs() > 1e-6)
+        );
         let mut end = 0;
         for range in &original.source_token_ranges {
             assert_eq!(range[0], end);

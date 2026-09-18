@@ -3,8 +3,8 @@ struct Bind<'a> {
     seen: &'a mut BTreeSet<String>,
 }
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, tensor: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, tensor: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         let value = self
             .values
             .get(name)
@@ -279,7 +279,7 @@ impl ActivationObserver<NumericTensor, Error> for Observer {
         assert!(value.data.iter().any(|v| v.abs() > 1e-9));
         trace.values.push((path.to_owned(), value.clone()));
         if trace.fail.as_deref() == Some(path) {
-            let failure = Error::backend_source(CallbackFailure {
+            let failure = Error::backend_retained_source(CallbackFailure {
                 path: path.to_owned(),
             });
             trace.failure = Some(failure.clone());

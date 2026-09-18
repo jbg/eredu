@@ -43,7 +43,7 @@ pub(super) struct Ordinary<'a> {
     pub relevance: &'a mut RelevanceCache,
 }
 impl Context for Ordinary<'_> {
-    type Error = anyhow::Error;
+    type Error = derivre::ParserError;
     fn cost(&self) -> u64 {
         self.source.cost()
     }
@@ -53,7 +53,7 @@ impl Context for Ordinary<'_> {
         big: ExprRef,
         fuel: u64,
         cache_failures: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> derivre::ParserResult<bool> {
         self.relevance.is_contained_in_prefixes(
             self.source,
             self.derivative,
@@ -63,7 +63,7 @@ impl Context for Ordinary<'_> {
             cache_failures,
         )
     }
-    fn recover_refusal(_: Self::Error) -> anyhow::Result<bool> {
+    fn recover_refusal(_: Self::Error) -> derivre::ParserResult<bool> {
         Ok(false)
     }
 }

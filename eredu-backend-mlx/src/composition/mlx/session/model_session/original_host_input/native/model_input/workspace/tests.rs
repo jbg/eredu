@@ -330,7 +330,7 @@ impl eredu_nn::workspace::WorkspaceMechanisms for IncompleteFacts {
             eredu_nn::workspace::WorkspaceOperationKind::PreparedMultiAxisRotary(_)
         ) {
             return if self.fail {
-                Err(eredu_nn::Error::backend_source(MissingEncoderFact))
+                Err(eredu_nn::Error::backend_retained_source(MissingEncoderFact))
             } else {
                 Ok(None)
             };

@@ -4,16 +4,16 @@
 //! register the returned bytes or establish a finite parser/cache bound.
 
 use eredu_core::HostPreparationAuthority;
-use eredu_text::tokenizer::{token_id_vocabulary, Tokenizer as ChatTokenizer};
+use eredu_text::tokenizer::{Tokenizer as ChatTokenizer, token_id_vocabulary};
 use llguidance::toktrie::TokEnv;
 use serde::{
-    de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor},
 };
 use tokenizers::Tokenizer;
 use tokenizers::{ModelCachePolicy, TokenizerSeed};
 
-const RECIPE_VERSION: u32 = 2;
+const RECIPE_VERSION: u32 = 3;
 
 #[derive(Serialize)]
 struct RecipeRef<'a> {
@@ -29,8 +29,7 @@ struct RecipeRef<'a> {
 struct RecipeHeader {
     version: u32,
     tokenizer: IgnoredAny,
-    #[serde(default)]
-    cache_policy: Option<ModelCachePolicy>,
+    cache_policy: ModelCachePolicy,
     encode_special_tokens: bool,
 }
 
@@ -159,14 +158,13 @@ pub(crate) fn tokenizer_span(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
 }
 impl RecipeHeader {
     fn policy(&self) -> Result<ModelCachePolicy, String> {
-        match (self.version, self.cache_policy) {
-            (1, None) => Ok(ModelCachePolicy::Legacy),
-            (RECIPE_VERSION, Some(policy)) => Ok(policy),
-            (1 | RECIPE_VERSION, _) => Err("invalid frozen tokenizer cache policy header".into()),
-            (version, _) => Err(format!(
-                "unsupported frozen tokenizer recipe version {version}"
-            )),
+        if self.version != RECIPE_VERSION {
+            return Err(format!(
+                "unsupported frozen tokenizer recipe version {}",
+                self.version
+            ));
         }
+        Ok(self.cache_policy)
     }
 }
 

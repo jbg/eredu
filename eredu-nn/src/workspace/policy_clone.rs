@@ -177,23 +177,48 @@ record!(CausalDepthwiseConvolutionSpec, { channels,kernel_size,weight,bias,activ
 
 record!(EmbeddingSpec, { vocabulary, dimensions, weight, format }, [weight, format]);
 
-// Native adapters may use these exact closed metadata producers without making
-// an extra WorkspaceContext. Arbitrary Clone implementations remain private.
-impl super::WorkspaceMetadataFunding {
-    /// Exact recursive storage of the existing ParameterSpec clone worker.
-    pub fn parameter_spec_clone_bytes(source: &ParameterSpec) -> Option<usize> {
+/// Closed parameter-policy clone operations paid by a core metadata account.
+/// Each query covers a specific NN declaration, never an arbitrary `Clone`.
+pub trait ParameterMetadataAllocation {
+    /// Exact recursive storage for one parameter specification.
+    fn parameter_spec_clone_bytes(source: &ParameterSpec) -> Option<usize>;
+    /// Copies one specification after reserving its complete storage.
+    fn clone_parameter_spec(&self, source: &ParameterSpec) -> Result<ParameterSpec, Error>;
+    /// Copies a physical companion and its authoritative weight identity.
+    fn clone_parameter_companion(&self, weight: &ParameterSpec, source: &ParameterSpec) -> Result<ParameterSpec, Error>;
+    /// Exact storage for a grouped gated-product declaration.
+    fn grouped_gated_product_clone_bytes(source: &GroupedGatedProductSpec) -> Option<usize>;
+    /// Copies a grouped gated-product declaration after reservation.
+    fn clone_grouped_gated_product(&self, source: &GroupedGatedProductSpec) -> Result<GroupedGatedProductSpec, Error>;
+    /// Exact storage for a grouped squared-ReLU declaration.
+    fn grouped_relu2_clone_bytes(source: &GroupedRelu2Spec) -> Option<usize>;
+    /// Copies a grouped squared-ReLU declaration after reservation.
+    fn clone_grouped_relu2(&self, source: &GroupedRelu2Spec) -> Result<GroupedRelu2Spec, Error>;
+    /// Exact storage for a grouped linear declaration.
+    fn grouped_linear_clone_bytes(source: &GroupedLinearSpec) -> Option<usize>;
+    /// Copies a grouped linear declaration after reservation.
+    fn clone_grouped_linear(&self, source: &GroupedLinearSpec) -> Result<GroupedLinearSpec, Error>;
+}
+macro_rules! funded_group_spec_clone {
+    ($ty:ty,$query:ident,$clone:ident) => {
+        fn $query(source:&$ty)->Option<usize>{source.metadata_clone_bytes()}
+        fn $clone(&self,source:&$ty)->Result<$ty,Error>{
+            self.reserve_metadata(Self::$query(source).ok_or(WorkspaceMetadataError::Overflow)?)
+                .map_err(WorkspaceMetadataError::from)?;
+            Ok(source.clone())
+        }
+    }
+}
+impl ParameterMetadataAllocation for super::HostMetadataFunding {
+    fn parameter_spec_clone_bytes(source: &ParameterSpec) -> Option<usize> {
         source.metadata_clone_bytes()
     }
-    /// Clones one declared parameter after its exact debit. The enclosing
-    /// returned value/error must keep this funding alive through retirement.
-    pub fn clone_parameter_spec(&self, source: &ParameterSpec) -> Result<ParameterSpec, Error> {
+    fn clone_parameter_spec(&self, source: &ParameterSpec) -> Result<ParameterSpec, Error> {
         self.reserve_metadata(Self::parameter_spec_clone_bytes(source)
             .ok_or(WorkspaceMetadataError::Overflow)?).map_err(WorkspaceMetadataError::from)?;
         Ok(source.clone())
     }
-    /// Same companion annotation as ordinary parameter binding: source-owned
-    /// metadata is cloned, then its weight identity is replaced by this one.
-    pub fn clone_parameter_companion(&self, weight: &ParameterSpec, source: &ParameterSpec)
+    fn clone_parameter_companion(&self, weight: &ParameterSpec, source: &ParameterSpec)
         -> Result<ParameterSpec, Error> {
         let bytes = source.metadata_clone_bytes()
             .and_then(|n| n.checked_add(weight.id.metadata_clone_bytes()?))
@@ -203,23 +228,7 @@ impl super::WorkspaceMetadataFunding {
         companion.linear_companion_of = Some(weight.id.clone());
         Ok(companion)
     }
+    funded_group_spec_clone!(GroupedGatedProductSpec,grouped_gated_product_clone_bytes,clone_grouped_gated_product);
+    funded_group_spec_clone!(GroupedRelu2Spec,grouped_relu2_clone_bytes,clone_grouped_relu2);
+    funded_group_spec_clone!(GroupedLinearSpec,grouped_linear_clone_bytes,clone_grouped_linear);
 }
-
-macro_rules! funded_group_spec_clone {
-    ($ty:ty,$query:ident,$clone:ident) => {
-        impl super::WorkspaceMetadataFunding {
-            /// Exact existing recursive metadata clone; grants no native source.
-            pub fn $query(source:&$ty)->Option<usize>{source.metadata_clone_bytes()}
-            /// Pays the closed clone worker before construction. The caller
-            /// retains this account with the returned owned spec and failures.
-            pub fn $clone(&self,source:&$ty)->Result<$ty,Error>{
-                self.reserve_metadata(Self::$query(source).ok_or(WorkspaceMetadataError::Overflow)?)
-                    .map_err(WorkspaceMetadataError::from)?;
-                Ok(source.clone())
-            }
-        }
-    }
-}
-funded_group_spec_clone!(GroupedGatedProductSpec,grouped_gated_product_clone_bytes,clone_grouped_gated_product);
-funded_group_spec_clone!(GroupedRelu2Spec,grouped_relu2_clone_bytes,clone_grouped_relu2);
-funded_group_spec_clone!(GroupedLinearSpec,grouped_linear_clone_bytes,clone_grouped_linear);

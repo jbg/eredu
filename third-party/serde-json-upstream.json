@@ -99,5 +99,10 @@
     },
     "path_in_vcs": ""
   },
-  "version": "1.0.151"
+  "version": "1.0.151",
+  "local_followup_changes": {
+    "src/error.rs": "Expose the dependency-owned boxed I/O error footprint for prospective serialization failure funding.",
+    "src/number.rs": "Compare with floating zero without constructing an owned number, preserving arbitrary-precision equality semantics.",
+    "src/map.rs": "The default ordered representation consumes the single safe local AVL worker extracted into the dependency-free eredu-collections foundation. The adapter forwards exact prospective node callbacks and original fixed allocation failures; generic collection tests moved with the worker and JSON behavior tests remain in the fork."
+  }
 }

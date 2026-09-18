@@ -1,18 +1,18 @@
 //! Host-only destinations for retained input geometry, independent of native scope.
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 #[derive(Clone, Copy)]
 pub(crate) enum Metadata<'a> {
     Context(crate::decoder::identity::Metadata<'a>),
-    Funding(&'a WorkspaceMetadataFunding),
+    Funding(&'a HostMetadataFunding),
 }
 impl<'a> Metadata<'a> {
     pub(crate) fn new(context: Option<&'a WorkspaceContext>) -> Self {
         Self::Context(crate::decoder::identity::Metadata::new(context))
     }
-    pub(crate) fn funded(funding: Option<&'a WorkspaceMetadataFunding>) -> Self {
+    pub(crate) fn funded(funding: Option<&'a HostMetadataFunding>) -> Self {
         funding.map_or_else(|| Self::new(None), Self::Funding)
     }
     pub(crate) fn checked(self) -> bool {
@@ -70,3 +70,5 @@ impl<'a> Metadata<'a> {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

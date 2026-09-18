@@ -56,15 +56,7 @@ fn native_borrowed_rows_follow_actual_freeze_state_and_preserve_ordinary_metadat
         rows.values[0].1.as_array(),
         &native.weight.value
     ));
-    struct Ordinary(Vec<eredu_nn::ParameterMetadata>);
-    impl<'a> eredu_nn::ParameterVisitor<'a, MlxTensor> for Ordinary {
-        fn visit(&mut self, m: eredu_nn::ParameterMetadata, _: &'a MlxTensor) {
-            self.0.push(m);
-        }
-    }
-    let mut ordinary = Ordinary(Vec::new());
-    visit_module_parameters(&native, &topology, &mut ordinary);
-    assert_eq!(ordinary.0, [rows.values[0].0.to_owned()]);
+    assert_eq!(rows.values[0].0.to_owned().id.as_str(), "norm.échelle");
     drop(rows);
     native.weight.unfreeze(false);
     let mut rows = Rows::default();
@@ -73,40 +65,31 @@ fn native_borrowed_rows_follow_actual_freeze_state_and_preserve_ordinary_metadat
 }
 #[derive(Debug, Clone, eredu_backend_mlx_macros::PhysicalParameters)]
 #[module(root = crate)]
-struct Legacy {
+struct UnclassifiedLeaf {
     #[param]
     weight: PhysicalParam<Array>,
 }
-impl NativeRetainedValues for Legacy {
-    fn visit_native_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        visitor(MlxTensor::ref_cast(&self.weight.value));
-        false
-    }
+impl NativeRetainedValues for UnclassifiedLeaf {
+    fn native_parameter_source_count(&self) -> Option<usize> { None }
+    fn visit_native_parameter_sources<'a>(&'a self, _: &mut dyn NativeParameterSourceVisitor<'a>) -> Result<(),ParameterSourceError> { Err(ParameterSourceError::UnclassifiedRetainedField) }
+    fn visit_native_parameter_sources_mut<'a>(&'a mut self, _: &mut dyn NativeParameterSourceVisitorMut<'a>) -> Result<(),ParameterSourceError> { Err(ParameterSourceError::UnclassifiedRetainedField) }
 }
 #[test]
-fn custom_native_keeps_ordinary_adapter_and_strict_default_refusal() {
-    let native = Legacy {
+fn unclassified_native_source_refuses_before_callbacks() {
+    let native = UnclassifiedLeaf {
         weight: norm().weight,
     };
     let topology = BTreeMap::from([(
         "weight".into(),
-        ParameterSpec::trainable("legacy.weight").unwrap(),
+        ParameterSpec::trainable("unclassified.weight").unwrap(),
     )]);
     let mut rows = Rows::default();
     assert_eq!(
         visit_module_parameter_sources(&native, &topology, &mut rows),
-        Err(ParameterSourceError::Unavailable)
+        Err(ParameterSourceError::UnclassifiedRetainedField)
     );
     assert!(rows.values.is_empty());
-    struct Ordinary(usize);
-    impl<'a> eredu_nn::ParameterVisitor<'a, MlxTensor> for Ordinary {
-        fn visit(&mut self, _: eredu_nn::ParameterMetadata, _: &'a MlxTensor) {
-            self.0 += 1;
-        }
-    }
-    let mut ordinary = Ordinary(0);
-    visit_module_parameters(&native, &topology, &mut ordinary);
-    assert_eq!(ordinary.0, 1);
+
 }
 #[test]
 fn lazy_source_traversal_preserves_unknown_without_native_work() {
@@ -156,10 +139,10 @@ impl NativeRetainedValues for RepeatedKey {
         visitor.parameter("weight", &self.other.value, true);
         Ok(())
     }
-    fn visit_native_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
-        visitor(MlxTensor::ref_cast(&self.weight.value));
-        visitor(MlxTensor::ref_cast(&self.other.value));
-        true
+    fn visit_native_parameter_sources_mut<'a>(&'a mut self, visitor: &mut dyn NativeParameterSourceVisitorMut<'a>) -> Result<(),ParameterSourceError> {
+        visitor.parameter("weight", &mut self.weight.value, true);
+        visitor.parameter("weight", &mut self.other.value, true);
+        Ok(())
     }
 }
 #[test]
@@ -213,7 +196,7 @@ fn weightless_normalization_is_complete_only_with_empty_topology() {
     let mut norm = MlxRmsNorm {
         groups: None,
         module: None,
-        topology: BTreeMap::new(),
+        topology: NativeParameterTable::from_rows(Vec::new()).unwrap(),
         offset: None,
         dimensions: 2,
         epsilon: 1e-5,
@@ -223,8 +206,7 @@ fn weightless_normalization_is_complete_only_with_empty_topology() {
     assert!(rows.values.is_empty());
     assert!(rows.auxiliary.is_empty());
     drop(rows);
-    norm.topology
-        .insert("weight".into(), ParameterSpec::trainable("absent").unwrap());
+    norm.topology = NativeParameterTable::from_rows(vec![("weight", ParameterSpec::trainable("absent").unwrap())]).unwrap();
     let mut rows = Rows::default();
     assert_eq!(
         norm.visit_parameter_sources(&mut rows),

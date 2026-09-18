@@ -217,15 +217,15 @@ fn load_recurrent_parameters(model: &mut Model, config: &kimi_linear::ModelArgs)
     #[derive(Default)]
     struct Load(BTreeMap<String, ()>);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Load {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let Some((base, step)) = recurrent_parameter_pattern(metadata.id.as_str()) else {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let Some((base, step)) = recurrent_parameter_pattern(metadata.id().as_str()) else {
                 return;
             };
-            assert!(self.0.insert(metadata.id.as_str().into(), ()).is_none());
+            assert!(self.0.insert(metadata.id().as_str().into(), ()).is_none());
             assert!(
                 value.data.iter().all(|v| *v == 0.0),
                 "unloaded {}",
-                metadata.id.as_str()
+                metadata.id().as_str()
             );
             for (index, value) in value.data.iter_mut().enumerate() {
                 *value = base + step * (index % 7) as f32;
@@ -252,8 +252,8 @@ fn assert_loaded_parameters(model: &Model, context: &NumericContext) {
     #[derive(Default)]
     struct Loaded(BTreeMap<String, Vec<usize>>);
     impl<'a> ParameterVisitor<'a, NumericTensor> for Loaded {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-            let name = metadata.id.as_str();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+            let name = metadata.id().as_str();
             assert!(
                 value.data.iter().all(|v| v.is_finite()),
                 "finite parameter {name}"
@@ -285,7 +285,7 @@ fn assert_loaded_parameters(model: &Model, context: &NumericContext) {
     for unit in model.units().iter().flatten() {
         unit.visit_parameters(&mut actual);
     }
-    let description = model.architecture().parameter_description(context).unwrap();
+    let description = model.architecture().parameter_description(context).unwrap().into_owned();
     let expected = description
         .groups()
         .iter()
@@ -305,7 +305,7 @@ fn make_model(
 ) {
     let architecture = KimiArchitecture::new(config.clone(), context).unwrap();
     let declarations = <KimiArchitecture as LayeredArchitecture<NumericBackend, KimiState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(
         declarations.len(),
         10 + 4 * config.num_hidden_layers as usize
@@ -314,8 +314,7 @@ fn make_model(
         let path = <KimiArchitecture as LayeredArchitecture<NumericBackend, KimiState>>::unit_path(
             &architecture,
             0,
-            index,
-        )
+            index, None)
         .unwrap();
         for suffix in ["input", "input.effective", "output", "output.effective"] {
             assert!(declarations
@@ -759,7 +758,7 @@ fn kimi_linear_target_rows_preserve_existing_nope_and_prediction_policy() {
     ] {
         assert!(hooks.supports(site));
     }
-    let declarations = <KimiArchitecture as LayeredArchitecture<NumericBackend, KimiState>>::prefill_observation_declarations(&architecture).unwrap();
+    let declarations = <KimiArchitecture as LayeredArchitecture<NumericBackend, KimiState>>::prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 18);
     assert!(declarations.iter().all(|d| !d.path().starts_with("mtp.")
         && !d.path().starts_with("vision.")

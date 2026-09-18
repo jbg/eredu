@@ -3,21 +3,21 @@ mod exchange;
 mod construction;
 mod summary;
 mod histogram;
-use eredu_nn::workspace::{WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 #[derive(Debug)]
 struct Account { used: Arc<AtomicUsize>, refuse: Arc<AtomicBool>, retired: Arc<AtomicBool> }
-impl WorkspaceMetadataAccount for Account {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
-        if self.refuse.load(Ordering::SeqCst) { return Err(WorkspaceMetadataFundingError::Overflow); }
+impl HostMetadataAccount for Account {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+        if self.refuse.load(Ordering::SeqCst) { return Err(HostMetadataFundingError::Overflow); }
         self.used.fetch_add(bytes, Ordering::SeqCst); Ok(())
     }
 }
 impl Drop for Account { fn drop(&mut self) { self.retired.store(true, Ordering::SeqCst); } }
-fn funding() -> (WorkspaceMetadataFunding, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>) {
+fn funding() -> (HostMetadataFunding, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>) {
     let used = Arc::new(AtomicUsize::new(0)); let refuse = Arc::new(AtomicBool::new(false)); let retired = Arc::new(AtomicBool::new(false));
-    let funding = WorkspaceMetadataFunding::new(Account { used: used.clone(), refuse: refuse.clone(), retired: retired.clone() }).unwrap();
+    let funding = HostMetadataFunding::new(Account { used: used.clone(), refuse: refuse.clone(), retired: retired.clone() }).unwrap();
     (funding, used, refuse, retired)
 }
 fn context(source: &SharedCapturePlan, index: usize) -> PartitionCaptureContext {

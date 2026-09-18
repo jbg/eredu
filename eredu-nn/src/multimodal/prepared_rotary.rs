@@ -199,7 +199,7 @@ pub fn reference_multi_axis_rotary_embeddings_prepared(
     prepared: PreparedMultiAxisRotary<'_>,
 ) -> Result<(Vec<f32>, Vec<f32>), Error> {
     let spec = prepared.spec;
-    let dimensions = spec.dimensions().map_err(Error::backend_source)? as usize;
+    let dimensions = spec.dimensions().map_err(Error::backend_retained_source)? as usize;
     let axes = spec.axes.len();
     if rows == 0 || rows.checked_mul(axes) != Some(positions.len()) {
         return Err(Error::backend(
@@ -208,7 +208,7 @@ pub fn reference_multi_axis_rotary_embeddings_prepared(
     }
     let count = rows
         .checked_mul(dimensions)
-        .ok_or_else(|| Error::backend_source(RotaryTableError::Overflow))?;
+        .ok_or_else(|| Error::backend_retained_source(RotaryTableError::Overflow))?;
     let (mut cosine, mut sine) = (vec![0.; count], vec![0.; count]);
     let half = dimensions / 2;
     for row in 0..rows {

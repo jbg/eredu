@@ -11,6 +11,8 @@ impl ResidentRecipeRecorder {
     ) -> Result<Self, Error> {
         let frames = [
             size_of::<CpuPopulation>() * 2,
+            size_of::<GroupedOutputStorage>() * 2,
+            size_of::<Result<GroupedOutputStorage, super::super::MlxWorkspaceFactError>>(),
             size_of::<MlxCpuWorkspaceMechanisms>(),
             size_of::<Option<super::super::cpu::OperationPlan>>(),
             size_of::<super::super::cpu::OperationPlan>(),
@@ -19,7 +21,7 @@ impl ResidentRecipeRecorder {
             size_of::<Option<safemlx::ResidentGraphLayout>>(),
             size_of::<Option<safemlx::OperationEvalTraversalLayout>>(),
             size_of::<safemlx::OperationEvalTraversalLimits>(),
-            size_of::<usize>() * 25,
+            size_of::<usize>() * 29,
             size_of::<Option<&parallel::OriginalParallelInvocation>>(),
             size_of::<u64>(),
             size_of::<(
@@ -42,6 +44,25 @@ impl ResidentRecipeRecorder {
         recorder.cpu = Some(cpu);
         Ok(recorder)
     }
+    fn missing_cpu_source(
+        &self, index: usize, operation: &WorkspaceOperation, reason: &'static str,
+        missing: &mut Option<usize>, detail: &mut Option<String>,
+    ) -> Result<(), Error> {
+        if missing.is_some() { return Ok(()); }
+        if let Some(context)=&self.context {
+            context.charge_metadata(size_of::<(&Self,usize,&WorkspaceOperation,&str,
+                &mut Option<usize>,&mut Option<String>,std::fmt::Arguments<'_>,
+                Option<String>,Result<(),Error>)>())?;
+        }
+        let arguments=format_args!("{reason}: {:?}; inputs: {:?}; outputs: {:?}",
+            operation.kind,operation.inputs,operation.outputs);
+        *detail=Some(match &self.context {
+            Some(context)=>context.metadata_string(arguments)?,
+            None=>arguments.to_string(),
+        });
+        *missing=Some(index);
+        Ok(())
+    }
     pub(super) fn reduce_cpu_trace(
         &self,
         report: &WorkspaceTraceReport,
@@ -63,6 +84,7 @@ impl ResidentRecipeRecorder {
     ) -> Result<ReducedTrace, Error> {
         let overflow = || self.metadata_error("CPU source population overflow");
         let mut population = CpuPopulation::default();
+        let mut grouped_outputs = GroupedOutputStorage::default();
         let mut maximum_rank = 0usize;
         let mut parallel_entries = 0usize;
         let mut parallel_edges = 0usize;
@@ -72,9 +94,14 @@ impl ResidentRecipeRecorder {
         let mut parallel_controls = 0usize;
         let mut streams = 1usize;
         let mut nested_completions = 0usize;
+        let mut nested_root_capacity = report.operations.iter()
+            .filter(|op| matches!(op.kind, WorkspaceOperationKind::ValueCompletion|WorkspaceOperationKind::AddressableRegion(_)))
+            .map(|op| op.inputs.len()).max().unwrap_or(0);
         let mut arrays = 1usize;
         let mut bytes = 0u64;
         let mut seeds=0usize;
+        let mut retained_source_seeds=0usize;
+        let mut transient_roots=0usize;
         let mut validations=0usize;
         let mut validation_bytes=0u64;
         let mut validation_births=0usize;
@@ -95,12 +122,12 @@ impl ResidentRecipeRecorder {
                 arrays = arrays.checked_add(1).ok_or_else(overflow)?;
                 continue;
             }
-            if parallel.is_some() && self.layerwise_constructors.is_some()
+            if self.layerwise_constructors.is_some()
                 && matches!(operation.kind, WorkspaceOperationKind::ParameterPlaceholder) {
                 continue;
             }
             if matches!(operation.kind,WorkspaceOperationKind::AddressableRegion(_)) {
-                let Some(source)=self.addressable_sources.as_ref()else{missing.get_or_insert(index);continue;};
+                let Some(source)=self.addressable_sources.as_ref()else{self.missing_cpu_source(index,operation,"addressable source",&mut missing,&mut missing_operation_detail)?;continue;};
                 let quote=source.quote(operation.as_view())?;
                 bytes=bytes.checked_add(u64::try_from(quote.capacity.backing).map_err(|_|overflow())?).ok_or_else(overflow)?;
                 child_births=child_births.checked_add(quote.numerical.storage.maximum_births()).ok_or_else(overflow)?;
@@ -113,13 +140,16 @@ impl ResidentRecipeRecorder {
                 if let Some((controls,nested))=super::super::cpu::value_frontier(operation.as_view()) {
                     population.controls=population.controls.checked_add(controls).ok_or_else(overflow)?;
                     arrays=arrays.checked_add(operation.inputs.len()).ok_or_else(overflow)?;
+                    if matches!(operation.kind,WorkspaceOperationKind::ValueRetention) {
+                        transient_roots=transient_roots.checked_add(operation.inputs.len()).ok_or_else(overflow)?;
+                    }
                     nested_completions=nested_completions.checked_add(nested).ok_or_else(overflow)?;
                     continue;
                 }
             }
             if matches!(operation.kind,WorkspaceOperationKind::ExpertProviderWave(_)) {
                 let Some(wave)=parallel.and_then(|p|p.expert_provider_wave_occurrence(index))else{
-                    missing.get_or_insert(index);continue;
+                    self.missing_cpu_source(index,operation,"expert provider occurrence",&mut missing,&mut missing_operation_detail)?;continue;
                 };
                 bytes=bytes.checked_add(wave.provider.backing).ok_or_else(overflow)?;
                 child_births=child_births.checked_add(wave.provider.births).ok_or_else(overflow)?;
@@ -127,31 +157,40 @@ impl ResidentRecipeRecorder {
             }
             if matches!(operation.kind,WorkspaceOperationKind::ExpertRegion(_)|WorkspaceOperationKind::ExpertInactiveWave(_)) {
                 let Some(region)=parallel.and_then(|p|p.expert_aggregate(index))else{
-                    missing.get_or_insert(index);continue;
+                    self.missing_cpu_source(index,operation,"expert aggregate occurrence",&mut missing,&mut missing_operation_detail)?;continue;
                 };
                 bytes=bytes.checked_add(region.child_bytes).ok_or_else(overflow)?;
                 child_births=child_births.checked_add(region.child_births).ok_or_else(overflow)?;
                 nested_completions=nested_completions.checked_add(region.parent_completions).ok_or_else(overflow)?;
+                if region.indexed_parent {
+                    // The addressable wrapper completes all four actual
+                    // operands together before opening its native child.
+                    nested_root_capacity = nested_root_capacity.max(4);
+                    arrays=arrays.checked_add(4).ok_or_else(overflow)?;
+                    population.controls=population.controls.checked_add(crate::backend::runtime::cache::value_completion_control_bytes(4).ok_or_else(overflow)?).ok_or_else(overflow)?;
+                }
                 arrays=arrays.checked_add(operation.outputs.len()).ok_or_else(overflow)?;
                 for (slice,n) in std::iter::once((&region.empty_slice,region.empty_slices))
                     .chain(region.extra_parents.iter().map(|operation|(operation,1))){
-                let Some(plan)=cpu.plan(slice.as_view()).map_err(|cause|self.metadata_source(cause))?else{missing.get_or_insert(index);continue;};
+                let Some(plan)=cpu.plan(slice.as_view()).map_err(|cause|self.metadata_source(cause))?else{self.missing_cpu_source(index,slice,"expert parent source",&mut missing,&mut missing_operation_detail)?;continue;};
                 let repeated=|value:usize|value.checked_mul(n).ok_or_else(overflow);
                 let source=plan.population;
-                population.add(CpuPopulation{primitives:repeated(source.primitives)?,input_edges:repeated(source.input_edges)?,
+                population.add(CpuPopulation{construction_entries:repeated(source.construction_entries)?,primitives:repeated(source.primitives)?,input_edges:repeated(source.input_edges)?,
+                    hidden_leaves:repeated(source.hidden_leaves)?,
+                    maximum_operands:source.maximum_operands,maximum_captures:source.maximum_captures,
                     births:repeated(source.births)?,extents:repeated(source.extents)?,controls:repeated(source.controls)?}).ok_or_else(overflow)?;
                 seeds=seeds.checked_add(repeated(plan.seeds)?).ok_or_else(overflow)?;
-                arrays=arrays.checked_add(repeated(source.primitives.checked_add(slice.inputs.len()).and_then(|v|v.checked_add(plan.seeds)).ok_or_else(overflow)?)?).ok_or_else(overflow)?;
+                arrays=arrays.checked_add(repeated(source.primitives.checked_add(slice.inputs.len()).and_then(|v|v.checked_add(plan.seeds)).and_then(|v|v.checked_add(source.hidden_leaves)).ok_or_else(overflow)?)?).ok_or_else(overflow)?;
                 shells=shells.and_then(|v|v.checked_add(plan.parameter_shells.checked_mul(n)?));
                 bytes=bytes.checked_add(plan.output_bytes.checked_add(plan.scratch_bytes).and_then(|v|v.checked_mul(n as u64)).ok_or_else(overflow)?).ok_or_else(overflow)?;
                 maximum_rank=maximum_rank.max(plan.rank).max(2);
-                if plan.validations!=0{missing.get_or_insert(index);}
+                if plan.validations!=0{self.missing_cpu_source(index,slice,"expert parent validation source",&mut missing,&mut missing_operation_detail)?;}
                 }
                 continue;
             }
             if matches!(operation.kind, WorkspaceOperationKind::Collective(_)) {
                 let Some(profile) = self.parallel_population(index, operation, parallel)? else {
-                    missing.get_or_insert(index);
+                    self.missing_cpu_source(index,operation,"parallel occurrence source",&mut missing,&mut missing_operation_detail)?;
                     continue;
                 };
                 bytes = bytes.checked_add(profile.bytes).ok_or_else(overflow)?;
@@ -170,20 +209,23 @@ impl ResidentRecipeRecorder {
                 .plan(operation.as_view())
                 .map_err(|cause| self.metadata_source(cause))?
             else {
-                if missing.is_none() {
-                    let arguments = format_args!(
-                        "{:?}; inputs: {:?}; outputs: {:?}",
-                        operation.kind, operation.inputs, operation.outputs
-                    );
-                    missing_operation_detail = Some(match &self.context {
-                        Some(context) => context.metadata_string(arguments)?,
-                        None => arguments.to_string(),
-                    });
-                    missing = Some(index);
-                }
+                self.missing_cpu_source(index,operation,"equation source",&mut missing,&mut missing_operation_detail)?;
                 continue;
             };
             maximum_rank = maximum_rank.max(plan.rank);
+            if matches!(operation.kind, WorkspaceOperationKind::Grouped { .. }) {
+                grouped_outputs = grouped_outputs.merge(super::super::cpu::grouped::output_storage(operation.as_view())
+                    .map_err(|cause| self.metadata_source(cause))?).ok_or_else(overflow)?;
+            }
+            if matches!(operation.kind,WorkspaceOperationKind::HostStoreFloating(..)) {
+                transient_roots=transient_roots.checked_add(1).ok_or_else(overflow)?;
+                nested_completions=nested_completions.checked_add(1).ok_or_else(overflow)?;
+            } else if super::super::cpu::host_transfer::is_load(operation.as_view().kind) {
+                retained_source_seeds=retained_source_seeds.checked_add(1).ok_or_else(overflow)?;
+                nested_completions=nested_completions.checked_add(1).ok_or_else(overflow)?;
+            }
+            nested_completions=nested_completions.checked_add(
+                super::super::cpu::blockwise::nested_completions(operation.as_view())).ok_or_else(overflow)?;
             population.add(plan.population).ok_or_else(overflow)?;
             seeds=seeds.checked_add(plan.seeds).ok_or_else(overflow)?;
             validations=validations.checked_add(plan.validations).ok_or_else(overflow)?;
@@ -201,13 +243,16 @@ impl ResidentRecipeRecorder {
                 .checked_add(plan.population.primitives)
                 .and_then(|n| n.checked_add(operation.inputs.len()))
                 .and_then(|n| n.checked_add(plan.seeds))
+                .and_then(|n| n.checked_add(plan.population.hidden_leaves))
                 .ok_or_else(overflow)?;
             shells = shells.and_then(|n| n.checked_add(plan.parameter_shells));
         }
         let roots = retained_roots
             .checked_add(output_roots)
             .and_then(|n|n.checked_add(validations))
+            .and_then(|n|n.checked_add(transient_roots))
             .ok_or_else(overflow)?;
+        let construction_entries = population.construction_entries.checked_add(parallel_entries).ok_or_else(overflow)?;
         let primitives = population.primitives.checked_add(parallel_entries).ok_or_else(overflow)?;
         let tape = primitives.checked_add(1).ok_or_else(overflow)?;
         arrays = arrays.checked_add(roots).ok_or_else(overflow)?;
@@ -234,19 +279,19 @@ impl ResidentRecipeRecorder {
                 input_edges: edges,
                 output_slots: tape,
                 streams,
-                captures: base.capture_slots().max(1),
+                captures: base.capture_slots().max(population.maximum_captures).max(1),
             })
         });
         let graph = if missing.is_none() {
             shells.and_then(|shells| {
                 safemlx::OperationEvent::resident_graph_layout_with_shells(
-                    primitives,
-                    seeds,
+                    construction_entries,
+                    seeds.checked_add(retained_source_seeds)?,
                     maximum_rank,
                     // Shared resident constructors include four-entry temporary
                     // operand vectors even when the final CPU primitive is binary.
                     // Eval input edges above still count the actual graph only.
-                    4,
+                    population.maximum_operands.max(4),
                     shells,
                 )
             })
@@ -308,14 +353,12 @@ impl ResidentRecipeRecorder {
             maximum_rank,
             host_primitive_nodes: primitives,
             validation_roots: validations,
-            grouped_outputs: GroupedOutputStorage::default(),
+            grouped_outputs,
             query_controls,
             graph,
             dispatch,
             nested_completions,
-            nested_root_capacity: report.operations.iter()
-                .filter(|op| matches!(op.kind, WorkspaceOperationKind::ValueCompletion|WorkspaceOperationKind::AddressableRegion(_)))
-                .map(|op| op.inputs.len()).max().unwrap_or(0),
+            nested_root_capacity: nested_root_capacity.max(usize::from(nested_completions!=0)),
         })
     }
 }
@@ -408,8 +451,8 @@ mod tests {
         bias: &'a WorkspaceTensor,
     }
     impl<'a> ParameterVisitorMut<'a, WorkspaceTensor> for Bind<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut WorkspaceTensor) {
-            *value = if metadata.id.as_str() == "cpu.bias" {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut WorkspaceTensor) {
+            *value = if metadata.id().as_str() == "cpu.bias" {
                 self.bias
             } else {
                 self.weight
@@ -1343,9 +1386,8 @@ mod tests {
             let report=context.report(&[output]).unwrap();let plan=cpu.plan(report.operations[0].as_view()).unwrap().unwrap();
             assert_eq!(plan.alias_input,Some(0));assert_eq!(plan.population.births,0);
             let mut missing=report.operations[0].clone();missing.kind=WorkspaceOperationKind::View("transpose");
-            if shape[1]!=1 {
-                assert!(!cpu.output_representation(missing.as_view(),0).unwrap().last_axis_contiguous());
-            }
+            assert!(cpu.plan(missing.as_view()).unwrap().is_none());
+            assert!(cpu.output_representation(missing.as_view(),0).is_none());
             let mut invalid=report.operations[0].clone();invalid.kind=WorkspaceOperationKind::Transpose(vec![0,2,1,2]);
             assert!(cpu.plan(invalid.as_view()).is_err());
             context.begin_span();

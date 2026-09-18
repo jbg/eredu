@@ -692,7 +692,7 @@ where
         &mut self,
         now: Instant,
         maximum_frames: usize,
-        mut execute: impl FnMut(
+        execute: impl FnMut(
             WorkId,
             &RealtimeInputFrame,
             &mut RealtimeSessionBranch<M::Branch, S, R, C, P>,
@@ -1293,7 +1293,15 @@ mod tests {
             funding.reserve_metadata(128).unwrap();
             assert!(accepted.metadata_funding().is_err());
             let output_custody=native.budget_custody();
+            let retained_origin: crate::working_memory::OriginalOperationMetadataCustody =
+                output_custody.clone().into();
+            retained_origin.validate_retained_origin(&pool).unwrap();
+            let foreign = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+            assert_eq!(retained_origin.validate_retained_origin(&foreign),
+                Err(WorkingMemoryError::IdentityMismatch));
             drop((accepted,native,source,funding,alias));
+            retained_origin.validate_retained_origin(&pool).unwrap();
+            drop(retained_origin);
             assert_eq!(pool.used_bytes().unwrap(),required);
             assert!(matches!(pool.reserve_realtime_frame(&execution,requirements(),required,None)
                 .unwrap_err().cause(),WorkingMemoryError::BudgetExceeded{..}));
@@ -1302,6 +1310,12 @@ mod tests {
             let retry=pool.reserve_realtime_frame(&execution,requirements(),required,None).unwrap();
             drop(retry);
             assert_eq!(pool.used_bytes().unwrap(),0);
+            let fenced = pool.reserve_realtime_frame(&execution, requirements(), required, None).unwrap();
+            let source = fenced.budget_custody();
+            drop(fenced);
+            source.assert_closed_metadata_origin_refusal(&pool);
+            drop(source);
+            assert_eq!(pool.used_bytes().unwrap(), required, "quarantine cannot refund the original account");
             execute_immediately(id,frame,branch)
         }).unwrap();
         assert!(observed);

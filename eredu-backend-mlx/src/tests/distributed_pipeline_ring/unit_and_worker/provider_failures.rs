@@ -105,7 +105,7 @@ fn verify_loaded_provider_failures(
                 run.enable_capture(capture.clone()).unwrap();
                 for expected in &baseline[..preceding_predictions] {
                     assert_eq!(run.next().unwrap().unwrap().token_id(), *expected);
-                    let step = run.take_captured_step().unwrap().unwrap();
+                    let step = run.take_captured_delivery().unwrap().unwrap();
                     assert_eq!(
                         step.outcome,
                         eredu_core::capture::CaptureStepOutcome::Committed
@@ -123,7 +123,7 @@ fn verify_loaded_provider_failures(
                 provider_failure_cause(&error);
                 // Earlier captures remain actual measurements, explicitly belonging
                 // to an aborted forward; all their reservations remain charged.
-                let failed = run.take_captured_step().unwrap().unwrap();
+                let failed = run.take_captured_delivery().unwrap().unwrap();
                 assert_eq!(
                     failed.outcome,
                     eredu_core::capture::CaptureStepOutcome::Aborted
@@ -132,7 +132,7 @@ fn verify_loaded_provider_failures(
                 assert!(failed.step_usage.captures > 0);
                 assert!(failed.step_usage.host_bytes > 0);
                 assert!(failed.partitions.is_empty());
-                assert!(run.take_captured_step().unwrap().is_none());
+                assert!(run.take_captured_delivery().unwrap().is_none());
                 assert!(run.next().is_none());
             } else {
                 let mut run = eredu_core::TextGeneration::new(
@@ -302,7 +302,7 @@ fn verify_partition_provider_failure(
                 run.enable_capture(capture.clone()).unwrap();
                 for expected in &baseline[..preceding_predictions] {
                     assert_eq!(run.next().unwrap().unwrap().token_id(), *expected);
-                    assert_eq!(run.take_captured_step().unwrap().unwrap().outcome,
+                    assert_eq!(run.take_captured_delivery().unwrap().unwrap().outcome,
                         eredu_core::capture::CaptureStepOutcome::Committed);
                 }
                 let _fault = (rank == failure_rank).then(|| provider_failure::arm(operator, 0));
@@ -313,10 +313,10 @@ fn verify_partition_provider_failure(
                 } else {
                     provider_peer_failure(&error);
                 }
-                let failed = run.take_captured_step().unwrap().unwrap();
+                let failed = run.take_captured_delivery().unwrap().unwrap();
                 assert_eq!(failed.outcome, eredu_core::capture::CaptureStepOutcome::Aborted);
                 assert_eq!(failed.prediction_index, preceding_predictions as u64);
-                assert!(run.take_captured_step().unwrap().is_none());
+                assert!(run.take_captured_delivery().unwrap().is_none());
                 assert!(run.next().is_none());
             } else {
                 let mut run = eredu_core::TextGeneration::new(

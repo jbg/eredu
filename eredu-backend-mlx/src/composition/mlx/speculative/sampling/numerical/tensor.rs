@@ -17,14 +17,14 @@ pub(crate) struct CompletedTensorSource {
 }
 struct PhaseCustody {
     _account: OriginalSpeculativeNumericalBudgetCustody,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
 struct CloneFailure {
     #[source]
     cause: safemlx::PreparedArrayCloneCause,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 
 fn invalid() -> Error {
@@ -51,7 +51,7 @@ fn packet_with_parents(
     let funding = sources.metadata_funding();
     let parts = [
         OriginalEmbeddedCachePreparation::tensor_handoff_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         size_of::<&Stream>(),
         size_of::<Value>(),
         size_of::<OriginalNumericalValue>(),
@@ -68,7 +68,7 @@ fn packet_with_parents(
         size_of::<HostPreparationAuthority>(),
         size_of::<[Option<EmbeddedPredictionTensor<MlxTensor>>;2]>(),
         HostPreparationAuthority::retention_bytes::<PhaseCustody>()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     funding
         .reserve_metadata(
@@ -76,7 +76,7 @@ fn packet_with_parents(
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
                 .ok_or(Error::WorkspacePlanning(
-                    WorkspaceMetadataFundingError::Overflow,
+                    HostMetadataFundingError::Overflow,
                 ))?,
         )
         .map_err(Error::WorkspacePlanning)?;
@@ -313,13 +313,25 @@ pub(crate) fn registered_range(
 )->Result<EmbeddedPredictionTensor<MlxTensor>,Error>{
     let result=(||{
         preparation.validate_sources(sources).map_err(Error::StorageSource)?;
-        let registered=RegisteredTensorSource::from_value(source,sources,environment)?;
+        let registered = if matches!(&source.value().provenance, Provenance::Registered(_)) {
+            Some(RegisteredTensorSource::from_value(source, sources, environment)?)
+        } else { None };
+        let completed = match &source.value().provenance {
+            Provenance::Numerical(custody) => Some(CompletedResidentSource::capture_numerical_array_sources(
+                |visit| visit(&source.value().array), &[],
+                source.value().original_budget.as_ref().ok_or_else(invalid)?, custody, sources.metadata_funding())?
+                .with_completed_stream(environment.stream())?),
+            Provenance::Registered(_) => None,
+            _ => return Err(invalid()),
+        };
+        let prior = completed.as_ref().map(|source| [source]);
         let start=u32::try_from(start).map_err(|_|invalid())?;
         let end=u32::try_from(end).map_err(|_|invalid())?;
         let (roots,mechanisms)=sources.numerical_prerequisites();
         let kind=program::SpeculativeNumericalKind::TokenRange{start,end};
         match NumericalProducer::execute(sources,environment,roots,mechanisms,kind,source,None)?{
-            NumericalOutput::Tensor(value)=>packet(value,sources,environment,preparation,&[],None,Some(&registered)),
+            NumericalOutput::Tensor(value)=>packet(value,sources,environment,preparation,
+                prior.as_ref().map_or(&[], |p| p.as_slice()),None,registered.as_ref()),
             _=>Err(invalid()),
         }
     })();

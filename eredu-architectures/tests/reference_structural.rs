@@ -412,7 +412,7 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
     });
     let args = qwen::model_args_from_config_value(&config).unwrap();
     let model = qwen::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
-    let description = model.parameter_description(&()).unwrap();
+    let description = model.parameter_description(&()).unwrap().into_owned();
     let mut authoritative = BTreeMap::new();
     for owned in description.groups() {
         for member in owned.group().members() {
@@ -722,7 +722,7 @@ fn llama_static_parameter_topology_matches_constructed_dense_model() {
     let args = tiny_args();
     let static_description = llama::dense_parameter_description(&args).unwrap();
     let constructed = llama::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
-    let constructed_description = constructed.parameter_description(&()).unwrap();
+    let constructed_description = constructed.parameter_description(&()).unwrap().into_owned();
     assert_eq!(static_description, constructed_description);
 }
 
@@ -788,7 +788,7 @@ fn dense_qwen_partition_topology_preserves_qwen2_biases_and_qwen3_qk_norms() {
         let description = qwen::dense_parameter_description(&args).unwrap();
         let constructed = qwen::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
         if model_type == "qwen3" {
-            assert_eq!(description, constructed.parameter_description(&()).unwrap());
+            assert_eq!(description, constructed.parameter_description(&()).unwrap().into_owned());
         }
 
         let (layout, partition) = local_qwen_partition(&args, 2, 1);
@@ -919,7 +919,7 @@ fn gpt_oss_parameter_description(args: &gpt_oss::ModelArgs) -> ArchitectureParam
     gpt_oss::LayeredModel::<ReferenceBackend>::new(args.clone(), &())
         .unwrap()
         .parameter_description(&())
-        .unwrap()
+        .unwrap().into_owned()
 }
 fn qwen_realization(
     args: &qwen::ModelArgs,
@@ -1014,7 +1014,7 @@ fn routed_qwen_and_gpt_oss_cartesian_partitions_own_exact_units_state_and_banks(
             let qwen_args = routed_qwen_partition_args();
             let qwen_global =
                 qwen::RoutedLayeredModel::<ReferenceBackend>::new(qwen_args.clone(), &()).unwrap();
-            let qwen_description = qwen_global.parameter_description(&()).unwrap();
+            let qwen_description = qwen_global.parameter_description(&()).unwrap().into_owned();
             let qwen_layout =
                 eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
                     &qwen_description,
@@ -1174,7 +1174,7 @@ fn routed_qwen_and_gpt_oss_cartesian_partitions_own_exact_units_state_and_banks(
 fn routed_partition_geometry_rejects_wrong_expert_owner_and_state() {
     let args = routed_qwen_partition_args();
     let global = qwen::RoutedLayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
-    let description = global.parameter_description(&()).unwrap();
+    let description = global.parameter_description(&()).unwrap().into_owned();
     let topology = eredu_core::ParallelTopology::new(1, 2, 2, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, 3).unwrap();
     let wrong_rank = eredu_core::ParallelRankTopology::new(topology, 2).unwrap();
@@ -1403,7 +1403,7 @@ fn local_lfm2_partition(
     ArchitecturePartition<lfm2::PartitionLocalGeometry, NoAuxiliaryBoundarySchema>,
 ) {
     let complete = lfm2::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
-    let description = complete.parameter_description(&()).unwrap();
+    let description = complete.parameter_description(&()).unwrap().into_owned();
     assert_eq!(
         lfm2::dense_parameter_description(args).unwrap(),
         description
@@ -1987,7 +1987,7 @@ fn authoritative_kimi_visitor_selects_indexed_tp_pp_partition_and_exact_mixed_st
     });
     let args = kimi_linear::model_args_from_config_value(&config).unwrap();
     let architecture = kimi_linear::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
-    let description = architecture.parameter_description(&()).unwrap();
+    let description = architecture.parameter_description(&()).unwrap().into_owned();
     let artifact = tempfile::tempdir().unwrap();
     std::fs::write(
         artifact.path().join("config.json"),
@@ -3287,7 +3287,7 @@ fn replicated_moshi_parallel_layout(config: &moshi::MoshiConfig) -> LocalModelLa
         let count = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
             ReferenceBackend,
             ReferenceMoshiState,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             let unit = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
@@ -3327,7 +3327,7 @@ fn constructed_moshi_parameter_groups(config: &moshi::MoshiConfig) -> Vec<Parame
         let count = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
             ReferenceBackend,
             ReferenceMoshiState,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             let unit = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
@@ -3416,7 +3416,7 @@ fn one_portable_moshi_model_runs_replicated_and_parallel_lifecycles() {
         let count = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
             ReferenceBackend,
             ReferenceMoshiState,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             units.push(
@@ -3469,7 +3469,7 @@ fn one_portable_moshi_model_runs_replicated_and_parallel_lifecycles() {
     assert_eq!(driver.decisions(), replicated.2.decisions());
     assert_eq!(
         state.layout(),
-        &runtime.architecture().state_layout().unwrap()
+        &runtime.architecture().state_layout(None).unwrap()
     );
 }
 
@@ -3563,7 +3563,7 @@ fn tiny_moshi_executes_one_temporal_block_and_one_depth_slice_with_exact_logit_g
 fn moshi_parallel_selection_owns_local_geometry_and_opaque_group_projection() {
     let config = tiny_moshi_config();
     let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
-    let parameters = architecture.parameter_description(&()).unwrap();
+    let parameters = architecture.parameter_description(&()).unwrap().into_owned();
     let topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, 1).unwrap();
     let completion = eredu_runtime::CommunicationCompletionPolicy::new(
@@ -3940,7 +3940,7 @@ fn portable_moshi_topology_state_and_decision_order_are_backend_independent() {
         ReferenceBackend,
         ReferenceMoshiState,
     >>::execution_graph(runtime.architecture())
-    .unwrap();
+    .unwrap().into_owned();
     assert_eq!(graph.execution_order(), &[0, 1]);
     assert_eq!(
         graph.groups()[1].dependencies(),
@@ -4151,9 +4151,9 @@ fn fused_decoder_projection_fields_must_be_named() {
 fn topology<M: Parameterized<ReferenceTensor>>(module: &M) -> Vec<(String, Vec<usize>)> {
     struct Collector(Vec<(String, Vec<usize>)>);
     impl<'a> ParameterVisitor<'a, ReferenceTensor> for Collector {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a ReferenceTensor) {
             self.0.push((
-                metadata.id.to_string(),
+                metadata.id().to_string(),
                 value
                     .shape()
                     .iter()
@@ -4503,7 +4503,7 @@ fn qwen_routed_execution_uses_the_runtime_provider_and_observer_contract() {
     );
 
     let mut observer = ProbeObserver::default();
-    let point = args.routed_observation_points("model.layers.0", 0).unwrap();
+    let point = args.routed_observation_points("model.layers.0", 0, None).unwrap().unwrap();
     let mut observed_provider =
         eredu_runtime::ObservedExpertProvider::new(&mut provider, &mut observer, point);
     let output = policy
@@ -4864,7 +4864,7 @@ fn inkling_partition_args() -> inkling::ModelArgs {
 fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactly() {
     let args = inkling_partition_args();
     let architecture = inkling::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
-    let parameters = architecture.parameter_description(&()).unwrap();
+    let parameters = architecture.parameter_description(&()).unwrap().into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -5050,7 +5050,7 @@ fn inkling_partition_foundation_tracks_final_vision_owner_and_absent_media_roles
             });
             let architecture =
                 inkling::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
-            let parameters = architecture.parameter_description(&()).unwrap();
+            let parameters = architecture.parameter_description(&()).unwrap().into_owned();
             let groups = parameters
                 .groups()
                 .iter()
@@ -5349,7 +5349,7 @@ fn deepseek_v3_v4_partition_foundations_cover_cartesian_ownership_and_compact_ba
                     ArchitectureStatePartitionRule::group_units(0, 0..4),
                 ]),
                 v4_geometry,
-                deepseek::v4::TargetBoundarySchema::from_args(&v4_args).unwrap(),
+                deepseek::v4::TargetBoundarySchema::from_args(&v4_args, None).unwrap(),
             )
             .unwrap();
             let v4 = deepseek::V4PartitionLocalFoundation::from_partition(&v4_args, &v4_partition)
@@ -5780,7 +5780,7 @@ fn authoritative_composite_dispatch_preserves_selected_gemma_partition_and_local
     });
     let args = gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
     let model = gemma4::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
-    let description = ArchitectureParameters::parameter_description(&model, &()).unwrap();
+    let description = ArchitectureParameters::parameter_description(&model, &()).unwrap().into_owned();
     let artifact = tempfile::tempdir().unwrap();
     std::fs::write(
         artifact.path().join("config.json"),
@@ -5951,7 +5951,7 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
     assert_two_stage_composite_dispatch(
         "muse",
         muse_config,
-        ArchitectureParameters::parameter_description(&muse_model, &()).unwrap(),
+        ArchitectureParameters::parameter_description(&muse_model, &()).unwrap().into_owned(),
         24,
     );
 
@@ -5978,7 +5978,7 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
     assert_two_stage_composite_dispatch(
         "qwen-vl",
         qwen_vl_config,
-        ArchitectureParameters::parameter_description(&qwen_vl_model, &()).unwrap(),
+        ArchitectureParameters::parameter_description(&qwen_vl_model, &()).unwrap().into_owned(),
         64,
     );
 
@@ -6007,7 +6007,7 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
     assert_two_stage_composite_dispatch(
         "conditional-qwen",
         conditional_config,
-        ArchitectureParameters::parameter_description(&conditional_model, &()).unwrap(),
+        ArchitectureParameters::parameter_description(&conditional_model, &()).unwrap().into_owned(),
         64,
     );
 
@@ -6034,7 +6034,7 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
     assert_two_stage_composite_dispatch(
         "inkling",
         inkling_config,
-        ArchitectureParameters::parameter_description(&inkling_model, &()).unwrap(),
+        ArchitectureParameters::parameter_description(&inkling_model, &()).unwrap().into_owned(),
         30,
     );
 }

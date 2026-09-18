@@ -38,7 +38,7 @@ impl<'a> PreparedMoshiWorkspaceFrame<'a> {
         let mut model=source.workspace_model(context)
             .map_err(|cause|source_failure(context,"static model construction",cause))?;
         eredu_runtime::working_memory::bind_prepared_workspace_parameters(
-            model.static_modules_mut(),static_bindings,context)
+            model.static_modules_mut(),static_bindings,context, |_| false)
             .map_err(|cause|source_failure(context,"static parameter binding",cause))?;
         Ok(model)
     }

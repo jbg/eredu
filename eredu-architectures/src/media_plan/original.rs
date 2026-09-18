@@ -3,6 +3,7 @@ mod config;
 mod encoder;
 mod gemma;
 mod position_facts;
+mod chat_projection;
 use super::qwen::{
     self, InspectedPartRef, MediaSemanticError, QwenPartRef, QwenPartRole, QwenPolicy,
 };
@@ -222,6 +223,7 @@ impl PreparedModelSources {
         source: &'h OriginalPreparedHostInput,
     ) -> Result<PreparedMediaSemanticCompile<'s, 'h>, MediaSemanticError> {
         let policy = Policy::source(self)?;
+        chat_projection::validate(self, source, policy)?;
         let processor =
             self.selected()
                 .execution()
@@ -334,6 +336,7 @@ impl<'s, 'h> PreparedMediaSemanticCompile<'s, 'h> {
                 modality: part.modality,
                 placeholder: part.placeholder,
                 workspace_scalars: part.workspace_scalars,
+                chat_projection: chat_projection::part(provenance, source, index, policy, part.role),
             };
             position = end;
         }
@@ -439,6 +442,11 @@ impl<'s> OriginalPreparedMediaSemantics<'s> {
     }
 }
 impl BoundPreparedMediaSemantics {
+    /// Borrows the same complete source-bound neutral records and coordinates.
+    /// This never re-admits a source or reconstructs an architecture plan.
+    pub fn storage(&self) -> &BoundCompositeSemanticStorage {
+        &self.0
+    }
     /// Carries the same admitted source/configuration through the actual shared
     /// copied-state exchange. The receipt cannot be minted from a raw frontier.
     pub fn for_copied_state(

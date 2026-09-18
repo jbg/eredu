@@ -78,17 +78,31 @@ where
     ) -> Option<SharedPreparedInputCacheIdentity> {
         plan.identity.clone()
     }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan) -> Result<(), Error> {
-        if self.args.architecture_fingerprint() != plan.fingerprint {
-            return Err(Error::backend(
-                "Muse media source belongs to another architecture",
-            ));
+    fn ingress_execution_graph(&self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ArchitectureExecutionGraph<'_>)>()?;
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.execution_graph))
+    }
+    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        metadata.controls::<(&Self, &Self::IngressPlan, Option<&eredu_nn::workspace::WorkspaceContext>,
+            PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>, String)>()?;
+        let identity_metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        let fingerprint = match metadata_context { Some(context) => self.args.architecture_fingerprint_with_metadata(context)?, None => self.args.architecture_fingerprint() };
+        if fingerprint != plan.fingerprint {
+            return Err(metadata.error(format_args!("Muse media source belongs to another architecture")));
         }
-        PreparedCompositeInput::new(&plan.prepared, &plan.admitted).map_err(Error::backend)?;
+        PreparedCompositeInput::new_with_diagnostic(&plan.prepared, &plan.admitted,
+            |message| metadata.error(format_args!("{message}")))?;
         Ok(())
     }
-    fn ingress_error(error: MediaIngressError) -> Error {
-        Error::backend_source(error)
+    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Error {
+        let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
+        if let Err(refusal) = metadata.controls::<(MediaIngressError, Option<&eredu_nn::workspace::WorkspaceContext>)>() {
+            return refusal;
+        }
+        metadata.source(error)
     }
     fn begin_ingress(
         &mut self,
@@ -359,7 +373,7 @@ where
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
         <Self as CompositeArchitecture<B,S>>::prepared_group_collective_waves(self, group,
-            <Self as crate::composite_execution::CompositeMediaIngressArchitecture<B,S>>::prepared_ingress_input(plan), tensor_partitions, pipeline_stages)
+            <Self as crate::composite_execution::CompositeMediaIngressArchitecture<B,S>>::prepared_ingress_input(plan), tensor_partitions, pipeline_stages, None).map_err(|error|error.to_string())
     }
     fn media_primary_ingress_collectives(
         &self,

@@ -32,14 +32,14 @@ pub(crate) struct PreparedRankCollective<'a> {
     members:usize,
     backing_capacity:usize,
     source:RetainedCommunicationSource,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 /// Owns the actual accepted graph and the matching preallocated completion.
 /// Consuming it never asks whether a *new* submission would still be admitted.
 pub(crate) struct AcceptedRankCollective<'stream> {
     accepted:AcceptedCommunicationSource<'stream>,
     ready:ReadyCompletionResources,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 impl OriginalCommunicationSource<'_> {
     pub(crate) fn prepare_rank_collective<'a>(&'a self,id:CollectiveGroupId,input:&'a Array,
@@ -53,13 +53,13 @@ impl OriginalCommunicationSource<'_> {
             size_of::<Result<(),eredu_runtime::CommunicationTensorContractError>>(),
             size_of::<TensorDtype>(),size_of::<(usize,usize)>(),size_of::<Option<usize>>(),
             eredu_runtime::CommunicationManifest::group_operation_control_bytes()
-                .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             eredu_runtime::CommunicationOperationRequirement::tensor_metadata_control_bytes()
-                .and_then(|bytes|bytes.checked_mul(2)).ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            size_of::<&Self>().checked_mul(3).ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?,
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+                .and_then(|bytes|bytes.checked_mul(2)).ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            size_of::<&Self>().checked_mul(3).ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.validate()?;
         let selected=self.source.manifest().select_group_operation(id,collective.operation())
             .map_err(|cause|failure(Cause::Rank(cause),&self.source,&self.funding))?;
@@ -97,9 +97,9 @@ impl PreparedRankCollective<'_> {
             size_of::<(&OriginalCommunicationSource<'_>,&OriginalScopeObserver,&Stream)>(),
             size_of::<std::iter::Enumerate<std::slice::Iter<'_,i32>>>(),
             size_of::<(usize,&i32)>(),size_of::<Option<usize>>(),size_of::<bool>(),
-            failure_control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            failure_control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         if !self.source.same_source(source.source()) {return Err(failure(Cause::Identity,&self.source,&self.funding));}
         let accepted=self.operation.construct_accepted(source,observer,stream)?;
         let output=&accepted.outputs()[0];
@@ -121,7 +121,7 @@ impl AcceptedRankCollective<'_> {
     pub(crate) fn submit(self)->Result<(OriginalCommunicationConstructed,OriginalCommunicationCompletion),Error> {
         let parts=[size_of::<Self>(),size_of::<Result<(OriginalCommunicationConstructed,OriginalCommunicationCompletion),Error>>()];
         self._funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         self.accepted.submit(self.ready)
     }
 }

@@ -72,18 +72,16 @@ pub fn component_graph(args: &DecoderConfig) -> Result<ComponentGraph, Component
 
 /// Declares the exact per-layer full/sliding key/value state geometry.
 pub fn state_layout(args: &DecoderConfig) -> Result<StateLayout, StateError> {
-    let layers = args
-        .attention_schedule
-        .iter()
-        .map(|policy| {
-            LayerCachePolicy::key_value(*policy, args.num_key_value_heads, args.head_dim)
-                .map_err(|error| StateError::InvalidResidency(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    StateLayout::new(
-        LayerSchedule::new(layers.len(), layers)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
-    )
+    state_layout_in(args,&crate::state_geometry::Ordinary(StateError::InvalidResidency))
+}
+pub(crate) fn state_layout_with_metadata(args:&DecoderConfig,context:&eredu_nn::workspace::WorkspaceContext)->Result<StateLayout,eredu_nn::Error>{
+    state_layout_in(args,&crate::state_geometry::Counted::new(context,StateError::InvalidResidency))
+}
+fn state_layout_in<D:crate::state_geometry::Destination>(args:&DecoderConfig,destination:&D)->Result<StateLayout,D::Error>{
+    destination.controls::<(&DecoderConfig,StateLayout,LayerSchedule<LayerCachePolicy>,Vec<LayerCachePolicy>)>()?;
+    let mut layers=destination.vector(args.attention_schedule.len())?;
+    for policy in args.attention_schedule.iter(){layers.push(destination.key_value(*policy,args.num_key_value_heads,args.head_dim)?);}
+    destination.layout(destination.schedule(layers.len(),layers)?)
 }
 
 #[cfg(test)]

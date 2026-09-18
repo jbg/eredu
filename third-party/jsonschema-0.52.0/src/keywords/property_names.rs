@@ -19,15 +19,18 @@ impl<F: Json> PropertyNamesObjectValidator<F> {
         ctx: &compiler::Context<F>,
         schema: &'a Value,
     ) -> CompilationResult<'a, F> {
-        let ctx = ctx.new_at_location("propertyNames");
-        Ok(Box::new(PropertyNamesObjectValidator {
+        let ctx = ctx.new_at_location("propertyNames")?;
+        Ok(ctx.funding().boxed(PropertyNamesObjectValidator {
             node: compiler::compile(&ctx, ctx.as_resource_ref(schema))?,
-        }))
+        })?)
     }
 }
 
 impl<F: Json> Validate<F> for PropertyNamesObjectValidator<F> {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.node(&self.node)
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
@@ -37,15 +40,23 @@ impl<F: Json> Validate<F> for PropertyNamesObjectValidator<F> {
             std::mem::size_of::<(&mut F::StringBuffer, &str, F::Node<'_>, bool)>(),
         ])
     }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
-            if !ctx.workspace.string_constructor(true) { return false; }
+            if !ctx.workspace.string_constructor(true) {
+                return false;
+            }
             let mut buffer = F::StringBuffer::default();
             for (name, _) in object.members() {
-                if !ctx.workspace.string_constructor(false) { return false; }
-                let valid = F::with_string_node(&mut buffer, name.as_ref(), |node| {
-                    self.node.is_valid(&node, ctx)
-                });
+                let Some(valid) =
+                    ctx.with_string_node::<F, _>(&mut buffer, name.as_ref(), |node, ctx| {
+                        self.node.is_valid(&node, ctx)
+                    })
+                else {
+                    return false;
+                };
                 if !valid {
                     return false;
                 }
@@ -54,7 +65,7 @@ impl<F: Json> Validate<F> for PropertyNamesObjectValidator<F> {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -62,29 +73,42 @@ impl<F: Json> Validate<F> for PropertyNamesObjectValidator<F> {
         ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
         if let Some(object) = instance.as_object() {
+            if !ctx.workspace.string_constructor(true) {
+                return Ok(());
+            }
             let mut buffer = F::StringBuffer::default();
             for (name, _) in object.members() {
-                let result = F::with_string_node(&mut buffer, name.as_ref(), |node| {
-                    self.node
-                        .validate(&node, location, tracker, ctx)
-                        .map_err(ValidationError::to_owned)
-                });
-                if let Err(error) = result {
+                let result = ctx.with_string_node::<F, _>(
+                    &mut buffer,
+                    name.as_ref(),
+                    |node, ctx| match self.node.validate(&node, location, tracker, ctx) {
+                        Ok(()) => None,
+                        Err(error) => ctx.produce(|funding| error.to_owned_with_funding(funding)),
+                    },
+                );
+                if ctx.workspace.failed() {
+                    return Ok(());
+                }
+                if let Some(Some(error)) = result {
                     let schema_path = error.schema_path().clone();
-                    return Err(ValidationError::property_names(
-                        schema_path.clone(),
-                        crate::paths::capture_evaluation_path(tracker, &schema_path),
-                        location.into(),
-                        instance.to_value(),
-                        error,
-                    ));
+                    return ctx.diagnostic::<F>(
+                        instance,
+                        location,
+                        tracker,
+                        &schema_path,
+                        |funding| {
+                            Ok(crate::error::ValidationErrorKind::PropertyNames {
+                                error: funding.boxed(error)?,
+                            })
+                        },
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    fn collect_errors<'i>(
+    fn collect_errors_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -95,24 +119,37 @@ impl<F: Json> Validate<F> for PropertyNamesObjectValidator<F> {
         let Some(object) = instance.as_object() else {
             return;
         };
+        if !ctx.workspace.string_constructor(true) {
+            return;
+        }
         let mut buffer = F::StringBuffer::default();
-        let mut name_errors = Vec::new();
         for (name, _) in object.members() {
-            F::with_string_node(&mut buffer, name.as_ref(), |node| {
-                let mut collected = Vec::new();
-                self.node
-                    .collect_errors(&node, location, tracker, ctx, &mut collected);
-                name_errors.extend(collected.into_iter().map(ValidationError::to_owned));
-            });
-            for error in name_errors.drain(..) {
+            let collected =
+                ctx.with_string_node::<F, _>(&mut buffer, name.as_ref(), |node, ctx| {
+                    let mut collected = Vec::new();
+                    self.node
+                        .collect_errors(&node, location, tracker, ctx, &mut collected);
+                    ctx.produce(|funding| funding.owned_errors(collected))
+                });
+            let Some(Some(collected)) = collected else {
+                return;
+            };
+            for error in collected {
                 let schema_path = error.schema_path().clone();
-                errors.push(ValidationError::property_names(
-                    schema_path.clone(),
-                    crate::paths::capture_evaluation_path(tracker, &schema_path),
-                    location.into(),
-                    instance.to_value(),
-                    error,
-                ));
+                if let Err(error) =
+                    ctx.diagnostic::<F>(instance, location, tracker, &schema_path, |funding| {
+                        Ok(crate::error::ValidationErrorKind::PropertyNames {
+                            error: funding.boxed(error)?,
+                        })
+                    })
+                {
+                    if !ctx.workspace.push(errors, error) {
+                        return;
+                    }
+                }
+                if ctx.workspace.failed() {
+                    return;
+                }
             }
         }
     }
@@ -146,17 +183,27 @@ pub(crate) struct PropertyNamesBooleanValidator {
 impl PropertyNamesBooleanValidator {
     #[inline]
     pub(crate) fn compile<'a, F: Json>(ctx: &compiler::Context<F>) -> CompilationResult<'a, F> {
-        let location = ctx.location().join("propertyNames");
-        Ok(Box::new(PropertyNamesBooleanValidator { location }))
+        let location = ctx
+            .location()
+            .join_with_funding("propertyNames", ctx.funding())?;
+        Ok(ctx
+            .funding()
+            .boxed(PropertyNamesBooleanValidator { location })?)
     }
 }
 
 impl<F: Json> Validate<F> for PropertyNamesBooleanValidator {
-    fn original_source(&self, source: &mut crate::validator::source::Inspector<F>) -> Result<(), crate::validator::workspace::Error> {
+    fn original_source(
+        &self,
+        source: &mut crate::validator::source::Inspector<F>,
+    ) -> Result<(), crate::validator::workspace::Error> {
         source.location(&self.location)
     }
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F, Self>(&[std::mem::size_of::<bool>()])
+    }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
     }
     fn is_valid_body(&self, instance: &F::Node<'_>, _ctx: &mut ValidationContext) -> bool {
         if let Some(object) = instance.as_object() {
@@ -167,7 +214,7 @@ impl<F: Json> Validate<F> for PropertyNamesBooleanValidator {
         true
     }
 
-    fn validate<'i>(
+    fn validate_body<'i>(
         &self,
         instance: &F::Node<'i>,
         location: &LazyLocation,
@@ -177,12 +224,9 @@ impl<F: Json> Validate<F> for PropertyNamesBooleanValidator {
         if <Self as Validate<F>>::is_valid(self, instance, ctx) {
             Ok(())
         } else {
-            Err(ValidationError::false_schema(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-            ))
+            ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| {
+                Ok(crate::error::ValidationErrorKind::FalseSchema)
+            })
         }
     }
 }

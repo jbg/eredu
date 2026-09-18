@@ -202,7 +202,7 @@ pub(super) struct PreparedStatusAgreement<'a> {
     capacity: AgreementCapacity,
     leaf: AgreementCapacity,
     source: RetainedCommunicationSource,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 fn sum(a: AgreementCapacity, b: AgreementCapacity) -> Result<AgreementCapacity, Error> {
     Ok(AgreementCapacity {
@@ -673,3 +673,5 @@ impl Worker<'_, '_, '_, '_> {
         Ok(output)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

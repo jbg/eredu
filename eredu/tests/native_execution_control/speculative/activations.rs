@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::{component::ComponentActivation, intervention::*, TensorObservationData};
+use eredu_core::{TensorObservationData, component::ComponentActivation, intervention::*};
 
 fn public_internal_activations(device: LocalDevice, pooling: bool) {
     public_internal_activations_profile(device, pooling, false);
@@ -52,11 +52,14 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
         let generation = loaded.speculative_generation_options().unwrap().unwrap();
         let (model, _) = loaded.parts_mut();
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
-                add_generation_prompt: true,
-                ..Default::default()
-            })
+            .source_chat_with_capacity(
+                ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user", "content":"left right"})],
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+                ORIGINAL_CAPACITY,
+            )
             .unwrap();
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
@@ -66,16 +69,19 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             },
             ..Default::default()
         };
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::token_ids(&chat, vec![1, 2, 5]),
+        let request = || PreparedChatSpeculativeRequest {
+            chat: &chat,
+            input: eredu::api::PreparedChatPrompt::TokenIds(&[1, 2, 5]),
+            output_mode: eredu::api::PreparedChatOutputMode::Text,
+            skip_special_tokens: true,
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings,
+            settings: chat_settings(&chat, settings),
             options: generation.clone(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},
         };
-        let baseline = model.generate_prepared_text_speculative(request()).unwrap();
+        let baseline = model.generate_prepared_chat_speculative(request()).unwrap();
         let mut ordinary_records = Vec::new();
         for mask in [false, true] {
             let per_step = CaptureUsage {
@@ -174,7 +180,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             .unwrap();
             let mut continuous = Vec::new();
             let output = model
-                .generate_observed_text_speculative(
+                .generate_observed_prepared_chat_speculative(
                     request(),
                     ControlledSpeculativeOptions {
                         activations: Some(admitted.clone()),
@@ -187,14 +193,26 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                 )
                 .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
-            assert!(continuous
-                .iter()
-                .any(|r| r.phase == SpeculativeActivationPhase::Verification));
-            assert_eq!(continuous[0].captures.as_step().invocation.unwrap().sequence, 3);
-            if fused {
-                assert!(continuous
+            assert!(
+                continuous
                     .iter()
-                    .any(|record| record.phase == SpeculativeActivationPhase::FusedProposal));
+                    .any(|r| r.phase == SpeculativeActivationPhase::Verification)
+            );
+            assert_eq!(
+                continuous[0]
+                    .captures
+                    .as_step()
+                    .invocation
+                    .unwrap()
+                    .sequence,
+                3
+            );
+            if fused {
+                assert!(
+                    continuous
+                        .iter()
+                        .any(|record| record.phase == SpeculativeActivationPhase::FusedProposal)
+                );
                 assert!(continuous
                     .iter()
                     .any(|record| record.phase == SpeculativeActivationPhase::PredictionPrefill));
@@ -224,171 +242,189 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                 }
             }
             let mut controlled = Vec::new();
-            let output =
-                model
-                    .with_controlled_text_speculative(
-                        request(),
-                        ControlledSpeculativeOptions {
-                            activations: Some(admitted),
-                            snapshots: Some(SnapshotLimits {
-                                max_snapshots: 2,
-                                max_branches: 2,
-                                retained_bytes: 64 << 20,
-                                cumulative_copy_bytes: 512 << 20,
-                            }),
-                            ..Default::default()
-                        },
-                        |session| {
-                            assert!(session
+            let output = model
+                .with_controlled_prepared_chat_speculative(
+                    request(),
+                    ControlledSpeculativeOptions {
+                        activations: Some(admitted),
+                        snapshots: Some(SnapshotLimits {
+                            max_snapshots: 2,
+                            max_branches: 2,
+                            retained_bytes: 64 << 20,
+                            cumulative_copy_bytes: 512 << 20,
+                        }),
+                        ..Default::default()
+                    },
+                    |session| {
+                        assert!(
+                            session
                                 .readmit_activation_interventions(stale.clone())
-                                .is_err());
-                            controlled.extend(session.step()?.unwrap().activations.iter().cloned());
-                            assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
-                            let saved = session.snapshot()?;
-                            let start = controlled.len();
+                                .is_err()
+                        );
+                        controlled.extend(session.step()?.unwrap().activations.iter().cloned());
+                        assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
+                        let saved = session.snapshot()?;
+                        let start = controlled.len();
+                        while let Some(step) = session.step()? {
+                            controlled.extend(step.activations.iter().cloned());
+                        }
+                        let expected_tokens = session.token_ids().to_vec();
+                        let mut last_invocation = controlled.last().unwrap().invocation;
+                        for _ in 0..2 {
+                            let usage = session.snapshot_usage();
+                            session.restore(&saved)?;
+                            assert!(
+                                session.snapshot_usage().cumulative_copy_bytes
+                                    > usage.cumulative_copy_bytes
+                            );
+                            let mut replay = Vec::new();
                             while let Some(step) = session.step()? {
-                                controlled.extend(step.activations.iter().cloned());
+                                replay.extend(step.activations.iter().cloned());
                             }
-                            let expected_tokens = session.token_ids().to_vec();
-                            let mut last_invocation = controlled.last().unwrap().invocation;
-                            for _ in 0..2 {
-                                let usage = session.snapshot_usage();
-                                session.restore(&saved)?;
-                                assert!(
-                                    session.snapshot_usage().cumulative_copy_bytes
-                                        > usage.cumulative_copy_bytes
+                            assert_eq!(session.token_ids(), expected_tokens);
+                            assert_eq!(replay.len(), controlled.len() - start);
+                            for (a, b) in replay.iter().zip(&controlled[start..]) {
+                                assert!(a.invocation > last_invocation);
+                                last_invocation = a.invocation;
+                                assert_eq!(a.admission_identity, b.admission_identity);
+                                assert_eq!((a.origin, a.phase), (b.origin, b.phase));
+                                assert_eq!(
+                                    a.captures.as_step().records,
+                                    b.captures.as_step().records
                                 );
-                                let mut replay = Vec::new();
-                                while let Some(step) = session.step()? {
-                                    replay.extend(step.activations.iter().cloned());
-                                }
-                                assert_eq!(session.token_ids(), expected_tokens);
-                                assert_eq!(replay.len(), controlled.len() - start);
-                                for (a, b) in replay.iter().zip(&controlled[start..]) {
-                                    assert!(a.invocation > last_invocation);
-                                    last_invocation = a.invocation;
-                                    assert_eq!(a.admission_identity, b.admission_identity);
-                                    assert_eq!((a.origin, a.phase), (b.origin, b.phase));
-                                    assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
-                                    assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
-                                    assert!(
-                                        a.captures.as_step().cumulative_usage.encoded_bytes
-                                            > b.captures.as_step().cumulative_usage.encoded_bytes
+                                assert_eq!(
+                                    a.captures.as_step().interventions,
+                                    b.captures.as_step().interventions
+                                );
+                                assert!(
+                                    a.captures.as_step().cumulative_usage.encoded_bytes
+                                        > b.captures.as_step().cumulative_usage.encoded_bytes
+                                );
+                            }
+                        }
+                        let left = session.fork(&saved)?;
+                        let right = session.fork(&saved)?;
+                        session.exchange(&left)?;
+                        session.readmit_activation_interventions(alternate.clone())?;
+                        let different = (expected_tokens[session.token_ids().len()] + 1) % 64;
+                        session.force_next_token(different)?;
+                        let changed = session.snapshot()?;
+                        let mut child_records = Vec::new();
+                        while let Some(step) = session.step()? {
+                            child_records.extend(step.activations.iter().cloned());
+                        }
+                        assert_ne!(session.token_ids(), expected_tokens);
+                        let child_tokens = session.token_ids().to_vec();
+                        assert!(
+                            child_records
+                                .iter()
+                                .all(|r| r.admission_identity.as_deref()
+                                    == Some(alternate.identity()))
+                        );
+                        if mask {
+                            assert!(
+                                child_records.iter().all(|r| r
+                                    .captures
+                                    .as_step()
+                                    .interventions
+                                    .is_empty())
+                            );
+                            for record in &child_records {
+                                let payload = |path: &str| {
+                                    record
+                                        .captures
+                                        .as_step()
+                                        .records
+                                        .iter()
+                                        .find(|r| r.path == path)
+                                        .and_then(|r| r.payload.as_ref())
+                                };
+                                if let Some(before) = payload(&channel.activation) {
+                                    assert_eq!(
+                                        Some(before),
+                                        payload(&channel.effective_activation)
                                     );
                                 }
                             }
-                            let left = session.fork(&saved)?;
-                            let right = session.fork(&saved)?;
-                            session.exchange(&left)?;
-                            session.readmit_activation_interventions(alternate.clone())?;
-                            let different = (expected_tokens[session.token_ids().len()] + 1) % 64;
-                            session.force_next_token(different)?;
-                            let changed = session.snapshot()?;
-                            let mut child_records = Vec::new();
-                            while let Some(step) = session.step()? {
-                                child_records.extend(step.activations.iter().cloned());
-                            }
-                            assert_ne!(session.token_ids(), expected_tokens);
-                            let child_tokens = session.token_ids().to_vec();
-                            assert!(child_records
+                        } else {
+                            let applied: Vec<_> = child_records
                                 .iter()
-                                .all(|r| r.admission_identity.as_deref()
-                                    == Some(alternate.identity())));
-                            if mask {
-                                assert!(child_records
-                                    .iter()
-                                    .all(|r| r.captures.as_step().interventions.is_empty()));
-                                for record in &child_records {
-                                    let payload = |path: &str| {
-                                        record
-                                            .captures.as_step().records
-                                            .iter()
-                                            .find(|r| r.path == path)
-                                            .and_then(|r| r.payload.as_ref())
+                                .flat_map(|r| &r.captures.as_step().interventions)
+                                .filter(|e| e.outcome == InterventionOutcome::Applied)
+                                .collect();
+                            assert!(!applied.is_empty());
+                            for edit in applied {
+                                let values = |record: &CaptureRecord| {
+                                    let Some(CapturePayload::Tensor(tensor)) = &record.payload
+                                    else {
+                                        panic!("missing edited evidence")
                                     };
-                                    if let Some(before) = payload(&channel.activation) {
-                                        assert_eq!(
-                                            Some(before),
-                                            payload(&channel.effective_activation)
-                                        );
-                                    }
-                                }
-                            } else {
-                                let applied: Vec<_> = child_records
-                                    .iter()
-                                    .flat_map(|r| &r.captures.as_step().interventions)
-                                    .filter(|e| e.outcome == InterventionOutcome::Applied)
-                                    .collect();
-                                assert!(!applied.is_empty());
-                                for edit in applied {
-                                    let values = |record: &CaptureRecord| {
-                                        let Some(CapturePayload::Tensor(tensor)) = &record.payload
-                                        else {
-                                            panic!("missing edited evidence")
-                                        };
-                                        let TensorObservationData::F32(values) = tensor.data()
-                                        else {
-                                            panic!("wrong dtype")
-                                        };
-                                        values.clone()
+                                    let TensorObservationData::F32(values) = tensor.data() else {
+                                        panic!("wrong dtype")
                                     };
-                                    for (index, (before, after)) in values(&edit.evidence[0])
-                                        .iter()
-                                        .zip(values(&edit.evidence[1]))
-                                        .enumerate()
-                                    {
-                                        assert_eq!(
-                                            after,
-                                            if index % channel.count == 0 {
-                                                0.0
-                                            } else {
-                                                *before
-                                            }
-                                        );
-                                    }
+                                    values.clone()
+                                };
+                                for (index, (before, after)) in values(&edit.evidence[0])
+                                    .iter()
+                                    .zip(values(&edit.evidence[1]))
+                                    .enumerate()
+                                {
+                                    assert_eq!(
+                                        after,
+                                        if index % channel.count == 0 {
+                                            0.0
+                                        } else {
+                                            *before
+                                        }
+                                    );
                                 }
                             }
-                            session.restore(&changed)?;
-                            let mut replay_records = Vec::new();
-                            while let Some(step) = session.step()? {
-                                replay_records.extend(step.activations.iter().cloned());
-                            }
-                            assert_eq!(session.token_ids(), child_tokens);
-                            assert_eq!(child_records.len(), replay_records.len());
-                            for (a, b) in child_records.iter().zip(&replay_records) {
-                                assert_eq!(a.admission_identity, b.admission_identity);
-                                assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
-                                assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
-                                assert!(b.invocation > a.invocation);
-                            }
-                            session.release_snapshot(&changed)?;
-                            session.exchange(&left)?;
-                            assert_eq!(session.token_ids(), expected_tokens);
-                            session.exchange(&right)?;
-                            while let Some(step) = session.step()? {
-                                assert!(step
-                                    .activations
-                                    .iter()
-                                    .all(|r| r.admission_identity.as_deref()
-                                        == Some(identity.as_str())));
-                            }
-                            assert_eq!(session.token_ids(), expected_tokens);
-                            session.exchange(&right)?;
-                            assert_eq!(session.token_ids(), expected_tokens);
-                            session.release_branch(&left)?;
-                            session.release_branch(&right)?;
-                            session.release_snapshot(&saved)?;
-                            Ok(())
-                        },
-                    )
-                    .unwrap();
+                        }
+                        session.restore(&changed)?;
+                        let mut replay_records = Vec::new();
+                        while let Some(step) = session.step()? {
+                            replay_records.extend(step.activations.iter().cloned());
+                        }
+                        assert_eq!(session.token_ids(), child_tokens);
+                        assert_eq!(child_records.len(), replay_records.len());
+                        for (a, b) in child_records.iter().zip(&replay_records) {
+                            assert_eq!(a.admission_identity, b.admission_identity);
+                            assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
+                            assert_eq!(
+                                a.captures.as_step().interventions,
+                                b.captures.as_step().interventions
+                            );
+                            assert!(b.invocation > a.invocation);
+                        }
+                        session.release_snapshot(&changed)?;
+                        session.exchange(&left)?;
+                        assert_eq!(session.token_ids(), expected_tokens);
+                        session.exchange(&right)?;
+                        while let Some(step) = session.step()? {
+                            assert!(step.activations.iter().all(
+                                |r| r.admission_identity.as_deref() == Some(identity.as_str())
+                            ));
+                        }
+                        assert_eq!(session.token_ids(), expected_tokens);
+                        session.exchange(&right)?;
+                        assert_eq!(session.token_ids(), expected_tokens);
+                        session.release_branch(&left)?;
+                        session.release_branch(&right)?;
+                        session.release_snapshot(&saved)?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
             assert_eq!(continuous.len(), controlled.len());
             for (a, b) in continuous.iter().zip(&controlled) {
                 assert_eq!(a.admission_identity.as_deref(), Some(identity.as_str()));
                 assert_eq!((a.origin, a.phase), (b.origin, b.phase));
                 assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
-                assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
+                assert_eq!(
+                    a.captures.as_step().interventions,
+                    b.captures.as_step().interventions
+                );
                 assert!(a.completed && b.completed);
             }
             if mask {
@@ -425,7 +461,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             } else {
                 ordinary_records = continuous;
             }
-            let restored = model.generate_prepared_text_speculative(request()).unwrap();
+            let restored = model.generate_prepared_chat_speculative(request()).unwrap();
             assert_eq!(restored.token_ids(), baseline.token_ids());
         }
     }

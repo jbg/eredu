@@ -26,7 +26,7 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism: MlxCpuWo
             p.copy(OperationEvent::cpu_reshape_alias_layout(1,2,false)?,1)?;
             p.copy(OperationEvent::cpu_cast_layout(Dtype::Int32,Dtype::Int32,1,selected,false)?,1)?;
             p.copy(OperationEvent::cpu_cast_layout(Dtype::Float32,Dtype::Float32,2,selected,false)?,1)?;
-            p.copy(OperationEvent::cpu_flat_scatter_layout(Dtype::Int32,elements,selected,false)?,3)?;
+            p.copy(OperationEvent::cpu_scatter_layout(Dtype::Float32,Dtype::Int32,1,elements,selected,false)?,3)?;
             p.controls = p.controls.checked_add(safemlx::Array::flat_index_update_control_bytes()?)?;
         } else {
             p.copy(OperationEvent::cpu_cast_layout(Dtype::Int32,Dtype::Int32,1,selected,false)?,1)?;

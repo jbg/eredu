@@ -81,7 +81,8 @@ impl<'a> TokenTriePlan<'a> {
         if count != info.vocab_size as usize || count == 0 {
             return Err(TokTrieSourceError::Vocabulary.into());
         }
-        if eos.first().copied() != Some(info.tok_eos) || eos.iter().any(|&id| id >= info.vocab_size)
+        if eos.first().copied().unwrap_or(toktrie::INVALID_TOKEN) != info.tok_eos
+            || eos.iter().any(|&id| id >= info.vocab_size)
         {
             return Err(TokTrieSourceError::Eos.into());
         }

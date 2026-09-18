@@ -1,7 +1,9 @@
-//! Exact resident routed partition source; equations use the ordinary provider driver.
+//! Exact routed partition source; equations use the selected ordinary provider driver.
+use crate::prepared_execution::workspace::layerwise::QuoteError;
 use super::*;
 mod region;
 mod movement;
+pub(crate) mod provider;
 use crate::decoder::TensorParallelRoutedProjectionOperator;
 use crate::routed_text::RetainedPartitionResidentSource;
 use eredu_runtime::working_memory::{
@@ -21,7 +23,7 @@ struct Routed<C, P> {
     rank: eredu_core::ParallelRankTopology,
     local_state: eredu_runtime::SelectedStateRealization,
     execution: crate::partitioned_execution::PreparedRoutedExecutionHandoff,
-    providers: RetainedPartitionResidentSource,
+    providers: provider::Source,
     pipeline: Option<PipelineSource>,
     marker: std::marker::PhantomData<fn() -> P>,
 }
@@ -33,7 +35,9 @@ impl PreparedDirectPartitionSource {
         rank: eredu_core::ParallelRankTopology,
         local_state: eredu_runtime::SelectedStateRealization,
         execution: crate::partitioned_execution::PreparedRoutedExecutionHandoff,
-        providers: RetainedPartitionResidentSource,
+        providers: Option<RetainedPartitionResidentSource>,
+        banks: crate::routed_text::RetainedRoutedBanks,
+        residency: eredu_runtime::ParameterBankResidency,
         pipeline_addresses: Option<Vec<eredu_runtime::ExecutionUnitAddress>>,
     ) -> Self
     where
@@ -41,6 +45,10 @@ impl PreparedDirectPartitionSource {
         P: BlockFactory<WorkspaceBackend, C> + 'static,
         P::FeedForward: TensorParallelRoutedProjectionOperator<WorkspaceBackend>,
     {
+        let providers = match providers {
+            Some(source) => provider::Source::Resident(source),
+            None => provider::Source::Addressable { banks, residency },
+        };
         let pipeline = pipeline_addresses.map(|addresses| PipelineSource {
             plan: execution.retained_execution_plan(), addresses,
             dtype: execution.activation_dtype(),
@@ -59,11 +67,21 @@ where
     P: BlockFactory<WorkspaceBackend, C> + 'static,
     P::FeedForward: TensorParallelRoutedProjectionOperator<WorkspaceBackend>,
 {
+    fn routed_addressable_source(&self, selected: &crate::SelectedPreparation,
+        rank: eredu_core::ParallelRankTopology)
+        -> Result<Option<(crate::routed_text::RetainedRoutedBanks,
+            crate::partitioned_execution::PreparedRoutedExecutionHandoff)>, String> {
+        self.tensor_waves(selected, rank)?;
+        Ok(match &self.providers {
+            provider::Source::Addressable { banks, .. } => Some((banks.clone(), self.execution.clone())),
+            provider::Source::Resident(_) => None,
+        })
+    }
     fn routed_resident_source(&self, selected: &crate::SelectedPreparation,
         rank: eredu_core::ParallelRankTopology)
         -> Result<Option<RetainedPartitionResidentSource>, String> {
         self.tensor_waves(selected, rank)?;
-        Ok(Some(self.providers.clone()))
+        Ok(self.providers.resident())
     }
     fn tensor_waves(&self, selected: &crate::SelectedPreparation,
         rank: eredu_core::ParallelRankTopology)
@@ -107,7 +125,7 @@ where
         if let Some(pipeline) = &self.pipeline {
             return pipeline_quote(self, pipeline, architecture, communication, visitor);
         }
-        let layout = architecture.state_layout_with_metadata(context)?;
+        let layout = architecture.state_layout(Some(context))?;
         if visitor.state.layout() != &layout {
             return Err(context.metadata_error(format_args!(
                 "routed state projection differs from its exact local constructor")));
@@ -120,33 +138,34 @@ where
             Some(parameters) => {
                 let runtime = LayerwiseRuntime::new_workspace_with_policy(architecture,
                     |layout| WorkspaceLayerwisePolicy::for_layout(parameters, layout, context), context)?;
-                spans::<Model<C,P>, _>(&self.selected, self.rank, &self.execution, &self.providers, runtime, &parallel, &communication, visitor)
+                spans::<Model<C,P>, _, _>(&self.selected, self.rank, &self.execution, self.providers.provider(context)?, runtime, &parallel, &communication, visitor)
             }
             None => {
                 let runtime = ResidentRuntime::<_, WorkspaceBackend, ResidentState>::new_workspace(
                     architecture, context)?.into_layerwise_workspace(context)?;
-                spans::<Model<C,P>, _>(&self.selected, self.rank, &self.execution, &self.providers, runtime, &parallel, &communication, visitor)
+                spans::<Model<C,P>, _, _>(&self.selected, self.rank, &self.execution, self.providers.provider(context)?, runtime, &parallel, &communication, visitor)
             }
         }
     }
 }
 
-pub(super) fn spans<A, Q>(selected: &crate::SelectedPreparation, rank: eredu_core::ParallelRankTopology,
+pub(super) fn spans<A, Q, Provider>(selected: &crate::SelectedPreparation, rank: eredu_core::ParallelRankTopology,
     execution: &crate::partitioned_execution::PreparedRoutedExecutionHandoff,
-    providers: &RetainedPartitionResidentSource,
+    mut provider: Provider,
     mut runtime: LayerwiseRuntime<A, WorkspaceBackend, ResidentState, Q>,
     parallel: &eredu_nn::workspace::WorkspaceParallelContext,
     communication: &Communication, visitor: EquationVisitor<'_, '_, '_>) -> Result<EquationQuote, Error>
 where
     A:eredu_runtime::ParallelRoutedLayeredArchitecture<WorkspaceBackend,ResidentState,Error=Error>
         +eredu_runtime::ReplicatedTextArchitecture<WorkspaceBackend,ResidentState>+'static,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<WorkspaceBackend>,
     Q:eredu_runtime::LayerwisePolicy<WorkspaceBackend,A::Unit>,
     Q::Error:std::error::Error+Send+Sync+'static,
 {
     let context = visitor.context;
     context.charge_metadata(std::mem::size_of::<(
         &crate::SelectedPreparation, eredu_core::ParallelRankTopology,
-        &crate::partitioned_execution::PreparedRoutedExecutionHandoff, &RetainedPartitionResidentSource, LayerwiseRuntime<A, WorkspaceBackend, ResidentState, Q>,
+        &crate::partitioned_execution::PreparedRoutedExecutionHandoff, Provider, LayerwiseRuntime<A, WorkspaceBackend, ResidentState, Q>,
         <A as LayeredArchitecture<WorkspaceBackend, ResidentState>>::ForwardContext,
         &eredu_nn::workspace::WorkspaceParallelContext, &Communication,
         EquationVisitor<'_, '_, '_>, Result<EquationQuote, Error>,
@@ -157,15 +176,15 @@ where
         Some(execution.communication_tensor_group().ok_or_else(||
             context.metadata_error(format_args!("routed constructor retained no tensor provider agreement group")))?)
     } else { None };
-    let paths = visitor.observation.map(|observation| runtime.bind_observation_paths(observation.paths))
-        .transpose().map_err(|cause| context.metadata_source(cause))?;
-    let mut provider = providers.borrowed();
+    let paths = visitor.observation.map(|observation| runtime.bind_observation_paths(observation.paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
+        .transpose().map_err(|cause| cause.into_quote_error(context))?;
     let mut provider = region::RegionProvider::new(execution, &mut provider);
     context.charge_metadata(std::mem::size_of_val(&provider).checked_mul(2)
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
     direct_publication_spans(selected, visitor, paths,
         |tokens, state, demand, observer, paths, span| {
             let pass = match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
                 InferenceWorkspaceSpan::Prefill(_) => eredu_runtime::ExpertPass::Prefill,
                 InferenceWorkspaceSpan::Decode { .. } => eredu_runtime::ExpertPass::Decode,
             };
@@ -216,7 +235,7 @@ where C: PartitionedConfig + Send + Sync,
     }
     let mut addresses = context.metadata_vec(pipeline.addresses.len())?;
     addresses.extend_from_slice(&pipeline.addresses);
-    let unit_strategy = pipeline_strategy(&source.execution, source.providers.borrowed(), context)?;
+    let unit_strategy = pipeline_strategy(&source.execution, source.providers.provider(context)?, context)?;
     context.charge_metadata(std::mem::size_of_val(&unit_strategy).checked_mul(2)
         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
     match visitor.parameters {

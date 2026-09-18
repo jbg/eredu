@@ -28,10 +28,17 @@ impl State {
 }
 
 struct StatefulBackend(Rc<State>);
+impl SourceBackend for StatefulBackend {
+    fn source_environment(runtime: &ModelRuntime<Self>) -> &Environment {
+        &runtime.session().original
+    }
+}
+original_sources::implement!(StatefulBackend);
 struct Session {
     state: Rc<State>,
     authority: eredu_core::SessionAuthority,
-    history: Vec<u32>,
+    history: usize,
+    original: Environment,
 }
 
 impl Drop for Session {
@@ -44,11 +51,14 @@ impl Drop for Session {
 
 struct Pending(Rc<State>);
 #[derive(Clone)]
-struct Token(u32);
+struct Token {
+    id: u32,
+    receipt: Option<eredu_runtime::working_memory::InferenceTextStepReceipt>,
+}
 impl TokenOutput for Token {
     type Error = io::Error;
     fn token_id(&self) -> io::Result<u32> {
-        Ok(self.0)
+        Ok(self.id)
     }
 }
 
@@ -82,13 +92,14 @@ impl BackendProvider for StatefulBackend {
         Ok(Session {
             state: self.0.clone(),
             authority: Default::default(),
-            history: vec![],
+            history: 0,
+            original: Environment::new(None),
         })
     }
 }
 
 impl BackendSession<StatefulBackend> for Session {
-    type PrefillInput = Vec<u32>;
+    type PrefillInput = Prompt;
     type DecodeInput = u32;
     type Output = Token;
     type Completion = Pending;
@@ -98,7 +109,7 @@ impl BackendSession<StatefulBackend> for Session {
     fn prefill(
         &mut self,
         _: &StatefulBackend,
-        input: Vec<u32>,
+        input: Prompt,
     ) -> io::Result<Submission<Token, Pending>> {
         if self.state.poison.get() {
             return Err(io::Error::other("poisoned session"));
@@ -108,9 +119,12 @@ impl BackendSession<StatefulBackend> for Session {
             .begin_submission()
             .map_err(io::Error::other)?;
         self.state.pending.replace(Some(lease));
-        self.history.extend(input);
+        self.history += input.len();
         Ok(Submission {
-            output: Token(self.history.len() as u32 % 4),
+            output: Token {
+                id: self.history as u32 % 4,
+                receipt: None,
+            },
             completion: Pending(self.state.clone()),
         })
     }
@@ -119,7 +133,7 @@ impl BackendSession<StatefulBackend> for Session {
         backend: &StatefulBackend,
         input: u32,
     ) -> io::Result<Submission<Token, Pending>> {
-        self.prefill(backend, vec![input])
+        self.prefill(backend, vec![input].into())
     }
     fn observe_output(&self, _: &StatefulBackend, _: &Token) -> io::Result<ObservationSet> {
         Ok(ObservationSet::new())
@@ -127,34 +141,159 @@ impl BackendSession<StatefulBackend> for Session {
 }
 
 impl TextGenerationBackend for StatefulBackend {
-    type TextPreparation = ();
-    type TextPreparationControl = ();
-    type TextStepPermit = ();
-    fn begin_text_step<C: eredu_core::TokenFilterController>(
-        _: &eredu_core::ModelRuntime<Self>,
-        _: &Self::TextPreparation,
-        _: &Self::TextGenerationState,
-        _: &C,
-        _: eredu_core::PendingTextInput<&Self::Prompt, &Self::Token>,
-        _: &eredu_core::backend::TextStepContext,
-    ) -> Result<Self::TextStepPermit, Self::Error> {
-        Ok(())
+    fn prepare_shared_token_filter(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> TokenFilter,
+    ) -> Result<eredu_core::SharedTokenFilter, BackendFailure> {
+        Self::source_environment(runtime)
+            .pool
+            .prepare_shared_token_filter(factory)
+            .map_err(BackendFailure::from_error)
     }
-    fn finish_text_step(_: Self::TextStepPermit) -> Result<(), Self::Error> {
+    type TextPreparation = Option<admitted_text::PreparationOwner>;
+    type TextPreparationControl = ();
+    type TextStepPermit = Option<admitted_text::Step>;
+    type Prompt = Prompt;
+    type Token = Token;
+    type TextGenerationState = ();
+    type TextCompletion = Pending;
+    fn begin_text_step<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        p: &Self::TextPreparation,
+        _: &(),
+        controller: &C,
+        input: eredu_core::PendingTextInput<&Prompt, &Token>,
+        context: &eredu_core::TextStepContext,
+    ) -> io::Result<Self::TextStepPermit> {
+        p.as_ref()
+            .map(|p| {
+                let receipt = match input {
+                    eredu_core::PendingTextInput::Prefill(_) => None,
+                    eredu_core::PendingTextInput::Decode(token) => Some(
+                        token
+                            .receipt
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("missing original step receipt"))?,
+                    ),
+                };
+                p.step(controller, receipt, context)
+                    .map_err(io::Error::other)
+            })
+            .transpose()
+    }
+    fn finish_text_step(step: Self::TextStepPermit) -> io::Result<()> {
+        if let Some(step) = step {
+            step.finish().map_err(io::Error::other)?;
+        }
         Ok(())
     }
     fn admit_text_preparation<C: eredu_core::TokenFilterController>(
         _: &ModelRuntime<Self>,
-        _: &eredu_core::TextPreparationInput<'_, Self::Prompt>,
+        _: &eredu_core::TextPreparationInput<'_, Prompt>,
         _: TextGenerationConfig,
         _: &C,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Ok(None)
+    }
+    fn admit_text_preparation_with_token_input<C: eredu_core::TokenFilterController>(
+        runtime: &ModelRuntime<Self>,
+        _: &eredu_core::TextPreparationInput<'_, Prompt>,
+        config: TextGenerationConfig,
+        controller: &C,
+        options: Option<&eredu_core::TextPreparationOptions>,
+        claim: &eredu_core::GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        if options.is_some_and(|o| o.capture.is_some() || o.interventions.is_some()) {
+            return Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure());
+        }
+        let env = Self::source_environment(runtime);
+        admitted_text::Preparation::admit(env, config, controller, claim, env.output_width.get(), None)
+            .map(Some)
+    }
+    fn bind_text_preparation_run<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        p: &Self::TextPreparation,
+        c: &C,
+        context: &eredu_core::TextStepContext,
     ) -> Result<(), BackendFailure> {
+        if let Some(p) = p {
+            p.bind(c, context)?;
+        }
         Ok(())
     }
-    type Prompt = Vec<u32>;
-    type Token = Token;
-    type TextGenerationState = ();
-    type TextCompletion = Pending;
+    fn prepare_generation_sequence_admitted(
+        _: &ModelRuntime<Self>,
+        p: &Self::TextPreparation,
+        claim: eredu_core::GenerationSequencePreparation<'_, '_>,
+    ) -> Result<eredu_core::RetainedGenerationSequence, BackendFailure> {
+        p.as_ref().unwrap().sequence(claim)
+    }
+    fn prepare_original_text_prompt_admitted(
+        _: &Self,
+        p: &Self::TextPreparation,
+    ) -> Result<Prompt, BackendFailure> {
+        p.as_ref().unwrap().prompt()
+    }
+    fn bind_text_prompt_preparation(
+        _: &Self,
+        prompt: Prompt,
+        p: &Self::TextPreparation,
+    ) -> io::Result<Prompt> {
+        if let Some(p) = p {
+            p.request.bind_prompt().map_err(io::Error::other)?;
+        }
+        Ok(prompt)
+    }
+    fn start_text_generation_admitted(
+        backend: &Self,
+        config: TextGenerationConfig,
+        p: &Self::TextPreparation,
+    ) -> io::Result<()> {
+        if let Some(p) = p {
+            p.request
+                .claim_sampling(config)
+                .and_then(|s| s.finish())
+                .map_err(io::Error::other)?;
+        }
+        Self::start_text_generation(backend, config)
+    }
+    fn submit_text_prefill_permitted(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Prompt,
+        decision: &eredu_core::TokenSamplingDecision<'_>,
+        state: &mut (),
+        cancel: &eredu_core::GenerationCancellationToken,
+        step: &mut Self::TextStepPermit,
+    ) -> io::Result<Option<Submission<Token, Pending>>> {
+        if let Some(step) = step {
+            step.validate(decision, Self::source_environment(runtime))
+                .map_err(io::Error::other)?;
+        }
+        let mut result = Self::submit_text_prefill_cancellable_decision(
+            runtime, prompt, decision, state, cancel,
+        )?;
+        if let (Some(step), Some(result)) = (step, result.as_mut()) {
+            result.output.receipt = Some(step.receipt());
+        }
+        Ok(result)
+    }
+    fn submit_text_decode_permitted(
+        runtime: &mut ModelRuntime<Self>,
+        token: Token,
+        decision: &eredu_core::TokenSamplingDecision<'_>,
+        state: &mut (),
+        step: &mut Self::TextStepPermit,
+    ) -> io::Result<Submission<Token, Pending>> {
+        if let Some(step) = step {
+            step.validate(decision, Self::source_environment(runtime))
+                .map_err(io::Error::other)?;
+        }
+        let mut result = Self::submit_text_decode_decision(runtime, token, decision, state)?;
+        if let Some(step) = step {
+            result.output.receipt = Some(step.receipt());
+        }
+        Ok(result)
+    }
     fn reset_session(_: &Self, session: &mut Session) -> Result<(), BackendFailure> {
         session.authority.require_idle()?;
         if session.state.fail_reset.get() {
@@ -163,7 +302,7 @@ impl TextGenerationBackend for StatefulBackend {
                 io::Error::other("reset failed"),
             ));
         }
-        session.history.clear();
+        session.history = 0;
         session.state.resets.set(session.state.resets.get() + 1);
         Ok(())
     }
@@ -177,12 +316,12 @@ impl TextGenerationBackend for StatefulBackend {
     fn start_text_generation(_: &Self, _: TextGenerationConfig) -> io::Result<()> {
         Ok(())
     }
-    fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> io::Result<Vec<u32>> {
-        Ok(prompt)
+    fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> io::Result<Prompt> {
+        Ok(prompt.into())
     }
     fn submit_text_prefill(
         runtime: &mut ModelRuntime<Self>,
-        prompt: Vec<u32>,
+        prompt: Prompt,
         _: &TokenFilter,
         _: &mut (),
     ) -> io::Result<Submission<Token, Pending>> {
@@ -194,11 +333,11 @@ impl TextGenerationBackend for StatefulBackend {
         _: &TokenFilter,
         _: &mut (),
     ) -> io::Result<Submission<Token, Pending>> {
-        runtime.decode(token.0)
+        runtime.decode(token.id)
     }
 }
 
-fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
+fn model() -> (original_sources::Fixture<StatefulBackend>, Rc<State>) {
     let state = Rc::new(State::default());
     let vocabulary = ["[UNK]", "a", "b", "c"]
         .into_iter()
@@ -212,12 +351,14 @@ fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
             .build()
             .unwrap(),
     );
-    tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+    tokenizer.with_pre_tokenizer(Some(
+        tokenizers::pre_tokenizers::whitespace::Whitespace::default(),
+    ));
     tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
     tokenizer
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
-    let model = LoadedModel::from_runtime(
+    let model = original_sources::Fixture::from_runtime(
         ModelRuntime::prepare(StatefulBackend(state.clone()), ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
@@ -282,7 +423,7 @@ fn reset_restores_fresh_requests_without_reloading_and_synchronize_preserves_sta
     model.reset().unwrap();
     assert_eq!(model.model_id(), "lifecycle-host");
     assert_eq!(state.loads.get(), 1);
-    evict(model).unwrap();
+    evict(model.into_model()).unwrap();
     assert_eq!(state.drops.get(), 1);
 }
 
@@ -300,43 +441,62 @@ fn abandoned_generation_settles_before_generic_reuse_or_eviction() {
     assert_eq!(state.waits.get(), 1);
     model.synchronize().unwrap();
     assert_eq!(fresh_request(&mut model), vec![1, 2]);
-    evict(model).unwrap();
+    evict(model.into_model()).unwrap();
     assert_eq!(state.drops.get(), 1);
 }
 
 #[test]
 fn cancellation_settles_and_allows_a_fresh_generic_request() {
     use eredu::api::{
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatGenerationSettings,
     };
     use eredu::runtime::chat::ChatTemplateRequest;
     use eredu_core::{FinishReason, GenerationCancellationToken};
 
     for pre_cancel in [false, true] {
         let (mut model, state) = model();
+        let preparation_cancel = GenerationCancellationToken::new();
+        let source = model
+            .chat_source(false, &preparation_cancel)
+            .unwrap()
+            .unwrap();
         let chat = model
-            .prepare_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role": "user", "content": "a"})],
-                add_generation_prompt: true,
-                ..Default::default()
-            })
+            .prepare_chat(
+                &source,
+                &ChatTemplateRequest {
+                    messages: vec![serde_json::json!({"role":"user","content":"a"})],
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+                original_sources::CAPACITY,
+                &preparation_cancel,
+            )
+            .unwrap()
             .unwrap();
         let cancellation = GenerationCancellationToken::new();
         if pre_cancel {
             cancellation.cancel();
         }
         let cancel_on_event = cancellation.clone();
-        let output = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::RenderedPrompt(&chat),
-                settings: PreparedChatGenerationSettings::default(),
-                caller_stop_sequences: &[],
-                cancellation,
-                on_event: move |_| cancel_on_event.cancel(),
-            })
+        let run = model
+            .start_prepared_chat(
+                eredu::api::PreparedChatRequest::new(
+                    &chat,
+                    original_sources::settings(PreparedChatGenerationSettings::default()),
+                ),
+                &cancellation,
+            )
             .unwrap();
-        assert_eq!(output.finish_reason, FinishReason::Cancelled);
-        assert_eq!(output.token_ids.len(), usize::from(!pre_cancel));
+        if pre_cancel {
+            assert!(run.is_none());
+        } else {
+            let output = run
+                .unwrap()
+                .run(&cancellation, &mut move |_| cancel_on_event.cancel())
+                .unwrap();
+            assert_eq!(output.finish_reason, FinishReason::Cancelled);
+            assert_eq!(output.token_ids.len(), 1);
+        }
         model.synchronize().unwrap();
         assert!(state.pending.borrow().is_none());
         assert_eq!(fresh_request(&mut model), vec![1, 2]);

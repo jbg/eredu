@@ -176,18 +176,18 @@ fn load_recurrent_parameters<A>(
         visited: BTreeMap<String, ()>,
     }
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Load {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-            let Some((base, step)) = recurrent_parameter_pattern(metadata.id.as_str()) else {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+            let Some((base, step)) = recurrent_parameter_pattern(metadata.id().as_str()) else {
                 return;
             };
             assert!(self
                 .visited
-                .insert(metadata.id.as_str().into(), ())
+                .insert(metadata.id().as_str().into(), ())
                 .is_none());
             assert!(
                 value.data.iter().all(|value| *value == 0.0),
                 "unloaded {}",
-                metadata.id.as_str()
+                metadata.id().as_str()
             );
             for (index, value) in value.data.iter_mut().enumerate() {
                 *value = base + step * (index % 7) as f32;
@@ -210,7 +210,7 @@ fn compare_equations(config: serde_json::Value) {
     let context = NumericContext::default();
     let architecture = HybridModel::new(args.clone(), &context).unwrap();
     let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 18);
     let mut model = ResidentRuntime::new(architecture, &context).unwrap();
     // The fixture has one gated-delta unit and one attention unit.
@@ -426,7 +426,7 @@ fn qwen_hybrid_actual_sources_bind_all_target_rows_and_original_physical_readout
         let context = NumericContext::default();
         let architecture = HybridModel::new(args, &context).unwrap();
         let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-            prefill_observation_declarations(&architecture).unwrap();
+            prefill_observation_declarations(&architecture, None).unwrap();
         assert_eq!(declarations.len(), 18);
         let runtime =
             ResidentRuntime::<_, NumericBackend, HybridState>::new(architecture, &context).unwrap();
@@ -491,7 +491,7 @@ fn qwen_hybrid_target_evidence_preserves_existing_mtp_availability_gate() {
     let context = NumericContext::default();
     let architecture = HybridModel::new(args, &context).unwrap();
     let declarations = <HybridModel as LayeredArchitecture<NumericBackend, HybridState>>::
-        prefill_observation_declarations(&architecture).unwrap();
+        prefill_observation_declarations(&architecture, None).unwrap();
     assert_eq!(declarations.len(), 18);
     assert!(declarations
         .iter()

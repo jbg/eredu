@@ -26,6 +26,12 @@ use serde::de::Visitor;
 /// This trait is sealed and cannot be implemented for types outside of
 /// `serde_json`.
 pub trait Read<'de>: private::Sealed {
+    /// Borrow the selected source's explicit numeric producer policy.
+    #[doc(hidden)]
+    fn numeric_allocation(&self) -> &'de dyn crate::allocation::Allocation {
+        &crate::allocation::Unenforced
+    }
+
     #[doc(hidden)]
     fn next(&mut self) -> Result<Option<u8>>;
     #[doc(hidden)]
@@ -162,6 +168,8 @@ where
 // This is more efficient than other iterators because peek() can be read-only
 // and we can compute line/col position only if an error happens.
 pub struct SliceRead<'a> {
+    #[cfg(feature = "arbitrary_precision")]
+    numeric_allocation: Option<&'a dyn crate::allocation::Allocation>,
     slice: &'a [u8],
     /// Index of the *next* byte that will be returned by next() or peek().
     index: usize,
@@ -408,9 +416,20 @@ where
 //////////////////////////////////////////////////////////////////////////////
 
 impl<'a> SliceRead<'a> {
+    #[cfg(feature = "arbitrary_precision")]
+    pub(crate) fn with_numeric_allocations(
+        mut self,
+        allocation: &'a dyn crate::allocation::Allocation,
+    ) -> Self {
+        self.numeric_allocation = Some(allocation);
+        self
+    }
+
     /// Create a JSON input source to read from a slice of bytes.
     pub fn new(slice: &'a [u8]) -> Self {
         SliceRead {
+            #[cfg(feature = "arbitrary_precision")]
+            numeric_allocation: None,
             slice,
             index: 0,
             #[cfg(feature = "raw_value")]
@@ -541,6 +560,12 @@ impl<'a> SliceRead<'a> {
 impl<'a> private::Sealed for SliceRead<'a> {}
 
 impl<'a> Read<'a> for SliceRead<'a> {
+    #[cfg(feature = "arbitrary_precision")]
+    fn numeric_allocation(&self) -> &'a dyn crate::allocation::Allocation {
+        self.numeric_allocation
+            .unwrap_or(&crate::allocation::Unenforced)
+    }
+
     #[inline]
     fn next(&mut self) -> Result<Option<u8>> {
         // `Ok(self.slice.get(self.index).map(|ch| { self.index += 1; *ch }))`

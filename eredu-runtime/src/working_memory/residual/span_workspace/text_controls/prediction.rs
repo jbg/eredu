@@ -135,11 +135,19 @@ pub struct OriginalTextPredictionScopes {
     controls: OriginalTextControlGuard,
 }
 impl PreparedTextControlWorkspace {
+    /// The two actual prediction roles of a sampling extension. Model, model
+    /// validation and token-scalar roles are absent from the resulting bank.
+    pub fn with_sampling_prediction_scopes(self, sampling: Option<u64>, event: Option<u64>)
+        -> Result<Self, WorkingMemoryError> {
+        if self.binding.sampling_extension.is_none() { return Err(WorkingMemoryError::IdentityMismatch); }
+        self.with_prediction_scopes(TextPredictionScopeFacts::new(Some(0), sampling, event, Some(0), Some(0)))
+    }
     /// Enrich original Q with the five roles for its own accepted output ceiling.
     pub fn with_prediction_scopes(
         mut self,
         facts: TextPredictionScopeFacts,
     ) -> Result<Self, WorkingMemoryError> {
+        cold_controls::<(Self, TextPredictionScopeFacts, Result<Self, WorkingMemoryError>)>(self.plan.metadata_funding().as_ref())?;
         if self.binding.prediction_scopes.is_some() {
             return Err(WorkingMemoryError::AlreadyStarted);
         }
@@ -151,7 +159,8 @@ impl PreparedTextControlWorkspace {
         let population = facts
             .known_sum()?
             .checked_add(issue)
-            .and_then(|n| n.checked_mul(self.binding.geometry.max_output_tokens))
+            .and_then(|n| n.checked_mul(self.binding.sampling_extension.as_ref()
+                .map_or(self.binding.geometry.max_output_tokens, |origin| origin.end() - origin.first())))
             .and_then(|n| n.checked_add(neutral))
             .and_then(|n| n.checked_add(self.binding.facts.admission.unwrap_or(0)))
             .ok_or(WorkingMemoryError::Overflow)?;
@@ -180,7 +189,7 @@ impl OwnedTextSpanWorkspace {
             binding: binding.clone(),
             reservation: self.reservation().clone(),
             preparation: None,
-            next_attempt: 0,
+            next_attempt: binding.sampling_extension.as_ref().map_or(0, |origin| origin.first()),
             controls: self.controls.clone(),
         };
         self.prediction_scopes_taken = true;
@@ -188,7 +197,9 @@ impl OwnedTextSpanWorkspace {
     }
 }
 impl OriginalTextPredictionScopes {
-    fn role(&self, kind: Role) -> Option<OriginalPredictionScopeRole> {
+    fn role(&self, kind: Role, original_sampling: bool) -> Option<OriginalPredictionScopeRole> {
+        if self.binding.sampling_extension.is_some() && !matches!(kind, Role::Sampling | Role::SamplingEvent) { return None; }
+        if self.binding.sampling_extension.is_none() && !original_sampling && matches!(kind, Role::Sampling | Role::SamplingEvent) { return None; }
         Some(OriginalPredictionScopeRole {
             _role: kind,
             native: OriginalPredictionNativeCustody {
@@ -216,7 +227,12 @@ impl OriginalTextPredictionScopes {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.controls.validate_reservation(&self.reservation)?;
-        let (preparation, attempt) = step.original_scope_identity(&self.reservation)?;
+        let (preparation, attempt) = if let Some(origin) = &self.binding.sampling_extension {
+            let attempt = origin.validate_step(step)?;
+            let (preparation, _) = step.original_scope_identity(origin.request().memory_reservation()
+                .ok_or(WorkingMemoryError::IdentityMismatch)?)?;
+            (preparation, attempt)
+        } else { step.original_scope_identity(&self.reservation)? };
         if self
             .preparation
             .as_ref()
@@ -237,13 +253,14 @@ impl OriginalTextPredictionScopes {
             });
         }
         let next = attempt.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
+        let original_sampling = step.original_sampling_is_current()?;
         let set = OriginalTextPredictionScopeSet {
             roles: [
-                self.role(Role::ModelExecution),
-                self.role(Role::Sampling),
-                self.role(Role::SamplingEvent),
-                self.role(Role::ModelValidation),
-                self.role(Role::TokenScalar),
+                self.role(Role::ModelExecution, original_sampling),
+                self.role(Role::Sampling, original_sampling),
+                self.role(Role::SamplingEvent, original_sampling),
+                self.role(Role::ModelValidation, original_sampling),
+                self.role(Role::TokenScalar, original_sampling),
             ],
         };
         self.preparation = Some(preparation);

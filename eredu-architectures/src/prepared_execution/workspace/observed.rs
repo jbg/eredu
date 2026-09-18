@@ -13,7 +13,7 @@ fn source_error<E: std::error::Error + Send + Sync + 'static>(
     if context.uses_checked_metadata() {
         context.metadata_source(cause)
     } else {
-        Error::backend_source(cause)
+        Error::backend_retained_source(cause)
     }
 }
 
@@ -59,6 +59,7 @@ impl ObservationRef<'_, '_> {
         let prediction = match self.invocation_prediction {
             Some(prediction) => Some(prediction),
             None => match span {
+                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
             InferenceWorkspaceSpan::Prefill(_) => (geometry.max_output_tokens > 0).then_some(0),
             InferenceWorkspaceSpan::Decode { index, .. } => Some(
                 index
@@ -155,7 +156,7 @@ pub(super) fn with_hook_workspace(
                     if context.uses_checked_metadata() {
                         context.metadata_source(ObservationError::Overflow)
                     } else {
-                        Error::backend_source(ObservationError::Overflow)
+                        Error::backend_retained_source(ObservationError::Overflow)
                     }
                 })
             })

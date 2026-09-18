@@ -89,7 +89,7 @@ fn invoke(
                     .push("complete");
             });
             if fail_completion {
-                Err(Error::backend_source(std::io::Error::new(
+                Err(Error::backend_retained_source(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "auxiliary completion sentinel",
                 )))

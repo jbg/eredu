@@ -614,6 +614,54 @@ fn retained_cursor_preparation_unwind_retires_prefix_and_prevents_retry() {
     assert_eq!(probe.prepared.load(SeqCst), 1);
 }
 
+#[test]
+fn funded_semantic_state_uses_the_committed_cursor_without_speculative_execution() {
+    use eredu_runtime::working_memory::{
+        InferenceExecutionIdentity, PreparedSemanticSource, WorkingMemoryPool,
+    };
+    use eredu_text::{stop_storage::StopCompilePlan, tokenizer_storage::TokenizerPlan};
+    type Consumer = RetainedConsumerCursor<SourceFailure, eredu_core::SpeculativeOutputError, true>;
+    let json = br#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}}"#;
+
+    for cancel_after_first in [false, true] {
+        let pool = WorkingMemoryPool::new(64 * 1024 * 1024, 0).unwrap();
+        let tokenizer = pool.compile_tokenizer(TokenizerPlan::prepare_json(json).unwrap()).unwrap();
+        let stops = pool.compile_stop_source(StopCompilePlan::prepare_refs(&[]).unwrap()).unwrap();
+        let preparation = PreparedSemanticSource::new(
+            &tokenizer, &InferenceExecutionIdentity::default(), 64 * 1024 * 1024,
+        ).unwrap();
+        let mut semantic = preparation.prepare(&stops, 2, NonZeroUsize::new(1).unwrap(), true).unwrap();
+        let (mut cursor, probe) = retained_for(2, &[], Behavior::Ready, Consumer::layout());
+        let mut cursor = Consumer::from_sequence(cursor.sequence.take().unwrap()).unwrap();
+        let mut source = Source::new(probe.clone(), Disposition::Healthy);
+        source.tokens = [0, 1].into();
+        let cancellation = GenerationCancellationToken::new();
+        let mut events = Vec::new();
+        while cursor.finish_reason().is_none() {
+            cursor = cursor.advance_semantic(&mut source, &mut semantic, &cancellation, &mut |event| {
+                events.push(event);
+                if cancel_after_first && events.len() == 1 { cancellation.cancel(); }
+            }).unwrap();
+        }
+        let output = cursor.into_output(Default::default()).unwrap();
+        assert_eq!(output.token_ids.as_ref(), if cancel_after_first { &[0][..] } else { &[0, 1][..] });
+        let reason = if cancel_after_first { FinishReason::Cancelled } else { FinishReason::MaxTokens };
+        assert_eq!(output.finish_reason, reason);
+        let mut expected = vec![SemanticEvent::TextDelta("a".into())];
+        if !cancel_after_first { expected.push(SemanticEvent::TextDelta("b".into())); }
+        expected.push(SemanticEvent::Finished { reason });
+        assert_eq!(events, expected);
+        semantic.publish_events(&mut |_| panic!("committed event delivered twice"));
+        drop((semantic, preparation, tokenizer, stops));
+        assert!(pool.used_bytes().unwrap() > 0, "escaped text retains its actual payer");
+        drop(events);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(source.next, if cancel_after_first { 1 } else { 2 });
+        drop(output);
+        assert_eq!(probe.retired.load(SeqCst), 1);
+    }
+}
+
 mod consumer;
 
 mod decoder;

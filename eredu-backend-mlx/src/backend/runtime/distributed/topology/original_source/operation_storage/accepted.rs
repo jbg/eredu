@@ -11,7 +11,7 @@ pub(crate) struct AcceptedCommunicationSource<'stream> {
     observer:OriginalScopeObserver,
     stream:&'stream Stream,
     traversal:safemlx::OperationEvalTraversalLayout,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 impl OriginalCommunicationCompletedOperation<'_> {
     pub(crate) fn construct_accepted<'stream>(self,source:&OriginalCommunicationSource<'_>,
@@ -20,10 +20,10 @@ impl OriginalCommunicationCompletedOperation<'_> {
             size_of::<Result<AcceptedCommunicationSource<'stream>,Error>>(),
             size_of::<Result<(OriginalCommunicationConstructed,OriginalCommunicationCompletion),Error>>(),
             size_of::<(&OriginalCommunicationSource<'_>,&OriginalScopeObserver,&Stream)>(),
-            size_of::<WorkspaceMetadataFunding>(),size_of::<safemlx::OperationEvalTraversalLayout>(),
-            safemlx::OriginalScopeObserver::control_bytes().ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?];
+            size_of::<HostMetadataFunding>(),size_of::<safemlx::OperationEvalTraversalLayout>(),
+            safemlx::OriginalScopeObserver::control_bytes().ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
         let traversal=self.native.traversal();
         let funding=self.funding.clone();
         let value=self.construct(source,observer,stream)?;

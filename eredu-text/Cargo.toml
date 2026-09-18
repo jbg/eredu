@@ -36,6 +36,7 @@ stop-compiler-test-support = []
 workspace = true
 
 [dependencies]
+hashbrown = { version = "=0.17.1", default-features = false }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 minijinja = { version = "2.24", path = "../third-party/minijinja-2.24.0", features = ["json", "loader", "preserve_order", "chat-clock"] }

@@ -9,7 +9,7 @@ use crate::backend::{
 };
 use eredu_core::HostPreparationAuthority;
 use eredu_nn::workspace::{
-    WorkspaceMetadataAccount, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
 };
 
 thread_local! {
@@ -36,12 +36,12 @@ pub(in crate::backend::runtime::cache::state::hybrid::resident_grouped_copy) fn 
 }
 
 #[derive(Debug)]
-struct RefuseOnce(WorkspaceMetadataFunding);
-impl WorkspaceMetadataAccount for RefuseOnce {
-    fn reserve_metadata(&self, bytes: usize) -> Result<(), WorkspaceMetadataFundingError> {
+struct RefuseOnce(HostMetadataFunding);
+impl HostMetadataAccount for RefuseOnce {
+    fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
         if REFUSE.replace(false) {
             REFUSED_BYTES.set(bytes);
-            return Err(WorkspaceMetadataFundingError::Capacity {
+            return Err(HostMetadataFundingError::Capacity {
                 required: u64::try_from(bytes).unwrap(),
                 available: 0,
             });
@@ -51,14 +51,14 @@ impl WorkspaceMetadataAccount for RefuseOnce {
 }
 fn attempt_funding(
     pool: &WorkingMemoryPool,
-) -> (WorkspaceMetadataFunding, HostPreparationAuthority) {
+) -> (HostMetadataFunding, HostPreparationAuthority) {
     let real = pool
         .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), u64::MAX)
         .unwrap();
-    let funding = WorkspaceMetadataFunding::new(RefuseOnce(real)).unwrap();
+    let funding = HostMetadataFunding::new(RefuseOnce(real)).unwrap();
     funding
         .reserve_metadata(
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().unwrap(),
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
         )
         .unwrap();
     let host = HostPreparationAuthority::retain(funding.clone());
@@ -143,7 +143,7 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
     assert!(REFUSED_BYTES.get() > 0);
     let mut cause: &(dyn std::error::Error + 'static) = &failure;
     let refused = loop {
-        if let Some(value) = cause.downcast_ref::<WorkspaceMetadataFundingError>() {
+        if let Some(value) = cause.downcast_ref::<HostMetadataFundingError>() {
             break *value;
         }
         cause = cause
@@ -152,7 +152,7 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
     };
     assert_eq!(
         refused,
-        WorkspaceMetadataFundingError::Capacity {
+        HostMetadataFundingError::Capacity {
             required: u64::try_from(REFUSED_BYTES.get()).unwrap(),
             available: 0,
         }

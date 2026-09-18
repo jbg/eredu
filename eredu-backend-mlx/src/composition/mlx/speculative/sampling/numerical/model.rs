@@ -12,7 +12,7 @@ use std::cell::{OnceCell, RefCell};
 #[derive(Debug)]
 pub(super) struct StreamOwner {
     _custody: StreamSource,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 /// Exact retained source accounts share a native stream mechanism, without
 /// treating a registered copy as a completed model or numerical allocation.
@@ -26,11 +26,11 @@ enum StreamSource {
 struct Failure<E: std::error::Error + 'static> {
     #[source]
     cause: E,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 pub(super) fn failed<E: std::error::Error + Send + Sync + 'static>(
     cause: E,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Error {
     // Its exact shell was paid before the single constructor/fill/seal attempt.
     Error::StorageSource(eredu_core::BackendFailure::from_error(Failure {
@@ -42,7 +42,7 @@ fn invalid() -> Error {
     Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
 }
 pub(super) fn overflow() -> Error {
-    Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)
+    Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
 struct Source {
     array: Option<Array>,
@@ -57,7 +57,7 @@ struct Destination {
     sealed: Cell<bool>,
     role: OriginalEmbeddedSpeculativeRole,
     identity: OriginalSpeculativeSourceIdentity,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// No raw or incomplete value can enter the numerical compiler. Clones share
 /// one fill and one seal; the returned carrier owns this destination even after
@@ -244,28 +244,28 @@ impl OriginalNumericalValue {
 pub(super) fn prepare_stream(
     custody: OriginalSpeculativeBudgetCustody,
     stream: &Stream,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PreparedStreamCopy<StreamOwner>, Error> {
     prepare_account_stream(custody.into(), stream, funding)
 }
 pub(super) fn prepare_account_stream(
     custody: eredu_runtime::working_memory::CompletedWorkspaceSourceAccount,
     stream: &Stream,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PreparedStreamCopy<StreamOwner>, Error> {
     prepare_source_stream(StreamSource::Completed(custody), stream, funding)
 }
 pub(super) fn prepare_registered_stream(
     source: eredu_runtime::working_memory::OriginalSpeculativeRegisteredSource,
     stream: &Stream,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PreparedStreamCopy<StreamOwner>, Error> {
     prepare_source_stream(StreamSource::Registered(source), stream, funding)
 }
 fn prepare_source_stream(
     custody: StreamSource,
     stream: &Stream,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> Result<PreparedStreamCopy<StreamOwner>, Error> {
     let parts =
         [

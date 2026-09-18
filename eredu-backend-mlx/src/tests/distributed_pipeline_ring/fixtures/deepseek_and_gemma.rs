@@ -126,8 +126,8 @@ fn write_deepseek_config_fixture(directory: &Path, config: serde_json::Value, co
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
-            let name = metadata.id.to_string();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+            let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let value = if self.components {
                 let seed = name.bytes().fold(2166136261u32, |seed, byte| {
@@ -424,14 +424,14 @@ fn write_gemma_fixture(directory: &Path) {
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
             let parameter = parameter.as_array();
-            let value = if metadata.id.as_str().ends_with("norm.weight") {
+            let value = if metadata.id().as_str().ends_with("norm.weight") {
                 Array::ones::<f32>(parameter.shape(), self.stream).unwrap()
             } else {
                 Array::full::<f32>(parameter.shape(), Array::from_f32(0.01), self.stream).unwrap()
             };
-            self.arrays.push((metadata.id.to_string(), value));
+            self.arrays.push((metadata.id().to_string(), value));
         }
     }
     let architecture = Architecture::new(args, stream).unwrap();
@@ -448,7 +448,7 @@ fn write_gemma_fixture(directory: &Path) {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
             State,
-        >>::group_unit_count(&architecture, group)
+        >>::group_unit_count(&architecture, group, None)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<

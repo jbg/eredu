@@ -88,6 +88,10 @@ fn host_publication_survives_array_aliases_until_final_physical_owner() {
         let host_bytes = host.allocation_info().unwrap().bytes() as u64;
         let mut only_host = RetainedStorage::default();
         only_host.include_host(host.clone()).unwrap();
+        assert_eq!(super::native::borrowed_native_roots(&only_host).count(), 1);
+        let observed = host.inspect_original_source().unwrap();
+        assert!(!observed.is_prepared_source(), "ordinary constructor has positive ordinary provenance");
+        drop(observed);
         let only_host = only_host.publish_unquoted(&owner).unwrap();
         let array = host.copy_to_array(&stream).unwrap().synchronize().unwrap();
         array.evaluated().unwrap();
@@ -102,6 +106,13 @@ fn host_publication_survives_array_aliases_until_final_physical_owner() {
         combined.include_host(host.clone()).unwrap();
         combined.include_array(&array).unwrap();
         combined.include_array(&view).unwrap();
+        let roots = super::native::borrowed_native_roots(&combined).collect::<Vec<_>>();
+        assert_eq!(roots.len(), if shared { 1 } else { 2 });
+        assert_eq!(roots.iter().filter(|root| matches!(root,
+            super::super::super::native_storage::NativeStorageRoot::Host(_, _))).count(), 1);
+        assert_eq!(roots.iter().filter(|root| matches!(root,
+            super::super::super::native_storage::NativeStorageRoot::Array(_))).count(), usize::from(!shared));
+        drop(roots);
         let combined = combined.publish_unquoted(&owner).unwrap();
         let total = host_bytes + if shared { 0 } else { native.bytes() as u64 };
         assert_eq!(pool.used_bytes().unwrap(), total);
@@ -155,6 +166,45 @@ fn non_native_publication_retires_payloads_outside_native_lock_before_charges() 
 }
 
 #[test]
+fn publication_retirement_requires_exact_retained_source_charges() {
+    fn publish(pool: &WorkingMemoryPool, bytes: &[Arc<[u8]>]) -> RetainedStoragePublication {
+        let owner = NativeMemoryOwner::acquire(pool).unwrap();
+        let mut inventory = RetainedStorage::default();
+        for source in bytes {
+            inventory.include_bytes(source.clone());
+        }
+        inventory.publish_unquoted(&owner).unwrap()
+    }
+    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let foreign_pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let source: Arc<[u8]> = Arc::from([3, 5, 7]);
+    let other: Arc<[u8]> = Arc::from([3, 5, 7]);
+    let initial = publish(&pool, &[source.clone()]);
+    let later = publish(&pool, &[source.clone()]);
+    let foreign = publish(&foreign_pool, &[source.clone()]);
+    let changed = publish(&pool, &[other.clone()]);
+    let grown = publish(&pool, &[source.clone(), other.clone()]);
+    assert!(later.can_retire_with(&initial));
+    assert!(!later.can_retire_with(&foreign));
+    assert!(!changed.can_retire_with(&initial));
+    assert!(!grown.can_retire_with(&initial));
+    assert_eq!(pool.used_bytes().unwrap(), 6);
+    drop(later);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.used_bytes().unwrap(), 6);
+    drop((changed, grown, other));
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.used_bytes().unwrap(), 3);
+    drop((initial, source));
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.used_bytes().unwrap(), 3);
+    drop(foreign);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
 fn publication_rejects_complete_overcapacity_batch_and_unknown_lazy_storage_atomically() {
     let pool = WorkingMemoryPool::new(1 << 14, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
@@ -192,4 +242,76 @@ fn publication_rejects_complete_overcapacity_batch_and_unknown_lazy_storage_atom
     assert_eq!(pool.used_bytes().unwrap(), 0);
     assert_eq!(pool.peak_bytes().unwrap(), 0);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
+}
+
+#[test]
+fn completed_attachment_receipts_match_exact_backing_and_domain_without_pinning_payload() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let foreign = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let owner = NativeMemoryOwner::acquire(&pool).unwrap();
+    let root = Array::from_slice(&[19u32, 23], &[2]);
+    let alias = root.clone();
+    let facts = root.allocation_info().unwrap().unwrap();
+    let mut storage = RetainedStorage::default();
+    storage.include_array(&root).unwrap();
+    assert!(matches!(storage.arrays.get(&facts.identity()), Some(NativeEntry::Owned(_))));
+    let receipt = storage.publish_unquoted(&owner).unwrap();
+    assert!(receipt.has_native_attachment(pool.shared_storage_domain(), facts));
+    assert!(!receipt.has_native_attachment(foreign.shared_storage_domain(), facts));
+    assert!(!receipt.has_native_attachment_facts(
+        pool.shared_storage_domain(), facts.identity(), facts.bytes() as u64 + 1));
+    assert_eq!(receipt.0._non_native.array_entries().count(), 0);
+    assert!(receipt.0._registrations.is_empty(), "native charge lives on its backing");
+    drop(root);
+    reclaim(&pool, facts.bytes() as u64, &stream);
+    assert_eq!(alias.evaluated().unwrap().as_slice::<u32>(), &[19, 23]);
+    drop(alias);
+    reclaim(&pool, 0, &stream);
+    // The receipt outlives physical retirement but its never-reused generation
+    // cannot cover a new allocation, even one with exactly the same capacity.
+    let next = Array::from_slice(&[29u32, 31], &[2]);
+    let next_facts = next.allocation_info().unwrap().unwrap();
+    assert_eq!(next_facts.bytes(), facts.bytes());
+    assert_ne!(next_facts.identity(), facts.identity());
+    assert!(!receipt.has_native_attachment(pool.shared_storage_domain(), next_facts));
+    drop((next, receipt, owner));
+    reclaim(&pool, 0, &stream);
+}
+
+#[test]
+fn completed_host_receipt_keeps_only_exact_domain_generation_and_capacity() {
+    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let foreign = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let owner = NativeMemoryOwner::acquire(&pool).unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let host = Arc::new(
+        HostTransferBuffer::new(&[4], Dtype::Float32, HostTransferPolicy::Transfer)
+            .unwrap()
+            .freeze(),
+    );
+    let weak = Arc::downgrade(&host);
+    let facts = host.allocation_info().unwrap();
+    let mut storage = RetainedStorage::default();
+    storage.include_host(host.clone()).unwrap();
+    let receipt = storage.publish_unquoted(&owner).unwrap();
+    assert!(receipt.has_native_attachment(pool.shared_storage_domain(), facts));
+    assert!(!receipt.has_native_attachment(foreign.shared_storage_domain(), facts));
+    assert!(!receipt.has_native_attachment_facts(
+        pool.shared_storage_domain(),
+        facts.identity(),
+        facts.bytes() as u64 + 1,
+    ));
+    assert_eq!(receipt.0._non_native.host_entries().count(), 0);
+    assert_eq!(receipt.0._non_native.byte_bound().unwrap(), Some(0));
+    assert!(receipt.0._registrations.is_empty());
+    drop(host);
+    reclaim(&pool, 0, &stream);
+    assert!(
+        weak.upgrade().is_none(),
+        "scalar receipts never pin the Host Arc"
+    );
+    assert!(receipt.has_native_attachment(pool.shared_storage_domain(), facts));
+    drop((receipt, owner));
+    reclaim(&pool, 0, &stream);
 }

@@ -66,7 +66,7 @@ impl<O: ?Sized> ArrayObserverAdapter<'_, O> {
             batch.units.coefficients,
             batch.source_groups,
         ])
-        .map_err(eredu_nn::Error::backend_source)
+        .map_err(eredu_nn::Error::backend_retained_source)
     }
 }
 
@@ -175,7 +175,7 @@ pub(super) fn observe_tensor(
             let evaluated = value.as_array().evaluated()?;
             let values = evaluated
                 .try_iter::<$ty>()
-                .map_err(eredu_nn::Error::backend_source)?;
+                .map_err(eredu_nn::Error::backend_retained_source)?;
             let mut output = Vec::with_capacity(values.len());
             output.extend(values.map($map));
             output
@@ -187,7 +187,7 @@ pub(super) fn observe_tensor(
                 .as_array()
                 .evaluated()?
                 .try_to_vec::<bool>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         ),
         Dtype::Uint8 => TensorObservationData::U64(mapped_values!(u8, u64::from)),
         Dtype::Uint16 => TensorObservationData::U64(mapped_values!(u16, u64::from)),
@@ -197,7 +197,7 @@ pub(super) fn observe_tensor(
                 .as_array()
                 .evaluated()?
                 .try_to_vec::<u64>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         ),
         Dtype::Int8 => TensorObservationData::I64(mapped_values!(i8, i64::from)),
         Dtype::Int16 => TensorObservationData::I64(mapped_values!(i16, i64::from)),
@@ -207,7 +207,7 @@ pub(super) fn observe_tensor(
                 .as_array()
                 .evaluated()?
                 .try_to_vec::<i64>()
-                .map_err(eredu_nn::Error::backend_source)?,
+                .map_err(eredu_nn::Error::backend_retained_source)?,
         ),
         Dtype::Float16 | Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 => {
             TensorObservationData::F32(value.to_f32_vec(stream)?)
@@ -495,7 +495,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         invocation: &eredu_runtime::RoutedUnitInvocation<'_, Array>,
     ) -> Result<(), eredu_nn::Error> {
         self.retain_arrays([invocation.input])
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         self.routed_invocation_active = true;
         let path = self
             .routed_path
@@ -504,7 +504,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
         {
             Some(observer) => observer.begin_invocation(&eredu_runtime::RoutedUnitInvocation {
                 input: MlxTensor::ref_cast(invocation.input),
@@ -523,7 +523,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
         {
             Some(observer) => observer.finish_invocation(success),
             None => Ok(()),
@@ -544,7 +544,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
         {
             Some(observer) => observer.observe(&batch.map_tensors(MlxTensor::ref_cast)),
             None => Ok(()),
@@ -562,7 +562,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         let replacement = match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
         {
             Some(observer) => observer
                 .intervene(&batch.map_tensors(MlxTensor::ref_cast))
@@ -570,7 +570,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
             None => Ok(None),
         }?;
         self.retain_arrays(replacement.iter())
-            .map_err(eredu_nn::Error::backend_source)?;
+            .map_err(eredu_nn::Error::backend_retained_source)?;
         Ok(replacement)
     }
     fn observe_effective(
@@ -585,7 +585,7 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(eredu_nn::Error::backend_retained_source)?
         {
             Some(observer) => observer.observe_effective(&batch.map_tensors(MlxTensor::ref_cast)),
             None => Ok(()),

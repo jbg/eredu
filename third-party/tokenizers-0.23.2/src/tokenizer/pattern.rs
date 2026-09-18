@@ -121,20 +121,7 @@ impl Pattern for &Regex {
 
 impl Pattern for &SysRegex {
     fn find_matches(&self, inside: &str) -> Result<Vec<(Offsets, bool)>> {
-        if inside.is_empty() {
-            return Ok(vec![((0, 0), false)]);
-        }
-        let matches = self
-            .find_iter(inside)
-            .map(Ok::<_, std::convert::Infallible>);
-        let mut splits = Vec::with_capacity(inside.len());
-        for item in coverage(inside.len(), matches) {
-            match item {
-                Ok(item) => splits.push(item),
-                Err(never) => match never {},
-            }
-        }
-        Ok(splits)
+        SysRegex::find_matches(self, inside)
     }
 }
 

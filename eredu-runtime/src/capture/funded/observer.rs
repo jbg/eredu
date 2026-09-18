@@ -45,15 +45,6 @@ pub(super) struct FundedCaptureObserver<'a, T, E: std::error::Error + Send + Syn
     routed_partition_hooks:Option<crate::capture::partition::PartitionCaptureRoutedHooks>,
 }
 impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'a, T, E, N> {
-    fn stage_error(&self, error: FundedCaptureError<E>, stage: &'static str) -> N {
-        let error = match error {
-            FundedCaptureError::Protocol(CaptureProtocolError::Transaction) =>
-                FundedCaptureError::Protocol(CaptureProtocolError::TransactionPhase(stage)),
-            other => other,
-        };
-        (self.map_error)(error)
-    }
-
     pub(super) fn new(
         session: &'a mut CaptureSession,
         delivery: &'a mut Option<FundedDelivery>,
@@ -183,15 +174,15 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             self.session.has_step = true;
         } else {
             self.session.reset_step_ledger()?;
-            CaptureObservationStep::with_invocation(
-                &self.session.plan,
-                phase,
-                self.prediction,
-                self.invocation.map(|value| value.1),
-            )?
-            .with_window(self.window)?
-            .reserve_metadata(&mut self.session.ledger)?;
             if let Some(claim) = &claim {
+                CaptureObservationStep::with_invocation(
+                    &self.session.plan,
+                    phase,
+                    self.prediction,
+                    self.invocation.map(|value| value.1),
+                )?
+                .with_window(self.window)?
+                .reserve_metadata(&mut self.session.ledger)?;
                 claim.reserve_intervention_metadata(&mut self.session.ledger)?;
             }
         }
@@ -218,7 +209,7 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
         }
 
         if let Some(partition) = self.backend.partition_capture() {
-            let source = self.session.plan.shared().ok_or(CaptureProtocolError::Transaction)?;
+            let source = &self.session.plan;
             let Frame::Active(frame) = &mut self.frame else {
                 return Err(CaptureProtocolError::Transaction.into());
             };
@@ -729,7 +720,7 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
             self.continuation_announced = true;
             Ok(())
         } else {
-            self.begin_chunk(chunk).map_err(|error| self.stage_error(error, "prefill chunk announcement"))
+            self.begin_chunk(chunk).map_err(|error| (self.map_error)(error))
         }
     }
     fn finish_prefill(&mut self, committed: bool) {
@@ -754,7 +745,7 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
             self.continuation_epoch = Some(context.epoch());
             Ok(None)
         } else {
-            self.prepare_retention(context).map_err(|error| self.stage_error(error, "prefill retention preparation"))
+            self.prepare_retention(context).map_err(|error| (self.map_error)(error))
         }
     }
     fn retire_prefill_chunk_retention(
@@ -771,26 +762,26 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
         epoch: DistributedCommitEpoch,
         pass: crate::ExpertPass,
     ) -> Result<(), N> {
-        self.prepare(epoch, pass).map_err(|error| self.stage_error(error, "transaction preparation"))
+        self.prepare(epoch, pass).map_err(|error| (self.map_error)(error))
     }
     fn coordinate_transaction(&mut self, epoch: DistributedCommitEpoch) -> Result<(), N> {
-        self.coordinate_partition(epoch).map_err(|error| self.stage_error(error, "partition coordination"))
+        self.coordinate_partition(epoch).map_err(|error| (self.map_error)(error))
     }
     fn complete_transaction(&mut self, epoch: DistributedCommitEpoch) -> Result<(), N> {
-        self.prepare_delivery(epoch).map_err(|error| self.stage_error(error, "transaction completion"))
+        self.prepare_delivery(epoch).map_err(|error| (self.map_error)(error))
     }
     fn finish_transaction(&mut self, epoch: DistributedCommitEpoch, committed: bool) {
         self.terminal(epoch, committed);
     }
     fn intervene(&mut self, path: &str, value: &T) -> Result<Option<T>, N> {
-        self.intervene_value(path, value).map_err(|error| self.stage_error(error, "activation intervention"))
+        self.intervene_value(path, value).map_err(|error| (self.map_error)(error))
     }
     fn observe(&mut self, path: &str, value: &T) -> Result<(), N> {
-        self.observe_value(path, value).map_err(|error| self.stage_error(error, "activation observation"))
+        self.observe_value(path, value).map_err(|error| (self.map_error)(error))
     }
     fn observe_replica(&mut self, path: &str, value: &T) -> Result<(), N> {
         if self.backend.partition_capture().is_none() { return Ok(()); }
-        self.observe_value(path, value).map_err(|error| self.stage_error(error, "activation observation"))
+        self.observe_value(path, value).map_err(|error| (self.map_error)(error))
     }
     fn observe_generated(
         &mut self,
@@ -799,7 +790,7 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
         _source: &GeneratedCaptureSource,
         _generate: &mut dyn FnMut() -> Result<T, N>,
     ) -> Result<(), N> {
-        self.generated(path).map_err(|error| self.stage_error(error, "generated observation"))
+        self.generated(path).map_err(|error| (self.map_error)(error))
     }
     fn observe_generated_retained(
         &mut self,

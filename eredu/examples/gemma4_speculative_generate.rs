@@ -1,146 +1,39 @@
-use std::{
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+//! Compare ordinary and speculative generation with the same prepared chat.
+//! Arguments: target directory, assistant directory, prompt, maximum tokens,
+//! and the enforced request capacity in bytes.
+use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 
+use anyhow::Context;
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LoadedModel, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeGenerationRequest,
+        ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatOutputMode,
+        PreparedChatPrompt, PreparedChatRequest, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeRequest, TokenizerSourceInput, default_local_device,
+        local_device_plan,
     },
-    runtime::chat::{ChatTemplateRequest, PreparedChat},
+    runtime::chat::ChatTemplateRequest,
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
-    GenerationConfigOverrides, TextGenerationConfig,
+    GenerationConfigOverrides, SemanticEvent, TextInferencePolicy,
 };
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let target_dir = args
-        .first()
-        .map(PathBuf::from)
-        .or_else(default_target_snapshot)
-        .expect("target model dir required");
-    let assistant_dir = args
-        .get(1)
-        .map(PathBuf::from)
-        .or_else(default_assistant_snapshot)
-        .expect("assistant model dir required");
-    let prompt = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "Why is the sky blue?".to_string());
+    let target_dir = PathBuf::from(args.first().context("target directory required")?);
+    let assistant_dir = PathBuf::from(args.get(1).context("assistant directory required")?);
+    let prompt = args.get(2).context("prompt required")?;
     let max_tokens = args
         .get(3)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(96);
+        .context("maximum token count required")?
+        .parse::<usize>()?;
+    let capacity = args
+        .get(4)
+        .context("request capacity in bytes required")?
+        .parse::<u64>()?;
+    anyhow::ensure!(max_tokens > 0, "maximum token count must be positive");
 
-    println!("target: {}", target_dir.display());
-    println!("assistant: {}", assistant_dir.display());
-    println!("prompt: {prompt:?}");
-
-    let prepared = prepare_prompt(&target_dir, &prompt)?;
-    println!(
-        "\n=== rendered prompt ===\n{}\n",
-        prepared.rendered_prompt()
-    );
-
-    let greedy = run_greedy(&target_dir, prepared.rendered_prompt(), max_tokens)?;
-    println!("\n=== greedy ===");
-    println!(
-        "tokens: {} elapsed: {:.2?}",
-        greedy.token_ids.len(),
-        greedy.elapsed
-    );
-    println!("{}", greedy.text);
-
-    let mtp = run_speculative(&target_dir, &assistant_dir, &prepared, max_tokens)?;
-    println!("\n=== mtp ===");
-    println!(
-        "tokens: {} elapsed: {:.2?}",
-        mtp.token_ids.len(),
-        mtp.elapsed
-    );
-    println!("accepted per round: {:?}", mtp.accept_lens);
-    println!("{}", mtp.text);
-
-    Ok(())
-}
-
-struct GenerationResult {
-    token_ids: Vec<u32>,
-    text: String,
-    elapsed: std::time::Duration,
-    accept_lens: Vec<usize>,
-}
-
-fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
-    let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
-    let (mut loaded, _) = planned.into_parts();
-    loaded
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({
-                "role": "user",
-                "content": [{"type": "text", "text": prompt, "content": prompt}],
-            })],
-            add_generation_prompt: true,
-            ..ChatTemplateRequest::default()
-        })
-        .map_err(Into::into)
-}
-
-fn run_greedy(
-    target_dir: &PathBuf,
-    prompt: &str,
-    max_tokens: usize,
-) -> anyhow::Result<GenerationResult> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
-    let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
-    let (mut loaded, _) = planned.into_parts();
-    let prompt_tokens = loaded.encode(prompt, false)?;
-    let eos = loaded.eos_token_ids().to_vec();
-    let mut ids = Vec::new();
-    let start = Instant::now();
-    {
-        let resolved = loaded.resolve_generation_config(GenerationConfigOverrides {
-            temperature: Some(0.0),
-            max_new_tokens: Some(max_tokens),
-            ..Default::default()
-        })?;
-        let generator = loaded
-            .generate_tokens(prompt_tokens, TextGenerationConfig::new(resolved))?
-            .take(max_tokens);
-        for token in generator {
-            let id = token?.token_id()?;
-            if eos.contains(&id) {
-                break;
-            }
-            ids.push(id);
-        }
-    }
-    let elapsed = start.elapsed();
-    let text = loaded.decode(&ids, true)?;
-    Ok(GenerationResult {
-        token_ids: ids,
-        text,
-        elapsed,
-        accept_lens: Vec::new(),
-    })
-}
-
-fn run_speculative(
-    target_dir: &Path,
-    assistant_dir: &Path,
-    prepared: &PreparedChat,
-    max_tokens: usize,
-) -> anyhow::Result<GenerationResult> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
         .with_drafting(DraftingPlan::External {
             model: assistant_dir.display().to_string(),
@@ -150,67 +43,96 @@ fn run_speculative(
             adaptive_lookahead: false,
         });
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_dir, &plan)?;
     let (mut target, mut drafting) = planned.into_parts();
-    if !drafting.is_enabled() {
-        anyhow::bail!("external drafting plan was not realized");
-    }
-    let output =
-        target.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(prepared),
+    let cancellation = GenerationCancellationToken::new();
+    let tokenizer =
+        target.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+    let source = target
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancellation,
+        )?
+        .context("chat preparation cancelled")?;
+    let prepared = target
+        .prepare_chat(
+            &source,
+            &ChatTemplateRequest {
+                messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt, "content": prompt}],
+                })],
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            capacity,
+            &cancellation,
+        )?
+        .context("chat preparation cancelled")?;
+    let settings = PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(max_tokens),
+            ..Default::default()
+        },
+        inference: TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(capacity),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    println!("rendered prompt:\n{}", prepared.rendered_prompt());
+
+    let started = Instant::now();
+    let mut text = String::new();
+    let ordinary = target
+        .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)?
+        .context("ordinary generation cancelled")?
+        .run(&cancellation, &mut |event| {
+            if let SemanticEvent::TextDelta(delta) = event {
+                text.push_str(delta.as_str());
+            }
+        })?;
+    println!(
+        "ordinary: {} tokens in {:.2?}\n{text}",
+        ordinary.token_ids.len(),
+        started.elapsed()
+    );
+    drop(ordinary);
+
+    let mut text = String::new();
+    let speculative =
+        target.generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
+            chat: &prepared,
+            input: PreparedChatPrompt::Rendered,
             drafting: drafting
                 .as_speculative_draft()
-                .expect("drafting is enabled"),
-            settings: PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    max_new_tokens: Some(max_tokens),
-                    ..Default::default()
-                },
-                ..PreparedChatGenerationSettings::default()
-            },
+                .context("drafting plan was not realized")?,
+            settings,
+            output_mode: PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
             options: PreparedChatSpeculativeGenerationOptions {
                 max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                ..PreparedChatSpeculativeGenerationOptions::default()
+                ..Default::default()
             },
             caller_stop_sequences: &[],
-            cancellation: GenerationCancellationToken::new(),
-            on_event: |_| {},
+            cancellation,
+            on_event: |event| {
+                if let SemanticEvent::TextDelta(delta) = event {
+                    text.push_str(delta.as_str());
+                }
+            },
         })?;
-    let mut generated = output.token_ids().to_vec();
-    let stats = output.stats();
-    if generated
-        .last()
-        .is_some_and(|token| target.eos_token_ids().contains(token))
-    {
-        generated.pop();
-    }
-    let text = target.decode(&generated, true)?;
-    Ok(GenerationResult {
-        token_ids: generated,
-        text,
-        elapsed: stats.elapsed(),
-        accept_lens: stats.accept_lens().to_vec(),
-    })
-}
-
-fn default_target_snapshot() -> Option<PathBuf> {
-    default_snapshot("models--mlx-community--gemma-4-e4b-it-4bit")
-}
-
-fn default_assistant_snapshot() -> Option<PathBuf> {
-    default_snapshot("models--mlx-community--gemma-4-e4b-it-assistant-bf16")
-}
-
-fn default_snapshot(repo_dir: &str) -> Option<PathBuf> {
-    let snapshots = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
-    snapshots
-        .read_dir()
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("config.json").exists())
+    println!(
+        "speculative: {} tokens in {:.2?}\n{text}",
+        speculative.token_ids().len(),
+        speculative.stats().elapsed()
+    );
+    println!(
+        "accepted per round: {:?}",
+        speculative.stats().accept_lens()
+    );
+    Ok(())
 }

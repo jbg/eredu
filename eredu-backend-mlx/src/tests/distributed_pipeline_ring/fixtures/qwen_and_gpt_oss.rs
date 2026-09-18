@@ -137,8 +137,8 @@ fn qwen_fixture_arrays(
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
-            let name = metadata.id.to_string();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+            let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let value = if name.ends_with("norm.weight") {
                 Array::ones::<f32>(&shape, self.stream).unwrap()

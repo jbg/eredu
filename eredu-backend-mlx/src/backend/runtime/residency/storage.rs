@@ -8,6 +8,10 @@ use safemlx::{Array, ImmutableHostTransferBuffer};
 use super::manager::{ResidencyError, RetainedHostBuffer};
 
 pub(crate) mod filled_host;
+mod attachment;
+mod array;
+pub(crate) use array::RetainedArray;
+pub(crate) use attachment::{PublishedAllocation, RetainedAllocationReceipt};
 
 mod borrowed;
 pub(crate) use borrowed::{RetainedStorageInspectionError, RetainedStorageRef};
@@ -36,12 +40,12 @@ pub(crate) use admission::{
 /// requires a separate workspace bound and reservation.
 #[derive(Default)]
 pub struct RetainedStorage {
-    arrays: BTreeMap<safemlx::AllocationIdentity, (u64, Array)>,
+    arrays: BTreeMap<safemlx::AllocationIdentity, NativeEntry<RetainedArray>>,
     group_buffers: BTreeMap<
         safemlx::distributed::GroupBufferIdentity,
         (u64, safemlx::distributed::RetainedGroupBuffer),
     >,
-    hosts: BTreeMap<safemlx::AllocationIdentity, (u64, RetainedHostBuffer)>,
+    hosts: BTreeMap<safemlx::AllocationIdentity, NativeEntry<RetainedHostBuffer>>,
     byte_buffers: BTreeMap<usize, Arc<[u8]>>,
     metadata:
         BTreeMap<eredu_runtime::HostMetadataIdentity, (u64, eredu_runtime::SharedHostMetadata)>,
@@ -57,6 +61,22 @@ pub struct RetainedStorage {
     incomplete: bool,
     original: Option<original::Inventory>,
     census: Option<original::Census>,
+}
+
+// Publication consumes the existing map value after successful attachment.
+// The receipt retains no native payload, registry pin or allocation; generations
+// are never reused by the linked native runtime.
+enum NativeEntry<T> {
+    Owned((u64, T)),
+    Attached(u64),
+}
+impl<T> NativeEntry<T> {
+    fn owned(&self) -> Option<&(u64, T)> {
+        match self { Self::Owned(value) => Some(value), Self::Attached(_) => None }
+    }
+    fn bytes(&self) -> u64 {
+        match self { Self::Owned((bytes, _)) | Self::Attached(bytes) => *bytes }
+    }
 }
 
 impl std::fmt::Debug for RetainedStorage {
@@ -128,7 +148,8 @@ impl RetainedStorage {
         // A prepared clone shell belongs to this inventory's raw custody. Bare
         // extraction would let that shell outlive its charge. Keep the complete
         // input on refusal; census is observational and owns no array rows.
-        if self.original.is_some() || self.census.is_some() {
+        if self.original.is_some() || self.census.is_some()
+            || self.arrays.values().any(|entry| entry.owned().is_some_and(|(_, array)| array.canonical().is_some())) {
             return Err((
                 original::failure(
                     eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -139,7 +160,7 @@ impl RetainedStorage {
         Ok(self
             .arrays
             .into_values()
-            .map(|(_, array)| array)
+            .filter_map(|entry| match entry { NativeEntry::Owned((_, RetainedArray::Plain(array))) => Some(array), NativeEntry::Attached(_) => None, NativeEntry::Owned(_) => unreachable!("canonical owners refused above") })
             .chain(self.unknown_arrays))
     }
 
@@ -207,11 +228,69 @@ impl RetainedStorage {
         Ok(())
     }
 
+    pub(crate) fn include_canonical_array(
+        &mut self,
+        cell: &super::manager::CanonicalArrayOwner,
+    ) -> Result<(), ResidencyError> {
+        let info = cell
+            .array()
+            .try_allocation_info()
+            .map_err(array_inspection_error)?;
+        if let Some(census) = &mut self.census {
+            match info {
+                Some(info) if info.bytes() != 0 => census.add()?,
+                Some(_) => {}
+                None => self.incomplete = true,
+            }
+            return Ok(());
+        }
+        let Some(info) = info else {
+            return self.include_array(cell.array());
+        };
+        let bytes = checked_bytes(info.bytes())?;
+        self.check_backing_capacity(info.identity(), bytes)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        // A manager visitor may follow module aliases. Upgrade the existing
+        // physical row in either inventory without retiring its native handle
+        // while the caller still holds the manager loan.
+        if let Some(entry) = self.arrays.get_mut(&info.identity()) {
+            if let NativeEntry::Owned((_, prior)) = entry {
+                if !prior.upgrade(cell) {
+                    return Err(original::failure(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(original) = &mut self.original {
+            let key = StorageIdentity::Native(info.identity());
+            if let Some(original::Value::Array((_, prior))) = original.get_mut(0, &key) {
+                if !prior.upgrade(cell) {
+                    return Err(original::failure(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                    ));
+                }
+                return Ok(());
+            }
+            original.ensure_room()?;
+            return original.insert(
+                Some(key),
+                original::Value::Array((bytes, RetainedArray::from_canonical(cell))),
+            );
+        }
+        self.arrays.insert(
+            info.identity(),
+            NativeEntry::Owned((bytes, RetainedArray::from_canonical(cell))),
+        );
+        Ok(())
+    }
     /// Adds completed certified backing without evaluation, polling or runtime
     /// housekeeping. Foreign runtime contention returns a typed unavailable
     /// error without changing the inventory. Unknown backing remains unknown.
     /// The caller keeps the settled source unchanged while inspecting/retaining.
-    #[track_caller]
     pub fn include_array(&mut self, array: &Array) -> Result<(), ResidencyError> {
         if let Some(census) = &mut self.census {
             match array
@@ -238,12 +317,8 @@ impl RetainedStorage {
                 let retained = self.original.as_mut().unwrap().clone_array(array)?;
                 return self.original.as_mut().unwrap().insert(
                     Some(StorageIdentity::Native(info.identity())),
-                    original::Value::Array((bytes, retained)),
+                    original::Value::Array((bytes, retained.into())),
                 );
-            }
-            if std::env::var_os("EREDU_HOST_SAVED_SOURCE_DIAGNOSTICS").is_some() {
-                eprintln!("NATIVE_PUBLICATION_UNKNOWN_ARRAY at {} shape={:?} dtype={:?}",
-                    std::panic::Location::caller(), array.shape(), array.dtype());
             }
             self.original.as_ref().unwrap().ensure_room()?;
             let retained = self.original.as_mut().unwrap().clone_array(array)?;
@@ -260,8 +335,8 @@ impl RetainedStorage {
             Some(info) => {
                 let bytes = checked_bytes(info.bytes())?;
                 self.check_backing_capacity(info.identity(), bytes)?;
-                if let Some((prior, _)) = self.arrays.get(&info.identity()) {
-                    require_same_capacity(*prior, bytes)?;
+                if let Some(prior) = self.arrays.get(&info.identity()) {
+                    require_same_capacity(prior.bytes(), bytes)?;
                 } else if bytes != 0 {
                     // Clone only a handle that will actually be retained. A
                     // duplicate's temporary handle/drop could run housekeeping.
@@ -269,7 +344,7 @@ impl RetainedStorage {
                     let retained = array
                         .try_clone_for_inspection()
                         .map_err(array_inspection_error)?;
-                    self.arrays.insert(info.identity(), (bytes, retained));
+                    self.arrays.insert(info.identity(), NativeEntry::Owned((bytes, retained.into())));
                 }
             }
             None => {
@@ -325,10 +400,10 @@ impl RetainedStorage {
                 original::Value::Host((bytes, buffer)),
             );
         }
-        if let Some((prior, _)) = self.hosts.get(&identity) {
-            require_same_capacity(*prior, bytes)?;
+        if let Some(prior) = self.hosts.get(&identity) {
+            require_same_capacity(prior.bytes(), bytes)?;
         } else if bytes != 0 {
-            self.hosts.insert(identity, (bytes, buffer));
+            self.hosts.insert(identity, NativeEntry::Owned((bytes, buffer)));
         }
         Ok(())
     }
@@ -549,20 +624,22 @@ impl RetainedStorage {
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
-        for (identity, (bytes, array)) in other.arrays {
+        for (identity, entry) in other.arrays {
+            let bytes = entry.bytes();
             self.check_backing_capacity(identity, bytes)?;
-            if let Some((prior, _)) = self.arrays.get(&identity) {
-                require_same_capacity(*prior, bytes)?;
+            if let Some(prior) = self.arrays.get(&identity) {
+                require_same_capacity(prior.bytes(), bytes)?;
             } else {
-                self.arrays.insert(identity, (bytes, array));
+                self.arrays.insert(identity, entry);
             }
         }
-        for (identity, (bytes, buffer)) in other.hosts {
+        for (identity, entry) in other.hosts {
+            let bytes = entry.bytes();
             self.check_backing_capacity(identity, bytes)?;
-            if let Some((prior, _)) = self.hosts.get(&identity) {
-                require_same_capacity(*prior, bytes)?;
+            if let Some(prior) = self.hosts.get(&identity) {
+                require_same_capacity(prior.bytes(), bytes)?;
             } else {
-                self.hosts.insert(identity, (bytes, buffer));
+                self.hosts.insert(identity, entry);
             }
         }
         for (_, (_, source)) in other.group_buffers {
@@ -617,6 +694,7 @@ impl RetainedStorage {
                 })?;
         self.arrays
             .values()
+            .filter_map(NativeEntry::owned)
             .map(|(bytes, _)| *bytes)
             .chain(self.group_buffers.values().map(|(bytes, _)| *bytes))
             .chain(self.metadata.values().map(|(bytes, _)| *bytes))
@@ -626,7 +704,8 @@ impl RetainedStorage {
                 self.hosts
                     .iter()
                     .filter(|(identity, _)| !self.arrays.contains_key(identity))
-                    .map(|(_, (bytes, _))| *bytes),
+                    .filter_map(|(_, entry)| entry.owned())
+                    .map(|(bytes, _)| *bytes),
             )
             .try_fold(buffers, |total, bytes| {
                 total
@@ -700,6 +779,8 @@ fn native_error(operation: &'static str, source: safemlx::error::Exception) -> R
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::CanonicalCollectionFixture;
 
 #[cfg(test)]
 mod cold_tests;

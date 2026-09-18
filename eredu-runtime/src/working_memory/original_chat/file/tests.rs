@@ -14,7 +14,7 @@ fn sizes(bytes: &[u8]) -> (u64, u64) {
     (
         WorkingMemoryPool::chat_template_file_required_bytes(&read(bytes)).unwrap(),
         WorkingMemoryPool::chat_template_required_bytes(
-            &ChatTemplatePlan::prepare_config(bytes, "chat").unwrap(),
+            &ChatTemplatePlan::prepare_config(bytes, "chat", false).unwrap(),
         )
         .unwrap(),
     )
@@ -28,6 +28,7 @@ fn chat_file_real_i_j_overlap_and_last_source_retirement() {
         .compile_chat_template_file_with(
             read(&bytes),
             "chat",
+            false,
             |_| {
                 assert_eq!(pool.used_bytes().unwrap(), i);
                 assert!(matches!(
@@ -73,6 +74,7 @@ fn chat_file_exact_minus_one_at_i_and_j_keeps_actual_prefixes() {
         .compile_chat_template_file_with(
             read(&bytes),
             "chat",
+            false,
             |_| panic!("short I entered reserve"),
             || panic!("short I read"),
             |_, _| panic!("short I reached J"),
@@ -86,7 +88,7 @@ fn chat_file_exact_minus_one_at_i_and_j_keeps_actual_prefixes() {
     );
     let short = WorkingMemoryPool::new(i + j - 1, 0).unwrap();
     let error = short
-        .compile_chat_template_file(read(&bytes), "chat")
+        .compile_chat_template_file(read(&bytes), "chat", false)
         .unwrap_err();
     assert_eq!(error.input_bytes(), i);
     assert_eq!(error.input_capacity(), bytes.len());
@@ -109,6 +111,7 @@ fn chat_file_real_reserve_changed_file_and_late_j_errors_are_retained() {
         .compile_chat_template_file_with(
             read(&bytes),
             "chat",
+            false,
             |capacity| *capacity = usize::MAX,
             || panic!("reserve failure reached read"),
             |_, _| panic!("reserve failure reached J"),
@@ -128,7 +131,7 @@ fn chat_file_real_reserve_changed_file_and_late_j_errors_are_retained() {
     let prepared = PreparedArtifactFileRead::new(File::open(path.path()).unwrap()).unwrap();
     path.as_file().set_len(0).unwrap();
     let error = pool
-        .compile_chat_template_file(prepared, "chat")
+        .compile_chat_template_file(prepared, "chat", false)
         .unwrap_err();
     assert!(error.read_failure().is_some());
     assert_eq!(error.input_bytes(), i);
@@ -140,6 +143,7 @@ fn chat_file_real_reserve_changed_file_and_late_j_errors_are_retained() {
         .compile_chat_template_file_with(
             read(&bytes),
             "chat",
+            false,
             |_| {},
             || {},
             |pool, plan| {
@@ -155,4 +159,49 @@ fn chat_file_real_reserve_changed_file_and_late_j_errors_are_retained() {
     drop(pool.acquire_unquoted().unwrap());
     drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn named_file_selection_retains_exact_source_and_original_overlap() {
+    let bytes = serde_json::to_vec(&serde_json::json!({"chat_template": [
+        {"name":"default", "template":"plain:{{ messages[0].content }}"},
+        {"name":"tool_use", "template":"tools:{{ messages[0].content }}|{{ tools|tojson }}"},
+    ]}))
+    .unwrap();
+    let selected = eredu_text::tokenizer::load_model_chat_template_from_str(
+        std::str::from_utf8(&bytes).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    for has_tools in [false, true] {
+        let input = WorkingMemoryPool::chat_template_file_required_bytes(&read(&bytes)).unwrap();
+        let source_bytes = WorkingMemoryPool::chat_template_required_bytes(
+            &ChatTemplatePlan::prepare_config(&bytes, "named", has_tools).unwrap(),
+        )
+        .unwrap();
+        let pool = WorkingMemoryPool::new(input + source_bytes, 0).unwrap();
+        let source = pool
+            .compile_chat_template_file(read(&bytes), "named", has_tools)
+            .unwrap();
+        assert!(source.matches_selection(&selected, "named", has_tools));
+        assert!(!source.matches_selection(&selected, "named", !has_tools));
+        assert_eq!(pool.peak_bytes().unwrap(), input + source_bytes);
+        assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+        let alias = source.clone();
+        drop(source);
+        assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+        drop(alias);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+        let short = WorkingMemoryPool::new(input + source_bytes - 1, 0).unwrap();
+        let failure = short
+            .compile_chat_template_file(read(&bytes), "named", has_tools)
+            .unwrap_err();
+        assert!(matches!(
+            failure.accounting_failure(),
+            Some(WorkingMemoryError::BudgetExceeded { .. })
+        ));
+        assert_eq!(short.used_bytes().unwrap(), input);
+        drop(failure);
+        assert_eq!(short.used_bytes().unwrap(), 0);
+    }
 }

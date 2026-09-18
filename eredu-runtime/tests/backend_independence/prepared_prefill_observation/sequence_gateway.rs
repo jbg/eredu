@@ -71,7 +71,7 @@ impl PreparedPrefillSource<Rows, FakeBackend, State> for Input {
     fn prepare_chunk(&self, chunk: &PrefillChunk, _: &()) -> Result<FakeTensor, Error> {
         self.events.borrow_mut().prepared.push(chunk.input.clone());
         if chunk.input.start > 0 && self.fail == Fail::Source {
-            return Err(Error::backend_source(Sentinel(self.identity.clone())));
+            return Err(Error::backend_retained_source(Sentinel(self.identity.clone())));
         }
         if chunk.input.start > 0 && self.fail == Fail::Panic {
             std::panic::panic_any(self.identity.clone());
@@ -125,7 +125,7 @@ impl ScheduledCaptureBackend for Backend {
             .retired
             .push(ticket.chunk().input.clone());
         if self.fail == Fail::Retirement {
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Sentinel(self.identity.clone()),
             )));
         }
@@ -162,9 +162,9 @@ impl ScheduledCaptureBackend for Backend {
         value: &FakeTensor,
         claim: CaptureTensorClaim<'_, '_>,
     ) -> Result<ClaimedCaptureTensor, Error> {
-        let mut writer = claim.prepare().map_err(Error::backend_source)?;
+        let mut writer = claim.prepare().map_err(Error::backend_retained_source)?;
         for &n in &value.0 {
-            writer.push_f32(n as f32).map_err(Error::backend_source)?;
+            writer.push_f32(n as f32).map_err(Error::backend_retained_source)?;
         }
         Ok(writer.finish().unwrap())
     }
@@ -188,7 +188,7 @@ impl ScheduledCaptureBackend for Backend {
         claim: CapturePrefillFragmentClaim<'_, '_, '_, '_>,
     ) -> Result<(), FundedCaptureError<Error>> {
         if self.fail == Fail::Observer {
-            return Err(FundedCaptureError::Backend(Error::backend_source(
+            return Err(FundedCaptureError::Backend(Error::backend_retained_source(
                 Sentinel(self.identity.clone()),
             )));
         }
@@ -271,7 +271,7 @@ impl Original {
         );
         assert_eq!(pool.used_bytes().unwrap(), 64);
         let mut admitted_candidates = Vec::new();
-        let (admission, r, accepted) = accept(session, &pool, g, exact, |candidate| {
+        let (r, accepted) = accept(session, &pool, g, exact, |candidate| {
             admitted_candidates.push(candidate);
             assert_eq!(candidate, g, "the exact original candidate must fit");
             q.clone()
@@ -280,7 +280,7 @@ impl Original {
         assert_eq!(admitted_candidates, [g]);
         assert_eq!(r.geometry(), g);
         assert_eq!(r.bytes(), q.incremental_bytes());
-        assert_eq!(admission.incremental_required_bytes, q.incremental_bytes());
+        assert_eq!(r.admission().incremental_required_bytes, q.incremental_bytes());
         assert!(accepted
             .span_workspace()
             .plan()
@@ -416,7 +416,7 @@ fn invoke(
         |geometry| {
             events.borrow_mut().factory += 1;
             match fail {
-                Fail::Factory => Err(Error::backend_source(Sentinel(identity.clone()))),
+                Fail::Factory => Err(Error::backend_retained_source(Sentinel(identity.clone()))),
                 Fail::Unavailable => Ok(None),
                 _ => Ok(Some(Input {
                     geometry,
@@ -475,13 +475,13 @@ fn run(
         .with_admitted_prefill_observer(
             &mut backend,
             &accepted,
-            &Error::backend_source,
+            &Error::backend_retained_source,
             |observer| {
                 let mut borrowed = BorrowedActivationObserver(observer);
                 let mut bridge = ObserverErrorBridge::new(
                     &mut borrowed,
                     |e: Error| e,
-                    |_: &Error| Error::backend_source(Sentinel(Arc::new(()))),
+                    |_: &Error| Error::backend_retained_source(Sentinel(Arc::new(()))),
                 );
                 assert!(std::ptr::eq(
                     bridge.admitted_prefill_capture().unwrap(),
@@ -518,7 +518,7 @@ fn run(
     for prediction in 1..4 {
         let value = FakeTensor(vec![prediction as i32 + 1]);
         let result = bank
-            .with_observer(&mut backend, prediction, &Error::backend_source, |o| {
+            .with_observer(&mut backend, prediction, &Error::backend_retained_source, |o| {
                 session.decode_input_with_observer(&value, &(), o)
             })
             .unwrap()
@@ -687,7 +687,7 @@ fn sequence_gateway_rejects_bound_only_or_foreign_reservation_before_factory_and
         .with_prefill_observer(
             &mut backend,
             original.bound(),
-            &Error::backend_source,
+            &Error::backend_retained_source,
             |observer| {
                 assert!(observer.requires_sequence_readout());
                 assert!(observer.admitted_prefill_capture().is_none());
@@ -711,7 +711,7 @@ fn sequence_gateway_rejects_bound_only_or_foreign_reservation_before_factory_and
         .with_admitted_prefill_observer(
             &mut backend,
             &admitted,
-            &Error::backend_source,
+            &Error::backend_retained_source,
             |observer| {
                 invoke(
                     &mut session,
@@ -737,7 +737,7 @@ fn sequence_gateway_rejects_bound_only_or_foreign_reservation_before_factory_and
         .with_admitted_prefill_observer(
             &mut backend,
             &admitted,
-            &Error::backend_source,
+            &Error::backend_retained_source,
             |observer| {
                 invoke(
                     &mut session,
@@ -786,7 +786,7 @@ fn sequence_gateway_checks_current_token_and_state_only_before_source_work() {
             .with_admitted_prefill_observer(
                 &mut backend,
                 &admitted,
-                &Error::backend_source,
+                &Error::backend_retained_source,
                 |observer| {
                     invoke(
                         &mut session,
@@ -858,7 +858,7 @@ fn sequence_gateway_preserves_factory_observer_source_retirement_and_index_failu
             .with_admitted_prefill_observer(
                 &mut backend,
                 &admitted,
-                &Error::backend_source,
+                &Error::backend_retained_source,
                 |observer| {
                     invoke(
                         &mut session,
@@ -921,7 +921,7 @@ fn sequence_gateway_preserves_factory_observer_source_retirement_and_index_failu
     let mut bank = original.bank();
     let admitted = original.owner.prefill_capture(original.bound()).unwrap();
     let error = bank
-        .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_source, |o| {
+        .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
             invoke(
                 &mut session,
                 &original,
@@ -967,7 +967,7 @@ fn sequence_gateway_cancellation_and_panic_keep_real_committed_frontier_and_abor
         let mut bank = original.bank();
         let admitted = original.owner.prefill_capture(original.bound()).unwrap();
         let result = bank
-            .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_source, |o| {
+            .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
                 invoke(
                     &mut session,
                     &original,
@@ -1002,7 +1002,7 @@ fn sequence_gateway_cancellation_and_panic_keep_real_committed_frontier_and_abor
     let mut bank = original.bank();
     let admitted = original.owner.prefill_capture(original.bound()).unwrap();
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bank.with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_source, |o| {
+        bank.with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
             invoke(
                 &mut session,
                 &original,

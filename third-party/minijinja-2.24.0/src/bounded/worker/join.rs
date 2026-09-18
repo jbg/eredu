@@ -17,7 +17,7 @@ enum Items<'a> {
     Text(std::str::Chars<'a>),
     Split(crate::filters::SplitParts<'a>),
     #[cfg(feature = "json")]
-    Json(crate::bounded::input::record::ReadArrayIter<'a>),
+    Json(crate::bounded::input::record::InputArrayIter<'a>),
     #[cfg(feature = "json")]
     MapKeys(mapping::Pairs<'a>),
     #[cfg(feature = "json")]

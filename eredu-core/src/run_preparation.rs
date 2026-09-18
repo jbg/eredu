@@ -24,6 +24,10 @@ pub enum TextPreparationStage {
     Decision,
     /// Controlled token observation, controller commit and permit finalization.
     Commitment,
+    /// Originally funded empty-state preparation, before any rank installs it.
+    SessionReset,
+    /// All ranks report the outcome of the prepared empty-state installation.
+    SessionResetPublication,
 }
 
 /// Local disposition supplied even when preparation failed or was cancelled.

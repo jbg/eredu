@@ -35,7 +35,7 @@ pub(crate) struct DiskReadFinishFailure {
     cause: FinishCause,
     retained: Option<Mutex<ReadBody>>,
     output: PreparedDiskReadOutput,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl std::fmt::Debug for DiskReadFinishFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -128,9 +128,11 @@ impl ReadBody {
                 .completed_mut()
                 .freeze()
                 .map_err(FinishCause::Freeze)?;
-            let (buffer, allocation) =
-                filled_host::finish(self.filling[index].take().expect("frozen destination"))
-                    .map_err(FinishCause::Publication)?;
+            let source = filled_host::finish(self.filling[index].take().expect("frozen destination"))
+                .map_err(FinishCause::Publication)?;
+            let allocation = source.allocation();
+            let (buffer, _proof, source_custody) = source.into_parts();
+            drop(source_custody);
             // Two exact immutable Arc shells were priced before native entry.
             self.ready[index] = Some(Arc::new(buffer));
             let descriptor = self.ready[index]
@@ -202,10 +204,13 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<(&mut ReadBody, usize, safemlx::AllocationInfo)>(),
         size_of::<
             Result<
-                (ImmutableHostTransferBuffer, safemlx::AllocationInfo),
+                filled_host::PublishedHostSource,
                 filled_host::SourceError,
             >,
         >(),
+        size_of::<filled_host::PublishedHostSource>(),
+        size_of::<(ImmutableHostTransferBuffer, Option<crate::backend::runtime::residency::storage::PublishedAllocation>, eredu_runtime::working_memory::OriginalOperationMetadataCustody)>(),
+        size_of::<Option<crate::backend::runtime::residency::storage::PublishedAllocation>>(),
         size_of::<Result<(), filled_host::SourceCause>>(),
         size_of::<HostCacheBlock>(),
         size_of::<[Arc<ImmutableHostTransferBuffer>; 2]>(),

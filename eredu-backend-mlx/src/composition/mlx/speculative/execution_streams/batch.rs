@@ -16,7 +16,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         ];
         first.metadata_funding().reserve_metadata(controls.into_iter().try_fold(
             std::mem::size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         if assignments.is_empty() || self.batch_assignments.is_some() || self.batch_request.is_some()
             || self.embedded_invocation.is_some() || self.tensor_sources.is_some() || self.prefill_input.is_some() {

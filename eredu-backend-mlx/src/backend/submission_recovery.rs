@@ -10,6 +10,7 @@ use std::{
 };
 
 use safemlx::{error::Exception, SubmissionScope, SubmissionScopeBeginError};
+use crate::backend::{error::Error, runtime::execution::generic::{RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause}};
 pub(crate) mod observed;
 pub(crate) mod native_role;
 pub(crate) mod prediction;
@@ -71,11 +72,11 @@ pub(crate) trait Retention: 'static {
     /// Retire ordinary typed storage exactly as before. The observed wrapper
     /// overrides this private engine seam to keep its SAME empty node alive
     /// through a separately deferred payload's actual destruction.
-    fn retire_node<P: Probe>(node: Box<Node<Self, P>>)
+    fn retire_node<P: Probe>(node: Box<Node<Self, P>>) -> Result<(), RegisteredScopeRetirementFailure>
     where
         Self: Sized,
     {
-        retire_typed_node(node);
+        retire_typed_node(node)
     }
 
     /// Default direct payload destruction; selected nested deferred owners move
@@ -153,7 +154,7 @@ trait Pending {
     fn retire_terminal(&self) -> bool;
     fn take_next(&mut self) -> Option<PendingOwner>;
     fn set_next(&mut self, next: Option<PendingOwner>);
-    fn retire(self: Box<Self>);
+    fn retire(self: Box<Self>) -> Result<(), RegisteredScopeRetirementFailure>;
 }
 
 pub(crate) struct Node<T, P> {
@@ -162,8 +163,11 @@ pub(crate) struct Node<T, P> {
     seal_attempted: bool,
     seal_finished: bool,
     callback_failed: Cell<bool>,
+    last_status: Cell<Option<Status>>,
     // Original custody must outlive probe/native-handle destruction.
     retention: T,
+    // Prediction registration survives the native probe and actual payload.
+    registration: Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>,
 }
 
 struct CallbackHealth<'a> {
@@ -231,6 +235,7 @@ impl<T: Retention, P: Probe> Pending for Node<T, P> {
         let _health = CallbackHealth::new(&self.callback_failed);
         let status = probe.progress();
         self.retention.observe(status);
+        self.last_status.set(Some(status));
         status
     }
 
@@ -273,18 +278,21 @@ impl<T: Retention, P: Probe> Pending for Node<T, P> {
         self.next = next;
     }
 
-    fn retire(self: Box<Self>) {
-        T::retire_node(self);
+    fn retire(self: Box<Self>) -> Result<(), RegisteredScopeRetirementFailure> {
+        T::retire_node(self)
     }
 }
 
-fn retire_typed_node<T, P>(node: Box<Node<T, P>>) {
-    let node = unbox_node(node);
+fn retire_typed_node<T, P>(node: Box<Node<T, P>>) -> Result<(), RegisteredScopeRetirementFailure> {
+    let mut node = unbox_node(node);
     #[cfg(test)]
     UNBOXED.with(|count| count.set(count.get() + 1));
     // Unchanged ordinary destruction: Box first, then P before T, while the
     // caller's runtime guard remains held. Observed empty cleanup ends here too.
+    let registration = node.registration.take();
+    let status = node.last_status.get();
     drop(node);
+    match registration { Some(registration) => registration.finish_after_payload(status), None => Ok(()) }
 }
 
 fn unbox_node<T, P>(node: Box<Node<T, P>>) -> Node<T, P> {
@@ -332,8 +340,8 @@ impl PendingOwner {
             .expect("live pending node")
             .take_next()
     }
-    fn retire(mut self) {
-        self.0.take().expect("live pending node").retire();
+    fn retire(mut self) -> Result<(), RegisteredScopeRetirementFailure> {
+        self.0.take().expect("live pending node").retire()
     }
     fn retain_permanently(mut self) {
         if let Some(node) = self.0.take() {
@@ -373,7 +381,8 @@ fn retire(node: PendingOwner) -> Option<PendingOwner> {
         // no completion/certification inference for its independently held T.
         if node.never_started() || (node.progress().settled && node.retire_terminal()) {
             // The same guard covers Box deallocation, P and T destruction.
-            retained.take().expect("retained node").retire();
+            // Drop preserves an unreturned cleanup cause in its exact bank.
+            drop(retained.take().expect("retained node").retire());
         }
     });
     if observed.is_none() {
@@ -430,9 +439,15 @@ fn quarantine_chain(mut pending: Option<Box<dyn Pending>>) {
 }
 
 /// Advances old records without waiting or holding a reentrant list borrow.
+/// This unit-returning function is also the exact registered native callback.
 pub(crate) fn reap() {
+    reap_with_progress();
+}
+
+/// Reports actual retirement; unresolved records do not count as progress.
+pub(crate) fn reap_with_progress() -> bool {
     if std::thread::panicking() {
-        return;
+        return false;
     }
     let pending = ORPHANS
         .try_with(|orphans| {
@@ -444,11 +459,15 @@ pub(crate) fn reap() {
         .ok()
         .flatten();
     let mut pending = PendingList(pending);
+    let mut reclaimed = false;
     while let Some(node) = pending.pop() {
         // Returned or unwinding ownership re-enters quarantine through its
         // closed Drop; the remaining snapshot stays separately armed.
-        drop(retire(node));
+        let remaining = retire(node);
+        reclaimed |= remaining.is_none();
+        drop(remaining);
     }
+    reclaimed
 }
 
 pub(crate) struct Recovery<T: Retention, P: Probe = SubmissionScope> {
@@ -570,7 +589,9 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
                 seal_attempted: false,
                 seal_finished: false,
                 callback_failed: Cell::new(false),
+                last_status: Cell::new(None),
                 retention,
+                registration: None,
             })))),
         }
     }
@@ -654,10 +675,16 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
             size_of::<Option<Status>>(),
             size_of::<&mut Option<PendingOwner>>(), // guarded-retire capture
             size_of::<&Node<T, P>>(),               // guarded-progress capture
+            size_of::<Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>>(),
+            size_of::<Result<Status, Error>>(),
+            size_of::<Result<Status, RegisteredScopeRetirementCause>>(),
+            size_of::<Result<(), RegisteredScopeRetirementFailure>>(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)?;
-        u64::try_from(bytes).ok()
+        u64::try_from(bytes).ok()?.checked_add(
+            crate::backend::runtime::execution::generic::RegisteredOriginalScope::payload_retirement_control_bytes()?
+        )
     }
 
     /// Waits for successful work to settle, returning immediately on failure.
@@ -674,7 +701,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
 
     /// Completes a synchronous operation and retires its resources under the
     /// same runtime guard that establishes completion. Failure stays nonblocking.
-    pub fn finish(mut self) -> Status {
+    pub fn finish(mut self) -> Result<Status, RegisteredScopeRetirementCause> {
         loop {
             let status = safemlx::try_with_submission_retirement(|| {
                 let mut status = self.progress();
@@ -690,19 +717,19 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
                             .take()
                             .expect("live recovery scope")
                             .into_pending()
-                            .retire();
+                            .retire().map_err(RegisteredScopeRetirementFailure::into_cause)?;
                     } else {
                         status.settled = false;
                     }
                 }
-                status
+                Ok::<Status, RegisteredScopeRetirementCause>(status)
             })
-            .unwrap_or_else(|| Status {
+            .unwrap_or_else(|| Ok(Status {
                 settled: false,
                 ..self.progress()
-            });
+            }))?;
             if status.settled || status.failed || status.blocked {
-                return status;
+                return Ok(status);
             }
             std::thread::yield_now();
         }
@@ -710,6 +737,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
 }
 
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn wait_for_retirement(mut complete: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -780,7 +808,7 @@ mod tests {
     fn successful_finish_retires_resources_before_returning() {
         let drops = Arc::new(AtomicUsize::new(0));
         let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
-        let status = recovery.finish();
+        let status = recovery.finish().unwrap();
         assert!(status.settled && !status.failed && !status.blocked);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }

@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "94546ceb734c6076e73c4a6723de98804ad63ae6"
+  },
+  "path_in_vcs": "crates/jsonschema-regex"
+}

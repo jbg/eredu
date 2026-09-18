@@ -1,9 +1,10 @@
 pub(crate) mod source;
 pub(crate) mod step;
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
-use anyhow::{Result, ensure};
-use derivre::{HashMap, HashSet, RegexBuilder};
+use derivre::{ParserResult as Result, parser_ensure as ensure};
+use derivre::{ParserAllocationFunding, RegexBuilder};
+type HashSet<T> = hashbrown::HashSet<T, derivre::RandomState>;
 
 use crate::{
     earley::{BiasComputer, ParserRecognizer},
@@ -36,8 +37,13 @@ struct TokenizerSlice {
 }
 
 impl TokenizerSlice {
-    fn from_topo_node(node: &TopoNode, trie: &TokTrie, regexes: &[String]) -> Result<Self> {
-        source::prepared::ordinary_from_topo(node, trie, regexes)
+    fn from_topo_node(
+        node: &TopoNode,
+        trie: &TokTrie,
+        regexes: &[String],
+        funding: &ParserAllocationFunding,
+    ) -> Result<Self> {
+        source::prepared::ordinary_from_topo(node, trie, regexes, funding)
     }
 
     fn matches(&self, rec: &mut ParserRecognizer<'_>) -> bool {
@@ -155,105 +161,72 @@ struct TopoNode {
 // TODO this is stupid, but there is just a few nodes in num_nodes
 // and this only runs once
 // complexity O(num_nodes^3)
-fn topological_sort(num_nodes: usize, edges: &HashSet<(usize, usize)>) -> Vec<TopoNode> {
+fn topological_sort(
+    num_nodes: usize,
+    edges: &HashSet<(usize, usize)>,
+    funding: &ParserAllocationFunding,
+) -> Result<Vec<TopoNode>> {
     fn build_tree(
         node: usize,
         num_nodes: usize,
         edges: &HashSet<(usize, usize)>,
         visited: &mut HashSet<usize>,
-    ) -> TopoNode {
-        visited.insert(node);
-        let children = (0..num_nodes)
-            .filter(|&child| {
-                edges.contains(&(child, node))
-                    && !visited.contains(&child)
-                    && !(0..num_nodes).any(|desc| {
-                        desc != node && !visited.contains(&desc) && edges.contains(&(child, desc))
-                    })
-            })
-            .collect::<Vec<_>>();
-
-        TopoNode {
-            value: node,
-            children: children
-                .iter()
-                .map(|&child| build_tree(child, num_nodes, edges, visited))
-                .collect(),
-        }
-    }
-
-    let roots: Vec<usize> = (0..num_nodes)
-        .filter(|&node| !edges.iter().any(|&(desc, _)| desc == node))
-        .collect();
-
-    let mut visited = HashSet::default();
-    roots
-        .iter()
-        .map(|&root| build_tree(root, num_nodes, edges, &mut visited))
-        .collect()
-}
-
-#[allow(dead_code)]
-fn topological_sort2(num_nodes: usize, edges: &HashSet<(usize, usize)>) -> Vec<TopoNode> {
-    let mut children_map: HashMap<usize, Vec<usize>> = HashMap::default();
-    let mut indegree = vec![0; num_nodes];
-
-    for &(desc, anc) in edges {
-        children_map.entry(anc).or_default().push(desc);
-        indegree[desc] += 1;
-    }
-
-    let mut queue = VecDeque::new();
-    for node in 0..num_nodes {
-        if indegree[node] == 0 {
-            queue.push_back(node);
-        }
-    }
-
-    let mut topo_order = vec![];
-    while let Some(node) = queue.pop_front() {
-        topo_order.push(node);
-        for &child in children_map.get(&node).unwrap_or(&vec![]) {
-            indegree[child] -= 1;
-            if indegree[child] == 0 {
-                queue.push_back(child);
+        funding: &ParserAllocationFunding,
+    ) -> Result<TopoNode> {
+        funding.try_insert_set(visited, node)?;
+        let mut children = Vec::new();
+        for child in 0..num_nodes {
+            if edges.contains(&(child, node))
+                && !visited.contains(&child)
+                && !(0..num_nodes).any(|desc| {
+                    desc != node && !visited.contains(&desc) && edges.contains(&(child, desc))
+                })
+            {
+                funding.try_push(&mut children, child)?;
             }
         }
+        let mut nodes = Vec::new();
+        funding.try_grow_vec(&mut nodes, children.len())?;
+        for child in children {
+            nodes.push(build_tree(child, num_nodes, edges, visited, funding)?);
+        }
+        Ok(TopoNode {
+            value: node,
+            children: nodes,
+        })
     }
-
-    let mut built_nodes: HashMap<usize, TopoNode> = HashMap::default();
-    for &node in topo_order.iter().rev() {
-        let children = children_map
-            .get(&node)
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|child| built_nodes.remove(child))
-            .collect();
-        built_nodes.insert(
-            node,
-            TopoNode {
-                value: node,
-                children,
-            },
-        );
+    let mut roots = Vec::new();
+    for node in 0..num_nodes {
+        if !edges.iter().any(|&(desc, _)| desc == node) {
+            funding.try_push(&mut roots, node)?;
+        }
     }
-
-    topo_order
-        .iter()
-        .filter(|&&n| edges.iter().all(|&(desc, _)| desc != n))
-        .filter_map(|root| built_nodes.remove(root))
-        .collect()
+    let mut visited = HashSet::default();
+    let mut nodes = Vec::new();
+    funding.try_grow_vec(&mut nodes, roots.len())?;
+    for root in roots {
+        nodes.push(build_tree(root, num_nodes, edges, &mut visited, funding)?);
+    }
+    Ok(nodes)
 }
 
 impl SlicedBiasComputer {
-    pub fn json_slices() -> Vec<String> {
-        vec![
-            r#"[\x20\x0A\x0D\x09]+"#.to_string(),
+    /// The selected built-in syntax, borrowed before any source construction.
+    pub fn general_slice_patterns() -> &'static [&'static str] {
+        &[
+            r#"[\x20\x0A\x0D\x09]+"#,
             // r#"[1-9][0-9]*"#.to_string(), - seems to make things slower
-            r#"[^"\\\x00-\x1F\x7F]{1,10}"#.to_string(),
-            r#"[^"\\\x00-\x1F\x7F]{1,30}"#.to_string(),
-            r#"[^"\\\x00-\x1F\x7F]+"#.to_string(),
+            r#"[^"\\\x00-\x1F\x7F]{1,10}"#,
+            r#"[^"\\\x00-\x1F\x7F]{1,30}"#,
+            r#"[^"\\\x00-\x1F\x7F]+"#,
         ]
+    }
+
+    pub fn json_slices() -> Vec<String> {
+        Self::general_slice_patterns()
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect()
     }
 
     pub fn general_slices() -> Vec<String> {
@@ -262,40 +235,61 @@ impl SlicedBiasComputer {
     }
 
     pub fn new(tok_env: &TokEnv, regexes: &[String]) -> Result<Self> {
-        let slice_regexes = regexes.to_vec();
-        let mut regexes = regexes.to_vec();
-        regexes.push("".to_string());
+        let root = Self::recognize(
+            tok_env.tok_trie(),
+            regexes,
+            &ParserAllocationFunding::unenforced(),
+        )?;
+        let r = SlicedBiasComputer {
+            top_slice: Arc::new(root),
+            tok_env: tok_env.clone(),
+            slice_regexes: regexes.to_vec(),
+        };
+        debug!("slicer:\n{}", r.stats(false));
+        Ok(r)
+    }
+
+    // One containment and recognition worker, independent of tokenization.
+    fn recognize(
+        trie: &TokTrie,
+        patterns: &[String],
+        funding: &ParserAllocationFunding,
+    ) -> Result<TokenizerSlice> {
+        let mut regexes = Vec::new();
+        funding.try_grow_vec(
+            &mut regexes,
+            patterns
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| funding.storage_overflow())?,
+        )?;
+        for pattern in patterns {
+            regexes.push(funding.try_copy_str(pattern)?);
+        }
+        regexes.push(String::new());
 
         let roots = {
             let mut edges = HashSet::default();
             let max_fuel = 100_000;
-            let mut builder = RegexBuilder::new();
+            let mut builder = RegexBuilder::new(funding.clone())?;
             for i in 0..regexes.len() {
                 for j in 0..regexes.len() {
                     if i != j
                         && (regexes[j].is_empty()
                             || builder.is_contained_in(&regexes[i], &regexes[j], max_fuel)?)
                     {
-                        edges.insert((i, j));
+                        funding.try_insert_set(&mut edges, (i, j))?;
                         // println!("edge {} {:?} ⊆ {} {:?}", i, regexes[i], j, regexes[j]);
                     }
                 }
             }
-            topological_sort(regexes.len(), &edges)
+            topological_sort(regexes.len(), &edges, funding)?
         };
-        ensure!(roots.len() == 1, "expected only one top-slice");
+        ensure!(funding, roots.len() == 1, "expected only one top-slice");
 
-        let root = TokenizerSlice::from_topo_node(&roots[0], tok_env.tok_trie(), &regexes)?;
+        let root = TokenizerSlice::from_topo_node(&roots[0], trie, &regexes, funding)?;
 
-        let r = SlicedBiasComputer {
-            top_slice: Arc::new(root),
-            tok_env: tok_env.clone(),
-            slice_regexes,
-        };
-
-        debug!("slicer:\n{}", r.stats(false));
-
-        Ok(r)
+        Ok(root)
     }
 
     pub fn stats(&self, include_tokens: bool) -> String {
@@ -331,8 +325,8 @@ impl SlicedBiasComputer {
         s
     }
 
-    pub fn extra_lexemes(&self) -> Vec<String> {
-        self.slice_regexes.clone()
+    pub fn extra_lexemes(&self) -> &[String] {
+        &self.slice_regexes
     }
 }
 

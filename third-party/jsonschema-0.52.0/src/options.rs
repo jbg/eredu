@@ -1,10 +1,10 @@
 use crate::{
     compiler,
     content_encoding::{
-        ContentEncodingCheckType, ContentEncodingConverterType,
-        DEFAULT_CONTENT_ENCODING_CHECKS_AND_CONVERTERS,
+        BuiltinEncoding, ContentEncodingCheckType, ContentEncodingConverterType,
+        ContentEncodingSource,
     },
-    content_media_type::{ContentMediaTypeCheckType, DEFAULT_CONTENT_MEDIA_TYPE_CHECKS},
+    content_media_type::{ContentMediaTypeCheckType, ContentMediaTypeSource},
     keywords::{custom::KeywordFactory, format::Format},
     paths::Location,
     retriever::DefaultRetriever,
@@ -66,46 +66,50 @@ impl<R: Clone, F: Json> Clone for ValidationOptions<'_, R, F> {
 
 impl<F: Json> Default for ValidationOptions<'_, Arc<dyn Retrieve>, F> {
     fn default() -> Self {
-        ValidationOptions {
-            draft: None,
-            content_media_type_checks: AHashMap::default(),
-            content_encoding_checks_and_converters: AHashMap::default(),
-            base_uri: None,
-            retriever: Arc::new(DefaultRetriever),
-            registry: None,
-            formats: AHashMap::default(),
-            validate_formats: None,
-            validate_schema: true,
-            ignore_unknown_formats: true,
-            keywords: AHashMap::default(),
-            vocabularies: AHashSet::default(),
-            pattern_options: PatternEngineOptions::default(),
-            email_options: None,
-            representation: PhantomData,
-        }
+        Self::default_with_funding(&crate::compilation::Funding::default())
+            .expect("ordinary schema options")
     }
 }
-
+impl<F: Json> ValidationOptions<'_, Arc<dyn Retrieve>, F> {
+    pub(crate) fn default_with_funding(
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        Self::with_initial_retriever(funding.arc(DefaultRetriever)?, funding)
+    }
+}
 #[cfg(feature = "resolve-async")]
 impl<F: Json> Default for ValidationOptions<'_, Arc<dyn referencing::AsyncRetrieve>, F> {
     fn default() -> Self {
-        ValidationOptions {
+        Self::with_initial_retriever(
+            Arc::new(DefaultRetriever),
+            &crate::compilation::Funding::default(),
+        )
+        .expect("ordinary schema options")
+    }
+}
+impl<R, F: Json> ValidationOptions<'_, R, F> {
+    fn with_initial_retriever(
+        retriever: R,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Self, crate::CompilationError> {
+        let seed = funding.random_state()?;
+        Ok(ValidationOptions {
             draft: None,
-            content_media_type_checks: AHashMap::default(),
-            content_encoding_checks_and_converters: AHashMap::default(),
+            content_media_type_checks: AHashMap::with_hasher(seed.clone()),
+            content_encoding_checks_and_converters: AHashMap::with_hasher(seed.clone()),
             base_uri: None,
-            retriever: Arc::new(DefaultRetriever),
+            retriever,
             registry: None,
-            formats: AHashMap::default(),
+            formats: AHashMap::with_hasher(seed.clone()),
             validate_formats: None,
             validate_schema: true,
             ignore_unknown_formats: true,
-            keywords: AHashMap::default(),
-            vocabularies: AHashSet::default(),
+            keywords: AHashMap::with_hasher(seed.clone()),
+            vocabularies: AHashSet::with_hasher(seed.clone()),
             pattern_options: PatternEngineOptions::default(),
             email_options: None,
             representation: PhantomData,
-        }
+        })
     }
 }
 
@@ -127,14 +131,37 @@ impl<'i, R, F: Json> ValidationOptions<'i, R, F> {
         uri: &str,
         registry: &referencing::Registry<'_>,
     ) -> Result<Draft, referencing::Error> {
-        let uri = uri.trim_end_matches('#');
-        // Walk the meta-schema chain to find the underlying draft.
-        crate::meta::walk_meta_schema_chain(uri, |current_uri| {
-            let uri = referencing::uri::from_str(current_uri)?;
-            let resolver = registry.resolver(uri);
-            let resolved = resolver.lookup("")?;
-            Ok(resolved.contents().clone())
-        })
+        Self::resolve_draft_from_registry_with_funding(
+            uri,
+            registry,
+            &crate::compilation::Funding::default(),
+        )
+        .map_err(crate::compilation::CompileError::into_ordinary_reference)
+    }
+    fn resolve_draft_from_registry_with_funding(
+        uri: &str,
+        registry: &referencing::Registry<'_>,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Draft, crate::compilation::CompileError<'static>> {
+        let view = registry
+            .extend_with_allocations(std::iter::empty::<(&str, &Value)>(), funding)
+            .and_then(referencing::RegistryBuilder::prepare)
+            .map_err(|error| funding.reference_error(error))?;
+        crate::meta::walk_meta_schema_chain_with_funding(
+            uri.trim_end_matches('#'),
+            |current_uri| {
+                let uri = referencing::uri::from_str_with_allocations(current_uri, funding)
+                    .map_err(|error| funding.reference_error(error))?;
+                let resolver = view
+                    .try_resolver(uri)
+                    .map_err(|error| funding.reference_error(error))?;
+                let resolved = resolver
+                    .lookup("")
+                    .map_err(|error| funding.reference_error(error))?;
+                Ok(funding.value(resolved.contents())?)
+            },
+            funding,
+        )
     }
 
     /// Sets the JSON Schema draft version.
@@ -166,11 +193,11 @@ impl<'i, R, F: Json> ValidationOptions<'i, R, F> {
     pub(crate) fn get_content_media_type_check(
         &self,
         media_type: &str,
-    ) -> Option<ContentMediaTypeCheckType> {
-        if let Some(value) = self.content_media_type_checks.get(media_type) {
-            *value
-        } else {
-            DEFAULT_CONTENT_MEDIA_TYPE_CHECKS.get(media_type).copied()
+    ) -> Option<ContentMediaTypeSource> {
+        match self.content_media_type_checks.get(media_type) {
+            Some(value) => value.map(ContentMediaTypeSource::Custom),
+            None if media_type == "application/json" => Some(ContentMediaTypeSource::Json),
+            None => None,
         }
     }
     /// Add support for a custom content media type validation.
@@ -202,42 +229,12 @@ impl<'i, R, F: Json> ValidationOptions<'i, R, F> {
         self
     }
 
-    #[inline]
-    fn content_encoding_check_and_converter(
-        &self,
-        content_encoding: &str,
-    ) -> Option<(ContentEncodingCheckType, ContentEncodingConverterType)> {
-        if let Some(value) = self
-            .content_encoding_checks_and_converters
-            .get(content_encoding)
-        {
-            *value
-        } else {
-            DEFAULT_CONTENT_ENCODING_CHECKS_AND_CONVERTERS
-                .get(content_encoding)
-                .copied()
-        }
-    }
-
-    pub(crate) fn content_encoding_check(
-        &self,
-        content_encoding: &str,
-    ) -> Option<ContentEncodingCheckType> {
-        if let Some((check, _)) = self.content_encoding_check_and_converter(content_encoding) {
-            Some(check)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn get_content_encoding_convert(
-        &self,
-        content_encoding: &str,
-    ) -> Option<ContentEncodingConverterType> {
-        if let Some((_, converter)) = self.content_encoding_check_and_converter(content_encoding) {
-            Some(converter)
-        } else {
-            None
+    pub(crate) fn get_content_encoding(&self, encoding: &str) -> Option<ContentEncodingSource> {
+        match self.content_encoding_checks_and_converters.get(encoding) {
+            Some(value) => {
+                value.map(|(check, convert)| ContentEncodingSource::Custom { check, convert })
+            }
+            None => BuiltinEncoding::from_name(encoding).map(ContentEncodingSource::Builtin),
         }
     }
     /// Add support for a custom content encoding.
@@ -518,6 +515,36 @@ impl<F: Json> ValidationOptions<'_, Arc<dyn referencing::Retrieve>, F> {
     /// in a separate blocking thread via `tokio::task::spawn_blocking`.
     pub fn build(&self, schema: &Value) -> Result<Validator<F>, ValidationError<'static>> {
         compiler::build_validator(self, schema)
+            .map_err(crate::compilation::CompileError::into_ordinary)
+    }
+
+    /// Compile with prospective funding for every reached qualified producer.
+    ///
+    /// This borrows an existing configuration. To fund default configuration
+    /// construction too, use [`Validator::build_with_funding`]. The resulting
+    /// validator or error retains `source` until its owned storage is dropped.
+    ///
+    /// `None` is the explicit unenforced policy for the same worker.
+    ///
+    /// # Errors
+    /// Returns the original storage refusal, an unqualified extension or
+    /// producer, or the ordinary schema/reference diagnostic without formatting.
+    pub fn build_with_funding(
+        &self,
+        schema: &Value,
+        source: Option<Arc<dyn crate::CompilationFunding>>,
+    ) -> Result<Validator<F>, crate::CompilationError> {
+        let funding = source
+            .map(crate::compilation::Funding::enforced)
+            .unwrap_or_default();
+        funding.reserve(std::mem::size_of::<(
+            &Self,
+            &Value,
+            crate::compilation::Funding,
+            Result<Validator<F>, crate::CompilationError>,
+        )>())?;
+        compiler::build_validator_with_funding(self, schema, &funding)
+            .map_err(|error| error.into_compilation(&funding))
     }
 
     /// Build a [`ValidatorMap`](crate::ValidatorMap) — a map of compiled validators keyed by
@@ -542,6 +569,7 @@ impl<F: Json> ValidationOptions<'_, Arc<dyn referencing::Retrieve>, F> {
         schema: &Value,
     ) -> Result<crate::ValidatorMap<F>, ValidationError<'static>> {
         compiler::build_validator_map(self, schema)
+            .map_err(crate::compilation::CompileError::into_ordinary)
     }
 
     /// Bundle a JSON Schema into a Compound Schema Document.
@@ -591,6 +619,14 @@ impl<F: Json> ValidationOptions<'_, Arc<dyn referencing::Retrieve>, F> {
     }
 
     pub(crate) fn draft_for(&self, contents: &Value) -> Result<Draft, referencing::Error> {
+        self.draft_for_with_funding(contents, &crate::compilation::Funding::default())
+            .map_err(crate::compilation::CompileError::into_ordinary_reference)
+    }
+    pub(crate) fn draft_for_with_funding(
+        &self,
+        contents: &Value,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Draft, crate::compilation::CompileError<'static>> {
         // Preference:
         //  - Explicitly set
         //  - Autodetected (with registry resolution for custom meta-schemas)
@@ -609,7 +645,11 @@ impl<F: Json> ValidationOptions<'_, Arc<dyn referencing::Retrieve>, F> {
                         .and_then(|obj| obj.get("$schema"))
                         .and_then(|s| s.as_str())
                     {
-                        return Self::resolve_draft_from_registry(meta_schema_uri, registry);
+                        return Self::resolve_draft_from_registry_with_funding(
+                            meta_schema_uri,
+                            registry,
+                            funding,
+                        );
                     }
                 }
             }
@@ -742,7 +782,9 @@ impl<'i, F: Json> ValidationOptions<'i, Arc<dyn referencing::AsyncRetrieve>, F> 
     /// Returns an error if `schema` is invalid for the selected draft or if referenced resources
     /// cannot be retrieved or resolved.
     pub async fn build(&self, schema: &Value) -> Result<Validator<F>, ValidationError<'static>> {
-        compiler::build_validator_async(self, schema).await
+        compiler::build_validator_async(self, schema)
+            .await
+            .map_err(crate::compilation::CompileError::into_ordinary)
     }
 
     /// Refuse to fetch any reference that is not already in the registry.
@@ -764,7 +806,9 @@ impl<'i, F: Json> ValidationOptions<'i, Arc<dyn referencing::AsyncRetrieve>, F> 
         &self,
         schema: &Value,
     ) -> Result<crate::ValidatorMap<F>, ValidationError<'static>> {
-        compiler::build_validator_map_async(self, schema).await
+        compiler::build_validator_map_async(self, schema)
+            .await
+            .map_err(crate::compilation::CompileError::into_ordinary)
     }
 
     /// Bundle a JSON Schema using async retrieval for external references.

@@ -5,6 +5,7 @@ use crate::normalizers::replace::Replace;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Inline {
+    Metaspace(pre::Meta),
     ByteFallback,
     Fuse,
     Replace {
@@ -21,7 +22,9 @@ fn text(input: &str, span: Span) -> Result<json::Text<'_>, Error> {
     Ok(text)
 }
 pub(super) fn select(input: &str, span: Span, typ: Span) -> Result<Inline, Error> {
-    if text_is(input, typ, "ByteFallback")? {
+    if text_is(input, typ, "Metaspace")? {
+        pre::select(input, span).map(Inline::Metaspace)
+    } else if text_is(input, typ, "ByteFallback")? {
         fields(input, span, ["type"])?;
         Ok(Inline::ByteFallback)
     } else if text_is(input, typ, "Fuse")? {
@@ -62,6 +65,7 @@ pub(super) fn select(input: &str, span: Span, typ: Span) -> Result<Inline, Error
 impl Inline {
     pub(super) fn component(self) -> fixed_profile::Component {
         match self {
+            Self::Metaspace(value) => value.decoder_component(),
             Self::ByteFallback => fixed_profile::Component::ByteFallback,
             Self::Fuse => fixed_profile::Component::Fuse,
             Self::Replace { .. } => fixed_profile::Component::MarkerReplace,
@@ -70,6 +74,7 @@ impl Inline {
     }
     pub(super) fn bytes(self) -> usize {
         match self {
+            Self::Metaspace(value) => value.bytes(),
             Self::Replace { bytes, .. } => bytes,
             _ => 0,
         }
@@ -81,6 +86,7 @@ impl Inline {
         partial: &mut Partial,
     ) -> Result<DecoderWrapper, Cause> {
         Ok(match self {
+            Self::Metaspace(value) => value.compile_component(partial, failure)?.into(),
             Self::ByteFallback => ByteFallback::new().into(),
             Self::Fuse => Fuse::new().into(),
             Self::Strip => Strip::new(' ', 1, 0).into(),

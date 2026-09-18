@@ -27,7 +27,7 @@ impl OriginalParallelInvocation {
         run: F,
     ) -> Result<Result<T, E>, Error>
     where
-        F: FnOnce(Option<(&Group, &WorkspaceMetadataFunding)>) -> Result<T, E>,
+        F: FnOnce(Option<(&Group, &HostMetadataFunding)>) -> Result<T, E>,
     {
         let state = self.state();
         reserve(
@@ -120,7 +120,7 @@ impl OriginalParallelBinding {
         &self,
         group: &Group,
         prepared: &Group,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
         stream: &Stream,
         run: F,
     ) -> Result<Result<T, E>, Error>
@@ -136,7 +136,7 @@ impl OriginalParallelBinding {
                 size_of::<Result<T, E>>(),
                 size_of::<Result<Result<T, E>, Error>>(),
                 size_of::<ControlSourceLoan>(),
-                size_of::<(&Group, &Group, &WorkspaceMetadataFunding, &Stream)>(),
+                size_of::<(&Group, &Group, &HostMetadataFunding, &Stream)>(),
                 CommunicationManifest::group_operation_control_bytes().ok_or_else(overflow)?,
                 failure_control_bytes().ok_or_else(overflow)?,
             ],
@@ -295,7 +295,7 @@ impl State {
                 size_of::<Result<AcceptedCommunicationSource<'_>, Error>>(),
                 size_of::<OriginalCommunicationConstructed>(),
                 size_of::<OriginalCommunicationCompletion>(),
-                size_of::<(Array, RetainedCommunicationSource, WorkspaceMetadataFunding)>(),
+                size_of::<(Array, RetainedCommunicationSource, HostMetadataFunding)>(),
                 size_of::<Result<(Array, OriginalCommunicationCompletion), Error>>(),
                 size_of::<Option<Result<(Array, OriginalCommunicationCompletion), Error>>>(),
                 size_of::<(

@@ -3,7 +3,7 @@ use super::{
     model_session::{
         CompletionRootsOwner, ObservationRoots, ScopeRetention, SubmissionResourcesOwner,
     },
-    recovery::{Probe, Recovery, Retention},
+    recovery::{Probe, Recovery, Retention, Status},
 };
 use eredu_runtime::working_memory::{
     InferenceStateRevision, InferenceTextStepReceipt, WorkingMemoryError,
@@ -16,6 +16,18 @@ pub(in crate::composition::mlx::session) use observation::token_control_bytes as
 pub(super) use observation::Observation;
 use observation::TokenObservationOwner;
 pub(in crate::composition::mlx::session) use scalar::control_bytes as token_scalar_control_bytes;
+
+pub(in crate::composition::mlx::session) fn finish_control_bytes() -> Option<u64> {
+    use std::mem::size_of;
+    use crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause;
+    let parts = [
+        size_of::<&MlxTextCompletion>(), size_of::<&SubmissionResourcesOwner>(),
+        size_of::<Option<Result<Status, RegisteredScopeRetirementCause>>>(),
+        size_of::<Result<Option<Status>, RegisteredScopeRetirementCause>>(),
+        size_of::<Result<Option<Status>, Error>>(),
+    ];
+    u64::try_from(parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)?).ok()
+}
 
 // Return the extracted owner only after the slot loan ends. Finalization and
 // Drop may reenter the completion; they must never run under its RefMut.
@@ -164,6 +176,12 @@ impl MlxTextToken {
         self.state_revision.as_ref()
     }
 
+    pub(super) fn apply_branch_placement(&mut self, placement: &eredu_runtime::replicated_session::ControlBranchPlacement) {
+        assert!(self.state_revision.as_ref().is_some_and(|revision| placement.matches_source(revision)),
+            "closed branch source was validated before its atomic exchange");
+        self.state_revision = Some(placement.revision().clone());
+    }
+
     pub(super) fn attach_step_receipt(
         &mut self,
         receipt: InferenceTextStepReceipt,
@@ -220,7 +238,7 @@ fn read_ordinary_token_scalar(
     // Keep the first successful read's exact finish boundary. Runtime
     // contention is pending ownership; native failures retain recovery.
     let status = if result.is_ok() {
-        recovery.finish()
+        recovery.finish().map_err(|cause| { owner.reject_unresolved(); cause.into_error() })?
     } else {
         recovery.progress()
     };
@@ -317,7 +335,10 @@ impl MlxTextCompletion {
             };
             let sampling = if wait && matches!(result, Ok(true)) {
                 let sampling = take_recovery(&self.recovery);
-                sampling.map(Recovery::finish)
+                sampling.map(Recovery::finish).transpose().map_err(|cause| {
+                    self.model.owner().reject_unresolved();
+                    cause.into_error()
+                })?
             } else {
                 progress_recovery(&self.recovery)
             };

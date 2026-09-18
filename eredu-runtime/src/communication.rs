@@ -87,21 +87,21 @@ impl<'de> Deserialize<'de> for CommunicationPeerCounts {
 /// type never grants submission authority or replaces request authentication.
 pub struct PreparedPeerCountLoan<'a> {
     matrix: &'a [i32],
-    funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: &'a eredu_nn::workspace::HostMetadataFunding,
     source: Option<eredu_core::ErasedSharedStorageOwner>,
 }
 impl<'a> PreparedPeerCountLoan<'a> {
     /// The backend prepares all payload and owner storage before lending it.
-    pub fn new(matrix: &'a [i32], funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    pub fn new(matrix: &'a [i32], funding: &'a eredu_nn::workspace::HostMetadataFunding,
         source: Option<eredu_core::ErasedSharedStorageOwner>) -> Self {
         Self { matrix, funding, source }
     }
     /// Checked local rank-major count matrix.
     pub fn matrix(&self) -> &'a [i32] { self.matrix }
     /// Cumulative account shared by the source and derived plan.
-    pub fn funding(&self) -> &'a eredu_nn::workspace::WorkspaceMetadataFunding { self.funding }
+    pub fn funding(&self) -> &'a eredu_nn::workspace::HostMetadataFunding { self.funding }
     /// Moves custody; no owner clone, allocation or independent source appears.
-    pub fn into_parts(self) -> (&'a [i32], &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    pub fn into_parts(self) -> (&'a [i32], &'a eredu_nn::workspace::HostMetadataFunding,
         Option<eredu_core::ErasedSharedStorageOwner>) {
         (self.matrix, self.funding, self.source)
     }

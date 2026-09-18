@@ -7,12 +7,7 @@
 //! `[batch, sequence, heads, key_dim]` are supported.
 
 #[cfg(not(feature = "cuda"))]
-use std::cell::RefCell;
-
-#[cfg(not(feature = "cuda"))]
 use safemlx::DeviceType;
-#[cfg(not(feature = "cuda"))]
-use safemlx::fast::{CustomKernelConfig, MetalKernel};
 use safemlx::{
     Array, Dtype, Stream,
     error::Exception,
@@ -22,12 +17,6 @@ use safemlx::{
         sum_axis, zeros,
     },
 };
-
-#[cfg(not(feature = "cuda"))]
-thread_local! {
-    static SCALAR_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
-    static VECTOR_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
-}
 
 #[cfg(not(feature = "cuda"))]
 const PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
@@ -45,34 +34,6 @@ pub(super) fn metal_scan_chunk_tokens(length: i32) -> i32 {
     } else {
         PREFILL_LONG_SCAN_TOKENS
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-#[derive(Debug)]
-struct RecurrentScanKernel {
-    decode: MetalKernel,
-    prefill: MetalKernel,
-}
-
-#[cfg(not(feature = "cuda"))]
-fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
-    use crate::backend::managed_memory::recurrent_kernel::{ScanKernel, plan};
-    let build = |decode| {
-        let p = plan(ScanKernel::select(decode, vector_decay));
-        MetalKernel::new(
-            p.name,
-            p.inputs,
-            p.outputs,
-            p.source,
-            p.header,
-            p.ensure_row_contiguous,
-            p.atomic_outputs,
-        )
-    };
-    Ok(RecurrentScanKernel {
-        decode: build(true)?,
-        prefill: build(false)?,
-    })
 }
 
 fn recurrent_step(
@@ -175,48 +136,8 @@ fn metal_scan_chunk(
         },
     ];
     let grid = [grid_width, 1, 1];
-    if safemlx::OriginalScopeObserver::try_current()?.is_some() {
-        let [output, state] = recurrent_kernel::apply(kind, inputs, outputs, grid, stream)?;
-        return Ok((state, output));
-    }
-    let run = |cell: &RefCell<Option<RecurrentScanKernel>>| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(metal_kernels(vector_decay)?);
-        }
-        let loan = cell.borrow();
-        let kernels = loan.as_ref().expect("gated-delta kernels initialized");
-        let kernel = if decode {
-            &kernels.decode
-        } else {
-            &kernels.prefill
-        };
-        if MetalKernel::fixed_control_bytes::<6, 2>(0, 4).is_some() {
-            let [output, state] =
-                kernel.apply_fixed_device(inputs, outputs, &[], grid, [256, 1, 1], stream)?;
-            Ok((state, output))
-        } else {
-            // Existing unqualified ordinary compatibility still uses its owning
-            // transport; it cannot enter an original scope or gain source custody.
-            let config = CustomKernelConfig::new()
-                .with_grid(grid)
-                .with_thread_group([256, 1, 1])
-                .with_output_arg(sequence_shape, Dtype::Float32)
-                .with_output_arg(state_shape, Dtype::Float32);
-            let mut outputs = kernel.apply_device(inputs, &config, stream)?;
-            if outputs.len() != 2 {
-                return Err(Exception::custom(
-                    "gated-delta kernel returned an invalid output count",
-                ));
-            }
-            let state = outputs.remove(1);
-            Ok((state, outputs.remove(0)))
-        }
-    };
-    if vector_decay {
-        VECTOR_KERNELS.with(run)
-    } else {
-        SCALAR_KERNELS.with(run)
-    }
+    let [output, state] = recurrent_kernel::apply(kind, inputs, outputs, grid, stream)?;
+    Ok((state, output))
 }
 
 // Every scan slice retains all axes and uses checked nonnegative bounds. The

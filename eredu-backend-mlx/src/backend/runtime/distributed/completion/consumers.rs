@@ -4,6 +4,7 @@ use super::prepared::{Cause,ResourceCustody,error};
 use crate::backend::{runtime::distributed::topology::OriginalCommunicationSource,
     submission_recovery::observed::{ObservedRecovery,PreparedObservedRecovery,
         bank::{PreparedOperationBank,BankPreparationCause}}};
+use crate::backend::submission_recovery::observed::RetirementAttempt;
 use safemlx::{OriginalScopeObserver,OperationWaitRecordLayout,error::Exception};
 use std::{alloc::Layout,convert::Infallible,mem::{size_of,size_of_val}};
 
@@ -25,7 +26,7 @@ impl PreparedConsumers {
         let custody=ResourceCustody { source:source.source().clone(),funding:source.funding().clone() };
         let factory_custody=custody.clone();
         let factory=move |_:usize|Ok::<_,Infallible>(Ready::new(factory_custody.clone()));
-        let bytes=controls(&factory,waits).ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?;
+        let bytes=controls(&factory,waits).ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?;
         custody.funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
         let ready=PreparedOperationBank::try_new(waits.wait_count(),factory).map_err(|failed| {
             let (cause,prefix,factory)=failed.into_parts();
@@ -68,15 +69,26 @@ impl PreparedConsumers {
         self.slots.borrow_mut().active.push(child);
         result
     }
-    pub(super) fn retire_completed(&self,observer:&OriginalScopeObserver)->Result<bool,Exception> {
+    pub(super) fn retire_completed(&self,observer:&OriginalScopeObserver)->Result<RetirementAttempt,Exception> {
         let mut slots=self.slots.try_borrow_mut().map_err(|_|busy(observer))?;
         let mut index=0;
         while index<slots.active.len() {
-            if slots.active[index].try_finish_successfully()? {
-                drop(slots.active.swap_remove(index));
-            } else { index+=1; }
+            // Keep the actual owner through a consuming cleanup refusal.
+            let owner = slots.active[index].retention().owner.clone();
+            match slots.active[index].try_finish_successfully()? {
+                RetirementAttempt::Retired => drop(slots.active.swap_remove(index)),
+                RetirementAttempt::Pending => index+=1,
+                RetirementAttempt::Stopped(cause) => {
+                    drop(slots.active.swap_remove(index));
+                    owner.child_failed.set(true);
+                    // These observed child nodes currently have no registered
+                    // prediction role. Preserve a future stop unchanged until
+                    // the actual caller chooses synchronous or deferred handling.
+                    return Ok(RetirementAttempt::Stopped(cause));
+                }
+            }
         }
-        Ok(slots.active.is_empty())
+        Ok(if slots.active.is_empty() { RetirementAttempt::Retired } else { RetirementAttempt::Pending })
     }
 }
 fn busy(observer:&OriginalScopeObserver)->Exception {
@@ -89,7 +101,7 @@ where F:FnMut(usize)->Result<Ready,Infallible> {
         size_of::<std::cell::RefMut<'_,Slots>>(),size_of::<std::cell::BorrowMutError>(),
         size_of::<Active>(),size_of::<Option<Active>>(),size_of::<Vec<Active>>(),
         size_of::<Result<PreparedConsumers,Error>>(),size_of::<Result<(),Exception>>(),
-        size_of::<Result<bool,Exception>>(),size_of::<NativeChildResources>(),size_of::<ChildUnwind<'_>>(),
+        size_of::<Result<bool,Exception>>(),size_of::<Result<RetirementAttempt,Exception>>(),size_of::<NativeOwner>(),size_of::<NativeChildResources>(),size_of::<ChildUnwind<'_>>(),
         size_of::<(&NativeEvent,&NativeOwner,&Stream,&OriginalScopeObserver)>(),
         size_of::<std::slice::Iter<'_,Stream>>(),size_of::<(usize,usize)>(),
         size_of::<Result<(),std::collections::TryReserveError>>(),

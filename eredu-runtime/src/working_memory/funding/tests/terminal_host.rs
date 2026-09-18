@@ -292,6 +292,7 @@ fn completed_dense_table_transfers_held_bytes_before_or_after_terminal_trim() {
             retained,
             protected,
             HostKey(slots.metadata().identity().registry_key().clone()),
+            None,
         )
         .unwrap();
         assert_eq!(slots.get(1), Some(&19));

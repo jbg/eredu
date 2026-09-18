@@ -133,7 +133,7 @@ impl ForegroundDiskWindowPlan {
         window: WindowPopulation,
         ids: &[OffloadUnitId],
         scratch: &mut [ResidencyClosureSlot],
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Self, Error> {
         if let Some(funding) = funding {
             let bytes = [
@@ -215,7 +215,7 @@ impl ForegroundDiskWindowPlan {
     /// The same per-unit read constructor and source accountant remain in use.
     pub(crate) fn background_union(
         windows: &[Self],
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::background_population(windows, funding, false)
     }
@@ -224,11 +224,11 @@ impl ForegroundDiskWindowPlan {
     /// spend another unit's read. The source counter still follows every actual
     /// backing through publication, eviction and escaped transfer/failure.
     pub(crate) fn background_occurrences(
-        windows: &[Self], funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        windows: &[Self], funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         Self::background_population(windows, funding, true)
     }
-    fn background_population(windows: &[Self], funding: &eredu_nn::workspace::WorkspaceMetadataFunding, repeated: bool) -> Result<Self, Error> {
+    fn background_population(windows: &[Self], funding: &eredu_nn::workspace::HostMetadataFunding, repeated: bool) -> Result<Self, Error> {
         let source = &windows.first().ok_or_else(identity)?.source;
         let mut count = 0usize;
         for (index, window) in windows.iter().enumerate() {
@@ -248,7 +248,7 @@ impl ForegroundDiskWindowPlan {
             size_of::<std::collections::TryReserveError>(),
             size_of::<std::slice::Iter<'_, Self>>(),
             size_of::<std::slice::Iter<'_, UnitRead>>(),
-            size_of::<(&[Self], &eredu_nn::workspace::WorkspaceMetadataFunding, bool)>(),
+            size_of::<(&[Self], &eredu_nn::workspace::HostMetadataFunding, bool)>(),
             size_of::<bool>(), size_of::<std::slice::IterMut<'_, UnitRead>>(),
             size_of::<Option<usize>>(), size_of::<Result<usize, Error>>(),
             size_of::<(usize, &Self, &UnitRead)>(),
@@ -277,12 +277,12 @@ impl ForegroundDiskWindowPlan {
     }
     /// Exact Device source rows not already supplied by the selected Host
     /// promotion. Keeps the existing direct reader's actual retry population.
-    pub(crate) fn difference(&self, covered: &Self, funding: &eredu_nn::workspace::WorkspaceMetadataFunding) -> Result<Self, Error> {
+    pub(crate) fn difference(&self, covered: &Self, funding: &eredu_nn::workspace::HostMetadataFunding) -> Result<Self, Error> {
         if !self.source.same_source(&covered.source) { return Err(identity()); }
         let selected = |row: &&UnitRead| !covered.units.iter().any(|other| other.ordinal == row.ordinal);
         let count = self.units.iter().filter(selected).count();
         let controls = [size_of::<Self>(), size_of::<Result<Self, Error>>(),
-            size_of::<(&Self, &Self, &eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            size_of::<(&Self, &Self, &eredu_nn::workspace::HostMetadataFunding)>(),
             size_of::<UnitRead>(), size_of::<std::slice::Iter<'_, UnitRead>>(), size_of_val(&selected)];
         funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add).ok_or_else(overflow)?).map_err(Error::WorkspacePlanning)?;
         let mut units = funding.metadata_vec::<UnitRead>(count)?;
@@ -646,16 +646,16 @@ impl ForegroundDiskWindowPlan {
 impl ForegroundDiskSubsetCeiling {
     pub(crate) fn clone_control_bytes()->Option<usize> {
         let frames=[size_of::<Self>(),size_of::<ForegroundDiskDescriptors>(),
-            size_of::<(&Self,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
-            size_of::<Result<Self,eredu_nn::workspace::WorkspaceMetadataFundingError>>()];
+            size_of::<(&Self,&eredu_nn::workspace::HostMetadataFunding)>(),
+            size_of::<Result<Self,eredu_nn::workspace::HostMetadataFundingError>>()];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
     /// Paid descriptive alias only: the actual read counters, bank and native
     /// capacity remain outside this immutable source envelope.
-    pub(crate) fn clone_for_invocation(&self,funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
-        ->Result<Self,eredu_nn::workspace::WorkspaceMetadataFundingError> {
+    pub(crate) fn clone_for_invocation(&self,funding:&eredu_nn::workspace::HostMetadataFunding)
+        ->Result<Self,eredu_nn::workspace::HostMetadataFundingError> {
         funding.reserve_metadata(Self::clone_control_bytes()
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow)?)?;
+            .ok_or(eredu_nn::workspace::HostMetadataFundingError::Overflow)?)?;
         Ok(Self{source:self.source.clone(),population:self.population,
             source_controls:self.source_controls,attempt_controls:self.attempt_controls})
     }
@@ -702,3 +702,5 @@ impl ForegroundDiskSubsetCeiling {
             u64::try_from(backing).map_err(|_|WorkingMemoryError::Overflow)?),bank,custody,reservation)
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

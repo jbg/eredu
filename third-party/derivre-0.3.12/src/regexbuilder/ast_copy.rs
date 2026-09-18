@@ -1,5 +1,6 @@
 //! Source-derived AST copies using finite traversal and partial destinations.
 use super::{JsonQuoteOptions, RegexAst};
+use crate::{ParserAllocationFailure, prepared_funding::{FrameError, PreparedFunding}};
 use std::{
     alloc::Layout,
     collections::TryReserveError,
@@ -60,6 +61,7 @@ impl fmt::Debug for RegexAstCopyPlan<'_> {
 #[derive(Debug)]
 enum Cause {
     Overflow,
+    Funding(ParserAllocationFailure),
     Capacity,
     Vector(TryReserveError),
     Utf8(FromUtf8Error),
@@ -96,6 +98,7 @@ impl fmt::Display for RegexAstCopyFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
             Cause::Overflow => f.write_str("regex AST source geometry overflow"),
+            Cause::Funding(error) => fmt::Display::fmt(error, f),
             Cause::Capacity => f.write_str("regex AST destination differs from source"),
             Cause::Vector(e) => fmt::Display::fmt(e, f),
             Cause::Utf8(e) => fmt::Display::fmt(e, f),
@@ -105,6 +108,7 @@ impl fmt::Display for RegexAstCopyFailure {
 impl std::error::Error for RegexAstCopyFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
+            Cause::Funding(error) => Some(error),
             Cause::Vector(e) => Some(e),
             Cause::Utf8(e) => Some(e),
             _ => None,
@@ -134,7 +138,24 @@ fn payload(source: &RegexAst) -> &[u8] {
         _ => &[],
     }
 }
-fn inspect(source: &RegexAst, depth: usize, g: &mut Geometry) -> Result<(), Cause> {
+fn frame(error: FrameError<ParserAllocationFailure>) -> Cause {
+    match error { FrameError::Overflow => Cause::Overflow, FrameError::Funding(error) => Cause::Funding(error) }
+}
+type InspectFrame<'a, F> = (
+    &'a RegexAst, usize, &'a mut Geometry, &'a F, &'a [RegexAst], usize,
+    std::slice::Iter<'a, RegexAst>, Result<(), Cause>,
+    Result<Layout, std::alloc::LayoutError>, Option<usize>,
+);
+type PlanFrame<'a, F> = (
+    &'a RegexAst, &'a F, Geometry, RegexAstCopyPlan<'a>, RegexAstCopyRequirements,
+    RegexAstCopyFailure, Cause, Result<RegexAstCopyPlan<'a>, Cause>,
+    Result<RegexAstCopyPlan<'a>, RegexAstCopyFailure>, [usize; 20],
+    usize, usize, usize, usize, Option<usize>, Result<Layout, std::alloc::LayoutError>,
+);
+fn inspect<F: PreparedFunding<Error = ParserAllocationFailure>>(
+    source: &RegexAst, depth: usize, g: &mut Geometry, funding: &F,
+) -> Result<(), Cause> {
+    let _frame = funding.frame(size_of::<InspectFrame<'_, F>>()).map_err(frame)?;
     add(&mut g.nodes, 1)?;
     g.depth = g.depth.max(depth);
     let args = source.get_args();
@@ -157,20 +178,49 @@ fn inspect(source: &RegexAst, depth: usize, g: &mut Geometry) -> Result<(), Caus
         add(&mut g.byte_words, o.allowed_escapes.len())?;
     }
     for child in args {
-        inspect(child, depth.checked_add(1).ok_or(Cause::Overflow)?, g)?;
+        inspect(child, depth.checked_add(1).ok_or(Cause::Overflow)?, g, funding)?;
     }
     Ok(())
 }
 impl RegexAst {
-    /// Counts this actual tree without parsing names or compiling expressions.
-    /// Enclosing admitted callers must already hold their source-inspection owner.
-    pub fn source_copy_plan(&self) -> Result<RegexAstCopyPlan<'_>, RegexAstCopyFailure> {
-        RegexAstCopyPlan::prepare(self).map_err(|cause| RegexAstCopyFailure {
-            cause,
-            destinations: Vec::new(),
-            completed: None,
-        })
+    /// Actual descendant allocations retained by this tree, including spare
+    /// vector/string capacity. This creates no source or compilation allowance.
+    pub fn retained_capacity_bytes<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        &self, funding: &F,
+    ) -> Result<usize, RegexAstCopyFailure> {
+        retained(self, funding).map_err(failure)
     }
+
+    /// Counts this actual tree without parsing names or compiling expressions.
+    /// Every reached inspection frame uses the caller's same live scope.
+    pub fn source_copy_plan<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        &self, funding: &F,
+    ) -> Result<RegexAstCopyPlan<'_>, RegexAstCopyFailure> {
+        RegexAstCopyPlan::prepare(self, funding).map_err(failure)
+    }
+
+}
+fn failure(cause: Cause) -> RegexAstCopyFailure {
+    RegexAstCopyFailure { cause, destinations: Vec::new(), completed: None }
+}
+fn retained<F: PreparedFunding<Error = ParserAllocationFailure>>(
+    source: &RegexAst, funding: &F,
+) -> Result<usize, Cause> {
+    let _frame = funding.frame(size_of::<(
+        &RegexAst, &F, usize, Option<usize>, Result<usize, Cause>,
+        std::slice::Iter<'_, RegexAst>,
+    )>()).map_err(frame)?;
+    let mut own = (|| match source {
+        RegexAst::And(v) | RegexAst::Or(v) | RegexAst::Concat(v) => v.capacity().checked_mul(size_of::<RegexAst>()),
+        RegexAst::LookAhead(_) | RegexAst::Not(_) | RegexAst::Repeat(_, _, _) => Some(size_of::<RegexAst>()),
+        RegexAst::JsonQuote(_, options) => size_of::<RegexAst>().checked_add(options.allowed_escapes.capacity()),
+        RegexAst::ByteSet(v) => v.capacity().checked_mul(size_of::<u32>()),
+        RegexAst::Regex(v) | RegexAst::SearchRegex(v) | RegexAst::Literal(v) => Some(v.capacity()),
+        RegexAst::ByteLiteral(v) => Some(v.capacity()),
+        _ => Some(0),
+    })().ok_or(Cause::Overflow)?;
+    for child in source.get_args() { add(&mut own, retained(child, funding)?)?; }
+    Ok(own)
 }
 fn reserve<T>(v: &mut Vec<T>, n: usize) -> Result<(), Cause> {
     v.try_reserve_exact(n).map_err(Cause::Vector)?;
@@ -214,9 +264,12 @@ fn assemble(source: &RegexAst, d: &mut Destination) -> Result<RegexAst, Cause> {
     })
 }
 impl<'a> RegexAstCopyPlan<'a> {
-    fn prepare(source: &'a RegexAst) -> Result<Self, Cause> {
+    fn prepare<F: PreparedFunding<Error = ParserAllocationFailure>>(
+        source: &'a RegexAst, funding: &F,
+    ) -> Result<Self, Cause> {
+        let _frame = funding.frame(size_of::<PlanFrame<'_, F>>()).map_err(frame)?;
         let mut g = Geometry::default();
-        inspect(source, 1, &mut g)?;
+        inspect(source, 1, &mut g, funding)?;
         let retained = g.buffers;
         add(&mut g.buffers, array::<Frame<'_>>(g.depth)?)?;
         add(&mut g.buffers, array::<Destination>(g.depth)?)?;
@@ -246,18 +299,15 @@ impl<'a> RegexAstCopyPlan<'a> {
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
             .ok_or(Cause::Overflow)?;
-        // The source inspection/drop descent is bounded by this same actual tree.
-        let recursive = size_of::<(
-            &RegexAst,
-            usize,
-            &mut Geometry,
-            std::slice::Iter<'_, RegexAst>,
-            Result<(), Cause>,
-        )>();
-        add(
-            &mut controls,
-            recursive.checked_mul(g.depth).ok_or(Cause::Overflow)?,
-        )?;
+        // Nested copy workers re-inspect their existing source under this prepaid
+        // requirement; count the same entry/guard layout, not only the old walk locals.
+        let recursive = crate::prepared_funding::frame_control_bytes::<ParserAllocationFailure>(
+            size_of::<InspectFrame<'_, F>>()
+        ).ok_or(Cause::Overflow)?;
+        add(&mut controls, recursive.checked_mul(g.depth).ok_or(Cause::Overflow)?)?;
+        add(&mut controls, crate::prepared_funding::frame_control_bytes::<ParserAllocationFailure>(
+            size_of::<PlanFrame<'_, F>>()
+        ).ok_or(Cause::Overflow)?)?;
         let total = g.buffers.checked_add(controls).ok_or(Cause::Overflow)?;
         Ok(Self {
             source,
@@ -394,18 +444,18 @@ mod tests {
             RegexAst::Repeat(Box::new(RegexAst::Byte(b'!')), 1, 3),
             RegexAst::LookAhead(Box::new(RegexAst::Regex("[0-9]".into()))),
         ]);
-        let plan = source.source_copy_plan().unwrap();
+        let plan = source.source_copy_plan(&crate::ParserAllocationFunding::unenforced()).unwrap();
         let requirements = plan.requirements();
         let copied = plan.compile().unwrap();
         assert!(requirements.nodes() > requirements.depth());
         assert!(requirements.required_bytes() > requirements.buffer_bytes());
         assert_eq!(format!("{source:?}"), format!("{copied:?}"));
-        let mut builder = RegexBuilder::new();
+        let mut builder = RegexBuilder::new(crate::ParserAllocationFunding::unenforced()).unwrap();
         let id = builder.mk(&source).unwrap();
         assert_eq!(builder.mk(&copied).unwrap(), id);
-        let mut matcher = builder.to_regex(id);
-        assert!(matcher.is_match("kept\"bc\"!!5"));
-        assert!(!matcher.is_match("kept\"bc\"!!x"));
+        let mut matcher = builder.to_regex(id).unwrap();
+        assert!(matcher.is_match("kept\"bc\"!!5").unwrap());
+        assert!(!matcher.is_match("kept\"bc\"!!x").unwrap());
 
         let other = RegexAst::And(vec![
             RegexAst::SearchRegex("α".into()),
@@ -415,14 +465,14 @@ mod tests {
             RegexAst::ByteSet(vec![0x55, 0xaa]),
             RegexAst::ExprRef(crate::ExprRef::ANY_BYTE),
         ]);
-        let other_copy = other.source_copy_plan().unwrap().compile().unwrap();
+        let other_copy = other.source_copy_plan(&crate::ParserAllocationFunding::unenforced()).unwrap().compile().unwrap();
         assert_eq!(format!("{other:?}"), format!("{other_copy:?}"));
 
         let mut deep = RegexAst::Byte(b'x');
         for _ in 0..640 {
             deep = RegexAst::Repeat(Box::new(deep), 1, 1);
         }
-        let deep_plan = deep.source_copy_plan().unwrap();
+        let deep_plan = deep.source_copy_plan(&crate::ParserAllocationFunding::unenforced()).unwrap();
         assert_eq!(deep_plan.requirements().depth(), 641);
         assert_eq!(
             deep_plan.requirements().retained_bytes(),
@@ -441,7 +491,7 @@ mod tests {
         }
         assert!(matches!(node, RegexAst::Byte(b'x')));
 
-        let mut failing = source.source_copy_plan().unwrap();
+        let mut failing = source.source_copy_plan(&crate::ParserAllocationFunding::unenforced()).unwrap();
         failing.byte_words = 4;
         let failure = match failing.compile() {
             Err(e) => e,
@@ -459,3 +509,6 @@ mod tests {
         assert!(failure.completed.is_none());
     }
 }
+
+#[cfg(test)]
+mod inspection_tests;

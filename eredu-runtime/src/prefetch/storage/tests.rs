@@ -1,5 +1,5 @@
 use super::*;
-use eredu_nn::workspace::WorkspaceMetadataAccount;
+use eredu_nn::workspace::HostMetadataAccount;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
@@ -14,7 +14,7 @@ struct State {
 }
 #[derive(Debug)]
 struct Account(Arc<State>);
-impl WorkspaceMetadataAccount for Account {
+impl HostMetadataAccount for Account {
     fn reserve_metadata(&self, bytes: usize) -> Result<(), eredu_core::HostMetadataFundingError> {
         let mut remaining = self.0.remaining.lock().unwrap();
         *remaining =
@@ -58,13 +58,13 @@ impl Drop for Failure {
             .fetch_or(1 << self.code, Ordering::SeqCst);
     }
 }
-fn account() -> (Arc<State>, WorkspaceMetadataFunding) {
+fn account() -> (Arc<State>, HostMetadataFunding) {
     let state = Arc::new(State {
         remaining: Mutex::new(usize::MAX),
         retired: AtomicBool::new(false),
         errors: AtomicUsize::new(0),
     });
-    let funding = WorkspaceMetadataFunding::new(Account(state.clone())).unwrap();
+    let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
     (state, funding)
 }
 fn ids() -> Vec<OffloadUnitId> {

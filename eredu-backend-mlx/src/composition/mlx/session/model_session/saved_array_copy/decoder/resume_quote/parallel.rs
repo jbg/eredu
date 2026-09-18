@@ -15,14 +15,14 @@ impl SavedWorkspace {
     pub(super) fn prepare(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         mechanisms: ResidentExecutionMechanisms,
-        funding: Option<&WorkspaceMetadataFunding>,
+        funding: Option<&HostMetadataFunding>,
     ) -> Result<Self, Error> {
         if let Some(funding) = funding {
             funding
                 .reserve_metadata(std::mem::size_of::<(
                     Self,
                     Result<Self, Error>,
-                    Option<&WorkspaceMetadataFunding>,
+                    Option<&HostMetadataFunding>,
                     &ModelRuntime<MlxBackend<'_>>,
                 )>())
                 .map_err(Error::WorkspacePlanning)?;
@@ -36,28 +36,7 @@ impl SavedWorkspace {
                     MlxParallelWorkspaceMechanisms,
                 )>()).map_err(Error::WorkspacePlanning)?;
                 let result = (|| {
-                    let selected = session
-                        .payload
-                        .model
-                        .inference_blueprint()
-                        .ok_or_else(unknown)?
-                        .selected();
-                    let manifest = selected.communication_manifest().ok_or_else(unknown)?;
-                    let source = distributed
-                        .original_communication_owner(
-                            manifest,
-                            distributed.native_world(),
-                            funding,
-                        )?
-                        .prepare_model_parallel_source(
-                            selected.execution().partitioned_tensor_group(),
-                            selected.partitioned_session_group().ok_or_else(unknown)?,
-                            selected
-                                .execution()
-                                .partitioned_output_publication()
-                                .ok_or_else(unknown)?,
-                            &session.payload.memory_pool,
-                        )?;
+                    let source = session.original_workspace_parallel_source(funding)?.ok_or_else(unknown)?;
                     if !source.funding().same_account(funding) {
                         return Err(memory(WorkingMemoryError::IdentityMismatch));
                     }
@@ -135,7 +114,7 @@ pub(super) fn quote(
         if capture.is_none() && interventions.is_some(){return Err(memory(WorkingMemoryError::IdentityMismatch));}
         let generation = if let Some((checkpoint, selection)) = capture {
             let session = runtime.session();
-            let loaded = session.partition_capture.get().and_then(|loaded| loaded.as_ref().ok())
+            let loaded = session.partition_capture_source()
                 .ok_or_else(unknown)?;
             let (_, execution, setup) = loaded.source_labels();
             let distributed = session.payload.distributed.as_ref().ok_or_else(unknown)?;

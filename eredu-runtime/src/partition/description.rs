@@ -366,3 +366,25 @@ pub(super) fn owned(
     }
     Ok(())
 }
+
+
+pub(super) fn copy(source:&ArchitectureParameterDescription,context:&WorkspaceContext)->Result<ArchitectureParameterDescription,eredu_nn::Error>{
+    context.charge_metadata(std::mem::size_of::<(&ArchitectureParameterDescription,ExecutionGraph,ExecutionUnitLayout,Vec<usize>,Vec<OwnedParameterGroupSpec>,ParameterGroupOwner,Vec<String>,Vec<(ExecutionGroupId,usize)>,String,Result<ArchitectureParameterDescription,eredu_nn::Error>)>())?;
+    let graph=source.graph.clone_with_metadata(context)?;
+    let mut counts=context.metadata_vec(source.unit_layout.group_count())?;
+    for index in 0..source.unit_layout.group_count(){counts.push(source.unit_layout.group_range(index).expect("validated group").len());}
+    let unit_layout=ExecutionUnitLayout::new_with_metadata(&graph,&counts,context)?;
+    let id=|source:&ExecutionGroupId|ExecutionGroupId::new(context.metadata_string(format_args!("{}",source.as_str()))?).map_err(|cause|context.metadata_source(cause));
+    context.charge_metadata(std::mem::size_of_val(&id))?;
+    let mut groups=context.metadata_vec(source.groups.len())?;
+    for owned in &source.groups{
+        let owner=match owned.owner(){
+            ParameterGroupOwner::StaticRole(role)=>ParameterGroupOwner::StaticRole(context.metadata_string(format_args!("{role}"))?),
+            ParameterGroupOwner::StaticAnyOf(roles)=>{let mut out=context.metadata_vec(roles.len())?;for role in roles{out.push(context.metadata_string(format_args!("{role}"))?);}ParameterGroupOwner::StaticAnyOf(out)},
+            ParameterGroupOwner::StaticUnitConsumers{role,consumers}=>{let mut out=context.metadata_vec(consumers.len())?;for (group,index) in consumers{out.push((id(group)?,*index));}ParameterGroupOwner::StaticUnitConsumers{role:context.metadata_string(format_args!("{role}"))?,consumers:out}},
+            ParameterGroupOwner::ExecutionUnit{group,global_unit}=>ParameterGroupOwner::execution_unit(id(group)?,*global_unit),
+        };
+        groups.push(OwnedParameterGroupSpec::new(owner,owned.group().clone_with_metadata(context)?));
+    }
+    Ok(ArchitectureParameterDescription{graph,unit_layout,groups})
+}

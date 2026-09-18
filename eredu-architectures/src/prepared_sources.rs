@@ -9,7 +9,7 @@ use std::{
 use eredu_checkpoint::gguf_store::open_prepared_gguf_source_with_reader_buffers;
 use eredu_checkpoint::{
     store::{
-        CheckpointSource, CompositeCheckpointSource, RestrictedCheckpointSource,
+        CheckpointSource, RestrictedCheckpointSource,
         RetainedCheckpointSource, StoreError, TensorMetadata,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
@@ -165,8 +165,15 @@ struct PreparedPredictionDiscovery {
 
 mod intervention_source;
 mod activation_source;
+mod component_source;
+pub use component_source::{PreparedComponentPartitionSource,ComponentPartitionSourceError,CaptureDiscoverySourceError};
 
 impl PreparedModelDiscovery {
+    /// Exact content identity only when prior source discovery established it.
+    /// This query performs no source I/O, hashing or allocation.
+    pub fn resolved_artifact_identity(&self) -> Option<eredu_core::artifact::ArtifactIdentity> {
+        self.identity.resolved_identity()
+    }
     /// Retains hook facts projected from the actual constructed executor and
     /// architecture. Backend collectors cannot infer these from parameter shapes.
     pub fn bind_partition_observation_hooks(
@@ -317,15 +324,7 @@ impl PreparedModelDiscovery {
         Option<crate::component_partition::ComponentPartitionLayouts>,
         crate::component_partition::ComponentPartitionError,
     > {
-        let Some(selected) = &self.partition_selection else {
-            return Ok(None);
-        };
-        let parameters = self.partition_parameters.as_ref().ok_or_else(|| {
-            eredu_core::capture::CaptureError::Invalid(
-                "component discovery has not been bound to the constructed partition".into(),
-            )
-        })?;
-        selected.component_partition_layouts(&self.descriptor, parameters, max_ranks)
+        self.component_layouts_worker(max_ranks,None,crate::component_partition::construction::Destination(None))
     }
 
     /// Combines target ownership with the actual prepared prediction modules.
@@ -339,22 +338,18 @@ impl PreparedModelDiscovery {
         Option<crate::component_partition::ComponentPartitionLayouts>,
         crate::component_partition::ComponentPartitionError,
     > {
-        let Some(target) = self.component_partition_layouts(max_ranks)? else {
-            return Ok(None);
-        };
-        let prediction = self.prediction.as_ref().ok_or_else(|| {
-            eredu_core::capture::CaptureError::Unsupported(
-                "prepared sources have no selected prediction catalog".into(),
-            )
-        })?;
-        let placement = prediction.placement.get().ok_or_else(|| {
-            eredu_core::capture::CaptureError::Invalid(
-                "prediction placement has not been bound by materialization".into(),
-            )
-        })?;
-        target
-            .with_prediction(&prediction.descriptor, placement, execution)
-            .map(Some)
+        self.component_layouts_worker(max_ranks,Some(execution),crate::component_partition::construction::Destination(None))
+    }
+
+    /// Borrow the exact selected capture declarations and collector support.
+    /// No artifact identity is resolved, declaration copied or authority issued.
+    pub fn capture_parts(&self) -> (&eredu_core::ObservationCatalog, &eredu_core::ObservationSupportReport) {
+        (&self.descriptor.observations, &self.support)
+    }
+
+    /// Allocation-free collector facts retained from the selected realization.
+    pub fn capture_capabilities(&self) -> &eredu_core::capture::CaptureCapabilities {
+        &self.support.capture
     }
 
     /// Revalidates an immutable admission against this retained selected catalog
@@ -393,39 +388,75 @@ impl PreparedModelDiscovery {
     pub fn capture(
         &self,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        let identity = self.identity.resolve()
+            .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
+        let construction = eredu_core::capture::CaptureSourceConstruction::new(None);
         Ok(eredu_core::capture::CaptureDiscovery {
-            artifact_identity: self
-                .identity
-                .resolve()
-                .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?
-                .to_string(),
-            catalog: self.descriptor.observations.clone(),
-            support: self.support.clone(),
+            artifact_identity: construction.format(format_args!("{identity}"))?,
+            catalog: construction.catalog(&self.descriptor.observations)?,
+            support: construction.support(&self.support)?,
         })
     }
 
     /// Refines partition support using retained architecture placement and exact
-    /// native collector facts. Existing selection/phase/mechanism gates still
-    /// apply; a callback cannot enable a disabled instrumented execution route.
+    /// native collector facts. Existing selection/phase/mechanism gates still apply.
     pub fn capture_with_partition_support(
-        &self,
-        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        &self, layouts: &crate::component_partition::ComponentPartitionLayouts,
         mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        let mut discovery = self.capture()?;
-        let mut support = eredu_runtime::inspection::observation_support_with_partition(
-            &self.descriptor.observations,
-            self.observation_context,
-            |point| match layouts
-                .capture_hook_support(&point.path, self.partition_hooks.unwrap_or_default())
-            {
-                eredu_core::ObservationSupportStatus::Supported => partition(point),
-                status => status,
-            },
-        );
-        support.capture = self.support.capture.clone();
-        discovery.support = support;
-        Ok(discovery)
+        let identity = self.identity.resolve()
+            .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
+        self.capture_partition_worker(identity, layouts,
+            eredu_core::capture::CaptureSourceConstruction::new(None), |point, _| Ok(partition(point)))
+    }
+
+    /// Compiles the exact original artifact identity and partition discovery
+    /// through their shared workers. Fresh file and metadata destinations use
+    /// the supplied source account; no ordinary lazy cache is warmed first.
+    /// The enclosing caller retains the account with every destination and error.
+    /// The collector callback constructs its status and errors under the supplied
+    /// policy and reports only borrowed facts from the actual selected transport.
+    pub fn capture_with_partition_source(
+        &self, layouts: &crate::component_partition::ComponentPartitionLayouts,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+        partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
+            -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError> {
+        construction.controls(std::mem::size_of::<(&Self,
+            &crate::component_partition::ComponentPartitionLayouts,
+            eredu_core::capture::CaptureSourceConstruction<'_>,
+            Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError>)>()
+            .checked_add(std::mem::size_of_val(&partition))
+            .ok_or(eredu_core::capture::CaptureError::Overflow)?)?;
+        let identity = match construction.funding() {
+            Some(funding) => self.identity.resolve_with_metadata(funding)?,
+            None => self.identity.resolve().map_err(|error|
+                eredu_core::capture::CaptureError::Invalid(error.to_string()))?,
+        };
+        self.capture_partition_worker(identity, layouts, construction, partition).map_err(Into::into)
+    }
+    fn capture_partition_worker(
+        &self, identity: eredu_core::artifact::ArtifactIdentity,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+        mut partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
+            -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::{CaptureDiscovery, CaptureError};
+        construction.controls(std::mem::size_of::<(&Self, eredu_core::artifact::ArtifactIdentity,
+            &crate::component_partition::ComponentPartitionLayouts, CaptureDiscovery, Result<CaptureDiscovery, CaptureError>)>()
+            .checked_add(std::mem::size_of_val(&partition)).ok_or(CaptureError::Overflow)?)?;
+        let artifact_identity = construction.format(format_args!("{identity}"))?;
+        let catalog = construction.catalog(&self.descriptor.observations)?;
+        let mut support = eredu_runtime::inspection::observation_support_with_partition_source(
+            &self.descriptor.observations, self.observation_context, construction,
+            |point, construction| match layouts.capture_hook_support_source(&point.path,
+                self.partition_hooks.unwrap_or_default(), construction)? {
+                    eredu_core::ObservationSupportStatus::Supported => partition(point, construction),
+                    status => Ok(status),
+                })?;
+        support.capture = construction.capabilities(&self.support.capture)?;
+        Ok(CaptureDiscovery { artifact_identity, catalog, support })
     }
 
     /// Combines retained semantic points with current native intervention facts.

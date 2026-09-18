@@ -89,7 +89,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             self.ensure_visual_mask(forward, context)?;
         }
         let path = format!("{}.layers.{index}", self.args.text.parameter_root);
-        let points = self.args.text.routed_observation_points(&path, index);
+        let points = self.args.text.routed_observation_points(&path, index, None)?;
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);
@@ -158,7 +158,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
             self.ensure_visual_mask(forward, context)?;
         }
         let path = format!("{}.layers.{index}", self.args.text.parameter_root);
-        let points = self.args.text.routed_observation_points(&path, index);
+        let points = self.args.text.routed_observation_points(&path, index, None)?;
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);

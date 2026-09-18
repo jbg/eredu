@@ -128,7 +128,7 @@ impl PredictionIoPlan {
             size_of::<Option<PreparedArrayClone>>(),
             size_of::<Result<(), IoError>>(),
             size_of::<[i32; 1]>(),
-            size_of::<&WorkspaceMetadataFunding>(),
+            size_of::<&HostMetadataFunding>(),
             size_of::<(
                 &mut PreparedPredictionIo,
                 u32,
@@ -280,7 +280,7 @@ pub(in crate::composition::mlx::replicated_text) struct PreparedPredictionIo {
     plan: PredictionIoPlan,
     spent: bool,
     role: OriginalEmbeddedSpeculativeRole,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl PreparedPredictionIo {
     pub(in crate::composition::mlx::replicated_text) fn token(
@@ -326,3 +326,5 @@ impl PreparedPredictionIo {
         }
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

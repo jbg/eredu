@@ -614,10 +614,10 @@ mod tests {
     use crate::{raw::DerivCache, AlphabetInfo};
     #[test]
     fn owning_expression_machine_keeps_successor_memo_and_terminal_source_custody() {
-        let mut source = ExprSet::new(256);
-        let root = source.mk_byte_literal(&[b'x'; 64]);
-        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[root]);
-        source.reserve(48);
+        let mut source = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+        let root = source.mk_byte_literal(&[b'x'; 64]).unwrap();
+        let (_, mut source, _) = AlphabetInfo::from_exprset(source, &[root]).unwrap();
+        source.reserve(48).unwrap();
         let mut ordinary = source.clone();
         let mut cache = DerivCache::new();
         let prepared = source.prepared_source_plan().unwrap().compile().unwrap();
@@ -634,7 +634,7 @@ mod tests {
         let mut successes = 0usize;
         let mut refused = false;
         for _ in 0..64 {
-            let expected = cache.derivative(&mut ordinary, current, b'x');
+            let expected = cache.derivative(&mut ordinary, current, b'x').unwrap();
             match machine.derivative(current, b'x') {
                 Ok(next) => {
                     assert_eq!(next, expected);
@@ -676,7 +676,7 @@ mod tests {
     }
     #[test]
     fn paid_successor_workspaces_preserve_memo_and_retain_exact_growth_refusal() {
-        use crate::raw::PreparedHashConsFunding;
+        use crate::raw::ParserAllocationFunding;
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
@@ -700,13 +700,13 @@ mod tests {
             }
         }
         for refuse in [false, true] {
-            let mut original = ExprSet::new(256);
-            let root = original.mk_byte_literal(&[b'x'; 64]);
-            let (_, original, _) = AlphabetInfo::from_exprset(original, &[root]);
+            let mut original = ExprSet::new(256, crate::ParserAllocationFunding::unenforced()).unwrap();
+            let root = original.mk_byte_literal(&[b'x'; 64]).unwrap();
+            let (_, original, _) = AlphabetInfo::from_exprset(original, &[root]).unwrap();
             let mut ordinary = original.clone();
             let mut cache = DerivCache::new();
             let mut prepared = original.prepared_source_plan().unwrap().compile().unwrap();
-            let initial_nodes = prepared.source().prepared_extents().unwrap().1;
+            let initial_nodes = prepared.source().storage_extents().1;
             let retired = Arc::new(AtomicBool::new(false));
             let account = Arc::new(Account {
                 reject: AtomicBool::new(false),
@@ -714,7 +714,7 @@ mod tests {
                 bytes: AtomicUsize::new(0),
             });
             let owner = account.clone();
-            let funding = PreparedHashConsFunding::prepare(move |bytes| {
+            let funding = ParserAllocationFunding::prepare(move |bytes| {
                 if owner.reject.load(Ordering::SeqCst) {
                     return Err(Refusal);
                 }
@@ -735,7 +735,7 @@ mod tests {
                 if refuse && machine.source().len() > initial_nodes {
                     account.reject.store(true, Ordering::SeqCst);
                 }
-                let expected = cache.derivative(&mut ordinary, current, b'x');
+                let expected = cache.derivative(&mut ordinary, current, b'x').unwrap();
                 match machine.derivative(current, b'x') {
                     Ok(next) => {
                         assert_eq!(next, expected);
@@ -791,7 +791,7 @@ mod tests {
                 let copy_account = Arc::new(Account {
                     reject: AtomicBool::new(false), retired: copy_retired.clone(), bytes: AtomicUsize::new(0),
                 });
-                let copy_backing = PreparedHashConsFunding::prepare(move |bytes| {
+                let copy_backing = ParserAllocationFunding::prepare(move |bytes| {
                     copy_account.bytes.fetch_add(bytes, Ordering::SeqCst);
                     Ok::<_, Refusal>(())
                 }).unwrap();

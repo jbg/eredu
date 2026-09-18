@@ -128,13 +128,25 @@ impl ParserNumber {
         }
     }
 
-    fn invalid_type(self, exp: &dyn Expected) -> Error {
+    fn invalid_type(
+        self,
+        exp: &dyn Expected,
+        allocation: &dyn crate::allocation::Allocation,
+    ) -> Error {
         match self {
-            ParserNumber::F64(x) => de::Error::invalid_type(Unexpected::Float(x), exp),
-            ParserNumber::U64(x) => de::Error::invalid_type(Unexpected::Unsigned(x), exp),
-            ParserNumber::I64(x) => de::Error::invalid_type(Unexpected::Signed(x), exp),
+            ParserNumber::F64(x) => {
+                Error::invalid_type_with_allocations(Unexpected::Float(x), exp, allocation)
+            }
+            ParserNumber::U64(x) => {
+                Error::invalid_type_with_allocations(Unexpected::Unsigned(x), exp, allocation)
+            }
+            ParserNumber::I64(x) => {
+                Error::invalid_type_with_allocations(Unexpected::Signed(x), exp, allocation)
+            }
             #[cfg(feature = "arbitrary_precision")]
-            ParserNumber::String(_) => de::Error::invalid_type(Unexpected::Other("number"), exp),
+            ParserNumber::String(_) => {
+                Error::invalid_type_with_allocations(Unexpected::Other("number"), exp, allocation)
+            }
         }
     }
 }
@@ -267,49 +279,52 @@ impl<'de, R: Read<'de>> Deserializer<R> {
 
     #[cold]
     fn peek_invalid_type(&mut self, exp: &dyn Expected) -> Error {
+        let allocation = self.read.numeric_allocation();
         let err = match self.peek_or_null().unwrap_or(b'\x00') {
             b'n' => {
                 self.eat_char();
                 if let Err(err) = self.parse_ident(b"ull") {
                     return err;
                 }
-                de::Error::invalid_type(Unexpected::Unit, exp)
+                Error::invalid_type_with_allocations(Unexpected::Unit, exp, allocation)
             }
             b't' => {
                 self.eat_char();
                 if let Err(err) = self.parse_ident(b"rue") {
                     return err;
                 }
-                de::Error::invalid_type(Unexpected::Bool(true), exp)
+                Error::invalid_type_with_allocations(Unexpected::Bool(true), exp, allocation)
             }
             b'f' => {
                 self.eat_char();
                 if let Err(err) = self.parse_ident(b"alse") {
                     return err;
                 }
-                de::Error::invalid_type(Unexpected::Bool(false), exp)
+                Error::invalid_type_with_allocations(Unexpected::Bool(false), exp, allocation)
             }
             b'-' => {
                 self.eat_char();
                 match self.parse_any_number(false) {
-                    Ok(n) => n.invalid_type(exp),
+                    Ok(n) => n.invalid_type(exp, allocation),
                     Err(err) => return err,
                 }
             }
             b'0'..=b'9' => match self.parse_any_number(true) {
-                Ok(n) => n.invalid_type(exp),
+                Ok(n) => n.invalid_type(exp, allocation),
                 Err(err) => return err,
             },
             b'"' => {
                 self.eat_char();
                 self.scratch.clear();
                 match self.read.parse_str(&mut self.scratch) {
-                    Ok(s) => de::Error::invalid_type(Unexpected::Str(&s), exp),
+                    Ok(s) => {
+                        Error::invalid_type_with_allocations(Unexpected::Str(&s), exp, allocation)
+                    }
                     Err(err) => return err,
                 }
             }
-            b'[' => de::Error::invalid_type(Unexpected::Seq, exp),
-            b'{' => de::Error::invalid_type(Unexpected::Map, exp),
+            b'[' => Error::invalid_type_with_allocations(Unexpected::Seq, exp, allocation),
+            b'{' => Error::invalid_type_with_allocations(Unexpected::Map, exp, allocation),
             _ => self.peek_error(ErrorCode::ExpectedSomeValue),
         };
 
@@ -913,6 +928,15 @@ impl<'de, R: Read<'de>> Deserializer<R> {
             _ => Err(self.peek_error(ErrorCode::InvalidNumber)),
         };
 
+        // Storage refusal has precedence over any unconsumed suffix; the
+        // original syntax-error replacement policy below is otherwise unchanged.
+        if value
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.allocation_error().is_some())
+        {
+            return value;
+        }
         let value = match tri!(self.peek()) {
             Some(_) => Err(self.peek_error(ErrorCode::InvalidNumber)),
             None => value,
@@ -935,10 +959,21 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
+    fn push_numeric(&mut self, buf: &mut String, value: char) -> Result<()> {
+        let mut utf8 = [0; 4];
+        crate::allocation::Allocator::new(self.read.numeric_allocation())
+            .append(buf, value.encode_utf8(&mut utf8))
+            .map_err(|error| self.error(ErrorCode::Allocation(error)))
+    }
+
+    #[cfg(feature = "arbitrary_precision")]
     fn parse_any_number(&mut self, positive: bool) -> Result<ParserNumber> {
-        let mut buf = String::with_capacity(16);
+        let mut buf = String::new();
+        crate::allocation::Allocator::new(self.read.numeric_allocation())
+            .grow_string(&mut buf, 16)
+            .map_err(|error| self.error(ErrorCode::Allocation(error)))?;
         if !positive {
-            buf.push('-');
+            self.push_numeric(&mut buf, '-')?;
         }
         tri!(self.scan_integer(&mut buf));
         if positive {
@@ -957,7 +992,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     fn scan_or_eof(&mut self, buf: &mut String) -> Result<u8> {
         match tri!(self.next_char()) {
             Some(b) => {
-                buf.push(b as char);
+                self.push_numeric(buf, b as char)?;
                 Ok(b)
             }
             None => Err(self.error(ErrorCode::EofWhileParsingValue)),
@@ -978,7 +1013,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
                 match tri!(self.peek_or_null()) {
                     c @ b'0'..=b'9' => {
                         self.eat_char();
-                        buf.push(c as char);
+                        self.push_numeric(buf, c as char)?;
                     }
                     _ => {
                         return self.scan_number(buf);
@@ -1001,12 +1036,12 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     #[cfg(feature = "arbitrary_precision")]
     fn scan_decimal(&mut self, buf: &mut String) -> Result<()> {
         self.eat_char();
-        buf.push('.');
+        self.push_numeric(buf, '.')?;
 
         let mut at_least_one_digit = false;
         while let c @ b'0'..=b'9' = tri!(self.peek_or_null()) {
             self.eat_char();
-            buf.push(c as char);
+            self.push_numeric(buf, c as char)?;
             at_least_one_digit = true;
         }
 
@@ -1026,19 +1061,19 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     #[cfg(feature = "arbitrary_precision")]
     fn scan_exponent(&mut self, buf: &mut String) -> Result<()> {
         self.eat_char();
-        buf.push('e');
+        self.push_numeric(buf, 'e')?;
 
         match tri!(self.peek_or_null()) {
             b'+' => {
                 self.eat_char();
-                buf.push('+');
+                self.push_numeric(buf, '+')?;
             }
             b'-' => {
                 self.eat_char();
-                buf.push('-');
+                self.push_numeric(buf, '-')?;
             }
             _ => {
-                buf.push('+');
+                self.push_numeric(buf, '+')?;
             }
         }
 
@@ -1052,7 +1087,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
 
         while let c @ b'0'..=b'9' = tri!(self.peek_or_null()) {
             self.eat_char();
-            buf.push(c as char);
+            self.push_numeric(buf, c as char)?;
         }
 
         Ok(())
@@ -1295,12 +1330,56 @@ impl<'de, R: Read<'de>> Deserializer<R> {
 
 impl FromStr for Number {
     type Err = Error;
-
-    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
-        Deserializer::from_str(s)
-            .parse_any_signed_number()
-            .map(Into::into)
+    fn from_str(source: &str) -> result::Result<Self, Self::Err> {
+        match number_from_str_with_allocations(source, &crate::allocation::Unenforced) {
+            Ok(value) => Ok(value),
+            Err(crate::NumberSourceError::Syntax(error)) => Err(error),
+            Err(crate::NumberSourceError::Allocation(error)) => {
+                panic!("ordinary JSON number allocation: {error}")
+            }
+        }
     }
+}
+/// The actual signed-number worker shared by ordinary and admitted construction.
+pub(crate) fn number_from_str_with_allocations(
+    source: &str,
+    allocation: &dyn crate::allocation::Allocation,
+) -> result::Result<Number, crate::NumberSourceError> {
+    use crate::{
+        allocation::{AllocationError, Allocator},
+        NumberSourceError,
+    };
+    let allocator = Allocator::new(allocation);
+    // parse_any_signed_number can retain an initial syntax error while creating
+    // the trailing-character replacement. Both concrete envelopes are prepaid.
+    let controls = bounded_number_control_bytes()
+        .and_then(|n| n.checked_add(core::mem::size_of::<NumberSourceError>()))
+        .and_then(|n| n.checked_add(Error::bounded_number_storage_bytes().checked_mul(2)?))
+        .and_then(|n| n.checked_add(bounded_number_temporary_bytes(source.len())?))
+        .ok_or(AllocationError::SizeOverflow)?;
+    allocator.reserve(controls)?;
+    let reader = SliceRead::new(source.as_bytes());
+    #[cfg(feature = "arbitrary_precision")]
+    let reader = reader.with_numeric_allocations(allocation);
+    let mut parser = Deserializer::new(reader);
+    #[cfg(all(feature = "float_roundtrip", not(feature = "arbitrary_precision")))]
+    {
+        parser
+            .scratch
+            .try_reserve_exact(source.len())
+            .map_err(|_| AllocationError::HostAllocation)?;
+        if parser.scratch.capacity() != source.len() {
+            return Err(AllocationError::HostAllocation.into());
+        }
+    }
+    let parsed = parser.parse_any_signed_number().map_err(|error| {
+        if let Some(failure) = error.allocation_error() {
+            NumberSourceError::Allocation(failure)
+        } else {
+            NumberSourceError::Syntax(error)
+        }
+    })?;
+    Number::from_parser_with_allocations(parsed, allocation).map_err(Into::into)
 }
 
 #[cfg(not(feature = "float_roundtrip"))]
@@ -2425,6 +2504,56 @@ where
         self.offset
     }
 
+    // Both ordinary typed streams and bounded event sinks use this worker.
+    pub(crate) fn next_seed<S: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Option<Result<S::Value>> {
+        if R::should_early_return_if_failed && self.failed {
+            return None;
+        }
+
+        // skip whitespaces, if any
+        // this helps with trailing whitespaces, since whitespaces between
+        // values are handled for us.
+        match self.de.parse_whitespace() {
+            Ok(None) => {
+                self.offset = self.de.read.byte_offset();
+                None
+            }
+            Ok(Some(b)) => {
+                // If the value does not have a clear way to show the end of the value
+                // (like numbers, null, true etc.) we have to look for whitespace or
+                // the beginning of a self-delineated value.
+                let self_delineated_value = match b {
+                    b'[' | b'"' | b'{' => true,
+                    _ => false,
+                };
+                self.offset = self.de.read.byte_offset();
+                let result = seed.deserialize(&mut self.de);
+
+                Some(match result {
+                    Ok(value) => {
+                        self.offset = self.de.read.byte_offset();
+                        if self_delineated_value {
+                            Ok(value)
+                        } else {
+                            self.peek_end_of_value().map(|()| value)
+                        }
+                    }
+                    Err(e) => {
+                        self.de.read.set_failed(&mut self.failed);
+                        Err(e)
+                    }
+                })
+            }
+            Err(e) => {
+                self.de.read.set_failed(&mut self.failed);
+                Some(Err(e))
+            }
+        }
+    }
+
     fn peek_end_of_value(&mut self) -> Result<()> {
         match tri!(self.de.peek()) {
             Some(b' ' | b'\n' | b'\t' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':')
@@ -2449,49 +2578,7 @@ where
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Result<T>> {
-        if R::should_early_return_if_failed && self.failed {
-            return None;
-        }
-
-        // skip whitespaces, if any
-        // this helps with trailing whitespaces, since whitespaces between
-        // values are handled for us.
-        match self.de.parse_whitespace() {
-            Ok(None) => {
-                self.offset = self.de.read.byte_offset();
-                None
-            }
-            Ok(Some(b)) => {
-                // If the value does not have a clear way to show the end of the value
-                // (like numbers, null, true etc.) we have to look for whitespace or
-                // the beginning of a self-delineated value.
-                let self_delineated_value = match b {
-                    b'[' | b'"' | b'{' => true,
-                    _ => false,
-                };
-                self.offset = self.de.read.byte_offset();
-                let result = de::Deserialize::deserialize(&mut self.de);
-
-                Some(match result {
-                    Ok(value) => {
-                        self.offset = self.de.read.byte_offset();
-                        if self_delineated_value {
-                            Ok(value)
-                        } else {
-                            self.peek_end_of_value().map(|()| value)
-                        }
-                    }
-                    Err(e) => {
-                        self.de.read.set_failed(&mut self.failed);
-                        Err(e)
-                    }
-                })
-            }
-            Err(e) => {
-                self.de.read.set_failed(&mut self.failed);
-                Some(Err(e))
-            }
-        }
+        self.next_seed(PhantomData::<T>)
     }
 }
 
@@ -2770,11 +2857,11 @@ pub(crate) fn from_bounded_number_slice(input: &[u8]) -> Result<crate::Number> {
     Ok(value)
 }
 pub(crate) fn bounded_number_temporary_bytes(input: usize) -> Option<usize> {
-    #[cfg(feature = "float_roundtrip")]
+    #[cfg(all(feature = "float_roundtrip", not(feature = "arbitrary_precision")))]
     {
         input.checked_add(lexical::bounded::temporary_bytes()?)
     }
-    #[cfg(not(feature = "float_roundtrip"))]
+    #[cfg(not(all(feature = "float_roundtrip", not(feature = "arbitrary_precision"))))]
     {
         let _ = input;
         Some(0)
@@ -2783,10 +2870,17 @@ pub(crate) fn bounded_number_temporary_bytes(input: usize) -> Option<usize> {
 
 // The same ordinary byte-slice parser with its single reusable string/number
 // scratch supplied before parser entry. No borrowed key/value escapes a callback.
-pub(crate) fn bounded_event_deserializer(input: &[u8], capacity: usize)
-    -> Deserializer<SliceRead<'_>>
-{
-    let mut parser = Deserializer::from_slice(input);
+pub(crate) fn bounded_event_deserializer<'a>(
+    input: &'a [u8],
+    capacity: usize,
+    allocation: &'a dyn crate::allocation::Allocation,
+) -> Deserializer<SliceRead<'a>> {
+    let reader = SliceRead::new(input);
+    #[cfg(feature = "arbitrary_precision")]
+    let reader = reader.with_numeric_allocations(allocation);
+    #[cfg(not(feature = "arbitrary_precision"))]
+    let _ = allocation;
+    let mut parser = Deserializer::new(reader);
     parser.scratch = Vec::with_capacity(capacity);
     parser
 }
@@ -2797,7 +2891,27 @@ pub(crate) fn bounded_event_access_control_bytes(depth: usize) -> Option<usize> 
         size_of::<SeqAccess<'_, SliceRead<'_>>>(),
         size_of::<MapAccess<'_, SliceRead<'_>>>(),
         size_of::<MapKey<'_, SliceRead<'_>>>(),
-        size_of::<(Option<u8>, bool, Result<()>, Result<Option<()>>)>()
-    ].into_iter().try_fold(size_of::<[usize;4]>(), usize::checked_add)?;
+        size_of::<(Option<u8>, bool, Result<()>, Result<Option<()>>)>(),
+    ]
+    .into_iter()
+    .try_fold(size_of::<[usize; 4]>(), usize::checked_add)?;
     frames.checked_mul(depth)
+}
+
+// Typed floating parsing shares parse_integer/decimal/exponent with ordinary
+// f64 deserialization. Arbitrary-precision Number transport is never entered.
+pub(crate) fn from_bounded_f64_slice(input: &[u8]) -> core::result::Result<f64, crate::bounded_number::F64Error> {
+    use crate::bounded_number::F64Error;
+    let mut deserializer = Deserializer::from_slice(input);
+    #[cfg(feature = "float_roundtrip")]
+    deserializer.scratch.try_reserve_exact(input.len()).map_err(F64Error::Reserve)?;
+    let value = <f64 as de::Deserialize>::deserialize(&mut deserializer).map_err(F64Error::Source)?;
+    deserializer.end().map_err(F64Error::Source)?;
+    Ok(value)
+}
+pub(crate) fn bounded_f64_temporary_bytes(input: usize) -> Option<usize> {
+    #[cfg(feature = "float_roundtrip")]
+    { input.checked_add(lexical::bounded::temporary_bytes()?) }
+    #[cfg(not(feature = "float_roundtrip"))]
+    { let _ = input; Some(0) }
 }

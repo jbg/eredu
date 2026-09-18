@@ -43,6 +43,11 @@ pub struct OriginalPreparationScopeCustody {
     _role: PreparationScopeRole,
     _raw: RawSpanHostOwner,
 }
+impl OriginalPreparationScopeCustody {
+    pub(super) fn sampling(controls: &OriginalTextControlGuard) -> Self {
+        Self { _role: PreparationScopeRole::Sampling, _raw: controls.custody.raw().clone() }
+    }
+}
 
 /// One non-refillable pair extracted from the accepted original span. A failed
 /// native begin retains its same claimed stage and capsule outside this bank.
@@ -55,12 +60,19 @@ pub struct OriginalTextPreparationScopes {
     controls: OriginalTextControlGuard,
 }
 impl PreparedTextControlWorkspace {
+    /// Price the optional single reseed role of a pending sampling extension.
+    /// No prompt construction role is issued for this origin.
+    pub fn with_sampling_reseed_scope(self, bytes: Option<u64>) -> Result<Self, WorkingMemoryError> {
+        if self.binding.sampling_extension.is_none() { return Err(WorkingMemoryError::IdentityMismatch); }
+        self.with_preparation_scopes(TextPreparationScopeFacts::new(Some(0), bytes))
+    }
     /// Seal this fixed pair into original Q before reservation. The existing
     /// identity and exact plan/source association remain part of the binding.
     pub fn with_preparation_scopes(
         mut self,
         facts: TextPreparationScopeFacts,
     ) -> Result<Self, WorkingMemoryError> {
+        cold_controls::<(Self, TextPreparationScopeFacts, Result<Self, WorkingMemoryError>)>(self.plan.metadata_funding().as_ref())?;
         if self.binding.preparation_scopes.is_some() {
             return Err(WorkingMemoryError::PreparationAlreadyStarted);
         }
@@ -155,10 +167,7 @@ impl OriginalTextPreparationScopes {
         if self.sampling_claimed {
             return Err(WorkingMemoryError::PreparationAlreadyStarted);
         }
-        let custody = OriginalPreparationScopeCustody {
-            _role: PreparationScopeRole::Sampling,
-            _raw: self.controls.custody.raw().clone(),
-        };
+        let custody = OriginalPreparationScopeCustody::sampling(&self.controls);
         let stage = preparation.claim_sampling(config)?;
         self.sampling_claimed = true;
         Ok((stage, custody))

@@ -159,7 +159,7 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
                 assert_eq!(value.0.as_ptr() as usize, r.state_pointer);
                 visits += 1;
             })
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         assert_eq!(visits, 1);
         r.events.push(Log::Opening(start));
         Ok(None)

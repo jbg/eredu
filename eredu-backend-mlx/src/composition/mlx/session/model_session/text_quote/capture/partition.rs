@@ -67,7 +67,7 @@ impl TextExecutionQuote {
             // Loaded public capture discovery established these exact common
             // labels. This entry only borrows it: no lazy source/declaration work
             // occurs under the active original native submission.
-            let loaded = session.partition_capture.get().and_then(|value| value.as_ref().ok())
+            let loaded = session.partition_capture_source()
                 .ok_or(Error::InvalidOperation("original parallel capture lacks loaded discovery source"))?;
             let (artifact, execution, setup) = loaded.source_labels();
             if setup != base.session_identity() || setup.participant_count() != transport.participant_count() {

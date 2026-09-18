@@ -32,8 +32,12 @@ use crate::{
         regex::RegexInfo,
     },
     nfa::thompson::{pikevm, NFA},
-    util::{prefilter::Prefilter, primitives::NonMaxUsize},
-    HalfMatch, Input, Match, MatchKind, PatternID, PatternSet,
+    util::{
+        allocation::{Allocation},
+        prefilter::Prefilter,
+        primitives::NonMaxUsize,
+    },
+    HalfMatch, Input, Match, MatchError, MatchKind, PatternID, PatternSet,
 };
 
 #[cfg(feature = "dfa-build")]
@@ -87,33 +91,47 @@ impl PikeVMEngine {
         Ok(PikeVMEngine(engine))
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn is_match(
+    pub(crate) fn is_match_with_allocations(
         &self,
         cache: &mut PikeVMCache,
         input: &Input<'_>,
-    ) -> bool {
-        self.0.is_match(cache.get(&self.0), input.clone())
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
+        self.0.is_match_with_allocations(
+            cache.get_with_allocations(&self.0, funding)?,
+            input.clone(),
+            funding,
+        )
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn search_slots(
+    pub(crate) fn search_slots_with_allocations(
         &self,
         cache: &mut PikeVMCache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
-        self.0.search_slots(cache.get(&self.0), input, slots)
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        self.0.search_slots_with_allocations(
+            cache.get_with_allocations(&self.0, funding)?,
+            input,
+            slots,
+            funding,
+        )
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn which_overlapping_matches(
+    pub(crate) fn which_overlapping_matches_with_allocations(
         &self,
         cache: &mut PikeVMCache,
         input: &Input<'_>,
         patset: &mut PatternSet,
-    ) {
-        self.0.which_overlapping_matches(cache.get(&self.0), input, patset)
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        self.0.which_overlapping_matches_with_allocations(
+            cache.get_with_allocations(&self.0, funding)?,
+            input,
+            patset,
+            funding,
+        )
     }
 }
 
@@ -125,16 +143,29 @@ impl PikeVMCache {
         PikeVMCache(None)
     }
 
-    pub(crate) fn reset(&mut self, builder: &PikeVM) {
-        self.get(&builder.get().0).reset(&builder.get().0);
+    pub(crate) fn reset_with_allocations(
+        &mut self,
+        builder: &PikeVM,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
+        self.get_with_allocations(&builder.get().0, funding)?
+            .reset_with_allocations(&builder.get().0, funding)?;
+        Ok(())
     }
 
     pub(crate) fn memory_usage(&self) -> usize {
         self.0.as_ref().map_or(0, |c| c.memory_usage())
     }
 
-    fn get(&mut self, vm: &pikevm::PikeVM) -> &mut pikevm::Cache {
-        self.0.get_or_insert_with(|| vm.create_cache())
+    fn get_with_allocations(
+        &mut self,
+        vm: &pikevm::PikeVM,
+        funding: &dyn Allocation,
+    ) -> Result<&mut pikevm::Cache, MatchError> {
+        if self.0.is_none() {
+            self.0 = Some(pikevm::Cache::new_with_allocations(vm, funding)?);
+        }
+        Ok(self.0.as_mut().unwrap())
     }
 }
 
@@ -220,18 +251,22 @@ impl BoundedBacktrackerEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn is_match(
+    pub(crate) fn is_match_with_allocations(
         &self,
         cache: &mut BoundedBacktrackerCache,
         input: &Input<'_>,
-    ) -> bool {
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
         #[cfg(feature = "nfa-backtrack")]
         {
             // OK because we only permit access to this engine when we know
             // the haystack is short enough for the backtracker to run without
             // reporting an error.
-            self.0.try_is_match(cache.get(&self.0), input.clone()).unwrap()
+            self.0.try_is_match_with_allocations(
+                cache.get_with_allocations(&self.0, funding)?,
+                input.clone(),
+                funding,
+            )
         }
         #[cfg(not(feature = "nfa-backtrack"))]
         {
@@ -241,19 +276,24 @@ impl BoundedBacktrackerEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn search_slots(
+    pub(crate) fn search_slots_with_allocations(
         &self,
         cache: &mut BoundedBacktrackerCache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
         #[cfg(feature = "nfa-backtrack")]
         {
             // OK because we only permit access to this engine when we know
             // the haystack is short enough for the backtracker to run without
             // reporting an error.
-            self.0.try_search_slots(cache.get(&self.0), input, slots).unwrap()
+            self.0.try_search_slots_with_allocations(
+                cache.get_with_allocations(&self.0, funding)?,
+                input,
+                slots,
+                funding,
+            )
         }
         #[cfg(not(feature = "nfa-backtrack"))]
         {
@@ -296,11 +336,17 @@ impl BoundedBacktrackerCache {
         }
     }
 
-    pub(crate) fn reset(&mut self, builder: &BoundedBacktracker) {
+    pub(crate) fn reset_with_allocations(
+        &mut self,
+        builder: &BoundedBacktracker,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         #[cfg(feature = "nfa-backtrack")]
         if let Some(ref e) = builder.0 {
-            self.get(&e.0).reset(&e.0);
+            self.get_with_allocations(&e.0, funding)?.reset(&e.0);
         }
+
+        Ok(())
     }
 
     pub(crate) fn memory_usage(&self) -> usize {
@@ -315,11 +361,17 @@ impl BoundedBacktrackerCache {
     }
 
     #[cfg(feature = "nfa-backtrack")]
-    fn get(
+    #[cfg(feature = "nfa-backtrack")]
+    fn get_with_allocations(
         &mut self,
         bb: &backtrack::BoundedBacktracker,
-    ) -> &mut backtrack::Cache {
-        self.0.get_or_insert_with(|| bb.create_cache())
+        funding: &dyn Allocation,
+    ) -> Result<&mut backtrack::Cache, MatchError> {
+        if self.0.is_none() {
+            self.0 =
+                Some(backtrack::Cache::new_with_allocations(bb, funding)?);
+        }
+        Ok(self.0.as_mut().unwrap())
     }
 }
 
@@ -327,12 +379,21 @@ impl BoundedBacktrackerCache {
 pub(crate) struct OnePass(Option<OnePassEngine>);
 
 impl OnePass {
-    pub(crate) fn new(info: &RegexInfo, nfa: &NFA) -> OnePass {
-        OnePass(OnePassEngine::new(info, nfa))
+    pub(crate) fn new_with_allocations(
+        info: &RegexInfo,
+        nfa: &NFA,
+        funding: &dyn Allocation,
+    ) -> Result<OnePass, BuildError> {
+        Ok(OnePass(OnePassEngine::new_with_allocations(
+            info, nfa, funding,
+        )?))
     }
 
-    pub(crate) fn create_cache(&self) -> OnePassCache {
-        OnePassCache::new(self)
+    pub(crate) fn create_cache_with_allocations(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<OnePassCache, MatchError> {
+        OnePassCache::new_with_allocations(self, funding)
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -358,11 +419,15 @@ pub(crate) struct OnePassEngine(
 );
 
 impl OnePassEngine {
-    pub(crate) fn new(info: &RegexInfo, nfa: &NFA) -> Option<OnePassEngine> {
+    pub(crate) fn new_with_allocations(
+        info: &RegexInfo,
+        nfa: &NFA,
+        funding: &dyn Allocation,
+    ) -> Result<Option<OnePassEngine>, BuildError> {
         #[cfg(feature = "dfa-onepass")]
         {
             if !info.config().get_onepass() {
-                return None;
+                return Ok(None);
             }
             // In order to even attempt building a one-pass DFA, we require
             // that we either have at least one explicit capturing group or
@@ -377,7 +442,7 @@ impl OnePassEngine {
                 && !info.props_union().look_set().contains_word_unicode()
             {
                 debug!("not building OnePass because it isn't worth it");
-                return None;
+                return Ok(None);
             }
             let onepass_config = onepass::Config::new()
                 .match_kind(info.config().get_match_kind())
@@ -389,37 +454,43 @@ impl OnePassEngine {
                 .size_limit(info.config().get_onepass_size_limit());
             let result = onepass::Builder::new()
                 .configure(onepass_config)
-                .build_from_nfa(nfa.clone());
+                .build_from_nfa_with_allocations(nfa.clone(), funding);
             let engine = match result {
                 Ok(engine) => engine,
                 Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
                     debug!("OnePass failed to build: {_err}");
-                    return None;
+                    return Ok(None);
                 }
             };
             debug!("OnePass built, {} bytes", engine.memory_usage());
-            Some(OnePassEngine(engine))
+            Ok(Some(OnePassEngine(engine)))
         }
         #[cfg(not(feature = "dfa-onepass"))]
         {
-            None
+            Ok(None)
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn search_slots(
+    pub(crate) fn search_slots_with_allocations(
         &self,
         cache: &mut OnePassCache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<PatternID> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
         #[cfg(feature = "dfa-onepass")]
         {
             // OK because we only permit getting a OnePassEngine when we know
             // the search is anchored and thus an error cannot occur.
-            self.0
-                .try_search_slots(cache.0.as_mut().unwrap(), input, slots)
-                .unwrap()
+            self.0.try_search_slots_with_allocations(
+                cache.0.as_mut().unwrap(),
+                input,
+                slots,
+                funding,
+            )
         }
         #[cfg(not(feature = "dfa-onepass"))]
         {
@@ -475,22 +546,41 @@ impl OnePassCache {
         }
     }
 
-    pub(crate) fn new(builder: &OnePass) -> OnePassCache {
+    pub(crate) fn new_with_allocations(
+        builder: &OnePass,
+        funding: &dyn Allocation,
+    ) -> Result<OnePassCache, MatchError> {
         #[cfg(feature = "dfa-onepass")]
         {
-            OnePassCache(builder.0.as_ref().map(|e| e.0.create_cache()))
+            Ok(OnePassCache(
+                builder
+                    .0
+                    .as_ref()
+                    .map(|e| {
+                        onepass::Cache::new_with_allocations(&e.0, funding)
+                    })
+                    .transpose()?,
+            ))
         }
         #[cfg(not(feature = "dfa-onepass"))]
         {
-            OnePassCache(())
+            Ok(OnePassCache(()))
         }
     }
 
-    pub(crate) fn reset(&mut self, builder: &OnePass) {
+    pub(crate) fn reset_with_allocations(
+        &mut self,
+        builder: &OnePass,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         #[cfg(feature = "dfa-onepass")]
         if let Some(ref e) = builder.0 {
-            self.0.as_mut().unwrap().reset(&e.0);
+            self.0
+                .as_mut()
+                .unwrap()
+                .reset_with_allocations(&e.0, funding)?;
         }
+        Ok(())
     }
 
     pub(crate) fn memory_usage(&self) -> usize {
@@ -522,8 +612,11 @@ impl Hybrid {
         Hybrid(HybridEngine::new(info, pre, nfa, nfarev))
     }
 
-    pub(crate) fn create_cache(&self) -> HybridCache {
-        HybridCache::new(self)
+    pub(crate) fn create_cache_with_allocations(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<HybridCache, MatchError> {
+        HybridCache::new_with_allocations(self, funding)
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -622,16 +715,18 @@ impl HybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search(
+    pub(crate) fn try_search_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<Match>, RetryFailError> {
         #[cfg(feature = "hybrid")]
         {
             let cache = cache.0.as_mut().unwrap();
-            self.0.try_search(cache, input).map_err(|e| e.into())
+            self.0
+                .try_search_with_allocations(cache, input, funding)
+                .map_err(|e| e.into())
         }
         #[cfg(not(feature = "hybrid"))]
         {
@@ -641,17 +736,18 @@ impl HybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search_half_fwd(
+    pub(crate) fn try_search_half_fwd_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryFailError> {
         #[cfg(feature = "hybrid")]
         {
             let fwd = self.0.forward();
             let mut fwdcache = cache.0.as_mut().unwrap().as_parts_mut().0;
-            fwd.try_search_fwd(&mut fwdcache, input).map_err(|e| e.into())
+            fwd.try_search_fwd_with_allocations(&mut fwdcache, input, funding)
+                .map_err(|e| e.into())
         }
         #[cfg(not(feature = "hybrid"))]
         {
@@ -661,18 +757,18 @@ impl HybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search_half_fwd_stopat(
+    pub(crate) fn try_search_half_fwd_stopat_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Result<HalfMatch, usize>, RetryFailError> {
         #[cfg(feature = "hybrid")]
         {
             let dfa = self.0.forward();
             let mut cache = cache.0.as_mut().unwrap().as_parts_mut().0;
-            crate::meta::stopat::hybrid_try_search_half_fwd(
-                dfa, &mut cache, input,
+            crate::meta::stopat::hybrid_try_search_half_fwd_with_allocations(
+                dfa, &mut cache, input, funding,
             )
         }
         #[cfg(not(feature = "hybrid"))]
@@ -683,17 +779,18 @@ impl HybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search_half_rev(
+    pub(crate) fn try_search_half_rev_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryFailError> {
         #[cfg(feature = "hybrid")]
         {
             let rev = self.0.reverse();
             let mut revcache = cache.0.as_mut().unwrap().as_parts_mut().1;
-            rev.try_search_rev(&mut revcache, input).map_err(|e| e.into())
+            rev.try_search_rev_with_allocations(&mut revcache, input, funding)
+                .map_err(|e| e.into())
         }
         #[cfg(not(feature = "hybrid"))]
         {
@@ -703,19 +800,19 @@ impl HybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search_half_rev_limited(
+    pub(crate) fn try_search_half_rev_limited_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
         min_start: usize,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryError> {
         #[cfg(feature = "hybrid")]
         {
             let dfa = self.0.reverse();
             let mut cache = cache.0.as_mut().unwrap().as_parts_mut().1;
-            crate::meta::limited::hybrid_try_search_half_rev(
-                dfa, &mut cache, input, min_start,
+            crate::meta::limited::hybrid_try_search_half_rev_with_allocations(
+                dfa, &mut cache, input, min_start, funding,
             )
         }
         #[cfg(not(feature = "hybrid"))]
@@ -727,18 +824,25 @@ impl HybridEngine {
     }
 
     #[inline]
-    pub(crate) fn try_which_overlapping_matches(
+
+    pub(crate) fn try_which_overlapping_matches_with_allocations(
         &self,
         cache: &mut HybridCache,
         input: &Input<'_>,
         patset: &mut PatternSet,
+        funding: &dyn Allocation,
     ) -> Result<(), RetryFailError> {
         #[cfg(feature = "hybrid")]
         {
             let fwd = self.0.forward();
             let mut fwdcache = cache.0.as_mut().unwrap().as_parts_mut().0;
-            fwd.try_which_overlapping_matches(&mut fwdcache, input, patset)
-                .map_err(|e| e.into())
+            fwd.try_which_overlapping_matches_with_allocations(
+                &mut fwdcache,
+                input,
+                patset,
+                funding,
+            )
+            .map_err(|e| e.into())
         }
         #[cfg(not(feature = "hybrid"))]
         {
@@ -767,22 +871,45 @@ impl HybridCache {
         }
     }
 
-    pub(crate) fn new(builder: &Hybrid) -> HybridCache {
+    pub(crate) fn new_with_allocations(
+        builder: &Hybrid,
+        funding: &dyn Allocation,
+    ) -> Result<HybridCache, MatchError> {
         #[cfg(feature = "hybrid")]
         {
-            HybridCache(builder.0.as_ref().map(|e| e.0.create_cache()))
+            Ok(HybridCache(
+                builder
+                    .0
+                    .as_ref()
+                    .map(|e| {
+                        hybrid::regex::Cache::new_with_allocations(
+                            &e.0, funding,
+                        )
+                        .map_err(hybrid_cache_error)
+                    })
+                    .transpose()?,
+            ))
         }
         #[cfg(not(feature = "hybrid"))]
         {
-            HybridCache(())
+            Ok(HybridCache(()))
         }
     }
 
-    pub(crate) fn reset(&mut self, builder: &Hybrid) {
+    pub(crate) fn reset_with_allocations(
+        &mut self,
+        builder: &Hybrid,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         #[cfg(feature = "hybrid")]
         if let Some(ref e) = builder.0 {
-            self.0.as_mut().unwrap().reset(&e.0);
+            self.0
+                .as_mut()
+                .unwrap()
+                .reset_with_allocations(&e.0, funding)
+                .map_err(hybrid_cache_error)?;
         }
+        Ok(())
     }
 
     pub(crate) fn memory_usage(&self) -> usize {
@@ -805,13 +932,16 @@ impl DFA {
         DFA(None)
     }
 
-    pub(crate) fn new(
+    pub(crate) fn new_with_allocations(
         info: &RegexInfo,
         pre: Option<Prefilter>,
         nfa: &NFA,
         nfarev: &NFA,
-    ) -> DFA {
-        DFA(DFAEngine::new(info, pre, nfa, nfarev))
+        funding: &dyn Allocation,
+    ) -> Result<DFA, BuildError> {
+        Ok(DFA(DFAEngine::new_with_allocations(
+            info, pre, nfa, nfarev, funding,
+        )?))
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -836,16 +966,17 @@ pub(crate) struct DFAEngine(
 );
 
 impl DFAEngine {
-    pub(crate) fn new(
+    pub(crate) fn new_with_allocations(
         info: &RegexInfo,
         pre: Option<Prefilter>,
         nfa: &NFA,
         nfarev: &NFA,
-    ) -> Option<DFAEngine> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<DFAEngine>, BuildError> {
         #[cfg(feature = "dfa-build")]
         {
             if !info.config().get_dfa() {
-                return None;
+                return Ok(None);
             }
             // If our NFA is anything but small, don't even bother with a DFA.
             if let Some(state_limit) = info.config().get_dfa_state_limit() {
@@ -856,7 +987,7 @@ impl DFAEngine {
                         nfa.states().len(),
                         state_limit,
                     );
-                    return None;
+                    return Ok(None);
                 }
             }
             // We cut the size limit in four because the total heap used by
@@ -881,12 +1012,15 @@ impl DFAEngine {
                 .dfa_size_limit(size_limit);
             let result = dfa::dense::Builder::new()
                 .configure(dfa_config.clone())
-                .build_from_nfa(&nfa);
+                .build_from_nfa_with_allocations(&nfa, funding);
             let fwd = match result {
                 Ok(fwd) => fwd,
                 Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
                     debug!("forward full DFA failed to build: {_err}");
-                    return None;
+                    return Ok(None);
                 }
             };
             let result = dfa::dense::Builder::new()
@@ -905,12 +1039,15 @@ impl DFAEngine {
                         .prefilter(None)
                         .specialize_start_states(false),
                 )
-                .build_from_nfa(&nfarev);
+                .build_from_nfa_with_allocations(&nfarev, funding);
             let rev = match result {
                 Ok(rev) => rev,
                 Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
                     debug!("reverse full DFA failed to build: {_err}");
-                    return None;
+                    return Ok(None);
                 }
             };
             let engine = dfa::regex::Builder::new().build_from_dfas(fwd, rev);
@@ -919,11 +1056,11 @@ impl DFAEngine {
                 engine.forward().memory_usage()
                     + engine.reverse().memory_usage(),
             );
-            Some(DFAEngine(engine))
+            Ok(Some(DFAEngine(engine)))
         }
         #[cfg(not(feature = "dfa-build"))]
         {
-            None
+            Ok(None)
         }
     }
 
@@ -988,7 +1125,10 @@ impl DFAEngine {
         #[cfg(feature = "dfa-build")]
         {
             use crate::dfa::Automaton;
-            self.0.reverse().try_search_rev(&input).map_err(|e| e.into())
+            self.0
+                .reverse()
+                .try_search_rev(&input)
+                .map_err(|e| e.into())
         }
         #[cfg(not(feature = "dfa-build"))]
         {
@@ -1067,8 +1207,11 @@ impl ReverseHybrid {
         ReverseHybrid(ReverseHybridEngine::new(info, nfarev))
     }
 
-    pub(crate) fn create_cache(&self) -> ReverseHybridCache {
-        ReverseHybridCache::new(self)
+    pub(crate) fn create_cache_with_allocations(
+        &self,
+        funding: &dyn Allocation,
+    ) -> Result<ReverseHybridCache, MatchError> {
+        ReverseHybridCache::new_with_allocations(self, funding)
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1130,19 +1273,19 @@ impl ReverseHybridEngine {
         }
     }
 
-    #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn try_search_half_rev_limited(
+    pub(crate) fn try_search_half_rev_limited_with_allocations(
         &self,
         cache: &mut ReverseHybridCache,
         input: &Input<'_>,
         min_start: usize,
+        funding: &dyn Allocation,
     ) -> Result<Option<HalfMatch>, RetryError> {
         #[cfg(feature = "hybrid")]
         {
             let dfa = &self.0;
             let mut cache = cache.0.as_mut().unwrap();
-            crate::meta::limited::hybrid_try_search_half_rev(
-                dfa, &mut cache, input, min_start,
+            crate::meta::limited::hybrid_try_search_half_rev_with_allocations(
+                dfa, &mut cache, input, min_start, funding,
             )
         }
         #[cfg(not(feature = "hybrid"))]
@@ -1172,22 +1315,43 @@ impl ReverseHybridCache {
         }
     }
 
-    pub(crate) fn new(builder: &ReverseHybrid) -> ReverseHybridCache {
+    pub(crate) fn new_with_allocations(
+        builder: &ReverseHybrid,
+        funding: &dyn Allocation,
+    ) -> Result<ReverseHybridCache, MatchError> {
         #[cfg(feature = "hybrid")]
         {
-            ReverseHybridCache(builder.0.as_ref().map(|e| e.0.create_cache()))
+            Ok(ReverseHybridCache(
+                builder
+                    .0
+                    .as_ref()
+                    .map(|e| {
+                        hybrid::dfa::Cache::new_with_allocations(&e.0, funding)
+                            .map_err(hybrid_cache_error)
+                    })
+                    .transpose()?,
+            ))
         }
         #[cfg(not(feature = "hybrid"))]
         {
-            ReverseHybridCache(())
+            Ok(ReverseHybridCache(()))
         }
     }
 
-    pub(crate) fn reset(&mut self, builder: &ReverseHybrid) {
+    pub(crate) fn reset_with_allocations(
+        &mut self,
+        builder: &ReverseHybrid,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         #[cfg(feature = "hybrid")]
         if let Some(ref e) = builder.0 {
-            self.0.as_mut().unwrap().reset(&e.0);
+            self.0
+                .as_mut()
+                .unwrap()
+                .reset_with_allocations(&e.0, funding)
+                .map_err(hybrid_cache_error)?;
         }
+        Ok(())
     }
 
     pub(crate) fn memory_usage(&self) -> usize {
@@ -1210,8 +1374,14 @@ impl ReverseDFA {
         ReverseDFA(None)
     }
 
-    pub(crate) fn new(info: &RegexInfo, nfarev: &NFA) -> ReverseDFA {
-        ReverseDFA(ReverseDFAEngine::new(info, nfarev))
+    pub(crate) fn new_with_allocations(
+        info: &RegexInfo,
+        nfarev: &NFA,
+        funding: &dyn Allocation,
+    ) -> Result<ReverseDFA, BuildError> {
+        Ok(ReverseDFA(ReverseDFAEngine::new_with_allocations(
+            info, nfarev, funding,
+        )?))
     }
 
     #[cfg_attr(feature = "perf-inline", inline(always))]
@@ -1236,14 +1406,15 @@ pub(crate) struct ReverseDFAEngine(
 );
 
 impl ReverseDFAEngine {
-    pub(crate) fn new(
+    pub(crate) fn new_with_allocations(
         info: &RegexInfo,
         nfarev: &NFA,
-    ) -> Option<ReverseDFAEngine> {
+        funding: &dyn Allocation,
+    ) -> Result<Option<ReverseDFAEngine>, BuildError> {
         #[cfg(feature = "dfa-build")]
         {
             if !info.config().get_dfa() {
-                return None;
+                return Ok(None);
             }
             // If our NFA is anything but small, don't even bother with a DFA.
             if let Some(state_limit) = info.config().get_dfa_state_limit() {
@@ -1254,7 +1425,7 @@ impl ReverseDFAEngine {
                         nfarev.states().len(),
                         state_limit,
                     );
-                    return None;
+                    return Ok(None);
                 }
             }
             // We cut the size limit in two because the total heap used by DFA
@@ -1280,23 +1451,26 @@ impl ReverseDFAEngine {
                 .dfa_size_limit(size_limit);
             let result = dfa::dense::Builder::new()
                 .configure(dfa_config)
-                .build_from_nfa(&nfarev);
+                .build_from_nfa_with_allocations(&nfarev, funding);
             let rev = match result {
                 Ok(rev) => rev,
                 Err(_err) => {
+                    if let Some(error) = _err.allocation_error() {
+                        return Err(error.into());
+                    }
                     debug!("full reverse DFA failed to build: {_err}");
-                    return None;
+                    return Ok(None);
                 }
             };
             debug!(
                 "fully compiled reverse DFA built, {} bytes",
                 rev.memory_usage()
             );
-            Some(ReverseDFAEngine(rev))
+            Ok(Some(ReverseDFAEngine(rev)))
         }
         #[cfg(not(feature = "dfa-build"))]
         {
-            None
+            Ok(None)
         }
     }
 
@@ -1332,5 +1506,103 @@ impl ReverseDFAEngine {
             // if the requisite features aren't enabled.
             unreachable!()
         }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn hybrid_cache_error(error: hybrid::CacheError) -> MatchError {
+    error
+        .allocation_error()
+        .map(MatchError::from)
+        .unwrap_or_else(|| MatchError::gave_up(0))
+}
+
+#[cfg(test)]
+mod allocation_tests;
+
+impl BoundedBacktracker {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "nfa-backtrack")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl OnePass {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "dfa-onepass")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl Hybrid {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "hybrid")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl DFA {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "dfa-build")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl ReverseHybrid {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "hybrid")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl ReverseDFA {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        #[cfg(feature = "dfa-build")]
+        if let Some(engine) = &self.0 {
+            engine.0.visit_source_storage(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl PikeVM {
+    pub(crate) fn visit_source_storage(
+        &self,
+        visitor: &mut dyn crate::util::source_storage::Visitor,
+    ) -> Result<(), crate::util::source_storage::Error> {
+        self.0 .0.visit_source_storage(visitor)
     }
 }

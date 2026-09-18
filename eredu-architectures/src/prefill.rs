@@ -1,5 +1,7 @@
 //! Architecture-owned decoder spans and unchanged whole prepared invocations.
 
+mod admission;
+pub(crate) use admission::PrefillAdmission;
 mod external;
 pub use external::{ExternalPrefillChunk, PreparedExternalPrefill};
 
@@ -94,7 +96,7 @@ pub struct PreparedTextPrefill<T> {
     identity: Option<SharedPreparedInputCacheIdentity>,
     // Source construction and native views are separate authorities. This
     // funding retains only the paid host destinations used by shared geometry.
-    metadata: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 /// Owned input views retained until a decoder chunk completes.
@@ -155,7 +157,7 @@ impl<T: Tensor> PreparedTextPrefill<T> {
     pub fn from_prepared_owner_with_metadata(
         input: eredu_runtime::input::PreparedModelInputOwner<T>,
         geometry: InferenceGeometry,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         let metadata = Metadata::funded(Some(funding));
         metadata.controls::<(Self, eredu_runtime::input::PreparedModelInputOwner<T>)>()?;
@@ -519,11 +521,6 @@ where
     fn input<'a>(&'a self, chunk: &'a Self::Chunk) -> A::Input<'a> {
         A::text_input(&chunk.tokens, chunk.mask.as_ref())
     }
-    fn cache_identity(&self) -> Option<PreparedInputCacheIdentity> {
-        self.identity
-            .as_ref()
-            .map(|identity| identity.as_ref().clone())
-    }
     fn shared_cache_identity(&self) -> Option<SharedPreparedInputCacheIdentity> {
         self.identity.clone()
     }
@@ -748,12 +745,6 @@ where
             .with_metadata_loan(chunk.metadata.as_ref())
     }
 
-    fn cache_identity(&self) -> Option<PreparedInputCacheIdentity> {
-        self.text
-            .identity
-            .as_ref()
-            .map(|identity| identity.as_ref().clone())
-    }
     fn shared_cache_identity(&self) -> Option<SharedPreparedInputCacheIdentity> {
         self.text.identity.clone()
     }
@@ -824,7 +815,7 @@ where
         None => eredu_runtime::PreparedModelInput::new(parts, |tensor| {
             source.inspector.identity(tensor)
         })
-        .map_err(Error::backend_source)?,
+        .map_err(Error::backend_retained_source)?,
     };
     let admitted = match metadata.context() {
         Some(context) => A::admit_prepared_input_with_metadata(
@@ -834,7 +825,7 @@ where
             context,
         )?,
         None => A::admit_prepared_input(&source.config, &prepared, &source.inspector)
-            .map_err(Error::backend_source)?,
+            .map_err(Error::backend_retained_source)?,
     };
     if admitted.decoder_shape()
         != [

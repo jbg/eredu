@@ -375,7 +375,7 @@ impl WorkspaceMechanisms for RetainedOutputFacts {
                 outputs[0] = WorkspaceOutputStorage::Allocate(128);
             }
             WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SelectRandomKey { .. })
-            | WorkspaceOperationKind::Index { .. }
+            | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
             | WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::ReadToken) => {
                 outputs[0] = WorkspaceOutputStorage::AliasInput(0);
             }

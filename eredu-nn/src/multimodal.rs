@@ -251,7 +251,7 @@ impl MultiAxisRotarySpec {
     }
     /// Validates the policy and returns the total rotated width.
     pub fn dimensions(&self) -> Result<i32, Error> {
-        self.dimensions_with_diagnostic(|message| Error::backend(message), Error::backend_source)
+        self.dimensions_with_diagnostic(|message| Error::backend(message), Error::backend_retained_source)
     }
 
     /// Uses the same borrowed policy validator and ordinary detailed diagnostics

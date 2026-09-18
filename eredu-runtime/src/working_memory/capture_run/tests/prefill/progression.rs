@@ -363,7 +363,7 @@ fn generated_full_padded_creation_charged_once_while_preview_zero_preserves_fact
     let usage = row.full_program_usage(charge(), full).unwrap();
     assert_eq!(
         usage.retained_bytes,
-        charge().retained_bytes + 4 * 6 * 256 + 12 * 6 * 130 + 4096
+        charge().retained_bytes + 4 * 6 * 256 + 12 * 6 * 130
     );
     let physical_shape = [2, 2, 130];
     assert!(row

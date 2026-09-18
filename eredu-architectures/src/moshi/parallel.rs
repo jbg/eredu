@@ -7,7 +7,7 @@ use eredu_checkpoint::LinearFormat;
 use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology};
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, ArchitectureGroupKind,
+    module_parameter_group, ArchitectureGroupKind,
     ArchitectureParameterDescription, ArchitecturePartition, CommunicationCompletionPolicy,
     CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
     CommunicationOperationRequirement, CommunicationTensorLimits, ExecutionGraph,
@@ -18,6 +18,8 @@ use eredu_runtime::{
     StateLayout, StateSegmentLifetime, StateSegmentSpec, TensorPlacement,
     TopologyCommunicationPlan,
 };
+
+pub(super) mod declaration;
 
 use super::{
     LayeredModel, MoshiConfig, MoshiTransformerConfig, StaticModules, Unit, DEPTH_STATE_SEGMENT,
@@ -396,148 +398,17 @@ pub fn select_parallel_execution<'a>(
 pub fn parameter_description(
     config: &MoshiConfig,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    Ok(parameter_contract(config)?.into_description())
+    declaration::description_with(config, crate::decoder::parameter_metadata::DeclarationDestination(None))
+        .map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)
 }
 
 /// Describes complete Moshi ownership together with exact executable formats.
 pub fn parameter_contract(
     config: &MoshiConfig,
 ) -> Result<MoshiParameterContract, ParallelPlanError> {
-    let dimension = |label: &str, value: i32| {
-        usize::try_from(value)
-            .map_err(|_| ParallelPlanError::InvalidTensor(format!("Moshi {label} exceeds usize")))
-    };
-    let temporal_layers = dimension(
-        "temporal layer count",
-        config.temporal().num_hidden_layers(),
-    )?;
-    let depth_slices = config.frame_schedule().depth_audio_codebooks();
-    let graph = ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layout = ExecutionUnitLayout::new(&graph, [temporal_layers, depth_slices])
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let temporal_group = layout
-        .group_id(0)
-        .expect("Moshi layout contains the temporal group")
-        .clone();
-    let depth_group = layout
-        .group_id(1)
-        .expect("Moshi layout contains the depth group")
-        .clone();
-    let temporal_hidden = dimension("temporal hidden width", config.temporal().hidden_size())?;
-    let text_vocabulary = dimension("text vocabulary", config.text_vocabulary_size())?;
-    let audio_vocabulary = dimension("audio vocabulary", config.audio_vocabulary_size())?;
-    let mut owned = Vec::new();
-
-    let mut add_static = |owner: &str,
-                          logical: String,
-                          role: ParameterRole,
-                          target: String,
-                          shape: Vec<usize>,
-                          sharding: MemberSharding|
-     -> Result<(), ParallelPlanError> {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role(owner),
-            ParameterGroupSpec::new(
-                logical,
-                role,
-                [ParameterMemberSpec::new(target, shape, sharding)],
-            )?,
-        ));
-        Ok(())
-    };
-    add_static(
-        "embedding",
-        "text_emb".into(),
-        ParameterRole::Vocabulary,
-        "text_emb.weight".into(),
-        vec![text_vocabulary + 1, temporal_hidden],
-        MemberSharding::Balanced { axis: 0 },
-    )?;
-    for codebook in 0..config.frame_schedule().total_audio_codebooks() {
-        add_static(
-            "embedding",
-            format!("audio_embs.{codebook}"),
-            ParameterRole::Vocabulary,
-            format!("audio_embs.{codebook}.weight"),
-            vec![audio_vocabulary + 1, temporal_hidden],
-            MemberSharding::Balanced { axis: 0 },
-        )?;
-    }
-    add_static(
-        "norm",
-        "out_norm".into(),
-        ParameterRole::Replicated,
-        "out_norm.weight".into(),
-        vec![temporal_hidden],
-        MemberSharding::Replicated,
-    )?;
-    add_static(
-        "output",
-        "text_linear".into(),
-        ParameterRole::Vocabulary,
-        "text_linear.weight".into(),
-        vec![text_vocabulary, temporal_hidden],
-        MemberSharding::Balanced { axis: 0 },
-    )?;
-
-    for layer in 0..temporal_layers {
-        for group in symbolic_block_parameter_groups(config.temporal(), layer)? {
-            owned.push(OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(temporal_group.clone(), layer),
-                group,
-            ));
-        }
-    }
-    for slice in 0..depth_slices {
-        let transformer = config
-            .depth_transformer(slice)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let hidden = dimension("depth hidden width", transformer.hidden_size())?;
-        let prefix = format!("depformer.slices.{slice}");
-        let input_vocabulary = if slice == 0 {
-            text_vocabulary
-        } else {
-            audio_vocabulary
-        } + 1;
-        let owner = ParameterGroupOwner::execution_unit(depth_group.clone(), slice);
-        let mut groups = vec![
-            ParameterGroupSpec::new(
-                format!("{prefix}.emb"),
-                ParameterRole::Vocabulary,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.emb.weight"),
-                    vec![input_vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-            ParameterGroupSpec::new(
-                format!("{prefix}.linear_in"),
-                ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.linear_in.weight"),
-                    vec![hidden, temporal_hidden],
-                    MemberSharding::Replicated,
-                )],
-            )?,
-            ParameterGroupSpec::new(
-                format!("{prefix}.linear_out"),
-                ParameterRole::Vocabulary,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.linear_out.weight"),
-                    vec![audio_vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ];
-        for layer in 0..dimension("depth layer count", transformer.num_hidden_layers())? {
-            groups.extend(symbolic_block_parameter_groups(&transformer, layer)?);
-        }
-        for group in groups {
-            owned.push(OwnedParameterGroupSpec::new(owner.clone(), group));
-        }
-    }
-
+    let (graph, layout, owned) = declaration::groups(config,
+        crate::decoder::parameter_metadata::DeclarationDestination(None))
+        .map_err(crate::decoder::parameter_metadata::ParameterGroupError::ordinary)?;
     let mut expanded = Vec::with_capacity(owned.len());
     let mut matrices = BTreeMap::new();
     for tagged in owned {
@@ -609,117 +480,12 @@ pub fn parameter_contract(
         }
         expanded.push(OwnedParameterGroupSpec::new(owner, group));
     }
-    let expected = expanded
-        .iter()
-        .map(|tagged| tagged.group().clone())
-        .collect::<Vec<_>>();
-    let description = ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
+    let description = ArchitectureParameterDescription::from_owned(graph, layout, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     Ok(MoshiParameterContract {
         description,
         matrices,
     })
-}
-
-fn symbolic_block_parameter_groups(
-    config: &MoshiTransformerConfig,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let dimension = |label: &str, value: i32| {
-        usize::try_from(value)
-            .map_err(|_| ParallelPlanError::InvalidTensor(format!("Moshi {label} exceeds usize")))
-    };
-    let hidden = dimension("transformer hidden width", config.hidden_size())?;
-    let heads = dimension("attention head count", config.num_attention_heads())?;
-    let head = dimension("attention head width", config.head_dim())?;
-    let gated = dimension("gated hidden width", config.gated_hidden_size())?;
-    let root = format!("{}.layers.{layer}", config.parameter_root());
-    let quantization_alignment = config
-        .weight_quantization(&format!("{root}.self_attn.out_proj.weight"))
-        .map_or(Ok(1), |quantization| {
-            usize::try_from(quantization.group_size()).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Moshi quantization group exceeds usize".into())
-            })
-        })?;
-    let attention_units = aligned_partition_units(
-        &format!("{root}.self_attn"),
-        heads,
-        head,
-        quantization_alignment,
-    )?;
-    let gating_units =
-        aligned_partition_units(&format!("{root}.gating"), gated, 1, quantization_alignment)?;
-    let q_end = hidden;
-    let k_end = q_end.checked_add(hidden).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused attention width overflowed".into())
-    })?;
-    let v_end = k_end.checked_add(hidden).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused attention width overflowed".into())
-    })?;
-    let gate_end = gated;
-    let up_end = gated.checked_mul(2).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused gating width overflowed".into())
-    })?;
-    Ok(vec![
-        ParameterGroupSpec::partitioned(
-            format!("{root}.self_attn.projections"),
-            ParameterRole::AttentionHeads,
-            attention_units,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.self_attn.in_proj.weight"),
-                    vec![v_end, hidden],
-                    MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: vec![0..q_end, q_end..k_end, k_end..v_end],
-                    },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.self_attn.out_proj.weight"),
-                    vec![hidden, hidden],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?,
-        ParameterGroupSpec::new(
-            format!("{root}.norm1"),
-            ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                format!("{root}.norm1.weight"),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?,
-        ParameterGroupSpec::new(
-            format!("{root}.norm2"),
-            ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                format!("{root}.norm2.weight"),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?,
-        ParameterGroupSpec::partitioned(
-            format!("{root}.gating.projections"),
-            ParameterRole::FeedForwardIntermediate,
-            gating_units,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.gating.linear_in.weight"),
-                    vec![up_end, hidden],
-                    MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: vec![0..gate_end, gate_end..up_end],
-                    },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.gating.linear_out.weight"),
-                    vec![hidden, gated],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?,
-    ])
 }
 
 /// Derives the backend-independent collective oracle for one traversal.
@@ -1475,7 +1241,7 @@ mod tests {
     use super::*;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout};
 
-    fn tiny_config() -> MoshiConfig {
+    pub(super) fn tiny_config() -> MoshiConfig {
         MoshiConfig::from_json(
             r#"{
                 "model_type":"moshi", "dim":32, "text_card":101,
@@ -1597,7 +1363,7 @@ mod tests {
         );
     }
 
-    fn local_layout(config: &MoshiConfig) -> LocalModelLayout {
+    pub(super) fn local_layout(config: &MoshiConfig) -> LocalModelLayout {
         let mut layout = LocalModelLayout::default();
         let temporal_width = config.temporal().hidden_size() as usize;
         insert_vocab(
@@ -1888,3 +1654,7 @@ mod tests {
         assert_eq!(packed_output.affine_bias(), Some("text_linear.biases"));
     }
 }
+
+#[cfg(test)]
+#[path = "parallel/funding_tests.rs"]
+mod funding_tests;

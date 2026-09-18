@@ -84,7 +84,7 @@ fn controlled(
 fn concrete_and_erased_nodes_unbox_before_probe_and_custody_under_the_guard() {
     let (mut direct, _, _, seals, drops) = controlled(true);
     direct.seal();
-    let status = direct.finish();
+    let status = direct.finish().unwrap();
     assert!(status.settled && !status.failed && !status.blocked);
     assert_eq!(seals.get(), 1);
     assert_eq!(drops.get(), 1);

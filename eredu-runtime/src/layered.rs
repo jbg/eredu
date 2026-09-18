@@ -9,7 +9,7 @@ mod ordered_completion;
 mod resident_construction;
 pub use resident_construction::ordinary_addressed_units;
 mod metadata;
-pub use metadata::LayeredForwardMetadata;
+pub use metadata::LayeredMetadata;
 use invocation::{LayeredInvocation, OrdinaryLayeredInput};
 use ordered_completion::BackendLayerwiseCompletion;
 pub use ordered_completion::OrderedLayerwiseCompletion;
@@ -65,53 +65,22 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
     /// Architecture-owned failure while deriving geometry or topology.
     type DefinitionError;
 
-    /// Returns the authoritative mutable-state geometry for this realization.
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError>;
+    /// Constructs the authoritative geometry in the supplied metadata destination.
+    /// `None` selects ordinary construction; checked callers supply their actual producer.
+    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<StateLayout, Self::DefinitionError>;
 
-    /// Constructs the actual geometry using an explicit metadata destination.
-    /// The compatibility default does not qualify unmodified constructors.
-    fn state_layout_with_metadata(
-        &self,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout()
-    }
-
-    /// Declares cache-relevant architecture identity for one realized state partition.
-    ///
-    /// The partition supplies the exact rank-local layout and architecture-global
-    /// offset. Concrete backends supply only their lowered parallel topology.
-    fn state_identity(
-        &self,
-        state: &crate::PartitionState,
+    /// Declares cache identity for the exact rank-local layout and global offset.
+    /// Identity text, validation errors and fixed controls share the destination.
+    fn state_identity(&self, state: &crate::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<crate::ModelStateIdentity, Self::DefinitionError>;
 
-    /// Derives the actual architecture identity with a metadata destination.
-    /// The default preserves existing implementations; only an overriding producer
-    /// participates in checked identity construction.
-    fn state_identity_with_metadata(
-        &self,
-        state: &crate::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-        _metadata: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<crate::ModelStateIdentity, Self::DefinitionError> {
-        self.state_identity(state, topology)
-    }
-
-    /// Describes every parameter with its canonical graph owner and placement.
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<crate::ArchitectureParameterDescription, Self::DefinitionError>;
-
-    /// Borrows the completed immutable description when the actual constructor
-    /// retains one. Compatibility implementations keep their existing producer.
-    fn parameter_description_with_metadata(
-        &self, context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<std::borrow::Cow<'_, crate::ArchitectureParameterDescription>, Self::DefinitionError> {
-        self.parameter_description(context).map(std::borrow::Cow::Owned)
-    }
+    /// Borrows the retained immutable description or constructs it through the
+    /// backend context's metadata destination. Owning consumers copy explicitly.
+    fn parameter_description(&self, context: &<B::Tensor as eredu_nn::Tensor>::Context)
+        -> Result<std::borrow::Cow<'_, crate::ArchitectureParameterDescription>, Self::DefinitionError>;
 
     /// Returns architecture-owned checkpoint rewrites for pinned parameters.
     fn static_parameter_recipes(
@@ -1031,8 +1000,7 @@ where
     /// causal prefix, no supplied attention mask or activation interventions.
     /// Construction/rebinding occurs under loading/preparation authority.
     fn prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        &self, _metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -1040,8 +1008,7 @@ where
     /// ingress. This never declares encoder axes or intervention equivalence.
     /// The session must authenticate the actual source/ingress plan before use.
     fn media_prefill_observation_declarations(
-        &self,
-    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        &self, _metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -1114,44 +1081,18 @@ where
     /// Declares how the complete mutable-state layout is divided among realized partitions.
     fn state_partition_plan(&self, layout: &StateLayout) -> crate::ArchitectureStatePartitionPlan;
 
-    /// Declares the dependency graph between ordered execution groups.
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
-
-    /// Supplies actual graph declarations for checked construction. The compatibility
-    /// default retains the existing owned producer and is not a metadata qualification.
-    fn execution_graph_with_metadata(
-        &self,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error> {
-        self.execution_graph()
-            .map(crate::ArchitectureExecutionGraph::owned)
-    }
+    /// Loans the validated source declaration between ordered execution groups.
+    /// Owning consumers explicitly materialize it in their metadata destination.
+    fn execution_graph(&self) -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error>;
 
     /// Returns the number of ordered execution units in one graph group.
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
+    /// The optional destination funds all produced diagnostics and controls.
+    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error>;
 
-    /// Reads the same unit population with a paid diagnostic destination when overridden.
-    fn group_unit_count_with_metadata(
-        &self,
-        group: usize,
-        _context: &eredu_nn::workspace::WorkspaceContext,
-    ) -> Result<usize, Self::Error> {
-        self.group_unit_count(group)
-    }
+/// Returns the stable architecture-owned path of one group-local execution unit.
+    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error>;
 
-    /// Returns the stable architecture-owned path of one group-local execution unit.
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
-
-    /// Emits the same architecture-owned unit name into a participating metadata
-    /// destination. The compatibility default preserves the existing producer;
-    /// original constructors qualify this hook alongside their unit factories.
-    fn unit_path_with_metadata(&self,group:usize,index:usize,
-        _context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error>{
-        self.unit_path(group,index)
-    }
-
-
-    /// Whether observed unit execution owns both input/output capture and
+/// Whether observed unit execution owns both input/output capture and
     /// intervention, including their effective companions. The traversal omits
     /// its outer copies of those exact seams. This includes observed provider
     /// and parallel entry points and preserves in-unit state/capture timing.
@@ -1159,28 +1100,17 @@ where
         false
     }
 
-    /// Architecture-owned name for the activation selected at group ingress.
-    fn group_input_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+    /// Architecture-owned ingress name in the selected metadata destination.
+    fn group_input_observation_path(&self, _group: usize, _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
         Ok(None)
     }
 
-    /// Architecture-owned name for the activation emitted after group completion.
-    fn group_output_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+    /// Architecture-owned completion name in the selected metadata destination.
+    fn group_output_observation_path(&self, _group: usize, _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
         Ok(None)
     }
 
-    /// Emits the same group ingress name into the selected metadata destination.
-    fn group_input_observation_path_with_metadata(&self, group:usize,
-        _context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        self.group_input_observation_path(group)
-    }
-    /// Emits the same group completion name into the selected metadata destination.
-    fn group_output_observation_path_with_metadata(&self, group:usize,
-        _context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
-        self.group_output_observation_path(group)
-    }
-
-    /// Borrows pinned modules for parameter discovery and binding.
+/// Borrows pinned modules for parameter discovery and binding.
     fn static_modules(&self) -> &Self::StaticModules;
 
     /// Mutably borrows pinned modules for parameter binding.
@@ -1350,7 +1280,7 @@ where
     fn forward_metadata(
         &self,
         _forward: &Self::ForwardContext,
-    ) -> Option<LayeredForwardMetadata<Self::Error>> {
+    ) -> Option<LayeredMetadata<Self::Error>> {
         None
     }
 
@@ -1581,14 +1511,10 @@ where
     /// Architecture-owned schema for primary and auxiliary partition transport.
     type Boundary: crate::ArchitectureBoundary;
 
-    /// Derives the complete transport schema from the normalized architecture.
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error>;
-
-    /// Derives the same typed boundary using an admitted metadata destination.
-    fn boundary_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<Self::Boundary,eredu_nn::Error> {
-        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
-    }
+    /// Derives the complete transport schema in the supplied metadata destination.
+    /// Checked callers supply their actual producer; refusal never changes destination.
+    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
+        -> Result<Self::Boundary, Self::Error>;
 
     /// Prepares a replicated partition from tokens or upstream hidden state.
     fn begin_partition<'a>(
@@ -3130,7 +3056,7 @@ where
             |architecture, group, index, unit, hidden, state, forward, context, observer| {
                 let owned = architecture.observes_unit_boundaries(group, index);
                 let path = owned
-                    .then(|| architecture.unit_path(group, index))
+                    .then(|| architecture.unit_path(group, index, None))
                     .transpose()?;
                 let input = path
                     .as_ref()
@@ -3269,7 +3195,7 @@ where
             Some(geometry) => geometry.graph(),
             None => {
                 ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
                 &ordinary_graph
             }
         };
@@ -3279,7 +3205,7 @@ where
         for group in 0..graph.groups().len() {
             let count = self
                 .architecture
-                .group_unit_count(group)
+                .group_unit_count(group, None)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             units.push(
                 (0..count)
@@ -3287,7 +3213,7 @@ where
                         if self.architecture.observes_unit_boundaries(group, index) {
                             Ok(None)
                         } else {
-                            self.architecture.unit_path(group, index).map(Some)
+                            self.architecture.unit_path(group, index, None).map(Some)
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -3295,12 +3221,12 @@ where
             );
             group_inputs.push(
                 self.architecture
-                    .group_input_observation_path(group)
+                    .group_input_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
             group_outputs.push(
                 self.architecture
-                    .group_output_observation_path(group)
+                    .group_output_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
         }
@@ -3483,7 +3409,7 @@ where
             Some(geometry) => geometry.graph(),
             None => {
                 ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
                 &ordinary_graph
             }
         };
@@ -3493,7 +3419,7 @@ where
         for group in 0..graph.groups().len() {
             let count = self
                 .architecture
-                .group_unit_count(group)
+                .group_unit_count(group, None)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             units.push(
                 (0..count)
@@ -3501,7 +3427,7 @@ where
                         if self.architecture.observes_unit_boundaries(group, index) {
                             Ok(None)
                         } else {
-                            self.architecture.unit_path(group, index).map(Some)
+                            self.architecture.unit_path(group, index, None).map(Some)
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -3509,12 +3435,12 @@ where
             );
             group_inputs.push(
                 self.architecture
-                    .group_input_observation_path(group)
+                    .group_input_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
             group_outputs.push(
                 self.architecture
-                    .group_output_observation_path(group)
+                    .group_output_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
         }
@@ -3809,11 +3735,11 @@ where
                 let graph = self
                     .architecture
                     .execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
                 let counts = (0..graph.groups().len())
                     .map(|group| {
                         self.architecture
-                            .group_unit_count(group)
+                            .group_unit_count(group, None)
                             .map_err(LayerwiseRuntimeError::Architecture)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4485,7 +4411,7 @@ where
             Some(geometry) => geometry.graph(),
             None => {
                 ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
                 &ordinary_graph
             }
         };
@@ -4495,7 +4421,7 @@ where
         for group in 0..graph.groups().len() {
             let count = self
                 .architecture
-                .group_unit_count(group)
+                .group_unit_count(group, None)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             units.push(
                 (0..count)
@@ -4503,7 +4429,7 @@ where
                         if self.architecture.observes_unit_boundaries(group, index) {
                             Ok(None)
                         } else {
-                            self.architecture.unit_path(group, index).map(Some)
+                            self.architecture.unit_path(group, index, None).map(Some)
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -4511,12 +4437,12 @@ where
             );
             group_inputs.push(
                 self.architecture
-                    .group_input_observation_path(group)
+                    .group_input_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
             group_outputs.push(
                 self.architecture
-                    .group_output_observation_path(group)
+                    .group_output_observation_path(group, None)
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
         }
@@ -4585,7 +4511,7 @@ where
             parallel,
             context,
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                let path = architecture.unit_path(group, index)?;
+                let path = architecture.unit_path(group, index, None)?;
                 let input = observe_outer_boundary(
                     observer,
                     &format!("{path}.input"),
@@ -4931,11 +4857,11 @@ where
                 let graph = self
                     .architecture
                     .execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
                 let counts = (0..graph.groups().len())
                     .map(|group| {
                         self.architecture
-                            .group_unit_count(group)
+                            .group_unit_count(group, None)
                             .map_err(LayerwiseRuntimeError::Architecture)
                     })
                     .collect::<Result<Vec<_>, _>>()?;

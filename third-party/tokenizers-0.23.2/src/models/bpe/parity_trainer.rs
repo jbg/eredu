@@ -1480,7 +1480,7 @@ impl ParityBpeTrainer {
             .map(|(i, (pair, new_token_id))| (pair, (i as u32, new_token_id)))
             .collect();
 
-        model.replace_legacy_storage(vocab, vocab_r, merges);
+        model.install_tables(vocab, vocab_r, merges);
 
         model.continuing_subword_prefix = self.continuing_subword_prefix.clone();
         model.end_of_word_suffix = self.end_of_word_suffix.clone();
@@ -1586,11 +1586,11 @@ mod tests {
             merge_strings
         );
         assert!(
-            model.storage.legacy_vocab().contains_key("aabb"),
+            model.storage.owned_vocab().contains_key("aabb"),
             "final token 'aabb' should be in vocab"
         );
         assert!(
-            model.storage.legacy_vocab().contains_key("ccdd"),
+            model.storage.owned_vocab().contains_key("ccdd"),
             "final token 'ccdd' should be in vocab"
         );
     }
@@ -1639,7 +1639,7 @@ mod tests {
         t_ref.feed_language(1, l1);
         let mut m_ref = BPE::default();
         let (_s, ref_merges) = t_ref.do_train(&mut m_ref).unwrap();
-        let ref_vocab = m_ref.storage.legacy_vocab().len();
+        let ref_vocab = m_ref.storage.owned_vocab().len();
 
         // total_symbols run: target = ref_vocab + N_SPECIALS, with that many
         // special tokens added. Final vocab must equal the target exactly.
@@ -1663,10 +1663,10 @@ mod tests {
         let (_s2, ts_merges) = t_ts.do_train(&mut m_ts).unwrap();
 
         assert_eq!(
-            m_ts.storage.legacy_vocab().len(),
+            m_ts.storage.owned_vocab().len(),
             target,
             "total_symbols=true should make final vocab == target {target}, got {}",
-            m_ts.storage.legacy_vocab().len()
+            m_ts.storage.owned_vocab().len()
         );
         assert_eq!(
             ts_merges.len(),
@@ -1930,7 +1930,7 @@ mod tests {
         // Sanity-check the resulting vocabulary contains every merged token.
         for tok in ["xy", "ab", "xyxy", "abab"] {
             assert!(
-                model.storage.legacy_vocab().contains_key(tok),
+                model.storage.owned_vocab().contains_key(tok),
                 "final vocab should contain merged token {:?}",
                 tok
             );
@@ -1988,7 +1988,7 @@ mod tests {
             "'g h' merge should be present"
         );
         assert!(
-            !model.storage.legacy_vocab().contains_key("cd"),
+            !model.storage.owned_vocab().contains_key("cd"),
             "'cd' should NOT be in vocab (pair freq 3 < min_frequency 5)"
         );
     }

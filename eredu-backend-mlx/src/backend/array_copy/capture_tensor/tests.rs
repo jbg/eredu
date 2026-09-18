@@ -465,9 +465,9 @@ mod metal {
                     .collect::<Vec<_>>()
                     .as_slice(),
                 [
-                    WorkspaceOperationKind::Index { selected_axes: 0 },
+                    WorkspaceOperationKind::StaticSlice { .. },
                     WorkspaceOperationKind::View("reshape"),
-                    WorkspaceOperationKind::Index { selected_axes: 0 }
+                    WorkspaceOperationKind::StaticSlice { .. }
                 ]
             ));
             assert_eq!(source.try_metadata_snapshot().unwrap(), snapshot);

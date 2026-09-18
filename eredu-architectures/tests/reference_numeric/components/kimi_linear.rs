@@ -4,8 +4,8 @@ use eredu_architectures::kimi_linear::{Block, ModelArgs, TokenMixer};
 
 struct Initialize;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
-        let name = metadata.id.as_str();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        let name = metadata.id().as_str();
         let seed = name
             .bytes()
             .fold(0_u32, |a, b| a.wrapping_mul(31).wrapping_add(b.into()));
@@ -25,8 +25,8 @@ impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
 #[derive(Default)]
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-        self.0.insert(metadata.id.to_string(), value.clone());
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+        self.0.insert(metadata.id().to_string(), value.clone());
     }
 }
 
@@ -301,7 +301,7 @@ fn kimi_observed_pipeline_cut_preserves_components_and_cached_trials() {
             })
             .unwrap()
         };
-        let description = model().parameter_description(&context).unwrap();
+        let description = model().parameter_description(&context).unwrap().into_owned();
         let topology = ParallelTopology::new(1, 2, 1, 1).unwrap();
         for masked in [false, true] {
             let mut ordinary = LayerwiseRuntime::new(model(), ResidentUnitWindow::new(units()));
@@ -779,7 +779,7 @@ fn kimi_prepared_transforms_retain_source_layout_across_residency_and_parallelis
             family::LayeredModel::<NumericBackend>::new(args.clone(), &NumericContext::default())
                 .unwrap()
                 .parameter_description(&NumericContext::default())
-                .unwrap();
+                .unwrap().into_owned();
         let mut topologies = vec![(2, 1, 1), (1, 2, 1), (2, 2, 1)];
         if routed {
             topologies.extend([(1, 1, 2), (2, 1, 2), (1, 2, 2), (2, 2, 2)]);
@@ -818,7 +818,7 @@ fn kimi_prepared_transforms_retain_source_layout_across_residency_and_parallelis
                             assert!(selected.parameters().iter().any(|p| matches!(p.lowering(), eredu_runtime::WeightLoweringKind::Transform | eredu_runtime::WeightLoweringKind::DerivedTransform)));
                             let target_args = family::with_checkpoint_formats(args, selected.parameters().iter().filter_map(|p| p.executable().weight_quantization().map(|format| (p.name().to_owned(), format))).collect()).unwrap();
                             let target = family::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
-                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
+                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap().into_owned();
                             let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                             let mut layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
                             let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();

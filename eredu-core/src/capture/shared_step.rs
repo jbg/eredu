@@ -12,9 +12,9 @@ type StepOwner = RetainedCaptureOwner<CapturedStep>;
 ///
 /// Clone shares the frame and its retained custody. Serialization is identical
 /// to `CapturedStep`, including the capture tensor's nonfinite wire policy.
-/// There is no mutable or owning raw export, detachable custody, or deserializer
-/// that could manufacture protected ownership. Deserialize into `CapturedStep`
-/// for ordinary caller-owned values instead.
+/// There is no mutable or owning raw export or detachable custody. Deserialization
+/// creates independent diagnostic ownership; it does not recover source identity,
+/// funding, transaction authority or native completion from the wire.
 ///
 /// This type alone certifies no allocation bound, provenance, quota, transaction
 /// success or native completion. Those remain the constructing runtime's job.
@@ -158,6 +158,19 @@ impl fmt::Debug for SharedCapturedStep {
 impl Serialize for SharedCapturedStep {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_step().serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for SharedCapturedStep {
+    type Target = CapturedStep;
+    fn deref(&self) -> &Self::Target { self.as_step() }
+}
+impl<'de> serde::Deserialize<'de> for SharedCapturedStep {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Wire diagnostics have independent ownership and create no source,
+        // funding, transaction, or completion authority.
+        let step = <CapturedStep as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::retain(step, ()))
     }
 }
 

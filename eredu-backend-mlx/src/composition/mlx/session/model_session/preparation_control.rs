@@ -13,16 +13,20 @@ pub(super) fn prepare(runtime:&ModelRuntime<MlxBackend<'_>>,input:&TextPreparati
     if sequence.context().attempt()!=0 || config.sampling().max_new_tokens!=Some(sequence.request().max_new_tokens()){
         return Err(rejected());
     }
-    match input {
-        TextPreparationInput::OriginalTokenIds(plan) if sequence.request().token_input().is_some_and(|source|std::ptr::eq(source,*plan))=>{},
-        // Existing completed-media admission must provide its own exact source
-        // validation before distributed original readiness can be enabled.
-        _=>return Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure()),
-    }
     let blueprint=session.payload.model.inference_blueprint().ok_or_else(rejected)?;
     let manifest=blueprint.selected().communication_manifest().ok_or_else(rejected)?;
     let capacity=config.inference_policy().managed_memory_capacity_bytes.ok_or_else(rejected)?;
     if !session.payload.memory_pool.same_domain(runtime.backend().memory_pool()) {return Err(rejected());}
+    // This is readiness authority, not prepared-media admission. Construct it
+    // before the original prepared-source worker validates exact packet, cache,
+    // pool and sequence identity. That worker's refusal must participate in the
+    // same Admission vote as a token-input refusal on another rank.
+    match input {
+        TextPreparationInput::OriginalTokenIds(plan)
+            if sequence.request().token_input().is_some_and(|source|std::ptr::eq(source,*plan))=>{},
+        TextPreparationInput::OriginalPrepared(_)=>{},
+        _=>return Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure()),
+    }
     let source=transport.prepare_original_readiness(manifest,transport.native_world(),runtime.backend().memory_pool(),
         session.payload.model.erased().inference_execution_identity(),capacity,sequence.context())
         .map_err(Error::into_backend_failure)?;

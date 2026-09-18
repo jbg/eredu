@@ -500,7 +500,7 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
             let mut receipts = [None, None, None];
             for i in 0..OUTPUTS {
                 let token = driver.advance(&mut run).unwrap().unwrap().into_output();
-                assert!(driver.take_completed_step(&mut run).unwrap().is_none());
+                assert!(driver.take_completed_delivery(&mut run).unwrap().is_none());
                 delivered[i] = (token.snapshot, token.scores, token.id);
                 sequence
                     .commit(token.id, TokenTerminalSignals::default())

@@ -19,7 +19,7 @@ pub(in crate::composition::mlx::session::model_session) struct TextWorkspaceCand
         Option<crate::backend::nn::workspace::ProjectedPagedSources>,
     // Last: all candidate diagnostics retire before their planning account.
     pub(in crate::composition::mlx::session::model_session) planning_metadata:
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 /// The first diagnostic candidate binds decisions even when its numerical
@@ -103,13 +103,17 @@ pub(super) fn plan_candidates_with_handoff_retained(
         Option<crate::backend::nn::workspace::ResidentNativeRecipe>,
         Option<original_prepared::PreparedMediaQuoteSource>,
         Option<crate::backend::nn::workspace::ProjectedPagedSources>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
     Error,
 > {
     let mut planning_metadata = None;
+    let mut diagnostic_metadata = None;
     let result: Result<_, Error> = (|| {
         let mut original: Option<(usize, TextControllerContract)> = None;
+        let mut last_components = None;
+        let mut initial_components = None;
+        let mut minimum_components = None;
         let mut native_failure = None;
         let mut native_recipe = None;
         let mut prepared_source = None;
@@ -123,6 +127,7 @@ pub(super) fn plan_candidates_with_handoff_retained(
             capacity,
             handoffs,
             |candidate| {
+                last_components = None;
                 // The shared planner has retired the rejected candidate before
                 // requesting the next size. Release its retained recipe first.
                 drop(native_recipe.take());
@@ -152,6 +157,34 @@ pub(super) fn plan_candidates_with_handoff_retained(
                         .is_ok_and(|quote| quote.controller_contract() != Some(&contract))
                     {
                         return Err(memory(WorkingMemoryError::IdentityMismatch));
+                    }
+                    last_components = candidate.native_recipe.as_ref()
+                        .filter(|recipe| recipe.quote_components.after_seal.is_some())
+                        .map(|recipe| (candidate.quote.as_ref().expect("sealed candidate").geometry(),
+                            recipe.quote_components));
+                    if let Some(value) = last_components {
+                        if initial_components.is_none() {
+                            if planning_metadata.is_some() {
+                                // These scalar copies survive candidate retirement.
+                                // Give them their own small account instead of
+                                // keeping an entire rejected recipe account alive.
+                                let funding = pool.prepare_workspace_metadata(execution, capacity)
+                                    .map_err(Error::WorkspacePlanning)?;
+                                funding.reserve_metadata(std::mem::size_of::<(
+                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
+                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
+                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
+                                    Option<eredu_core::HostMetadataFunding>,
+                                    Result<(), eredu_nn::workspace::HostMetadataFundingError>,
+                                )>()).map_err(Error::WorkspacePlanning)?;
+                                diagnostic_metadata = Some(funding);
+                            }
+                            initial_components = Some(value);
+                        }
+                        if minimum_components.as_ref().is_none_or(|(_, components): &(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)|
+                            value.1.after_seal < components.after_seal) {
+                            minimum_components = Some(value);
+                        }
                     }
                     native_recipe = candidate.native_recipe;
                     prepared_source = candidate.prepared_source;
@@ -190,13 +223,32 @@ pub(super) fn plan_candidates_with_handoff_retained(
         if let Some(error) = native_failure {
             return Err(error);
         }
-        let (_, reservation, accepted) = planned.map_err(|error| match error {
+        let (reservation, accepted) = planned.map_err(|error| {
+            if matches!(&error, PrefillPlanningError::Reservation(
+                WorkingMemoryError::BudgetExceeded { .. })) {
+                if let Some((geometry, components)) = last_components {
+                    if let Some(funding) = &planning_metadata {
+                        // The enclosing closed planning failure retains this
+                        // account until after the diagnostic Box is destroyed.
+                        if let Err(cause) = funding.reserve_metadata(std::mem::size_of::<(
+                            crate::backend::error::WorkspaceCandidateRefusal,
+                            Box<crate::backend::error::WorkspaceCandidateRefusal>,
+                            Result<(), eredu_nn::workspace::HostMetadataFundingError>,
+                        )>()) { return Error::WorkspacePlanning(cause); }
+                    }
+                    return Error::Other(Box::new(crate::backend::error::WorkspaceCandidateRefusal {
+                        geometry, components, initial: initial_components, minimum: minimum_components, cause: error,
+                        _funding: diagnostic_metadata.take(),
+                    }));
+                }
+            }
+            match error {
             PrefillPlanningError::Reservation(
                 cause @ (WorkingMemoryError::SubmissionTrackingCapacity { .. }
                 | WorkingMemoryError::GraphMetadataCapacity { .. }),
             ) => Error::PrefillControl(cause),
             error => Error::Other(Box::new(error)),
-        })?;
+        }})?;
         let (_, controller) =
             original.ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?;
         if accepted.controller_contract() != Some(&controller) {

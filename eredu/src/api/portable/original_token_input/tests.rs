@@ -37,16 +37,24 @@ struct Facts {
     at_admission: u64,
     validations: usize,
     prediction_ids: Option<[u32; 3]>,
+    prediction_sequence: Vec<u32>,
+    next_prediction: usize,
     output_width: Option<usize>,
     cancel_after_stops: Option<GenerationCancellationToken>,
     cancel_after_encode: Option<GenerationCancellationToken>,
+    empty_preparation_options: usize,
+    fail_step: bool,
 }
 struct PreparationControl(Rc<RefCell<Facts>>);
 impl Drop for PreparationControl {
     fn drop(&mut self){self.0.borrow_mut().preparation_control_drops+=1;}
 }
 #[derive(Clone)]
-struct Backend {
+struct Ordinary;
+
+#[derive(Clone)]
+struct Backend<M: Clone + 'static = Ordinary> {
+    mode: std::marker::PhantomData<M>,
     pool: WorkingMemoryPool,
     facts: Rc<RefCell<Facts>>,
     execution: InferenceExecutionIdentity,
@@ -58,8 +66,8 @@ struct Token {
     receipt: InferenceTextStepReceipt,
 }
 struct Done;
-struct NoTensorPrefill<'a>(&'a Backend);
-impl eredu_runtime::prefill::PrefillExecutor for NoTensorPrefill<'_> {
+struct NoTensorPrefill<'a, M: Clone + 'static>(&'a Backend<M>);
+impl<M: Clone + 'static> eredu_runtime::prefill::PrefillExecutor for NoTensorPrefill<'_, M> {
     type Output = u32;
     type Completion = Done;
     type Error = WorkingMemoryError;
@@ -73,8 +81,12 @@ impl eredu_runtime::prefill::PrefillExecutor for NoTensorPrefill<'_> {
         // The synchronous fixture has no tensor work. The real shared driver
         // still selects state-only chunks and waits for its exact completion.
         Ok(Submission {
-            output: (chunk.output != OutputDemand::StateOnly)
-                .then_some(self.0.facts.borrow().prediction_ids.map_or(0, |ids| ids[0])),
+            output: (chunk.output != OutputDemand::StateOnly).then(|| {
+                let mut facts = self.0.facts.borrow_mut();
+                facts.next_prediction = 1;
+                facts.prediction_sequence.first().copied()
+                    .unwrap_or_else(|| facts.prediction_ids.map_or(0, |ids| ids[0]))
+            }),
             completion: Done,
         })
     }
@@ -94,7 +106,7 @@ impl Completion for Done {
         Ok(())
     }
 }
-impl BackendProvider for Backend {
+impl<M: Clone + 'static> BackendProvider for Backend<M> {
     type ModelConfig = ();
     type Model = ();
     type Session = Session;
@@ -119,7 +131,7 @@ impl BackendProvider for Backend {
         WorkingMemoryError::IdentityMismatch
     }
 }
-impl BackendSession<Backend> for Session {
+impl<M: Clone + 'static> BackendSession<Backend<M>> for Session {
     type PrefillInput = ();
     type DecodeInput = Token;
     type Output = Token;
@@ -129,19 +141,19 @@ impl BackendSession<Backend> for Session {
     }
     fn prefill(
         &mut self,
-        _: &Backend,
+        _: &Backend<M>,
         _: (),
     ) -> Result<Submission<Token, Done>, WorkingMemoryError> {
         unreachable!("permitted shared driver only")
     }
     fn decode(
         &mut self,
-        _: &Backend,
+        _: &Backend<M>,
         _: Token,
     ) -> Result<Submission<Token, Done>, WorkingMemoryError> {
         unreachable!("permitted shared driver only")
     }
-    fn observe_output(&self, _: &Backend, _: &Token) -> Result<ObservationSet, WorkingMemoryError> {
+    fn observe_output(&self, _: &Backend<M>, _: &Token) -> Result<ObservationSet, WorkingMemoryError> {
         Ok(ObservationSet::default())
     }
 }
@@ -216,7 +228,25 @@ fn quote(
         .unwrap()
         .into_incremental()
 }
-impl TextGenerationBackend for Backend {
+impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
+    fn text_execution_control_support(_: &ModelRuntime<Self>) -> eredu_core::execution_control::ControlSupport<&'static str> {
+        // This fixture executes the actual completed-token ordinary machine;
+        // there are no native submissions or asynchronous pending tensors.
+        eredu_core::execution_control::ControlSupport::Supported
+    }
+
+    fn prepare_shared_token_filter(runtime: &ModelRuntime<Self>, factory: impl FnOnce() -> TokenFilter)
+        -> Result<SharedTokenFilter, BackendFailure> {
+        runtime.backend().pool.prepare_shared_token_filter(factory).map_err(memory)
+    }
+    fn prepare_shared_controller_bytes(runtime: &ModelRuntime<Self>, factory: impl FnOnce() -> Vec<u8>)
+        -> Result<SharedControllerBytes, BackendFailure> {
+        runtime.backend().pool.prepare_shared_controller_bytes(factory).map_err(memory)
+    }
+    fn prepare_shared_controller_declaration<T: ControllerDeclarationData>(runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Result<T, BackendFailure>) -> Result<SharedControllerDeclaration, BackendFailure> {
+        runtime.backend().pool.prepare_shared_controller_declaration(factory).map_err(memory)
+    }
     type TextPreparation = Rc<Preparation>;
     type TextPreparationControl = Rc<PreparationControl>;
     type TextStepPermit = OriginalStep;
@@ -246,7 +276,12 @@ impl TextGenerationBackend for Backend {
         options: Option<&TextPreparationOptions>,
         claim: &GenerationSequencePreparation<'_, '_>,
     ) -> Result<Rc<Preparation>, BackendFailure> {
-        assert!(options.is_none());
+        if let Some(options) = options {
+            if options.capture.is_some() || options.interventions.is_some() {
+                return Err(memory(WorkingMemoryError::UnknownBound));
+            }
+            runtime.backend().facts.borrow_mut().empty_preparation_options += 1;
+        }
         let TextPreparationInput::OriginalTokenIds(plan) = input else {
             panic!("exact borrowed input required")
         };
@@ -254,18 +289,13 @@ impl TextGenerationBackend for Backend {
         let b = runtime.backend();
         b.facts.borrow_mut().order.push("admit");
         b.facts.borrow_mut().at_admission = b.pool.used_bytes().unwrap();
-        let controller = if controller_input
-            .inference_storage()
-            .original_token_domain()
-            .is_some()
-        {
-            let workspace = controller_input
-                .inference_workspace(claim.request().max_new_tokens() as u64)
-                .unwrap();
+        let controller = if let Some(workspace) = controller_input
+            .inference_workspace(claim.request().max_new_tokens() as u64) {
             let storage = ControllerStorageContract::inspect_original_sequence(
                 controller_input,
                 workspace,
                 &b.pool,
+                &b.execution,
                 claim,
             )?;
             let contract = TextControllerContract::from_workspace(
@@ -277,7 +307,7 @@ impl TextGenerationBackend for Backend {
         } else {
             None
         };
-        let mut decoder = OriginalGenerationDecoderSource::take_original_for_pool(claim, &b.pool)?;
+        let mut decoder = OriginalGenerationDecoderSource::take_original(claim, &b.pool)?;
         let g = InferenceGeometry {
             batch_size: 1,
             cached_positions: 0,
@@ -288,7 +318,8 @@ impl TextGenerationBackend for Backend {
         };
         let mask_bytes = controller
             .as_ref()
-            .map_or(0, |(_, contract)| contract.filter_capacity_bytes());
+            .map_or(0, |(_, contract)| contract.filter_capacity_bytes()
+                .checked_add(contract.additional_host_bytes()).expect("finite fixture controller workspace"));
         let original = quote(&b.pool, g, mask_bytes);
         let controls = PreparedTextControlWorkspace::prepare_sequence(
             claim,
@@ -335,7 +366,7 @@ impl TextGenerationBackend for Backend {
             require_complete_estimate: true,
         };
         let execution = b.execution.clone();
-        let (_, reservation, accepted) = plan_prefill_incremental_with_capacity(
+        let (reservation, accepted) = plan_prefill_incremental_with_capacity(
             &execution,
             &b.pool,
             &caps,
@@ -351,10 +382,10 @@ impl TextGenerationBackend for Backend {
             .map_err(memory)?;
         drop(witness);
         b.facts.borrow_mut().held = owner.protected_host_bytes();
-        let sequence = owner
-            .take_generation_sequence_bank()
-            .unwrap()
-            .with_decoder_source(&mut decoder)?;
+        let mut sequence = owner.take_generation_sequence_bank().unwrap();
+        if decoder.is_some() {
+            sequence = sequence.with_decoder_source(&mut decoder)?;
+        }
         if let Some((storage, _)) = &controller {
             storage
                 .prepare_original_source(controller_input, &run, &reservation)
@@ -475,13 +506,16 @@ impl TextGenerationBackend for Backend {
         })
     }
     fn begin_text_step<C: TokenFilterController>(
-        _: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self>,
         p: &Rc<Preparation>,
         _: &(),
         controller: &C,
         input: PendingTextInput<&(), &Token>,
         context: &TextStepContext,
     ) -> Result<OriginalStep, WorkingMemoryError> {
+        if runtime.backend().facts.borrow().fail_step {
+            return Err(WorkingMemoryError::CompletionUnavailable);
+        }
         let input = match input {
             PendingTextInput::Prefill(_) => PendingTextInput::Prefill(()),
             PendingTextInput::Decode(token) => PendingTextInput::Decode(&token.receipt),
@@ -521,13 +555,15 @@ impl TextGenerationBackend for Backend {
         let (_, output) = driver
             .run_final(&mut NoTensorPrefill(runtime.backend()))
             .expect("the synchronous no-tensor fixture completes every admitted chunk");
-        Ok(output.map(|id| Submission {
+        Ok(output.map(|id| {
+            assert!(decision.filter().allows(id), "scripted prefill token {id} must satisfy the actual controller mask");
+            Submission {
             output: Token {
                 id,
                 receipt: step.receipt(),
             },
             completion: Done,
-        }))
+        }}))
     }
     fn submit_text_decode_permitted(
         runtime: &mut ModelRuntime<Self>,
@@ -542,16 +578,15 @@ impl TextGenerationBackend for Backend {
         Ok(Submission {
             output: Token {
                 id: {
-                    let ids = runtime
-                        .backend()
-                        .facts
-                        .borrow()
-                        .prediction_ids
-                        .unwrap_or([0, 8, 0]);
-                    if token.id == ids[0] {
-                        ids[1]
+                    let mut facts = runtime.backend().facts.borrow_mut();
+                    if !facts.prediction_sequence.is_empty() {
+                        let id = facts.prediction_sequence[facts.next_prediction];
+                        facts.next_prediction += 1;
+                        assert!(decision.filter().allows(id), "scripted decode token {id} must satisfy the actual controller mask");
+                        id
                     } else {
-                        ids[2]
+                        let ids = facts.prediction_ids.unwrap_or([0, 8, 0]);
+                        if token.id == ids[0] { ids[1] } else { ids[2] }
                     }
                 },
                 receipt: step.receipt(),
@@ -576,7 +611,7 @@ impl TextGenerationBackend for Backend {
         unreachable!("permitted")
     }
 }
-impl LoadedDecodeSourceBackend for Backend {
+impl<M: Clone + 'static> LoadedDecodeSourceBackend for Backend<M> {
     fn compile_loaded_decode_source(
         runtime: &ModelRuntime<Self>,
         plan: eredu_text::decoder_storage::DecodeCompilePlan<'_>,
@@ -588,7 +623,7 @@ impl LoadedDecodeSourceBackend for Backend {
             .map_err(memory)
     }
 }
-impl OriginalStopSourceBackend for Backend {
+impl<M: Clone + 'static> OriginalStopSourceBackend for Backend<M> {
     fn compile_original_stop_source(
         runtime: &ModelRuntime<Self>,
         plan: eredu_text::stop_storage::StopCompilePlan<'_>,
@@ -611,10 +646,16 @@ fn bare_runtime() -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPo
 fn bare_runtime_with_capacity(
     capacity: u64,
 ) -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
+    bare_runtime_with_capacity_for::<Ordinary>(capacity)
+}
+fn bare_runtime_with_capacity_for<M: Clone + 'static>(
+    capacity: u64,
+) -> (ModelRuntime<Backend<M>>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
     let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
     let facts = Rc::new(RefCell::new(Facts::default()));
     let runtime = ModelRuntime::prepare(
         Backend {
+            mode: std::marker::PhantomData,
             pool: pool.clone(),
             facts: facts.clone(),
             execution: InferenceExecutionIdentity::default(),
@@ -623,24 +664,6 @@ fn bare_runtime_with_capacity(
     )
     .unwrap();
     (runtime, facts, pool)
-}
-fn setup() -> (LoadedModel<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
-    let (runtime, facts, pool) = bare_runtime();
-    let tokenizer=ChatTokenizer::from_bytes(r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":15,"content":"added","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"é":8,"[UNK]":1},"unk_token":"[UNK]"}}"#.as_bytes()).unwrap();
-    let model = LoadedModel::from_runtime(
-        runtime,
-        tokenizer,
-        LoadedTextModelConfig {
-            model_family: ModelKind::Llama,
-            effective_model_type: "llama".into(),
-            model_id: "original-input".into(),
-            chat_template: None,
-            eos_token_ids: vec![],
-            checkpoint_generation_config: None,
-        },
-    )
-    .unwrap();
-    (model, facts, pool)
 }
 fn config() -> TextGenerationConfig {
     TextGenerationConfig::new(
@@ -653,108 +676,6 @@ fn config() -> TextGenerationConfig {
         )
         .unwrap(),
     )
-}
-#[test]
-fn actual_private_facade_uses_original_input_source_banks_and_same_cursor_readiness() {
-    for explicit_steps in [false, true] {
-        let (mut model, facts, pool) = setup();
-        model.prepare_compiled_decoder().unwrap();
-        let stops = model.compile_request_stops(&[]).unwrap();
-        let decoder = model
-            .compiled_plain_decoder_input(&stops, 3, false)
-            .unwrap()
-            .unwrap();
-        let mut ids = vec![0, 8, 1];
-        let (mut source, mut cursor) = model
-            .start_original_plain_tokens(&ids, config(), &decoder)
-            .unwrap();
-        ids.fill(1);
-        assert_eq!(facts.borrow().ids, [0, 8, 1]);
-        assert_eq!(
-            facts.borrow().order,
-            ["admit", "bind", "input+R", "prompt", "sampling"]
-        );
-        let cancellation = GenerationCancellationToken::new();
-        let mut text = String::new();
-        let mut token_address = None;
-        loop {
-            cursor = cursor
-                .advance_plain(&mut source, &cancellation, &mut |event| {
-                    if let GenerationPlainTextEvent::TextDelta(delta) = event {
-                        text.push_str(delta)
-                    }
-                })
-                .unwrap();
-            if token_address.is_none() {
-                token_address = Some(cursor.token_ids().as_ptr());
-            }
-            if explicit_steps {
-                assert_eq!(cursor.token_ids().as_ptr(), token_address.unwrap());
-            }
-            if cursor.finish_reason().is_some() {
-                break;
-            }
-        }
-        assert_eq!(cursor.token_ids(), [0, 8, 0]);
-        assert_eq!(text, "hello é hello");
-        let (ids, _) = cursor.into_tokens().unwrap();
-        assert_eq!(ids.as_ptr(), token_address.unwrap());
-        let order = facts.borrow().order.clone();
-        assert_eq!(order[5], "delivery");
-        assert_eq!(order[6], "submit");
-        assert_eq!(order.iter().filter(|&&phase| phase == "submit").count(), 5);
-        let held = facts.borrow().held;
-        drop(source);
-        drop((decoder, stops, model));
-        assert_eq!(pool.used_bytes().unwrap(), held);
-        drop(ids);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
-}
-#[test]
-fn facade_borrowed_membership_short_admission_and_peer_startup_failures_precede_work() {
-    for stage in [Stage::Admission, Stage::Prompt, Stage::Sampling] {
-        let (mut model, facts, pool) = setup();
-        model.prepare_compiled_decoder().unwrap();
-        let stops = model.compile_request_stops(&[]).unwrap();
-        let decoder = model
-            .compiled_plain_decoder_input(&stops, 3, false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.original_token_plan(&[0, 8]).unwrap().tokens(), [0, 8]);
-        assert!(model.original_token_plan(&[7]).is_err()); // sparse hole
-                                                           // Use the actual added reverse ID, not the configuration's requested ID.
-        let added = model.tokenizer.token_to_id("added").unwrap();
-        assert!(model.original_token_plan(&[added]).is_ok());
-        assert!(facts.borrow().order.is_empty());
-        facts.borrow_mut().reject = Some(stage);
-        assert!(model
-            .start_original_plain_tokens(&[0, 8], config(), &decoder)
-            .is_err());
-        assert!(!facts.borrow().order.contains(&"submit"));
-        assert_eq!(
-            facts.borrow().ids.len(),
-            if stage == Stage::Admission { 0 } else { 2 }
-        );
-        drop((decoder, stops, model));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
-    let (mut model, facts, pool) = setup();
-    model.prepare_compiled_decoder().unwrap();
-    let stops = model.compile_request_stops(&[]).unwrap();
-    let decoder = model
-        .compiled_plain_decoder_input(&stops, 3, false)
-        .unwrap()
-        .unwrap();
-    let cold = pool.used_bytes().unwrap();
-    facts.borrow_mut().short = true;
-    assert!(model
-        .start_original_plain_tokens(&[0, 8], config(), &decoder)
-        .is_err());
-    assert_eq!(facts.borrow().order, ["admit"]);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
-    drop((decoder, stops, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 mod original_chat;
@@ -784,18 +705,23 @@ impl OriginalStep {
         Ok(())
     }
 }
-impl OriginalTokenizerBackend for Backend {
-    fn prepare_original_speculative_semantic(runtime: &ModelRuntime<Self>, source: &OriginalTokenizer,
-        capacity: u64) -> Result<OriginalSpeculativeSemanticPreparation, SpeculativeOutputError> {
+impl<M: Clone + 'static> OriginalTokenizerBackend for Backend<M> {
+    fn validate_semantic_source(runtime: &ModelRuntime<Self>, source: &PreparedSemanticSource)
+        -> Result<(), TokenInputRejection> {
+        source.validate(&runtime.backend().pool, &runtime.backend().execution)
+            .map_err(|_| TokenInputRejection::IdentityMismatch)
+    }
+    fn prepare_semantic_source(runtime: &ModelRuntime<Self>, source: &OriginalTokenizer,
+        capacity: u64) -> Result<PreparedSemanticSource, SpeculativeOutputError> {
         source.validate_pool(&runtime.backend().pool).map_err(|_| SpeculativeOutputError::Storage("foreign fixture source"))?;
         runtime.backend().facts.borrow_mut().speculative_sources += 1;
-        OriginalSpeculativeSemanticPreparation::new(source, &runtime.backend().execution, capacity)
+        PreparedSemanticSource::new(source, &runtime.backend().execution, capacity)
     }
-    fn prepare_original_speculative_prompt(runtime: &ModelRuntime<Self>, preparation: &OriginalSpeculativeSemanticPreparation,
-        encoded: &OriginalEncodedTokenIds, _: Option<std::num::NonZeroU64>) -> Result<(), BackendFailure> {
+    fn prepare_semantic_prompt(runtime: &ModelRuntime<Self>, preparation: &PreparedSemanticSource,
+        input: &eredu_core::TokenIdsInputPlan<'_>, _: Option<std::num::NonZeroU64>) -> Result<(), BackendFailure> {
         preparation.validate(&runtime.backend().pool, &runtime.backend().execution).map_err(memory)?;
-        assert!(encoded.matches_source(preparation.tokenizer()));
-        runtime.backend().facts.borrow_mut().speculative_prompts.push(encoded.ids().to_vec());
+        assert!(input.tokens().iter().all(|&id| preparation.tokenizer().generation_domain().unwrap().allows(id)));
+        runtime.backend().facts.borrow_mut().speculative_prompts.push(input.tokens().to_vec());
         Ok(()) // This neutral fixture has no tensor payload or native input work.
     }
     fn prepare_original_text_source_budget(
@@ -863,15 +789,15 @@ impl OriginalTokenizerBackend for Backend {
         }
         Ok(encoded)
     }
-    fn compile_original_tokenizer_file_for_generation(
+    fn compile_original_tokenizer_source_for_generation(
         runtime: &ModelRuntime<Self>,
-        read: eredu_checkpoint::artifact::PreparedArtifactFileRead,
-    ) -> Result<OriginalTokenizer, OriginalTextSourceError> {
+        input: eredu_runtime::working_memory::OriginalTokenizerInput<'_>,
+    ) -> Result<OriginalTokenizer, OriginalTokenizerSourceError> {
         runtime
             .backend()
             .pool
-            .compile_tokenizer_file_for_generation(read)
-            .map_err(OriginalTextSourceError::from)
+            .compile_tokenizer_source_for_generation(input)
+            .map_err(OriginalTokenizerSourceError::from)
     }
     fn encode_original_tokenizer_ids(
         runtime: &ModelRuntime<Self>,
@@ -895,3 +821,4 @@ impl OriginalTokenizerBackend for Backend {
 }
 
 mod speculative_batch;
+mod prepared_semantic;

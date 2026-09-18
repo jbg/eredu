@@ -99,14 +99,14 @@ fn registered_current_roots(
     use crate::composition::mlx::speculative::{RegisteredTensorSource,retain_external_evidence_for_roots,tensor_sources};
     use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
     use eredu_core::HostPreparationAuthority;
-    use eredu_nn::workspace::WorkspaceMetadataFunding;
+    use eredu_nn::workspace::HostMetadataFunding;
     let funding=pair.metadata_funding();
     let retain=|copy:&crate::backend::array_copy::RegisteredArrayCopy|{
         let proof=RegisteredTensorSource::from_copy(copy,pair.request().source_identity(),environment.stream(),funding).unwrap();
         assert!(proof.matches_completed_stream(environment.stream(),funding).unwrap());
         assert!(!proof.matches_completed_stream(other_stream,funding).unwrap());
         funding.reserve_metadata(PreparedEmbeddedEvidence::retained_control_bytes::<RegisteredTensorSource>().unwrap()
-            +HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().unwrap()).unwrap();
+            +HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap()).unwrap();
         PreparedEmbeddedEvidence::from_prepared(proof,HostPreparationAuthority::retain(funding.clone()))
     };
     let first_proof=retain(first);let second_proof=retain(second);
@@ -307,8 +307,31 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                             .err()
                             .expect("one role's completed source cannot cover another backing");
                         identity_mismatch(&foreign_refusal);
+                        // A retained ingress can hold an earlier completed
+                        // backing while another span produces the current
+                        // cache. Its later alias must retain the earlier
+                        // native budget, not be attributed to the new span.
+                        let (next_budget, next_account) = other_completed.unwrap()
+                            .array_source_account(foreign_leaf, funding)?;
+                        let eredu_runtime::working_memory::CompletedWorkspaceSourceAccount::Model(next_account)
+                            = next_account else { panic!("model cache has model custody") };
+                        let retained = crate::backend::runtime::cache::state::CompletedResidentSource
+                            ::capture_array_sources_with_priors(
+                                |visit| { visit(foreign_leaf); visit(leaf); },
+                                &[completed_source], next_budget, next_account, funding,
+                            )?;
+                        let installed_alias = crate::backend::runtime::cache::state::CompletedResidentSource
+                            ::capture_array_sources_with_priors(
+                                |visit| visit(leaf), &[&retained], next_budget, next_account, funding,
+                            )?;
+                        let (original_budget, original_account) = completed_source.array_source_account(leaf, funding)?;
+                        let (alias_budget, alias_account) = installed_alias.array_source_account(leaf, funding)?;
+                        assert!(original_account.same_account(alias_account));
+                        assert!(original_budget.inspect_array(leaf).unwrap().is_some());
+                        assert!(alias_budget.inspect_array(leaf).unwrap().is_some());
+                        assert!(matches!(next_budget.inspect_array(leaf), Err(safemlx::OriginalBufferCause::ForeignDomain)));
                         let first = IsolatedArrayCopy::new(leaf).copy_completed(
-                            completed,
+                            Some(&installed_alias),
                             &environment,
                             roots,
                             mechanisms,

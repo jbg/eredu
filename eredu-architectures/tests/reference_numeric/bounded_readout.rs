@@ -99,7 +99,7 @@ where
 {
     let context = NumericContext::default();
     let architecture = create(&context);
-    let layout = architecture.state_layout().unwrap();
+    let layout = architecture.state_layout(None).unwrap();
     let state = || {
         DeviceState::create(layout.clone(), |_, policy| {
             Ok::<_, Error>(NumericHybridLayerState::new(policy))
@@ -915,7 +915,8 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 }
                 context.projections.lock().unwrap().clear();
                 let actual = session
-                    .try_prefill_unbudgeted_source(
+                    .try_prefill_source_cancellable(
+                        None,
                         Some([1, (5 - cached) as u64]),
                         std::num::NonZeroU64::new(chunk),
                         |geometry| {
@@ -927,11 +928,14 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                             )
                             .map(Some)
                         },
+                        &eredu_core::GenerationCancellationToken::new(),
                         context,
                         &mut eredu_runtime::NoopObserver,
                     )
-                    .map_err(|e| e.to_string())?
-                    .unwrap();
+                    .map_err(|e| e.to_string())?;
+                let eredu_runtime::replicated_session::PrefillSourceOutcome::Complete(actual) = actual else {
+                    return Err("ordinary text source did not complete".into());
+                };
                 assert_tensor_close(
                     &actual,
                     &expected_prefill,
@@ -1760,8 +1764,9 @@ where
     if !stepped {
         let admitted = A::admit_prepared_input(admission, input, &NumericInputInspector)
             .map_err(|error| error.to_string())?;
-        return session
-            .try_prefill_unbudgeted_source(
+        let outcome = session
+            .try_prefill_source_cancellable(
+                None,
                 Some(admitted.decoder_shape()),
                 std::num::NonZeroU64::new(chunk),
                 |geometry| {
@@ -1772,11 +1777,15 @@ where
                         NumericInputInspector,
                     )
                 },
+                &eredu_core::GenerationCancellationToken::new(),
                 context,
                 &mut eredu_runtime::NoopObserver,
             )
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "ordinary composite text source was not selected".into());
+            .map_err(|error| error.to_string())?;
+        return match outcome {
+            eredu_runtime::replicated_session::PrefillSourceOutcome::Complete(output) => Ok(output),
+            _ => Err("ordinary composite text source did not complete".into()),
+        };
     }
     parallel_boundary::scheduled::<A, D>(
         session,

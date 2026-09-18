@@ -53,7 +53,7 @@ where
         &self,
     ) -> Result<ResidentResetSource<'_, S>, crate::working_memory::WorkingMemoryError>
     where
-        S: crate::working_memory::ResidentKvResetState,
+        S: crate::working_memory::ResidentTableResetState,
         M::State: crate::working_memory::ResidentResetProjection<S>,
     {
         use crate::working_memory::{ResidentResetProjection, WorkingMemoryError};
@@ -86,7 +86,7 @@ where
         ),
     >
     where
-        S: crate::working_memory::ResidentKvResetState,
+        S: crate::working_memory::ResidentTableResetState,
         M::State: crate::working_memory::ResidentResetProjection<S>,
     {
         use crate::working_memory::{

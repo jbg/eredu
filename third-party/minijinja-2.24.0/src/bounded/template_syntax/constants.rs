@@ -65,7 +65,7 @@
 //! ```
 #![forbid(unsafe_code)]
 use super::ParsedTemplate;
-use crate::bounded::expression::store::{Joined, NodeId, SegmentKind, Sequence};
+use crate::bounded::expression::store::{NodeId, SegmentKind, Sequence};
 use crate::compiler::fold::{self, Continuation, View};
 use crate::compiler::tokens::Span;
 use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};

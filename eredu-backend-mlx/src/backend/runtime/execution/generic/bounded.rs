@@ -4,6 +4,12 @@ use super::*;
 use eredu_core::Completion;
 use eredu_runtime::{OrderedLayerwiseCompletion, SubmissionBackend};
 
+#[derive(Clone, Copy)]
+pub(super) enum AcquisitionRecovery {
+    SingleAttempt,
+    AfterRetirement,
+}
+
 impl<U, P> LayerwisePolicy<MlxNeuralBackend, U> for MlxLayerwisePolicy<U, P>
 where
     U: Parameterized<MlxTensor> + 'static,
@@ -146,13 +152,17 @@ where
 
     fn begin(&mut self, initial: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
         let original = self.original_operation_projection().is_some();
-        let background = self.original_operation_projection().map(|view| view.access()?.has_background()).transpose()?.unwrap_or(false);
+        let background = self
+            .original_operation_projection()
+            .map(|view| view.access()?.has_background())
+            .transpose()?
+            .unwrap_or(false);
         if self.residency.admitted_disk_route_active()
             && (!self.dense_window_matches_layout()
-                || !self
-                    .dense
-                    .as_ref()
-                    .is_some_and(|dense| dense.controller.is_foreground() || (background && dense.controller.is_source_prepared())))
+                || !self.dense.as_ref().is_some_and(|dense| {
+                    dense.controller.is_foreground()
+                        || (background && dense.controller.is_source_prepared())
+                }))
         {
             return Err(Error::Other(Box::new(
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -265,7 +275,12 @@ where
                 address.index()
             ))));
         }
-        let has_background = original.as_ref().map(|view| view.has_background()).transpose().map_err(LayerwiseAcquireError::Policy)?.unwrap_or(false);
+        let has_background = original
+            .as_ref()
+            .map(|view| view.has_background())
+            .transpose()
+            .map_err(LayerwiseAcquireError::Policy)?
+            .unwrap_or(false);
         if original.is_some()
             && self.dense.as_ref().is_some_and(|dense| {
                 !dense.controller.is_source_prepared()
@@ -288,13 +303,82 @@ where
         let admitted = self
             .prepare_admitted_disk_window(index, address)
             .map_err(LayerwiseAcquireError::Policy)?;
-        let mut unloaded = Some(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
+        let recovery = if original.is_some() || admitted {
+            AcquisitionRecovery::SingleAttempt
+        } else {
+            AcquisitionRecovery::AfterRetirement
+        };
+        let unloaded = build(stream).map_err(LayerwiseAcquireError::Architecture)?;
         self.reap_completed()
             .map_err(LayerwiseAcquireError::Policy)?;
-        if let (Some(original), Some((prepared, observer))) = (original, prepared) {
-            self.drain_one().map_err(LayerwiseAcquireError::Policy)?;
-            self.trim_device_window(index, address)
-                .map_err(LayerwiseAcquireError::Policy)?;
+        let finish = |this: &mut Self,
+                      transfer: MlxUnitTransfer,
+                      attempt: &mut Option<OriginalResidencyAttempt>|
+         -> Result<Self::Lease, Error> {
+            if let MlxUnitTransfer::Ordinary {
+                _transfer: transfer,
+            } = &transfer
+            {
+                match &original {
+                    Some(source) => source.with_residency(
+                        attempt.as_mut().expect("source-funded indexed attempt"),
+                        |slots, current| {
+                            transfer
+                                .order_after_original(stream, slots.observations, current)
+                                .map_err(Error::from)
+                        },
+                    )?,
+                    None => transfer.order_after(stream)?,
+                }
+            }
+            if original.is_some() {
+                if let Some(dense) = &this.dense {
+                    dense.controller.observe_group(
+                        &this.residency,
+                        this.layout
+                            .group_id(address.group())
+                            .expect("validated group")
+                            .as_str(),
+                        dense.prefill,
+                    )?;
+                }
+            }
+            let unit = MlxModule::new(unloaded);
+            let mut lease = match prepared {
+                Some((prepared, observer)) => {
+                    MlxUnitLease::from_prepared(prepared, unit, transfer, observer)
+                }
+                None => MlxUnitLease::new(unit, transfer)?,
+            };
+            let (unit, transfer) = lease.population_parts();
+            match &original {
+                Some(source) => {
+                    this.populator
+                        .populate_original(unit, transfer, source.binding_row_limit()?)?
+                }
+                None => this.populator.populate(unit, transfer)?,
+            }
+            Ok(lease)
+        };
+        let result = (|| -> Result<Self::Lease, Error> {
+            // The next window may retire the preceding unit only after its
+            // actual consumer and transfer complete, on either source path.
+            self.drain_one()?;
+            if self.dense.is_some() && original.is_none() {
+                let transfer = self.acquire_dense_transfer(index, address, recovery, stream)?;
+                return finish(
+                    self,
+                    MlxUnitTransfer::Dense {
+                        _transfer: transfer,
+                    },
+                    &mut residency_attempt,
+                );
+            }
+
+            // The ordinary dense scheduler replaces its named protection
+            // before invoking this same manager trim. Original indexed windows
+            // have no ordinary scheduler guard to replace here.
+            self.trim_device_window(index, address)?;
             let window = self
                 .layout
                 .window_range(
@@ -302,202 +386,75 @@ where
                     std::num::NonZeroUsize::new(self.window_depth).expect("validated window depth"),
                 )
                 .expect("validated unit address has a window");
-            let requests = original
-                .requests(window)
-                .map_err(LayerwiseAcquireError::Policy)?;
-            // One explicit original attempt. A capacity refusal is terminal for
-            // this attempt; no unseen ordinary retry can consume extra slots.
-            let attempt = residency_attempt
-                .as_mut()
-                .expect("original acquire owns its indexed attempt");
-            let finish = |transfer: crate::backend::runtime::residency::manager::ResidentTransfer, attempt: &mut super::original_operations::OriginalResidencyAttempt| -> Result<MlxUnitLease<U>, Error> {
-            original
-                .with_residency(attempt, |slots, current| {
-                    transfer
-                        .order_after_original(stream, slots.observations, current)
-                        .map_err(Error::from)
-                })
-                ?;
-            if let Some(dense) = &self.dense {
-                dense
-                    .controller
-                    .observe_group(
-                        &self.residency,
-                        self.layout
-                            .group_id(address.group())
-                            .expect("validated group")
-                            .as_str(),
-                        dense.prefill,
+            let requests = match &original {
+                Some(source) => std::borrow::Cow::Borrowed(source.requests(window)?),
+                None => std::borrow::Cow::Owned(
+                    self.unit_ids[window]
+                        .iter()
+                        .cloned()
+                        .map(|id| (id, 1))
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            if has_background {
+                let source = original
+                    .as_ref()
+                    .expect("background source is authenticated");
+                // Keep promotion, ordering and population inside this attempt:
+                // failure must fence the real background read coordinator.
+                return source.with_background_window(index, |reads, window| {
+                    let transfer = source.with_host_and_device(
+                        index,
+                        residency_attempt
+                            .as_mut()
+                            .expect("source-funded indexed attempt"),
+                        |host, device, current| {
+                            window
+                                .promote(&self.residency, reads, &requests, host, device, current)
+                                .map_err(Error::from)
+                        },
+                    )?;
+                    finish(
+                        self,
+                        MlxUnitTransfer::Ordinary {
+                            _transfer: transfer,
+                        },
+                        &mut residency_attempt,
                     )
-                    ?;
+                });
             }
-            let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
-            let mut lease = MlxUnitLease::from_prepared(
-                prepared,
-                unit,
+            // Funded attempts are finite. Only ordinary execution can retry,
+            // and only after retiring an actual pending completion owner.
+            let transfer = self.recover_acquisition(recovery, |this| match &original {
+                Some(source) => source.with_residency(
+                    residency_attempt
+                        .as_mut()
+                        .expect("source-funded indexed attempt"),
+                    |slots, current| {
+                        this.residency
+                            .acquire_many_with_original_transfer(
+                                &requests,
+                                MemoryTier::Device,
+                                slots,
+                                current,
+                            )
+                            .map_err(Error::from)
+                    },
+                ),
+                None => this
+                    .residency
+                    .acquire_many_with_transfer(&requests, MemoryTier::Device)
+                    .map_err(Error::from),
+            })?;
+            finish(
+                self,
                 MlxUnitTransfer::Ordinary {
                     _transfer: transfer,
                 },
-                observer,
-            );
-            let (unit, transfer) = lease.population_parts();
-            self.populator
-                .populate_original(
-                    unit,
-                    transfer,
-                    original
-                        .binding_row_limit()
-                        ?,
-                )
-                ?;
-            Ok(lease)
-            };
-            let lease = if has_background {
-                original.with_background_window(index, |reads, window| {
-                    let transfer = original.with_host_and_device(index, attempt, |host, device, current| {
-                        window.promote(&self.residency, reads, requests, host, device, current).map_err(Error::from)
-                    })?;
-                    finish(transfer, attempt)
-                })
-            } else {
-                (|| -> Result<MlxUnitLease<U>, Error> {
-            let transfer = original
-                .with_residency(attempt, |slots, current| {
-                    self.residency
-                        .acquire_many_with_original_transfer(
-                            requests,
-                            MemoryTier::Device,
-                            slots,
-                            current,
-                        )
-                        .map_err(Error::from)
-                })
-                ?;
-                finish(transfer, attempt)
-                })()
-            };
-            return lease.map_err(LayerwiseAcquireError::Policy);
-        }
-        if self.dense.is_some() {
-            let group = address.group();
-            let group_id = self
-                .layout
-                .group_id(group)
-                .expect("validated unit address names its execution group")
-                .as_str();
-            let range = self
-                .layout
-                .group_range(group)
-                .expect("validated unit address has a group range");
-            let dense = self.dense.as_mut().expect("dense policy is active");
-            if dense.groups[group].is_none() {
-                dense.groups[group] = Some(dense.controller.group_guard(&self.residency, group_id));
-            }
-            if dense.windows[group].is_none() {
-                dense.windows[group] = Some(
-                    dense
-                        .controller
-                        .transfer_window(
-                            &self.residency,
-                            group_id,
-                            &self.unit_ids,
-                            range,
-                            dense.prefill,
-                        )
-                        .map_err(LayerwiseAcquireError::Policy)?,
-                );
-            }
-            loop {
-                let refill = self
-                    .dense
-                    .as_mut()
-                    .and_then(|dense| dense.windows[group].as_mut())
-                    .expect("dense forward begins before acquisition")
-                    .refill();
-                match refill {
-                    Ok(()) => break,
-                    Err(_) if !admitted && !self.pending.is_empty() => {
-                        self.drain_one().map_err(LayerwiseAcquireError::Policy)?
-                    }
-                    Err(error) => return Err(LayerwiseAcquireError::Policy(error)),
-                }
-            }
-            let transfer = self
-                .dense
-                .as_mut()
-                .and_then(|dense| dense.windows[group].as_mut())
-                .expect("dense forward begins before acquisition")
-                .next(stream)
-                .map_err(LayerwiseAcquireError::Policy)?;
-            if transfer.index() != index {
-                return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
-                    "dense transfer returned unit {}, expected {index}",
-                    transfer.index()
-                ))));
-            }
-            let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
-            let mut lease = MlxUnitLease::new(
-                unit,
-                MlxUnitTransfer::Dense {
-                    _transfer: transfer,
-                },
+                &mut residency_attempt,
             )
-            .map_err(LayerwiseAcquireError::Policy)?;
-            let (unit, transfer) = lease.population_parts();
-            self.populator
-                .populate(unit, transfer)
-                .map_err(LayerwiseAcquireError::Policy)?;
-            return Ok(lease);
-        }
-        // An ordinary lookahead transfer owns every lease in its window until
-        // the preceding unit's exact completion.  Release that completed
-        // window before requesting the overlapping next window; otherwise an
-        // overlapping in-flight unit would wait for the very transfer guard
-        // retained by `pending` on this thread.
-        self.drain_one().map_err(LayerwiseAcquireError::Policy)?;
-        self.trim_device_window(index, address)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        let window = self
-            .layout
-            .window_range(
-                index,
-                std::num::NonZeroUsize::new(self.window_depth).expect("validated window depth"),
-            )
-            .expect("validated unit address has a window");
-        let requests = self.unit_ids[window]
-            .iter()
-            .cloned()
-            .map(|id| (id, 1))
-            .collect::<Vec<_>>();
-        let transfer = loop {
-            match self
-                .residency
-                .acquire_many_with_transfer(&requests, MemoryTier::Device)
-            {
-                Ok(transfer) => break transfer,
-                Err(_) if !self.pending.is_empty() => {
-                    self.drain_one().map_err(LayerwiseAcquireError::Policy)?
-                }
-                Err(error) => return Err(LayerwiseAcquireError::Policy(error.into())),
-            }
-        };
-        transfer
-            .order_after(stream)
-            .map_err(Error::from)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
-        let mut lease = MlxUnitLease::new(
-            unit,
-            MlxUnitTransfer::Ordinary {
-                _transfer: transfer,
-            },
-        )
-        .map_err(LayerwiseAcquireError::Policy)?;
-        let (unit, transfer) = lease.population_parts();
-        self.populator
-            .populate(unit, transfer)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        Ok(lease)
+        })();
+        result.map_err(LayerwiseAcquireError::Policy)
     }
 
     fn complete<'a, StateValues, ContextValues>(
@@ -551,7 +508,11 @@ where
         self.drain()?;
         if let Some(view) = self.original_operation_projection() {
             if let Some(report) = view.access()?.finish_background_forward()? {
-                self.dense.as_ref().ok_or(Error::PrefillScopeUnavailable)?.controller.record_background(report)?;
+                self.dense
+                    .as_ref()
+                    .ok_or(Error::PrefillScopeUnavailable)?
+                    .controller
+                    .record_background(report)?;
             }
         }
         if self.dense.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
@@ -600,5 +561,104 @@ where
             result?;
         }
         Ok(())
+    }
+}
+
+impl<U, P> MlxLayerwisePolicy<U, P>
+where
+    U: Parameterized<MlxTensor> + 'static,
+    P: MlxUnitPopulator<U>,
+{
+    fn recover_acquisition<T>(
+        &mut self,
+        recovery: AcquisitionRecovery,
+        mut acquire: impl FnMut(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        loop {
+            match acquire(self) {
+                Ok(value) => return Ok(value),
+                Err(_)
+                    if matches!(recovery, AcquisitionRecovery::AfterRetirement)
+                        && !self.pending_is_empty()? =>
+                {
+                    self.drain_one()?
+                }
+                Err(cause) => return Err(cause),
+            }
+        }
+    }
+
+    fn acquire_dense_transfer(
+        &mut self,
+        index: usize,
+        address: ExecutionUnitAddress,
+        recovery: AcquisitionRecovery,
+        stream: &Stream,
+    ) -> Result<DensePreparedTransfer, Error> {
+        let group = address.group();
+        let group_id = self
+            .layout
+            .group_id(group)
+            .expect("validated unit address names its execution group")
+            .as_str();
+        let range = self
+            .layout
+            .group_range(group)
+            .expect("validated unit address has a group range");
+        let dense = self.dense.as_mut().expect("dense policy is active");
+        // acquire has settled the preceding consumer. A different group's
+        // window can now retire only if every scheduled transfer was consumed.
+        // Keep unconsumed windows intact on rejection; they are still owners.
+        if dense.windows.iter().enumerate().any(|(other, window)| {
+            other != group && window.as_ref().is_some_and(|window| !window.is_exhausted())
+        }) {
+            return Err(Error::Parallel(
+                "dense execution changed groups before consuming its window".into(),
+            ));
+        }
+        for other in 0..dense.windows.len() {
+            if other != group {
+                dense.windows[other].take();
+                if let Some(completed) = dense.groups[other].take() {
+                    completed.complete()?;
+                }
+            }
+        }
+        // All other groups are now idle. Their cached copies do not widen the
+        // selected device window; exact persistent alias owners remain exempt.
+        self.residency
+            .trim_device_units(&self.unit_ids, &self.unit_ids[range.clone()])?;
+        if dense.groups[group].is_none() {
+            dense.groups[group] = Some(dense.controller.group_guard(&self.residency, group_id));
+        }
+        if dense.windows[group].is_none() {
+            dense.windows[group] = Some(dense.controller.transfer_window(
+                &self.residency,
+                group_id,
+                &self.unit_ids[range.clone()],
+                0..range.len(),
+                dense.prefill,
+            )?);
+        }
+        self.recover_acquisition(recovery, |this| {
+            this.dense
+                .as_mut()
+                .and_then(|dense| dense.windows[group].as_mut())
+                .expect("dense forward begins before acquisition")
+                .refill()
+        })?;
+        let transfer = self
+            .dense
+            .as_mut()
+            .and_then(|dense| dense.windows[group].as_mut())
+            .expect("dense forward begins before acquisition")
+            .next(stream)?;
+        if transfer.index() != address.index() {
+            return Err(Error::Parallel(format!(
+                "dense transfer returned unit {}, expected {index}",
+                range.start + transfer.index(),
+            )));
+        }
+        Ok(transfer)
     }
 }

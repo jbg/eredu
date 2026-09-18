@@ -125,7 +125,7 @@ impl PreparedPrefillSource<OrdinaryTextFixture, FakeBackend, State> for Input {
         r.prepared += 1;
         r.events.push(Log::Prepare(chunk.input.start));
         if let Some(id) = &self.failure {
-            return Err(Error::backend_source(Original(id.clone())));
+            return Err(Error::backend_retained_source(Original(id.clone())));
         }
         // This original scalar architecture advances exactly one position.
         assert_eq!(chunk.input.end - chunk.input.start, 1);
@@ -199,7 +199,7 @@ impl ActivationObserver<FakeTensor, Error> for Opening {
                 assert_eq!(v.0.as_ptr(), self.pointer);
                 values.extend_from_slice(&v.0);
             })
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         let mut adapted = Vec::new();
         source
             .with_tensor_adapter(
@@ -211,7 +211,7 @@ impl ActivationObserver<FakeTensor, Error> for Opening {
                     })
                 },
             )
-            .map_err(Error::backend_source)?;
+            .map_err(Error::backend_retained_source)?;
         assert_eq!(
             adapted, values,
             "lexical bridge preserves the borrowed source"
@@ -225,7 +225,7 @@ impl ActivationObserver<FakeTensor, Error> for Opening {
         r.events.push(Log::Open(c.chunk().input.start, values));
         self.epoch = Some(c.epoch());
         if self.fail_at == Some(c.chunk().input.start) {
-            return Err(Error::backend_source(Original(self.identity.clone())));
+            return Err(Error::backend_retained_source(Original(self.identity.clone())));
         }
         Ok(None) // This view does not manufacture a bank, stamp or ticket.
     }
@@ -527,7 +527,7 @@ fn whole_state_inventory_uses_actual_local_slots_independently_of_global_unit_ad
         ))
     })
     .unwrap();
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder").unwrap().into_owned();
     let units = ExecutionUnitLayout::new(&graph, [7]).unwrap();
     // Existing per-unit retention receives a local policy ordinal alongside a
     // global semantic address. Whole-state opening access needs neither guess.

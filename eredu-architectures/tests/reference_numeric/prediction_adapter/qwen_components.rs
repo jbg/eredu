@@ -121,10 +121,10 @@ impl eredu_runtime::RoutedUnitObserver<NumericTensor> for Observe {
 
 struct Parameters(BTreeMap<String, NumericTensor>);
 impl<'a> eredu_nn::ParameterVisitor<'a, NumericTensor> for Parameters {
-    fn visit(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a NumericTensor) {
+    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
         assert!(self
             .0
-            .insert(metadata.id.to_string(), value.clone())
+            .insert(metadata.id().to_string(), value.clone())
             .is_none());
     }
 }

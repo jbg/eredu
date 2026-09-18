@@ -4,7 +4,7 @@ use crate::{
     TensorObservation, TensorObservationData,
     capture::{
         CAPTURE_SCHEMA_VERSION, CaptureHistogram, CaptureOutcome, CapturePayload, CapturePhase,
-        CaptureRecord, CaptureStepOutcome, CaptureUsage, CapturedStep, CapturedStepDelivery,
+        CaptureRecord, CaptureStepOutcome, CaptureUsage, CapturedStep, SharedCapturedStep,
     },
     speculative::{
         SpeculativeActivationCapture, SpeculativeActivationOrigin, SpeculativeActivationPhase,
@@ -86,7 +86,7 @@ fn report(drops: Arc<Mutex<Vec<u8>>>) -> SpeculativePrefillReductions {
         },
     }
 }
-fn envelope(report: SpeculativePrefillReductionsDelivery) -> SpeculativeActivationCapture {
+fn envelope(report: SharedSpeculativePrefillReductions) -> SpeculativeActivationCapture {
     SpeculativeActivationCapture {
         admission_identity: Some("actual-admission".into()),
         invocation: 23,
@@ -94,23 +94,26 @@ fn envelope(report: SpeculativePrefillReductionsDelivery) -> SpeculativeActivati
         phase: SpeculativeActivationPhase::PredictionPrefill,
         prefill_span: None,
         completed: true,
-        captures: CapturedStepDelivery::Legacy(CapturedStep {
-            outcome: CaptureStepOutcome::Committed,
-            phase: CapturePhase::Prefill,
-            invocation: None,
-            prediction_index: 0,
-            records: Vec::new(),
-            partitions: Vec::new(),
-            interventions: Vec::new(),
-            step_usage: CaptureUsage::default(),
-            cumulative_usage: CaptureUsage {
-                captures: 10,
-                retained_bytes: 64,
-                host_bytes: 8192,
-                encoded_bytes: 16384,
+        captures: crate::capture::SharedCapturedStep::retain(
+            CapturedStep {
+                outcome: CaptureStepOutcome::Committed,
+                phase: CapturePhase::Prefill,
+                invocation: None,
+                prediction_index: 0,
+                records: Vec::new(),
+                partitions: Vec::new(),
+                interventions: Vec::new(),
+                step_usage: CaptureUsage::default(),
+                cumulative_usage: CaptureUsage {
+                    captures: 10,
+                    retained_bytes: 64,
+                    host_bytes: 8192,
+                    encoded_bytes: 16384,
+                },
+                capture_seconds: 0.0,
             },
-            capture_seconds: 0.0,
-        }),
+            (),
+        ),
         prefill_reductions: Some(report),
     }
 }
@@ -121,22 +124,22 @@ fn aggregate_delivery_preserves_wire_payload_aliases_and_escaped_custody() {
     let raw = report(drops.clone());
     let rows = raw.records.as_ptr();
     let path = raw.records[0].record.path.as_ptr();
-    let wire = serde_json::to_value(envelope(raw.clone().into())).unwrap();
+    let wire = serde_json::to_value(envelope(
+        SharedSpeculativePrefillReductions::retain(raw.clone(), ()),
+    ))
+    .unwrap();
     let shared = pending.finish(raw);
     assert_eq!(shared.as_reductions().records.as_ptr(), rows);
     let source = shared.clone();
-    let record = envelope(shared.into());
+    let record = envelope(shared);
     assert_eq!(serde_json::to_value(&record).unwrap(), wire);
     let decoded: SpeculativeActivationCapture = serde_json::from_value(wire).unwrap();
-    assert!(matches!(
-        &decoded.prefill_reductions,
-        Some(SpeculativePrefillReductionsDelivery::Legacy(_))
-    ));
+    assert!(decoded.prefill_reductions.is_some());
     assert_eq!(decoded, record);
     drop(decoded);
     let alias = record.clone();
     let reductions = alias.prefill_reductions.as_ref().unwrap();
-    assert!(source.same_storage(reductions.shared().unwrap()));
+    assert!(source.same_storage(reductions));
     assert_eq!(reductions.records[0].record.path.as_ptr(), path);
     assert_eq!(reductions.charged.host_bytes, 4096);
     let mut records = SpeculativeBuffer::try_new_retained(

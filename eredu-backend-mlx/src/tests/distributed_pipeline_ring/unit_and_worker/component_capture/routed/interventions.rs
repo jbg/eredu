@@ -3,7 +3,7 @@ fn verify_loaded_routed_interventions(
     reference: &mut ModelRuntime<MlxBackend<'_>>,
     capture: &eredu_core::capture::AdmittedCapturePlan,
     sampling: eredu_core::ResolvedGenerationConfig,
-    baseline: &[(u32, eredu_core::capture::CapturedStep)],
+    baseline: &[(u32, eredu_core::capture::SharedCapturedStep)],
 ) {
     use eredu_core::{capture::*, intervention::*, TextGenerationBackend as _};
     let discovery = MlxBackend::intervention_discovery(runtime).unwrap();
@@ -100,7 +100,7 @@ fn verify_loaded_routed_interventions(
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
-                    (token, generation.take_captured_step().unwrap().unwrap())
+                    (token, generation.take_captured_delivery().unwrap().unwrap())
                 })
                 .collect::<Vec<_>>()
         };
@@ -173,8 +173,8 @@ fn verify_loaded_routed_interventions(
 }
 
 fn compare_sparse_trials(
-    actual: &[(u32, eredu_core::capture::CapturedStep)],
-    expected: &[(u32, eredu_core::capture::CapturedStep)],
+    actual: &[(u32, eredu_core::capture::SharedCapturedStep)],
+    expected: &[(u32, eredu_core::capture::SharedCapturedStep)],
 ) {
     use eredu_core::capture::*;
     for ((token, actual), (expected_token, expected)) in actual.iter().zip(expected) {

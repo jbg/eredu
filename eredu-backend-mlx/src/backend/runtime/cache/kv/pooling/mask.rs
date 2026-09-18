@@ -33,7 +33,7 @@ fn geometry_error(cause: PoolingMaskGeometryError) -> Exception {
 }
 pub(super) fn neural_error(cause: Exception) -> ComputeError {
     match OriginalScopeObserver::try_current() {
-        Ok(None) => ComputeError::backend_source(cause),
+        Ok(None) => ComputeError::backend_retained_source(cause),
         _ => ComputeError::backend_retained_source(cause),
     }
 }
@@ -104,7 +104,7 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<&Stream>(),
         size_of::<MissingStream>(),
         OriginalScopeObserver::control_bytes()?,
-        ComputeError::retained_source_control_bytes::<Exception>()?,
+        ComputeError::retained_source_construction_bytes::<Exception>()?,
         Exception::retained_source_control_bytes::<OriginalFailure<PoolingMaskGeometryError>>()?,
         Exception::retained_source_control_bytes::<OriginalFailure<MissingStream>>()?,
     ];

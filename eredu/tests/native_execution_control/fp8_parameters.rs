@@ -1,6 +1,6 @@
 //! Loaded FP8 arithmetic and reversible edits through public portable APIs.
 use super::*;
-use eredu_core::{intervention::*, parameters::*, ArchitectureDescriptor, ResidencyPlan};
+use eredu_core::{ArchitectureDescriptor, ResidencyPlan, intervention::*, parameters::*};
 use std::collections::BTreeMap;
 #[path = "../../examples/component_reference_analysis.rs"]
 pub(super) mod analysis;
@@ -16,11 +16,7 @@ fn decode(code: u8) -> f32 {
     } else {
         (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
     };
-    if code & 128 == 0 {
-        v
-    } else {
-        -v
-    }
+    if code & 128 == 0 { v } else { -v }
 }
 fn fp8_fixture() -> (Fixture, serde_json::Value, Tensors, Tensors) {
     fp8_fixture_dimensions(false)
@@ -125,7 +121,12 @@ fn fp8_fixture_dimensions(partial_blocks: bool) -> (Fixture, serde_json::Value, 
 
 pub(super) fn capture<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     architecture: &ArchitectureDescriptor,
@@ -143,7 +144,12 @@ pub(super) fn capture<
 
 fn capture_with_precision<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     architecture: &ArchitectureDescriptor,
@@ -158,7 +164,12 @@ fn capture_with_precision<
 
 fn capture_with_precision_and_selection<
     B: eredu_runtime::execution_control::TextSnapshotBackend
-        + eredu_runtime::execution_control::TextSamplingControlBackend,
+        + eredu_runtime::execution_control::TextSamplingControlBackend
+        + eredu_runtime::working_memory::OriginalChatBackend
+        + eredu_core::TextResumeBackend<
+            ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as eredu_core::execution_control::NativeTextStateBackend>::NativeTextState,
+        >,
 >(
     model: &mut LoadedModel<B>,
     architecture: &ArchitectureDescriptor,
@@ -171,7 +182,7 @@ fn capture_with_precision_and_selection<
 ) {
     model.reset().unwrap();
     let chat = model
-        .prepare_chat(ChatTemplateRequest {
+        .source_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"left"})],
             add_generation_prompt: true,
             ..Default::default()
@@ -282,45 +293,52 @@ fn capture_with_precision_and_selection<
             vec![]
         },
     };
-    let prepared = model
-        .prepare_intervened_token_ids(
-            &chat,
-            vec![1, 2, 5, 7],
-            PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    max_new_tokens: Some(1),
-                    ..Default::default()
-                },
-                seed: 17,
+    let prepared_prefix = vec![1, 2, 5, 7];
+    let prepared_capture = capture;
+    let prepared_trace = TraceLimits {
+        per_record_bytes: 4 << 20,
+        total_bytes: 16 << 20,
+    };
+    let prepared_intervention = intervention;
+    let mut prepared = PreparedChatRequest::new(
+        &chat,
+        original_settings(PreparedChatGenerationSettings {
+            overrides: GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(1),
                 ..Default::default()
             },
-            capture,
-            intervention,
-            TraceLimits {
-                per_record_bytes: 4 << 20,
-                total_bytes: 16 << 20,
-            },
-        )
-        .unwrap();
+            seed: 17,
+            ..Default::default()
+        }),
+    );
+    prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
+    prepared.output_mode = PreparedChatOutputMode::Text;
+    prepared.capture = Some(&prepared_capture);
+    prepared.intervention = Some(&prepared_intervention);
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |e| {
-                records.push(e.generation);
+            .start_controlled_chat(prepared, prepared_trace, Default::default(), |e| {
+                records.push(e);
                 ControlFlow::Continue(())
             })
+            .unwrap()
             .unwrap();
-        run.enable_snapshots(SnapshotLimits {
-            max_snapshots: 2,
-            max_branches: 1,
-            retained_bytes: 64 << 20,
-            cumulative_copy_bytes: 256 << 20,
-        })
+        run.enable_snapshots(
+            SnapshotLimits {
+                max_snapshots: 2,
+                max_branches: 1,
+                retained_bytes: 64 << 20,
+                cumulative_copy_bytes: 256 << 20,
+            },
+            ORIGINAL_CAPACITY,
+            copy_limits(),
+        )
         .unwrap();
         let snap = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
         run.run(|e| {
-            records.push(e.generation);
+            records.push(e);
             ControlFlow::Continue(())
         })
         .unwrap();
@@ -329,29 +347,39 @@ fn capture_with_precision_and_selection<
         records.clear();
         run.restore(&snap, |_| ControlFlow::Continue(())).unwrap();
         run.run(|e| {
-            records.push(e.generation);
+            records.push(e);
             ControlFlow::Continue(())
         })
         .unwrap();
         assert_eq!(first, super::components::tensors(&records));
         assert_eq!(first_precision, source_precisions(&records));
     } else {
-        model
-            .generate_observed_text(prepared, &[], Default::default(), |e| {
+        (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |e| {
                 records.push(e);
                 ControlFlow::Continue(())
-            })
-            .unwrap();
+            };
+            let mut run = model
+                .start_controlled_chat(
+                    prepared,
+                    prepared_trace,
+                    GenerationControlHandle::new(Default::default()),
+                    &mut emit,
+                )?
+                .expect("live fixture control");
+            run.run(&mut emit)
+        })()
+        .unwrap();
     }
     if empty_projection_inputs {
         let mut empty_records = 0;
         for record in records
             .iter()
-            .filter_map(|event| match &event.event {
-                ObservedGenerationEvent::Token {
+            .filter_map(|event| match event.event.progress() {
+                Some(ObservedGenerationEvent::Token {
                     captures: Some(step),
                     ..
-                } => Some(step),
+                }) => Some(step),
                 _ => None,
             })
             .flat_map(|step| &step.records)
@@ -380,15 +408,15 @@ fn capture_with_precision_and_selection<
     )
 }
 fn source_precisions(
-    records: &[ObservedGenerationRecord],
+    records: &[ControlledGenerationRecord],
 ) -> BTreeMap<String, eredu_core::checkpoint::TensorDtype> {
     records
         .iter()
-        .filter_map(|e| match &e.event {
-            ObservedGenerationEvent::Token {
+        .filter_map(|e| match e.event.progress() {
+            Some(ObservedGenerationEvent::Token {
                 captures: Some(step),
                 ..
-            } => Some(step),
+            }) => Some(step),
             _ => None,
         })
         .flat_map(|step| &step.records)
@@ -511,10 +539,12 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
                     .as_ref(),
             )
         {
-            assert!(!intervention_points
-                .points
-                .iter()
-                .any(|point| &point.path == path));
+            assert!(
+                !intervention_points
+                    .points
+                    .iter()
+                    .any(|point| &point.path == path)
+            );
         }
         for p in facts.parameters.iter().filter(|p| p.supported) {
             let expected = &dense[&p.id];
@@ -604,10 +634,12 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
             packed.insert(edit.parameter.clone(), dense[&edit.parameter].clone());
             packed.remove(&format!("{}_scale_inv", edit.parameter));
         }
-        config["quantization_config"]["ignored_layers"] = serde_json::json!(edits
-            .iter()
-            .map(|e| e.parameter.trim_end_matches(".weight"))
-            .collect::<Vec<_>>());
+        config["quantization_config"]["ignored_layers"] = serde_json::json!(
+            edits
+                .iter()
+                .map(|e| e.parameter.trim_end_matches(".weight"))
+                .collect::<Vec<_>>()
+        );
         let reference = fixture(false);
         std::fs::write(
             reference.0.join("config.json"),
@@ -633,11 +665,13 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
         assert_eq!(model.parameter_discovery().unwrap().usage, before);
         model.activate_parameter_overlay(&overlay, limits).unwrap();
         let active = model.parameter_discovery().unwrap();
-        assert!(active
-            .parameters
-            .iter()
-            .filter(|p| p.supported)
-            .all(|p| p.input_transform == ProjectionInputTransform::Identity));
+        assert!(
+            active
+                .parameters
+                .iter()
+                .filter(|p| p.supported)
+                .all(|p| p.input_transform == ProjectionInputTransform::Identity)
+        );
         let changed = capture(&mut model, &architecture, false, true);
         assert_ne!(changed["model.logits"], baseline["model.logits"]);
         check_evidence(&mut model, &architecture, &changed, false);
@@ -972,10 +1006,12 @@ fn verify_fp8_bfloat16_overlay_precision(device: LocalDevice) {
                 reference_tensors.remove(&format!("{}_scale_inv", edit.parameter));
             }
             let mut reference_config = config.clone();
-            reference_config["quantization_config"]["ignored_layers"] = serde_json::json!(edits
-                .iter()
-                .map(|e| e.parameter.trim_end_matches(".weight"))
-                .collect::<Vec<_>>());
+            reference_config["quantization_config"]["ignored_layers"] = serde_json::json!(
+                edits
+                    .iter()
+                    .map(|e| e.parameter.trim_end_matches(".weight"))
+                    .collect::<Vec<_>>()
+            );
             let reference = fixture(false);
             std::fs::write(
                 reference.0.join("config.json"),

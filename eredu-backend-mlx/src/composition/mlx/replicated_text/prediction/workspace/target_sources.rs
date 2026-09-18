@@ -16,7 +16,7 @@ use crate::{
     MlxTensor,
 };
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
     Parameterized,
 };
 use eredu_runtime::{
@@ -48,7 +48,7 @@ impl ProjectedTargetEquationSources {
         workspace: EmbeddedInvocationWorkspace,
         sources: &OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error>
     where
         S: MlxStateMechanisms,
@@ -70,7 +70,7 @@ impl ProjectedTargetEquationSources {
         geometry: eredu_core::InferenceGeometry,
         sources: &OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
-        funding: &WorkspaceMetadataFunding,
+        funding: &HostMetadataFunding,
     ) -> Result<Self, Error>
     where
         S: MlxStateMechanisms,
@@ -112,7 +112,7 @@ impl ProjectedTargetEquationSources {
                 eredu_core::InferenceGeometry,
                 &OriginalSpeculativeNumericalSources,
                 &OriginalCopyEnvironment<'_>,
-                &WorkspaceMetadataFunding,
+                &HostMetadataFunding,
             )>(),
         ];
         funding

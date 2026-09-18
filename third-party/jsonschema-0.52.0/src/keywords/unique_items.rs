@@ -21,8 +21,8 @@ pub(crate) struct UniqueItemsValidator {
 
 impl UniqueItemsValidator {
     #[inline]
-    pub(crate) fn compile<'a, F: Json>(location: Location) -> CompilationResult<'a, F> {
-        Ok(Box::new(UniqueItemsValidator { location }))
+    pub(crate) fn compile<'a, F: Json>(ctx: &crate::compiler::Context<F>, location: Location) -> CompilationResult<'a, F> {
+        Ok(ctx.funding().boxed(UniqueItemsValidator { location })?)
     }
 }
 
@@ -33,30 +33,22 @@ impl<F: Json> Validate<F> for UniqueItemsValidator {
     fn original_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
         crate::validator::workspace::body_controls::<F,Self>(&[std::mem::size_of::<bool>()])
     }
+    fn original_diagnostic_controls(&self) -> Result<usize, crate::validator::workspace::Error> {
+        <Self as Validate<F>>::original_controls(self)
+    }
     fn is_valid_body(&self, instance: &F::Node<'_>, ctx: &mut ValidationContext) -> bool {
         if !ctx.workspace.original() { return has_unique_items::<F>(instance); }
         let Some(array) = instance.as_array() else { return true; };
         ctx.unique_items::<F>(&array)
     }
 
-    fn validate<'i>(
-        &self,
-        instance: &F::Node<'i>,
-        location: &LazyLocation,
-        tracker: Option<&RefTracker>,
-        _ctx: &mut ValidationContext,
+    fn validate_body<'i>(
+        &self, instance: &F::Node<'i>, location: &LazyLocation, tracker: Option<&RefTracker>, ctx: &mut ValidationContext,
     ) -> Result<(), ValidationError<'i>> {
-        if has_unique_items::<F>(instance) {
-            Ok(())
-        } else {
-            Err(ValidationError::unique_items(
-                self.location.clone(),
-                crate::paths::capture_evaluation_path(tracker, &self.location),
-                location.into(),
-                instance.to_value(),
-            ))
-        }
+        if Validate::<F>::is_valid(self, instance, ctx) { Ok(()) }
+        else { ctx.diagnostic::<F>(instance, location, tracker, &self.location, |_| Ok(crate::error::ValidationErrorKind::UniqueItems)) }
     }
+
 }
 
 #[inline]
@@ -67,8 +59,8 @@ pub(crate) fn compile<'a, F: Json>(
 ) -> Option<CompilationResult<'a, F>> {
     if let Value::Bool(value) = schema {
         if *value {
-            let location = ctx.location().join("uniqueItems");
-            Some(UniqueItemsValidator::compile(location))
+            let location = crate::keywords::try_compile!(ctx.location().join_with_funding("uniqueItems", ctx.funding()));
+            Some(UniqueItemsValidator::compile(ctx, location))
         } else {
             None
         }

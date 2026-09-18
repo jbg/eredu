@@ -9,7 +9,7 @@ use crate::backend::{
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{
-    WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan, WorkspaceMetadataFunding,
+    WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan, HostMetadataFunding,
 };
 use eredu_runtime::working_memory::{
     OriginalStorageSourcesLayout, RegisteredWorkspaceCopy, RegisteredWorkspaceStorageLayout,
@@ -87,8 +87,10 @@ impl Drop for DiscardUnpublished {
     }
 }
 #[derive(Debug, thiserror::Error)]
-#[error("{cause}")]
+#[error("{stage}: {cause}")]
 struct Failure {
+    stage: &'static str,
+    source_rows: Option<source::BindingRows>,
     #[source]
     cause: Error,
     _host: HostPreparationAuthority,
@@ -100,13 +102,13 @@ fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b)
         .ok_or_else(|| memory(WorkingMemoryError::Overflow))
 }
-fn reserve(funding: &WorkspaceMetadataFunding, bytes: usize) -> Result<(), Error> {
+fn reserve(funding: &HostMetadataFunding, bytes: usize) -> Result<(), Error> {
     funding
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)
 }
 fn paid(
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     cause: impl std::error::Error + Send + Sync + 'static,
 ) -> Error {
     Error::Neural(funding.metadata_source(cause))
@@ -120,7 +122,7 @@ pub(crate) fn copy(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &safemlx::PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
     capacity: u64,
 ) -> Result<OriginalResidentState, Error> {
@@ -142,7 +144,7 @@ pub(crate) fn copy_with_source(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &safemlx::PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
     capacity: u64,
 ) -> Result<OriginalResidentState, Error> {
@@ -161,6 +163,10 @@ pub(crate) fn copy_with_source(
         size_of::<std::cell::RefMut<'_, Vec<Array>>>(),
         size_of::<std::cell::RefMut<'_, Option<WorkingMemoryFundingScope>>>(),
         size_of::<Failure>(),
+        size_of::<Cell<&'static str>>(),
+        size_of::<&Cell<&'static str>>(),
+        size_of::<Cell<Option<source::BindingRows>>>(),
+        size_of::<source::BindingDiagnostics<'_>>(),
         size_of::<Error>(),
         size_of::<Option<Error>>(),
         size_of::<OriginalCopyLayoutBuilder>(),
@@ -178,6 +184,8 @@ pub(crate) fn copy_with_source(
         funding,
         frames.into_iter().try_fold(size_of_val(&frames), add)?,
     )?;
+    let stage = Cell::new("source inspection");
+    let source_rows = Cell::new(None);
     let result = copy_inner(
         source,
         completed,
@@ -187,10 +195,14 @@ pub(crate) fn copy_with_source(
         funding,
         host,
         capacity,
+        &stage,
+        &source_rows,
     );
     result.map_err(|cause| {
         Error::StorageSource(
             BackendFailure::from_error(Failure {
+                stage: stage.get(),
+                source_rows: source_rows.get(),
                 cause,
                 _host: host.clone(),
             })
@@ -204,9 +216,11 @@ fn copy_inner(
     environment: &OriginalCopyEnvironment<'_>,
     initialized: &safemlx::PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
     capacity: u64,
+    stage: &Cell<&'static str>,
+    source_rows: &Cell<Option<source::BindingRows>>,
 ) -> Result<OriginalResidentState, Error> {
     // Paged independent state copies have their own existing exact source
     // hook. Reject this H-only resident table path before opening a native
@@ -293,8 +307,14 @@ fn copy_inner(
         funding,
         controls.into_iter().try_fold(size_of_val(&controls), add)?,
     )?;
+    stage.set("source projection");
     let projected = projection.construct(mechanisms, host)?;
-    let binding = source::bind(&projected, completed, environment, funding, host)?;
+    stage.set("completed source binding");
+    let binding = source::bind(
+        &projected, completed, environment, funding, host,
+        source::BindingDiagnostics { stage, rows: source_rows },
+    )?;
+    stage.set("isolated copy program");
     let program = WorkspaceIsolatedCopyPlan::prepare_finite_with_layout(
         &projected.context,
         binding.borrowed(),
@@ -313,6 +333,7 @@ fn copy_inner(
         .as_ref()
         .map_or(0, |plan| plan.physical_bytes() as u64)
         .saturating_sub(numerical);
+    stage.set("copy admission");
     let account = binding.admit(program, environment, limits, funding)?;
     let (custody, scope) = account.into_parts();
     let root_count = operands
@@ -326,6 +347,7 @@ fn copy_inner(
             return Err(paid(funding, cause));
         }
     };
+    stage.set("native copy preparation");
     let prepared = match native
         .map(|plan| plan.prepare(&custody, initialized))
         .transpose()
@@ -336,6 +358,7 @@ fn copy_inner(
             return Err(cause.into());
         }
     };
+    stage.set("destination publication preparation");
     let pending = publication.construct(
         &scope,
         &custody,
@@ -349,6 +372,7 @@ fn copy_inner(
             return Err(cause);
         }
     };
+    stage.set("destination inventory preparation");
     let inventory =
         match RetainedStorage::prepare_snapshot_publication(operands, environment.pool(), host) {
             Ok(inventory) => inventory,
@@ -373,6 +397,7 @@ fn copy_inner(
     // publication prefix is destroyed before discarded Work can retire.
     let mut pending = pending;
     let mut inventory = inventory;
+    stage.set("native copy scope");
     let (mut recovery, mut execution) = match prepared {
         Some(prepared) => {
             let (recovery, execution) = prepared.begin(owner.clone())?;
@@ -389,6 +414,7 @@ fn copy_inner(
             }
         }
     }
+    stage.set("native copy execution");
     let result = (|| {
         let _construction = Construction(&mut execution);
         let roots = &owner.work().roots;
@@ -443,12 +469,14 @@ fn copy_inner(
         recovery.seal();
     }
     let destination = result?;
+    stage.set("native copy settlement");
     if let Some(recovery) = recovery.as_ref() {
         let status = recovery.progress();
         if !status.settled || status.failed || status.blocked {
             return Err(memory(WorkingMemoryError::UnknownBound));
         }
     }
+    stage.set("completed destination inventory");
     let output = destination
         .prepare_copy_fixed()
         .map_err(|cause| paid(funding, cause))?;
@@ -466,11 +494,13 @@ fn copy_inner(
         return Err(cause);
     }
     drop(output);
+    stage.set("completed destination publication");
     let published = {
         let scope = owner.work().scope.borrow();
         pending.publish(inventory, scope.as_ref().expect("copy scope"))?
     };
     drop(published);
+    stage.set("completed copy certification");
     owner
         .work()
         .scope
@@ -484,3 +514,5 @@ fn copy_inner(
     drop(discarded.0.take());
     Ok(destination)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

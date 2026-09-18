@@ -186,7 +186,7 @@ fn original_mirostat_preserves_mu_history_snapshot_and_native_retirement() {
                     .unwrap()
                     .checked_add(
                         eredu_core::HostPreparationAuthority::retention_bytes::<
-                            WorkspaceMetadataFunding,
+                            HostMetadataFunding,
                         >()
                         .unwrap(),
                     )

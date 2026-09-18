@@ -141,7 +141,7 @@ impl WorkspaceContext {
         if self.facts.is_none() {
             return values
                 .try_reserve(additional)
-                .map_err(Error::backend_source);
+                .map_err(Error::backend_retained_source);
         }
         // The requested length, not allocator-provided spare capacity, fixes
         // the next request. A source query can therefore enumerate the same
@@ -160,7 +160,7 @@ impl WorkspaceContext {
         }
         let parts = [
             Layout::array::<T>(capacity).ok()?.size(),
-            Error::retained_source_control_bytes::<TryReserveError>()?,
+            Error::retained_source_construction_bytes::<TryReserveError>()?,
             size_of::<Vec<T>>(),
             size_of::<TryReserveError>(),
             size_of::<Result<(), TryReserveError>>(),
@@ -329,7 +329,7 @@ impl WorkspaceContext {
     pub fn metadata_source_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize> {
         let controls = [
             size_of::<MetadataDestination<'_>>(),
-            Error::retained_source_control_bytes::<E>()?,
+            Error::retained_source_construction_bytes::<E>()?,
             size_of::<E>(),
             size_of::<Error>(),
             size_of::<Result<(), WorkspaceMetadataError>>(),
@@ -353,7 +353,7 @@ impl WorkspaceContext {
 #[derive(Clone, Copy)]
 enum MetadataDestination<'a> {
     Context(&'a WorkspaceContext),
-    Funding(&'a WorkspaceMetadataFunding),
+    Funding(&'a HostMetadataFunding),
 }
 impl MetadataDestination<'_> {
     fn checked(self) -> bool {
@@ -377,13 +377,7 @@ impl MetadataDestination<'_> {
         self.charge(bytes)?;
         values
             .try_reserve_exact(capacity - values.len())
-            .map_err(|cause| {
-                if self.checked() {
-                    Error::backend_retained_source(cause)
-                } else {
-                    Error::backend_source(cause)
-                }
-            })
+            .map_err(Error::backend_retained_source)
     }
     fn vector<T>(self, capacity: usize) -> Result<Vec<T>, Error> {
         let mut values = Vec::new();
@@ -406,7 +400,7 @@ impl MetadataDestination<'_> {
     }
     fn source<E: std::error::Error + Send + Sync + 'static>(self, cause: E) -> Error {
         if !self.checked() {
-            return Error::backend_source(cause);
+            return Error::backend_retained_source(cause);
         }
         let Some(amount) = WorkspaceContext::metadata_source_bytes::<E>() else {
             return WorkspaceMetadataError::Overflow.into();
@@ -431,20 +425,35 @@ impl MetadataDestination<'_> {
         }
     }
 }
-impl WorkspaceMetadataFunding {
+/// NN metadata allocation helpers backed by the canonical core account.
+/// These helpers apply workspace growth and error policy; they introduce no
+/// account wrapper, additional allocation authority, or retirement owner.
+pub trait WorkspaceMetadataAllocation {
+    /// Builds a counted NN diagnostic; an escaping owner must retain funding.
+    fn metadata_error(&self, arguments: fmt::Arguments<'_>) -> Error;
+    /// Allocates an exact-capacity vector after the cumulative account debit.
+    fn metadata_vec<T>(&self, capacity: usize) -> Result<Vec<T>, Error>;
+    /// Grows a vector using the workspace's counted powers-of-two policy.
+    fn reserve_metadata_vec<T>(&self, values: &mut Vec<T>, additional: usize) -> Result<(), Error>;
+    /// Builds counted UTF-8 text, retaining no independent account alias.
+    fn metadata_string(&self, arguments: fmt::Arguments<'_>) -> Result<String, Error>;
+    /// Constructs a counted NN source error; its owner must retain funding.
+    fn metadata_source<E: std::error::Error + Send + Sync + 'static>(&self, cause: E) -> Error;
+}
+impl WorkspaceMetadataAllocation for HostMetadataFunding {
     /// Same counted diagnostic producer, without introducing a Context. The
     /// enclosing returned/error owner must retain an independent funding alias.
-    pub fn metadata_error(&self, arguments: fmt::Arguments<'_>) -> Error {
+    fn metadata_error(&self, arguments: fmt::Arguments<'_>) -> Error {
         MetadataDestination::Funding(self).error(arguments)
     }
     /// Builds the same exact-capacity metadata vector against this retained
     /// account. Keep an independent funding alias with any escaping result/error.
-    pub fn metadata_vec<T>(&self, capacity: usize) -> Result<Vec<T>, Error> {
+    fn metadata_vec<T>(&self, capacity: usize) -> Result<Vec<T>, Error> {
         MetadataDestination::Funding(self).vector(capacity)
     }
     /// Grows a metadata vector through the same exact backing/error producer as
     /// checked Context growth. Each request remains cumulatively charged.
-    pub fn reserve_metadata_vec<T>(&self, values: &mut Vec<T>, additional: usize) -> Result<(), Error> {
+    fn reserve_metadata_vec<T>(&self, values: &mut Vec<T>, additional: usize) -> Result<(), Error> {
         let required = values.len().checked_add(additional).ok_or(WorkspaceMetadataError::Overflow)?;
         if required <= values.capacity() { return Ok(()); }
         let target = required.checked_next_power_of_two().ok_or(WorkspaceMetadataError::Overflow)?;
@@ -453,12 +462,12 @@ impl WorkspaceMetadataFunding {
     /// Uses the Context's counted UTF-8 producer with this actual account.
     /// Formatting must be deterministic and allocation-free. Retain funding
     /// independently through the returned text or error's complete lifetime.
-    pub fn metadata_string(&self, arguments: fmt::Arguments<'_>) -> Result<String, Error> {
+    fn metadata_string(&self, arguments: fmt::Arguments<'_>) -> Result<String, Error> {
         MetadataDestination::Funding(self).string(arguments)
     }
     /// Uses the same paid closed error-source producer without creating a Context.
     /// The returned cause does not itself retain funding; its enclosing owner must.
-    pub fn metadata_source<E: std::error::Error + Send + Sync + 'static>(&self, cause: E) -> Error {
+    fn metadata_source<E: std::error::Error + Send + Sync + 'static>(&self, cause: E) -> Error {
         MetadataDestination::Funding(self).source(cause)
     }
 }

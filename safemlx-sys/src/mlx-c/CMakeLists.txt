@@ -243,8 +243,23 @@ else()
       mlx-eval-record-capacity-attribution.patch
       mlx-ring-variable-envelope.patch
     mlx-prepared-zero-source.patch
+      mlx-masked-scatter-source.patch
       mlx-scatter-axis-sum-source.patch
-      mlx-cpu-flat-scatter-source.patch)
+      mlx-cpu-flat-scatter-source.patch
+      mlx-kernel-name-fold.patch
+      mlx-cpu-row-maximum-source.patch
+      mlx-cpu-host-transfer-source.patch
+      mlx-host-transfer-source-witness.patch
+      mlx-cpu-grouped-sum-source.patch
+      mlx-cpu-tiled-gather-mm-source.patch
+      mlx-cpu-grouped-argsort-source.patch
+      mlx-cpu-grouped-scatter-source.patch
+      mlx-cpu-grouped-gather-axis-source.patch
+      mlx-cpu-empty-typed-joins-source.patch
+      mlx-cpu-empty-structural-alias-source.patch
+      mlx-cpu-row-movement-source.patch
+      mlx-cpu-routing-selection-source.patch
+      mlx-cpu-empty-slice-source.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -425,6 +440,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     ${CMAKE_CURRENT_LIST_DIR}/tests/operation_observer_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/array_descriptor_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/cpu_argsort_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/kernel_name_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/intrusive_index_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp

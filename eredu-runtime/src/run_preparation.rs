@@ -368,6 +368,8 @@ fn stage_word(stage: TextPreparationStage) -> Result<u32, TextPreparationAgreeme
         TextPreparationStage::Prediction => 6,
         TextPreparationStage::Decision => 7,
         TextPreparationStage::Commitment => 8,
+        TextPreparationStage::SessionReset => 9,
+        TextPreparationStage::SessionResetPublication => 10,
         _ => {
             return Err(TextPreparationAgreementError::Admission(
                 "unknown preparation stage",

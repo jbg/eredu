@@ -61,11 +61,11 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
         let mut p=Program{native:CpuPopulation::default(),bytes:0,allocation:mechanism.allocation};
         // Full centroid partition owns one U32 output and its existing bank.
         let partition=OperationEvent::cpu_argpartition_source_layout(3,centroids,false)?;
-        p.native.add(CpuPopulation{primitives:1,input_edges:1,births:1,
+        p.native.add(CpuPopulation{construction_entries:1,primitives:1,input_edges:1,hidden_leaves:0,maximum_operands:1,maximum_captures:0,births:1,
             extents:partition.allocation_extents(),controls:partition.control_bytes()?})?;
         p.physical(centroids,1)?;
         // Static top-centroid slice and unchanged-shape reshape candidate.
-        p.copy(OperationEvent::cpu_slice_layout(3,false)?,1,0)?;p.reshape(3,3)?;
+        p.copy(OperationEvent::cpu_slice_layout(3, false, false)?,1,0)?;p.reshape(3,3)?;
         p.reshape(1,2)?;
         p.gather(index,Dtype::Uint32,3,v,picks,v/c)?;
         p.reshape(4,1)?;
@@ -73,7 +73,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
         p.reshape(2,4)?;
         // Shared hidden NewAxis subscript and selected-weight transpose.
         // The actual selected F32 matmul never copies the complete table.
-        p.copy(OperationEvent::cpu_slice_layout(3,false)?,1,0)?;p.reshape(3,4)?;
+        p.copy(OperationEvent::cpu_slice_layout(3, false, false)?,1,0)?;p.reshape(3,4)?;
         p.copy(OperationEvent::cpu_transpose_alias_layout(4,false)?,1,0)?;
         p.alias(4,4)?;p.alias(4,4)?;
         let product=mechanism.matmul.selected().geometry(4,1,u32::try_from(k).ok()?,

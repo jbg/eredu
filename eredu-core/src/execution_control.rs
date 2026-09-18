@@ -1,11 +1,10 @@
 //! Portable discovery and resource contracts for completed-token execution control.
 
+mod sampling;
+pub use sampling::{SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend};
+
 use crate::generation::GenerationCancellationToken;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 
 /// Native persistent-state mechanisms for ordinary text generation.
 ///
@@ -21,7 +20,7 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
 
     /// Side-effect-free support facts for this exact loaded execution. This is
     /// a primitive report, not full generation-snapshot capability discovery.
-    fn native_text_state_support(runtime: &crate::ModelRuntime<Self>) -> ControlSupport;
+    fn native_text_state_support(runtime: &crate::ModelRuntime<Self>) -> ControlSupport<&'static str>;
 
     /// Estimates copying installed state (`None`) or a compatible saved slot.
     /// Unknown costs remain explicit and must be rejected before copying.
@@ -70,6 +69,17 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
         runtime: &mut crate::ModelRuntime<Self>,
         slot: &mut Self::NativeTextState,
     ) -> Result<(), Self::Error>;
+
+    /// Atomically places two completed ordinary machines and their native slot.
+    /// Validate both actual run sources and admit both placement revisions before
+    /// mutation. Rebind their pending inputs from the same exchange receipts;
+    /// neither copied counters nor a raw native-state swap authenticate them.
+    fn exchange_text_branch(
+        runtime: &mut crate::ModelRuntime<Self>,
+        installed: crate::TextBranchSource<'_, Self>,
+        incoming: crate::TextBranchSource<'_, Self>,
+        slot: &mut Self::NativeTextState,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Version of execution-control metadata and lifecycle records.
@@ -96,14 +106,23 @@ pub enum GenerationStatus {
 /// Support for one operation on the actual selected execution configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "support", rename_all = "snake_case")]
-pub enum ControlSupport {
+pub enum ControlSupport<R = String> {
     /// Implemented with the scope and guarantees in the enclosing report.
     Supported,
     /// Rejected before work begins.
     Unsupported {
         /// Concrete missing mechanism or unsupported execution combination.
-        reason: String,
+        reason: R,
     },
+}
+impl<R> ControlSupport<R> {
+    /// Projects only the diagnostic carrier; the selected capability is unchanged.
+    pub fn map_reason<T>(self, convert: impl FnOnce(R) -> T) -> ControlSupport<T> {
+        match self {
+            Self::Supported => ControlSupport::Supported,
+            Self::Unsupported { reason } => ControlSupport::Unsupported { reason: convert(reason) },
+        }
+    }
 }
 
 /// Mutable-state isolation promised by an opaque native in-process snapshot.
@@ -166,31 +185,48 @@ impl ExecutionControlCapabilities {
 /// Thread-safe requests for a worker whose native session can remain thread-affine.
 /// Pausing is sticky until the owning worker explicitly resumes. Cancellation
 /// retains the ordinary permanent cancellation-token semantics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GenerationControlHandle {
-    pause: Arc<AtomicBool>,
+    pause: crate::generation::ControlFlag,
     cancellation: GenerationCancellationToken,
 }
 
+impl Default for GenerationControlHandle {
+    fn default() -> Self { Self::new_retained(crate::HostPreparationAuthority::unmanaged()) }
+}
 impl GenerationControlHandle {
+    /// Exact fresh pause/cancellation cells and constructor controls, before
+    /// their caller selects ordinary or original host construction policy.
+    pub fn construction_bytes() -> Option<usize> {
+        crate::generation::ControlFlag::construction_bytes()?
+            .checked_add(GenerationCancellationToken::construction_bytes()?)?
+            .checked_add(std::mem::size_of::<Self>())
+    }
+    /// Constructs fresh controls in an already paid original host destination.
+    /// The caller pays `construction_bytes` before this operation. Both kinds of
+    /// escaping alias retain that same destination authority.
+    pub fn new_retained(host: crate::HostPreparationAuthority) -> Self {
+        Self { pause: crate::generation::ControlFlag::new(host.clone()),
+            cancellation: GenerationCancellationToken::new_retained(host) }
+    }
     /// Creates a handle using the ordinary caller's cancellation token.
     pub fn new(cancellation: GenerationCancellationToken) -> Self {
         Self {
-            pause: Arc::new(AtomicBool::new(false)),
+            pause: crate::generation::ControlFlag::new(crate::HostPreparationAuthority::unmanaged()),
             cancellation,
         }
     }
     /// Requests pause at the next successful completed-token boundary.
     pub fn request_pause(&self) {
-        self.pause.store(true, Ordering::Release);
+        self.pause.set(true);
     }
     /// Whether a pause request is pending. This does not itself prove completion.
     pub fn pause_requested(&self) -> bool {
-        self.pause.load(Ordering::Acquire)
+        self.pause.get()
     }
     /// Acknowledges an explicit resume before checking for a new pause request.
     pub fn acknowledge_resume(&self) {
-        self.pause.store(false, Ordering::Release);
+        self.pause.set(false);
     }
     /// Permanently cancels this run, without reinterpreting cancellation as pause.
     pub fn cancel(&self) {

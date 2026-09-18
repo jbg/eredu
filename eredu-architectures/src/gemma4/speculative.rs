@@ -10,7 +10,7 @@ use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
 };
 
-use super::{AssistantState, SharedAttentionStates};
+use super::AssistantState;
 use crate::{
     composite_execution::ExternalPredictionTargetCapture,
     external_assistant::{

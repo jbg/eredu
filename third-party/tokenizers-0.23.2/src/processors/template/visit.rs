@@ -2,18 +2,13 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Texts<'a> {
-    Legacy(&'a [String]),
-    Packed(&'a [compiled::TextRange], &'a [u8]),
-}
+pub(crate) struct Texts<'a>(pub(crate) &'a [compiled::TextRange], pub(crate) &'a [u8]);
 impl Texts<'_> {
     pub(crate) fn owned(&self) -> Vec<String> {
-        match self {
-            Self::Legacy(tokens) => tokens.to_vec(),
-            Self::Packed(ranges, bytes) => {
-                ranges.iter().map(|r| r.text(bytes).to_owned()).collect()
-            }
-        }
+        self.0
+            .iter()
+            .map(|range| range.text(self.1).to_owned())
+            .collect()
     }
 }
 #[derive(Clone, Copy)]

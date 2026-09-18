@@ -407,6 +407,7 @@ impl NeuralBackend for WorkspaceBackend {
             .union(NeuralOperatorCapabilities::FROM_I32_SLICE)
             .union(NeuralOperatorCapabilities::FULL_F32)
             .union(NeuralOperatorCapabilities::FULL_I32)
+            .union(NeuralOperatorCapabilities::FULL_U32)
             .union(NeuralOperatorCapabilities::TANH)
             .union(NeuralOperatorCapabilities::CLIP)
             .union(NeuralOperatorCapabilities::SOFTMAX_AXIS)

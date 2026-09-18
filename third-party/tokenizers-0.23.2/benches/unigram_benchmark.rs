@@ -41,7 +41,7 @@ fn bench_train(c: &mut Criterion) {
         .unwrap()
         .into();
     let mut tokenizer = Tokenizer::new(Unigram::default()).into_inner();
-    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
     let mut group = c.benchmark_group("unigram-train-large");
     let data = std::fs::read_to_string("data/big.txt").unwrap();
     group.throughput(Throughput::Bytes(data.len() as u64));

@@ -9,7 +9,7 @@ Production crates occupy these dependency strata, from dependency roots to
 applications:
 
 ```text
-foundations:          eredu-gguf / eredu-nn-macros
+foundations:          eredu-collections / eredu-gguf / eredu-nn-macros
 storage and text:     eredu-checkpoint / eredu-text
 portable contracts:  eredu-core / eredu-nn
 portable mechanisms: eredu-media / eredu-runtime
@@ -26,6 +26,10 @@ portable strata. Validation tooling such as `eredu-evaluation` may depend on
 portable families, but production facade and backend code must not depend on
 it.
 
+- `eredu-collections` owns the safe ordered-map worker and exact prospective
+  node allocation callbacks. It is a dependency-free portable foundation used
+  by the local JSON fork and portable source producers. It owns no admission
+  policy, funding account, source custody, or native resources.
 - `eredu-gguf` owns framework-independent GGUF reading, writing, validation,
   canonical tensor encodings, and bounded conversion. `eredu-checkpoint` owns
   backend-neutral checkpoint schemas, recipes, exact prepared source stores,
@@ -250,3 +254,18 @@ cargo check -p eredu-backend-mlx --no-default-features
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
 ```
+
+Pinned auxiliary collection forks (`hashbrown` and `indexmap`) remain external
+collection dependencies and retain their upstream unsafe implementation
+boundaries. Local changes add safe prospective allocation facts and reservation
+hooks; they do not introduce unsafe code or weaken the `unsafe_code = "forbid"`
+policy of parser workspace members and portable production crates. IndexMap
+preserves insertion order and shares one growth worker between ordinary and
+funded reservation. Archive provenance and licenses remain under `third-party`.
+
+Pinned literal-search dependencies (`aho-corasick` and `memchr`) remain external
+search dependencies alongside `regex-automata`. Their upstream search/SIMD unsafe
+internals retain their existing boundary; local prospective construction hooks
+are safe Rust and introduce no unsafe code. They preserve the selected ordinary
+search algorithms and do not weaken parser/workspace unsafe forbids. Pristine
+archive hashes and licenses are recorded in `third-party/prefilter-upstream.json`.

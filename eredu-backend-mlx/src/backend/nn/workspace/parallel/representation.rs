@@ -89,6 +89,43 @@ mod tests {
         }
     }
     #[test]
+    fn cpu_softplus_gate_supplies_exact_sum_input_representation() {
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let selected = MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
+        let mechanism = ResidentExecutionMechanisms::Cpu { ordinary, cpu };
+        for dtype in [WorkspaceFloatingType::Float32, WorkspaceFloatingType::Bfloat16, WorkspaceFloatingType::Float16] {
+            let context = WorkspaceContext::new(cpu);
+            let input = WorkspaceTensor::existing(context.layout(&[1, 2, 8], WorkspaceDtype::Float32).unwrap()
+                .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+            context.begin_span();
+            let output = WorkspaceBackend::softplus(input, std::f32::consts::LN_2, &context).unwrap();
+            // The failing TP attention path applies its gate before the local
+            // output projection, then all-sums that projection. Exercise the
+            // actual F32 chain rather than assigning a collective input fact.
+            let output = if dtype == WorkspaceFloatingType::Float32 {
+                let attended = WorkspaceTensor::existing(context.layout(&[1, 2, 8], WorkspaceDtype::Float32).unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+                let gated = attended.multiply(&output, &context).unwrap();
+                let weight = WorkspaceTensor::existing(context.layout(&[8, 8], WorkspaceDtype::Float32).unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+                WorkspaceTensor::linear(&gated, &weight, None, &context).unwrap()
+            } else { output };
+            let layouts = [output.layout().as_view()];
+            let sum = WorkspaceOperationView {
+                kind: WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum { partitions: 2, rank: 0 }),
+                inputs: WorkspaceLayoutList::Views(&layouts), outputs: WorkspaceLayoutList::Views(&layouts),
+            };
+            assert_eq!(collective(&mechanism, sum, 0), Some(WorkspaceRepresentation::new(dtype, true)));
+            let unknown = [layouts[0].with_representation(None)];
+            assert!(collective(&mechanism, WorkspaceOperationView { inputs: WorkspaceLayoutList::Views(&unknown), ..sum }, 0).is_none());
+            let report = context.finish_report(&[output]).unwrap();
+            assert!(report.unpriced_operations.is_empty() && report.unpriced_host_operations.is_empty());
+            SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context).unwrap();
+        }
+    }
+
+    #[test]
     fn uneven_vocabulary_gather_keeps_exact_slice_and_zero_fill_sources() {
         let ordinary=MlxMetalWorkspaceMechanisms::current_host().unwrap();
         let choice=MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();

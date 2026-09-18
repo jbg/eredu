@@ -273,7 +273,7 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
     }
     if grouped_has_selected_rows(operation)? {
         value.unqualified_kernel_owner = if fp8 {
-            (!crate::backend::managed_memory::fp8_kernel::source_qualified())
+            (!crate::backend::nn::fp8::kernel::source_qualified())
                 .then_some(CustomKernelOwner::BlockFp8)
         } else if (before && bf16_grouped_width(bank.input))
             || (after && bf16_grouped_width(bank.units))

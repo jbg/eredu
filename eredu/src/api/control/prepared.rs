@@ -1,269 +1,293 @@
-//! Additive V2 startup using the existing controlled session implementation.
+//! Recorded startup consumes the same original chat request and native admission.
 use super::*;
-use crate::api::{PreparedChatGenerationSettings, TraceLimits};
-use crate::runtime::chat::PreparedChat;
+use crate::api::observed::PreparedIdentity;
+use eredu_runtime::working_memory::OriginalChatBackend;
+use records::construction::{self, RecordConstructionCause};
+use std::{fmt::Write, time::Duration};
+// The exact existing serialized policy, including all borrowed slice controls.
+type ConfigurationIdentityInput<'a> = (
+    u32,
+    &'a str,
+    [u8; 32],
+    ResolvedGenerationConfig,
+    u64,
+    TextInferencePolicy,
+    Option<(Option<&'a str>, [u8; 32], &'a str, &'a [String])>,
+    &'a [u32],
+    &'a [String],
+    bool,
+);
 
-pub(super) struct StartupPolicy {
-    pub chat: PreparedChat,
-    pub settings: PreparedChatGenerationSettings,
-    pub resolved: ResolvedGenerationConfig,
-    pub plan: Option<AdmittedCapturePlan>,
-    pub prepared_capture: Option<eredu_core::capture::SharedCapturePlan>,
-    pub intervention: Option<eredu_core::intervention::AdmittedInterventionPlan>,
-    pub session_identity: String,
-    pub artifact_identity: Option<String>,
-    pub parameter_overlay_id: Option<String>,
-    pub trace_limits: TraceLimits,
-}
-
-/// One-use source and output policy. Preparation submits no model prediction.
-/// Its private provider owner binds actual parts to the selected state revision.
-pub struct PreparedControlledInput<B: PreparedControlInputBackend> {
-    input: B::ControlInput,
-    policy: StartupPolicy,
-    tokenizer_identity: [u8; 32],
-    host: HostPreparationAuthority,
-}
-impl<B: PreparedControlInputBackend> PreparedControlledInput<B> {
-    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
-        self.input.attribution()
-    }
-    pub fn generation_config(&self) -> ResolvedGenerationConfig {
-        self.policy.resolved
-    }
-}
-
-pub type PreparedControlledGenerationSession<'a, B> =
-    ControlledGenerationSession<'a, B, PreparedInputV2>;
-pub type PreparedControlledGenerationSnapshot<B> = ControlledGenerationSnapshot<B, PreparedInputV2>;
-pub type PreparedControlledGenerationBranch<B> = ControlledGenerationBranch<B, PreparedInputV2>;
-
-#[derive(Debug)]
-struct OwnedPreparationError<E, C> {
-    error: E,
-    // Core unboxes this source before disposing its fields.
-    _custody: C,
-}
-impl<E: std::fmt::Display, C> std::fmt::Display for OwnedPreparationError<E, C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
-    }
-}
-impl<E: std::error::Error + 'static, C: std::fmt::Debug> std::error::Error
-    for OwnedPreparationError<E, C>
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-pub(super) fn retained<
-    E: std::error::Error + Send + Sync + 'static,
-    C: std::fmt::Debug + Send + Sync + 'static,
->(
-    error: E,
-    custody: C,
-) -> PreparedChatError {
-    PreparedChatError::Backend(BackendFailure::from_error(OwnedPreparationError {
-        error,
-        _custody: custody,
-    }))
-}
-
-impl<B: PreparedControlInputBackend> LoadedModel<B> {
-    /// Prepares actual ordered input attribution without retokenizing the chat.
-    /// Ordinary unobserved input and explicitly supported decoder-row capture
-    /// share this startup. Empty Capture still installs its own record owner.
-    /// Original managed source bounds and prepared interventions remain pending.
-    pub fn prepare_controlled_input(
-        &self,
-        chat: &PreparedChat,
-        prompt: B::Prompt,
-        settings: PreparedChatGenerationSettings,
-        instrumentation: PreparedInputInstrumentation,
-        trace_limits: TraceLimits,
-    ) -> Result<PreparedControlledInput<B>, PreparedChatError> {
-        if settings.inference.managed_memory_capacity_bytes.is_some()
-            || settings
-                .inference
-                .submission_tracking_capacity_bytes
-                .is_some()
-            || settings.inference.graph_metadata_capacity_bytes.is_some()
-        {
-            return Err(PreparedChatError::Backend(
-                PreparedControlInputError::UnknownBound.into_backend_failure(),
-            ));
-        }
-        if matches!(
-            instrumentation,
-            PreparedInputInstrumentation::Intervention { .. }
-        ) {
-            return Err(PreparedChatError::Backend(
-                PreparedControlInputError::InstrumentationUnavailable.into_backend_failure(),
-            ));
-        }
-        // The provider rejects an already-reserved opaque source before any
-        // facade ordinary allocation, then retains its own preparation custody.
-        let input =
-            B::prepare_control_input(&self.runtime, prompt).map_err(PreparedChatError::Backend)?;
-        let source_custody = input.shared_attribution().clone();
-        let host = B::acquire_host_preparation(&self.runtime)
-            .map_err(|error| retained(error, source_custody))?;
-        let local = (|| {
-            let (config, _) = self.resolve_text_generation_settings(settings)?;
-            if trace_limits.per_record_bytes == 0 || trace_limits.total_bytes == 0 {
-                return Err(
-                    CaptureError::Invalid("trace byte limits must be positive".into()).into(),
-                );
+fn capabilities(
+    sampling: ControlSupport<&'static str>,
+    funding: &HostMetadataFunding,
+) -> Result<ExecutionControlCapabilities, RecordConstructionCause> {
+    let unsupported = || -> Result<_, RecordConstructionCause> {
+        Ok(ControlSupport::Unsupported {
+            reason: construction::string(
+                "original snapshot limits and complete copy bounds have not been admitted",
+                funding,
+            )?,
+        })
+    };
+    Ok(ExecutionControlCapabilities {
+        schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
+        step: ControlSupport::Supported,
+        pause_resume: ControlSupport::Supported,
+        force_next_token: ControlSupport::Supported,
+        snapshot: unsupported()?,
+        restore: unsupported()?,
+        fork: unsupported()?,
+        isolation: None,
+        sampling_overrides: match sampling {
+            ControlSupport::Supported => ControlSupport::Supported,
+            ControlSupport::Unsupported { reason } => ControlSupport::Unsupported {
+                reason: construction::string(reason, funding)?,
+            },
+        },
+        conditions: {
+            let mut conditions = construction::vector(3, funding)?;
+            for text in [
+                "serial completed-token delivery over the prepared chat session",
+                "exact original sources and exclusive loaded execution",
+                "unchanged continuations retain RNG; numerical equality requires deterministic native execution",
+            ] {
+                conditions.push(construction::string(text, funding)?);
             }
-            input
-                .attribution()
-                .validate()
-                .map_err(|e| PreparedChatError::Backend(e.into_backend_failure()))?;
-            if input
-                .attribution()
-                .canonical_token_ids
-                .iter()
-                .any(|id| self.tokenizer.id_to_token(*id).is_none())
-            {
-                return Err(PreparedChatError::Backend(
-                    PreparedControlInputError::InvalidAttribution.into_backend_failure(),
+            conditions
+        },
+    })
+}
+
+impl<B: OriginalChatBackend> LoadedModel<B> {
+    /// Adds bounded records to the canonical source-prepared chat session.
+    /// Text, semantic, capture, intervention and authenticated media policy come
+    /// directly from `request`. No prediction occurs before Started delivery.
+    pub fn start_controlled_chat<'a>(
+        &'a mut self,
+        request: PreparedChatRequest<'_, B::Prompt>,
+        trace_limits: TraceLimits,
+        control: GenerationControlHandle,
+        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<Option<ControlledGenerationSession<'a, B>>, ControlledGenerationError> {
+        let funding = request.chat.compilation().metadata_funding().clone();
+        let local = (|| -> Result<_, ControlledGenerationError> {
+            if control.cancellation().is_cancelled() {
+                return Ok(None);
+            }
+            if trace_limits.per_record_bytes == 0 || trace_limits.total_bytes == 0 {
+                return Err(ControlledGenerationError::Rejected(
+                    "trace byte limits must be positive",
                 ));
             }
-            let (input, prepared_capture, artifact_identity) = match instrumentation {
-                PreparedInputInstrumentation::Unobserved => (input, None, None),
-                PreparedInputInstrumentation::Capture { plan } => {
-                    let attribution = input.attribution();
-                    let maximum = config.sampling().max_new_tokens.ok_or_else(|| {
-                        CaptureError::Invalid(
-                            "prepared capture requires a finite positive prediction limit".into(),
-                        )
-                    })?;
-                    let request = eredu_core::capture::CaptureRequestShape {
-                        batch: attribution.batch,
-                        prompt_tokens: attribution.decoder_positions,
-                        max_predictions: u64::try_from(maximum)
-                            .map_err(|_| CaptureError::Overflow)?,
-                    };
-                    let discovery = B::capture_discovery(&self.runtime)?;
-                    let admitted = plan.admit_with_text_origin(
-                        &discovery.catalog,
-                        &discovery.support,
-                        &discovery.support.capture,
-                        request,
-                        eredu_core::capture::CaptureTextOrigin {
-                            cached_positions: attribution.opening_position,
-                        },
-                    )?;
-                    B::validate_text_capture(&self.runtime, &admitted)?;
-                    let source = eredu_core::capture::SharedCapturePlan::new(admitted);
-                    source.retain_host_preparation(&host)?;
-                    let input =
-                        B::bind_control_input_capture(&self.runtime, input, config, source.clone())
-                            .map_err(PreparedChatError::Backend)?;
-                    (input, Some(source), Some(discovery.artifact_identity))
-                }
-                PreparedInputInstrumentation::Intervention { .. } => {
-                    unreachable!("rejected before preparation")
-                }
-            };
-            Ok(PreparedControlledInput {
-                input,
-                policy: StartupPolicy {
-                    chat: chat.clone(),
-                    settings,
-                    resolved: config.sampling(),
-                    plan: None,
-                    prepared_capture,
-                    intervention: None,
-                    session_identity: self.session_identity.clone(),
+            if let ControlSupport::Unsupported { reason } =
+                B::text_execution_control_support(&self.runtime)
+            {
+                return Err(ControlledGenerationError::Rejected(reason));
+            }
+            let prepare = (|| -> Result<_, RecordConstructionCause> {
+                construction::controls(
+                    &funding,
+                    &[
+                        size_of::<ControlledGenerationSession<'a, B>>(),
+                        size_of::<Delivery>(),
+                        size_of::<ExecutionControlCapabilities>(),
+                        size_of::<RecordContext>(),
+                        size_of::<ControlledGenerationError>(),
+                        size_of::<PreparedChatSessionError>(),
+                        size_of::<PreparedChatRequest<'_, B::Prompt>>(),
+                        size_of::<TraceBudget>(),
+                        size_of::<Option<eredu_core::TextPreparationOptions>>(),
+                        size_of::<PreparedIdentity<'_>>(),
+                        size_of::<std::fmt::Arguments<'_>>(),
+                        size_of::<std::fmt::Result>(),
+                        size_of::<Instant>(),
+                        size_of::<Duration>(),
+                        size_of::<
+                            Result<
+                                Option<ControlledGenerationSession<'a, B>>,
+                                ControlledGenerationError,
+                            >,
+                        >(),
+                        configuration_identity::control_bytes(),
+                        size_of::<ConfigurationIdentityInput<'_>>(),
+                    ],
+                )?;
+                let identity = PreparedIdentity::new("run");
+                let mut run_id = construction::string_capacity(
+                    identity
+                        .bytes()
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .ok_or(HostMetadataFundingError::Overflow)?,
+                    &funding,
+                )?;
+                identity
+                    .write_into(&mut run_id)
+                    .expect("funded String writer");
+                let artifact = B::prepared_artifact_identity(&self.runtime);
+                let artifact_identity = artifact
+                    .map(|artifact| {
+                        // ArtifactIdentity's canonical Display is sha256: plus 2 digits
+                        // for each byte of the retained digest. No hashing/read occurs.
+                        let mut text = construction::string_capacity(
+                            "sha256:".len() + artifact.digest().len() * 2,
+                            &funding,
+                        )?;
+                        write!(&mut text, "{artifact}").expect("funded String writer");
+                        Ok::<_, RecordConstructionCause>(text)
+                    })
+                    .transpose()?;
+                let template = RecordContext {
+                    run_id,
                     artifact_identity,
                     parameter_overlay_id: B::active_parameter_overlay(&self.runtime)
-                        .map(str::to_owned),
-                    trace_limits,
-                },
-                tokenizer_identity: self.tokenizer_fingerprint,
-                host: host.clone(),
-            })
-        })();
-        local.map_err(|error: PreparedChatError| retained(error, host))
-    }
-
-    /// Starts V2 semantic output from the exact prepared source. No model prediction
-    /// or media encoder runs at startup; ordinary native preparation may occur.
-    pub fn start_controlled_prepared_chat<'a>(
-        &'a mut self,
-        prepared: PreparedControlledInput<B>,
-        stops: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(PreparedControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<PreparedControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_prepared(prepared, stops, control, emit, OutputMode::Semantic)
-    }
-
-    /// Starts V2 literal text with the same driver, token domain and termination.
-    pub fn start_controlled_prepared_text<'a>(
-        &'a mut self,
-        prepared: PreparedControlledInput<B>,
-        stops: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(PreparedControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<PreparedControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_prepared(prepared, stops, control, emit, OutputMode::Text)
-    }
-
-    fn start_controlled_prepared<'a>(
-        &'a mut self,
-        prepared: PreparedControlledInput<B>,
-        stops: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(PreparedControlledGenerationRecord) -> ControlFlow<()>,
-        mode: OutputMode,
-    ) -> Result<PreparedControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        let PreparedControlledInput {
-            input,
-            policy,
-            tokenizer_identity,
-            host,
-        } = prepared;
-        let valid_tokenizer = tokenizer_identity == self.tokenizer_fingerprint;
-        let expected_overlay = policy.parameter_overlay_id.clone();
-        let result = self.start_controlled_source::<PreparedInputV2>(
-            policy,
-            |runtime| {
-                if !valid_tokenizer
-                    || expected_overlay.as_deref() != B::active_parameter_overlay(runtime)
-                {
-                    return Err(PreparedChatError::Backend(
-                        PreparedControlInputError::SourceMismatch.into_backend_failure(),
-                    )
-                    .into());
-                }
-                let (prompt, attribution) =
-                    B::consume_control_input(runtime, input).map_err(PreparedChatError::Backend)?;
+                        .map(|text| construction::string(text, &funding))
+                        .transpose()?,
+                    session_id: construction::string(&self.session_identity, &funding)?,
+                    capture_plan_id: None,
+                    intervention_plan_id: None,
+                };
                 Ok((
-                    TextGenerationInput::Prepared(prompt),
-                    PromptRecord::Prepared(attribution),
+                    template,
+                    capabilities(B::text_sampling_control_support(&self.runtime), &funding)?,
                 ))
-            },
-            stops,
-            control,
-            emit,
-            mode,
-        );
-        match result {
-            Ok(mut session) => {
-                session.host_preparation =
-                    HostPreparationAuthority::retain((session.host_preparation.clone(), host));
-                Ok(session)
+            })()
+            .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
+            if prepare.0.artifact_identity.is_none()
+                && request
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.capture.as_ref())
+                    .is_some_and(|capture| !capture.admission().plan().selections.is_empty())
+                || prepare.0.artifact_identity.is_none()
+                    && request
+                        .capture
+                        .is_some_and(|capture| !capture.selections.is_empty())
+            {
+                return Err(ControlledGenerationError::Rejected(
+                    "capture source has no retained artifact identity",
+                ));
             }
-            Err(error) => Err(retained(error, host).into()),
-        }
-    }
-}
-
-impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B, PreparedInputV2> {
-    /// Exact original source metadata, independent of generated history.
-    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
-        self.delivery.prompt.prepared().attribution()
+            let failure = ControlledSessionFailure::prepare(&funding)?;
+            Ok(Some((prepare, failure)))
+        })();
+        let Some((mut prepare, failure)) = self.finish_text_preparation_cancellable(
+            eredu_core::run_preparation::TextPreparationStage::Request,
+            local,
+            ControlledGenerationError::Backend,
+        )?
+        else {
+            return Ok(None);
+        };
+        let tokenizer_identity = self.tokenizer_fingerprint;
+        let chat = request.chat;
+        let mode = request.output_mode;
+        let skip_special = request.skip_special_tokens;
+        let stops = request.stop_sequences;
+        let cancellation = control.cancellation().clone();
+        let started = Instant::now();
+        let Some(session) = self.start_prepared_chat(request, &cancellation)? else {
+            return Ok(None);
+        };
+        // Raw declarations become original sources inside the canonical prompt
+        // worker. Record only the exact admitted aliases returned by that worker.
+        let record_sources = (|| -> Result<_, ControlledGenerationError> {
+            prepare.0.capture_plan_id = session
+                .capture_source()
+                .map(|source| construction::string(source.admission().identity(), &funding))
+                .transpose()
+                .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
+            prepare.0.intervention_plan_id = session
+                .intervention_source()
+                .filter(|source| !source.admission().plan().operations.is_empty())
+                .map(|source| construction::string(source.admission().identity(), &funding))
+                .transpose()
+                .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
+            session
+                .prompt_attribution()
+                .cloned()
+                .map(PromptRecord::new)
+                .ok_or(ControlledGenerationError::Rejected(
+                    "original source lacks complete prompt attribution for records",
+                ))
+        })();
+        let Some(prompt) = session
+            .finish_record_delivery(record_sources.map(Some), ControlledGenerationError::Backend)?
+        else {
+            return Ok(None);
+        };
+        let config = session.effective_config();
+        let semantic_identity = if mode == PreparedChatOutputMode::Text {
+            None
+        } else {
+            chat.generation_runtime_plan().map(|plan| {
+                (
+                    chat.format_profile_identity(),
+                    plan.generation_constraint().fingerprint,
+                    match plan.tool_choice() {
+                        crate::runtime::chat::ToolChoice::None => "none",
+                        crate::runtime::chat::ToolChoice::Auto => "auto",
+                        crate::runtime::chat::ToolChoice::Required => "required",
+                    },
+                    chat.profile_stop_sequences(),
+                )
+            })
+        };
+        let identity_input: ConfigurationIdentityInput<'_> = (
+            PREPARED_EXECUTION_CONTROL_SCHEMA_VERSION,
+            match mode {
+                PreparedChatOutputMode::Semantic => "Semantic",
+                PreparedChatOutputMode::Text => "Text",
+            },
+            tokenizer_identity,
+            config.sampling(),
+            config.seed(),
+            config.inference_policy(),
+            semantic_identity,
+            chat.eos_token_ids(),
+            stops,
+            skip_special,
+        );
+        let configuration_identity = configuration_identity::digest(&identity_input)
+            .expect("closed infallible identity serialization");
+        let delivery = Delivery {
+            configuration_identity,
+            template: prepare.0,
+            budget: TraceBudget::new(trace_limits),
+            control,
+            sequence: 0,
+            epoch: 0,
+            prediction: session.next_prediction(),
+            prompt,
+            started,
+            preparation_elapsed: started.elapsed(),
+            timing: session.timing(),
+            closed: false,
+            failure: None,
+            record_failure: None,
+            semantic_prefix: Vec::new(),
+            funding,
+        };
+        let mut recorded = ControlledGenerationSession {
+            session: Some(session),
+            failed: false,
+            failure,
+            tokenizer_identity,
+            snapshot_budget: None,
+            snapshot_host_capacity: 0,
+            native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits::new(0),
+            capabilities: prepare.1,
+            delivery,
+            journal_destination: None,
+        };
+        recorded.delivery.send(
+            ControlEvent::Started {
+                generation: config.sampling(),
+                seed: config.seed(),
+            },
+            &mut emit,
+        );
+        recorded.delivery_result()?;
+        Ok(Some(recorded))
     }
 }

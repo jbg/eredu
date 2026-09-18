@@ -54,7 +54,7 @@ impl CaptureBackend for Collector {
             })
         {
             self.calls[2].fetch_add(1, Ordering::SeqCst);
-            return Err(Error::backend_source(UnitSentinel));
+            return Err(Error::backend_retained_source(UnitSentinel));
         }
         Ok(BoundedCompletionOutcome::Completed)
     }
@@ -80,7 +80,7 @@ impl CaptureBackend for Collector {
         self.calls[1].fetch_add(1, Ordering::SeqCst);
         if self.fault == Some("collector") {
             self.calls[2].fetch_add(1, Ordering::SeqCst);
-            return Some(Err(Error::backend_source(UnitSentinel)));
+            return Some(Err(Error::backend_retained_source(UnitSentinel)));
         }
         let source = &input.source;
         let width = input.unit_coordinates.local_count();

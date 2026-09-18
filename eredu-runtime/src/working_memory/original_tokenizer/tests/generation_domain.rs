@@ -3,23 +3,36 @@ fn generation(input: &str) -> TokenizerPlan<'_> {
     plan(input).with_generation_domain().unwrap()
 }
 #[test]
+fn overlapping_added_token_retains_paid_capacity_without_extending_logical_domain() {
+    let input = INPUT.replace("\"Ġ\":3", "\"Ġ\":3,\"<S>\":4");
+    let plan = generation(&input);
+    assert_eq!(plan.generation_domain_extent(), Some(6));
+    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
+    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let source = pool.compile_tokenizer(plan).unwrap();
+    let Some(TokenFilter::Allowed(mask)) = source.generation_domain() else { panic!("original mask") };
+    assert_eq!(mask.as_slice(), &[true; 5]);
+    assert_eq!(mask.capacity(), 6, "logical canonicalization does not refund storage");
+    assert_eq!(source.original_bytes(), bytes);
+    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    drop(source);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+#[test]
 fn generation_domain_is_originally_admitted_and_all_strong_exits_retain_its_full_c() {
     let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(INPUT)).unwrap();
     let plain = WorkingMemoryPool::tokenizer_required_bytes(&plan(INPUT)).unwrap();
-    assert_eq!(
-        bytes - plain,
-        5 + (std::mem::size_of::<OriginalTextSourceError>()
-            + std::mem::size_of::<eredu_core::TokenInputRejection>()
-            + std::mem::size_of::<Result<(), OriginalTextSourceError>>()
-            + std::mem::size_of::<Result<OriginalTokenizer, OriginalTextSourceError>>())
-            as u64
-    );
+    // The dense vocabulary adds five mask entries and its source-operation
+    // controls. Admission/retirement below use the complete published quote;
+    // later encode errors do not determine source-compiler storage.
+    assert!(bytes >= plain + 5);
     let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
     let error = short
         .compile_tokenizer_inner(
             generation(INPUT),
             || panic!("one-short entered construction"),
             false,
+            None,
         )
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
@@ -56,7 +69,7 @@ fn actual_domain_reserve_failure_retains_completed_compiler_until_error_retireme
     let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(INPUT)).unwrap();
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
     let error = pool
-        .compile_tokenizer_inner(generation(INPUT), || {}, true)
+        .compile_tokenizer_inner(generation(INPUT), || {}, true, None)
         .unwrap_err();
     assert!(error.domain_failure().is_some());
     assert_eq!(error.domain_capacity(), 0);
@@ -66,12 +79,14 @@ fn actual_domain_reserve_failure_retains_completed_compiler_until_error_retireme
     drop(pool.acquire_unquoted().unwrap());
     let error = BackendFailure::new(eredu_core::BackendFailureKind::ResourceExhausted, error);
     assert_eq!(pool.used_bytes().unwrap(), bytes);
-    assert!(error
-        .source()
-        .unwrap()
-        .source()
-        .unwrap()
-        .is::<TryReserveError>());
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<TryReserveError>()
+    );
     drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }

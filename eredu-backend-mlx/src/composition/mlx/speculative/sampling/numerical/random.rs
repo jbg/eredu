@@ -16,7 +16,7 @@ impl OriginalNumericalKey {
         array: Array,
         stream: ValueStream,
         custody: OriginalSpeculativeNumericalBudgetCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
         budget: safemlx::OriginalBufferBudget,
     ) -> Self {
         Self(OriginalNumericalValue::completed(
@@ -174,7 +174,7 @@ fn fixed<E: std::error::Error + Send + Sync + 'static>(
         None => no_context(),
     }
 }
-fn reserve_controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
+fn reserve_controls(funding: &HostMetadataFunding) -> Result<(), Error> {
     let parts = [
         size_of::<SamplingPlacement>(),size_of::<Result<u32,Error>>(),
         size_of::<(&OriginalNumericalValue,f32,&mut OriginalNumericalKey,SamplingPlacement,SpeculativeExecutionStreams<'_>)>(),
@@ -195,7 +195,7 @@ fn reserve_controls(funding: &WorkspaceMetadataFunding) -> Result<(), Error> {
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
     funding
         .reserve_metadata(bytes)

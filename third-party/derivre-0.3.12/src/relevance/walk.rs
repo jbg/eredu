@@ -1,8 +1,9 @@
 //! One relevance DFS. The context owns equations; memory owns paid destinations.
 use super::{RelevanceCache, SymRes};
+use hashbrown::HashSet;
 use crate::{
     ast::{ExprRef, ExprSet},
-    HashSet,
+
 };
 
 pub(crate) struct StackFrame {
@@ -85,33 +86,33 @@ struct OrdinaryContext<'a> {
     cache: &'a mut RelevanceCache,
 }
 impl Context for OrdinaryContext<'_> {
-    type Error = anyhow::Error;
+    type Error = crate::ParserError;
     fn cached(&self, node: ExprRef) -> Option<bool> {
         self.cache.relevance_cache.get(&node).copied()
     }
-    fn cache(&mut self, node: ExprRef, value: bool) -> anyhow::Result<()> {
-        self.cache.relevance_cache.insert(node, value);
+    fn cache(&mut self, node: ExprRef, value: bool) -> crate::ParserResult<()> {
+        self.source.construction_funding()?.try_insert(&mut self.cache.relevance_cache, node, value)?;
         Ok(())
     }
     fn positive(&self, node: ExprRef) -> bool {
         self.source.is_positive(node)
     }
-    fn derivative(&mut self, node: ExprRef) -> anyhow::Result<SymRes> {
-        Ok(self.cache.deriv(self.source, node))
+    fn derivative(&mut self, node: ExprRef) -> crate::ParserResult<SymRes> {
+        self.cache.deriv(self.source, node)
     }
-    fn pay(&mut self, count: usize) -> anyhow::Result<()> {
-        self.source.pay(count);
+    fn pay(&mut self, count: usize) -> crate::ParserResult<()> {
+        self.source.pay_prepared(count)?;
         Ok(())
     }
-    fn prepare_weight(&mut self, node: ExprRef) -> anyhow::Result<()> {
-        self.source.get_weight(node);
+    fn prepare_weight(&mut self, node: ExprRef) -> crate::ParserResult<()> {
+        self.source.get_weight(node)?;
         Ok(())
     }
     fn weight(&self, node: ExprRef) -> u32 {
         self.source.cached_weight(node)
     }
-    fn check_fuel(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
+    fn check_fuel(&self) -> crate::ParserResult<()> {
+        crate::parser_ensure!(self.source.construction_funding()?,
             self.source.cost() <= self.cache.cost_limit,
             "maximum relevance check fuel {} exceeded",
             self.cache.max_fuel
@@ -120,40 +121,42 @@ impl Context for OrdinaryContext<'_> {
     }
 }
 struct OrdinaryMemory {
-    visited: HashSet<ExprRef>,
+    visited: HashSet<ExprRef, crate::RandomState>,
+    funding: crate::ParserAllocationFunding,
     stack: Vec<StackFrame>,
     pending: Vec<ExprRef>,
 }
 impl Memory for OrdinaryMemory {
-    type Error = anyhow::Error;
+    type Error = crate::ParserError;
     fn next(&mut self) -> Option<ExprRef> {
         next(&mut self.stack)
     }
     fn visited(&self, node: ExprRef) -> bool {
         self.visited.contains(&node)
     }
-    fn visit(&mut self, node: ExprRef) -> anyhow::Result<()> {
-        self.visited.insert(node);
+    fn visit(&mut self, node: ExprRef) -> crate::ParserResult<()> {
+        self.funding.try_insert_set(&mut self.visited, node)?;
         Ok(())
     }
-    fn begin_children(&mut self, count: usize) -> anyhow::Result<()> {
-        self.pending = Vec::with_capacity(count);
+    fn begin_children(&mut self, count: usize) -> crate::ParserResult<()> {
+        self.pending.clear();
+        self.funding.try_grow_vec(&mut self.pending, count)?;
         Ok(())
     }
-    fn child(&mut self, node: ExprRef) -> anyhow::Result<()> {
-        self.pending.push(node);
+    fn child(&mut self, node: ExprRef) -> crate::ParserResult<()> {
+        self.funding.try_push(&mut self.pending, node)?;
         Ok(())
     }
     fn children(&mut self) -> &mut [ExprRef] {
         &mut self.pending
     }
-    fn push(&mut self, node: ExprRef) -> anyhow::Result<()> {
+    fn push(&mut self, node: ExprRef) -> crate::ParserResult<()> {
         if !self.pending.is_empty() {
-            self.stack.push(StackFrame {
+            self.funding.try_push(&mut self.stack, StackFrame {
                 expression: node,
                 cursor: 0,
                 children: std::mem::take(&mut self.pending),
-            });
+            })?;
         }
         Ok(())
     }
@@ -163,7 +166,7 @@ impl Memory for OrdinaryMemory {
     fn publish_empty<C: Context<Error = Self::Error>>(
         &self,
         context: &mut C,
-    ) -> anyhow::Result<()> {
+    ) -> crate::ParserResult<()> {
         for &node in &self.visited {
             context.cache(node, false)?;
         }
@@ -186,15 +189,12 @@ pub(crate) fn ordinary(
     cache: &mut RelevanceCache,
     source: &mut ExprSet,
     root: ExprRef,
-) -> anyhow::Result<bool> {
-    let mut memory = OrdinaryMemory {
-        visited: HashSet::default(),
-        stack: vec![StackFrame {
-            expression: root,
-            cursor: 0,
-            children: vec![root],
-        }],
-        pending: Vec::new(),
-    };
+) -> crate::ParserResult<bool> {
+    let funding = source.construction_funding()?.clone();
+    let mut children = Vec::new();
+    funding.try_push(&mut children, root)?;
+    let mut stack = Vec::new();
+    funding.try_push(&mut stack, StackFrame { expression: root, cursor: 0, children })?;
+    let mut memory = OrdinaryMemory { visited: HashSet::default(), stack, pending: Vec::new(), funding };
     run(&mut OrdinaryContext { source, cache }, &mut memory)
 }

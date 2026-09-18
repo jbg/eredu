@@ -57,6 +57,12 @@ where
     ToObserver: FnMut(X) -> E,
     ToExecution: FnMut(&E) -> X,
 {
+    fn observes_activations(&self) -> bool {
+        self.observer.observes_activations()
+    }
+    fn retained_media_cut(&mut self, visit: &mut dyn FnMut(&mut dyn FnMut(&T))) -> Result<(), X> {
+        result(&mut self.failure, &mut self.to_execution, self.observer.retained_media_cut(visit))
+    }
     fn requires_prepared_traversal(&self) -> bool {
         self.observer.requires_prepared_traversal()
     }
@@ -251,6 +257,46 @@ where
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+    #[test]
+    fn activation_free_bridge_keeps_media_cut_lifecycle_and_original_failure() {
+        struct CutOnly {
+            cuts: usize,
+            finishes: usize,
+            identity: Rc<()>,
+        }
+        impl ActivationObserver<i32, Rc<()>> for CutOnly {
+            fn observes_activations(&self) -> bool { false }
+            fn observe(&mut self, _: &str, _: &i32) -> Result<(), Rc<()>> {
+                panic!("activation-only callback is absent")
+            }
+            fn retained_media_cut(&mut self, visit: &mut dyn FnMut(&mut dyn FnMut(&i32)))
+                -> Result<(), Rc<()>> {
+                visit(&mut |value| { assert_eq!(*value, 7); self.cuts += 1; });
+                Err(self.identity.clone())
+            }
+            fn finish_prefill(&mut self, committed: bool) {
+                assert!(committed);
+                self.finishes += 1;
+            }
+        }
+        let identity = Rc::new(());
+        let mut observer = CutOnly { cuts: 0, finishes: 0, identity: identity.clone() };
+        let mut bridge = ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
+        {
+            let mut borrowed = crate::BorrowedActivationObserver(&mut bridge);
+            assert!(!borrowed.observes_activations());
+            assert!(borrowed.retained_media_cut(&mut |visit| visit(&7)).is_err());
+        }
+        let error = bridge.resolve(Ok::<_, Rc<()>>(())).unwrap_err();
+        assert!(Rc::ptr_eq(&error, &identity));
+        assert_eq!(observer.cuts, 1);
+        // The absent activation fact does not alter the observer's ordinary
+        // lifecycle dispatch; this callback is still forwarded by the bridge.
+        let mut bridge = ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
+        bridge.finish_prefill(true);
+        drop(bridge);
+        assert_eq!(observer.finishes, 1);
+    }
     #[derive(Debug)]
     struct Failure(Rc<u32>);
     struct Observer {

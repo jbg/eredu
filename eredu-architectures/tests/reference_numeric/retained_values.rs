@@ -4,8 +4,8 @@ fn auxiliary_values(module: &impl Parameterized<NumericTensor>) -> Vec<NumericTe
     #[derive(Default)]
     struct Parameters(Vec<(String, *const NumericTensor)>);
     impl<'a> ParameterVisitor<'a, NumericTensor> for Parameters {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'a NumericTensor) {
-            self.0.push((metadata.id.as_str().into(), value));
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+            self.0.push((metadata.id().as_str().into(), value));
         }
     }
     let mut before = Parameters::default();

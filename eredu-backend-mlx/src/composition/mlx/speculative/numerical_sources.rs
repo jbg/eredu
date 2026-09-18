@@ -8,7 +8,7 @@ use crate::{
         session::OriginalInterventionDeclaration,
     },
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
     replicated_session::ReplicatedTextControlOrigin,
     working_memory::{OriginalSpeculativeRequest, WorkingMemoryError, WorkingMemoryPool},
@@ -33,7 +33,7 @@ pub(crate) struct OriginalSpeculativeNumericalSources {
     intervention_declaration: Option<OriginalInterventionDeclaration>,
     request: OriginalSpeculativeRequest,
     pool: WorkingMemoryPool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 /// Immutable prerequisites captured from the actual executable before its
 /// disjoint selected strategy and mutable session are lent to an executor.
@@ -46,13 +46,13 @@ pub(crate) struct OriginalSpeculativeNumericalPreparation {
     indexed: Vec<(u32,crate::backend::runtime::residency::parameter_bank::IndexedBankSource)>,
     execution: eredu_runtime::working_memory::InferenceExecutionIdentity,
     pool: WorkingMemoryPool,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 impl OriginalSpeculativeNumericalPreparation {
     pub(crate) fn prepare(
         target: &Executable,
         pool: &WorkingMemoryPool,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         let controls = [
             size_of::<Self>(),
@@ -61,7 +61,7 @@ impl OriginalSpeculativeNumericalPreparation {
             size_of::<(
                 &Executable,
                 &WorkingMemoryPool,
-                WorkspaceMetadataFunding,
+                HostMetadataFunding,
             )>(),
             size_of::<safemlx::PrefillRootsRuntime>(),
             size_of::<Result<safemlx::PrefillRootsRuntime, Error>>(),
@@ -78,26 +78,26 @@ impl OriginalSpeculativeNumericalPreparation {
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<SourceError>(),
             eredu_core::BackendFailure::source_retention_peak_bytes::<SourceError>().ok_or(
-                Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
             )?,
             eredu_core::BackendFailure::source_retention_peak_bytes::<WorkingMemoryError>().ok_or(
-                Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
             )?,
             eredu_core::BackendFailure::source_retention_peak_bytes::<
                 eredu_runtime::replicated_session::PreparedControlBindingError,
             >()
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?,
             eredu_core::BackendFailure::source_retention_peak_bytes::<Error>().ok_or(
-                Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
             )?,
         ];
         let bytes = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(
-                WorkspaceMetadataFundingError::Overflow,
+                HostMetadataFundingError::Overflow,
             ))?;
         funding
             .reserve_metadata(bytes)
@@ -140,7 +140,7 @@ impl OriginalSpeculativeNumericalPreparation {
         &self.execution
     }
     pub(crate) fn pool(&self) -> &WorkingMemoryPool { &self.pool }
-    pub(crate) fn metadata_funding(&self) -> &WorkspaceMetadataFunding { &self.funding }
+    pub(crate) fn metadata_funding(&self) -> &HostMetadataFunding { &self.funding }
 
     /// Consumes the source only after the selected schedule has opened its exact
     /// request. Equal geometry cannot replace its pool or execution identity.
@@ -153,7 +153,7 @@ impl OriginalSpeculativeNumericalPreparation {
             size_of::<Result<(), WorkingMemoryError>>(),
         ];
         self.funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         request.validate_pool(&self.pool)
             .and_then(|()| request.validate_execution(&self.execution))
@@ -170,16 +170,16 @@ impl OriginalSpeculativeNumericalSources {
     /// execution and request ceiling still admit every constructor. Outputs,
     /// completion recovery and errors retain this account through their usual
     /// funding aliases; the selected-source owner does not retain it.
-    pub(crate) fn prepare_phase_metadata(&self) -> Result<WorkspaceMetadataFunding, Error> {
+    pub(crate) fn prepare_phase_metadata(&self) -> Result<HostMetadataFunding, Error> {
         let parts = [
             size_of::<&Self>(),
-            size_of::<WorkspaceMetadataFunding>(),
-            size_of::<Result<WorkspaceMetadataFunding, WorkspaceMetadataFundingError>>(),
-            size_of::<Result<WorkspaceMetadataFunding, Error>>(),
+            size_of::<HostMetadataFunding>(),
+            size_of::<Result<HostMetadataFunding, HostMetadataFundingError>>(),
+            size_of::<Result<HostMetadataFunding, Error>>(),
         ];
         self.funding.reserve_metadata(parts.into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?)
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         self.pool.prepare_workspace_metadata(
             self.request.execution_identity(), self.request.capacity_bytes(),
@@ -190,7 +190,7 @@ impl OriginalSpeculativeNumericalSources {
         target: &Executable,
         request: OriginalSpeculativeRequest,
         pool: &WorkingMemoryPool,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         OriginalSpeculativeNumericalPreparation::prepare(target, pool, funding)?.bind(request)
     }
@@ -198,13 +198,13 @@ impl OriginalSpeculativeNumericalSources {
     /// The directory carries no source allowance or mutable invocation state.
     pub(crate) fn target_addressable_sources(&self,
         mechanism:crate::backend::nn::workspace::ResidentExecutionMechanisms,
-        environment:&OriginalCopyEnvironment<'_>,funding:&WorkspaceMetadataFunding,
+        environment:&OriginalCopyEnvironment<'_>,funding:&HostMetadataFunding,
     )->Result<Option<crate::backend::nn::workspace::AddressableSources>,Error> {
         self.validate_environment(environment)?;
         if self.indexed.is_empty(){return Ok(None);}
         funding.reserve_metadata(size_of::<(Option<crate::backend::nn::workspace::AddressableSources>,
             Result<Option<crate::backend::nn::workspace::AddressableSources>,Error>,
-            &Self,&OriginalCopyEnvironment<'_>,&WorkspaceMetadataFunding)>())
+            &Self,&OriginalCopyEnvironment<'_>,&HostMetadataFunding)>())
             .map_err(Error::WorkspacePlanning)?;
         let runtime=environment.input_runtime().map_err(|cause|retain_planning_error(cause,funding.clone()))?;
         crate::backend::nn::workspace::AddressableSources::new(
@@ -225,7 +225,7 @@ impl OriginalSpeculativeNumericalSources {
     pub(crate) fn request(&self) -> &OriginalSpeculativeRequest {
         &self.request
     }
-    pub(crate) fn metadata_funding(&self) -> &WorkspaceMetadataFunding {
+    pub(crate) fn metadata_funding(&self) -> &HostMetadataFunding {
         &self.funding
     }
     pub(crate) fn numerical_prerequisites(
@@ -261,7 +261,7 @@ impl OriginalSpeculativeNumericalSources {
         plan: &eredu_core::intervention::AdmittedInterventionPlan,
     ) -> Result<(), Error> {
         let controls = OriginalInterventionDeclaration::validation_control_bytes().ok_or(
-            Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow),
+            Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
         )?;
         self.funding
             .reserve_metadata(controls)
@@ -287,7 +287,7 @@ impl OriginalSpeculativeNumericalSources {
         &self, plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
     ) -> Result<(), Error> {
         let controls = OriginalInterventionDeclaration::activation_validation_control_bytes()
-            .ok_or(Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         self.funding.reserve_metadata(controls).map_err(Error::WorkspacePlanning)?;
         let declaration = self.intervention_declaration.as_ref()
             .ok_or_else(|| self.retain_startup_error(WorkingMemoryError::UnknownBound))?;
@@ -296,20 +296,18 @@ impl OriginalSpeculativeNumericalSources {
         }
         declaration.validate_activations(plan)
     }
-    #[track_caller]
     pub(crate) fn retain_error(&self, cause: Error) -> Error {
-        if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some(){eprintln!("EXTERNAL_RETAIN_ERROR {}: {}",std::panic::Location::caller(),cause);}
         match cause.take_retained_backend_failure() {
             Ok(cause) => Error::StorageSource(cause),
             Err(cause) => retain_planning_error(cause, self.funding.clone()),
         }
     }
-    #[track_caller]
     pub(crate) fn retain_startup_error<E: std::error::Error + Send + Sync + 'static>(
         &self,
         cause: E,
     ) -> Error {
-        if std::env::var_os("EREDU_EXTERNAL_FLOW_TRACE").is_some(){eprintln!("EXTERNAL_RETAIN_STARTUP {}: {}",std::panic::Location::caller(),cause);}
         retain_planning_error(cause, self.funding.clone())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

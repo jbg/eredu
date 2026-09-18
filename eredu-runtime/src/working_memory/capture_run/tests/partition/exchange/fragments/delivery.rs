@@ -1,7 +1,7 @@
 use super::*;
 
 struct Ranks {
-    local:usize,bytes:RefCell<[Option<Vec<u8>>;4]>,funding:WorkspaceMetadataFunding,
+    local:usize,bytes:RefCell<[Option<Vec<u8>>;4]>,funding:HostMetadataFunding,
     reject:bool,calls:RefCell<Vec<PartitionCaptureFrameKind>>,
 }
 
@@ -25,8 +25,8 @@ fn contiguous_prefill_delivers_to_the_original_global_target_after_real_hook_pro
         let ordinary_rows=receipt.producers().map(|(rank,p)|PartitionCaptureProducer{rank,projection:p.clone()}).collect();
         let limits=PartitionCaptureReceiptLimits{max_producers:3,max_fragments:3,max_record_bytes:receipt.max_record_bytes()};
         let mut oq=CaptureLedger::new(source.admission());oq.begin_step();
-        let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut oq)}
-            else{PartitionCaptureReceiptPlan::new_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut oq)}.unwrap();
+        let ordinary=if sum{PartitionCaptureReceiptPlan::new_sum(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut oq)}
+            else{PartitionCaptureReceiptPlan::new(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut oq)}.unwrap();
         assert_eq!(ordinary.identity(),receipt.identity());let mut ordinary=ordinary.into_delivery();
         let scalar=|rank:usize,head:usize,row:usize,column:usize| head as f32*100.0+row as f32*10.0+column as f32+rank as f32*0.25;
         for (rank,projection) in receipt.producers() {
@@ -195,8 +195,8 @@ fn contiguous_delivery_preserves_local_and_empty_sources_and_releases_only_after
             let limits=PartitionCaptureReceiptLimits{max_producers:3,max_fragments:3,max_record_bytes:receipt.max_record_bytes()};
             let mut ordinary_quota=CaptureLedger::new(source.admission());ordinary_quota.begin_step();
             let ordinary=if combination==PartitionCaptureCombination::SumF64ToF32 {
-                PartitionCaptureReceiptPlan::new_sum_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)
-            }else{PartitionCaptureReceiptPlan::new_shared(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
+                PartitionCaptureReceiptPlan::new_sum(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)
+            }else{PartitionCaptureReceiptPlan::new(source.clone(),receipt.context().clone(),ordinary_rows,4,limits,&mut ordinary_quota)}.unwrap();
             assert_eq!(ordinary.identity(),receipt.identity());let mut ordinary=ordinary.into_delivery();
             for (rank,bytes) in transport.bytes.borrow().iter().enumerate(){if let Some(bytes)=bytes{ordinary.receive(rank,bytes,&mut ordinary_quota).unwrap();}}
             let expected=ordinary.finish(&mut ordinary_quota).unwrap();
@@ -237,7 +237,7 @@ fn contiguous_delivery_preserves_local_and_empty_sources_and_releases_only_after
 // returning another request's independently paid host bank.
 #[test]
 fn partition_local_hook_rejects_foreign_original_owner_and_retains_both_accounts() {
-    fn prepared<'t>(transport:&'t Ranks,source:&SharedCapturePlan,funding:&WorkspaceMetadataFunding)
+    fn prepared<'t>(transport:&'t Ranks,source:&SharedCapturePlan,funding:&HostMetadataFunding)
         ->(PreparedPartitionFragmentDelivery<'t,Ranks>,WorkingMemoryPool) {
         let mut quota=CaptureLedger::new(source.admission());quota.begin_step();
         let mut receipt=receipt(source,PartitionCaptureCombination::Disjoint,funding,&mut quota);

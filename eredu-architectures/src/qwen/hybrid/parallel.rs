@@ -16,7 +16,7 @@ use super::{
 
 use crate::qwen::vision;
 use crate::decoder::parameter_metadata::{
-    DeclarationDestination as Destination, DeclarationParameter, ParameterGroupError as GroupError,
+    DeclarationDestination as Destination, ParameterGroupError as GroupError,
 };
 
 /// Complete planner-derived geometry for target, MTP, vocabulary, and state.
@@ -1008,17 +1008,17 @@ fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
 // one row per weight block, including on the expert bank's rank-3 row axis.
 fn segmented_member_sharding(
     config: &HybridConfig,
-    metadata: DeclarationParameter<'_>,
+    metadata: eredu_nn::ParameterMetadataView<'_>,
     axis: usize,
     segments: &[Range<usize>],
     destination: Destination<'_>,
 ) -> Result<MemberSharding, GroupError> {
-    destination.controls::<(Vec<Range<usize>>, MemberSharding, DeclarationParameter<'_>)>()?;
+    destination.controls::<(Vec<Range<usize>>, MemberSharding, eredu_nn::ParameterMetadataView<'_>)>()?;
     let mut owned = destination.vector(segments.len())?;
     owned.extend(segments.iter().cloned());
     let mut segments = owned;
-    if metadata.companion() == Some(eredu_nn::LinearCompanionRole::Scale) {
-        let weight = metadata.companion_of().ok_or_else(|| {
+    if metadata.linear_companion() == Some(eredu_nn::LinearCompanionRole::Scale) {
+        let weight = metadata.linear_companion_of().ok_or_else(|| {
             destination.tensor_error(format_args!(
                 "scale {} has no owning weight",
                 metadata.id().as_str()

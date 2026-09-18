@@ -34,8 +34,7 @@ macro_rules! execute_group {
         let unit_count =
             <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::group_unit_count(
                 &$architecture,
-                $group,
-            )
+                $group, None)
             .unwrap();
         for index in 0..unit_count {
             let mut unit =

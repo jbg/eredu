@@ -1,7 +1,7 @@
 //! Paid mechanical validation and framing in the existing boundary driver.
 use super::*;
 use crate::{PreparedBoundarySource,PreparedBoundaryFrameCause};
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use std::{alloc::Layout,mem::{size_of,size_of_val}};
 #[derive(Debug,thiserror::Error)]
 #[error("{cause}")]
@@ -17,7 +17,7 @@ impl<'a,E:std::error::Error+Send+Sync+'static> Controls<'a,E>{
             size_of::<crate::PreparedBoundaryFrameError>(),size_of::<Failure<E>>(),
             size_of::<eredu_core::BackendFailure>(),size_of::<CommunicationPoison>(),
             size_of::<std::sync::MutexGuard<'_,Option<CommunicationPoison>>>(),
-            size_of::<(TensorDtype,usize,Option<usize>)>(),size_of::<Result<Option<bool>,WorkspaceMetadataFundingError>>(),
+            size_of::<(TensorDtype,usize,Option<usize>)>(),size_of::<Result<Option<bool>,HostMetadataFundingError>>(),
             size_of::<Result<(),crate::CommunicationTensorContractError>>(),
             size_of::<Result<(),crate::CommunicationManifestError>>(),
             CommunicationOperationRequirement::tensor_metadata_control_bytes().ok_or_else(||value.overflow())?,
@@ -25,8 +25,8 @@ impl<'a,E:std::error::Error+Send+Sync+'static> Controls<'a,E>{
         value.reserve(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add).ok_or_else(||value.overflow())?)?;
         Ok(value)
     }
-    fn overflow(&self)->PartitionExecutionError{self.funding_error(WorkspaceMetadataFundingError::Overflow)}
-    fn funding_error(&self,cause:WorkspaceMetadataFundingError)->PartitionExecutionError{
+    fn overflow(&self)->PartitionExecutionError{self.funding_error(HostMetadataFundingError::Overflow)}
+    fn funding_error(&self,cause:HostMetadataFundingError)->PartitionExecutionError{
         self.source.error(PreparedBoundaryFrameCause::Funding(cause)).into()
     }
     fn contract(&self)->PartitionExecutionError{self.source.error(PreparedBoundaryFrameCause::Contract).into()}

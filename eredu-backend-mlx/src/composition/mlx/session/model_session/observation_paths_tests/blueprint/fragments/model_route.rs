@@ -367,6 +367,7 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
         for (plain, selected) in raw_spans.iter().zip(bound_spans) {
             assert_eq!(plain.span(), selected.span());
             let extra = match plain.span() {
+                eredu_runtime::working_memory::InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
                 eredu_runtime::working_memory::InferenceWorkspaceSpan::Prefill(_) => {
                     prefill_spans += 1;
                     hook

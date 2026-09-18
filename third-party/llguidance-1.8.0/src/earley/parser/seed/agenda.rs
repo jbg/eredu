@@ -1,12 +1,11 @@
 //! Initial chart closure using the ordinary agenda and paid reached destinations.
 use super::super::{
-    agenda, CGrammar, CSymIdx, GrammarStackNode, Item, Lexeme, ParamValue, Scratch,
+    agenda, CGrammar, SharedGrammar, CSymIdx, GrammarStackNode, Item, Lexeme, ParamValue, Scratch,
 };
 use super::{reserve, Cause, PreparedEarleySeed, PreparedEarleySeedError};
 use std::{
     mem::{size_of, size_of_val},
     ops::Range,
-    sync::Arc,
 };
 
 // Capture names remain in the independently paid immutable declaration. Initial
@@ -34,7 +33,7 @@ struct Context<'a, F> {
     owner: &'a mut PreparedEarleySeed,
     funding: &'a F,
 }
-impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> Context<'_, F> {
     fn capture(&mut self, symbol: CSymIdx, stop: bool) -> Result<(), Cause<E>> {
         let entry = InitialCapture {
             symbol,
@@ -63,7 +62,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> Context<'_, F> {
         Ok(())
     }
 }
-impl<F: Fn(usize) -> Result<(), E>, E> agenda::Context for Context<'_, F> {
+impl<F: crate::earley::PreparedFunding<Error = E>, E> agenda::Context for Context<'_, F> {
     type Error = Cause<E>;
     fn scratch(&self) -> &Scratch {
         self.owner.scratch.as_ref().expect("seed scratch")
@@ -120,7 +119,7 @@ impl<F: Fn(usize) -> Result<(), E>, E> agenda::Context for Context<'_, F> {
         if !initial && self.trie.is_none() {
             return Err(Cause::Source);
         }
-        let grammar = Arc::clone(&self.owner.grammar);
+        let grammar = self.owner.grammar.clone();
         agenda::capture_targets(&grammar, item, row, scanned, |symbol, is_lexeme, start| {
             let props = &grammar.sym_data(symbol).props;
             for stop in [true, false] {
@@ -160,7 +159,7 @@ impl PreparedEarleySeed {
     /// Closes the actual initial prediction agenda with the ordinary completion,
     /// nested-grammar, parametric and nullable rules. A failed destination stays
     /// in the returned owner; this does not yet publish a lexer-backed row.
-    pub fn close_initial_agenda<F: Fn(usize) -> Result<(), E>, E>(
+    pub fn close_initial_agenda<F: crate::earley::PreparedFunding<Error = E>, E>(
         mut self,
         funding: &F,
     ) -> Result<Self, PreparedEarleySeedError<E>> {
@@ -176,7 +175,7 @@ impl PreparedEarleySeed {
                 size_of::<Result<(), E>>(),
                 size_of::<Result<Range<usize>, Cause<E>>>(),
                 size_of::<InitialCapture>(),
-                size_of::<Arc<CGrammar>>(),
+                size_of::<SharedGrammar>(),
                 size_of::<GrammarStackNode>(),
                 size_of::<Lexeme>(),
                 size_of::<(usize, usize, usize, usize, Item, ParamValue, CSymIdx, bool)>(),
@@ -190,7 +189,7 @@ impl PreparedEarleySeed {
                 size_of::<Option<&[u8]>>(),
                 size_of::<Range<usize>>(),
             ];
-            funding(
+            funding.reserve(
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
@@ -246,7 +245,7 @@ impl PreparedEarleySeed {
     }
 }
 
-pub(super) fn run<F: Fn(usize) -> Result<(), E>, E>(
+pub(super) fn run<F: crate::earley::PreparedFunding<Error = E>, E>(
     owner: &mut PreparedEarleySeed,
     row: usize,
     lexeme: &Lexeme,
@@ -257,13 +256,13 @@ pub(super) fn run<F: Fn(usize) -> Result<(), E>, E>(
     let parts = [
         PreparedEarleySeed::controls::<F, E>().ok_or(Cause::Overflow)?,
         size_of::<Context<'_, F>>(),
-        size_of::<Arc<CGrammar>>(),
+        size_of::<SharedGrammar>(),
         size_of::<GrammarStackNode>(),
         size_of::<(usize, usize, usize, Item, ParamValue, CSymIdx, bool)>(),
         size_of::<std::ops::Range<usize>>(),
         size_of::<Result<(), Cause<E>>>(),
     ];
-    funding(
+    funding.reserve(
         parts
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)

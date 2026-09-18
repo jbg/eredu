@@ -15,7 +15,7 @@ enum Source<C, T, I, P> {
     Text(PreparedCompositeTextPrefill<C, T, I>),
     Whole {
         prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
-        admitted: AdmittedCompositeInput<P>,
+        admitted: PrefillAdmission<P>,
         geometry: InferenceGeometry,
         metadata: Option<WorkspaceContext>,
     },
@@ -36,7 +36,7 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
     ) -> Option<&'a crate::speculative_execution::EmbeddedPredictionTensor<T>> {
         match &chunk.0 {
             Chunk::Text(chunk) => chunk.packet.as_ref(),
-            Chunk::Whole => None,
+            Chunk::Whole { tokens } => tokens.as_ref().map(|(_, packet)| packet),
         }
     }
     pub(crate) fn token_ids<'a>(&self, chunk: &'a ExternalPrefillChunk<T, P>) -> Option<&'a T> {
@@ -45,15 +45,13 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
                 eredu_runtime::PreparedInputPayload::TokenIds(tokens) => Some(tokens),
                 _ => None,
             },
-            Chunk::Whole => None,
+            Chunk::Whole { tokens } => tokens.as_ref().map(|(tokens, _)| tokens),
         }
     }
     pub(crate) fn validate_completed_span(&self, chunk: &PrefillChunk) -> Result<(), Error> {
         match &self.body {
             Source::Text(text) => text.text.validate_completed_span(chunk),
-            Source::Whole { .. } => {
-                Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
-            }
+            Source::Whole { geometry, metadata, .. } => validate_whole_span(*geometry, chunk, metadata.as_ref()),
         }
     }
     pub(crate) fn prepare_completed_chunk<A, B, S>(
@@ -75,9 +73,11 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
                 prepare_composite_chunk::<A, B, S, I>(text, chunk, context, Some(supplied))
                     .map(|chunk| ExternalPrefillChunk(Chunk::Text(chunk)))
             }
-            Source::Whole { .. } => {
-                drop(supplied);
-                Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+            Source::Whole { geometry, metadata, .. } => {
+                validate_whole_span(*geometry, chunk, metadata.as_ref())?;
+                Metadata::new(metadata.as_ref()).controls::<(ExternalPrefillChunk<T, P>,
+                    (T, crate::speculative_execution::EmbeddedPredictionTensor<T>))>()?;
+                Ok(ExternalPrefillChunk(Chunk::Whole { tokens: Some(supplied) }))
             }
         }
     }
@@ -95,26 +95,7 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
     ) -> Result<Option<Self>, Error> {
         Self::from_source(
             prepared.into(),
-            admitted,
-            geometry,
-            config,
-            inspector,
-            allow_whole_input,
-            None,
-        )
-    }
-
-    pub(crate) fn from_source_owner(
-        prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
-        admitted: AdmittedCompositeInput<P>,
-        geometry: InferenceGeometry,
-        config: C,
-        inspector: I,
-        allow_whole_input: bool,
-    ) -> Result<Option<Self>, Error> {
-        Self::from_source(
-            prepared,
-            admitted,
+            PrefillAdmission::Ordinary(admitted),
             geometry,
             config,
             inspector,
@@ -136,7 +117,7 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
     ) -> Result<Option<Self>, Error> {
         Self::from_source(
             prepared,
-            admitted,
+            PrefillAdmission::Ordinary(admitted),
             geometry,
             config,
             inspector,
@@ -144,9 +125,9 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
             Some(context),
         )
     }
-    fn from_source(
+    pub(crate) fn from_source(
         prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
-        admitted: AdmittedCompositeInput<P>,
+        admitted: PrefillAdmission<P>,
         geometry: InferenceGeometry,
         config: C,
         inspector: I,
@@ -166,18 +147,11 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
             Self,
             Option<Self>,
             eredu_runtime::input::PreparedModelInputOwner<T>,
-            AdmittedCompositeInput<P>,
+            PrefillAdmission<P>,
             C,
             I,
         )>()?;
-        match context {
-            Some(context) => {
-                PreparedCompositeInput::new_with_metadata(&prepared, &admitted, context)?;
-            }
-            None => {
-                PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::backend)?;
-            }
-        }
+        let shape = admitted.input(&prepared, context)?.admitted().decoder_shape();
         if is_prepared_token_input(&prepared) {
             let text = match context {
                 Some(context) => PreparedCompositeTextPrefill::from_prepared_owner_with_metadata(
@@ -197,7 +171,7 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
         geometry
             .validate_fixed()
             .map_err(|cause| metadata.source(cause))?;
-        if admitted.decoder_shape() != [geometry.batch_size, geometry.input_positions]
+        if shape != [geometry.batch_size, geometry.input_positions]
             || geometry.prefill_chunk_positions < geometry.input_positions
         {
             return Err(metadata.error(format_args!(
@@ -219,7 +193,7 @@ impl<C, T: Tensor, I, P> PreparedExternalPrefill<C, T, I, P> {
 pub struct ExternalPrefillChunk<T, P>(Chunk<T, P>);
 enum Chunk<T, P> {
     Text(CompositeTextPrefillChunk<T, P>),
-    Whole,
+    Whole { tokens: Option<(T, crate::speculative_execution::EmbeddedPredictionTensor<T>)> },
 }
 
 impl<A, B, S, I> PreparedPrefillSource<PreparedCompositeArchitecture<A>, B, S>
@@ -257,15 +231,8 @@ where
             Source::Whole {
                 geometry, metadata, ..
             } => {
-                if chunk.input != (0..geometry.input_positions)
-                    || chunk.position != geometry.cached_positions
-                    || chunk.output != geometry.output
-                {
-                    return Err(Metadata::new(metadata.as_ref()).error(format_args!(
-                        "whole external input span differs from its source",
-                    )));
-                }
-                Ok(ExternalPrefillChunk(Chunk::Whole))
+                validate_whole_span(*geometry, chunk, metadata.as_ref())?;
+                Ok(ExternalPrefillChunk(Chunk::Whole { tokens: None }))
             }
         }
     }
@@ -289,11 +256,18 @@ where
                     metadata,
                     ..
                 },
-                Chunk::Whole,
-            ) => PreparedCompositeInput::new(prepared, admitted)
-                .expect("private whole source retains its actual admission")
-                .with_metadata_loan(metadata.as_ref()),
+                Chunk::Whole { .. },
+            ) => admitted.loan(prepared, metadata.as_ref()),
             _ => unreachable!("private chunk kind comes from its source"),
         }
     }
+}
+
+fn validate_whole_span(geometry: InferenceGeometry, chunk: &PrefillChunk,
+    metadata: Option<&WorkspaceContext>) -> Result<(), Error> {
+    if chunk.input != (0..geometry.input_positions) || chunk.position != geometry.cached_positions
+        || chunk.output != geometry.output {
+        return Err(Metadata::new(metadata).error(format_args!("whole external input span differs from its source")));
+    }
+    Ok(())
 }

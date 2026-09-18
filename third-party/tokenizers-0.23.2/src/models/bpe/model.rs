@@ -1,6 +1,6 @@
 #[cfg(test)]
 use super::super::OrderedVocabIter;
-use super::storage::{BpeIds, OrderedStorage, Packed, Storage};
+use super::storage::{BpeIds, OrderedStorage, Storage};
 use super::{trainer::BpeTrainer, Error, Pair, Word};
 use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{DEFAULT_CACHE_CAPACITY, MAX_LENGTH};
@@ -166,13 +166,10 @@ impl BpeBuilder {
         self
     }
 
-    /// Selects cache absence before build. Legacy preserves the configured capacity.
+    /// Configures cache capacity before model construction.
     #[must_use]
     pub fn cache_policy(self, policy: crate::ModelCachePolicy) -> Self {
-        match policy {
-            crate::ModelCachePolicy::Legacy => self,
-            crate::ModelCachePolicy::NoModelCaches => self.cache_capacity(0),
-        }
+        self.cache_capacity(policy.capacity)
     }
 
     /// Use [dropout](https://arxiv.org/abs/1910.13267) with the model.
@@ -291,11 +288,7 @@ impl BpeBuilder {
         // merges.insert(pair, (rank as u32, *new_id));
 
         Ok(BPE {
-            storage: Storage::Legacy {
-                vocab,
-                reverse: vocab_r,
-                merges: merge_map,
-            },
+            storage: Storage::from_maps(vocab, vocab_r, merge_map),
             cache,
             dropout: self.config.dropout,
             unk_token: self.config.unk_token,
@@ -333,6 +326,10 @@ pub struct BPE {
 }
 
 impl BPE {
+    pub(crate) fn cache_capacity(&self) -> usize {
+        self.cache.as_ref().map_or(0, |cache| cache.capacity)
+    }
+
     pub(crate) fn configuration_comparison_control_bytes() -> Option<usize> {
         use std::mem::size_of;
         [
@@ -345,7 +342,8 @@ impl BPE {
             size_of::<[usize; 2]>(),
             size_of::<bool>(),
         ]
-        .iter().copied()
+        .iter()
+        .copied()
         .try_fold(0usize, usize::checked_add)
     }
     /// Compares the actual vocabulary, merge ranks and encoding settings by borrow.
@@ -441,26 +439,17 @@ impl BPE {
     pub(crate) fn decode_token_ref(&self, id: u32) -> Option<&str> {
         self.storage.token(id)
     }
-    pub(super) fn replace_legacy_storage(
-        &mut self,
-        vocab: Vocab,
-        reverse: VocabR,
-        merges: MergeMap,
-    ) {
-        self.storage = Storage::Legacy {
-            vocab,
-            reverse,
-            merges,
-        };
+    pub(super) fn install_tables(&mut self, vocab: Vocab, reverse: VocabR, merges: MergeMap) {
+        self.storage = Storage::from_maps(vocab, reverse, merges);
     }
-    pub(super) fn from_packed(
-        storage: Packed,
+    pub(super) fn from_tables(
+        storage: Storage,
         strings: [Option<String>; 3],
         flags: [bool; 3],
     ) -> Self {
         let [unk_token, continuing_subword_prefix, end_of_word_suffix] = strings;
         Self {
-            storage: Storage::Packed(storage),
+            storage,
             cache: None,
             dropout: None,
             unk_token,
@@ -534,6 +523,10 @@ impl BPE {
 
     /// Resize the cache
     pub fn resize_cache(&mut self, capacity: usize) {
+        if capacity == 0 {
+            self.cache = None;
+            return;
+        }
         if let Some(ref mut cache) = self.cache {
             cache.resize(capacity);
         }
@@ -563,9 +556,8 @@ impl BPE {
         Ok(word)
     }
 
-    pub(crate) fn has_identity_packed_profile(&self) -> bool {
-        matches!(&self.storage, Storage::Packed(_))
-            && self.cache.is_none()
+    pub(crate) fn has_identity_profile(&self) -> bool {
+        self.cache.is_none()
             && self.dropout.is_none()
             && self
                 .continuing_subword_prefix
@@ -575,7 +567,29 @@ impl BPE {
                 .end_of_word_suffix
                 .as_deref()
                 .map_or(true, str::is_empty)
-            && !self.byte_fallback
+    }
+
+    fn fallback_id(&self, byte: u8) -> Option<u32> {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let spelling = [
+            b'<',
+            b'0',
+            b'x',
+            HEX[usize::from(byte >> 4)],
+            HEX[usize::from(byte & 15)],
+            b'>',
+        ];
+        let spelling = std::str::from_utf8(&spelling).expect("fixed ASCII byte spelling");
+        self.storage.id(spelling).copied()
+    }
+    pub(crate) fn fallback_control_bytes() -> usize {
+        use std::mem::size_of;
+        size_of::<[u8; 6]>()
+            + size_of::<u8>()
+            + size_of::<&str>()
+            + size_of::<Option<u32>>()
+            + size_of::<std::result::Result<&str, std::str::Utf8Error>>()
+            + size_of::<std::str::Bytes<'_>>()
     }
 
     pub(super) fn fill_word(
@@ -622,17 +636,12 @@ impl BPE {
                 word.add(*id, byte_len);
             } else {
                 if self.byte_fallback {
-                    let tokens: Option<Vec<_>> = s
-                        .bytes()
-                        .map(|b| -> Option<&u32> {
-                            let code = format!("<{b:#04X}>");
-
-                            self.storage.id(&code)
-                        })
-                        .collect();
-                    if let Some(tokens) = tokens {
-                        for t in tokens {
-                            word.add(*t, 1);
+                    // Borrowed validation precedes emission, preserving the
+                    // ordinary all-or-unknown fallback decision without a
+                    // temporary token Vec or formatted byte strings.
+                    if s.bytes().all(|byte| self.fallback_id(byte).is_some()) {
+                        for byte in s.bytes() {
+                            word.add(self.fallback_id(byte).expect("validated byte token"), 1);
                         }
                         continue;
                     }
@@ -1054,15 +1063,15 @@ mod tests {
 
         // Check merges.
         assert_eq!(
-            bpe.storage.legacy_merges().get(&(0, 1)).unwrap(),
+            bpe.storage.owned_merges().get(&(0, 1)).unwrap(),
             &(0u32, 3u32)
         );
 
         // Check vocab.
-        assert_eq!(bpe.storage.legacy_vocab().get("a").unwrap(), &0u32);
-        assert_eq!(bpe.storage.legacy_vocab().get("b").unwrap(), &1u32);
-        assert_eq!(bpe.storage.legacy_vocab().get("c").unwrap(), &2u32);
-        assert_eq!(bpe.storage.legacy_vocab().get("ab").unwrap(), &3u32);
+        assert_eq!(bpe.storage.owned_vocab().get("a").unwrap(), &0u32);
+        assert_eq!(bpe.storage.owned_vocab().get("b").unwrap(), &1u32);
+        assert_eq!(bpe.storage.owned_vocab().get("c").unwrap(), &2u32);
+        assert_eq!(bpe.storage.owned_vocab().get("ab").unwrap(), &3u32);
     }
 
     #[test]

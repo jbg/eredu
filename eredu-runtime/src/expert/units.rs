@@ -127,7 +127,7 @@ impl<'a> RoutedUnitOrigins<'a> {
                 route_positions,
                 routes_per_token,
             )
-            .map_err(Error::backend_source)?,
+            .map_err(Error::backend_retained_source)?,
         })
     }
     /// Lends the same checked host tags to a neutral bounded collector.
@@ -191,7 +191,7 @@ pub trait RoutedUnitObserver<T> {
     /// source and from an actual selected-member callback.
     fn observe_addressable_source(&mut self,_source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
         ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,Error>{
-        Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable))
+        Err(Error::backend_retained_source(eredu_nn::GroupedUnitError::Unavailable))
     }
 
     /// Cold source of a dynamic region before exchanged route counts exist.
@@ -199,7 +199,7 @@ pub trait RoutedUnitObserver<T> {
     /// observers without a qualified prospective source; no callback is skipped.
     fn observe_region_source(&mut self, _source: eredu_nn::workspace::WorkspaceExpertObservationView<'_>)
         -> Result<eredu_nn::workspace::WorkspaceExpertObservationSource,Error> {
-        Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable))
+        Err(Error::backend_retained_source(eredu_nn::GroupedUnitError::Unavailable))
     }
 
     /// Validates and prepares one actual local invocation before provider work.
@@ -369,7 +369,7 @@ fn partition_batch<'a, T: Tensor>(
 impl<T: Tensor> RoutedUnitObserver<T> for PartitionUnitObserver<'_, T> {
     fn observe_addressable_source(&mut self,source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
         ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,Error>{
-        if source.unit_coordinates.is_some(){return Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable));}
+        if source.unit_coordinates.is_some(){return Err(Error::backend_retained_source(eredu_nn::GroupedUnitError::Unavailable));}
         self.inner.observe_addressable_source(eredu_nn::workspace::WorkspaceAddressableObservationView{
             region:source.region,envelope:source.envelope,units:source.units,
             unit_coordinates:Some(self.coordinates),
@@ -545,7 +545,7 @@ pub fn with_borrowed_resident_unit_coordinates<T: Tensor, R, E>(
 where E: std::error::Error + Send + Sync + 'static,
 {
     let Some((coordinates, partitioned)) = coordinates else {
-        return execute(request).map_err(Error::backend_source);
+        return execute(request).map_err(Error::backend_retained_source);
     };
     let RoutedExpertRequest {
         bank,
@@ -572,7 +572,7 @@ where E: std::error::Error + Send + Sync + 'static,
                     pass,
                     unit_observer: observer,
                 })
-                .map_err(Error::backend_source);
+                .map_err(Error::backend_retained_source);
             }
             with_partition_unit_observer(&mut observer, coordinates, |observer| {
                 execute(RoutedExpertRequest {
@@ -583,7 +583,7 @@ where E: std::error::Error + Send + Sync + 'static,
                     pass,
                     unit_observer: observer,
                 })
-                .map_err(Error::backend_source)
+                .map_err(Error::backend_retained_source)
             })
         },
         |error| error,

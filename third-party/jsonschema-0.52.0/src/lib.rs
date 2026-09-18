@@ -1018,6 +1018,8 @@ compile_error!(
 pub(crate) mod bundler;
 pub mod canonical;
 pub(crate) mod compiler;
+mod compilation;
+pub use compilation::{CompilationAllocationError, CompilationError, CompilationFunding};
 mod content_encoding;
 mod content_media_type;
 pub(crate) mod dereferencer;
@@ -1070,8 +1072,9 @@ pub(crate) use jsonschema_value::{
 ///     // Scratch storage for nodes made from property names (`propertyNames`).
 ///     type StringBuffer = ToyValue;
 ///
-///     fn prepare_key(key: &str) -> String {
-///         key.to_owned()
+///     fn prepare_key_with_allocations(key: &str, allocations: &dyn serde_json::allocation::Allocation)
+///         -> Result<String, jsonschema::json::KeyPreparationError> {
+///         Ok(serde_json::allocation::Allocator::new(allocations).copy_string(key)?)
 ///     }
 ///
 ///     fn with_string_node<T>(
@@ -1245,6 +1248,7 @@ pub(crate) use jsonschema_value::{
 /// [`Keyword`] is generic over the representation and operates on `F::Node` directly; register
 /// implementations with [`ValidationOptions::with_keyword`](crate::ValidationOptions::with_keyword).
 pub mod json {
+    pub use jsonschema_value::KeyPreparationError;
     #[cfg(feature = "conformance")]
     pub use jsonschema_value::conformance;
     pub use jsonschema_value::{
@@ -2008,51 +2012,49 @@ pub mod meta {
         #[cfg(not(target_family = "wasm"))]
         use std::sync::LazyLock;
 
-        fn build_validator(schema: &serde_json::Value) -> Validator {
-            crate::options()
-                .without_schema_validation()
-                .build(schema)
+        fn build_validator(draft: crate::Draft) -> Validator {
+            crate::compiler::compile_meta_validator(draft, &crate::compilation::Funding::default())
                 .expect("Meta-schema should be valid")
         }
 
         #[cfg(not(target_family = "wasm"))]
         pub(crate) static DRAFT4_META_VALIDATOR: LazyLock<Validator> =
-            LazyLock::new(|| build_validator(&referencing::meta::DRAFT4));
+            LazyLock::new(|| build_validator(crate::Draft::Draft4));
         #[cfg(target_family = "wasm")]
         pub(crate) fn draft4_meta_validator() -> Validator {
-            build_validator(&referencing::meta::DRAFT4)
+            build_validator(crate::Draft::Draft4)
         }
 
         #[cfg(not(target_family = "wasm"))]
         pub(crate) static DRAFT6_META_VALIDATOR: LazyLock<Validator> =
-            LazyLock::new(|| build_validator(&referencing::meta::DRAFT6));
+            LazyLock::new(|| build_validator(crate::Draft::Draft6));
         #[cfg(target_family = "wasm")]
         pub(crate) fn draft6_meta_validator() -> Validator {
-            build_validator(&referencing::meta::DRAFT6)
+            build_validator(crate::Draft::Draft6)
         }
 
         #[cfg(not(target_family = "wasm"))]
         pub(crate) static DRAFT7_META_VALIDATOR: LazyLock<Validator> =
-            LazyLock::new(|| build_validator(&referencing::meta::DRAFT7));
+            LazyLock::new(|| build_validator(crate::Draft::Draft7));
         #[cfg(target_family = "wasm")]
         pub(crate) fn draft7_meta_validator() -> Validator {
-            build_validator(&referencing::meta::DRAFT7)
+            build_validator(crate::Draft::Draft7)
         }
 
         #[cfg(not(target_family = "wasm"))]
         pub(crate) static DRAFT201909_META_VALIDATOR: LazyLock<Validator> =
-            LazyLock::new(|| build_validator(&referencing::meta::DRAFT201909));
+            LazyLock::new(|| build_validator(crate::Draft::Draft201909));
         #[cfg(target_family = "wasm")]
         pub(crate) fn draft201909_meta_validator() -> Validator {
-            build_validator(&referencing::meta::DRAFT201909)
+            build_validator(crate::Draft::Draft201909)
         }
 
         #[cfg(not(target_family = "wasm"))]
         pub(crate) static DRAFT202012_META_VALIDATOR: LazyLock<Validator> =
-            LazyLock::new(|| build_validator(&referencing::meta::DRAFT202012));
+            LazyLock::new(|| build_validator(crate::Draft::Draft202012));
         #[cfg(target_family = "wasm")]
         pub(crate) fn draft202012_meta_validator() -> Validator {
-            build_validator(&referencing::meta::DRAFT202012)
+            build_validator(crate::Draft::Draft202012)
         }
 
         // Backs the `evaluate`/`iter_errors` fallback for generated meta validators.
@@ -2410,28 +2412,29 @@ pub mod meta {
         start_uri: &str,
         mut fetch: impl FnMut(&str) -> Result<Value, referencing::Error>,
     ) -> Result<Draft, referencing::Error> {
-        let mut visited = AHashSet::new();
-        let mut current_uri = start_uri.to_string();
+        walk_meta_schema_chain_with_funding(start_uri, |uri| fetch(uri).map_err(Into::into), &crate::compilation::Funding::default())
+            .map_err(crate::compilation::CompileError::into_ordinary_reference)
+    }
 
+    pub(crate) fn walk_meta_schema_chain_with_funding(
+        start_uri: &str,
+        mut fetch: impl FnMut(&str) -> Result<Value, crate::compilation::CompileError<'static>>,
+        funding: &crate::compilation::Funding,
+    ) -> Result<Draft, crate::compilation::CompileError<'static>> {
+        let mut visited = hashbrown::HashSet::with_hasher(funding.random_state()?);
+        let mut current_uri = funding.copy_str(start_uri)?;
         loop {
-            if !visited.insert(current_uri.clone()) {
-                return Err(referencing::Error::circular_metaschema(current_uri));
+            if !funding.insert_set(&mut visited, funding.copy_str(&current_uri)?)? {
+                return Err(referencing::Error::circular_metaschema(current_uri).into());
             }
-
             let meta_schema = fetch(&current_uri)?;
             let draft = Draft::default().detect(&meta_schema);
-
-            if draft != Draft::Unknown {
-                return Ok(draft);
-            }
-
-            current_uri = meta_schema
-                .get("$schema")
-                .and_then(|s| s.as_str())
-                .expect("`$schema` must exist when draft is Unknown")
-                .to_string();
+            if draft != Draft::Unknown { return Ok(draft); }
+            current_uri = funding.copy_str(meta_schema.get("$schema").and_then(|value| value.as_str())
+                .expect("`$schema` must exist when draft is Unknown"))?;
         }
     }
+
 }
 
 /// Functionality specific to JSON Schema Draft 4.

@@ -214,8 +214,22 @@ fn pipeline_ring_worker() {
         other => panic!("invalid EREDU_TEST_RING_DEVICE: {other:?}"),
     };
     let device = DeviceAssignment::new(device_type, 0);
-    let stream = Stream::new_with_device(&device.device().unwrap());
-    let weights_stream = fixture_weights_stream(&stream);
+    // Source loading must see the same admitted native singleton/stream owners
+    // from their birth. An ordinary stream created first cannot be adopted by
+    // the later bounded host or disk materializer.
+    let prepared_backend = std::env::var_os(OPAQUE_SESSION).is_some().then(|| {
+        crate::native::prepared_distributed_backend_on(&native_group, device_type)
+            .expect("prepared Ring execution/source stream construction")
+            .expect("selected Ring device has a qualified stream constructor")
+    });
+    let (stream, weights_stream) = match &prepared_backend {
+        Some(backend) => (backend.stream().clone(), backend.weights_stream().clone()),
+        None => {
+            let stream = Stream::new_with_device(&device.device().unwrap());
+            let weights = fixture_weights_stream(&stream);
+            (stream, weights)
+        }
+    };
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let component_media = std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some()
             || (std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_some()
@@ -345,7 +359,7 @@ fn pipeline_ring_worker() {
         if prove_prepared_communication_lifecycle || prove_expert_communication {
             crate::tests::support::path_instrumentation::reset();
         }
-        let backend = crate::native::distributed_backend(&stream, &weights_stream, &native_group);
+        let backend = prepared_backend.expect("opaque worker prepared the actual streams");
         // Keep a small device tier while reserving finite host capacity for the
         // independently writable branches exercised by the K2 control matrix
         // and the block-aligned Qwen FP8 prediction fixture.
@@ -704,6 +718,9 @@ fn pipeline_ring_worker() {
             .unwrap()
             .unit_sources()
             .keys()
+            // Original residency reports identify every unit's exact source;
+            // only the prediction namespace denotes supplementary modules.
+            .filter(|id| id.as_str().starts_with("prediction."))
             .cloned()
             .collect::<Vec<_>>();
         if matches!(
@@ -789,6 +806,11 @@ fn pipeline_ring_worker() {
             return;
         }
         if std::env::var_os(OPAQUE_COMPONENT_CAPTURE).is_some() {
+            // Exercise cold source admission before the ordinary numerical
+            // oracle mutates parameters or state and acquires unquoted owners.
+            runtime.session().verify_original_partition_capture_publication(
+                component_capture_prompt_tokens().len() as u64,
+            );
             let backend = MlxBackend::new(&stream, &weights_stream);
             let reference_path = if family == FixtureFamily::Qwen3MoeGguf {
                 checkpoint.parent().unwrap().join("independent-reference")

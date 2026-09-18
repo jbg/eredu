@@ -145,18 +145,22 @@ fn construct_with_original(
     let pool = runtime.backend().memory_pool();
     let request = authority.preparation.request();
     let geometry = request.geometry();
-    let (positions, saved_chunk) = source.sampling.pending_geometry().map_err(memory)?;
+    let terminal = geometry.input_positions == 0 && geometry.max_output_tokens == 0
+        && geometry.prefill_chunk_positions == 0 && geometry.output == eredu_core::OutputDemand::StateOnly;
+    let (positions, saved_chunk) = if terminal { (0, 0) } else { source.sampling.pending_geometry().map_err(memory)? };
     if geometry.batch_size != 1
         || geometry.cached_positions != source.sampling.frontier()
         || geometry.input_positions != positions
-        || geometry.prefill_chunk_positions == 0
+        || (!terminal && geometry.prefill_chunk_positions == 0)
         || geometry.prefill_chunk_positions > saved_chunk
-        || geometry.max_output_tokens == 0
-        || geometry.output != super::resume_quote::resume_output_demand(source)
+        || (!terminal && geometry.max_output_tokens == 0)
         || !authority.funding.pool().same_domain(pool)
     {
         return Err(mismatch());
     }
+    // Readout comes from the actual admitted child declaration, which may
+    // change score interventions. The sealed reservation below authenticates
+    // that complete geometry; the saved parent cannot prescribe child readout.
     request
         .memory_reservation()
         .ok_or_else(unknown)?
@@ -169,7 +173,7 @@ fn construct_with_original(
             geometry,
         )
         .map_err(memory)?;
-    let mut pending_plan = source.sampling.prepare_pending_tokens().map_err(other)?;
+    let mut pending_plan = if terminal { None } else { source.sampling.prepare_pending_tokens().map_err(other)? };
     if let Some(pending) = &mut pending_plan {
         pending
             .select_chunk_positions(
@@ -202,7 +206,7 @@ fn construct_with_original(
             .arrays
             .key
             .iter()
-            .chain(source.sampling.arrays.pending.iter())
+            .chain(source.sampling.arrays.pending.iter().filter(|_| !terminal))
         {
             complete.include_array(array)?;
         }
@@ -349,7 +353,7 @@ fn construct_with_original(
             .arrays
             .key
             .iter()
-            .chain(source.sampling.arrays.pending.iter())
+            .chain(source.sampling.arrays.pending.iter().filter(|_| !terminal))
         {
             if failure.is_none() {
                 failure = retain_source(array, &roots, original.is_some()).err();
@@ -366,7 +370,7 @@ fn construct_with_original(
             }
             completed(array, original.is_some())
         };
-        let state = plan.copy_dense_retained_with_preparation(slots, &stream, &roots, &mut observe, original.as_ref().map(|authority| authority.host))?;
+        let state = plan.copy_dense_retained_observed(slots, &stream, &roots, &mut observe)?;
         if !paged {
             let mut error = None;
             state
@@ -430,6 +434,15 @@ fn construct_with_original(
                 funding.retain(tokens);
                 completed(tokens, original.is_some())?;
                 (prompt, SavedPromptCompletion::Tokens(completion))
+            }
+            (None, PendingPromptHost::Media(completion)) if terminal => {
+                let prompt = MlxModelInput {
+                    parts: super::super::super::pending_prompt::ModelInputParts::Owned(Vec::new()),
+                    controlled_attribution: None, prepared_capture: None, original_media: None,
+                    placement_semantics: None, cache_identity: None, prefill_chunk_positions: None,
+                    inference_request: Some(request.clone()), memory_owner: None, quote: None,
+                };
+                (prompt, SavedPromptCompletion::Media(completion))
             }
             (None, PendingPromptHost::Media(completion)) => {
                 let media = source.sampling.pending_media().ok_or_else(mismatch)?;

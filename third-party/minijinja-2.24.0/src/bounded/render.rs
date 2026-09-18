@@ -110,6 +110,11 @@ pub enum RenderPlanError {
     Execution(RenderFailure),
 }
 impl RenderPlanError {
+    /// A template expression rejected its input. Resource, arithmetic, and
+    /// checked geometry failures remain distinct from ordinary template errors.
+    pub fn is_template_rejection(&self) -> bool {
+        matches!(self, Self::Execution(failure) if !failure.overflow)
+    }
     /// True only for the actual absent-callable failure from the shared worker.
     /// Geometry, capacity, allocation, and arithmetic failures remain distinct.
     pub fn is_unknown_function(&self) -> bool {
@@ -760,6 +765,10 @@ pub enum RenderCause {
     State(RenderPlanError),
 }
 impl RenderCause {
+    /// Whether the shared worker rejected template input after successful storage.
+    pub fn is_template_rejection(&self) -> bool {
+        matches!(self, Self::State(cause) if cause.is_template_rejection())
+    }
     /// Whether actual execution rejected an absent callable, without consuming
     /// any retained partial render or changing its retirement obligations.
     pub fn is_unknown_function(&self) -> bool {

@@ -463,7 +463,7 @@ fn restored_occurrences_extend_paid_storage_without_recycling_spent_roles() {
     competitor.reserve_metadata(remaining).unwrap();
     let competing_destination = vec![0u8; remaining];
     assert!(matches!(request.prepare_continuation(&continuation, &funding),
-        Err(SpeculativeContinuationError::Metadata(eredu_nn::workspace::WorkspaceMetadataFundingError::Capacity { .. }))));
+        Err(SpeculativeContinuationError::Metadata(eredu_nn::workspace::HostMetadataFundingError::Capacity { .. }))));
     assert_eq!(pool.used_bytes().unwrap(), capacity);
     assert_eq!(cursor.attempted(), spent);
     assert!(matches!(cursor.claim(2, invocation), Err(AutoregressiveOccurrenceError::Exhausted)));
@@ -518,3 +518,59 @@ mod completed_sources;
 mod registered_sources;
 
 mod batch_cursors;
+
+#[test]
+fn media_ingress_origin_rejects_equal_geometry_foreign_roles_and_spent_ordinals() {
+    use crate::media_prefill::MediaPrefillOrigin;
+    let selected = selected();
+    let config = SpeculativeConfig { max_tokens: 1, max_draft_tokens: 1, ..Default::default() };
+    let fixture = || {
+        let plan = AutoregressiveSchedulePlan::new(
+            &selected, NonZeroUsize::new(1).unwrap(), NonZeroU64::new(3).unwrap(),
+            NonZeroU64::new(16).unwrap(), &config, SpeculativeSchedulerOptions::default(),
+        ).unwrap();
+        let invocation=AutoregressiveInvocation::prefill(AutoregressivePass::TargetPrefill,3).unwrap();
+        let geometry=plan.workspace_geometry(0,invocation,NonZeroU64::new(2).unwrap()).unwrap();
+        let report=report(geometry);
+        let pool=WorkingMemoryPool::new(1<<24,0).unwrap();
+        let execution=InferenceExecutionIdentity::default();
+        let request=OriginalSpeculativeRequest::prepare(&pool,&execution,&plan,1<<24).unwrap();
+        let mut cursor=plan.into_cursor();
+        let role=request.reserve_role(cursor.claim(0,invocation).unwrap(),requirements(report.span_workspace_plan())).unwrap();
+        (pool,execution,request,role,geometry,report)
+    };
+    let (pool,execution,request,role,geometry,report)=fixture();
+    let (other_pool,other_execution,other_request,other,other_geometry,other_report)=fixture();
+    assert_eq!(geometry,other_geometry);
+    let mut wrong=geometry; wrong.prefill_chunk_positions=1;
+    assert!(MediaPrefillOrigin::speculative(role.clone(),wrong).is_err());
+    let mut source=MediaPrefillOrigin::speculative(role.clone(),geometry).unwrap();
+    assert!(source.request().is_err(), "a media role is not an ordinary inference request");
+    role.begin_prefill(&execution,geometry).unwrap();
+    other.begin_prefill(&other_execution,other_geometry).unwrap();
+    let chunk=|report:&InferenceWorkspaceReport,index:usize| match report.span_workspace_plan().records()[index].span() {
+        InferenceWorkspaceSpan::Prefill(chunk)=>chunk.clone(), _=>panic!("actual prefill row"),
+    };
+    let first=role.claim_prefill_span(&chunk(&report,0)).unwrap();
+    let second=role.claim_prefill_span(&chunk(&report,1)).unwrap();
+    let foreign=other.claim_prefill_span(&chunk(&other_report,0)).unwrap();
+    let equation = MediaPrefillOrigin::Equation;
+    assert!(equation.request().is_err(), "workspace traversal has no ordinary request");
+    assert!(equation.validate_span(&first).is_err(), "workspace traversal cannot consume a native media role");
+    assert!(source.validate_span(&foreign).is_err());
+    assert!(source.validate_span(&second).is_err(), "an already claimed future span cannot skip ingress");
+    source.validate_span(&first).unwrap();
+    let spent=pool.used_bytes().unwrap();
+    source.committed().unwrap();
+    assert!(source.validate_span(&first).is_err(), "commit cannot replay encoder ingress");
+    source.validate_span(&second).unwrap();
+    source.committed().unwrap();
+    assert!(source.validate_span(&second).is_err());
+    assert_eq!(pool.used_bytes().unwrap(),spent);
+    request.close().unwrap(); other_request.close().unwrap();
+    drop((first,second,foreign,role,other,request,other_request));
+    assert!(pool.used_bytes().unwrap()>0, "retained ingress keeps its exact occurrence account");
+    assert_eq!(other_pool.used_bytes().unwrap(),0);
+    drop(source);
+    assert_eq!(pool.used_bytes().unwrap(),0);
+}

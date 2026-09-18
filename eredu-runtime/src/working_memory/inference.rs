@@ -12,11 +12,14 @@ use std::convert::Infallible;
 mod metadata;
 mod spans;
 use metadata::Metadata;
-pub use spans::{InferenceSpanWorkspacePlan, InferenceSpanWorkspaceRecord};
+pub use spans::{InferenceSpanWorkspacePlan, InferenceSpanWorkspaceRecord, SamplingWorkspacePlanCollector};
 
 /// One equation invocation in the admitted prompt and output allowance.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum InferenceWorkspaceSpan {
+    /// Actual sampling-only preparation or prediction in an admitted extension.
+    /// This describes no model invocation, cache update, or prefill work.
+    Sampling(super::SamplingWorkspacePhase),
     /// The same semantic span scheduled by ordinary/controlled prefill.
     Prefill(PrefillChunk),
     /// One cached decode invocation, including every possible cache-growth edge.
@@ -189,7 +192,10 @@ impl InferenceResidualWorkspace {
 
 impl InferenceWorkspaceReport {
     pub(super) fn has_complete_state_spans(&self) -> bool {
-        self.completed_spans != 0 && self.state_spans_complete
+        self.state_spans_complete && (self.completed_spans != 0 || self.has_empty_schedule())
+    }
+    fn has_empty_schedule(&self) -> bool {
+        self.geometry.input_positions == 0 && self.geometry.max_output_tokens == 0
     }
     /// Exact geometry inspected by this report.
     pub const fn geometry(&self) -> InferenceGeometry {
@@ -286,6 +292,12 @@ impl InferenceWorkspaceReport {
         state: RuntimeStateEstimate,
         metadata: super::WorkspaceReportMetadata<'_>,
     ) -> Result<RuntimeStateEstimate, super::WorkspaceReportError> {
+        // A terminal placement inspects no equation and therefore says nothing
+        // new about the existing state's backing. Preserve its actual bound,
+        // including unknown coverage, instead of replacing it with zero.
+        if self.has_empty_schedule() {
+            return Ok(state);
+        }
         let backing = match self.retained_peak {
             Some(bytes) => metadata.bounded(bytes, format_args!(
                 "largest complete retained decoder-state backing over all selected prefill and decode spans, including capacity padding and distinct retained views"))?,
@@ -317,7 +329,7 @@ pub fn quote_inference_workspace<E>(
     geometry: InferenceGeometry,
     quote: impl FnMut(&InferenceWorkspaceSpan) -> Result<WorkspaceTraceReport, E>,
 ) -> Result<InferenceWorkspaceReport, InferenceWorkspaceError<E>> {
-    quote_inference_workspace_inner(geometry, quote, Metadata::ordinary())
+    quote_inference_workspace_inner(geometry, quote, Metadata::ordinary(), None)
 }
 
 /// The same complete schedule with every owned quote/report destination charged
@@ -328,7 +340,12 @@ pub fn quote_inference_workspace_with_context<E>(
     context: &eredu_nn::workspace::WorkspaceContext,
     quote: impl FnMut(&InferenceWorkspaceSpan) -> Result<WorkspaceTraceReport, E>,
 ) -> Result<InferenceWorkspaceReport, InferenceWorkspaceError<E>> {
-    quote_inference_workspace_inner(geometry, quote, Metadata::from_context(context))
+    quote_inference_workspace_inner(
+        geometry,
+        quote,
+        Metadata::from_context(context),
+        context.borrowed_storage_selection(),
+    )
 }
 
 /// Reduces the same exact completed reports while their caller retains an
@@ -342,13 +359,19 @@ pub fn quote_inference_workspace_with_report_owner<E, R>(
 where
     R: std::borrow::Borrow<WorkspaceTraceReport>,
 {
-    quote_inference_workspace_inner(geometry, quote, Metadata::from_context(context))
+    quote_inference_workspace_inner(
+        geometry,
+        quote,
+        Metadata::from_context(context),
+        context.borrowed_storage_selection(),
+    )
 }
 
 fn quote_inference_workspace_inner<F, E, R>(
     geometry: InferenceGeometry,
     quote: F,
     metadata: Metadata<'_>,
+    borrowed: Option<WorkspaceBorrowedStorage>,
 ) -> Result<InferenceWorkspaceReport, InferenceWorkspaceError<E>>
 where
     F: FnMut(&InferenceWorkspaceSpan) -> Result<R, E>,
@@ -414,6 +437,16 @@ where
     }
     inspection.report.spans =
         InferenceSpanWorkspacePlan::new_metadata(geometry, inspection.spans, metadata.context())?;
+    if inspection.report.has_empty_schedule() {
+        // No equation can create new storage. Residual composition still needs
+        // this exact context selection and its separately registered owner;
+        // absence of spans must not invent an empty source association.
+        inspection.report.residual = borrowed.map(|borrowed| InferenceResidualWorkspace {
+            borrowed,
+            peak_bytes: Some(0),
+            association_complete: true,
+        });
+    }
     Ok(inspection.report)
 }
 

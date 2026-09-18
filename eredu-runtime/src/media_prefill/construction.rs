@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, WorkspaceMetadataFunding},
+    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::mem::{size_of, size_of_val};
 
@@ -18,7 +18,7 @@ impl Destination<'_> {
     pub(super) fn source<E: std::error::Error + Send + Sync + 'static>(&self, cause: E) -> Error {
         match self.0 {
             Some(context) => context.metadata_source(cause),
-            None => Error::backend_source(cause),
+            None => Error::backend_retained_source(cause),
         }
     }
     pub(super) fn missing_binding(&self) -> Error {
@@ -27,20 +27,6 @@ impl Destination<'_> {
             Some(context) => context.metadata_error(format_args!("{MESSAGE}")),
             None => Error::backend(MESSAGE),
         }
-    }
-    pub(super) fn request(
-        &self,
-        execution: &InferenceExecutionIdentity,
-        geometry: InferenceGeometry,
-    ) -> Result<InferenceRequest, Error> {
-        if let Some(context) = self.0 {
-            let bytes = InferenceRequest::unbudgeted_control_bytes()
-                .and_then(|bytes| usize::try_from(bytes).ok())
-                .ok_or(WorkspaceMetadataError::Unqualified)?;
-            context.charge_metadata(bytes)?;
-        }
-        InferenceRequest::without_memory_budget(execution, geometry)
-            .map_err(|cause| self.source(cause))
     }
     pub(super) fn cut(
         &self,
@@ -53,6 +39,17 @@ impl Destination<'_> {
             |count| self.vector(count),
             |cause| self.source(cause),
         )
+    }
+    pub(super) fn equation<A, S>(
+        &self, plan:A::IngressPlan, cut:CompositePrefillCut, revision:InferenceStateRevision,
+    ) -> Result<PreparedMediaPrefill<A,eredu_nn::workspace::WorkspaceBackend,S>,Error>
+    where S: RuntimeState<eredu_nn::workspace::WorkspaceBackend>,
+        A: PrefillIngressArchitecture<eredu_nn::workspace::WorkspaceBackend,S>,
+    {
+        A::ingress_geometry(&plan).validate_fixed().map_err(|cause|self.source(cause))?;
+        let mut source=PreparedMediaPrefill::from_storage(plan,cut,MediaPrefillOrigin::Equation,revision,|count|self.vector(count))?;
+        source.metadata=self.0.cloned();
+        Ok(source)
     }
     pub(super) fn prepared<A, B, S>(
         &self,
@@ -86,7 +83,7 @@ impl Destination<'_> {
 pub(super) struct SourceFailure {
     #[source]
     pub(super) cause: Error,
-    pub(super) _funding: Option<WorkspaceMetadataFunding>,
+    pub(super) _funding: Option<HostMetadataFunding>,
 }
 
 pub(super) fn admit_source<A, S>(context: &WorkspaceContext) -> Result<(), Error>
@@ -106,13 +103,12 @@ where
         size_of::<Vec<CutValue<WorkspaceTensor>>>(),
         size_of::<CutValue<WorkspaceTensor>>(),
         size_of::<A::IngressPlan>(),
-        size_of::<InferenceRequest>(),
-        size_of::<Result<InferenceRequest, eredu_core::CapabilityError>>(),
-        size_of::<InferenceExecutionIdentity>(),
+        size_of::<MediaPrefillOrigin>(),
+        size_of::<Result<(),eredu_core::AdmissionPolicyError>>(),
         size_of::<InferenceStateRevision>(),
         size_of::<InferenceGeometry>(),
         size_of::<Destination<'_>>(),
-        size_of::<Option<WorkspaceMetadataFunding>>(),
+        size_of::<Option<HostMetadataFunding>>(),
         size_of::<SourceFailure>(),
         size_of::<Result<(), WorkingMemoryError>>(),
         size_of::<Result<(), Error>>(),
@@ -121,7 +117,7 @@ where
         .into_iter()
         .try_fold(size_of_val(&controls), usize::checked_add)
         .and_then(|bytes| {
-            bytes.checked_add(Error::retained_source_control_bytes::<SourceFailure>()?)
+            bytes.checked_add(Error::retained_source_construction_bytes::<SourceFailure>()?)
         })
         .ok_or(WorkspaceMetadataError::Overflow)?;
     context.charge_metadata(bytes)?;

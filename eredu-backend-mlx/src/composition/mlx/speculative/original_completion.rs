@@ -70,6 +70,8 @@ enum OnceCause {
     Submission(OriginalArraySubmissionCause),
     #[error(transparent)]
     Native(Exception),
+    #[error(transparent)]
+    Retirement(crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause),
     #[error("original speculative retirement unavailable: {0:?}")]
     Observation(Observation),
     #[error("speculative completion deadline exceeds the host monotonic clock range; live work was quarantined safely")]
@@ -245,6 +247,7 @@ impl OriginalSpeculativeCompletion {
         let result = retained.finish_detailed().map_err(|error| {
             let cause = match error {
                 FinishRetainingError::Native(cause) => OnceCause::Native(cause),
+                FinishRetainingError::Retirement(cause) => OnceCause::Retirement(cause),
                 FinishRetainingError::Observation(observed) => OnceCause::Observation(observed),
             };
             once_failure(cause, controls.clone())

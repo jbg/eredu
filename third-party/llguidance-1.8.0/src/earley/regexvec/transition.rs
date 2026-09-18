@@ -44,20 +44,20 @@ pub(super) struct Ordinary<'a> {
     pub candidate: &'a mut Vec<u32>,
 }
 impl Context for Ordinary<'_> {
-    type Error = anyhow::Error;
+    type Error = derivre::ParserError;
     fn cost(&self) -> u64 {
         self.source.cost()
     }
-    fn derivative(&mut self, root: ExprRef, byte: u8) -> anyhow::Result<ExprRef> {
-        Ok(self.derivative.derivative(self.source, root, byte))
+    fn derivative(&mut self, root: ExprRef, byte: u8) -> derivre::ParserResult<ExprRef> {
+        self.derivative.derivative(self.source, root, byte)
     }
-    fn non_empty(&mut self, root: ExprRef, fuel: u64) -> anyhow::Result<bool> {
+    fn non_empty(&mut self, root: ExprRef, fuel: u64) -> derivre::ParserResult<bool> {
         self.relevance.is_non_empty_limited(self.source, root, fuel)
     }
     fn is_fuel(_: &Self::Error) -> bool {
         true
     }
-    fn emit(&mut self, index: LexemeIdx, root: ExprRef) -> anyhow::Result<()> {
+    fn emit(&mut self, index: LexemeIdx, root: ExprRef) -> derivre::ParserResult<()> {
         self.candidate.push(index.as_usize() as u32);
         self.candidate.push(root.as_u32());
         Ok(())

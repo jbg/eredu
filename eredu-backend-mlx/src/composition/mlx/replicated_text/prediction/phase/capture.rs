@@ -174,8 +174,8 @@ impl Capture {
             size_of::<std::cell::BorrowMutError>(),
             // One callback failure and one terminal host/protocol failure are
             // distinct possible producers; both keep the same exact role.
-            eredu_nn::Error::retained_source_control_bytes::<Failure>()?,
-            eredu_nn::Error::retained_source_control_bytes::<Failure>()?,
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>()?,
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>()?,
         ];
         parts
             .into_iter()

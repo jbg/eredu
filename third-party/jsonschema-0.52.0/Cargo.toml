@@ -79,6 +79,10 @@ path = "src/lib.rs"
 version = "0.8"
 features = ["serde"]
 
+[dependencies.getrandom]
+version = "0.3.4"
+features = ["std"]
+
 [dependencies.async-trait]
 version = "0.1.86"
 optional = true

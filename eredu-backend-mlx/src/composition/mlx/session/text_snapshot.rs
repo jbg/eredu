@@ -79,7 +79,7 @@ fn copy_array(array: &Array, stream: &Stream, owner: &NativeMemoryOwner) -> Resu
 #[cfg(test)]
 mod sampling_copy_tests;
 
-impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend<'_> {
+impl eredu_core::TextSamplingControlBackend for MlxBackend<'_> {
     fn sampling_control_facts(
         state: &MlxTextGenerationState,
     ) -> eredu_runtime::execution_control::SamplingStateFacts {
@@ -92,44 +92,64 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend
             has_rng: state.sampling.prng.is_some(),
         }
     }
-    fn install_sampling_override(
+    fn apply_sampling_override(
         runtime: &mut ModelRuntime<Self>,
         state: &mut MlxTextGenerationState,
-        request: eredu_runtime::execution_control::ValidatedSamplingOverride,
-    ) -> Result<(), Error> {
-        if state.sampling.quote.is_some() || state.sampling.sampler.is_funded() {
-            // Semantic validation alone does not reprice replacement overlap
-            // or the future native sampling trace of this retained run.
-            return Err(Error::Other(Box::new(
-                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-            )));
-        }
-        let Some(seed) = request.reseed() else {
-            runtime.session().ensure_no_submission_in_flight()?;
-            state.sampling.temperature = request.temperature();
-            return Ok(());
-        };
-        let owner = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
-        let mut memory = state.sampling.memory_retention.clone();
-        memory.retain(&owner);
-        let replacement = super::recovery::detached_retained(
-            TextInferenceRetention::new(state.sampling.inference_retention.clone(), memory.clone()),
-            || {
-                runtime.session_mut().with_model_operation(|_| {
-                    Ok((|| {
-                        let random = RandomState::with_seed(seed)?;
-                        random.as_array().evaluated()?;
-                        owner.retain_array(random.as_array())?;
-                        Ok::<_, Error>(random)
-                    })())
-                })?
-            },
+        context: Option<&eredu_core::TextStepContext>,
+        request: eredu_core::SamplingOverride,
+    ) -> Result<eredu_core::SamplingStateFacts, eredu_core::SamplingOverrideError<Error>> {
+        let action = eredu_runtime::execution_control::prepare_sampling_override::<Self>(
+            runtime, state, request,
         )?;
-        state.sampling.prng = Some(replacement);
-        state.sampling.memory_retention = memory;
-        state.sampling.temperature = request.temperature();
-        Ok(())
+        install_sampling_override(runtime, state, action, context)
+            .map_err(eredu_core::SamplingOverrideError::Backend)?;
+        Ok(Self::sampling_control_facts(state))
     }
+}
+
+fn install_sampling_override(
+    runtime: &mut ModelRuntime<MlxBackend<'_>>,
+    state: &mut MlxTextGenerationState,
+    request: eredu_runtime::execution_control::ValidatedSamplingOverride,
+    context: Option<&eredu_core::TextStepContext>,
+) -> Result<(), Error> {
+    if state.sampling.quote.is_some() || state.sampling.sampler.is_funded() {
+        if context.is_none() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        let context = context.ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+        let quote = state.sampling.quote.clone().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+        return quote.replace_sampling(runtime, &mut state.sampling, context, request);
+    }
+    let Some(seed) = request.reseed() else {
+        runtime.session().ensure_no_submission_in_flight()?;
+        state.sampling.temperature = request.temperature();
+        return Ok(());
+    };
+    let owner = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
+    let mut memory = state.sampling.memory_retention.clone();
+    memory.retain(&owner);
+    let replacement = super::recovery::detached_retained(
+        TextInferenceRetention::new(state.sampling.inference_retention.clone(), memory.clone()),
+        || {
+            runtime.session_mut().with_model_operation(|_| {
+                Ok((|| {
+                    let random = RandomState::with_seed(seed)?;
+                    random.as_array().evaluated()?;
+                    owner.retain_array(random.as_array())?;
+                    Ok::<_, Error>(random)
+                })())
+            })?
+        },
+    )?;
+    state.sampling.prng = Some(replacement);
+    state.sampling.memory_retention = memory;
+    state.sampling.temperature = request.temperature();
+    Ok(())
 }
 
 fn with_text_prompt_array<T>(
@@ -219,21 +239,23 @@ impl TextSnapshotBackend for MlxBackend<'_> {
     fn original_saved_components_resume_preparation_bytes<C: eredu_core::TokenFilterController>(
         runtime: &ModelRuntime<Self>,
         saved: &Self::SavedTextComponents,
-        _config: eredu_core::TextGenerationConfig,
+        config: eredu_core::TextGenerationConfig,
         _controller: &C,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
         // H0 follows the immutable saved source and its actual pending geometry.
         // Config/controller-dependent equations use the separately funded planning
         // context and fresh request; the shared provider owns controller copying.
-        saved.original_resume_preparation_bytes(runtime).map(Some)
+        saved.original_resume_preparation_bytes(runtime, config, options).map(Some)
     }
 
     fn original_saved_components_resume_estimate(
         runtime: &ModelRuntime<Self>,
         saved: &Self::SavedTextComponents,
         config: eredu_core::TextGenerationConfig,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Option<SnapshotEstimate> {
-        saved.original_resume_estimate(runtime, config)
+        saved.original_resume_estimate(runtime, config, options)
     }
 
     fn original_saved_components_preparation_bytes(

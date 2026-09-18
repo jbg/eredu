@@ -70,7 +70,7 @@ impl eredu_nn::ProjectionInputObserver<MlxTensor> for Observer {
         })?;
         factory.generate(&mut |value| {
             self.roots.push(value.clone());
-            Err(ComputeError::backend_source(RetainedInputFailure(
+            Err(ComputeError::backend_retained_source(RetainedInputFailure(
                 Sentinel(self.original.clone()),
             )))
         })?;

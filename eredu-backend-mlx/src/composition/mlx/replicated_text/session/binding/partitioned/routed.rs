@@ -15,6 +15,7 @@ pub(crate) fn bind_partitioned_routed<A, S, G, F>(
     weights_stream: &Stream,
     finalizer: F,
     addressable_manager: Option<&AddressableManagerSlot>,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -64,6 +65,7 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
+            layerwise_manager,
             finalizer,
         ),
         |native, prepared, provider, banks| {
@@ -75,12 +77,13 @@ where
 
 #[allow(clippy::type_complexity)]
 fn bind_selected_partition_provider<A, S, G, Provider, F>(
-    (store, distributed, additional, stream, weights_stream, finalizer): (
+    (store, distributed, additional, stream, weights_stream, layerwise_manager, finalizer): (
         eredu_checkpoint::store::RetainedCheckpointSource,
         crate::backend::distributed::MlxDistributedSession,
         std::collections::BTreeSet<String>,
         &Stream,
         &Stream,
+        Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
         F,
     ),
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
@@ -113,6 +116,7 @@ where
         additional,
         stream,
         weights_stream,
+        layerwise_manager,
         finalizer,
     )
 }
@@ -135,6 +139,7 @@ pub(crate) fn bind_partitioned_routed_with_provider<A, S, G, Provider, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -158,9 +163,10 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
+            layerwise_manager,
             finalizer,
         ),
-        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, finalizer)| {
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, layerwise_manager, finalizer)| {
             bind_partitioned_routed_local_with_provider(
                 prepared,
                 store,
@@ -170,10 +176,11 @@ where
                 additional,
                 stream,
                 weights_stream,
+                layerwise_manager,
                 finalizer,
             )
         },
-        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, finalizer)| {
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, layerwise_manager, finalizer)| {
             bind_partitioned_routed_pipeline_with_provider(
                 prepared,
                 store,
@@ -183,6 +190,7 @@ where
                 additional,
                 stream,
                 weights_stream,
+                layerwise_manager,
                 finalizer,
             )
         },
@@ -207,6 +215,7 @@ pub(crate) fn bind_partitioned_routed_local_with_provider<A, S, G, Provider, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -232,6 +241,7 @@ where
         .into_iter()
         .collect::<Vec<_>>();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);

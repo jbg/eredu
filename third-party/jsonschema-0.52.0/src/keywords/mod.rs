@@ -35,6 +35,15 @@ pub(crate) mod type_;
 pub(crate) mod unevaluated_items;
 pub(crate) mod unevaluated_properties;
 pub(crate) mod unique_items;
+// Propagate a reached construction refusal through optional keyword dispatch.
+macro_rules! try_compile {
+    ($expression:expr) => { match $expression {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error.into())),
+    } };
+}
+pub(crate) use try_compile;
+
 use core::fmt;
 
 use referencing::{Draft, Vocabulary};
@@ -43,7 +52,7 @@ use serde_json::{Map, Value};
 use crate::{compiler, error, validator::Validate, Json, SerdeJson};
 
 pub(crate) type CompilationResult<'a, F = SerdeJson> =
-    Result<BoxedValidator<F>, error::ValidationError<'a>>;
+    Result<BoxedValidator<F>, crate::compilation::CompileError<'a>>;
 pub(crate) type BoxedValidator<F = SerdeJson> = Box<dyn Validate<F>>;
 
 type CompileFunc<'a, F> = fn(

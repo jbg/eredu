@@ -41,13 +41,33 @@ pub(in crate::working_memory) struct NativeStorageLayout {
     pub(super) population: Option<(usize, usize)>,
     control_bytes: Option<u64>,
     pub(super) exact_storage: bool,
+    _funding: Option<eredu_core::HostMetadataFunding>,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::working_memory) struct NativeStorageLayoutOwner(Option<Arc<NativeStorageLayout>>);
+impl std::ops::Deref for NativeStorageLayoutOwner {
+    type Target = NativeStorageLayout;
+    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("live native storage layout") }
+}
+impl NativeStorageLayoutOwner {
+    pub(in crate::working_memory) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.0.as_ref().expect("live layout"), other.0.as_ref().expect("live layout"))
+    }
+    pub(super) fn get_mut(&mut self) -> Option<&mut NativeStorageLayout> {
+        Arc::get_mut(self.0.as_mut().expect("live native storage layout"))
+    }
+}
+impl Drop for NativeStorageLayoutOwner {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() { drop(Arc::into_inner(owner)); }
+    }
+}
 /// Cold facts tied to the exact equation plan and selected mechanism. This is
 /// not an allocation grant. Unknown allocator/control or span coverage keeps
 /// the original quote incomplete even when the requested cap is known.
 pub struct PreparedNativeStoragePlan<M: OriginalNativeStorageMechanism> {
-    pub(super) layout: Arc<NativeStorageLayout>,
+    pub(super) layout: NativeStorageLayoutOwner,
     pub(super) plan: InferenceSpanWorkspacePlan,
     _mechanism: PhantomData<fn() -> M>,
 }
@@ -71,8 +91,26 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         provider_controls: Option<u64>,
         allocator_and_keys: Option<u64>,
     ) -> Result<Self, WorkingMemoryError> {
+        let funding = workspace.plan().metadata_funding();
+        cold_controls::<(Self, NativeStorageLayout, Result<Self, WorkingMemoryError>)>(funding.as_ref())?;
+        if let Some(funding) = &funding {
+            funding.reserve_metadata(shared_shell::<NativeStorageLayout>()?)
+                .map_err(crate::working_memory::reservation_metadata::funding_error)?;
+        }
+        if let Some(funding) = &funding {
+            funding.reserve_metadata(std::mem::size_of_val(&covered))
+                .map_err(crate::working_memory::reservation_metadata::funding_error)?;
+        }
         let mut covered = covered.into_iter();
-        let mut spans = Vec::with_capacity(workspace.plan().records().len());
+        if let Some(funding) = &funding {
+            funding.reserve_metadata(std::mem::size_of_val(&covered))
+                .map_err(crate::working_memory::reservation_metadata::funding_error)?;
+        }
+        let mut spans = match &funding {
+            Some(funding) => funding.metadata_vec(workspace.plan().records().len())
+                .map_err(|error| crate::working_memory::reservation_metadata::neural_error(error, funding))?,
+            None => Vec::with_capacity(workspace.plan().records().len()),
+        };
         for index in 0..workspace.plan().records().len() {
             let native = covered.next().ok_or(WorkingMemoryError::IdentityMismatch)?;
             let full = workspace.span_bytes(index);
@@ -127,17 +165,8 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
             && spans
                 .iter()
                 .all(|(_, full, native)| full.is_some() && native.is_some());
-        #[cfg(debug_assertions)]
-        if !complete && std::env::var_os("EREDU_TRACE_HOST_PARALLEL_STORAGE").is_some() {
-            eprintln!("HOST_PARALLEL_STORAGE_NATIVE capacity={capacity:?} population={population:?} provider={provider_controls:?} allocator={allocator_and_keys:?}");
-            for (index, (span, full, native)) in spans.iter().enumerate() {
-                if full.is_none() || native.is_none() {
-                    eprintln!("HOST_PARALLEL_STORAGE_SPAN index={index} span={span:?} full={full:?} native={native:?}");
-                }
-            }
-        }
         Ok(Self {
-            layout: Arc::new(NativeStorageLayout {
+            layout: NativeStorageLayoutOwner(Some(Arc::new(NativeStorageLayout {
                 mechanism: TypeId::of::<M>(),
                 selection: selection.clone(),
                 spans,
@@ -147,7 +176,8 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
                 population,
                 control_bytes: complete.then_some(known),
                 exact_storage: false,
-            }),
+                _funding: funding,
+            }))),
             plan: workspace.plan().clone(),
             _mechanism: PhantomData,
         })
@@ -170,6 +200,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         covered: impl IntoIterator<Item = Option<u64>>,
         provider_controls: Option<u64>,
     ) -> Result<Self, WorkingMemoryError> {
+        cold_controls::<(Self, Result<Self, WorkingMemoryError>, Option<u64>, Option<(usize, usize)>)>(workspace.plan().metadata_funding().as_ref())?;
         let qualified = crate::working_memory::qualified_storage::qualified();
         let nested = mechanism.key_clone_storage_bytes();
         let complete = qualified && nested.is_some() && population.is_some();
@@ -187,7 +218,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         )?;
         if let (true, Some(nested), Some((attempts, rows))) = (qualified, nested, population) {
             let managed = Self::qualified_control_bytes(attempts, rows, nested)?;
-            let layout = Arc::get_mut(&mut plan.layout).expect("unpublished control recipe");
+            let layout = plan.layout.get_mut().expect("unpublished control recipe");
             let payload = crate::working_memory::qualified_storage::array_bytes::<(
                 InferenceWorkspaceSpan,
                 Option<u64>,
@@ -228,7 +259,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        Arc::get_mut(&mut self.layout)
+        self.layout.get_mut()
             .ok_or(WorkingMemoryError::IdentityMismatch)?
             .carryover = Some(report);
         Ok(self)
@@ -247,6 +278,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         mut self,
         generations: impl IntoIterator<Item = Option<u64>>,
     ) -> Result<Self, WorkingMemoryError> {
+        cold_controls::<(Self, Result<Self, WorkingMemoryError>, u64, bool)>(self.plan.metadata_funding().as_ref())?;
         let mut generations = generations.into_iter();
         let mut sum = 0u64;
         let mut complete = true;
@@ -274,7 +306,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
         }
-        let layout = Arc::get_mut(&mut self.layout).ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let layout = self.layout.get_mut().ok_or(WorkingMemoryError::IdentityMismatch)?;
         if layout.equation_generations.is_some() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -304,9 +336,9 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
             .ok_or(WorkingMemoryError::Overflow)?;
         let frames = [
             storage::vector_control_bytes::<Option<M::Attachment>>()?,
-            storage::vector_control_bytes::<Option<usize>>()?,
+            storage::vector_control_bytes::<RootPublicationInput>()?,
             storage::vector_control_bytes::<usize>()?,
-            storage::vector_control_bytes::<&M::Root>()?,
+            storage::vector_control_bytes::<M::Root<'static>>()?,
             storage::vector_control_bytes::<Option<M::Observation<'static>>>()?,
             storage::vector_control_bytes::<WorkingMemoryStorage<M::Key>>()?,
             storage::vector_control_bytes::<bool>()?,
@@ -362,9 +394,9 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
             .and_then(|n| n.checked_add(size_of::<M::Observation<'static>>() as u64))
             .and_then(|n| n.checked_add(size_of::<Option<M::Observation<'static>>>() as u64))
             .and_then(|n| n.checked_add(size_of::<NativeStorageObservation<M::Key>>() as u64))
-            .and_then(|n| n.checked_add(size_of::<Option<usize>>() as u64))
+            .and_then(|n| n.checked_add(size_of::<RootPublicationInput>() as u64))
             .and_then(|n| n.checked_add(size_of::<usize>() as u64))
-            .and_then(|n| n.checked_add(size_of::<&M::Root>() as u64))
+            .and_then(|n| n.checked_add(size_of::<M::Root<'static>>() as u64))
             .and_then(|n| n.checked_add(size_of::<WorkingMemoryStorage<M::Key>>() as u64))
             .and_then(|n| n.checked_add(size_of::<bool>() as u64))
             .ok_or(WorkingMemoryError::Overflow)?;
@@ -391,7 +423,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
                 )
             })
             .and_then(|n| n.checked_add(size_of::<OriginalNativePublication<M>>() as u64))
-            .and_then(|n| n.checked_add(size_of::<Vec<&M::Root>>() as u64))
+            .and_then(|n| n.checked_add(size_of::<Vec<M::Root<'static>>>() as u64))
             .and_then(|n| n.checked_add(size_of::<Vec<Option<M::Observation<'static>>>>() as u64))
             // Borrow/clone attachment and consuming source-vector transfer
             // happen after publication, while the prepared registry stays live.
@@ -471,13 +503,6 @@ impl PreparedTextControlWorkspace {
     ) -> Result<Self, WorkingMemoryError> {
         if self.binding.native_storage.is_some() || !self.plan.same_plan(&plan.plan) {
             return Err(WorkingMemoryError::IdentityMismatch);
-        }
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-            eprintln!("ORIGINAL_QUOTE_NATIVE chunk={} spans={} capacity={:?} equation_generations={:?} population={:?} controls={:?}",
-                self.binding.geometry.prefill_chunk_positions, plan.layout.spans.len(),
-                plan.layout.capacity, plan.layout.equation_generations, plan.layout.population,
-                plan.layout.control_bytes);
         }
         let known = [self.binding.facts.work, plan.layout.control_bytes]
             .into_iter()

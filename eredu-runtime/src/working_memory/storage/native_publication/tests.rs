@@ -750,3 +750,118 @@ fn prepared_and_ordinary_namespaces_share_lookup_and_detach_middle_head_and_tail
 }
 
 mod registered_source;
+
+#[test]
+fn physical_owner_alias_preserves_closed_ordinary_and_copy_funding() {
+    use crate::working_memory::{
+        residual::RegisteredStoragePin, AdmittedWorkspaceCopy, InferenceExecutionIdentity,
+    };
+    for copied in [false, true] {
+        let pool = WorkingMemoryPool::new(10_000, 0).unwrap();
+        let source = pool
+            .register_storage(std::iter::empty::<(u32, u64)>())
+            .unwrap();
+        let original = if copied {
+            let execution = InferenceExecutionIdentity::default();
+            let pin = RegisteredStoragePin::new(
+                pool.pin_registered_storage(std::iter::empty::<(u32, u64)>())
+                    .unwrap(),
+            );
+            let (run, scope) = pool
+                .open_workspace_copy_account(&source, pin, &execution, 64, 10_000)
+                .unwrap();
+            let (copy, scope) =
+                AdmittedWorkspaceCopy::from_account(execution, 64, run, scope).into_parts();
+            let mut rows = scope.adopt_storage_individually([(71u32, 64)]).unwrap();
+            let row = rows.remove(&71).unwrap();
+            scope.certify().unwrap();
+            drop((rows, copy));
+            row
+        } else {
+            pool.register_storage([(71u32, 64)]).unwrap()
+        };
+        assert_eq!(pool.used_bytes().unwrap(), 64);
+        let (metadata, run, partition) = account(&pool);
+        let scope = run.scope().unwrap();
+        let before = balances(&pool);
+        // A prepaid-source claim remains false for either ordinary origin.
+        let mut strict = PreparedNativePublication::prepare_slots(partition.clone(), 1);
+        strict
+            .push_observation(
+                crate::working_memory::NativeStorageObservation::ExistingImmutable(71u32, 64),
+            )
+            .unwrap();
+        assert_eq!(
+            strict.publish(&scope),
+            Err(WorkingMemoryError::IdentityMismatch)
+        );
+        assert_eq!(balances(&pool), before);
+        drop(strict);
+        let mut alias = PreparedNativePublication::prepare_slots(partition.clone(), 2);
+        for _ in 0..2 {
+            alias
+                .push_observation(
+                    crate::working_memory::NativeStorageObservation::ExistingPhysical(71u32, 64),
+                )
+                .unwrap();
+        }
+        alias.publish(&scope).unwrap();
+        assert_eq!(balances(&pool), before);
+        let retained = alias.take(0).unwrap();
+        assert!(alias.take(1).is_none());
+        scope.certify().unwrap();
+        drop((alias, original, metadata, run, partition, source));
+        assert_eq!(
+            pool.used_bytes().unwrap(),
+            64,
+            "the last exact physical alias preserves its donor's full charge"
+        );
+        drop(retained);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
+}
+
+#[test]
+fn physical_owner_alias_refuses_missing_capacity_and_conflicting_classifications() {
+    let pool = WorkingMemoryPool::new(10_000, 0).unwrap();
+    let source = pool.register_storage([(71u32, 64)]).unwrap();
+    let (metadata, run, partition) = account(&pool);
+    let scope = run.scope().unwrap();
+    for (key, bytes, ordinary_duplicate) in [(72u32, 64, false), (71, 65, false), (71, 64, true)] {
+        let before = balances(&pool);
+        let mut attempt = PreparedNativePublication::prepare_slots(partition.clone(), 2);
+        attempt
+            .push_observation(
+                crate::working_memory::NativeStorageObservation::ExistingPhysical(key, bytes),
+            )
+            .unwrap();
+        if ordinary_duplicate {
+            attempt
+                .push_observation(crate::working_memory::NativeStorageObservation::Ordinary(
+                    key, bytes,
+                ))
+                .unwrap();
+        }
+        let error = attempt.publish(&scope).unwrap_err();
+        if bytes == 65 {
+            assert!(matches!(
+                error,
+                WorkingMemoryError::StorageCapacityMismatch {
+                    expected_bytes: 64,
+                    actual_bytes: 65
+                }
+            ));
+        } else {
+            assert_eq!(error, WorkingMemoryError::IdentityMismatch);
+        }
+        assert_eq!(balances(&pool), before);
+        assert!(attempt.take(0).is_none());
+        assert_eq!(
+            attempt.publish(&scope),
+            Err(WorkingMemoryError::PreparationAlreadyStarted)
+        );
+    }
+    scope.certify().unwrap();
+    drop((metadata, run, partition, source));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}

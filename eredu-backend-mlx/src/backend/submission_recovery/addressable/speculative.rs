@@ -5,30 +5,30 @@ use super::{AddressableRequestOwner,AddressableExecutionRow};
 use super::request_sources::{AddressableRequestSourcePlan,AddressableRequestSources};
 use crate::backend::{error::Error,nn::workspace::{AddressableInvocation,ResidentSpanRecipe},
     runtime::execution::generic::OriginalSelectedResidencyAccess};
-use eredu_nn::workspace::{WorkspaceMetadataFunding,WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding,HostMetadataFundingError};
 use eredu_runtime::working_memory::{HostSourceConstructionFacts,OriginalHostSourceBank,WorkingMemoryError};
 use safemlx::{OriginalScopeObserver,OriginalBufferBudget};
 use std::{cell::{Cell,RefCell},mem::{size_of,size_of_val}};
-fn overflow()->Error{Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow)}
+fn overflow()->Error{Error::WorkspacePlanning(HostMetadataFundingError::Overflow)}
 fn identity()->Error{Error::PrefillControl(WorkingMemoryError::IdentityMismatch)}
 fn sum(values:&[usize])->Option<usize>{values.iter().copied().try_fold(size_of_val(values),usize::checked_add)}
 struct Row {taken:Cell<bool>,value:RefCell<Option<SpeculativeAddressableSpan>>}
 pub(crate) struct SpeculativeAddressableSources {
     rows:Vec<Row>,facts:Option<Vec<Option<HostSourceConstructionFacts>>>,controls:u64,
-    _funding:WorkspaceMetadataFunding,
+    _funding:HostMetadataFunding,
 }
 pub(crate) struct SpeculativeAddressableSpan {
     plan:Option<AddressableRequestSourcePlan>,
     invocation:AddressableInvocation,
     accepted:Option<AddressableRequestSources>,
-    funding:WorkspaceMetadataFunding,
+    funding:HostMetadataFunding,
 }
 impl SpeculativeAddressableSources {
     pub(crate) fn prepare(records:&[ResidentSpanRecipe],target:Option<HostSourceConstructionFacts>,
-        funding:&WorkspaceMetadataFunding)->Result<Option<Self>,Error>{
+        funding:&HostMetadataFunding)->Result<Option<Self>,Error>{
         if !records.iter().any(|row|row.addressable().is_some()){return Ok(None);}
         let fixed=sum(&[size_of::<Self>(),size_of::<Result<Option<Self>,Error>>(),
-            size_of::<(&[ResidentSpanRecipe],Option<HostSourceConstructionFacts>,&WorkspaceMetadataFunding)>(),
+            size_of::<(&[ResidentSpanRecipe],Option<HostSourceConstructionFacts>,&HostMetadataFunding)>(),
             size_of::<Vec<Row>>(),size_of::<Vec<Option<HostSourceConstructionFacts>>>(),
             size_of::<AddressableRequestSourcePlan>(),size_of::<SpeculativeAddressableSpan>(),
             size_of::<AddressableInvocation>(),size_of::<[(&AddressableInvocation,usize);1]>(),
@@ -78,7 +78,7 @@ impl SpeculativeAddressableSpan {
             size_of::<Option<AddressableRequestSourcePlan>>(),
             size_of::<Option<OriginalHostSourceBank>>(),size_of::<Result<Option<OriginalHostSourceBank>,Error>>(),
             size_of::<(&mut Self,Option<OriginalHostSourceBank>)>(),
-            size_of::<(Self,OriginalSelectedResidencyAccess,OriginalBufferBudget,&OriginalScopeObserver,Option<std::time::Duration>,&WorkspaceMetadataFunding)>(),
+            size_of::<(Self,OriginalSelectedResidencyAccess,OriginalBufferBudget,&OriginalScopeObserver,Option<std::time::Duration>,&HostMetadataFunding)>(),
             size_of::<AddressableRequestOwner>(),size_of::<AddressableExecutionRow>(),
             size_of::<Result<AddressableExecutionRow,Error>>(),size_of::<&mut Self>()])
     }
@@ -92,7 +92,7 @@ impl SpeculativeAddressableSpan {
         Ok(target)
     }
     pub(crate) fn activate(self,access:OriginalSelectedResidencyAccess,budget:OriginalBufferBudget,
-        observer:&OriginalScopeObserver,timeout:Option<std::time::Duration>,funding:&WorkspaceMetadataFunding)
+        observer:&OriginalScopeObserver,timeout:Option<std::time::Duration>,funding:&HostMetadataFunding)
         ->Result<AddressableExecutionRow,Error>{
         if self.plan.is_some()||!self.funding.same_account(funding){return Err(identity());}
         let owner=AddressableRequestOwner::new_prepared(self.accepted.ok_or_else(identity)?,
@@ -101,3 +101,5 @@ impl SpeculativeAddressableSpan {
     }
 }
 
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -94,7 +94,7 @@ pub(super) fn prepare(
 
 pub(super) fn quote(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    source: &CopiedTextComponents,
+    source: &child::Source<'_, '_>,
     geometry: InferenceGeometry,
     state: &DeviceState<WorkspaceBackend, WorkspaceResidentLayerState>,
     context: &WorkspaceContext,
@@ -102,6 +102,7 @@ pub(super) fn quote(
     prepared: PreparedSavedMedia,
     addressable:Option<&crate::backend::nn::workspace::AddressableSources>,
     interventions: Option<TextInterventionQuote<'_>>,
+    parallel: Option<&crate::backend::nn::workspace::MlxParallelWorkspace>,
 ) -> Result<SavedMediaQuote, Error> {
     let funding = context
         .metadata_funding()
@@ -139,36 +140,47 @@ pub(super) fn quote(
         let layerwise = model.layerwise_workspace()?;
         // Native numerical tracing is independent of the selected source-copy
         // mechanism. Its authoritative constructor/copy recipe is bound below.
-        let mut recorder = mechanisms.recorder(geometry, context)
-            .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
-        if let Some(source)=addressable{recorder.bind_addressable_sources(source.clone()).map_err(|cause|retain_planning_error(cause,funding.clone()))?;}
         let capture = match (source.capture_checkpoint(), source.capture_selection()) {
             (Some(checkpoint), Some(selection)) => Some((checkpoint, selection)),
             (None, None) => None,
             _ => return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)),
         };
         if capture.is_none() && interventions.is_some(){return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));}
-        let report = if let Some((checkpoint, selection)) = capture {
-            model.quote_saved_original_media_capture(
-                input, media.semantics().binding(), geometry, state, context,
-                sampling, checkpoint, selection, interventions, &mut recorder,
-            ).map_err(|cause| retain_planning_error(cause, funding.clone()))?
-        } else {
-            blueprint.quote_original_media_with_existing_sampling_and_trace(
-                input,
-                media.semantics().binding(),
-                geometry,
-                state,
-                context,
-                None,
-                sampling,
-                &mut recorder,
-            )
-            .map_err(|cause| retain_planning_error(cause.into_failure(), funding.clone()))?
+        let loaded_capture=if capture.is_some() && parallel.is_some() {
+            Some(runtime.session().partition_capture_source().ok_or_else(unknown)?)
+        } else {None};
+        let quote=|recorder:&mut dyn crate::composition::mlx::model::CaptureRecorder,
+            communication:Option<&eredu_runtime::RetainedCommunicationSource>| {
+            if let Some((checkpoint,selection))=capture {
+                let parallel=communication.map(|communication| {
+                    let loaded=loaded_capture.as_ref().expect("prepared partition capture source");
+                    (communication,(loaded.layouts(),communication.manifest().rank()),None)
+                });
+                model.quote_saved_original_media_capture(input,media.semantics().binding(),geometry,state,context,
+                    sampling,checkpoint,selection,interventions,recorder,parallel)
+                    .map_err(|cause|retain_planning_error(cause,funding.clone()))
+            } else {
+                blueprint.quote_original_media_with_existing_sampling_and_trace(input,media.semantics().binding(),
+                    geometry,state,context,None,sampling,recorder,communication)
+                    .map_err(|cause|retain_planning_error(cause.into_failure(),funding.clone()))
+            }
         };
-        let mut recipe = recorder
-            .finish(report.equations().span_workspace_plan())
-            .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+        context.charge_metadata(std::mem::size_of_val(&quote))
+            .map_err(|cause|retain_planning_error(cause,funding.clone()))?;
+        let (report,mut recipe)=if let Some(parallel)=parallel {
+            let mut recorder=parallel.recorder(geometry).map_err(|cause|retain_planning_error(cause,funding.clone()))?;
+            let report=quote(&mut recorder,Some(parallel.declaration_source()))?;
+            let recipe=recorder.finish(report.equations().span_workspace_plan())
+                .map_err(|cause|retain_planning_error(cause,funding.clone()))?;
+            (report,recipe)
+        } else {
+            let mut recorder=mechanisms.recorder(geometry,context).map_err(|cause|retain_planning_error(cause,funding.clone()))?;
+            if let Some(source)=addressable{recorder.bind_addressable_sources(source.clone()).map_err(|cause|retain_planning_error(cause,funding.clone()))?;}
+            let report=quote(&mut recorder,None)?;
+            let recipe=recorder.finish(report.equations().span_workspace_plan())
+                .map_err(|cause|retain_planning_error(cause,funding.clone()))?;
+            (report,recipe)
+        };
         model
             .erased()
             .bind_layerwise_neural_recipe(pool, &mut recipe, Some(&funding))?;

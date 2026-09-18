@@ -10,7 +10,7 @@ use eredu_checkpoint::{
     },
 };
 use eredu_nn::{
-    ParameterId, ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    ParameterId, ParameterVisitor, ParameterVisitorMut, Parameterized,
 };
 
 use crate::{
@@ -386,8 +386,8 @@ where
     }
 
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'a P) {
+            let name = metadata.id().as_str().to_owned();
             if self.parameters.insert(name.clone(), parameter).is_some() {
                 self.duplicate = Some(name);
             }
@@ -398,7 +398,7 @@ where
         parameters: BTreeMap::new(),
         duplicate: None,
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     if let Some(parameter) = collector.duplicate {
         return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
     }
@@ -496,8 +496,8 @@ where
         duplicate: Option<String>,
     }
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'a P) {
+            let name = metadata.id().as_str().to_owned();
             // The description is filled after traversal because the visitor cannot
             // retain a borrowed callback without complicating this neutral API.
             if self
@@ -524,7 +524,7 @@ where
         parameters: BTreeMap::new(),
         duplicate: None,
     };
-    module.visit_parameters(&mut collector);
+    module.visit_parameters(&mut collector)?;
     if let Some(parameter) = collector.duplicate {
         return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
     }
@@ -962,6 +962,10 @@ fn qualify_parameter(prefix: &str, name: &str) -> String {
 /// Failure while converting a neutral module traversal into a binding plan.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingPlanError {
+    /// Canonical source traversal could not establish complete parameter coverage.
+    #[error(transparent)]
+    Source(#[from] eredu_nn::ParameterSourceError),
+
     /// Immutable traversal repeated a stable parameter identity.
     #[error("module traversal repeats parameter {parameter:?}")]
     DuplicateParameter {
@@ -1275,6 +1279,10 @@ pub enum ParameterOrchestrationError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    /// Canonical source traversal failed before binding publication.
+    #[error(transparent)]
+    Source(#[from] eredu_nn::ParameterSourceError),
+
     /// Binding aliases were invalid before materialization began.
     #[error(transparent)]
     Declaration(#[from] ResidencyDeclarationError),

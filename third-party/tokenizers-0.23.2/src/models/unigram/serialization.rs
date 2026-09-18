@@ -26,7 +26,7 @@ impl<'de> Deserialize<'de> for Unigram {
     where
         D: Deserializer<'de>,
     {
-        Self::deserialize_with_cache_policy(deserializer, crate::ModelCachePolicy::Legacy)
+        Self::deserialize_with_cache_policy(deserializer, crate::ModelCachePolicy::default())
     }
 }
 

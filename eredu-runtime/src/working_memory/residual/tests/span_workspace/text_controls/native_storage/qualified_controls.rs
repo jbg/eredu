@@ -92,7 +92,7 @@ fn qualified_controls_require_key_fact_and_exact_admission_before_provider_work(
     ));
     assert_eq!(mechanism.calls.get(), 0);
     assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (_, r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let mut bank = span
@@ -482,7 +482,7 @@ fn retained_equation_generations_replace_the_peak_and_fund_one_exact_partition()
         ))
     ));
     assert_eq!(mechanism.calls.get(), 0);
-    let (_, reservation, accepted) = sealed_plan(&pool, &retained, exact).unwrap();
+    let (reservation, accepted) = sealed_plan(&pool, &retained, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
         .into_funded_text_span_workspace(&run, &reservation)

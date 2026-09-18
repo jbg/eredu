@@ -634,7 +634,17 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
         }
         if let Some(consumers)=&self.consumers {
             let Some(observer)=self.event.original_observer() else { return false; };
-            if !consumers.retire_completed(observer).unwrap_or(false) { return false; }
+            use crate::backend::submission_recovery::observed::RetirementAttempt;
+            match consumers.retire_completed(observer) {
+                Ok(RetirementAttempt::Retired) => {}
+                Ok(RetirementAttempt::Stopped(cause)) => {
+                    // This bool boundary cannot deliver a typed cause. Keep
+                    // the original refusal in its already fenced request bank.
+                    drop(cause);
+                    return false;
+                }
+                Ok(RetirementAttempt::Pending) | Err(_) => return false,
+            }
         }
         native_resources_releasable(&self.recovery)
     }

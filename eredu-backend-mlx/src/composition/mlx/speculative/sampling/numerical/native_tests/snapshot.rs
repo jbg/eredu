@@ -8,13 +8,13 @@ fn snapshot_host(
     sampler: &MlxSpeculativeSampling<DefaultSampler>,
     target: &MlxSpeculativeRandomState,
     draft: &MlxSpeculativeSeed,
-    funding: &WorkspaceMetadataFunding,
+    funding: &HostMetadataFunding,
 ) -> HostPreparationAuthority {
     let bytes = sampler
         .original_snapshot_metadata(Some(target), Some(draft))
         .unwrap()
         .checked_add(
-            HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>().unwrap(),
+            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
         )
         .unwrap();
     funding.reserve_metadata(bytes).unwrap();

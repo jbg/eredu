@@ -66,5 +66,5 @@ pub(crate) fn check(operator: Operator, stream: &Stream) -> Result<(), eredu_nn:
         source.location().file().into(),
         source.location().line(),
     )));
-    Err(eredu_nn::Error::backend_source(source))
+    Err(eredu_nn::Error::backend_retained_source(source))
 }

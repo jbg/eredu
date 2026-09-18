@@ -1,6 +1,8 @@
 //! High-level contract implemented once per execution backend.
 
 mod capture_delivery;
+mod branch;
+pub use branch::{TextBranchSource, TextGenerationBranch, TextBranchFenced};
 mod continuation;
 mod controller_workspace;
 mod failure;
@@ -15,6 +17,10 @@ mod resume;
 mod shared_filter;
 mod shared_storage;
 mod text_step;
+mod token_choice;
+mod sampling_boundary;
+pub use sampling_boundary::TextSamplingBoundary;
+pub use token_choice::{ProspectiveTokenController, TextTokenChoiceBoundary};
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
     TextGenerationContinuation, TextGenerationDriver, TextSnapshotSource,
@@ -37,14 +43,13 @@ pub use preparation::{
 pub use reset_preparation::{
     PreparedSessionReset, SessionResetPreparationBackend, SessionResetReadiness,
 };
-pub use resume::{OriginalTextResumeKind, TextResumeBackend, text_resume_control_bytes};
+pub use resume::{OriginalTextResumeKind, OriginalTextResumeOptions, TextResumeBackend, TextResumeFacts, TextResumeSourceFacts, text_resume_control_bytes};
 pub use shared_filter::SharedTokenFilter;
 pub(crate) use shared_storage::SharedStorageCustody;
 pub use shared_storage::{
     ControllerDeclarationData, ErasedSharedStorageOwner, SharedControllerBytes,
     SharedControllerDeclaration, SharedControllerSource, SharedStorageAttachmentError,
     SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
-    SharedTokenFilterIdentity,
 };
 pub use text_step::{TextContextError, TextPolicyIdentity, TextRunIdentity, TextStepContext};
 
@@ -1771,7 +1776,7 @@ pub struct TokenSamplingDecision<'a> {
     pre_override_filter: Option<TokenFilter>,
     tokenizer_validity: Option<&'a TokenFilter>,
     shared_tokenizer_validity: Option<&'a SharedTokenFilter>,
-    original_tokenizer_validity: Option<OriginalTokenDomainWitness<'a>>,
+    original_tokenizer_validity: Option<OriginalSourceWitness<'a>>,
     controller_storage: Option<TextControllerStorage<'a>>,
 }
 
@@ -1812,7 +1817,7 @@ impl<'a> TokenSamplingDecision<'a> {
     pub fn with_original_tokenizer_validity(
         mut self,
         validity: &'a TokenFilter,
-        source: OriginalTokenDomainWitness<'a>,
+        source: OriginalSourceWitness<'a>,
     ) -> Self {
         self.tokenizer_validity = Some(validity);
         self.shared_tokenizer_validity = None;
@@ -1821,7 +1826,7 @@ impl<'a> TokenSamplingDecision<'a> {
     }
 
     /// Actual borrowed source provenance, still requiring runtime authentication.
-    pub fn original_tokenizer_validity(&self) -> Option<OriginalTokenDomainWitness<'a>> {
+    pub fn original_tokenizer_validity(&self) -> Option<OriginalSourceWitness<'a>> {
         self.original_tokenizer_validity
     }
 
@@ -1884,14 +1889,14 @@ impl<'a> TokenSamplingDecision<'a> {
 /// the original request. A matching type, value or size alone is insufficient.
 ///
 /// ```compile_fail
-/// fn escape() -> eredu_core::OriginalTokenDomainWitness<'static> {
+/// fn escape() -> eredu_core::OriginalSourceWitness<'static> {
 ///     let source = 7u8;
-///     eredu_core::OriginalTokenDomainWitness::new(&source)
+///     eredu_core::OriginalSourceWitness::new(&source)
 /// }
 /// ```
 #[derive(Clone, Copy)]
-pub struct OriginalTokenDomainWitness<'a>(&'a (dyn std::any::Any + Send + Sync));
-impl<'a> OriginalTokenDomainWitness<'a> {
+pub struct OriginalSourceWitness<'a>(&'a (dyn std::any::Any + Send + Sync));
+impl<'a> OriginalSourceWitness<'a> {
     /// Borrows an actual immutable source without allocating or invoking it.
     pub fn new(source: &'a (dyn std::any::Any + Send + Sync)) -> Self {
         Self(source)
@@ -1906,10 +1911,27 @@ impl<'a> OriginalTokenDomainWitness<'a> {
         self.0.downcast_ref()
     }
 }
-impl Debug for OriginalTokenDomainWitness<'_> {
+impl Debug for OriginalSourceWitness<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("OriginalTokenDomainWitness(..)")
+        f.write_str("OriginalSourceWitness(..)")
     }
+}
+
+/// Actual borrowed state source for an independently paid semantic controller.
+/// The runtime must authenticate these owners and their retained account.
+#[derive(Debug, Clone, Copy)]
+pub enum PreparedControllerSource<'a> {
+    /// Plain canonical token history and its immutable validity source.
+    Plain {
+        /// Actual paid mutable history.
+        history: &'a crate::speculative::PlainControllerHistory,
+        /// Exact loaded tokenizer-validity owner.
+        validity: &'a SharedTokenFilter,
+    },
+    /// Mutable grammar state and its exact immutable recipe/trie inputs.
+    Grammar(crate::speculative::PreparedGrammarSource<'a>),
+    /// Fixed forbidden inputs and their paid canonical history.
+    Forbidden(crate::speculative::ForbiddenControllerSource<'a>),
 }
 
 /// Complete lifetime declaration for controller numerical payloads.
@@ -1928,7 +1950,17 @@ pub enum TextControllerStorage<'a> {
     /// Legacy inventory/pinning cannot accept this declaration. A source-aware
     /// runtime must authenticate the actual owner and original request; no source
     /// bytes are credited, adopted or attached to the request account.
-    RunOwnedWithOriginalTokenDomain(OriginalTokenDomainWitness<'a>),
+    RunOwnedWithOriginalTokenDomain(OriginalSourceWitness<'a>),
+    /// Authenticated independently paid semantic state, plus a run-owned emitted
+    /// mask. The witness is descriptive until a source-aware runtime validates
+    /// its exact closed binding and the actual state source. Registry adoption
+    /// cannot accept this declaration or discount its independent funding.
+    RunOwnedWithPreparedSemantic {
+        /// Borrow of the closed runtime source/execution binding.
+        binding: OriginalSourceWitness<'a>,
+        /// Actual state inputs and retained history payer at this callback.
+        source: PreparedControllerSource<'a>,
+    },
     /// The enumerated immutable filters have independent shared lifetimes;
     /// every other numerical payload is run-owned. The inventory must remain
     /// unchanged throughout the admitted run, including callbacks: every
@@ -1964,7 +1996,7 @@ pub enum TextControllerStorage<'a> {
 
 impl<'a> TextControllerStorage<'a> {
     /// Actual source-bearing declaration, never a grant or numeric size witness.
-    pub fn original_token_domain(self) -> Option<OriginalTokenDomainWitness<'a>> {
+    pub fn original_token_domain(self) -> Option<OriginalSourceWitness<'a>> {
         match self {
             Self::RunOwnedWithOriginalTokenDomain(source) => Some(source),
             _ => None,
@@ -1974,7 +2006,7 @@ impl<'a> TextControllerStorage<'a> {
     /// ownership is unknown or any non-mask source would be omitted.
     pub fn shared_filters(self) -> Option<&'a [SharedTokenFilter]> {
         match self {
-            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) => None,
+            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) | Self::RunOwnedWithPreparedSemantic { .. } => None,
             Self::RunOwned => Some(&[]),
             Self::RunOwnedWithSharedFilters(filters) => Some(filters),
             Self::RunOwnedWithSharedStorage { filters, bytes } if bytes.is_empty() => Some(filters),
@@ -1997,7 +2029,7 @@ impl<'a> TextControllerStorage<'a> {
             &'a [SharedControllerBytes],
             &'a [SharedControllerDeclaration],
         ) = match self {
-            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) => return None,
+            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) | Self::RunOwnedWithPreparedSemantic { .. } => return None,
             Self::RunOwned => (&[], &[], &[]),
             Self::RunOwnedWithSharedFilters(filters) => (filters, &[], &[]),
             Self::RunOwnedWithSharedStorage { filters, bytes } => (filters, bytes, &[]),
@@ -2496,7 +2528,7 @@ pub trait TextGenerationBackend: BackendProvider {
         _runtime: &ModelRuntime<Self>,
         factory: impl FnOnce() -> Vec<u8>,
     ) -> Result<SharedControllerBytes, BackendFailure> {
-        Ok(SharedControllerBytes::new(factory()))
+        Ok(SharedControllerBytes::new(factory(), crate::HostPreparationAuthority::unmanaged()))
     }
 
     /// Creates an immutable declaration under the same source-accounting
@@ -2510,7 +2542,7 @@ pub trait TextGenerationBackend: BackendProvider {
         _runtime: &ModelRuntime<Self>,
         factory: impl FnOnce() -> Result<T, BackendFailure>,
     ) -> Result<SharedControllerDeclaration, BackendFailure> {
-        Ok(SharedControllerDeclaration::new(factory()?))
+        Ok(SharedControllerDeclaration::new(factory()?, HostPreparationAuthority::unmanaged()))
     }
 
     /// Opaque prepared prompt, including any backend-owned multimodal values.
@@ -2565,9 +2597,9 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Snapshot mechanisms and complete facade-state support are separate facts.
     fn text_execution_control_support(
         _runtime: &ModelRuntime<Self>,
-    ) -> crate::execution_control::ControlSupport {
+    ) -> crate::execution_control::ControlSupport<&'static str> {
         crate::execution_control::ControlSupport::Unsupported {
-            reason: "backend has not declared completed-token control support".into(),
+            reason: "backend has not declared completed-token control support",
         }
     }
 
@@ -2575,14 +2607,20 @@ pub trait TextGenerationBackend: BackendProvider {
     /// The runtime validates policy; the adapter supplies atomic native changes.
     fn text_sampling_control_support(
         _runtime: &ModelRuntime<Self>,
-    ) -> crate::execution_control::ControlSupport {
+    ) -> crate::execution_control::ControlSupport<&'static str> {
         crate::execution_control::ControlSupport::Unsupported {
-            reason: "backend has no prospective sampling controls".into(),
+            reason: "backend has no prospective sampling controls",
         }
     }
 
     /// Active parameter-edit provenance for ordinary and controlled generation.
     fn active_parameter_overlay(_runtime: &ModelRuntime<Self>) -> Option<&str> {
+        None
+    }
+
+    /// Content identity already established during source discovery. This cold
+    /// borrowed query must not hash, reopen artifacts or allocate a discovery.
+    fn prepared_artifact_identity(_runtime: &ModelRuntime<Self>) -> Option<crate::artifact::ArtifactIdentity> {
         None
     }
 
@@ -2672,29 +2710,21 @@ pub trait TextGenerationBackend: BackendProvider {
         }
     }
 
-    /// Moves out at most one completed capture step. No implementation may queue
-    /// unconsumed steps without a separately admitted finite buffering contract.
-    fn take_text_capture(
-        _state: &mut Self::TextGenerationState,
-    ) -> Option<crate::capture::CapturedStep> {
-        None
-    }
-
     /// Fallibly moves one completed frame without detaching retained custody.
     /// The shared driver establishes exact completion before calling this hook.
-    /// Failure must leave undelivered payloads owned by the state. No backend
-    /// may queue additional frames without its own admitted buffering contract.
-    /// Legacy implementors retain their existing raw delivery behavior.
+    /// Failure leaves undelivered payloads owned by the state. Implementations
+    /// with capture must also report pending transactions through
+    /// `text_capture_pending`; additional frames require admitted buffering.
     fn try_take_text_capture(
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Option<crate::capture::CapturedStepDelivery>, Self::Error> {
-        Ok(Self::take_text_capture(state).map(crate::capture::CapturedStepDelivery::Legacy))
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<Option<crate::capture::SharedCapturedStep>, Self::Error> {
+        Ok(None)
     }
 
     /// Whether any capture transaction or undelivered frame remains, including
     /// failed/aborted work with no ready frame. This read-only query performs no
     /// completion, allocation, publication or retry. Retained/fallible collectors
-    /// must override it; false is the compatibility default for legacy backends.
+    /// must override it; uninstrumented backends have no capture transactions.
     fn text_capture_pending(_state: &Self::TextGenerationState) -> bool {
         false
     }
@@ -3064,10 +3094,12 @@ where
     step: Option<PendingTextInput<B::Prompt, B::Token>>,
     completions: Vec<B::TextCompletion>,
     // A legacy raw drain cannot detach or copy a retained frame.
-    capture_delivery: Option<crate::capture::CapturedStepDelivery>,
     remaining_tokens: Option<usize>,
     // Core-issued evidence is never copied into a snapshot or a child machine.
     step_context: TextStepContext,
+    // Stable exclusive borrowed branch tree, independently of fresh resume runs.
+    branch_owner: TextRunIdentity,
+    branch_fenced: bool,
     // A backend may keep the run's remaining allocation authority here. Retire
     // machine-owned controller/input/completion payloads before closing it.
     // Escaped outputs and unresolved work require independent backend retention.
@@ -3080,6 +3112,7 @@ where
     // Exact shared source retires after all machine payload and run custody.
     // This ownership is not a grant to copy, reserve, or reconfigure capture.
     capture_source: Option<crate::capture::SharedCapturePlan>,
+    intervention_source: Option<crate::intervention::SharedInterventionPlan>,
     // Fresh host-copy custody outlives every resumed machine field. No run grant.
     resume_host: Option<HostPreparationAuthority>,
 }
@@ -3089,7 +3122,8 @@ where
 ///
 /// This sums their named constructor/return/error overlaps without constructing
 /// them. It excludes nested backend/controller/source payloads, completion-vector
-/// backing, cancellation/driver identity allocations, and formatting. A concrete
+/// backing, cancellation allocations, and formatting. Driver identity uses the
+/// non-repeating core evidence issuer without a heap owner. A concrete
 /// original producer must add those actual populations before the same admission;
 /// this layout alone grants no storage, completeness or execution authority.
 pub fn text_generation_control_bytes<B: TextGenerationBackend, C: TokenFilterController>()
@@ -3264,6 +3298,20 @@ where
         self.inner.controller.is_complete()
     }
 
+    /// Exact immutable source installed by this machine's original preparation.
+    pub fn capture_source(&self) -> Option<&crate::capture::SharedCapturePlan> {
+        self.inner.capture_source.as_ref()
+    }
+    /// Exact immutable intervention source, including a fresh resumed revision.
+    pub fn intervention_source(&self) -> Option<&crate::intervention::SharedInterventionPlan> {
+        self.inner.intervention_source.as_ref()
+    }
+
+    /// Borrows canonical constraint state without revising policy or advancing.
+    pub fn controller(&self) -> &C {
+        &self.inner.controller
+    }
+
     /// Mutably borrows the canonical constraint state.
     pub fn controller_mut(&mut self) -> &mut C {
         self.inner.step_context.revise_policy();
@@ -3428,13 +3476,7 @@ where
         )
     }
 
-    /// Legacy raw delivery after exact completion. A retained frame stays owned
-    /// by this machine and returns None; None therefore does not prove draining.
-    /// Funded callers must use `take_captured_delivery` instead. No shared frame
-    /// is cloned into an unpriced raw DTO.
-    pub fn take_captured_step(&mut self) -> Result<Option<crate::capture::CapturedStep>, B::Error> {
-        self.inner.take_legacy_capture()
-    }
+
 }
 
 impl<B, C> TextGenerationMachine<B, C>
@@ -3515,7 +3557,8 @@ where
             owned.sequence.as_ref(),
         )?;
         Ok(Self {
-            capture_source: owned.options.take().and_then(|options| options.capture),
+            capture_source: owned.options.as_ref().and_then(|options| options.capture.clone()),
+            intervention_source: owned.options.take().and_then(|options| options.interventions),
             resume_host: None,
             prepared_sequence,
             preparation,
@@ -3524,8 +3567,9 @@ where
             controller,
             step: Some(PendingTextInput::Prefill(prompt)),
             completions: Vec::new(),
-            capture_delivery: None,
             remaining_tokens: config.sampling().max_new_tokens,
+            branch_owner: step_context.run_identity().clone(),
+            branch_fenced: false,
             step_context,
         })
     }
@@ -3627,6 +3671,10 @@ where
         runtime: &mut ModelRuntime<B>,
         cancellation: &crate::GenerationCancellationToken,
     ) -> Option<ControlledGenerationResult<B, C>> {
+        if self.branch_fenced {
+            return Some(Err(ControlledTextGenerationError::Preparation(
+                BackendFailure::new(BackendFailureKind::Other, TextBranchFenced))));
+        }
         if let Err(error) = self.step_context.validate() {
             self.step = None;
             return Some(Err(ControlledTextGenerationError::Preparation(error)));
@@ -4483,10 +4531,13 @@ mod tests {
         type TextGenerationState = (u32, u64);
         type TextCompletion = Done;
 
-        fn take_text_capture(
+        fn try_take_text_capture(
             _: &mut Self::TextGenerationState,
-        ) -> Option<crate::capture::CapturedStep> {
-            capture_delivery_defaults::take()
+        ) -> Result<Option<crate::capture::SharedCapturedStep>, Self::Error> {
+            Ok(capture_delivery_defaults::take())
+        }
+        fn text_capture_pending(_: &Self::TextGenerationState) -> bool {
+            capture_delivery_defaults::pending()
         }
 
         fn start_text_generation(
@@ -4956,7 +5007,7 @@ mod tests {
                 Err(TextContinuationError::NotQuiescent)
             ));
             assert_eq!(state.controller().committed, index + 1);
-            assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+            assert!(driver.take_completed_delivery(&mut state).unwrap().is_none());
             state.require_quiescent().unwrap();
         }
         assert!(driver.advance(&mut state).unwrap().is_none());
@@ -4987,10 +5038,10 @@ mod tests {
         assert!(foreign.runtime().session().tokens.is_empty());
         assert!(owner.advance(&mut state).unwrap().is_some());
         assert!(matches!(
-            foreign.take_completed_step(&mut state),
+            foreign.take_completed_delivery(&mut state),
             Err(TextContinuationError::IncompatibleDriver)
         ));
-        owner.take_completed_step(&mut state).unwrap();
+        owner.take_completed_delivery(&mut state).unwrap();
         drop(owner);
         let mut replacement = TextGenerationDriver::new(&mut first);
         assert!(matches!(
@@ -5026,7 +5077,7 @@ mod tests {
                 ControlledTextGenerationError::Controller(_)
             ))
         ));
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
         assert!(matches!(
             state.require_quiescent(),
             Err(TextContinuationError::Failed)
@@ -5064,7 +5115,7 @@ mod tests {
             }))
             .is_err()
         );
-        driver.take_completed_step(&mut state).unwrap();
+        driver.take_completed_delivery(&mut state).unwrap();
         assert!(matches!(
             state.require_quiescent(),
             Err(TextContinuationError::Failed)

@@ -5,7 +5,7 @@ use safemlx::Dtype;
 fn cast(p:&mut CpuPopulation,source:Dtype,destination:Dtype,rank:usize,count:usize)->Option<()> {
     p.copy(OperationEvent::cpu_cast_layout(source,destination,rank,count,false)?,1)
 }
-fn matmul(p:&mut CpuPopulation,mechanism:MlxCpuWorkspaceMechanisms,dtype:Dtype,rank:usize,
+pub(super) fn matmul(p:&mut CpuPopulation,mechanism:MlxCpuWorkspaceMechanisms,dtype:Dtype,rank:usize,
     m:usize,n:usize,k:usize,batches:usize,copies:usize)->Option<()> {
     // The shared frontend receives already-promoted values, then broadcasts
     // the actual batch geometries while retaining both matrix interiors.

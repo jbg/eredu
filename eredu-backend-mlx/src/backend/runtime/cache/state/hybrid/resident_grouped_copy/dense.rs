@@ -72,7 +72,7 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
     pub(crate) fn copy_dense_with_preparation(
         self,
         host: &eredu_core::HostPreparationAuthority,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<MlxHybridState, Error> {
@@ -115,7 +115,7 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
         &self,
         source: DenseHostSlotInitialization<'_, S, MlxHybridLayerState>,
         host: &eredu_core::HostPreparationAuthority,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<eredu_runtime::HostSlotTable<MlxHybridLayerState>, Error> {
@@ -605,3 +605,5 @@ impl PreparedDenseHybridGroupedState<'_> {
         Ok(())
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

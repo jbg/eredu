@@ -163,9 +163,33 @@ impl<S: MlxStateMechanisms> AutoregressiveStateRoots for S {
         .map_err(Error::PrefillState)
     }
 }
+/// Closed typed ingress erased only after the selected architecture constructs it.
+/// The concrete owner and its Box allocation retire before the original funding.
+pub(crate) struct OriginalAutoregressiveMediaPrefill {
+    source: Box<dyn std::any::Any>,
+    visit: fn(&dyn std::any::Any, &mut dyn FnMut(&Array)),
+    _funding: eredu_nn::workspace::HostMetadataFunding,
+}
+impl OriginalAutoregressiveMediaPrefill {
+    pub(super) fn new<T: 'static>(source:T,
+        visit:fn(&dyn std::any::Any, &mut dyn FnMut(&Array)),
+        metadata:&eredu_nn::workspace::WorkspaceContext) -> Result<Self,Error> {
+        let funding=metadata.metadata_funding().ok_or(Error::PrefillScopeUnavailable)?;
+        metadata.charge_metadata(std::mem::size_of::<(T,Self,Result<Self,Error>,
+            fn(&dyn std::any::Any, &mut dyn FnMut(&Array)),
+            &eredu_nn::workspace::WorkspaceContext)>())
+            .map_err(|cause|Error::Neural(cause.into()))?;
+        Ok(Self { source:Box::new(source), visit, _funding:funding })
+    }
+    pub(super) fn downcast_mut<T:'static>(&mut self)->Option<&mut T> { self.source.downcast_mut() }
+    pub(crate) fn visit_retained_roots(&self, visitor:&mut dyn FnMut(&Array)) {
+        (self.visit)(self.source.as_ref(), visitor)
+    }
+}
 pub(crate) trait AutoregressiveSequenceCompletion {
+    fn metadata_context(&self) -> eredu_nn::workspace::WorkspaceContext;
     fn role(&self) -> &eredu_runtime::working_memory::OriginalSpeculativeRole;
-    fn metadata_funding(&self) -> eredu_nn::workspace::WorkspaceMetadataFunding;
+    fn metadata_funding(&self) -> eredu_nn::workspace::HostMetadataFunding;
     fn take_checkpoint(&mut self) -> Result<MlxPredictionTargetState, Error>;
     fn complete(
         &mut self,
@@ -342,7 +366,7 @@ impl MlxPredictionTargetState {
         environment: &crate::backend::OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         capacity: u64,
     ) -> Result<Self, Error> {
         self.with_original_copy_source(funding, |source, completed| {
@@ -363,7 +387,7 @@ impl MlxPredictionTargetState {
     /// evidence; leaf copying still authenticates every actual native backing.
     pub(crate) fn with_original_copy_source<T>(
         &self,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         operation: impl for<'source> FnOnce(
             crate::backend::runtime::cache::state::PreparedResidentDecoderCopy<'source>,
             Option<&'source crate::backend::runtime::cache::state::CompletedResidentSource>,
@@ -398,7 +422,7 @@ impl MlxPredictionTargetState {
         environment: &crate::backend::OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         capacity: u64,
     ) -> Result<Self, Error> {
         Self::copy_original_source_with_completion(
@@ -417,7 +441,7 @@ impl MlxPredictionTargetState {
         environment: &crate::backend::OriginalCopyEnvironment<'_>,
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
         capacity: u64,
     ) -> Result<Self, Error> {
         use crate::backend::runtime::cache::state::{
@@ -425,7 +449,7 @@ impl MlxPredictionTargetState {
         };
         use eredu_core::HostPreparationAuthority;
         let bytes = HostPreparationAuthority::retention_bytes::<
-            eredu_nn::workspace::WorkspaceMetadataFunding,
+            eredu_nn::workspace::HostMetadataFunding,
         >()
         .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
         funding
@@ -468,7 +492,9 @@ impl MlxPredictionTargetState {
         &mut self,
         budget: &safemlx::OriginalBufferBudget,
         role: &eredu_runtime::working_memory::OriginalSpeculativeRole,
-        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        stream: &safemlx::Stream,
+        additional: impl FnMut(&mut dyn FnMut(&Array)) -> Result<(), Error>,
     ) -> Result<(), Error> {
         use crate::backend::runtime::cache::state::{
             CompletedResidentSource, PreparedResidentDecoderCopy, ResidentDecoderPreparationError,
@@ -482,10 +508,12 @@ impl MlxPredictionTargetState {
             std::mem::size_of::<CompletedResidentSource>(),
             std::mem::size_of::<Option<CompletedResidentSource>>(),
             std::mem::size_of::<Result<(), Error>>(),
+            std::mem::size_of_val(&additional),
             std::mem::size_of::<(
                 &mut Self,
                 &safemlx::OriginalBufferBudget,
                 &eredu_runtime::working_memory::OriginalSpeculativeRole,
+                &safemlx::Stream,
             )>(),
         ];
         let bytes = frames
@@ -509,7 +537,8 @@ impl MlxPredictionTargetState {
             budget,
             role,
             funding,
-        )?;
+            additional,
+        )?.with_completed_stream(stream)?;
         self.2 = Some(completed);
         Ok(())
     }
@@ -615,6 +644,14 @@ impl MlxPredictionTargetState {
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ))?
             .visit_original_roots(visitor)
+    }
+    pub(crate) fn matches_media_binding(
+        &self,
+        execution: &eredu_runtime::working_memory::InferenceExecutionIdentity,
+        binding: &eredu_runtime::working_memory::MediaSessionBinding,
+    ) -> bool {
+        let Some(state) = self.0.as_ref() else { return false; };
+        self.generation_fixed().is_some_and(|frontier| binding.matches_retained_state(execution, state.retention(), frontier))
     }
     pub(crate) fn generation_fixed(&self) -> Option<u64> {
         u64::try_from(self.0.as_ref()?.offset()).ok()
@@ -918,7 +955,7 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
             })
             .map_err(|error| match error {
                 Error::Neural(error) => error,
-                error => eredu_nn::Error::backend_source(error),
+                error => eredu_nn::Error::backend_retained_source(error),
             })
     }
 
@@ -1388,7 +1425,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     /// before compiling/binding B. Default performs no state/native work.
     fn prepare_original_media_semantic_binding(
         &self,
-        _funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        _funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<(), eredu_runtime::replicated_session::OriginalMediaBindingError> {
         Err(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound.into())
     }
@@ -1618,14 +1655,23 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         ))
     }
 
+    /// Exact typed placement sources, without copying retained charge directories.
+    fn original_control_branch_sources(&self, _slot: &dyn std::any::Any)
+        -> Result<[eredu_runtime::replicated_session::ControlBranchSource; 2], Error> {
+        Err(crate::composition::mlx::session::prepared_control_slot_error(
+            crate::composition::mlx::session::PreparedControlSlotError::Unknown))
+    }
+
     /// Exchanges an exact prepared original slot through the shared control
     /// worker, without ordinary support estimates or diagnostic formatting.
     fn exchange_original_control_state(
         &mut self,
         _slot: &mut dyn std::any::Any,
-        _metadata: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        _metadata: &eredu_nn::workspace::HostMetadataFunding,
         _media: Option<&eredu_runtime::working_memory::MediaSessionBinding>,
-    ) -> Result<Option<eredu_runtime::working_memory::CopiedMediaStateBinding>, Error> {
+        _branch: Option<(&eredu_runtime::working_memory::PendingTextBranchExchange,
+            &[eredu_runtime::replicated_session::ControlBranchSource; 2])>,
+    ) -> Result<eredu_runtime::replicated_session::ControlExchangeResult, Error> {
         use crate::composition::mlx::session::{
             PreparedControlSlotError, prepared_control_slot_error,
         };
@@ -1650,10 +1696,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
             crate::backend::runtime::cache::state::PublishedResidentDecoderState::KeyValue(
                 state,
             ) => self.bind_prepared_dense_control_state(origin, state, prompt),
-            crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridKvOnly(
-                _,
-            )
-            | crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridGrouped(
+            crate::backend::runtime::cache::state::PublishedResidentDecoderState::HybridGrouped(
                 _,
             )
             | crate::backend::runtime::cache::state::PublishedResidentDecoderState::Pooling(_) => {
@@ -1843,10 +1886,11 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn validate_prepared_observation_paths(
         &self,
         _expected: &eredu_runtime::SharedLayeredObservationPaths,
+        _metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<(), Error> {
-        Err(Error::Other(Box::new(
+        Err(Error::PreparedObservation(
             eredu_runtime::PreparedSessionObservationError::Unavailable,
-        )))
+        ))
     }
 
     /// Exact local text-prefill control component, not complete media admission.
@@ -1861,7 +1905,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     }
 
     #[cfg(test)]
-    fn inspection_adapters_for_test(&self, _: eredu_core::InferenceGeometry) -> Result<(), Error> {
+    fn inspection_adapters_for_test(&self, _: eredu_core::InferenceGeometry, _: &eredu_runtime::working_memory::WorkingMemoryPool) -> Result<(), Error> {
         Err(Error::PrefillScopeUnavailable)
     }
     #[cfg(test)]
@@ -1875,7 +1919,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         &self,
         _pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         _recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
-        _funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        _funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<(), Error> {
         Err(Error::PrefillScopeUnavailable)
     }
@@ -1884,7 +1928,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         &self,
         _source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         _pool: &eredu_runtime::working_memory::WorkingMemoryPool,
-        _funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        _funding: &eredu_nn::workspace::HostMetadataFunding,
         _recipe: &mut crate::backend::nn::workspace::AutoregressiveEquationRecipe,
     ) -> Result<
         (
@@ -1927,7 +1971,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         _native_root_capacity: Option<u64>,
         _retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         _native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        _funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        _funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Option<eredu_runtime::working_memory::TextPrefillScopeFacts>, Error> {
         Ok(None)
     }
@@ -1941,7 +1985,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         _host_destinations: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
         _retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
         _native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        _funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        _funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<
         Option<crate::backend::runtime::execution::generic::OriginalOperationBankOwner>,
         Error,
@@ -2193,6 +2237,30 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         Err(Error::PrefillScopeUnavailable)
     }
 
+    /// Compiles from the retained host source while the actual independent
+    /// cache is installed. The resulting plan binds that cache's own revision.
+    fn prepare_autoregressive_media_semantics(
+        &mut self,
+        _source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
+        _cache: &mut MlxPredictionTargetState,
+        _blueprint: &eredu_architectures::prepared_execution::PreparedInferenceBlueprint,
+        _pool: &WorkingMemoryPool,
+        _funding: &eredu_nn::workspace::HostMetadataFunding,
+        _stream: &Stream,
+    ) -> Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error> {
+        Err(Error::PrefillScopeUnavailable)
+    }
+    fn prepare_autoregressive_media_prefill(
+        &mut self, _packet: &input::OriginalMediaPacket, _semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics, _cache: &mut MlxPredictionTargetState,
+        _geometry: eredu_core::InferenceGeometry, _role: &eredu_runtime::working_memory::OriginalSpeculativeRole,
+        _metadata: &eredu_nn::workspace::WorkspaceContext, _stream: &Stream,
+    ) -> Result<OriginalAutoregressiveMediaPrefill,Error> { Err(Error::PrefillScopeUnavailable) }
+    fn autoregressive_media_prefill_span_with_completion(
+        &mut self, _source:&mut OriginalAutoregressiveMediaPrefill, _cache:&mut MlxPredictionTargetState,
+        _span:&eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
+        _stream:&Stream, _completion:&mut dyn AutoregressiveSequenceCompletion,
+    ) -> Result<Option<Array>,Error> { Err(Error::PrefillScopeUnavailable) }
+
     /// Actual bounded-driver prefill span with the same checkpoint/publication
     /// transaction as independent decode. Completion receives no output root
     /// for StateOnly; it must still complete every mutable state root.
@@ -2207,9 +2275,9 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         Err(Error::PrefillScopeUnavailable)
     }
 
-    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
+    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport<&'static str> {
         eredu_core::execution_control::ControlSupport::Unsupported {
-            reason: "complete native state copying is unavailable for this executable".into(),
+            reason: "complete native state copying is unavailable for this executable",
         }
     }
     /// Exact live logical estimate without inventories, native clones or owned
@@ -2617,3 +2685,5 @@ pub(crate) struct PreparedControlBinding {
     pub(crate) revision: eredu_runtime::working_memory::InferenceStateRevision,
     pub(crate) frontier: u64,
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

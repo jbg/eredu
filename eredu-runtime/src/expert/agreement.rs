@@ -13,9 +13,9 @@ fn finish<T, E: std::error::Error + Send + Sync + 'static>(
 ) -> Result<T, Error> {
     let agreement = agree(local.is_ok());
     match (local, agreement) {
-        (Err(error), _) => Err(Error::backend_source(error)),
+        (Err(error), _) => Err(Error::backend_retained_source(error)),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(_), Ok(false)) => Err(Error::backend_source(ProviderAgreementRejected)),
+        (Ok(_), Ok(false)) => Err(Error::backend_retained_source(ProviderAgreementRejected)),
         (Ok(output), Ok(true)) => Ok(output),
     }
 }
@@ -46,7 +46,7 @@ where
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Error> {
         self.provider
             .routing_control(bank, rows)
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
     fn routing_unmodified_interest(&self, bank: RoutedBankId) -> crate::RoutingUnmodifiedInterest {
         self.provider.routing_unmodified_interest(bank)
@@ -58,7 +58,7 @@ where
     ) -> Result<(), Error> {
         self.provider
             .routing_unmodified(bank, effective)
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
 
     fn routing_applied(
@@ -69,7 +69,7 @@ where
     ) -> Result<(), Error> {
         self.provider
             .routing_applied(bank, original, effective)
-            .map_err(Error::backend_source)
+            .map_err(Error::backend_retained_source)
     }
     fn routing_failed(&mut self, bank: RoutedBankId, message: &str) {
         self.provider.routing_failed(bank, message);
@@ -290,7 +290,7 @@ mod tests {
                                         votes.fetch_add(1, Ordering::SeqCst);
                                         ready.wait();
                                         if agreement_fails {
-                                            Err(Error::backend_source(AgreementFault))
+                                            Err(Error::backend_retained_source(AgreementFault))
                                         } else {
                                             Ok(!failed.load(Ordering::SeqCst))
                                         }

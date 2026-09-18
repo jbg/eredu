@@ -25,8 +25,8 @@ struct Bind<'a> {
     values: &'a BTreeMap<String, MlxTensor>,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut MlxTensor) {
-        *value = self.values[metadata.id.as_str()].clone();
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+        *value = self.values[metadata.id().as_str()].clone();
     }
 }
 fn dense_values(

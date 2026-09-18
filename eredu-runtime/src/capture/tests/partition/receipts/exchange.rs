@@ -204,7 +204,7 @@ fn receipt(
         ]
     };
     PartitionCaptureReceiptPlan::new(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(plan),
         maps.into_iter()
             .map(|(rank, map)| PartitionCaptureProducer {
@@ -367,7 +367,7 @@ fn concurrent_rank_exchange_delivers_exact_raw_and_reduced_values_after_agreemen
             assert_eq!(result.context().forward_epoch, 19);
         }
         let plan = plan_for(transform, false);
-        let mut ordinary = CaptureSession::new(plan);
+        let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
         ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
         ordinary
             .observe(
@@ -627,7 +627,7 @@ fn overflowing_transport_buffers_are_rejected_before_reservation_or_submission()
         )
         .unwrap();
         let authority = PartitionCaptureReceiptPlan::new(
-            plan.clone(),
+            eredu_core::capture::SharedCapturePlan::new(plan.clone()),
             context(&plan),
             vec![PartitionCaptureProducer {
                 rank: 0,

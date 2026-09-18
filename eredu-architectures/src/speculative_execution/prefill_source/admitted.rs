@@ -2,7 +2,7 @@
 use super::*;
 use crate::composite_execution::PreparedCompositeInput;
 use crate::media_plan::AdmittedCompositeInput;
-use crate::prefill::{ExternalPrefillChunk, PreparedExternalPrefill};
+use crate::prefill::{ExternalPrefillChunk, PreparedExternalPrefill, PrefillAdmission};
 use eredu_nn::Tensor;
 use eredu_runtime::{PreparedInputInspector, PreparedInputPayload, PreparedModelInput};
 
@@ -11,7 +11,7 @@ use eredu_runtime::{PreparedInputInspector, PreparedInputPayload, PreparedModelI
 /// until selected retained-media ingress is connected to captured seeding.
 pub struct AdmittedPredictionPrefill<C, T, I, P> {
     input: eredu_runtime::input::PreparedModelInputOwner<T>,
-    admitted: AdmittedCompositeInput<P>,
+    admitted: PrefillAdmission<P>,
     config: C,
     inspector: I,
     identity: Option<SharedPreparedInputCacheIdentity>,
@@ -30,7 +30,7 @@ impl<C, T, I, P> AdmittedPredictionPrefill<C, T, I, P> {
     ) -> Self {
         Self {
             input: input.into(),
-            admitted,
+            admitted: PrefillAdmission::Ordinary(admitted),
             config,
             inspector,
             identity,
@@ -55,13 +55,30 @@ impl<C, T, I, P> AdmittedPredictionPrefill<C, T, I, P> {
         }
         Ok(Self {
             input,
-            admitted,
+            admitted: PrefillAdmission::Ordinary(admitted),
             config,
             inspector,
             identity,
             chunk,
             metadata: Some(context.clone()),
         })
+    }
+    /// Retains the original compiled semantic admission instead of re-reading
+    /// native metadata. The input account must be the exact source of that plan.
+    pub fn from_compiled_source_with_metadata(
+        input: eredu_runtime::input::PreparedModelInputOwner<T>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        config: C, inspector: I,
+        identity: Option<SharedPreparedInputCacheIdentity>, chunk: Option<NonZeroU64>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, Error> {
+        crate::decoder::identity::Metadata::new(Some(context)).controls::<(Self, Result<Self, Error>)>()?;
+        if context.metadata_funding().is_none() {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        let admitted = PrefillAdmission::Original(original);
+        admitted.input(&input, Some(context))?;
+        Ok(Self { input, admitted, config, inspector, identity, chunk, metadata: Some(context.clone()) })
     }
 }
 
@@ -84,16 +101,9 @@ where
 {
     type Source = AdmittedPredictionSource<A::AdmissionConfig, B::Tensor, I, A::InputPartPlan>;
     fn shape(&self) -> Result<[u64; 2], Error> {
-        match self.metadata.as_ref() {
-            Some(context) => {
-                PreparedCompositeInput::new_with_metadata(&self.input, &self.admitted, context)?;
-            }
-            None => {
-                PreparedCompositeInput::new(&self.input, &self.admitted).map_err(Error::backend)?;
-            }
-        }
-        Ok(self.admitted.decoder_shape())
+        Ok(self.admitted.input(&self.input, self.metadata.as_ref())?.admitted().decoder_shape())
     }
+
     fn chunk_positions(&self) -> Option<NonZeroU64> {
         self.chunk
     }
@@ -106,26 +116,17 @@ where
     fn identity(&self) -> Option<&PreparedInputCacheIdentity> {
         self.identity.as_ref().map(AsRef::as_ref)
     }
+    fn visit_token_parts(&self,
+        visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let input = self.admitted.input(&self.input, self.metadata.as_ref())?;
+        A::visit_prepared_prediction_tokens(input, visitor)
+    }
     fn into_source(self, geometry: InferenceGeometry) -> Result<Option<Self::Source>, Error> {
-        let input = match self.metadata.as_ref() {
-            Some(context) => PreparedExternalPrefill::from_prepared_owner_with_metadata(
-                self.input,
-                self.admitted,
-                geometry,
-                self.config,
-                self.inspector,
-                self.chunk.is_none(),
-                context,
-            ),
-            None => PreparedExternalPrefill::from_source_owner(
-                self.input,
-                self.admitted,
-                geometry,
-                self.config,
-                self.inspector,
-                self.chunk.is_none(),
-            ),
-        }?;
+        let input = PreparedExternalPrefill::from_source(
+            self.input, self.admitted, geometry, self.config, self.inspector,
+            self.chunk.is_none(), self.metadata.as_ref(),
+        )?;
         Ok(input.map(|input| AdmittedPredictionSource { input }))
     }
 }

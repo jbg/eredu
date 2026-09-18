@@ -414,9 +414,9 @@ fn funded_reached_backing_growth_keeps_ids_scratch_and_exact_refusal_owner() {
             self.retired.store(true, Ordering::SeqCst);
         }
     }
-    fn owner(account: &Arc<Account>) -> PreparedHashConsFunding {
+    fn owner(account: &Arc<Account>) -> ParserAllocationFunding {
         let account = Arc::clone(account);
-        PreparedHashConsFunding::prepare(move |bytes| {
+        ParserAllocationFunding::prepare(move |bytes| {
             account.calls.fetch_add(1, Ordering::SeqCst);
             if account.deny.load(Ordering::SeqCst) {
                 Err(Denied)

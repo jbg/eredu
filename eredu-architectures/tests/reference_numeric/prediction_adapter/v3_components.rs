@@ -12,8 +12,8 @@ struct ParameterEdit<'a> {
     modules: Vec<usize>,
 }
 impl<'a> eredu_nn::ParameterVisitorMut<'a, NumericTensor> for ParameterEdit<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut NumericTensor) {
-        if metadata.id.as_str() == self.target {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        if metadata.id().as_str() == self.target {
             assert!(
                 self.saved.replace(value.clone()).is_none(),
                 "one authoritative prediction slot"
@@ -524,11 +524,11 @@ fn v3_prepared_prediction_formats_preserve_sources_and_packed_layouts() {
     let context = NumericContext::default();
     struct Geometry(BTreeMap<String, (Vec<i32>, eredu_core::checkpoint::TensorDtype)>);
     impl<'a> eredu_nn::ParameterVisitor<'a, NumericTensor> for Geometry {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a NumericTensor) {
+        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
             assert!(self
                 .0
                 .insert(
-                    metadata.id.to_string(),
+                    metadata.id().to_string(),
                     (value.shape.clone(), value.dtype.clone())
                 )
                 .is_none());

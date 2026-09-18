@@ -6,6 +6,7 @@ use crate::working_memory::{
     saved_source::SavedSourceValidation,
 };
 use std::mem::size_of;
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
 mod text_controls;
 pub(in crate::working_memory) use text_controls::OriginalTokenDomainBinding;
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub(in crate::working_memory) use text_controls::SequenceExtractionError;
 pub(in crate::working_memory) use text_controls::TextControlBinding;
 pub use text_controls::{
     AdmittedCaptureContinuation, AdmittedPrefillCapture, AggregateGenerationDecoderInput,
+    SamplingExtensionQuote, OriginalTextSamplingExtension,
     FailedCapturePlanPublication, GraphMetadataFacts, HostDestinationCause, HostDestinationFacts,
     HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, LoadedGenerationDecoderInput, NativeStorageError,
     NativeStorageObservation, NativeStorageRegistration, NativeStorageSelection,
@@ -49,6 +51,9 @@ pub struct InferenceSpanWorkspace {
     preparation: Option<u64>,
     attention: Option<u64>,
     materialization: Option<u64>,
+    // A sampling-only program includes its original host/history and tensor
+    // peaks, rather than invoking model preparation/attention mechanisms.
+    sampling: Option<u64>,
     text_controls: Option<PreparedTextControlWorkspace>,
 }
 impl InferenceSpanWorkspace {
@@ -91,6 +96,7 @@ impl InferenceSpanWorkspace {
             preparation,
             attention,
             materialization,
+            sampling: None,
             text_controls: None,
         })
     }
@@ -118,6 +124,9 @@ impl InferenceSpanWorkspace {
     /// Conservative new equation plus full original preparation/materialization
     /// terms. Sampling, controller and cumulative retained H remain separate.
     pub fn span_bytes(&self, index: usize) -> Option<u64> {
+        if matches!(self.plan.records().get(index)?.span(), crate::working_memory::InferenceWorkspaceSpan::Sampling(_)) {
+            return self.sampling;
+        }
         self.plan
             .records()
             .get(index)?
@@ -184,10 +193,14 @@ fn add_fixed(
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::working_memory) struct SpanWorkspaceIdentity(Arc<()>);
+pub(in crate::working_memory) struct SpanWorkspaceIdentity {
+    allocation: Arc<()>,
+    // Every identity alias holds the payer until after its shared shell retires.
+    _funding: Option<eredu_core::HostMetadataFunding>,
+}
 impl SpanWorkspaceIdentity {
     fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.allocation, &other.allocation)
     }
 }
 #[derive(Debug, Clone)]
@@ -275,11 +288,29 @@ impl IncrementalInferenceQuote {
         if self.span_seal.is_some() {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        if self.span_workspace.plan.records().is_empty()
+        // A terminal saved-state placement has no equation roles. Its copied
+        // destination, source pins and enclosing controls remain fully priced;
+        // sealing the empty schedule must not manufacture a forward span.
+        let geometry = self.span_workspace.plan.geometry();
+        let terminal = geometry == self.geometry
+            && geometry.input_positions == 0
+            && geometry.max_output_tokens == 0
+            && geometry.prefill_chunk_positions == 0
+            && geometry.output == eredu_core::OutputDemand::StateOnly
+            && geometry.validate_fixed().is_ok();
+        if (self.span_workspace.plan.records().is_empty() && !terminal)
             || (0..self.span_workspace.plan.records().len())
                 .any(|i| self.span_workspace.span_bytes(i).is_none())
         {
             return Err(WorkingMemoryError::UnknownBound.into());
+        }
+        let funding = self.span_workspace.plan.metadata_funding();
+        cold_controls::<(
+            Self, SpanWorkspaceSeal, SpanWorkspaceIdentity, Result<Self, ResidualQuoteError>,
+            InferenceGeometry, bool, Result<(), eredu_core::AdmissionPolicyError>,
+        )>(funding.as_ref())?;
+        if let Some(funding) = &funding {
+            funding.reserve_metadata(shared_shell::<()>()?).map_err(crate::working_memory::reservation_metadata::funding_error)?;
         }
         let host = self.span_workspace.protected_peak_bytes()?;
         let source = self
@@ -294,13 +325,9 @@ impl IncrementalInferenceQuote {
             .incremental_bytes
             .checked_add(retained)
             .ok_or(WorkingMemoryError::Overflow)?;
-        #[cfg(debug_assertions)]
-        if std::env::var_os("EREDU_ORIGINAL_QUOTE_TRACE").is_some() {
-            eprintln!("ORIGINAL_QUOTE_SEAL chunk={} before={} protected={} publication_source={} retained_added={} after={}",
-                self.geometry.prefill_chunk_positions, self.incremental_bytes, host, source, retained, incremental);
-        }
+        let has_text_controls = self.span_workspace.text_controls.is_some();
         let workspace = self
-            .state
+            .state_mut()?
             .execution_workspace
             .as_mut()
             .ok_or(WorkingMemoryError::UnknownBound)?;
@@ -310,14 +337,19 @@ impl IncrementalInferenceQuote {
         *bytes = bytes
             .checked_add(retained)
             .ok_or(WorkingMemoryError::Overflow)?;
-        assumptions.push_str("; original immutable span schedule actual capacity and measured retained controls/moves");
-        if self.span_workspace.text_controls.is_some() {
-            assumptions.push_str("; original named Q, optional finite pin and single-C publication controls protected with P; exact new C reserved separately, without native capacity credit");
-        }
-        validate_requirement(&self.state, self.geometry)?;
+        append_assumptions(assumptions,
+            "; original immutable span schedule actual capacity and measured retained controls/moves",
+            if has_text_controls {
+                "; original named Q, optional finite pin and single-C publication controls protected with P; exact new C reserved separately, without native capacity credit"
+            } else { "" }, funding.as_ref())?;
+        validate_requirement_with(&self.state, self.geometry).map_err(|error| match funding.as_ref() {
+            Some(funding) => ResidualQuoteError::Storage(crate::working_memory::reservation_metadata::neural_error(
+                error.into_workspace(crate::working_memory::WorkspaceReportMetadata::with_funding(funding)), funding)),
+            None => error.into_legacy(),
+        })?;
         self.incremental_bytes = incremental;
         self.span_seal = Some(SpanWorkspaceSeal {
-            identity: SpanWorkspaceIdentity(Arc::new(())),
+            identity: SpanWorkspaceIdentity { allocation: Arc::new(()), _funding: funding },
         });
         Ok(self)
     }
@@ -521,3 +553,32 @@ pub use text_controls::{
     NativeEquationStorage, NativePrefillEnvelope, NativePrefillEnvelopeBuilder,
     NativeStorageCarryoverReport,
 };
+
+// Same cold producer in ordinary and source-paid plans. The existing account is
+// retained by the plan and every detached identity; these helpers mint no credit.
+fn cold_controls<T>(funding: Option<&eredu_core::HostMetadataFunding>) -> Result<(), WorkingMemoryError> {
+    if let Some(funding) = funding {
+        let bytes = [size_of::<T>(), size_of::<Result<(), WorkingMemoryError>>(),
+            size_of::<Option<&eredu_core::HostMetadataFunding>>(),
+            eredu_core::HostMetadataFunding::reservation_control_bytes()]
+            .into_iter().try_fold(0usize, usize::checked_add).ok_or(WorkingMemoryError::Overflow)?;
+        funding.reserve_metadata(bytes).map_err(crate::working_memory::reservation_metadata::funding_error)?;
+    }
+    Ok(())
+}
+fn shared_shell<T>() -> Result<usize, WorkingMemoryError> {
+    std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+        .extend(std::alloc::Layout::new::<T>()).map(|layout| layout.0.pad_to_align().size())
+        .map_err(|_| WorkingMemoryError::Overflow)
+}
+fn append_assumptions(target: &mut String, first: &str, second: &str,
+    funding: Option<&eredu_core::HostMetadataFunding>) -> Result<(), WorkingMemoryError> {
+    cold_controls::<(&mut String, &str, &str, std::fmt::Arguments<'_>, String)>(funding)?;
+    let value = match funding {
+        Some(funding) => funding.metadata_string(format_args!("{target}{first}{second}"))
+            .map_err(|error| crate::working_memory::reservation_metadata::neural_error(error, funding))?,
+        None => format!("{target}{first}{second}"),
+    };
+    *target = value;
+    Ok(())
+}

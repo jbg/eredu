@@ -201,8 +201,8 @@ impl<'a> GroupCpuExchangeLayoutStorage<'a> {
     /// the unchanged constructors and shared two-root completion source.
     pub fn bind_actual_pair<'input>(self, input: &'input Array, receive_like: &'input Array)
         -> std::result::Result<GroupCpuExchangeStorage<'input>, GroupStorageUnavailable> where 'a: 'input {
-        let send=self.send.bind_actual(input)?;
-        let receive=self.receive.bind_actual(receive_like)?;
+        let send=self.send.bind_actual(input).map_err(|_|GroupStorageUnavailable)?;
+        let receive=self.receive.bind_actual(receive_like).map_err(|_|GroupStorageUnavailable)?;
         let actual=send.with_asymmetric_exchange_storage(receive)?;
         if actual.traversal!=self.traversal || actual.native.graph_allocation_extents!=self.native.graph_allocation_extents
             || actual.native.graph_capacity!=self.native.graph_capacity || actual.native.record_allocation_extents!=self.native.record_allocation_extents

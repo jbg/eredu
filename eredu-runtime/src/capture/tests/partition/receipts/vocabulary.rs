@@ -26,7 +26,7 @@ fn score_authority(
     let shape = [3, width];
     let slice = resolve_slice(&plan.points()[0], &plan.plan().selections[0], &shape).unwrap();
     PartitionCaptureReceiptPlan::new(
-        plan.clone(),
+        eredu_core::capture::SharedCapturePlan::new(plan.clone()),
         context(plan),
         maps.iter()
             .enumerate()

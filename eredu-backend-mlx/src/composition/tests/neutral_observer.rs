@@ -52,7 +52,7 @@ impl RoutedUnitObserver<Array> for Observer<'_> {
         );
         self.starts += 1;
         if self.failure == "start" {
-            Err(eredu_nn::Error::backend_source(Sentinel("start")))
+            Err(eredu_nn::Error::backend_retained_source(Sentinel("start")))
         } else {
             Ok(())
         }
@@ -60,7 +60,7 @@ impl RoutedUnitObserver<Array> for Observer<'_> {
     fn finish_invocation(&mut self, success: bool) -> Result<(), eredu_nn::Error> {
         self.finishes.push(success);
         if self.failure != "none" {
-            Err(eredu_nn::Error::backend_source(Sentinel("finish")))
+            Err(eredu_nn::Error::backend_retained_source(Sentinel("finish")))
         } else {
             Ok(())
         }
@@ -102,7 +102,7 @@ fn native_adapter_forwards_borrowed_invocation_and_preserves_first_failure() {
                 calls += 1;
                 assert!(observer.unwrap().invocation_active());
                 if failure == "provider" {
-                    Err(eredu_nn::Error::backend_source(Sentinel("provider")))
+                    Err(eredu_nn::Error::backend_retained_source(Sentinel("provider")))
                 } else {
                     Ok(())
                 }

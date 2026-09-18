@@ -1,19 +1,27 @@
-//! Loaded-model chat composition over the original renderer and shared text cursor.
+//! Original source compilation and canonical prepared-chat publication.
 use super::original_token_input::chat::{
-    ManagedChatPolicyRejection, OriginalChatError, OriginalTextChatPreparation,
-    compile_original_chat_file, prepare_original_text_chat_with_defaults_for,
-    start_original_text_chat_for,
+    OriginalChatError, compile_original_chat_file, prepare_original_chat,
 };
-use super::{LoadedModel, ManagedPlainTextSession, ManagedPlainTextSource};
-use crate::api::PreparedChatGenerationSettings;
+use super::{LoadedModel, ManagedPlainTextSource};
 use crate::runtime::chat::ChatTemplateRequest;
-use eredu_core::{
-    BackendFailure, GenerationCancellationToken, GenerationPlainTextEvent,
-    GenerationPlainTextOutput, TokenInputRejection,
-};
+use eredu_core::{BackendFailure, GenerationCancellationToken, TokenInputRejection};
 use eredu_runtime::working_memory::{
-    OriginalChatBackend, OriginalChatOperationError, OriginalChatTemplate,
+    OriginalChatBackend, OriginalChatSourceError, OriginalChatTemplate,
 };
+
+/// Actual input to fresh selected chat-template source preparation.
+#[derive(Debug)]
+pub enum ChatSourceInput {
+    /// Read a consumed tokenizer-config JSON file under its original allowance.
+    File(std::fs::File),
+    /// Borrow the complete template selection retained by this loaded model.
+    RetainedConfiguration,
+}
+impl From<std::fs::File> for ChatSourceInput {
+    fn from(file: std::fs::File) -> Self {
+        Self::File(file)
+    }
+}
 
 /// Originally compiled tokenizer and chat template matched to loaded metadata.
 /// Clones retain the same source accounts without exposing mutable compiler state.
@@ -23,45 +31,18 @@ pub struct ManagedChatSource {
     template: OriginalChatTemplate,
 }
 
-/// Borrowed text-chat request using the existing template and sampling policy.
-/// Message and stop storage stays caller-owned during startup.
-#[derive(Debug, Clone, Copy)]
-pub struct ManagedChatRequest<'a> {
-    /// Actual message/tool/reasoning/template policy; unintegrated policies reject.
-    pub chat: &'a ChatTemplateRequest,
-    /// Checkpoint overrides, sampler, seed and enforced caller memory ceiling.
-    pub settings: PreparedChatGenerationSettings,
-    /// Literal output stops in caller order.
-    pub stop_sequences: &'a [&'a str],
-    /// Omit special-token spellings from visible output.
-    pub skip_special_tokens: bool,
-}
-impl<'a> ManagedChatRequest<'a> {
-    /// Uses no literal stops and hides special-token output spellings.
-    pub fn new(chat: &'a ChatTemplateRequest, settings: PreparedChatGenerationSettings) -> Self {
-        Self {
-            chat,
-            settings,
-            stop_sequences: &[],
-            skip_special_tokens: true,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 enum Cause {
     #[error(transparent)]
     Input(#[from] TokenInputRejection),
+    #[error("chat preparation requires a selected chat template")]
+    MissingTemplate,
     #[error(transparent)]
-    Policy(#[from] ManagedChatPolicyRejection),
-    #[error(transparent)]
-    Generation(#[from] eredu_core::generation::GenerationError),
-    #[error(transparent)]
-    Operation(#[from] OriginalChatOperationError),
-    #[error(transparent)]
-    Chat(#[from] OriginalChatError<BackendFailure>),
+    Chat(#[from] OriginalChatError),
     #[error(transparent)]
     Backend(#[from] BackendFailure),
+    #[error(transparent)]
+    Publication(#[from] crate::runtime::chat::PreparedChatPublicationError),
 }
 /// Backend-independent managed chat failure retaining original failed-prefix owners.
 /// It carries no native error type or backend-error type parameter.
@@ -77,94 +58,107 @@ impl ManagedChatError {
             cause: cause.into(),
         }
     }
-    fn chat<B: OriginalChatBackend>(error: OriginalChatError<B::Error>) -> Self {
-        Self::new(error.into_neutral::<B>())
-    }
     /// Returns a fixed input/source identity refusal without error allocation.
     pub fn input_rejection(&self) -> Option<TokenInputRejection> {
         match &self.cause {
             Cause::Input(error) => Some(*error),
             Cause::Chat(error) => error.input_rejection().copied(),
-            Cause::Operation(OriginalChatOperationError::Domain(error)) => Some(*error),
-            _ => None,
-        }
-    }
-    /// Identifies an unfinished managed policy integration, not a model limitation.
-    pub fn policy_rejection(&self) -> Option<ManagedChatPolicyRejection> {
-        match &self.cause {
-            Cause::Policy(error) => Some(*error),
-            Cause::Chat(error) => error.policy_rejection(),
             _ => None,
         }
     }
 }
 
-// Public and private preparation/startup/error/terminal returns share the same
-// actual H/S/E/I/R consumer specialization. Lifetimes affect borrows, not layout.
-type PublicConsumer<'a, B> = (
-    ManagedChatRequest<'static>,
-    ManagedChatError,
-    Result<Option<OriginalTextChatPreparation>, ManagedChatError>,
-    Result<Option<ManagedPlainTextSession<'a, B>>, ManagedChatError>,
-    Result<Option<GenerationPlainTextOutput>, ManagedChatError>,
-);
+/// Template source compilation failure with its original partial compiler owner.
+/// Generation failures do not carry this source-only compiler storage.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedChatSourceError {
+    /// Loaded metadata or source identity failed validation.
+    #[error(transparent)]
+    Validation(#[from] ManagedChatError),
+    /// The consumed file or selected template failed original preparation.
+    #[error(transparent)]
+    Source(#[from] OriginalChatSourceError),
+}
 
 impl<B: OriginalChatBackend> LoadedModel<B> {
     fn validate_managed_chat_metadata(
         &self,
         source: &ManagedChatSource,
+        has_tools: bool,
     ) -> Result<(), ManagedChatError> {
         let template = self
             .chat_template
             .as_ref()
-            .ok_or_else(|| ManagedChatError::new(ManagedChatPolicyRejection::MissingTemplate))?;
+            .ok_or_else(|| ManagedChatError::new(Cause::MissingTemplate))?;
         if !source
             .tokenizer
             .original()
             .matches_configuration(&self.tokenizer)
             || !source
                 .template
-                .matches_configuration(template, &self.model_id)
+                .matches_selection(template, &self.model_id, has_tools)
         {
             return Err(ManagedChatError::new(TokenInputRejection::IdentityMismatch));
         }
         Ok(())
     }
 
-    /// Compiles a consumed tokenizer-config file under the existing original J account.
+    /// Compiles the actual selected template under the existing original J account.
     /// The tokenizer source is created with `compile_managed_plain_text_source`.
-    /// Exact loaded template source/name and tokenizer configuration must match.
+    /// `has_tools` selects the same named entry as the eventual request's
+    /// non-empty declaration list. Exact source/name and tokenizer must match.
     /// File opening and loaded-model construction remain separate operations.
     pub fn compile_managed_chat_source(
         &self,
         tokenizer: &ManagedPlainTextSource,
-        file: std::fs::File,
+        input: impl Into<ChatSourceInput>,
+        has_tools: bool,
         cancellation: &GenerationCancellationToken,
-    ) -> Result<Option<ManagedChatSource>, ManagedChatError> {
+    ) -> Result<Option<ManagedChatSource>, ManagedChatSourceError> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
         if self.chat_template.is_none() {
-            return Err(ManagedChatError::new(
-                ManagedChatPolicyRejection::MissingTemplate,
-            ));
+            return Err(ManagedChatError::new(Cause::MissingTemplate).into());
         }
         if !tokenizer.original().matches_configuration(&self.tokenizer) {
-            return Err(ManagedChatError::new(TokenInputRejection::IdentityMismatch));
+            return Err(ManagedChatError::new(TokenInputRejection::IdentityMismatch).into());
         }
         B::validate_original_tokenizer_source(&self.runtime, tokenizer.original())
             .map_err(ManagedChatError::new)?;
-        let Some(template) =
-            compile_original_chat_file(&self.runtime, file, &self.model_id, cancellation)
-                .map_err(ManagedChatError::new)?
-        else {
-            return Ok(None);
+        let template = match input.into() {
+            ChatSourceInput::File(file) => {
+                let Some(template) = compile_original_chat_file(
+                    &self.runtime,
+                    file,
+                    &self.model_id,
+                    has_tools,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                template
+            }
+            ChatSourceInput::RetainedConfiguration => {
+                let plan = eredu_text::chat_storage::ChatTemplatePlan::prepare_model(
+                    self.chat_template.as_ref().expect("template checked above"),
+                    &self.model_id,
+                    has_tools,
+                )
+                .map_err(OriginalChatSourceError::from)?;
+                let template = B::compile_original_chat_template(&self.runtime, plan)?;
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                template
+            }
         };
         let source = ManagedChatSource {
             tokenizer: tokenizer.clone(),
             template,
         };
-        self.validate_managed_chat_metadata(&source)?;
+        self.validate_managed_chat_metadata(&source, has_tools)?;
         B::validate_original_chat_sources(
             &self.runtime,
             &source.template,
@@ -174,68 +168,48 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         Ok(Some(source))
     }
 
-    /// Renders and starts the existing controlled managed text cursor.
-    /// A caller memory ceiling is required and applies before rendering or S/E.
-    /// Missing complete native fit and unfinished chat policies remain typed refusals.
-    /// None means cancellation before a session was started.
-    pub fn start_managed_chat<'a>(
-        &'a mut self,
+    /// Prepares one authenticated chat under the supplied managed capacity.
+    /// The actual request stays borrowed through profile, policy and rendering;
+    /// the result retains their original allocations for every execution consumer.
+    /// Cancellation returns `None` before the next expensive preparation stage.
+    pub fn prepare_chat(
+        &self,
         source: &ManagedChatSource,
-        request: ManagedChatRequest<'_>,
+        request: &ChatTemplateRequest,
+        capacity: u64,
         cancellation: &GenerationCancellationToken,
-    ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedChatError> {
+    ) -> Result<Option<crate::runtime::chat::PreparedChat>, ManagedChatError> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        self.validate_managed_chat_metadata(source)?;
-        let (config, _) = self
-            .resolve_text_generation_settings(request.settings)
-            .map_err(ManagedChatError::new)?;
-        let Some(prepared) =
-            prepare_original_text_chat_with_defaults_for::<B, PublicConsumer<'a, B>>(
-                &self.runtime,
-                &source.template,
-                source.tokenizer.original(),
-                request.chat,
-                Some(self.tokenizer.template_kwargs()),
-                config,
-                cancellation,
-            )
-            .map_err(ManagedChatError::chat::<B>)?
+        self.validate_managed_chat_metadata(source, !request.tools.is_empty())?;
+        let (_, named_entry) = self
+            .chat_template
+            .as_ref()
+            .and_then(|template| template.selected_source(!request.tools.is_empty()))
+            .ok_or_else(|| ManagedChatError::new(Cause::MissingTemplate))?;
+        let Some((rendered, (policy, compilation))) = prepare_original_chat(
+            &self.runtime,
+            &source.template,
+            source.tokenizer.original(),
+            request,
+            Some(self.tokenizer.template_kwargs()),
+            &self.eos_token_ids,
+            capacity,
+            cancellation,
+        )
+        .map_err(ManagedChatError::new)?
         else {
             return Ok(None);
         };
-        start_original_text_chat_for::<B, PublicConsumer<'a, B>>(
-            &mut self.runtime,
-            &source.template,
-            source.tokenizer.original(),
-            prepared,
-            request.chat.add_generation_prompt,
-            config,
-            &self.eos_token_ids,
-            request.stop_sequences,
-            request.skip_special_tokens,
-            cancellation,
-        )
-        .map(|session| session.map(ManagedPlainTextSession))
-        .map_err(ManagedChatError::chat::<B>)
-    }
-
-    /// Runs the same session advancement as `start_managed_chat`, lending text events
-    /// and retaining terminal output without an owned semantic-event conversion.
-    pub fn generate_managed_chat(
-        &mut self,
-        source: &ManagedChatSource,
-        request: ManagedChatRequest<'_>,
-        cancellation: &GenerationCancellationToken,
-        emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
-    ) -> Result<Option<GenerationPlainTextOutput>, ManagedChatError> {
-        self.start_managed_chat(source, request, cancellation)?
-            .map(|session| {
-                session
-                    .run(cancellation, emit)
-                    .map_err(ManagedChatError::new)
-            })
-            .transpose()
+        let prepared = rendered
+            .publish(
+                policy,
+                compilation,
+                named_entry,
+                request.add_generation_prompt,
+            )
+            .map_err(ManagedChatError::new)?;
+        Ok(Some(prepared))
     }
 }

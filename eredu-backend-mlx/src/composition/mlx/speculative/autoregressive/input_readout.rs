@@ -269,10 +269,12 @@ pub(super) struct SequenceCompletion<'a> {
     invocation: &'a ActiveSpeculativeInvocation,
 }
 impl AutoregressiveSequenceCompletion for SequenceCompletion<'_> {
+    fn metadata_context(&self) -> WorkspaceContext { self.invocation.metadata_context() }
+
     fn role(&self) -> &OriginalSpeculativeRole {
         self.invocation.role()
     }
-    fn metadata_funding(&self) -> eredu_nn::workspace::WorkspaceMetadataFunding {
+    fn metadata_funding(&self) -> eredu_nn::workspace::HostMetadataFunding {
         self.invocation.metadata_funding()
     }
     fn take_checkpoint(&mut self) -> Result<MlxPredictionTargetState, Error> {
@@ -312,19 +314,19 @@ pub(super) struct CompletedReadouts {
     rows: RefCell<Vec<Option<Array>>>,
     observer: OriginalScopeObserver,
     role: OriginalSpeculativeRole,
-    funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: eredu_nn::workspace::HostMetadataFunding,
 }
 /// Only the real once-only completed row worker can create this source proof.
 pub(crate) struct CompletedNumericalReadout {
     value: Array,
     stream: StateStream,
     custody: eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody,
-    funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    funding: eredu_nn::workspace::HostMetadataFunding,
 }
 impl CompletedNumericalReadout {
     pub(in crate::composition::mlx::speculative) fn funding(
         &self,
-    ) -> &eredu_nn::workspace::WorkspaceMetadataFunding {
+    ) -> &eredu_nn::workspace::HostMetadataFunding {
         &self.funding
     }
     pub(in crate::composition::mlx::speculative) fn into_parts(
@@ -333,7 +335,7 @@ impl CompletedNumericalReadout {
         Array,
         StateStream,
         eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody,
-        eredu_nn::workspace::WorkspaceMetadataFunding,
+        eredu_nn::workspace::HostMetadataFunding,
     ) {
         (self.value, self.stream, self.custody, self.funding)
     }
@@ -419,3 +421,5 @@ fn runtime_controls(rows: usize, input: OriginalPromptInputFacts) -> Option<usiz
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

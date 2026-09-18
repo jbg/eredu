@@ -15,7 +15,7 @@ pub(crate) struct PartitionCaptureRankSource {
 #[derive(Debug,thiserror::Error)]
 enum Cause {
     #[error("contiguous delivery source, rank, precision or destination differs")] Source,
-    #[error(transparent)] Funding(#[from] WorkspaceMetadataFundingError),
+    #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Destination(#[from] eredu_nn::Error),
     #[error(transparent)] Memory(#[from] WorkingMemoryError),
     #[error(transparent)] Host(#[from] CaptureRunHostError),
@@ -36,7 +36,7 @@ pub(crate) struct PartitionFragmentDeliveryError {
     _source:SharedCapturePlan,
     _fragment_host:CaptureTensorCustody,
     _final_host:Option<CaptureTensorCustody>,
-    _metadata:WorkspaceMetadataFunding,
+    _metadata:HostMetadataFunding,
 }
 /// Released only after the existing final delivery vote succeeds. The enclosing
 /// frame still authenticates its final claim; no prefill progress is invented.
@@ -50,7 +50,7 @@ pub(crate) struct PartitionFragmentDelivered {
 pub(crate) struct PreparedPartitionFragmentDelivery<'t,T:PartitionCaptureTransport> {
     exchange:PartitionCaptureExchange<'t,T>,bank:PreparedPartitionFragmentDestinations,
     ranks:Vec<PartitionCaptureRankSource>,evidence:PreparedPartitionCaptureEvidence,
-    dtype:TensorDtype,metadata:WorkspaceMetadataFunding,
+    dtype:TensorDtype,metadata:HostMetadataFunding,
 }
 impl<T:PartitionCaptureTransport> fmt::Debug for PreparedPartitionFragmentDelivery<'_,T> {
     fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
@@ -63,7 +63,7 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
     /// and transport qualification remain independently required.
     pub(crate) fn prepare(transport:&'t T,receipt:PartitionCaptureReceiptPlan,
         mut bank:PreparedPartitionFragmentDestinations,ranks:&[PartitionCaptureRankSource],
-        metadata:&WorkspaceMetadataFunding)->Result<Self,PartitionFragmentDeliveryError> {
+        metadata:&HostMetadataFunding)->Result<Self,PartitionFragmentDeliveryError> {
         match Self::prepare_worker(transport,receipt,&mut bank,ranks,metadata) {
             Ok((exchange,ranks,evidence,dtype))=>Ok(Self{exchange,bank,ranks,evidence,dtype,metadata:metadata.clone()}),
             Err(cause)=>Err(PartitionFragmentDeliveryError{cause,_source:bank.source.clone(),
@@ -71,7 +71,7 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
         }
     }
     fn prepare_worker(transport:&'t T,receipt:PartitionCaptureReceiptPlan,
-        bank:&mut PreparedPartitionFragmentDestinations,ranks:&[PartitionCaptureRankSource],metadata:&WorkspaceMetadataFunding)
+        bank:&mut PreparedPartitionFragmentDestinations,ranks:&[PartitionCaptureRankSource],metadata:&HostMetadataFunding)
         ->Result<(PartitionCaptureExchange<'t,T>,Vec<PartitionCaptureRankSource>,PreparedPartitionCaptureEvidence,TensorDtype),Cause> {
         let producers=receipt.producers();
         let source_rows=receipt.producers().zip(ranks);
@@ -80,17 +80,17 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
             size_of::<Result<PartitionFragmentDelivered,PartitionFragmentDeliveryError>>(),
             size_of::<(PartitionCaptureExchange<'t,T>,Vec<PartitionCaptureRankSource>,PreparedPartitionCaptureEvidence,TensorDtype)>(),
             size_of::<Result<(PartitionCaptureExchange<'t,T>,Vec<PartitionCaptureRankSource>,PreparedPartitionCaptureEvidence,TensorDtype),Cause>>(),
-            size_of::<(&T,PartitionCaptureReceiptPlan,PreparedPartitionFragmentDestinations,&[PartitionCaptureRankSource],&WorkspaceMetadataFunding)>(),
-            size_of::<(&T,&mut PreparedPartitionFragmentDestinations,&[PartitionCaptureRankSource],&WorkspaceMetadataFunding)>(),
+            size_of::<(&T,PartitionCaptureReceiptPlan,PreparedPartitionFragmentDestinations,&[PartitionCaptureRankSource],&HostMetadataFunding)>(),
+            size_of::<(&T,&mut PreparedPartitionFragmentDestinations,&[PartitionCaptureRankSource],&HostMetadataFunding)>(),
             size_of::<PartitionCaptureRankSource>()*2,size_of::<Option<TensorDtype>>()*2,
-            size_of::<CaptureTensorCustody>()*3,size_of::<SharedCapturePlan>(),size_of::<WorkspaceMetadataFunding>(),
+            size_of::<CaptureTensorCustody>()*3,size_of::<SharedCapturePlan>(),size_of::<HostMetadataFunding>(),
             size_of::<Option<PreparedPartitionFragmentDestinations>>(),size_of::<CaptureUsage>()*3,
             size_of_val(&producers),size_of_val(&source_rows),size_of::<std::slice::Iter<'_,PartitionCaptureRankSource>>(),
             size_of::<(usize,bool)>(),size_of::<(&mut Decoder<'_,'_,'_>,&PartitionCaptureReceiptPlan,usize)>(),
             size_of::<PartitionFragmentDestination<'_,'_>>(),size_of::<Result<(),Cause>>(),
-            size_of::<(Cause,Option<PreparedPartitionFragmentDestinations>,&SharedCapturePlan,&CaptureTensorCustody,Option<&CaptureTensorCustody>,&WorkspaceMetadataFunding)>(),
-            size_of::<(&mut PreparedPartitionFragmentDestinations,&Vec<PartitionCaptureRankSource>,&PartitionCaptureReceiptPlan,&mut usize,&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&WorkspaceMetadataFunding)>(),
-            size_of::<(&mut PreparedPartitionFragmentDestinations,&PartitionCaptureReceiptPlan,&Vec<PartitionCaptureRankSource>,&WorkspaceMetadataFunding)>(),
+            size_of::<(Cause,Option<PreparedPartitionFragmentDestinations>,&SharedCapturePlan,&CaptureTensorCustody,Option<&CaptureTensorCustody>,&HostMetadataFunding)>(),
+            size_of::<(&mut PreparedPartitionFragmentDestinations,&Vec<PartitionCaptureRankSource>,&PartitionCaptureReceiptPlan,&mut usize,&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&HostMetadataFunding)>(),
+            size_of::<(&mut PreparedPartitionFragmentDestinations,&PartitionCaptureReceiptPlan,&Vec<PartitionCaptureRankSource>,&HostMetadataFunding)>(),
             // Named owning source-error boxes, before any fallible forward work.
             BackendFailure::source_retention_peak_bytes::<PartitionFragmentDeliveryError>().ok_or(Cause::Source)?.checked_mul(2).ok_or(Cause::Source)?,
             PartitionCaptureExchange::<T>::decoder_control_bytes::<Decoder<'_,'_,'_>>().ok_or(Cause::Source)?,
@@ -138,7 +138,7 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
     }
     fn prefill_control_bytes(receipt:&PartitionCaptureReceiptPlan)->Option<usize> {
         let raw=receipt.combination()==PartitionCaptureCombination::SumF64ToF32 || matches!(
-            receipt.shared_plan_source()?.admission().plan().selections[receipt.context().selection_index].transform,
+            receipt.shared_plan_source().admission().plan().selections[receipt.context().selection_index].transform,
             CaptureTransform::FullTensor|CaptureTransform::Slice|CaptureTransform::Preview{..});
         let payload=if receipt.producers().any(|(rank,_)|receipt.routed_producer(rank).is_some()) {
             size_of::<CaptureRoutedClaim<'_,'_>>().checked_add(size_of::<ClaimedAssembledRoutedUnits>())?
@@ -155,8 +155,8 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
             size_of::<(&mut Self,usize)>(),size_of::<Result<(),PartitionFragmentDestinationError>>(),
             size_of::<Result<(),PartitionFragmentDeliveryError>>(),size_of::<Result<PreparedPartitionFragmentLoan,PartitionFragmentDestinationError>>(),
             size_of::<PartitionFragmentDelivered>(),size_of::<PartitionFragmentDeliveryError>(),size_of::<PartitionFragmentDestinationError>(),
-            size_of::<SharedCapturePlan>()*2,size_of::<CaptureTensorCustody>()*3,size_of::<WorkspaceMetadataFunding>(),
-            size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&WorkspaceMetadataFunding)>(),
+            size_of::<SharedCapturePlan>()*2,size_of::<CaptureTensorCustody>()*3,size_of::<HostMetadataFunding>(),
+            size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&HostMetadataFunding)>(),
             size_of::<crate::capture::partition::PreparedPartitionAssemblyCharge<'_>>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
@@ -241,8 +241,8 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
             size_of::<Result<(),PartitionFragmentDeliveryError>>(),size_of::<PartitionFragmentDeliveryError>(),
             size_of::<super::super::assembled::InvocationAssemblyTarget<'_>>(),
             size_of::<Result<(PartitionFragmentDestination<'_,'_>,super::super::assembled::InvocationAssemblyTarget<'_>),Cause>>(),
-            size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>()*3,size_of::<WorkspaceMetadataFunding>(),
-            size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&WorkspaceMetadataFunding)>(),
+            size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>()*3,size_of::<HostMetadataFunding>(),
+            size_of::<(&SharedCapturePlan,&CaptureTensorCustody,&CaptureTensorCustody,&HostMetadataFunding)>(),
             size_of::<(Cause,Option<PreparedPartitionFragmentDestinations>)>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
@@ -287,10 +287,10 @@ where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+
 struct Decoder<'a,'c,'m> {
     bank:PreparedPartitionFragmentDestinations,ranks:Vec<PartitionCaptureRankSource>,
     evidence:PreparedPartitionCaptureEvidence,dtype:TensorDtype,
-    destination:PartitionFragmentDestination<'a,'c>,metadata:&'m WorkspaceMetadataFunding,
+    destination:PartitionFragmentDestination<'a,'c>,metadata:&'m HostMetadataFunding,
 }
 fn as_exchange(cause:Cause,bank:Option<PreparedPartitionFragmentDestinations>,source:&SharedCapturePlan,
-    fragment_host:&CaptureTensorCustody,final_host:Option<&CaptureTensorCustody>,metadata:&WorkspaceMetadataFunding)
+    fragment_host:&CaptureTensorCustody,final_host:Option<&CaptureTensorCustody>,metadata:&HostMetadataFunding)
     ->PartitionCaptureExchangeError {
     BackendFailure::from_error(PartitionFragmentDeliveryError{cause,_bank:bank,_source:source.clone(),
         _fragment_host:fragment_host.share_scheduled(),_final_host:final_host.map(CaptureTensorCustody::share_scheduled),
@@ -335,3 +335,5 @@ impl<T:PartitionCaptureTransport> PartitionCaptureDecoder<T> for Decoder<'_,'_,'
 
 mod hook;
 pub(crate) use hook::{PartitionLocalCaptureHook,PartitionCaptureHookContinuation,PartitionCaptureHookReturnError};
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

@@ -61,7 +61,7 @@ fn config() -> TextGenerationConfig {
 
 fn ordinary() -> Vec<u32> {
     let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
-    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3], config())
+    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3].into(), config())
         .unwrap()
         .map(|token| token.unwrap().0)
         .collect()
@@ -92,7 +92,7 @@ fn advance(
     driver: &mut TextGenerationDriver<'_, MockBackend>,
 ) -> Option<u32> {
     let token = state.advance(driver).unwrap()?.into_output().0;
-    state.take_completed_step(driver).unwrap();
+    state.take_completed_delivery(driver).unwrap();
     Some(token)
 }
 
@@ -105,7 +105,7 @@ fn capture_and_fork_preserve_parent_policy_and_match_ordinary_outputs() {
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let mut state = ManagedTextContinuation::root(
         driver
-            .start(vec![11, 7, 3], config(), Controller::default())
+            .start(vec![11, 7, 3].into(), config(), Controller::default())
             .unwrap(),
     );
     let budget = budget();
@@ -163,7 +163,7 @@ fn failed_copy_staging_preserves_policy_and_installed_restore_revises_without_re
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = ManagedTextContinuation::root(
             driver
-                .start(vec![11, 7, 3], config(), Controller::default())
+                .start(vec![11, 7, 3].into(), config(), Controller::default())
                 .unwrap(),
         );
         let budget = budget();

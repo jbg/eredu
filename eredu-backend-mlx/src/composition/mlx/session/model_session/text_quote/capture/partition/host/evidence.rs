@@ -15,7 +15,7 @@ pub(super) struct RowSource {
     combination: PartitionCaptureCombination,
     local_shape: Option<Vec<u64>>,
     native: Vec<NativeRow>,
-    loaded: Arc<LoadedPartitionCapture>,
+    loaded: LoadedPartitionCapture,
 }
 impl std::fmt::Debug for RowSource {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
@@ -30,13 +30,13 @@ pub(in crate::composition::mlx::session::model_session::text_quote::capture) str
     entries:Vec<Option<Entry<HostAdmission>>>,
     bytes:u64,
     original:OriginalInterventionSource,
-    metadata:WorkspaceMetadataFunding,
+    metadata:HostMetadataFunding,
 }
 #[derive(Debug)]
 pub(in crate::composition::mlx::session::model_session::text_quote::capture) struct Hosts {
     entries:Vec<Option<Entry<HostRows>>>,
     original:OriginalInterventionSource,
-    _metadata:WorkspaceMetadataFunding,
+    _metadata:HostMetadataFunding,
 }
 /// One actual operation/prediction, retaining the same two original Host rows.
 #[derive(Debug)]
@@ -55,10 +55,10 @@ fn controls()->Option<usize> {
         size_of::<CaptureSummaryGeometry<'_>>()*2,size_of::<Result<ResolvedCaptureSlice,Error>>(),
         size_of::<Result<Option<Admission>,Error>>(),size_of::<Result<Hosts,Error>>(),
         size_of::<Result<Operation,Error>>(),size_of::<Result<Prototype,Error>>(),
-        size_of::<Result<Option<HostAdmission>,Error>>(),size_of::<Arc<LoadedPartitionCapture>>(),
-        size_of::<(&MlxModelSession,&SharedCapturePlan,Option<&OriginalInterventionSource>,&PreparedCaptureSelection,InferenceGeometry,u64,&WorkspaceMetadataFunding)>(),
-        size_of::<(&Arc<LoadedPartitionCapture>,&SharedCapturePlan,&OriginalInterventionSource,usize,&SharedCapturePlan,&PartitionCaptureContext,InferenceGeometry,usize,&WorkspaceMetadataFunding)>(),
-        size_of::<(&mut Hosts,&OriginalInterventionSource,InferenceGeometry,u64,&WorkspaceMetadataFunding)>(),
+        size_of::<Result<Option<HostAdmission>,Error>>(),size_of::<LoadedPartitionCapture>(),
+        size_of::<(&MlxModelSession,&SharedCapturePlan,Option<&OriginalInterventionSource>,&PreparedCaptureSelection,InferenceGeometry,u64,&HostMetadataFunding)>(),
+        size_of::<(&LoadedPartitionCapture,&SharedCapturePlan,&OriginalInterventionSource,usize,&SharedCapturePlan,&PartitionCaptureContext,InferenceGeometry,usize,&HostMetadataFunding)>(),
+        size_of::<(&mut Hosts,&OriginalInterventionSource,InferenceGeometry,u64,&HostMetadataFunding)>(),
         size_of::<std::vec::IntoIter<Option<Entry<HostAdmission>>>>(),
         size_of::<std::slice::IterMut<'_,Option<Entry<HostRows>>>>(),
         size_of::<std::ops::Range<u64>>()*2,size_of::<(usize,u64,bool)>(),
@@ -69,7 +69,7 @@ fn controls()->Option<usize> {
 impl Admission {
     pub(in crate::composition::mlx::session::model_session::text_quote::capture) fn prepare(
         session:&MlxModelSession,parent:&SharedCapturePlan,original:Option<&OriginalInterventionSource>,
-        selected:&PreparedCaptureSelection,geometry:InferenceGeometry,first:u64,metadata:&WorkspaceMetadataFunding,
+        selected:&PreparedCaptureSelection,geometry:InferenceGeometry,first:u64,metadata:&HostMetadataFunding,
     )->Result<Option<Self>,Error> {
         let Some(original)=original else{return Ok(None)};
         if session.payload.distributed.is_none() {return Ok(None)};
@@ -109,7 +109,7 @@ impl Admission {
 }
 impl Hosts {
     pub(in crate::composition::mlx::session::model_session::text_quote::capture) fn take(&mut self,
-        original:&OriginalInterventionSource,geometry:InferenceGeometry,prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<Vec<Option<Operation>>,Error> {
+        original:&OriginalInterventionSource,geometry:InferenceGeometry,prediction:u64,metadata:&HostMetadataFunding)->Result<Vec<Option<Operation>>,Error> {
         metadata.reserve_metadata(controls().ok_or_else(overflow)?)?;
         if !self.original.same_source(original) {return Err(memory(WorkingMemoryError::IdentityMismatch));}
         let plan=original.plan().admission();let phase=if prediction==0{CapturePhase::Prefill}else{CapturePhase::Decode};
@@ -128,10 +128,10 @@ impl Hosts {
 }
 impl HostAdmission {
     fn prepare_evidence(session:&MlxModelSession,parent:&SharedCapturePlan,original:&OriginalInterventionSource,
-        operation:usize,source:&SharedCapturePlan,geometry:InferenceGeometry,first:u64,metadata:&WorkspaceMetadataFunding)
+        operation:usize,source:&SharedCapturePlan,geometry:InferenceGeometry,first:u64,metadata:&HostMetadataFunding)
         ->Result<Option<Self>,Error> {
         let distributed=session.payload.distributed.as_ref().ok_or_else(unknown)?;
-        let loaded=session.partition_capture.get().and_then(|v|v.as_ref().ok()).ok_or_else(unknown)?;
+        let loaded=session.partition_capture_source().ok_or_else(unknown)?;
         metadata.reserve_metadata(controls().ok_or_else(overflow)?)?;
         let plan=original.plan().admission();let entry=plan.plan().operations.get(operation).ok_or_else(unknown)?;
         let (artifact,execution,setup)=loaded.source_labels();
@@ -150,7 +150,7 @@ impl HostAdmission {
             let mut rows=metadata.metadata_vec(2)?;
             for index in 0..2 {
                 context.selection_index=index;
-                let row=prepare(loaded,parent,original,operation,source,&context,geometry,distributed.native_world().rank(),metadata)?;
+                let row=prepare(&loaded,parent,original,operation,source,&context,geometry,distributed.native_world().rank(),metadata)?;
                 let super::RowSource::Evidence(ref owner)=row.source else{unreachable!("evidence source")};
                 let host=if owner.prefill{PartitionFragmentHostPlan::prepare_prefill(&row.receipt,geometry)}
                     else{PartitionFragmentHostPlan::prepare(&row.receipt)}
@@ -163,9 +163,9 @@ impl HostAdmission {
         Ok(Some(Self{frames,geometry,bytes,source:source.clone(),metadata:metadata.clone()}))
     }
 }
-fn prepare(loaded:&Arc<LoadedPartitionCapture>,parent:&SharedCapturePlan,original:&OriginalInterventionSource,
+fn prepare(loaded:&LoadedPartitionCapture,parent:&SharedCapturePlan,original:&OriginalInterventionSource,
     operation:usize,source:&SharedCapturePlan,context:&PartitionCaptureContext,inference:InferenceGeometry,
-    rank:usize,metadata:&WorkspaceMetadataFunding)->Result<Prototype,Error> {
+    rank:usize,metadata:&HostMetadataFunding)->Result<Prototype,Error> {
     let admission=source.admission();let index=context.selection_index;let selection=&admission.plan().selections[index];
     let selected=loaded.layouts().component_capture_source(&selection.path)
         .map_err(|cause|Error::Neural(metadata.metadata_source(cause)))?;
@@ -220,7 +220,7 @@ fn prepare(loaded:&Arc<LoadedPartitionCapture>,parent:&SharedCapturePlan,origina
 impl RowSource {
     pub(super) fn prefill(&self)->bool {self.prefill}
     pub(super) fn bind(self,source:&SharedCapturePlan,rank:usize,scalar:Option<WorkspaceFloatingType>,
-        inference:InferenceGeometry,prediction:u64,metadata:&WorkspaceMetadataFunding)->Result<PreparedPartitionContiguousSource,Error> {
+        inference:InferenceGeometry,prediction:u64,metadata:&HostMetadataFunding)->Result<PreparedPartitionContiguousSource,Error> {
         metadata.reserve_metadata(controls().ok_or_else(overflow)?)?;
         let selected=self.loaded.layouts().component_capture_source(&source.admission().plan().selections[self.index].path)
             .map_err(|cause|Error::Neural(metadata.metadata_source(cause)))?;
@@ -249,3 +249,5 @@ impl RowSource {
         }.map_err(|cause|Error::Neural(metadata.metadata_source(cause)))
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

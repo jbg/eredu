@@ -52,37 +52,37 @@ impl<'a> CaptureAdmission<'a> {
             .map_err(memory)?;
         checkpoint
             .validate_continuation_geometry(geometry)
-            .map_err(|cause| Error::Other(Box::new(cause)))?;
+            .map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
         selection
             .validate_sources(checkpoint.source(), selection.paths())
-            .map_err(|cause| Error::Other(Box::new(cause)))?;
+            .map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
         session
             .payload
             .model
             .erased()
-            .validate_prepared_observation_paths(selection.paths())?;
-        validate_current_admission(session, checkpoint.source().admission())?;
+            .validate_prepared_observation_paths(selection.paths(), metadata)?;
+        validate_current_admission(session, checkpoint.source().admission(), metadata)?;
         interventions::validate_saved_source(
             session, checkpoint.intervention_source(), metadata,
         )?;
         let host = checkpoint
             .continuation_host_plan_for(geometry)
-            .map_err(|cause| Error::Other(Box::new(cause)))?;
+            .map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
         // Both the saved cold quote and its later accepted reconstruction use
         // this constructor. Retain the same real projected Host descriptor on
         // each; a before-prefill checkpoint still needs those destinations.
         // The shared worker returns None only for a non-applicable source or a
         // continuation after the initial prefill observation has been spent.
         let partition_hosts = match metadata.funding() {
-            Some(funding) => partition::host::HostAdmission::prepare(
+            Some(funding) if geometry.max_output_tokens > 0 => partition::host::HostAdmission::prepare(
                 session, checkpoint.source(), geometry, checkpoint.next_prediction(), &funding,
             )?,
-            None => None,
+            _ => None,
         };
         let partition_evidence=match metadata.funding() {
-            Some(funding)=>partition::host::evidence::Admission::prepare(session,checkpoint.source(),
+            Some(funding) if geometry.max_output_tokens > 0 =>partition::host::evidence::Admission::prepare(session,checkpoint.source(),
                 checkpoint.intervention_source(),selection,geometry,checkpoint.next_prediction(),&funding)?,
-            None=>None,
+            _=>None,
         };
         Ok(Self {
             session,
@@ -102,6 +102,7 @@ impl<'a> CaptureAdmission<'a> {
             paths_pin: None,
             plan_pin: None,
             new_source_bytes: checkpoint.source().capacity_bytes().ok_or_else(unknown)?,
+            metadata_funding: metadata.funding(),
         })
     }
 
@@ -109,7 +110,7 @@ impl<'a> CaptureAdmission<'a> {
         match self.checkpoint {
             Some(checkpoint) => checkpoint
                 .validate_continuation_geometry(geometry)
-                .map_err(|cause| Error::Other(Box::new(cause))),
+                .map_err(|cause| Error::Neural(validation::source(self.metadata(), cause))),
             None => self.bind_geometry(geometry).map(|_| ()),
         }
     }
@@ -147,7 +148,7 @@ impl<'a> CaptureAdmission<'a> {
             self.control_facts_with_sequence(quote.geometry(), true)?,
         )
         .map_err(memory)?;
-        let controls = if checkpoint.next_prediction() == 0 {
+        let controls = if checkpoint.next_prediction() == 0 && quote.geometry().max_output_tokens > 0 {
             controls
                 .with_prefill_capture_selection(self.bind_geometry(quote.geometry())?)
                 .map_err(memory)?
@@ -176,7 +177,7 @@ impl<'a> CaptureAdmission<'a> {
             .map_err(memory)?;
         quote
             .with_span_workspace_and_text_controls(controls)
-            .map_err(|cause| Error::Other(Box::new(cause)))
+            .map_err(|cause| Error::Neural(validation::source(self.metadata(), cause)))
     }
 
     pub(in crate::composition::mlx::session::model_session::text_quote) fn prepare_saved(
@@ -190,12 +191,12 @@ impl<'a> CaptureAdmission<'a> {
         self.validate_geometry(geometry)?;
         self.selection
             .validate_sources(self.source, self.paths)
-            .map_err(|cause| Error::Other(Box::new(cause)))?;
+            .map_err(|cause| Error::Neural(validation::source(self.metadata(), cause)))?;
         self.session
             .payload
             .model
             .erased()
-            .validate_prepared_observation_paths(self.paths)?;
+            .validate_prepared_observation_paths(self.paths, self.metadata())?;
         if !accepted
             .pool()
             .same_domain(&self.session.payload.memory_pool)
@@ -239,7 +240,7 @@ impl CaptureQuotation {
             .payload
             .model
             .erased()
-            .validate_prepared_observation_paths(paths)?;
+            .validate_prepared_observation_paths(paths, self.metadata())?;
         let PendingCaptureBank {
             bank,
             selection,

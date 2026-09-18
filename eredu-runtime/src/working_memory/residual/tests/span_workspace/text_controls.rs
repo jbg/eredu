@@ -114,7 +114,7 @@ fn accept(
     WorkingMemoryFundingRun,
     IncrementalInferenceQuote,
 ) {
-    let (_, r, q) = sealed_plan(pool, &q, 1_000_000).unwrap();
+    let (r, q) = sealed_plan(pool, &q, 1_000_000).unwrap();
     let (r, run) = r.into_funding().unwrap();
     (r, run, q)
 }
@@ -158,7 +158,7 @@ fn text_seal_adds_named_q_and_actual_p_once_with_exact_original_capacity() {
             WorkingMemoryError::BudgetExceeded { .. }
         ))
     ));
-    let (_, r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
+    let (r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (owner, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     assert_eq!(owner.protected_host_bytes(), p + 51);

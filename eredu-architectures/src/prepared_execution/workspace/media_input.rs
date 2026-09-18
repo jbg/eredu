@@ -2,7 +2,7 @@
 use super::*;
 use crate::media_plan::BoundPreparedMediaSemantics;
 use eredu_runtime::{
-    PreparedInputPart, PreparedModelInput,
+    PreparedModelInput,
     input::{OriginalPreparedInputProjection, PreparedModelInputOwner},
     working_memory::WorkingMemoryUnquotedLease,
 };
@@ -18,7 +18,7 @@ pub struct OriginalMediaWorkspaceInput {
     pub(super) source_storage: eredu_runtime::input::OriginalPreparedWorkspaceSource,
     pub(super) ordinary: Option<WorkingMemoryUnquotedLease>,
     // Projected part/identity storage outlives the constructing Context.
-    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+    funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl std::fmt::Debug for OriginalMediaWorkspaceInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,8 +35,8 @@ pub struct OriginalMediaWorkspaceInputError {
     original: BoundPreparedMediaSemantics,
     ordinary: Option<WorkingMemoryUnquotedLease>,
     _funding: (
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
 }
 impl std::fmt::Debug for OriginalMediaWorkspaceInputError {
@@ -61,8 +61,8 @@ struct PlanFailure {
     tables: OriginalPreparedInputProjection,
     ordinary: Option<WorkingMemoryUnquotedLease>,
     _funding: (
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
 }
 impl std::fmt::Debug for PlanFailure {
@@ -97,7 +97,7 @@ impl OriginalMediaWorkspaceInput {
     }
     pub(crate) fn reject(self, cause: Error) -> Error {
         let Some(bytes) =
-            Error::retained_source_control_bytes::<OriginalMediaWorkspaceInputError>()
+            Error::retained_source_construction_bytes::<OriginalMediaWorkspaceInputError>()
         else {
             return eredu_nn::workspace::WorkspaceMetadataError::Overflow.into();
         };
@@ -127,8 +127,8 @@ impl OriginalMediaWorkspaceInput {
         tables: OriginalPreparedInputProjection,
         ordinary: Option<WorkingMemoryUnquotedLease>,
         funding: (
-            Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-            Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+            Option<eredu_nn::workspace::HostMetadataFunding>,
+            Option<eredu_nn::workspace::HostMetadataFunding>,
         ),
     ) -> Error {
         // The shared neutral error deallocates both its Arc and concrete Box
@@ -151,7 +151,7 @@ impl OriginalMediaWorkspaceInput {
         P,
         (eredu_runtime::input::OriginalEncoderTableProjection,
          eredu_runtime::input::OriginalPreparedWorkspaceSource, Option<WorkingMemoryUnquotedLease>),
-        (Option<eredu_nn::workspace::WorkspaceMetadataFunding>, Option<eredu_nn::workspace::WorkspaceMetadataFunding>),
+        (Option<eredu_nn::workspace::HostMetadataFunding>, Option<eredu_nn::workspace::HostMetadataFunding>),
     ), Error> {
         if !self.tables.has_encoder_tables() {
             return Err(self.reject(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into()));
@@ -159,7 +159,7 @@ impl OriginalMediaWorkspaceInput {
         let controls = std::mem::size_of::<(
             P, OriginalPreparedInputProjection, eredu_runtime::input::OriginalEncoderTableProjection,
             eredu_runtime::input::OriginalPreparedWorkspaceSource, Option<WorkingMemoryUnquotedLease>,
-            (Option<eredu_nn::workspace::WorkspaceMetadataFunding>, Option<eredu_nn::workspace::WorkspaceMetadataFunding>),
+            (Option<eredu_nn::workspace::HostMetadataFunding>, Option<eredu_nn::workspace::HostMetadataFunding>),
         )>();
         match context {
             Some(context) => context.charge_metadata(controls)?,
@@ -191,8 +191,8 @@ impl OriginalMediaWorkspaceInput {
                 Option<WorkingMemoryUnquotedLease>,
             ),
             (
-                Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-                Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+                Option<eredu_nn::workspace::HostMetadataFunding>,
+                Option<eredu_nn::workspace::HostMetadataFunding>,
             ),
         ),
         Error,
@@ -213,8 +213,8 @@ impl OriginalMediaWorkspaceInput {
                                 Option<WorkingMemoryUnquotedLease>,
                             ),
                             (
-                                Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-                                Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+                                Option<eredu_nn::workspace::HostMetadataFunding>,
+                                Option<eredu_nn::workspace::HostMetadataFunding>,
                             ),
                         ),
                         Error,
@@ -226,14 +226,14 @@ impl OriginalMediaWorkspaceInput {
                     eredu_runtime::input::OriginalPreparedWorkspaceSource,
                     Option<WorkingMemoryUnquotedLease>,
                     (
-                        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
-                        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+                        Option<eredu_nn::workspace::HostMetadataFunding>,
+                        Option<eredu_nn::workspace::HostMetadataFunding>,
                     ),
                 )>(),
                 std::mem::size_of::<
                     Result<P, eredu_runtime::working_memory::OriginalCompositeSemanticStorageError>,
                 >(),
-                Error::retained_source_control_bytes::<PlanFailure>()
+                Error::retained_source_construction_bytes::<PlanFailure>()
                     .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
             ];
             let bytes = controls
@@ -264,7 +264,7 @@ impl OriginalMediaWorkspaceInput {
         context: &WorkspaceContext,
     ) -> Error {
         let Some(bytes) =
-            Error::retained_source_control_bytes::<OriginalMediaWorkspaceInputError>()
+            Error::retained_source_construction_bytes::<OriginalMediaWorkspaceInputError>()
         else {
             return eredu_nn::workspace::WorkspaceMetadataError::Overflow.into();
         };
@@ -393,7 +393,7 @@ impl OriginalMediaWorkspaceInput {
         OriginalPreparedInputProjection,
         eredu_runtime::input::OriginalPreparedWorkspaceSource,
         Option<WorkingMemoryUnquotedLease>,
-        Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     ) {
         (
             self.prepared,

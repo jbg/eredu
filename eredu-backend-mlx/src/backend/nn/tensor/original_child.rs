@@ -3,7 +3,7 @@
 //! keep their numerical aliases and metadata custody until their owner retires.
 use super::*;
 use crate::backend::{error::Error, nn::workspace::ResidentCompletionRecipe};
-use eredu_nn::workspace::WorkspaceMetadataFunding;
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{OriginalTextControlGuard, WorkingMemoryError};
 use safemlx::OriginalScopeObserver;
 use std::mem::{size_of, size_of_val};
@@ -12,7 +12,7 @@ pub(crate) struct PreparedTokenChild {
     pending: RefCell<Option<PreparedTokenValidations>>,
     retired: RefCell<Option<ActiveTokenValidations>>,
     parent: OriginalScopeObserver,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
 }
 pub(crate) struct TokenChildScope<'a> {
     parent: Option<ActiveTokenValidations>,
@@ -32,14 +32,14 @@ impl PreparedTokenChild {
         controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
     }
     pub(crate) fn prepare(recipe: ResidentCompletionRecipe, controls: &OriginalTextControlGuard,
-        parent: &OriginalScopeObserver, funding: &WorkspaceMetadataFunding) -> Result<Self, Error> {
+        parent: &OriginalScopeObserver, funding: &HostMetadataFunding) -> Result<Self, Error> {
         Self::prepare_metadata(recipe,controls.metadata_custody().into(),parent,funding)
     }
     /// Metadata custody keeps storage live; the actual current parent collector
     /// and scope are still authenticated before any child slots are prepared.
     pub(crate) fn prepare_metadata(recipe:ResidentCompletionRecipe,
         custody:eredu_runtime::working_memory::OriginalOperationMetadataCustody,
-        parent:&OriginalScopeObserver,funding:&WorkspaceMetadataFunding)->Result<Self,Error> {
+        parent:&OriginalScopeObserver,funding:&HostMetadataFunding)->Result<Self,Error> {
         funding.reserve_metadata(Self::control_bytes(recipe).ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?)
             .map_err(Error::WorkspacePlanning)?;
         let current = OriginalScopeObserver::require_current()?;

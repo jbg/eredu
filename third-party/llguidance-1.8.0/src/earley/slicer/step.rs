@@ -254,16 +254,21 @@ impl SlicerStep<'_> {
 mod tests {
     use super::*;
     use crate::{
-        ParserFactory, TokenParser,
         api::{GrammarInit, LLGuidanceOptions, NodeProps},
         earley::{BiasComputer, SlicedBiasComputer, SlicerConstructionPlan},
         grammar_builder::GrammarBuilder,
         toktrie::ApproximateTokEnv,
+        ParserFactory, TokenParser,
     };
     use derivre::RegexAst;
 
     fn parser(factory: &ParserFactory, regex: &str) -> TokenParser {
-        let mut builder = GrammarBuilder::new(None, factory.limits().clone());
+        let mut builder = GrammarBuilder::new(
+            None,
+            factory.limits().clone(),
+            derivre::ParserAllocationFunding::unenforced(),
+        )
+        .unwrap();
         builder
             .add_grammar(
                 LLGuidanceOptions {
@@ -274,8 +279,8 @@ mod tests {
             )
             .unwrap();
         let rx = builder.regex.regex(regex).unwrap();
-        let start = builder.lexeme_ext(rx, None, NodeProps::default());
-        builder.set_start_node(start);
+        let start = builder.lexeme_ext(rx, None, NodeProps::default()).unwrap();
+        builder.set_start_node(start).unwrap();
         let mut parser = factory
             .create_parser_from_init_default(GrammarInit::Internal(
                 builder.grammar,

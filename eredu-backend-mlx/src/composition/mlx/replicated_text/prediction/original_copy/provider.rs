@@ -11,7 +11,7 @@ use eredu_architectures::speculative_execution::{
     PreparedEmbeddedState,
 };
 use eredu_core::BackendFailure;
-use eredu_nn::workspace::WorkspaceMetadataFundingError;
+use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::SelectedSpeculativeRealization;
 use std::{cell::RefCell, collections::TryReserveError};
 
@@ -29,7 +29,7 @@ enum Cause {
 struct Failure {
     #[source]
     cause: Cause,
-    _funding: WorkspaceMetadataFunding,
+    _funding: HostMetadataFunding,
 }
 fn error_controls() -> Option<usize> {
     let frames = [
@@ -66,21 +66,21 @@ fn pay(
     let frames = [
         bytes,
         error_controls()
-            .ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>()
-            .ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?,
+            .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?,
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+            .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?,
         size_of::<HostPreparationAuthority>(),
         size_of::<Result<HostPreparationAuthority, BackendFailure>>(),
     ];
     let bytes = frames
         .into_iter()
         .try_fold(size_of_val(&frames), usize::checked_add)
-        .ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?;
+        .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?;
     context
         .preparation
         .metadata_funding()
         .reserve_metadata(bytes)
-        .map_err(WorkspaceMetadataFundingError::into_backend_failure)?;
+        .map_err(HostMetadataFundingError::into_backend_failure)?;
     Ok(HostPreparationAuthority::retain(
         context.preparation.metadata_funding().clone(),
     ))
@@ -180,7 +180,7 @@ impl OriginalPredictionLane {
         self,
         extension: &P,
         selected: &SelectedSpeculativeRealization,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<PreparedEmbeddedState<P::LaneState>, BackendFailure>
     where
@@ -324,7 +324,7 @@ impl OriginalEmbeddedCachePreparation {
     }
     pub(crate) fn validate(
         &self,
-        preparation: &OriginalSpeculativeSemanticPreparation,
+        preparation: &PreparedSemanticSource,
         origin: &ReplicatedTextControlOrigin,
     ) -> Result<(), BackendFailure> {
         let _controls = pay(&self.copy, size_of::<Result<(), BackendFailure>>())?;
@@ -401,7 +401,7 @@ pub(crate) fn cache_metadata(
     };
     let parts = [
         bytes,
-        HostPreparationAuthority::retention_bytes::<WorkspaceMetadataFunding>(),
+        HostPreparationAuthority::retention_bytes::<HostMetadataFunding>(),
         Some(size_of::<HostPreparationAuthority>()),
         Some(size_of::<Result<HostPreparationAuthority, BackendFailure>>()),
         Some(size_of::<(Option<usize>, SpeculativeExecutionStreams<'_>)>()),
@@ -415,11 +415,11 @@ pub(crate) fn cache_metadata(
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), |n, p| n.checked_add(p?))
-        .ok_or_else(|| WorkspaceMetadataFundingError::Overflow.into_backend_failure())?;
+        .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?;
     sources
         .metadata_funding()
         .reserve_metadata(bytes)
-        .map_err(WorkspaceMetadataFundingError::into_backend_failure)?;
+        .map_err(HostMetadataFundingError::into_backend_failure)?;
     sources
         .validate_environment(environment)
         .map_err(Error::into_backend_failure)?;

@@ -3,16 +3,14 @@
 use serde_json::json;
 
 use crate::api::ConstraintError;
-use crate::runtime::chat::constraints::{
-    advance_trigger_prefix, completes_trigger, ConstraintController,
-};
+use crate::runtime::chat::constraints::ConstraintController;
 use crate::{
-    runtime::chat::constraints::ConstraintCompiler,
+    runtime::chat::constraints::fixtures,
     runtime::chat::dialect::{
         DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
         GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
     },
-    runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
+    runtime::chat::{ParallelToolCallPolicy, ToolChoice},
 };
 use eredu_core::{
     generation::{FinishReason, SemanticEvent},
@@ -257,58 +255,77 @@ impl SpeculativeSampler<TestSamplingBackend> for CountingPolicy {
 
 fn constrained_sampler<S>(
     policy: S,
-    plan: &GenerationRuntimePlan,
+    plan: &fixtures::Plan,
 ) -> Result<ConstrainedSampler<S, ConstraintController>, ConstraintError> {
-    Ok(ConstrainedSampler::new(
-        policy,
-        ConstraintController::from_generation_plan_unregistered(plan)?,
-    ))
+    Ok(ConstrainedSampler::new(policy, plan.controller()))
 }
 
-fn synthetic_plan(tool_choice: ToolChoice) -> GenerationRuntimePlan {
-    ConstraintCompiler::synthetic_for_tests()
-        .compile_tool_plan(
-            &DECLARATIVE_DIALECT,
-            SYNTHETIC_PARAMETERS,
-            &[json!({
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }
+fn synthetic_plan(tool_choice: ToolChoice) -> fixtures::Plan {
+    fixtures::Compiler::byte_tokens_with_added(
+        &[255],
+        &[
+            "<|tool|>",
+            "<|/tool|>",
+            "<|user|>",
+            "<|system|>",
+            "<|assistant|>",
+            "<|end|>",
+        ],
+        &[],
+    )
+    .compile_tool_plan(
+        &DECLARATIVE_DIALECT,
+        SYNTHETIC_PARAMETERS,
+        &[json!({
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
                 }
-            })],
-            tool_choice,
-            ParallelToolCallPolicy::Disabled,
-            Vec::new(),
-        )
-        .unwrap()
+            }
+        })],
+        tool_choice,
+        ParallelToolCallPolicy::Disabled,
+        Vec::new(),
+    )
+    .unwrap()
 }
 
-fn boundary_plan() -> GenerationRuntimePlan {
-    ConstraintCompiler::synthetic_with_tokens_for_tests(BOUNDARY_TOKENS)
-        .compile_tool_plan(
-            &DECLARATIVE_DIALECT,
-            BOUNDARY_PARAMETERS,
-            &[json!({
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }
+fn boundary_plan() -> fixtures::Plan {
+    fixtures::Compiler::byte_tokens_with_added(
+        &[261],
+        &[
+            "<|tool|>",
+            "<|/tool|>",
+            "<|user|>",
+            "<|system|>",
+            "<|assistant|>",
+            "<|end|>",
+        ],
+        BOUNDARY_TOKENS,
+    )
+    .compile_tool_plan(
+        &DECLARATIVE_DIALECT,
+        BOUNDARY_PARAMETERS,
+        &[json!({
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
                 }
-            })],
-            ToolChoice::Auto,
-            ParallelToolCallPolicy::Disabled,
-            Vec::new(),
-        )
-        .unwrap()
+            }
+        })],
+        ToolChoice::Auto,
+        ParallelToolCallPolicy::Disabled,
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 fn placeholder_logits() -> Vec<f32> {
@@ -414,12 +431,18 @@ fn auto_ignores_partial_and_near_triggers() {
         context,
     );
     assert!(!partial.controller().constraint_is_active());
-    assert_eq!(partial.controller_mut().valid_token_ids().unwrap(), None);
+    assert_eq!(
+        partial.controller_mut().valid_token_ids().unwrap(),
+        Some((0..SYNTHETIC_VOCAB_SIZE as u32).collect())
+    );
 
     let mut near = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
     commit_bytes(&mut near, br#"{"callx":"#, &logits, context);
     assert!(!near.controller().constraint_is_active());
-    assert_eq!(near.controller_mut().valid_token_ids().unwrap(), None);
+    assert_eq!(
+        near.controller_mut().valid_token_ids().unwrap(),
+        Some((0..SYNTHETIC_VOCAB_SIZE as u32).collect())
+    );
 }
 
 #[test]
@@ -532,7 +555,10 @@ fn runtime_plan_creates_independent_sampler_instances() {
 
     assert!(first.controller().constraint_is_active());
     assert!(!second.controller().constraint_is_active());
-    assert_eq!(second.controller_mut().valid_token_ids().unwrap(), None);
+    assert_eq!(
+        second.controller_mut().valid_token_ids().unwrap(),
+        Some((0..SYNTHETIC_VOCAB_SIZE as u32).collect())
+    );
     assert_eq!(first.policy().commits, AUTO_TRIGGER.len());
     assert_eq!(second.policy().commits, 0);
 }
@@ -610,7 +636,13 @@ fn none_masks_and_rejects_the_tool_call_trigger() {
     let error = rejecting
         .commit_token(&logits, u32::from(final_trigger_byte), context)
         .unwrap_err();
-    assert!(error.to_string().contains("tool_choice is None"), "{error}");
+    assert!(
+        error.to_string().contains(&format!(
+            "token {} would emit a forbidden activation trigger",
+            final_trigger_byte
+        )),
+        "{error}"
+    );
     assert_eq!(
         rejecting.policy().commits,
         AUTO_TRIGGER.len() - 1,
@@ -657,15 +689,15 @@ fn none_parser_never_emits_tool_events() {
 
 #[test]
 fn forbidden_trigger_matching_handles_whole_tokens_and_overlaps() {
-    assert!(completes_trigger(b"", b"xxababyy", b"abab"));
-    assert!(completes_trigger(b"ab", b"ab", b"abab"));
-    assert!(!completes_trigger(b"ab", b"ax", b"abab"));
-
-    let mut pending = Vec::new();
-    advance_trigger_prefix(&mut pending, b"aba", b"abab");
-    assert_eq!(pending, b"aba");
-    advance_trigger_prefix(&mut pending, b"a", b"abab");
-    assert_eq!(pending, b"a");
+    use eredu_core::speculative::byte_trigger::{find, TriggerPrefix};
+    assert!(find(b"", b"xxababyy", b"abab").is_some());
+    assert!(find(b"ab", b"ab", b"abab").is_some());
+    assert!(find(b"ab", b"ax", b"abab").is_none());
+    let mut pending = TriggerPrefix::default();
+    pending.advance(b"aba", b"abab");
+    assert_eq!(pending.bytes(b"abab"), b"aba");
+    pending.advance(b"a", b"abab");
+    assert_eq!(pending.bytes(b"abab"), b"a");
 }
 
 #[test]
@@ -777,14 +809,14 @@ fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() 
     use eredu_runtime::execution_control::{TokenChoiceController, TokenChoiceError};
 
     let plan = synthetic_plan(ToolChoice::Required);
-    let mut grammar = ConstraintController::from_generation_plan_unregistered(&plan).unwrap();
+    let mut grammar = plan.controller();
     let grammar_filter = grammar.current_filter().unwrap();
     let valid = (0..256).find(|&id| grammar_filter.allows(id)).unwrap();
     let forbidden = (0..256).find(|&id| !grammar_filter.allows(id)).unwrap();
     let mut validity = vec![false; 256];
     validity[valid as usize] = true;
     validity[forbidden as usize] = true;
-    let controller = grammar.with_validity(SharedTokenFilter::new(
+    let controller = plan.controller_with_validity(SharedTokenFilter::new(
         TokenFilter::allowed(validity).unwrap(),
     ));
     let mut choices = TokenChoiceController::new(controller.clone(), TokenDomain::new(256));
@@ -859,7 +891,7 @@ fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() 
 
     let mut only_forbidden = vec![false; 256];
     only_forbidden[forbidden as usize] = true;
-    let mut empty = controller.with_validity(SharedTokenFilter::new(
+    let mut empty = plan.controller_with_validity(SharedTokenFilter::new(
         TokenFilter::allowed(only_forbidden).unwrap(),
     ));
     assert!(empty
@@ -872,18 +904,28 @@ fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() 
 #[test]
 fn snapshot_forks_retain_validity_without_copying_or_loosening_it() {
     use eredu_core::TokenFilterController;
-    use eredu_runtime::execution_control::SnapshotTokenController;
     let plan = synthetic_plan(ToolChoice::None);
     let mut validity = vec![false; 256];
     validity[b'a' as usize] = true;
-    let mut parent = ConstraintController::from_generation_plan_unregistered(&plan)
-        .unwrap()
-        .with_validity(eredu_core::SharedTokenFilter::new(
-            TokenFilter::allowed(validity).unwrap(),
-        ));
-    let bytes = parent.snapshot_storage_bytes().unwrap();
-    let mut child = parent.fork_snapshot().unwrap();
-    assert_eq!(child.snapshot_storage_bytes(), Some(bytes));
+    let mut parent = plan.controller_with_validity(eredu_core::SharedTokenFilter::new(
+        TokenFilter::allowed(validity).unwrap(),
+    ));
+    use eredu_core::SpeculativeTokenFilterController;
+    let funding = plan.funding();
+    let bytes = parent.prepared_forbidden_copy_bytes(4096).unwrap();
+    funding
+        .reserve_metadata(
+            bytes
+                + eredu_core::HostPreparationAuthority::retention_bytes::<
+                    eredu_core::HostMetadataFunding,
+                >()
+                .unwrap(),
+        )
+        .unwrap();
+    let mut child = parent
+        .copy_prepared_forbidden(4096, eredu_core::HostPreparationAuthority::retain(funding))
+        .unwrap();
+    assert_eq!(child.prepared_forbidden_copy_bytes(4096), Some(bytes));
     assert_eq!(
         parent.current_filter().unwrap(),
         child.current_filter().unwrap()
@@ -1081,13 +1123,12 @@ fn text_controller_quoted_choices_cover_forced_overlap_and_preserve_sampling() {
 }
 
 #[test]
-fn grammar_controllers_keep_incomplete_storage_explicit_through_prepared_wrapper() {
+fn grammar_controllers_require_actual_semantic_binding_through_wrapper() {
     use eredu_core::{TextControllerStorage, TokenFilterController};
 
     for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {
-        let controller =
-            ConstraintController::from_generation_plan_unregistered(&synthetic_plan(choice))
-                .unwrap();
+        let controller = synthetic_plan(choice)
+            .controller_with_validity(eredu_core::SharedTokenFilter::new(TokenFilter::All));
         assert!(controller.inference_workspace(2).is_none());
         assert!(matches!(
             controller.inference_storage(),

@@ -6,7 +6,7 @@ use crate::composition::mlx::speculative::autoregressive::{
     CompletedNumericalPrefill, StateStream,
     input_readout::CompletedNumericalReadout,
 };
-use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::speculative::numerical as program;
 use eredu_runtime::working_memory::{
     OriginalSpeculativeBudgetCustody, OriginalSpeculativeNumericalBudgetCustody,
@@ -23,6 +23,8 @@ mod model;
 mod readout;
 mod tensor;
 mod registered;
+mod token_projection;
+pub(crate) use token_projection::{repeated_token_input, concatenate_token_inputs};
 mod transfer;
 pub(crate) use transfer::{copy_key_to,copy_value_to};
 pub(crate) use registered::token_input as registered_copy_input;
@@ -85,6 +87,7 @@ impl std::ops::Deref for ValueStream {
 enum RetainedValues {
     One(OriginalNumericalValue),
     Two([OriginalNumericalValue; 2]),
+    Sequence(token_projection::TokenSequence),
     // Imported tensor readouts keep the actual copy/view proof independently
     // of the account that owns their shared physical backing.
     Evidence(eredu_architectures::speculative_execution::PreparedEmbeddedEvidence),
@@ -97,7 +100,7 @@ struct Value {
     stream: ValueStream,
     meaning: Meaning,
     provenance: Provenance,
-    funding: WorkspaceMetadataFunding,
+    funding: HostMetadataFunding,
     // A copied Array retires before its independent registered-copy Q/H.
     _copy: Option<crate::backend::array_copy::RegisteredArrayCopyCustody>,
     _snapshot_host: Option<eredu_core::HostPreparationAuthority>,
@@ -133,7 +136,7 @@ impl OriginalNumericalValue {
         source: CompletedNumericalPrefill,
     ) -> Result<Self, Error> {
         let bytes = value_control_bytes().ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
         source
             .funding()
@@ -156,7 +159,7 @@ impl OriginalNumericalValue {
         readout: CompletedNumericalReadout,
     ) -> Result<Self, Error> {
         let bytes = value_control_bytes().ok_or(Error::WorkspacePlanning(
-            WorkspaceMetadataFundingError::Overflow,
+            HostMetadataFundingError::Overflow,
         ))?;
         readout
             .funding()
@@ -182,7 +185,7 @@ impl OriginalNumericalValue {
     pub(super) fn validate_consumer(
         &self,
         sources: &OriginalSpeculativeNumericalSources,
-    ) -> Result<&WorkspaceMetadataFunding, Error> {
+    ) -> Result<&HostMetadataFunding, Error> {
         let value = self.value();
         if !value.provenance.source().belongs_to_request(sources.request()) {
             // No diagnostic allocation or foreign funding substitution. The
@@ -212,7 +215,7 @@ impl OriginalNumericalValue {
         stream: ValueStream,
         meaning: Meaning,
         custody: OriginalSpeculativeNumericalBudgetCustody,
-        funding: WorkspaceMetadataFunding,
+        funding: HostMetadataFunding,
     ) -> Self {
         Self(Some(Rc::new(Value {
             array,

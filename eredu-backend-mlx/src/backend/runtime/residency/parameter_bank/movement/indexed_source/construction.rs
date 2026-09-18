@@ -7,7 +7,7 @@ impl OriginalIndexedChunkSource {
         let frames=[size_of::<[Option<&str>;N]>(),size_of::<[&str;N]>(),
             size_of::<Result<([&str;N],usize),Error>>(),size_of::<(usize,usize,&str)>(),
             size_of::<Option<&str>>(),size_of::<(Instant,Duration)>(),
-            eredu_nn::Error::retained_source_control_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
+            eredu_nn::Error::retained_source_construction_bytes::<Failure>().ok_or_else(||self.failure(Cause::Overflow))?];
         let bytes=frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
             .ok_or_else(||self.failure(Cause::Overflow))?;
         self.body().funding.reserve_metadata(bytes).map_err(|cause|self.failure(Cause::Funding(cause)))?;
@@ -63,3 +63,5 @@ impl OriginalIndexedChunkSource {
         })
     }
 }
+
+use eredu_nn::workspace::ParameterMetadataAllocation;

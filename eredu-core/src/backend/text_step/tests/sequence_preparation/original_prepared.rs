@@ -114,3 +114,31 @@ fn original_prepared_requires_sequence_and_preserves_token_source_pairing_preced
     assert!(!facts.borrow().sequence.extracted);
     assert!(facts.borrow().preparation_events.is_empty());
 }
+
+#[test]
+fn original_prepared_authentication_refusal_uses_explicit_readiness_before_any_work() {
+    let (mut runtime, facts, probe) = setup();
+    facts.borrow_mut().sequence.explicit_control = true;
+    let error = ControlledTextGeneration::from_input_with_sequence(
+        &mut runtime,
+        original(&facts),
+        config(),
+        controller(&facts, ControllerFailure::None),
+        None,
+        GenerationSequenceRequest::new(8, &[7, 9]),
+    ).err().expect("the mock has no completed-source admission mechanism");
+    let ControlledTextGenerationError::Preparation(error) = error else {
+        panic!("original prepared admission must retain its typed cause");
+    };
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().downcast_ref::<PreparedRequestRejection>(),
+        Some(&PreparedRequestRejection::Unsupported),
+    );
+    let f = facts.borrow();
+    assert_eq!(f.sequence.controls, 1);
+    assert_eq!(f.sequence.votes, [(Stage::Admission, Status::Failed)]);
+    assert!(f.preparation_events.is_empty());
+    assert!(f.events.is_empty());
+    assert!(!f.sequence.extracted);
+    assert_eq!(probe.alive.load(Ordering::SeqCst), 0);
+}

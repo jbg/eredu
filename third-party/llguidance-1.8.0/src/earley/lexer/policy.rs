@@ -83,13 +83,12 @@ pub(super) fn next_byte(next: NextByte, info: &StateDesc) -> NextByte {
 // One typed interpretation of lexical match handles. The immutable spec supplies
 // singletons and the actual state owner supplies greedy/lazy descriptor rows.
 pub(crate) fn matching<'a>(
-    spec: &'a super::LexerSpec,
+    spec: &'a [crate::earley::lexerspec::LexemeSpec],
     idx: MatchingLexemesIdx,
     state: impl FnOnce(StateID) -> Option<&'a StateDesc>,
 ) -> Option<&'a super::MatchingLexemes> {
     match idx {
         MatchingLexemesIdx::Single(id) => spec
-            .lexemes
             .get(id.as_usize())
             .map(|lexeme| &lexeme.single_set),
         MatchingLexemesIdx::GreedyAccepting(id) => state(id).map(|info| &info.greedy_accepting),

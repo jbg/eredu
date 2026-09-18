@@ -90,3 +90,7 @@ impl Drop for Guard {
         PROBE.with(|slot| drop(slot.borrow_mut().take()));
     }
 }
+
+pub(super) fn source_pool() -> Option<WorkingMemoryPool> {
+    PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.pool.clone()))
+}

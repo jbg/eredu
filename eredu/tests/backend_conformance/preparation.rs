@@ -1,5 +1,5 @@
 use super::*;
-use eredu::api::{ObservedGenerationEvent, ObservedGenerationRecord, TraceLimits};
+use eredu::api::{ObservedGenerationEvent, TraceLimits};
 use eredu_core::run_preparation::{
     TextPreparationOutcome as Outcome, TextPreparationStage as Stage,
     TextPreparationStatus as Status,
@@ -28,7 +28,14 @@ enum Fault {
     PeerAfter(Stage, usize),
     CancelAfter(Stage, usize),
     CancelOnce(Stage),
-    DraftSampling { peer: bool },
+    DeliveryAt {
+        forwards: usize,
+        skip: usize,
+        rejected: bool,
+    },
+    DraftSampling {
+        peer: bool,
+    },
 }
 #[derive(Clone)]
 struct Probe {
@@ -46,6 +53,11 @@ struct Probe {
     completion_charge: Vec<bool>,
 }
 
+#[derive(Clone)]
+pub(super) struct Admission {
+    pub probe: Option<std::sync::Arc<PreparationCharge>>,
+    pub original: Option<admitted_text::PreparationOwner>,
+}
 pub(super) struct PreparationCharge;
 impl Drop for PreparationCharge {
     fn drop(&mut self) {
@@ -58,7 +70,7 @@ impl Drop for PreparationCharge {
 }
 
 pub(super) fn admit(
-    input: &eredu_core::TextPreparationInput<'_, Vec<u32>>,
+    input: &eredu_core::TextPreparationInput<'_, Prompt>,
     config: TextGenerationConfig,
 ) -> Result<Option<std::sync::Arc<PreparationCharge>>, eredu_core::BackendFailure> {
     PROBE.with(|probe| {
@@ -76,11 +88,9 @@ pub(super) fn admit(
                 capacity_bytes,
             } => Some((*positions, *capacity_bytes)),
             eredu_core::TextPreparationInput::Prepared(_) => None,
-            eredu_core::TextPreparationInput::OriginalPrepared(_) => {
-                return Err(eredu_core::PreparedRequestRejection::Unsupported.into_backend_failure())
-            }
-            eredu_core::TextPreparationInput::OriginalTokenIds(_) => {
-                unreachable!("legacy fixture default rejects original input before admission")
+            eredu_core::TextPreparationInput::OriginalPrepared(_) => None,
+            eredu_core::TextPreparationInput::OriginalTokenIds(plan) => {
+                Some((plan.tokens().len() as u64, plan.destination_bytes()))
             }
         });
         if probe.fault == Fault::Local(Stage::Admission) {
@@ -238,6 +248,26 @@ pub(super) fn agreement(stage: Stage, status: Status) -> Outcome {
             .filter(|(seen, _)| *seen == stage)
             .count();
         match probe.fault {
+            Fault::DeliveryAt {
+                forwards,
+                skip,
+                rejected,
+            } if stage == Stage::Delivery && probe.forwards == forwards => {
+                if skip == 0 {
+                    Some(if rejected {
+                        Outcome::Rejected { rank: 1 }
+                    } else {
+                        Outcome::Cancelled
+                    })
+                } else {
+                    probe.fault = Fault::DeliveryAt {
+                        forwards,
+                        skip: skip - 1,
+                        rejected,
+                    };
+                    None
+                }
+            }
             Fault::CancelOnce(selected) if selected == stage => {
                 probe.fault = Fault::None;
                 Some(Outcome::Cancelled)
@@ -260,7 +290,7 @@ pub(super) fn agreement(stage: Stage, status: Status) -> Outcome {
     })
 }
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    original_sources::Fixture<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
@@ -270,59 +300,79 @@ fn setup() -> (
         ..Default::default()
     };
     let mut model = unicode_model(None);
-    let chat = model.prepare_chat(request()).unwrap();
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
     let first = model.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let mut model = unicode_model(Some(first));
-    let chat = model.prepare_chat(request()).unwrap();
-    let settings = PreparedChatGenerationSettings {
+    let chat = {
+        let request = request();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .unwrap()
+            .unwrap()
+    };
+    let settings = original_sources::settings(PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(2),
             ..Default::default()
         },
         seed: 17,
         ..Default::default()
-    };
+    });
     (model, chat, settings)
 }
 fn run(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut original_sources::Fixture<MockBackend>,
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     controlled: bool,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let prepared = model.prepare_observed_chat(
-        chat,
-        settings,
-        eredu_core::capture::CapturePlan::none(),
+    let capture = eredu_core::capture::CapturePlan::none();
+    let mut request =
+        eredu::api::PreparedChatRequest::new(chat, original_sources::settings(settings));
+    request.capture = Some(&capture);
+    request.output_mode = eredu::api::PreparedChatOutputMode::Text;
+    let Some(mut run) = model.start_controlled_chat(
+        request,
         TraceLimits {
             per_record_bytes: 65536,
             total_bytes: 1 << 20,
         },
-    )?;
-    let mut events: Vec<ObservedGenerationRecord> = vec![];
+        Default::default(),
+        |_| ControlFlow::Continue(()),
+    )?
+    else {
+        return Ok(Vec::new());
+    };
     if controlled {
-        let mut run = model.start_controlled_text(prepared, &[], Default::default(), |record| {
-            events.push(record.generation);
-            ControlFlow::Continue(())
-        })?;
-        run.run(|record| {
-            events.push(record.generation);
-            ControlFlow::Continue(())
-        })?;
+        while matches!(
+            run.status(),
+            eredu_core::execution_control::GenerationStatus::Prepared
+                | eredu_core::execution_control::GenerationStatus::Paused
+        ) {
+            run.step(|_| ControlFlow::Continue(()))?;
+        }
     } else {
-        model.generate_observed_text(prepared, &[], Default::default(), |record| {
-            events.push(record);
-            ControlFlow::Continue(())
-        })?;
+        run.run(|_| ControlFlow::Continue(()))?;
     }
-    Ok(events
-        .into_iter()
-        .filter_map(|record| match record.event {
-            ObservedGenerationEvent::Token { token_id, .. } => Some(token_id),
-            _ => None,
-        })
-        .collect())
+    Ok(run.token_ids().to_vec())
 }
+
 fn has_source<T: std::error::Error + 'static>(
     mut error: &(dyn std::error::Error + 'static),
 ) -> bool {
@@ -361,27 +411,10 @@ fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseli
                 assert_eq!(actual.native.last(), Some(&stage));
             }
             assert_eq!(actual.charge.strong_count(), 0);
-            if stage == Stage::Instrumentation {
-                // Local policy remains a typed public variant. Transparent
-                // wrappers need not add that variant to Error::source().
-                let policy = match error.downcast_ref::<PreparedChatError>() {
-                    Some(PreparedChatError::Capture(policy)) => Some(policy),
-                    _ => match error.downcast_ref::<eredu::api::ControlledGenerationError>() {
-                        Some(eredu::api::ControlledGenerationError::Generation(
-                            PreparedChatError::Capture(policy),
-                        ))
-                        | Some(eredu::api::ControlledGenerationError::Capture(policy)) => {
-                            Some(policy)
-                        }
-                        _ => None,
-                    },
-                };
-                assert!(
-                    matches!(policy, Some(eredu_core::capture::CaptureError::Invalid(message)) if message.contains("original Instrumentation"))
-                );
-            } else {
-                assert!(has_source::<MockError>(error.as_ref()));
-            }
+            assert!(
+                has_source::<MockError>(error.as_ref()),
+                "native preparation cause must survive every shared stage: {error}"
+            );
             PROBE.with(|probe| probe.borrow_mut().as_mut().unwrap().fault = Fault::None);
             model.reset().unwrap();
             assert_eq!(
@@ -419,14 +452,10 @@ fn public_peer_rejection_stops_every_preparation_boundary_before_model_work() {
                 .iter()
                 .position(|vote| *vote == (stage, Status::Ready))
                 .expect("the selected boundary must vote before peer rejection");
-            // The borrowed ordinary cursor agrees its failed delivery. The
-            // detached controlled continuation is already fenced by advance's
-            // agreed failure, so delivery preserves that cause without starting
-            // another phase. Neither path may vote ready after rejection.
-            let cleanup: &[(Stage, Status)] = match (controlled, stage) {
-                (false, Stage::Prediction | Stage::Decision) => {
-                    &[(Stage::Delivery, Status::Failed)]
-                }
+            // Continuous and explicit advancement share one cursor and agree
+            // the same failed completed-delivery boundary.
+            let cleanup: &[(Stage, Status)] = match stage {
+                Stage::Prediction | Stage::Decision => &[(Stage::Delivery, Status::Failed)],
                 _ => &[],
             };
             assert_eq!(
@@ -456,12 +485,20 @@ fn peer_initial_delivery_cancellation_stops_ordinary_and_controlled_runs() {
             snapshot()
                 .votes
                 .iter()
+                .filter(|(stage, _)| *stage == Stage::Delivery)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot()
+                .votes
+                .iter()
                 .find(|(stage, _)| *stage == Stage::Delivery),
             Some(&(Stage::Delivery, Status::Ready))
         );
         assert_eq!(
             snapshot().votes.last(),
-            Some(&(Stage::Delivery, Status::Cancelled))
+            Some(&(Stage::Delivery, Status::Ready))
         );
     }
 }
@@ -486,7 +523,7 @@ fn asynchronous_public_token_generation_agrees_native_preparation() {
 }
 
 fn run_speculative(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut original_sources::Fixture<MockBackend>,
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     controlled: bool,
@@ -495,15 +532,18 @@ fn run_speculative(
 }
 
 fn run_speculative_with_scheduler(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut original_sources::Fixture<MockBackend>,
     chat: &PreparedChat,
     mut settings: PreparedChatGenerationSettings,
     controlled: bool,
     scheduler: eredu_core::SpeculativeSchedulerOptions,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     settings.seed = 0;
-    let request = PreparedChatSpeculativeGenerationRequest {
-        input: PreparedChatInput::token_ids(chat, vec![3, 4]),
+    let request = PreparedChatSpeculativeRequest {
+        chat: chat,
+        input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+        output_mode: eredu::api::PreparedChatOutputMode::Text,
+        skip_special_tokens: true,
         drafting: SpeculativeDraft::Embedded,
         settings,
         options: PreparedChatSpeculativeGenerationOptions {
@@ -515,12 +555,12 @@ fn run_speculative_with_scheduler(
         on_event: |_| {},
     };
     let output = if controlled {
-        model.with_controlled_text_speculative(request, Default::default(), |session| {
+        model.with_controlled_prepared_chat_speculative(request, Default::default(), |session| {
             while session.step()?.is_some() {}
             Ok(())
         })?
     } else {
-        model.generate_prepared_text_speculative(request)?
+        model.generate_prepared_chat_speculative(request)?
     };
     Ok(output.token_ids().to_vec())
 }
@@ -581,12 +621,15 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
     invalid.overrides.temperature = Some(-1.0);
     let _guard = probe(Fault::None);
     let error = model
-        .generate_prepared_text_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
             drafting: SpeculativeDraft::Embedded,
             lanes: [settings, invalid]
                 .into_iter()
                 .map(|settings| PreparedChatSpeculativeBatchLane {
-                    input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+                    chat: &chat,
+                    input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                    output_mode: eredu::api::PreparedChatOutputMode::Text,
+                    skip_special_tokens: true,
                     settings,
                     max_draft_tokens: NonZeroUsize::new(1).unwrap(),
                     caller_stop_sequences: &[],
@@ -598,7 +641,7 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
         })
         .err()
         .expect("invalid second lane must reject the batch");
-    assert!(matches!(error, PreparedChatSpeculativeError::Generation(_)));
+    assert!(has_source::<eredu_core::GenerationError>(&error));
     assert_eq!(snapshot().votes, vec![(Stage::Request, Status::Failed)]);
     assert!(snapshot().native.is_empty());
     assert_eq!(snapshot().forwards, 0);
@@ -623,9 +666,12 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
         .unwrap();
     let _guard = probe(Fault::None);
     let error = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -641,12 +687,8 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
         )
         .unwrap_err();
     assert!(matches!(
-        error,
-        eredu::api::ControlledSpeculativeGenerationError::Control(
-            eredu_core::speculative::SpeculativeControlError::Capture(
-                eredu_core::capture::CaptureError::Invalid(_)
-            )
-        )
+        error.control_failure(),
+        Some(eredu_core::speculative::SpeculativeControlError::Invalid(_))
     ));
     assert_eq!(
         snapshot().votes,
@@ -714,18 +756,8 @@ fn speculative_scheduler_policy_failure_votes_before_native_prompt_preparation()
             let error =
                 run_speculative_with_scheduler(&mut model, &chat, settings, controlled, scheduler)
                     .unwrap_err();
-            let cause = if controlled {
-                match error.downcast_ref::<eredu::api::ControlledSpeculativeGenerationError>() {
-                    Some(eredu::api::ControlledSpeculativeGenerationError::Prepared(cause)) => {
-                        Some(cause)
-                    }
-                    _ => None,
-                }
-            } else {
-                error.downcast_ref::<PreparedChatSpeculativeError>()
-            };
             assert!(
-                matches!(cause, Some(PreparedChatSpeculativeError::Generation(_))),
+                has_source::<eredu_core::GenerationError>(error.as_ref()),
                 "{error}"
             );
             assert_eq!(
@@ -744,7 +776,11 @@ fn peer_cancellation_after_a_committed_token_stops_ordinary_and_controlled_runs(
         let (mut model, chat, settings) = setup();
         // Initial delivery and pre-step readiness succeed; the peer cancels
         // while the first token/semantic records are being delivered.
-        let _guard = probe(Fault::CancelAfter(Stage::Delivery, 2));
+        let _guard = probe(Fault::DeliveryAt {
+            forwards: 1,
+            skip: 0,
+            rejected: false,
+        });
         let tokens = run(&mut model, &chat, settings, controlled).unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(snapshot().forwards, 1);
@@ -759,7 +795,11 @@ fn peer_cancellation_after_a_committed_token_stops_ordinary_and_controlled_runs(
 fn peer_delivery_failure_after_a_committed_token_preserves_the_completed_prefix() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
-        let _guard = probe(Fault::PeerAfter(Stage::Delivery, 2));
+        let _guard = probe(Fault::DeliveryAt {
+            forwards: 1,
+            skip: 0,
+            rejected: true,
+        });
         let error = run(&mut model, &chat, settings, controlled).unwrap_err();
         assert!(
             has_source::<eredu_core::run_preparation::TextPreparationRejected>(error.as_ref()),
@@ -779,72 +819,55 @@ fn peer_delivery_failure_after_a_committed_token_preserves_the_completed_prefix(
 
 #[test]
 fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
-    for controlled in [false, true] {
+    for stepped in [false, true] {
         let (mut model, chat, settings) = setup();
-        let prepare = |model: &LoadedModel<MockBackend>, total_bytes| {
-            model
-                .prepare_observed_chat(
-                    &chat,
-                    settings,
-                    eredu_core::capture::CapturePlan::none(),
-                    TraceLimits {
-                        per_record_bytes: 65536,
-                        total_bytes,
-                    },
-                )
-                .unwrap()
+        let capture = eredu_core::capture::CapturePlan::none();
+        let request = || {
+            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings);
+            r.capture = Some(&capture);
+            r.output_mode = eredu::api::PreparedChatOutputMode::Text;
+            r
         };
-        let prepared = prepare(&model, 1 << 20);
         let mut initial_bytes = 0;
-        if controlled {
-            let run = model
-                .start_controlled_text(prepared, &[], Default::default(), |record| {
+        let session = model
+            .start_controlled_chat(
+                request(),
+                TraceLimits {
+                    per_record_bytes: 65536,
+                    total_bytes: 1 << 20,
+                },
+                Default::default(),
+                |record| {
                     initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
                     ControlFlow::Continue(())
-                })
-                .unwrap();
-            drop(run);
-        } else {
-            model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if matches!(record.event, ObservedGenerationEvent::Started { .. }) {
-                        initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    }
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-        }
+                },
+            )
+            .unwrap()
+            .unwrap();
+        drop(session);
         model.reset().unwrap();
-        let prepared = prepare(&model, initial_bytes + 64);
         let _guard = probe(Fault::None);
-        let cause = if controlled {
-            let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-            match run.step(|_| ControlFlow::Continue(())).unwrap_err() {
-                eredu::api::ControlledGenerationError::Capture(error) => error,
-                other => panic!("original typed delivery error was lost: {other}"),
-            }
+        let mut session = model
+            .start_controlled_chat(
+                request(),
+                TraceLimits {
+                    per_record_bytes: 65536,
+                    total_bytes: initial_bytes + 64,
+                },
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap()
+            .unwrap();
+        let error = if stepped {
+            session.step(|_| ControlFlow::Continue(())).unwrap_err()
         } else {
-            match model
-                .generate_observed_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap_err()
-            {
-                PreparedChatError::Capture(error) => error,
-                other => panic!("original typed delivery error was lost: {other}"),
-            }
+            session.run(|_| ControlFlow::Continue(())).unwrap_err()
         };
-        assert!(matches!(
-            cause,
-            eredu_core::capture::CaptureError::Limit {
-                budget: eredu_core::capture::CaptureBudget::Encoded,
-                cumulative: true
-            }
-        ));
+        assert_eq!(
+            delivery_limit(&error),
+            (eredu_core::capture::CaptureBudget::Encoded, true)
+        );
         assert_eq!(snapshot().forwards, 1);
         assert_eq!(
             snapshot().votes.last(),
@@ -859,10 +882,10 @@ fn controlled_lifecycle_peer_disposition_prevents_another_forward() {
         let (mut model, chat, settings) = setup();
         // Initial delivery and the token's before/after agreements succeed.
         // The peer's lifecycle callback then cancels or exhausts its budget.
-        let _guard = probe(if rejected {
-            Fault::PeerAfter(Stage::Delivery, 3)
-        } else {
-            Fault::CancelAfter(Stage::Delivery, 3)
+        let _guard = probe(Fault::DeliveryAt {
+            forwards: 1,
+            skip: 1,
+            rejected,
         });
         let result = run(&mut model, &chat, settings, true);
         if rejected {
@@ -881,10 +904,11 @@ fn terminal_record_peer_failure_is_reported_after_the_completed_prediction() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
         // This decoder needs both tokens to complete its UTF-8 sequence.
-        let _guard = probe(Fault::PeerAfter(
-            Stage::Delivery,
-            if controlled { 6 } else { 5 },
-        ));
+        let _guard = probe(Fault::DeliveryAt {
+            forwards: 2,
+            skip: 1,
+            rejected: true,
+        });
         let error = run(&mut model, &chat, settings, controlled).unwrap_err();
         assert!(has_source::<
             eredu_core::run_preparation::TextPreparationRejected,
@@ -895,100 +919,87 @@ fn terminal_record_peer_failure_is_reported_after_the_completed_prediction() {
 
 #[test]
 fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
-    for controlled in [false, true] {
+    for stepped in [false, true] {
         let (mut model, chat, settings) = setup();
-        let prepare = |model: &LoadedModel<MockBackend>, total_bytes| {
-            model
-                .prepare_observed_chat(
-                    &chat,
-                    settings,
-                    eredu_core::capture::CapturePlan::none(),
-                    TraceLimits {
-                        per_record_bytes: 65536,
-                        total_bytes,
-                    },
-                )
-                .unwrap()
+        let capture = eredu_core::capture::CapturePlan::none();
+        let request = || {
+            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings);
+            r.capture = Some(&capture);
+            r.output_mode = eredu::api::PreparedChatOutputMode::Text;
+            r
         };
         let mut preceding_bytes = 0;
-        let prepared = prepare(&model, 1 << 20);
-        if controlled {
-            let mut session = model
-                .start_controlled_text(prepared, &[], Default::default(), |record| {
-                    preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+        let mut session = model
+            .start_controlled_chat(
+                request(),
+                TraceLimits {
+                    per_record_bytes: 65536,
+                    total_bytes: 1 << 20,
+                },
+                Default::default(),
+                |r| {
+                    preceding_bytes += serde_json::to_vec(&r).unwrap().len() as u64;
                     ControlFlow::Continue(())
-                })
-                .unwrap();
-            session
-                .step(|record| {
-                    if !matches!(
-                        record.generation.event,
-                        ObservedGenerationEvent::Lifecycle { .. }
-                    ) {
-                        preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    }
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-        } else {
-            model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if !matches!(record.event, ObservedGenerationEvent::Completed { .. }) {
-                        preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    }
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-        }
+                },
+            )
+            .unwrap()
+            .unwrap();
+        session
+            .step(|r| {
+                if !matches!(
+                    r.event.progress(),
+                    Some(ObservedGenerationEvent::Lifecycle { .. })
+                ) {
+                    preceding_bytes += serde_json::to_vec(&r).unwrap().len() as u64;
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        drop(session);
         model.reset().unwrap();
-        let prepared = prepare(&model, preceding_bytes + 64);
         let _guard = probe(Fault::None);
-        let cause = if controlled {
-            let mut session = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
-            let error = session.step(|_| ControlFlow::Continue(())).unwrap_err();
-            assert_eq!(
-                session.status(),
-                eredu_core::execution_control::GenerationStatus::Failed
-            );
-            match error {
-                eredu::api::ControlledGenerationError::Capture(error) => error,
-                other => panic!("lost lifecycle delivery cause: {other}"),
-            }
+        let mut session = model
+            .start_controlled_chat(
+                request(),
+                TraceLimits {
+                    per_record_bytes: 65536,
+                    total_bytes: preceding_bytes + 64,
+                },
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap()
+            .unwrap();
+        let error = if stepped {
+            session.step(|_| ControlFlow::Continue(())).unwrap_err()
         } else {
-            match model
-                .generate_observed_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
-                .unwrap_err()
-            {
-                PreparedChatError::Capture(error) => error,
-                other => panic!("lost terminal delivery cause: {other}"),
-            }
+            session.run(|_| ControlFlow::Continue(())).unwrap_err()
         };
-        assert!(matches!(
-            cause,
-            eredu_core::capture::CaptureError::Limit {
-                budget: eredu_core::capture::CaptureBudget::Encoded,
-                cumulative: true
-            }
-        ));
-        assert_eq!(snapshot().forwards, if controlled { 1 } else { 2 });
+        assert_eq!(
+            session.status(),
+            eredu_core::execution_control::GenerationStatus::Failed
+        );
+        assert_eq!(
+            delivery_limit(&error),
+            (eredu_core::capture::CaptureBudget::Encoded, true)
+        );
+        assert_eq!(snapshot().forwards, 1);
         assert_eq!(
             snapshot().votes.last(),
             Some(&(Stage::Delivery, Status::Failed))
         );
-        assert_eq!(
-            snapshot()
-                .votes
-                .iter()
-                .filter(|(stage, _)| *stage == Stage::Delivery)
-                .count(),
-            if controlled { 4 } else { 6 }
-        );
+    }
+}
+
+fn delivery_limit(
+    error: &eredu::api::ControlledGenerationError,
+) -> (eredu_core::capture::CaptureBudget, bool) {
+    match error {
+        eredu::api::ControlledGenerationError::Capture(error)
+        | eredu::api::ControlledGenerationError::CaptureFailure { capture: error, .. } => {
+            capture_limit(error)
+        }
+        error => panic!("expected original capture limit: {error:?}"),
     }
 }
 
@@ -1031,9 +1042,12 @@ fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
         .unwrap();
     let _guard = probe(Fault::Local(Stage::Instrumentation));
     let error = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+        .with_controlled_prepared_chat_speculative(
+            PreparedChatSpeculativeRequest {
+                chat: &chat,
+                input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
+                output_mode: eredu::api::PreparedChatOutputMode::Text,
+                skip_special_tokens: true,
                 drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: Default::default(),
@@ -1054,4 +1068,13 @@ fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
         snapshot().votes.last(),
         Some(&(Stage::Instrumentation, Status::Failed))
     );
+}
+
+fn capture_limit(
+    error: &eredu_core::capture::CaptureError,
+) -> (eredu_core::capture::CaptureBudget, bool) {
+    match error {
+        eredu_core::capture::CaptureError::Limit { budget, cumulative } => (*budget, *cumulative),
+        other => panic!("typed capture limit changed: {other}"),
+    }
 }

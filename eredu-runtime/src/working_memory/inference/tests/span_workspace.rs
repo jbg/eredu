@@ -43,6 +43,7 @@ fn actual_schedule_retains_new_state_and_nonzero_operations_without_opening_cred
         actual.push(span.clone());
         context.begin_state_span([&current])?;
         let n = match span {
+            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
             InferenceWorkspaceSpan::Prefill(c) => c.input.end - c.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };

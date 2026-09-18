@@ -1,6 +1,17 @@
 //! One support projection with owned and borrowed declaration destinations.
 use eredu_core::{ObservationSupport, ObservationSupportStatus as Status, intervention::*};
+mod funded;
+pub use funded::{prepare_intervention_discovery, intervention_discovery_preparation_bytes,
+    FundedInterventionDiscovery, InterventionDiscoveryPreparationError};
 const UNAVAILABLE: &str = "required intervention geometry or native mechanism is not declared";
+pub(super) fn support_for<'a>(point: &InterventionPoint, support: &'a [ObservationSupport]) -> Option<&'a ObservationSupport> {
+    support.iter().find(|row| {
+        if point.routing.is_some() {
+            row.path.strip_prefix(&point.path).and_then(|suffix| suffix.strip_prefix(".routing."))
+                == Some(eredu_core::RoutingObservationField::SelectedExperts.suffix())
+        } else { row.path == point.path }
+    })
+}
 enum ProjectedStatus<'a> {
     Borrowed(&'a Status),
     Unavailable,

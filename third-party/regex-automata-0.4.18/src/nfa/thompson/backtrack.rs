@@ -10,6 +10,7 @@ is can be faster than the [`PikeVM`](thompson::pikevm::PikeVM) in many cases
 because it does less book-keeping.
 */
 
+use crate::util::allocation::{Allocation, AllocationError, Allocator, Unenforced};
 use alloc::{vec, vec::Vec};
 
 use crate::{
@@ -274,10 +275,7 @@ impl Builder {
     /// If there was a problem parsing or compiling the pattern, then an error
     /// is returned.
     #[cfg(feature = "syntax")]
-    pub fn build(
-        &self,
-        pattern: &str,
-    ) -> Result<BoundedBacktracker, BuildError> {
+    pub fn build(&self, pattern: &str) -> Result<BoundedBacktracker, BuildError> {
         self.build_many(&[pattern])
     }
 
@@ -287,7 +285,19 @@ impl Builder {
         &self,
         patterns: &[P],
     ) -> Result<BoundedBacktracker, BuildError> {
-        let nfa = self.thompson.build_many(patterns)?;
+        self.build_many_with_allocations(patterns, &Unenforced)
+    }
+
+    /// Compile the original source with prospective admission.
+    #[cfg(feature = "syntax")]
+    pub fn build_many_with_allocations<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+        funding: &dyn Allocation,
+    ) -> Result<BoundedBacktracker, BuildError> {
+        let nfa = self
+            .thompson
+            .build_many_with_allocations(patterns, funding)?;
         self.build_from_nfa(nfa)
     }
 
@@ -296,12 +306,12 @@ impl Builder {
     /// Note that when using this method, any configuration that applies to the
     /// construction of the NFA itself will of course be ignored, since the NFA
     /// given here is already built.
-    pub fn build_from_nfa(
-        &self,
-        nfa: NFA,
-    ) -> Result<BoundedBacktracker, BuildError> {
+    pub fn build_from_nfa(&self, nfa: NFA) -> Result<BoundedBacktracker, BuildError> {
         nfa.look_set_any().available().map_err(BuildError::word)?;
-        Ok(BoundedBacktracker { config: self.config.clone(), nfa })
+        Ok(BoundedBacktracker {
+            config: self.config.clone(),
+            nfa,
+        })
     }
 
     /// Apply the given `BoundedBacktracker` configuration options to this
@@ -320,10 +330,7 @@ impl Builder {
     /// These settings only apply when constructing a `BoundedBacktracker`
     /// directly from a pattern.
     #[cfg(feature = "syntax")]
-    pub fn syntax(
-        &mut self,
-        config: crate::util::syntax::Config,
-    ) -> &mut Builder {
+    pub fn syntax(&mut self, config: crate::util::syntax::Config) -> &mut Builder {
         self.thompson.syntax(config);
         self
     }
@@ -482,9 +489,7 @@ impl BoundedBacktracker {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[cfg(feature = "syntax")]
-    pub fn new_many<P: AsRef<str>>(
-        patterns: &[P],
-    ) -> Result<BoundedBacktracker, BuildError> {
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<BoundedBacktracker, BuildError> {
         BoundedBacktracker::builder().build_many(patterns)
     }
 
@@ -901,8 +906,19 @@ impl BoundedBacktracker {
         cache: &mut Cache,
         input: I,
     ) -> Result<bool, MatchError> {
+        self.try_is_match_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Test for a match through the same prospectively admitted search.
+    pub fn try_is_match_with_allocations<'h, I: Into<Input<'h>>>(
+        &self,
+        cache: &mut Cache,
+        input: I,
+        funding: &dyn Allocation,
+    ) -> Result<bool, MatchError> {
         let input = input.into().earliest(true);
-        self.try_search_slots(cache, &input, &mut []).map(|pid| pid.is_some())
+        self.try_search_slots_with_allocations(cache, &input, &mut [], funding)
+            .map(|pid| pid.is_some())
     }
 
     /// Executes a leftmost forward search and returns a `Match` if one exists.
@@ -941,39 +957,51 @@ impl BoundedBacktracker {
         cache: &mut Cache,
         input: I,
     ) -> Result<Option<Match>, MatchError> {
+        self.try_find_with_allocations(cache, input, &Unenforced)
+    }
+
+    /// Find the same match with prospectively admitted temporary slots.
+    pub fn try_find_with_allocations<'h, I: Into<Input<'h>>>(
+        &self,
+        cache: &mut Cache,
+        input: I,
+        funding: &dyn Allocation,
+    ) -> Result<Option<Match>, MatchError> {
         let input = input.into();
-        if self.get_nfa().pattern_len() == 1 {
-            let mut slots = [None, None];
-            let pid = match self.try_search_slots(cache, &input, &mut slots)? {
-                None => return Ok(None),
-                Some(pid) => pid,
-            };
-            let start = match slots[0] {
-                None => return Ok(None),
-                Some(s) => s.get(),
-            };
-            let end = match slots[1] {
-                None => return Ok(None),
-                Some(s) => s.get(),
-            };
-            return Ok(Some(Match::new(pid, Span { start, end })));
-        }
-        let ginfo = self.get_nfa().group_info();
-        let slots_len = ginfo.implicit_slot_len();
-        let mut slots = vec![None; slots_len];
-        let pid = match self.try_search_slots(cache, &input, &mut slots)? {
-            None => return Ok(None),
-            Some(pid) => pid,
+        let allocation = Allocator::new(funding);
+        allocation.reserve(
+            core::mem::size_of::<Vec<Option<NonMaxUsize>>>()
+                + core::mem::size_of::<[Option<NonMaxUsize>; 2]>(),
+        )?;
+        let mut pair = [None, None];
+        let mut temporary = Vec::new();
+        let slots = if self.get_nfa().pattern_len() == 1 {
+            &mut pair[..]
+        } else {
+            allocation.resize_copy(
+                &mut temporary,
+                self.get_nfa().group_info().implicit_slot_len(),
+                None,
+            )?;
+            &mut temporary
         };
-        let start = match slots[pid.as_usize() * 2] {
-            None => return Ok(None),
-            Some(s) => s.get(),
+        let Some(pid) = self.try_search_slots_with_allocations(cache, &input, slots, funding)?
+        else {
+            return Ok(None);
         };
-        let end = match slots[pid.as_usize() * 2 + 1] {
-            None => return Ok(None),
-            Some(s) => s.get(),
+        let Some(start) = slots[pid.as_usize() * 2] else {
+            return Ok(None);
         };
-        Ok(Some(Match::new(pid, Span { start, end })))
+        let Some(end) = slots[pid.as_usize() * 2 + 1] else {
+            return Ok(None);
+        };
+        Ok(Some(Match::new(
+            pid,
+            Span {
+                start: start.get(),
+                end: end.get(),
+            },
+        )))
     }
 
     /// Executes a leftmost forward search and writes the spans of capturing
@@ -1058,7 +1086,12 @@ impl BoundedBacktracker {
     ) -> TryFindMatches<'r, 'c, 'h> {
         let caps = Captures::matches(self.get_nfa().group_info().clone());
         let it = iter::Searcher::new(input.into());
-        TryFindMatches { re: self, cache, caps, it }
+        TryFindMatches {
+            re: self,
+            cache,
+            caps,
+            it,
+        }
     }
 
     /// Returns an iterator over all non-overlapping `Captures` values. If no
@@ -1109,7 +1142,12 @@ impl BoundedBacktracker {
     ) -> TryCapturesMatches<'r, 'c, 'h> {
         let caps = self.create_captures();
         let it = iter::Searcher::new(input.into());
-        TryCapturesMatches { re: self, cache, caps, it }
+        TryCapturesMatches {
+            re: self,
+            cache,
+            caps,
+            it,
+        }
     }
 }
 
@@ -1212,8 +1250,20 @@ impl BoundedBacktracker {
         input: &Input<'_>,
         caps: &mut Captures,
     ) -> Result<(), MatchError> {
+        self.try_search_with_allocations(cache, input, caps, &Unenforced)
+    }
+
+    /// Capture through the same fallible search; refusal never reports a match.
+    pub fn try_search_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        caps: &mut Captures,
+        funding: &dyn Allocation,
+    ) -> Result<(), MatchError> {
         caps.set_pattern(None);
-        let pid = self.try_search_slots(cache, input, caps.slots_mut())?;
+        let pid =
+            self.try_search_slots_with_allocations(cache, input, caps.slots_mut(), funding)?;
         caps.set_pattern(pid);
         Ok(())
     }
@@ -1296,27 +1346,48 @@ impl BoundedBacktracker {
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
     ) -> Result<Option<PatternID>, MatchError> {
+        self.try_search_slots_with_allocations(cache, input, slots, &Unenforced)
+    }
+
+    /// Run the original backtracker with admission before adaptive growth.
+    /// The caller retains actual authority through cache/error retirement.
+    pub fn try_search_slots_with_allocations(
+        &self,
+        cache: &mut Cache,
+        input: &Input<'_>,
+        slots: &mut [Option<NonMaxUsize>],
+        funding: &dyn Allocation,
+    ) -> Result<Option<PatternID>, MatchError> {
+        let allocation = Allocator::new(funding);
+        allocation.reserve(
+            core::mem::size_of::<Frame>()
+                + core::mem::size_of::<Vec<Option<NonMaxUsize>>>()
+                + core::mem::size_of::<[Option<NonMaxUsize>; 2]>()
+                + core::mem::size_of::<Input<'_>>()
+                + core::mem::size_of::<Result<Option<HalfMatch>, MatchError>>(),
+        )?;
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
         if !utf8empty {
-            let maybe_hm = self.try_search_slots_imp(cache, input, slots)?;
+            let maybe_hm = self.try_search_slots_imp(cache, input, slots, allocation)?;
             return Ok(maybe_hm.map(|hm| hm.pattern()));
         }
         // See PikeVM::try_search_slots for why we do this.
         let min = self.get_nfa().group_info().implicit_slot_len();
         if slots.len() >= min {
-            let maybe_hm = self.try_search_slots_imp(cache, input, slots)?;
+            let maybe_hm = self.try_search_slots_imp(cache, input, slots, allocation)?;
             return Ok(maybe_hm.map(|hm| hm.pattern()));
         }
         if self.get_nfa().pattern_len() == 1 {
             let mut enough = [None, None];
-            let got = self.try_search_slots_imp(cache, input, &mut enough)?;
+            let got = self.try_search_slots_imp(cache, input, &mut enough, allocation)?;
             // This is OK because we know `enough_slots` is strictly bigger
             // than `slots`, otherwise this special case isn't reached.
             slots.copy_from_slice(&enough[..slots.len()]);
             return Ok(got.map(|hm| hm.pattern()));
         }
-        let mut enough = vec![None; min];
-        let got = self.try_search_slots_imp(cache, input, &mut enough)?;
+        let mut enough = Vec::new();
+        allocation.resize_copy(&mut enough, min, None)?;
+        let got = self.try_search_slots_imp(cache, input, &mut enough, allocation)?;
         // This is OK because we know `enough_slots` is strictly bigger than
         // `slots`, otherwise this special case isn't reached.
         slots.copy_from_slice(&enough[..slots.len()]);
@@ -1333,16 +1404,17 @@ impl BoundedBacktracker {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
+        allocation: Allocator<'_>,
     ) -> Result<Option<HalfMatch>, MatchError> {
         let utf8empty = self.get_nfa().has_empty() && self.get_nfa().is_utf8();
-        let hm = match self.search_imp(cache, input, slots)? {
+        let hm = match self.search_imp(cache, input, slots, allocation)? {
             None => return Ok(None),
             Some(hm) if !utf8empty => return Ok(Some(hm)),
             Some(hm) => hm,
         };
         empty::skip_splits_fwd(input, hm, hm.offset(), |input| {
             Ok(self
-                .search_imp(cache, input, slots)?
+                .search_imp(cache, input, slots, allocation)?
                 .map(|hm| (hm, hm.offset())))
         })
     }
@@ -1359,6 +1431,7 @@ impl BoundedBacktracker {
         cache: &mut Cache,
         input: &Input<'_>,
         slots: &mut [Option<NonMaxUsize>],
+        allocation: Allocator<'_>,
     ) -> Result<Option<HalfMatch>, MatchError> {
         // Unlike in the PikeVM, we write our capturing group spans directly
         // into the caller's captures groups. So we have to make sure we're
@@ -1371,7 +1444,7 @@ impl BoundedBacktracker {
         for slot in slots.iter_mut() {
             *slot = None;
         }
-        cache.setup_search(&self, input)?;
+        cache.setup_search(&self, input, allocation)?;
         if input.is_done() {
             return Ok(None);
         }
@@ -1394,7 +1467,7 @@ impl BoundedBacktracker {
         };
         if anchored {
             let at = input.start();
-            return Ok(self.backtrack(cache, input, at, start_id, slots));
+            return self.backtrack(cache, input, at, start_id, slots, allocation);
         }
         let pre = self.get_config().get_prefilter();
         let mut at = input.start();
@@ -1406,8 +1479,7 @@ impl BoundedBacktracker {
                     Some(ref span) => at = span.start,
                 }
             }
-            if let Some(hm) = self.backtrack(cache, input, at, start_id, slots)
-            {
+            if let Some(hm) = self.backtrack(cache, input, at, start_id, slots, allocation)? {
                 return Ok(Some(hm));
             }
             at += 1;
@@ -1429,13 +1501,23 @@ impl BoundedBacktracker {
         at: usize,
         start_id: StateID,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<HalfMatch> {
-        cache.stack.push(Frame::Step { sid: start_id, at });
+        allocation: Allocator<'_>,
+    ) -> Result<Option<HalfMatch>, MatchError> {
+        allocation.push(&mut cache.stack, Frame::Step { sid: start_id, at })?;
         while let Some(frame) = cache.stack.pop() {
             match frame {
                 Frame::Step { sid, at } => {
-                    if let Some(hm) = self.step(cache, input, sid, at, slots) {
-                        return Some(hm);
+                    match self.step(cache, input, sid, at, slots, allocation) {
+                        Ok(Some(hm)) => return Ok(Some(hm)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            while let Some(frame) = cache.stack.pop() {
+                                if let Frame::RestoreCapture { slot, offset } = frame {
+                                    slots[slot] = offset;
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
                 }
                 Frame::RestoreCapture { slot, offset } => {
@@ -1443,7 +1525,7 @@ impl BoundedBacktracker {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     // LAMENTATION: The actual backtracking search is implemented in about
@@ -1465,10 +1547,11 @@ impl BoundedBacktracker {
         mut sid: StateID,
         mut at: usize,
         slots: &mut [Option<NonMaxUsize>],
-    ) -> Option<HalfMatch> {
+        allocation: Allocator<'_>,
+    ) -> Result<Option<HalfMatch>, MatchError> {
         loop {
             if !cache.visited.insert(sid, at - input.start()) {
-                return None;
+                return Ok(None);
             }
             match *self.nfa.state(sid) {
                 State::ByteRange { ref trans } => {
@@ -1484,46 +1567,53 @@ impl BoundedBacktracker {
                     // an '&Input' instead of a '&[u8]'. Or at least, add a new
                     // API that does it.
                     if at >= input.end() {
-                        return None;
+                        return Ok(None);
                     }
                     if !trans.matches(input.haystack(), at) {
-                        return None;
+                        return Ok(None);
                     }
                     sid = trans.next;
                     at += 1;
                 }
                 State::Sparse(ref sparse) => {
                     if at >= input.end() {
-                        return None;
+                        return Ok(None);
                     }
-                    sid = sparse.matches(input.haystack(), at)?;
+                    sid = match sparse.matches(input.haystack(), at) {
+                        Some(sid) => sid,
+                        None => return Ok(None),
+                    };
                     at += 1;
                 }
                 State::Dense(ref dense) => {
                     if at >= input.end() {
-                        return None;
+                        return Ok(None);
                     }
-                    sid = dense.matches(input.haystack(), at)?;
+                    sid = match dense.matches(input.haystack(), at) {
+                        Some(sid) => sid,
+                        None => return Ok(None),
+                    };
                     at += 1;
                 }
                 State::Look { look, next } => {
                     // OK because we don't permit building a searcher with a
                     // Unicode word boundary if the requisite Unicode data is
                     // unavailable.
-                    if !self.nfa.look_matcher().matches_inline(
-                        look,
-                        input.haystack(),
-                        at,
-                    ) {
-                        return None;
+                    if !self
+                        .nfa
+                        .look_matcher()
+                        .matches_inline(look, input.haystack(), at)
+                    {
+                        return Ok(None);
                     }
                     sid = next;
                 }
                 State::Union { ref alternates } => {
                     sid = match alternates.get(0) {
-                        None => return None,
+                        None => return Ok(None),
                         Some(&sid) => sid,
                     };
+                    allocation.grow(&mut cache.stack, alternates.len() - 1)?;
                     cache.stack.extend(
                         alternates[1..]
                             .iter()
@@ -1534,21 +1624,24 @@ impl BoundedBacktracker {
                 }
                 State::BinaryUnion { alt1, alt2 } => {
                     sid = alt1;
-                    cache.stack.push(Frame::Step { sid: alt2, at });
+                    allocation.push(&mut cache.stack, Frame::Step { sid: alt2, at })?;
                 }
                 State::Capture { next, slot, .. } => {
                     if slot.as_usize() < slots.len() {
-                        cache.stack.push(Frame::RestoreCapture {
-                            slot,
-                            offset: slots[slot],
-                        });
+                        allocation.push(
+                            &mut cache.stack,
+                            Frame::RestoreCapture {
+                                slot,
+                                offset: slots[slot],
+                            },
+                        )?;
                         slots[slot] = NonMaxUsize::new(at);
                     }
                     sid = next;
                 }
-                State::Fail => return None,
+                State::Fail => return Ok(None),
                 State::Match { pattern_id } => {
-                    return Some(HalfMatch::new(pattern_id, at));
+                    return Ok(Some(HalfMatch::new(pattern_id, at)));
                 }
             }
         }
@@ -1582,8 +1675,12 @@ impl<'r, 'c, 'h> Iterator for TryFindMatches<'r, 'c, 'h> {
     #[inline]
     fn next(&mut self) -> Option<Result<Match, MatchError>> {
         // Splitting 'self' apart seems necessary to appease borrowck.
-        let TryFindMatches { re, ref mut cache, ref mut caps, ref mut it } =
-            *self;
+        let TryFindMatches {
+            re,
+            ref mut cache,
+            ref mut caps,
+            ref mut it,
+        } = *self;
         it.try_advance(|input| {
             re.try_search(cache, input, caps)?;
             Ok(caps.get_match())
@@ -1620,8 +1717,12 @@ impl<'r, 'c, 'h> Iterator for TryCapturesMatches<'r, 'c, 'h> {
     #[inline]
     fn next(&mut self) -> Option<Result<Captures, MatchError>> {
         // Splitting 'self' apart seems necessary to appease borrowck.
-        let TryCapturesMatches { re, ref mut cache, ref mut caps, ref mut it } =
-            *self;
+        let TryCapturesMatches {
+            re,
+            ref mut cache,
+            ref mut caps,
+            ref mut it,
+        } = *self;
         let _ = it
             .try_advance(|input| {
                 re.try_search(cache, input, caps)?;
@@ -1674,7 +1775,19 @@ impl Cache {
     /// `BoundedBacktracker`, then you must call [`Cache::reset`] with the
     /// desired `BoundedBacktracker`.
     pub fn new(re: &BoundedBacktracker) -> Cache {
-        Cache { stack: vec![], visited: Visited::new(re) }
+        Self::new_with_allocations(re, &Unenforced).expect("ordinary backtracking cache allocation")
+    }
+
+    /// Construct the original cache under an explicit prospective policy.
+    pub fn new_with_allocations(
+        re: &BoundedBacktracker,
+        funding: &dyn Allocation,
+    ) -> Result<Cache, AllocationError> {
+        Allocator::new(funding).reserve(core::mem::size_of::<Self>())?;
+        Ok(Cache {
+            stack: Vec::new(),
+            visited: Visited::new(re),
+        })
     }
 
     /// Reset this cache such that it can be used for searching with different
@@ -1727,8 +1840,7 @@ impl Cache {
     /// This does **not** include the stack size used up by this cache. To
     /// compute that, use `std::mem::size_of::<Cache>()`.
     pub fn memory_usage(&self) -> usize {
-        self.stack.len() * core::mem::size_of::<Frame>()
-            + self.visited.memory_usage()
+        self.stack.capacity() * core::mem::size_of::<Frame>() + self.visited.memory_usage()
     }
 
     /// Clears this cache. This should be called at the start of every search
@@ -1745,9 +1857,10 @@ impl Cache {
         &mut self,
         re: &BoundedBacktracker,
         input: &Input<'_>,
+        allocation: Allocator<'_>,
     ) -> Result<(), MatchError> {
         self.stack.clear();
-        self.visited.setup_search(re, input)?;
+        self.visited.setup_search(re, input, allocation)?;
         Ok(())
     }
 }
@@ -1769,7 +1882,10 @@ enum Frame {
     /// different branch that results in a different offset (or perhaps none at
     /// all), then this "restore capture" frame will cause the offset to get
     /// reset.
-    RestoreCapture { slot: SmallIndex, offset: Option<NonMaxUsize> },
+    RestoreCapture {
+        slot: SmallIndex,
+        offset: Option<NonMaxUsize>,
+    },
 }
 
 /// A bitset that keeps track of whether a particular (StateID, offset) has
@@ -1809,7 +1925,10 @@ impl Visited {
     /// The set is ready to use, but must be setup at the beginning of each
     /// search by calling `setup_search`.
     fn new(re: &BoundedBacktracker) -> Visited {
-        let mut visited = Visited { bitset: vec![], stride: 0 };
+        let mut visited = Visited {
+            bitset: vec![],
+            stride: 0,
+        };
         visited.reset(re);
         visited
     }
@@ -1842,6 +1961,7 @@ impl Visited {
         &mut self,
         re: &BoundedBacktracker,
         input: &Input<'_>,
+        allocation: Allocator<'_>,
     ) -> Result<(), MatchError> {
         // Our haystack length is only the length of the span of the entire
         // haystack that we'll be searching.
@@ -1851,12 +1971,11 @@ impl Visited {
         // search loop includes the position at input.end(). (And it does this
         // because matches are delayed by one byte to account for look-around.)
         self.stride = haylen + 1;
-        let needed_capacity =
-            match re.get_nfa().states().len().checked_mul(self.stride) {
-                None => return Err(err()),
-                Some(capacity) => capacity,
-            };
-        let max_capacity = 8 * re.get_config().get_visited_capacity();
+        let needed_capacity = match re.get_nfa().states().len().checked_mul(self.stride) {
+            None => return Err(err()),
+            Some(capacity) => capacity,
+        };
+        let max_capacity = re.get_config().get_visited_capacity().saturating_mul(8);
         if needed_capacity > max_capacity {
             return Err(err());
         }
@@ -1866,14 +1985,14 @@ impl Visited {
             *block = 0;
         }
         if needed_blocks > self.bitset.len() {
-            self.bitset.resize(needed_blocks, 0);
+            allocation.resize_copy(&mut self.bitset, needed_blocks, 0)?;
         }
         Ok(())
     }
 
     /// Return the heap memory usage, in bytes, of this visited set.
     fn memory_usage(&self) -> usize {
-        self.bitset.len() * core::mem::size_of::<usize>()
+        self.bitset.capacity() * core::mem::size_of::<usize>()
     }
 }
 
@@ -1904,5 +2023,14 @@ mod tests {
             .build(r"[0-9A-Za-z]{100}")
             .unwrap();
         assert_eq!(0, re.max_haystack_len());
+    }
+}
+
+impl BoundedBacktracker {
+    /// Visit shared immutable NFA and prefilter ownership, excluding caches.
+    pub fn visit_source_storage(&self, visitor: &mut dyn crate::util::source_storage::Visitor) -> Result<(), crate::util::source_storage::Error> {
+        self.nfa.visit_source_storage(visitor)?;
+        if let Some(pre) = self.config.get_prefilter() { pre.visit_source_storage(visitor)?; }
+        Ok(())
     }
 }

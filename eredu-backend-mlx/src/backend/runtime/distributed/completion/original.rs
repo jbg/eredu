@@ -121,6 +121,8 @@ pub(super) fn completion_controls()->Option<usize> {
         size_of::<Option<&OriginalScopeObserver>>(),size_of::<Result<bool,Exception>>(),
         size_of::<Option<Result<bool,Exception>>>(),size_of::<Result<(),Exception>>(),
         size_of::<Option<Exception>>(),size_of::<(&str,bool)>(),size_of::<Status>(),
+        size_of::<crate::backend::submission_recovery::observed::RetirementAttempt>(),
+        size_of::<Result<crate::backend::submission_recovery::observed::RetirementAttempt,Exception>>(),
         size_of::<eredu_core::BoundedCompletionWait>(),size_of::<eredu_core::BoundedCompletionOutcome>(),
         size_of::<Result<eredu_core::BoundedCompletionOutcome,Exception>>(),
         size_of::<eredu_core::BoundedSubmissionOutcome<MlxCommunicationCompletion>>(),

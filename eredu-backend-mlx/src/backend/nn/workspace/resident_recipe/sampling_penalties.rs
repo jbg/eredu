@@ -57,20 +57,9 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
 mod tests {
     use super::*;
     use eredu_runtime::working_memory::{
-        SamplingWorkspaceObserver, SamplingWorkspacePhase, quote_sampling_workspace_with_observer,
+        quote_sampling_workspace_with_observer,
     };
     use eredu_runtime::{ConfiguredTextSampler, GenerationSampler};
-
-    struct Observer(ResidentRecipeRecorder);
-    impl SamplingWorkspaceObserver for Observer {
-        fn observe(
-            &mut self,
-            phase: SamplingWorkspacePhase,
-            report: &WorkspaceTraceReport,
-        ) -> Result<(), Error> {
-            self.0.observe_sampling(phase, report)
-        }
-    }
 
     #[test]
     fn actual_penalty_windows_join_complete_sampling_constructors() {
@@ -107,7 +96,7 @@ mod tests {
                         .penalties(repeat, window, frequency, presence)
                         .with_generated_tokens([1, 1, u32::MAX, 2]),
                 );
-                let mut observer = Observer(ResidentRecipeRecorder::new(geometry, mechanism));
+                let mut observer = ResidentRecipeRecorder::new(geometry, mechanism);
                 quote_sampling_workspace_with_observer(
                     &source,
                     0.0,
@@ -119,8 +108,9 @@ mod tests {
                     Some(&mut observer),
                 )
                 .unwrap();
-                assert_eq!(observer.0.sampling.len(), 3);
-                for row in &observer.0.sampling[1..] {
+                let program = observer.finish_sampling(2).unwrap();
+                assert_eq!(program.steps(), Some(2));
+                for row in &program.rows()[1..] {
                     assert!(row.first_missing_operation.is_none());
                     assert!(row.mutable_storage.unwrap().mutable_bytes() > 0);
                     assert!(row.query_controls.unwrap() > 0);

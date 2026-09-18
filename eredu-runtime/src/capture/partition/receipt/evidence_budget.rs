@@ -46,7 +46,7 @@ impl EvidenceBudgetSource {
 impl PartitionCaptureReceiptPlan {
     pub(in crate::capture::partition) fn bind_evidence_budget(&mut self, source: EvidenceBudgetSource)
         -> Result<(), CaptureError> {
-        if self.evidence_budget.is_some() || self.shared_plan_source().is_none_or(|plan| !source.matches(plan)) {
+        if self.evidence_budget.is_some() || !source.matches(self.shared_plan_source()) {
             return Err(invalid("receipt evidence budget source differs or is already bound"));
         }
         self.evidence_budget = Some(source);

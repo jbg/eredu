@@ -224,11 +224,11 @@ mod tests {
                         "{}Check carefully.{closing}\n{collection}",
                         if prefilled { "" } else { opening }
                     );
-                    let mut grammar = plan.generation_constraint().grammar_state();
+                    let mut grammar = plan.generation_constraint().grammar_matcher();
                     for (index, byte) in output.bytes().enumerate() {
-                        grammar.commit(u32::from(byte)).unwrap_or_else(|e| panic!("format {format}, effort {effort}, prefilled {prefilled}, index {index}, prefix {:?}: {e}", &output[..index]));
+                        grammar.consume_token(u32::from(byte)).unwrap_or_else(|e| panic!("format {format}, effort {effort}, prefilled {prefilled}, index {index}, prefix {:?}: {e}", &output[..index]));
                     }
-                    assert!(grammar.is_complete().unwrap());
+                    assert!(grammar.is_accepting().unwrap());
                     for split in 0..=output.len() {
                         let mut parser = plan.create_parser().unwrap();
                         parser

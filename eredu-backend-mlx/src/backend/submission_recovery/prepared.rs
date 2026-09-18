@@ -48,7 +48,9 @@ impl<T: Retention, C: Send + 'static> PreparedRecovery<T, C> {
             seal_attempted: false,
             seal_finished: false,
             callback_failed: Cell::new(false),
+            last_status: Cell::new(None),
             retention,
+            registration: None,
         })));
         Ok(Self {
             node: Some(node),

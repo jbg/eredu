@@ -56,10 +56,10 @@ mod original_operations;
 pub(crate) use original_operations::{
     RealtimeNeuralPlan,QualifiedRealtimeNeuralPlan,RealtimeNeuralOwner,
     RealtimeLayerwisePlan,QualifiedRealtimeLayerwisePlan,
-    gguf_host_typed, ActivePredictionModuleBank, OriginalOperationBankOwner, OriginalOperationPlan,
+    gguf_host_typed, ActivePredictionModuleBank, OriginalOperationActivation, OriginalOperationBankOwner, OriginalOperationPlan,
     OriginalOperationAccess, OriginalResidencyAttempt, OriginalSelectedResidencyAttempt, OriginalSelectedResidencyAccess, PreparedSelectedResidencyAccess,
     OriginalOperationRegistration, PredictionModuleCall, PredictionModulePlan,
-    PredictionModuleProjection, PreparedPredictionModuleBank, RegisteredOriginalScope,
+    PredictionModuleProjection, PreparedPredictionModuleBank, RegisteredOriginalScope, RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause,
     ResidentNeuralPlan, SelectedOriginalOperationPlan, SpeculativeNeuralOwner, SpeculativeSourcePartition,
 };
 
@@ -174,13 +174,21 @@ struct MlxDenseExecution {
 mod resident;
 pub use resident::{MlxResidentPolicy, MlxResidentUnit};
 
+mod exclusions;
+pub use exclusions::MlxParameterExclusions;
 mod host_workspace;
+mod parameter_constructors;
+pub(crate) use parameter_constructors::ParameterConstructors;
 pub(crate) use host_workspace::{
     DiskLayerwiseReceipt, LayerwiseWorkspace, LayerwiseWorkspaceIdentity,
 };
 
 /// Statically dispatched parameter population used by the MLX policy.
 pub trait MlxUnitPopulator<U> {
+    /// Immutable selection shared with cold binding; absent rows are never an
+    /// exclusion certificate. Retaining this Arc performs no allocation.
+    fn prepared_parameter_exclusions(&self) -> Option<&MlxParameterExclusions> { None }
+
     /// Whether the selected populator imports the prepared lease unchanged.
     /// This is a source declaration, not proof of residency or native readiness.
     /// Custom overrides remain unqualified until they describe their own source.
@@ -266,15 +274,19 @@ impl<U> MlxUnitPopulator<U> for () {
 /// Exact parameter exclusions for units with independently stored members.
 #[derive(Clone)]
 pub struct MlxSelectiveUnitPopulator {
-    excluded: Arc<BTreeSet<String>>,
+    excluded: MlxParameterExclusions,
     replacements: Arc<std::collections::BTreeMap<String, MlxTensor>>,
 }
 
 impl MlxSelectiveUnitPopulator {
+    pub(crate) fn from_prepared(excluded: MlxParameterExclusions) -> Self {
+        Self { excluded, replacements: Arc::new(std::collections::BTreeMap::new()) }
+    }
+
     /// Creates one generic logical-parameter exclusion set.
     pub fn new(excluded: BTreeSet<String>) -> Self {
         Self {
-            excluded: Arc::new(excluded),
+            excluded: MlxParameterExclusions::ordinary(excluded),
             replacements: Arc::new(std::collections::BTreeMap::new()),
         }
     }
@@ -284,14 +296,18 @@ pub(super) struct ParameterPublisher<'a>(
     pub(super) &'a std::collections::BTreeMap<String, MlxTensor>,
 );
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
-        if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+        if let Some(replacement) = self.0.get(metadata.id().as_str()) {
             *value = replacement.clone();
         }
     }
 }
 
 impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
+    fn prepared_parameter_exclusions(&self) -> Option<&MlxParameterExclusions> {
+        Some(&self.excluded)
+    }
+
     fn preserves_prepared_parameter_source(&self) -> bool {
         // Exclusions remove independently owned parameters from both the exact
         // prepared bindings and populate_original's lease visitor. Every value
@@ -311,7 +327,7 @@ impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
     {
         // Replacement handles are a distinct producer from lease imports.
         // The selected prepared host source currently carries no overrides.
-        if !self.replacements.is_empty() {
+        if !self.replacements.is_empty() || !self.excluded.is_source_funded() {
             return Err(Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             ));
@@ -569,20 +585,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 std::num::NonZeroUsize::new(self.window_depth).expect("validated window depth"),
             )
             .expect("validated window ordinal");
-        if let Some(persistent) = self.residency.original_foreground_persistent_units() {
-            for (index, id) in self.unit_ids.iter().enumerate() {
-                if !range.contains(&index) && !persistent.clone().any(|owner| owner == id) {
-                    self.residency.evict(id, MemoryTier::Device)?;
-                }
-            }
-        } else {
-            let persistent = self.residency.admitted_disk_persistent_units();
-            for (index, id) in self.unit_ids.iter().enumerate() {
-                if !range.contains(&index) && !persistent.contains(id) {
-                    self.residency.evict(id, MemoryTier::Device)?;
-                }
-            }
-        }
+        self.residency.trim_device_units(&self.unit_ids, &self.unit_ids[range])?;
         Ok(())
     }
 
@@ -839,11 +842,11 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::Other(Box::new(error)))?;
+        .map_err(|error| Error::Other(Box::new(error)))?.into_owned();
     let counts = (0..graph.groups().len())
         .map(|group| {
             architecture
-                .group_unit_count(group)
+                .group_unit_count(group, None)
                 .map_err(|error| Error::Other(Box::new(error)))
         })
         .collect::<Result<Vec<_>, _>>()?;

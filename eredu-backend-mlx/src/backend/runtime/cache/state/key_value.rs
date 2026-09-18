@@ -320,7 +320,7 @@ fn empty_resident_kv_layer(window: Option<i32>) -> MlxKeyValueLayerState {
     })
 }
 
-impl eredu_runtime::working_memory::ResidentKvResetState for MlxKeyValueState {
+impl eredu_runtime::working_memory::ResidentTableResetState for MlxKeyValueState {
     type Layer = MlxKeyValueLayerState;
     type ResetPlan = original_reset::MlxPagedResetPlan;
     type ResetContext = original_reset::MlxPagedResetContext;
@@ -332,12 +332,13 @@ impl eredu_runtime::working_memory::ResidentKvResetState for MlxKeyValueState {
     fn prepare_resident_reset_context(
         &self,
         plan: &Self::ResetPlan,
-        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Self::ResetContext, eredu_core::BackendFailure> {
         self.prepare_original_reset(plan, funding)
     }
     fn validate_resident_reset_placement(
         layer: &Self::Layer,
+        _role: eredu_core::cache::StateComponentRole,
         placement: eredu_runtime::StateComponentPlacement,
     ) -> bool {
         matches!(
@@ -404,6 +405,7 @@ impl eredu_runtime::working_memory::ResidentKvResetState for MlxKeyValueState {
         }
     }
     fn from_resident_reset(
+        _context: &mut Self::ResetContext,
         layout: eredu_runtime::SharedStateLayout,
         global_layer_start: usize,
         layers: eredu_runtime::HostSlotTable<Self::Layer>,

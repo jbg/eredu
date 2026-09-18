@@ -135,6 +135,7 @@ impl PreparedInferenceBlueprint {
         request: &ExternalPredictionCaptureRequest,
         paths: &SharedLayeredObservationPaths,
         input: &WorkspaceTensor,
+        media: Option<OriginalMediaWorkspaceInput>,
         state: &ResidentState,
         context: &WorkspaceContext,
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
@@ -184,6 +185,10 @@ impl PreparedInferenceBlueprint {
             ));
         }
         let trace = std::cell::RefCell::new(trace);
+        context.charge_metadata(std::mem::size_of::<std::cell::RefCell<Option<OriginalMediaWorkspaceInput>>>())
+            .map_err(|cause| PreparedExecutionError::Metadata(cause.into()))?;
+        let has_media = media.is_some();
+        let media = std::cell::RefCell::new(media);
         EquationVisitor {
             geometry,
             state,
@@ -193,7 +198,7 @@ impl PreparedInferenceBlueprint {
             unpriced_execution: None,
             observation: None,
             trace: Some(EquationTraceRef(&trace)),
-            media: None,
+            media: has_media.then_some(MediaEquationRef { input: &media, intervals: None }),
             input_dtype: Some(input_dtype),
             target_capture: false,
                 routed_pass: None,

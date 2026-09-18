@@ -35,6 +35,7 @@ pub use outer_observer::observe_embedded_tensor_ordinary;
 pub use logit_block::{EmbeddedPredictionLogitBlock, EmbeddedPredictionTensor};
 pub use prepared_copy::{PreparedEmbeddedCopy, PreparedEmbeddedCopyError, PreparedEmbeddedCopyProvider, PreparedEmbeddedEvidence, PreparedEmbeddedPayload, PreparedEmbeddedState};
 pub use capture::{speculative_capture_scope, SpeculativeActivationExecution};
+pub(crate) use capture::{resolve_scope,ScopeError};
 
 /// Observation path for the physical target capture consumed by embedded prediction.
 pub const EMBEDDED_TARGET_CAPTURE_PATH: &str = "embedded_prediction.target_capture";
@@ -1458,7 +1459,7 @@ where
 
     /// Crosses the shared neural driver boundary, preserving typed custody.
     fn neural_cause_with_context<E:std::error::Error+Send+Sync+'static>(error:E, _context:M::Context<'_>) -> eredu_nn::Error {
-        eredu_nn::Error::backend_source(error)
+        eredu_nn::Error::backend_retained_source(error)
     }
 
     /// The observer bridge retains the actual failure separately from its marker.
@@ -2131,7 +2132,7 @@ where
         let tokens=M::prefill_token_packet(tokens,Some(&output.tokens),context)?;
         let next = M::token_range_packet(&tokens,1,sequence,context)?;
         let checkpoint = cache.prediction_fork().map_err(N::session_failure)?;
-        let tensor_context = N::target_context(context);
+        let _tensor_context = N::target_context(context);
         let equation = PredictionEquation::Prefill { target_capture: output.capture(), hidden: &*hidden, tokens: &*next };
         let result = M::with_tensor_source(target_source.as_ref(),context,|context|
             M::with_tensor_source(hidden.evidence(),context,|context|
@@ -2209,7 +2210,7 @@ where
         context: M::Context<'a>,
         observer: Option<&mut dyn SpeculativeActivationObserver<B::Tensor, M::Error>>,
     ) -> Result<(M::Logits, B::Tensor), M::Error> {
-        let tensor_context = N::target_context(context);
+        let _tensor_context = N::target_context(context);
         let equation = PredictionEquation::Sequential { hidden: capture, token: last_token, depth };
         observation::neural_with_error(
             observer,
@@ -2266,7 +2267,7 @@ where
             // above; no fused invocation exists to instrument for this strategy.
             return Ok(None);
         }
-        let tensor_context = N::target_context(context);
+        let _tensor_context = N::target_context(context);
         let equation = PredictionEquation::Fused { anchor: last_token, capacity };
         if observer.is_some() {
             // Retain all temporary proposal cache members through the same
@@ -2342,7 +2343,7 @@ where
         self.extension
             .validate_capture(self.selected, &lane, N::shape(captures))
             .map_err(|cause|N::session_cause_with_context(cause,context))?;
-        let tensor_context = N::target_context(context);
+        let _tensor_context = N::target_context(context);
         let equation = PredictionEquation::Replay { captures, tokens };
         observation::neural_with_error(
             observer,

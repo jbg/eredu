@@ -64,7 +64,7 @@ impl Aggregate {
             )?;
         }
         let controls = PreparedSpeculativePrefillReductions::retained_control_bytes::<
-            WorkspaceMetadataFunding,
+            HostMetadataFunding,
         >()
         .and_then(|n| usize::try_from(n).ok())
         .ok_or(ConstructionError::Overflow)?;
@@ -234,3 +234,5 @@ impl OriginalSpeculativeCapture {
         self.reduction_geometry = None;
     }
 }
+
+use eredu_nn::workspace::WorkspaceMetadataAllocation;

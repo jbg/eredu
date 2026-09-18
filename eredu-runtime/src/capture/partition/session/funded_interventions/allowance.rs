@@ -15,7 +15,7 @@ pub struct PartitionInterventionLocalAllowance {
     pub(super) prediction: u64,
     pub(super) identity: Arc<Identity>,
     pub(super) source: OriginalInterventionSource,
-    pub(super) metadata: WorkspaceMetadataFunding,
+    pub(super) metadata: HostMetadataFunding,
     pub(super) spent: bool,
     pub(super) charges: u8,
     pub(super) validated: bool,
