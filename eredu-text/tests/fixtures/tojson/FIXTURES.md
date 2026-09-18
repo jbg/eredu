@@ -7,5 +7,6 @@ The positional argument order is `ensure_ascii, indent, separators, sort_keys`.
 
 The fixtures cover recursive map ordering, default and explicit separators,
 numeric/string/boolean indentation, Unicode and HTML characters, string escaping,
-empty containers, scalar values, and floating-point notation. Tests consume the
+empty containers, scalar values, floating-point notation, shortest-decimal
+rounding, subnormals and the largest finite float. Tests consume the
 stored outputs without requiring Python, a checkpoint, or a native backend.
