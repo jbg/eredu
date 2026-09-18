@@ -117,7 +117,8 @@ impl RegisteredControllerStorage {
         &self.pool
     }
 
-    /// Unique source allocation capacity, including spare mask or byte storage.
+    /// Unique source admission allowance. Filters and byte buffers use exact
+    /// capacity; compiled declarations may include estimated dependency storage.
     pub fn source_bytes(&self) -> u64 {
         self.contract.shared_bytes
     }
@@ -189,7 +190,7 @@ impl WorkingMemoryPool {
         source: SharedControllerSource<'_>,
     ) -> Result<(), ControllerStorageError> {
         let bytes = source
-            .capacity_bytes()
+            .admission_bytes()
             .ok_or(WorkingMemoryError::UnknownBound)?;
         if bytes != 0 {
             let identity = source.identity().clone();
@@ -243,7 +244,7 @@ impl ControllerStorageContract {
         Ok(())
     }
 
-    /// Rechecks completeness and exact identity/capacity before preparation or
+    /// Rechecks completeness and exact identity/admission allowance before preparation or
     /// a controller callback. Equal values and totals do not identify storage.
     pub fn validate<C: TokenFilterController>(
         &self,
@@ -265,7 +266,7 @@ impl ControllerStorageContract {
     }
 
     /// Pins this exact inventory only when every nonzero source is already
-    /// registered in the supplied pool at its full capacity. Rejection creates
+    /// registered in the supplied pool at its full allowance. Rejection creates
     /// no partial pin and changes neither known usage nor historical peak.
     ///
     /// Zero-byte source identities still participate in contract validation,
@@ -422,7 +423,7 @@ fn inventory_from_declaration(
                 SharedControllerSource::Declaration(_) => SourceKind::Declaration,
             },
             bytes: source
-                .capacity_bytes()
+                .admission_bytes()
                 .ok_or(WorkingMemoryError::UnknownBound)?,
         };
         if let Some((previous, _)) = inventory.insert(source.identity().clone(), (evidence, source))

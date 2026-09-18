@@ -33,6 +33,33 @@ struct DeclaredController {
     sources: Vec<SharedControllerDeclaration>,
     additional: u64,
 }
+
+#[test]
+fn estimated_declaration_admission_preserves_unknown_capacity_and_alias_custody() {
+    struct Opaque;
+    impl ControllerDeclarationData for Opaque {
+        fn owned_capacity_bytes(&self) -> Option<u64> { None }
+        fn admission_bytes(&self) -> Option<u64> { Some(73) }
+    }
+    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let source = pool.prepare_shared_controller_declaration(|| Ok(Opaque)).unwrap();
+    assert_eq!(source.capacity_bytes(), None);
+    assert_eq!(source.admission_bytes(), Some(73));
+    let alias = source.clone();
+    let mut controller = DeclaredController { sources: vec![source.clone(), source], additional: 73 };
+    let contract = ControllerStorageContract::inspect(&controller).unwrap();
+    assert_eq!(contract.shared.len(), 1);
+    assert_eq!(contract.shared_bytes, 73);
+    contract.validate_workspace(controller.inference_workspace(1).unwrap()).unwrap();
+    controller.additional = 72;
+    assert!(matches!(contract.validate_workspace(controller.inference_workspace(1).unwrap()),
+        Err(ControllerStorageError::UnpricedSharedStorage { required_bytes: 73, available_bytes: 72 })));
+    assert_eq!(balances(&pool), (0, 73, 73));
+    drop((contract, controller));
+    assert_eq!(balances(&pool), (0, 73, 73));
+    drop(alias);
+    assert_eq!(balances(&pool), (0, 0, 73));
+}
 impl TokenFilterController for DeclaredController {
     type Error = Infallible;
     fn inference_storage(&self) -> TextControllerStorage<'_> {

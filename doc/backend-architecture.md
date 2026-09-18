@@ -473,6 +473,13 @@ records pristine parity and the derived storage reduction separately from whole
 request cost and device execution.
 
 Tokenizer matching and encoding use one implementation with explicit cache policy.
+`ControllerDeclarationData::admission_bytes` supplies the fixed planning allowance
+for opaque compiled declarations. Their `owned_capacity_bytes` remains unknown;
+exact filter and byte-buffer capacities retain their existing contracts. Runtime
+deduplicates admission by the same immutable source identity and retains its
+charge until final retirement. This allowance is not a measured heap inventory
+or a dependency memory ceiling.
+
 The pinned dependencies own parser/table growth and their qualified allocation
 facts. Grammar, schema and tokenizer sources share immutable paid graphs; mutable
 parser/history/copy state is independently admitted. Compilation receipts bind

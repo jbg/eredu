@@ -444,6 +444,15 @@ impl SharedControllerSource<'_> {
         }
     }
 
+    /// Planning allowance for the source. Byte buffers and filters report exact
+    /// capacity; opaque declaration storage may use a configured estimate.
+    pub fn admission_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Declaration(value) => value.admission_bytes(),
+            _ => self.capacity_bytes(),
+        }
+    }
+
     /// Uses the closed owner's accounting protocol. The provider restrictions
     /// and destruction guarantees of `SharedControllerBytes::try_attach` apply.
     pub fn try_attach<E>(

@@ -20,6 +20,14 @@ pub trait ControllerDeclarationData: Send + Sync + 'static {
     /// Exact independently owned retained allocation bytes, or unknown.
     /// This query must be allocation-free and must not inspect external state.
     fn owned_capacity_bytes(&self) -> Option<u64>;
+
+    /// Fixed planning allowance for this immutable owner. The default uses its
+    /// exact capacity. A producer containing opaque dependency storage may
+    /// instead return a configured estimate while leaving capacity unknown.
+    /// Estimates do not establish a dependency or process memory ceiling.
+    fn admission_bytes(&self) -> Option<u64> {
+        self.owned_capacity_bytes()
+    }
 }
 struct Inner<T> {
     value: T,
@@ -46,6 +54,10 @@ fn capacity<T: ControllerDeclarationData>(owner: &ErasedSharedStorageOwner) -> O
         .value
         .owned_capacity_bytes()
 }
+fn admission<T: ControllerDeclarationData>(owner: &ErasedSharedStorageOwner) -> Option<u64> {
+    owner.downcast_ref::<Inner<T>>().expect("closed declaration type")
+        .value.admission_bytes()
+}
 fn retains_funding<T: ControllerDeclarationData>(
     owner: &ErasedSharedStorageOwner, funding: &super::super::HostMetadataFunding,
 ) -> bool {
@@ -60,6 +72,7 @@ pub struct SharedControllerDeclaration {
     owner: ErasedSharedStorageOwner,
     custody: fn(&ErasedSharedStorageOwner) -> &SharedStorageCustody,
     capacity: fn(&ErasedSharedStorageOwner) -> Option<u64>,
+    admission: fn(&ErasedSharedStorageOwner) -> Option<u64>,
     retains_funding: fn(&ErasedSharedStorageOwner, &super::super::HostMetadataFunding) -> bool,
 }
 impl SharedControllerDeclaration {
@@ -127,6 +140,7 @@ impl SharedControllerDeclaration {
             .erase(),
             custody: custody::<T>,
             capacity: capacity::<T>,
+            admission: admission::<T>,
             retains_funding: retains_funding::<T>,
         }
     }
@@ -143,6 +157,11 @@ impl SharedControllerDeclaration {
     /// Actual completed capacity supplied by the closed declaration producer.
     pub fn capacity_bytes(&self) -> Option<u64> {
         (self.capacity)(&self.owner)
+    }
+    /// Fixed planning allowance, which may include estimated dependency storage.
+    /// Use `capacity_bytes` when exact retained allocation capacity is needed.
+    pub fn admission_bytes(&self) -> Option<u64> {
+        (self.admission)(&self.owner)
     }
     /// Whether both handles retain the same declaration allocation owner.
     pub fn same_storage(&self, other: &Self) -> bool {
