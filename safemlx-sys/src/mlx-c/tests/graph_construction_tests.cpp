@@ -5423,3 +5423,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "cpu_affine_converter_tests.cpp"
 
 #include "affine_construction_tests.cpp"
+
+#include "mxfp4_construction_tests.cpp"

@@ -100,6 +100,33 @@ impl AffineQuantizeConstructionLayout {
     }
 }
 
+/// CPU MXFP4 group-32/four-bit frontend through the shared resident graph bank.
+/// The six eager constant requests need separately admitted physical backing;
+/// source custody, Eval and completion resources are not included here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuMxFp4QuantizeConstructionLayout {
+    native: safemlx_sys::mlx_cpu_mxfp4_quantize_construction_layout,
+}
+impl CpuMxFp4QuantizeConstructionLayout {
+    /// Bound for potential frontend nodes, including identity candidates.
+    pub fn graph(self) -> ResidentGraphLayout {
+        ResidentGraphLayout { native: self.native.graph, additional_shells: 0 }
+    }
+    /// Eager constant payloads in constructor order; apply the actual allocator's
+    /// request layout to each entry before creating the bound physical budget.
+    pub fn seed_request_bytes(self) -> [usize; 6] { self.native.seed_request_bytes }
+    /// Named native, C and safe query/constructor transports, including the
+    /// resident graph driver's control bytes. This is not a process memory ceiling.
+    pub fn control_bytes(self) -> Option<usize> {
+        use std::mem::{size_of,size_of_val};
+        let parts=[self.graph().control_bytes()?,size_of::<Self>(),size_of::<Option<Self>>(),
+            size_of::<crate::Dtype>(),size_of::<usize>()*3,
+            size_of::<<crate::ops::QuantizedArrays as crate::utils::guard::Guarded>::Guard>(),
+            size_of::<crate::ops::QuantizedArrays>(),size_of::<Result<crate::ops::QuantizedArrays>>()];
+        parts.into_iter().try_fold(self.native.named_control_bytes.checked_add(size_of_val(&parts))?,usize::checked_add)
+    }
+}
+
 /// Once-owned physical reservation in an existing exact role. Drop frees unused
 /// blocks before releasing the retained role; consumed blocks keep their birth.
 /// This owner must retire before entering Eval and creates no work authority.
@@ -156,6 +183,17 @@ impl PreparedResidentGraph {
 }
 
 impl OperationEvent {
+    /// Query the CPU MXFP4 frontend for positive F16/BF16/F32 geometry. Rows is
+    /// the product of all leading dimensions; columns must be divisible by 32.
+    pub fn cpu_mxfp4_quantize_construction_layout(dtype: crate::Dtype,
+        rank: usize, rows: usize, columns: usize) -> Option<CpuMxFp4QuantizeConstructionLayout> {
+        let mut native=safemlx_sys::mlx_cpu_mxfp4_quantize_construction_layout::default();
+        // SAFETY: scalar-only query writes initialized output only on success.
+        unsafe { safemlx_sys::mlx_operation_event_cpu_mxfp4_quantize_construction_layout(
+            &mut native,dtype.into(),rank,rows,columns) }
+            .then_some(CpuMxFp4QuantizeConstructionLayout { native })
+    }
+
     /// Query the actual fixed affine constructor, including its three results.
     pub fn affine_quantize_construction_layout(rank: usize) -> Option<AffineQuantizeConstructionLayout> {
         let mut native = safemlx_sys::mlx_affine_quantize_construction_layout::default();
@@ -536,6 +574,35 @@ mod affine_construction_tests {
         }
         for rank in [0, 1, usize::MAX] {
             assert!(OperationEvent::affine_quantize_construction_layout(rank).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mxfp4_construction_tests {
+    use super::*;
+    #[test]
+    fn cpu_mxfp4_quantize_construction_tracks_seed_precision_and_geometry() {
+        let qualified=OperationEvent::resident_graph_layout(1,0,3).is_some();
+        for dtype in [crate::Dtype::Float16,crate::Dtype::Bfloat16,crate::Dtype::Float32] {
+            for rank in [2,3,4,11,21] {
+                let layout=OperationEvent::cpu_mxfp4_quantize_construction_layout(dtype,rank,2,64);
+                assert_eq!(layout.is_some(),qualified);
+                if let Some(layout)=layout {
+                    let scalar=if dtype==crate::Dtype::Float32 {4} else {2};
+                    assert_eq!(layout.seed_request_bytes(),[scalar,scalar,scalar,4,64,4]);
+                    assert_eq!(layout.graph().seeds(),6);
+                    assert!(layout.graph().allocation_extents()>0);
+                    assert!(layout.control_bytes().unwrap()>0);
+                }
+            }
+        }
+        for (dtype,rank,rows,columns) in [
+            (crate::Dtype::Float64,2,2,64),(crate::Dtype::Int32,2,2,64),
+            (crate::Dtype::Float32,1,2,64),(crate::Dtype::Float32,2,0,64),
+            (crate::Dtype::Float32,2,2,33),(crate::Dtype::Float32,2,usize::MAX,64),
+        ] {
+            assert!(OperationEvent::cpu_mxfp4_quantize_construction_layout(dtype,rank,rows,columns).is_none());
         }
     }
 }

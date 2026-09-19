@@ -7453,3 +7453,16 @@ pub struct mlx_affine_quantize_construction_layout {
     pub graph_extents: usize,
     pub named_control_bytes: usize,
 }
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct mlx_cpu_mxfp4_quantize_construction_layout {
+    pub graph: mlx_resident_graph_layout,
+    pub seed_request_bytes: [usize; 6],
+    pub named_control_bytes: usize,
+}
+unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_mxfp4_quantize_construction_layout(
+        out: *mut mlx_cpu_mxfp4_quantize_construction_layout, dtype: mlx_dtype,
+        rank: usize, rows: usize, columns: usize) -> bool;
+}

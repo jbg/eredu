@@ -1,0 +1,167 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -5137,37 +5137,7 @@
+       {w});
+ }
+ 
+-ArrayVector fp_quantize(
+-    const array& w,
+-    int group_size,
+-    int bits,
+-    QuantizationMode mode,
+-    const std::optional<array>& global_scale /* = std::nullopt */,
+-    Stream s) {
+-  int expected_gs = mode == QuantizationMode::Nvfp4 ? 16 : 32;
+-  int expected_bits = mode == QuantizationMode::Mxfp8 ? 8 : 4;
+-  if (group_size != expected_gs) {
+-    std::ostringstream msg;
+-    msg << "[quantize] " << quantization_mode_to_string(mode)
+-        << " quantization requires group size " << expected_gs << " but got "
+-        << group_size << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (bits != expected_bits) {
+-    std::ostringstream msg;
+-    msg << "[quantize] " << quantization_mode_to_string(mode)
+-        << " quantization requires bits to be " << expected_bits << " but got "
+-        << bits << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  auto inputs = ArrayVector{w};
+-  if (global_scale.has_value()) {
+-    inputs.push_back(global_scale.value());
+-  }
+-
+-  auto fallback = [bits = bits, group_size = group_size, s](
+-                      const ArrayVector& inputs) -> ArrayVector {
++ArrayVector FpQuantizeFallback::operator()(const ArrayVector& inputs) const {
+     auto& w = inputs[0];
+     float maxval = (bits == 4) ? 6.0f : 448.0f;
+     auto new_shape = w.shape();
+@@ -5227,7 +5197,38 @@
+     wq = reshape(wq, new_shape, s);
+     scales = reshape(scales, new_shape, s);
+     return {std::move(wq), std::move(scales)};
+-  };
++}
++
++ArrayVector fp_quantize(
++    const array& w,
++    int group_size,
++    int bits,
++    QuantizationMode mode,
++    const std::optional<array>& global_scale /* = std::nullopt */,
++    Stream s) {
++  int expected_gs = mode == QuantizationMode::Nvfp4 ? 16 : 32;
++  int expected_bits = mode == QuantizationMode::Mxfp8 ? 8 : 4;
++  if (group_size != expected_gs) {
++    std::ostringstream msg;
++    msg << "[quantize] " << quantization_mode_to_string(mode)
++        << " quantization requires group size " << expected_gs << " but got "
++        << group_size << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (bits != expected_bits) {
++    std::ostringstream msg;
++    msg << "[quantize] " << quantization_mode_to_string(mode)
++        << " quantization requires bits to be " << expected_bits << " but got "
++        << bits << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto inputs = ArrayVector{w};
++  if (global_scale.has_value()) {
++    inputs.push_back(global_scale.value());
++  }
++
++  const auto fallback = FpQuantizeFallback{bits,group_size,s};
+ 
+   if (s.device == Device::gpu) {
+     auto wq_shape = w.shape();
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -525,7 +525,8 @@
+       resident_primitive_control<fast::Quantize>(),
+       resident_primitive_control<fast::CustomKernel>(),
+       resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
+-      resident_primitive_control<Negative>(),
++      resident_primitive_control<Negative>(), resident_primitive_control<Abs>(),
++      resident_primitive_control<Round>(),
+       resident_primitive_control<Convolution>(), resident_primitive_control<Pad>(),
+       resident_primitive_control<Softmax>(), resident_primitive_control<StopGradient>(),
+       resident_primitive_control<Arange>(), resident_primitive_control<Cos>(),
+@@ -607,6 +608,46 @@
+   output = value; return true;
+ #endif
+ }
++bool cpu_mxfp4_quantize_construction_layout(Dtype dtype,size_t rank,
++    size_t rows,size_t columns,CpuMxFp4QuantizeConstructionLayout& output) noexcept {
++  if((dtype!=float16&&dtype!=bfloat16&&dtype!=float32)||rank<2||rank>size_t(INT_MAX)||
++      rank>Shape::max_size()||rank>Strides::max_size()||!rows||!columns||columns%32||
++      columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/16/columns)return false;
++  // Each binary frontend may construct two casts, two broadcasts and its
++  // primitive; where may construct three casts/broadcasts and Select. Count
++  // potential identity nodes too, so shape-dependent elision cannot grow this
++  // bound. The seven views include both reduction squeezes and four reshapes.
++  constexpr size_t binary_candidates=8*5;
++  constexpr size_t select_candidates=7;
++  // Cast candidates include log2's input dtype normalization.
++  constexpr size_t unary_candidates=4,cast_candidates=4,view_candidates=7;
++  constexpr size_t reductions=3,ranges=1;
++  constexpr size_t candidates=binary_candidates+select_candidates+unary_candidates+
++      cast_candidates+view_candidates+reductions+ranges;
++  CpuMxFp4QuantizeConstructionLayout value;
++  if(!resident_graph_layout(candidates,6,std::max(rank,size_t(3)),value.graph))return false;
++  // maxval, zero, power base, exponent offset, F32 lookup table, packing base.
++  const size_t requests[]={dtype.size(),dtype.size(),dtype.size(),sizeof(int32_t),
++      16*sizeof(float),sizeof(uint32_t)};
++  std::copy(std::begin(requests),std::end(requests),std::begin(value.seed_request_bytes));
++  // Named quantizer/query frames and a conservative sum of the potential
++  // frontend call transports; descriptor and callable storage is in Graph.
++  const size_t frontend_controls=sizeof(StreamOrDevice)+sizeof(Stream)+sizeof(Dtype)*3+
++      sizeof(array)*3+sizeof(ArrayVector)*3+sizeof(Shape)*4+sizeof(AxisView)*2+
++      sizeof(std::optional<bool>)+sizeof(int)*4+sizeof(size_t)*4;
++  const size_t controls[]={sizeof(value),sizeof(output),sizeof(dtype),sizeof(rank),
++      sizeof(rows),sizeof(columns),sizeof(requests),sizeof(frontend_controls),
++      sizeof(FpQuantizeFallback),sizeof(array)*9,sizeof(ArrayVector)*3,sizeof(Shape)*3,
++      sizeof(StreamOrDevice),sizeof(Stream),sizeof(std::optional<int>)*2,
++      sizeof(std::optional<array>),sizeof(std::string),sizeof(QuantizationMode),
++      sizeof(float),sizeof(int)*4,sizeof(size_t)*3};
++  size_t frames=0;
++  if(!resident_multiply(candidates,frontend_controls,frames))return false;
++  value.named_control_bytes=sizeof(controls)+sizeof(size_t);
++  if(!add(value.named_control_bytes,frames,value.named_control_bytes))return false;
++  for(size_t bytes:controls)if(!add(value.named_control_bytes,bytes,value.named_control_bytes))return false;
++  output=value;return true;
++}
+ GraphFailure GraphConstruction::create_resident(GraphQuota& quota, uint64_t scope,
+     const ResidentGraphLayout& layout, GraphConstruction*& output) noexcept {
+   const auto context = current_graph_construction_context();
+diff --git a/mlx/quantize_construction.h b/mlx/quantize_construction.h
+--- a/mlx/quantize_construction.h
++++ b/mlx/quantize_construction.h
+@@ -8,7 +8,21 @@
+   Stream s;
+   ArrayVector operator()(const ArrayVector& inputs);
+ };
++struct FpQuantizeFallback {
++  int bits, group_size;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs) const;
++};
+ namespace submission {
++struct CpuMxFp4QuantizeConstructionLayout {
++  ResidentGraphLayout graph;
++  size_t seed_request_bytes[6]{};
++  size_t named_control_bytes{0};
++};
++// CPU group-32/four-bit frontend, with six eager constants. Eval, source
++// custody and the physical capacities of these requests remain separate.
++MLX_API bool cpu_mxfp4_quantize_construction_layout(Dtype,size_t rank,
++    size_t rows,size_t columns,CpuMxFp4QuantizeConstructionLayout&) noexcept;
+ struct AffineQuantizeConstructionLayout : GraphConstructionLayout {
+   size_t rank{0};
+ };

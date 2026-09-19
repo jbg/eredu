@@ -314,6 +314,15 @@ unsigned mlx_operation_event_prepare_resident_graph_with_shells(void**, mlx_subm
     size_t additional_shells);
 void mlx_operation_event_finish_resident_graph(void*);
 
+typedef struct mlx_cpu_mxfp4_quantize_construction_layout_ {
+  mlx_resident_graph_layout graph;
+  size_t seed_request_bytes[6];
+  size_t named_control_bytes;
+} mlx_cpu_mxfp4_quantize_construction_layout;
+bool mlx_operation_event_cpu_mxfp4_quantize_construction_layout(
+    mlx_cpu_mxfp4_quantize_construction_layout*,mlx_dtype,size_t rank,size_t rows,size_t columns);
+
+
 
 
 // A finite prepared Record destination, including the selected Synchronizer.

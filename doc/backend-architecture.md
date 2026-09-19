@@ -794,8 +794,13 @@ ordinary allocator calls during that construction. Fixed C result handles feed
 the same safe Rust quantization API for ordinary and prepared calls; failure
 leaves each published prefix under its result guard. Graph quota extents include
 alignment headroom; they are not a process-wide memory ceiling.
-Eval, physical buffers, source preparation, streams and composed MXFP4 graph
-construction require separate admission. Failed allocation prefixes retain their
+CPU MXFP4 construction uses the same resident bank, with a source-derived bound
+for binary/Select casts and broadcasts, unary operators, views, reductions and
+range construction. Its six eager constants expose individual payload requests;
+their physical capacities are admitted separately with the selected allocator.
+The bank also covers the two fixed C result handles. Identity elision may consume
+less than the reserved population. Eval, physical buffers, source preparation
+and streams require separate admission. Failed allocation prefixes retain their
 accounts without publishing failed outputs as completed values.
 CPU-only event dispatch quotes use the actual named wait and signal tasks,
 including their retained Event owners and Graph allocator extents. No GPU
