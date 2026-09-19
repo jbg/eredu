@@ -814,6 +814,15 @@ The bank also covers the two fixed C result handles. Identity elision may consum
 less than the reserved population. Eval, physical buffers, source preparation
 and streams require separate admission. Failed allocation prefixes retain their
 accounts without publishing failed outputs as completed values.
+A shared CPU MXFP4 submission layout composes the constructor population with
+existing typed worker queries, exact output roots, the completion Synchronizer
+and finite traversal storage. It prices every potential frontend candidate with
+the largest applicable worker layout, so identity elision and donation cannot
+increase its allowance. Fresh Graph and Record capacities cover one detached,
+completed input and two output roots on the same CPU stream. Physical buffers,
+input custody, arena owners, runtime/stream/cache setup, failure ownership and
+encoded host outputs remain separate contributions. Completed output access
+uses the original scope's read-only completed view rather than another evaluation.
 CPU-only event dispatch quotes use the actual named wait and signal tasks,
 including their retained Event owners and Graph allocator extents. No GPU
 handler allocation is included in that CPU-only backend's query.

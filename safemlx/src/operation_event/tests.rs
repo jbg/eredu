@@ -3,6 +3,7 @@ use super::*;
 mod eval_traversal;
 mod exact_roots;
 mod graph_construction;
+mod quantize_submission;
 mod original_array;
 mod owned_host_copy;
 mod prepared_clones;
@@ -31,11 +32,14 @@ impl Original {
         Self::with_failure_owner(())
     }
     fn with_failure_owner(owner: impl Send + 'static) -> Self {
-        let graph = PreparedSubmissionGraphQuota::try_new(GRAPH_CAPACITY, ())
+        Self::with_capacities(owner, GRAPH_CAPACITY, 1 << 20)
+    }
+    fn with_capacities(owner: impl Send + 'static, graph_bytes: usize, record_bytes: usize) -> Self {
+        let graph = PreparedSubmissionGraphQuota::try_new(graph_bytes, ())
             .unwrap()
             .try_allocate()
             .unwrap();
-        let records = PreparedSubmissionRecordQuota::try_new(1 << 20, ())
+        let records = PreparedSubmissionRecordQuota::try_new(record_bytes, ())
             .unwrap()
             .try_allocate()
             .unwrap();
