@@ -353,6 +353,7 @@ fn transform_target(
         rows,
         columns,
         output_row_bytes,
+        live_output_row_bytes,
         output_bytes,
         one_row_source_bytes,
         source_bytes,
@@ -407,7 +408,7 @@ fn transform_target(
                 let candidate_elements = candidate_rows
                     .checked_mul(columns)
                     .ok_or_else(|| quantization_error("leading batch element count overflow"))?;
-                let candidate_output_bytes = output_row_bytes
+                let candidate_output_bytes = live_output_row_bytes
                     .checked_mul(candidate_rows as u64)
                     .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
                 let candidate_peak = candidate
@@ -438,7 +439,11 @@ fn transform_target(
                 .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
             let batch_peak = recipe
                 .peak_materialization_bytes(source)?
-                .checked_add(batch_output_bytes)
+                .checked_add(
+                    live_output_row_bytes
+                        .checked_mul(batch_rows as u64)
+                        .ok_or_else(|| quantization_error("leading batch live output size overflow"))?,
+                )
                 .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
             if batch_peak > tile_budget {
                 return Err(quantization_error(format!(
@@ -483,7 +488,7 @@ fn transform_target(
                         candidate_end,
                     )?;
                     let candidate_rows = candidate_end - start;
-                    let output_bytes = output_row_bytes
+                    let output_bytes = live_output_row_bytes
                         .checked_mul(candidate_rows as u64)
                         .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
                     let peak = candidate
@@ -505,7 +510,11 @@ fn transform_target(
                     .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
                 let tile_peak = tile_recipe
                     .peak_materialization_bytes(source)?
-                    .checked_add(tile_output_bytes)
+                    .checked_add(
+                        live_output_row_bytes
+                            .checked_mul(tile_rows as u64)
+                            .ok_or_else(|| quantization_error("tile live output size overflow"))?,
+                    )
                     .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
                 if tile_peak > tile_budget {
                     return Err(quantization_error(format!(

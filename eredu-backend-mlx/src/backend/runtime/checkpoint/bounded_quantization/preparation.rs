@@ -11,6 +11,7 @@ pub(super) struct ConversionGeometry {
     pub(super) rows: usize,
     pub(super) columns: usize,
     pub(super) output_row_bytes: u64,
+    pub(super) live_output_row_bytes: u64,
     pub(super) output_bytes: u64,
     pub(super) one_row_source_bytes: u64,
     pub(super) source_bytes: u64,
@@ -261,6 +262,13 @@ fn prepare_target(
             .checked_add(layout.row_bytes)
             .ok_or_else(|| quantization_error("quantized output row size overflow"))
     })?;
+    let live_output_row_bytes = output_row_bytes
+        .checked_add(target.companion_cast_source_row_bytes(
+            plan.quantization,
+            metadata.dtype(),
+            columns,
+        )?)
+        .ok_or_else(|| quantization_error("live quantized output row size overflow"))?;
     let mut one_row_source_bytes = 0u64;
     let mut one_row_peak = 0u64;
     for matrix in 0..leading {
@@ -271,7 +279,7 @@ fn prepare_target(
         one_row_peak = one_row_peak.max(
             one_row
                 .peak_materialization_bytes(source)?
-                .checked_add(output_row_bytes)
+                .checked_add(live_output_row_bytes)
                 .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?,
         );
     }
@@ -304,7 +312,11 @@ fn prepare_target(
     let complete_peak = target
         .source
         .peak_materialization_bytes(source)?
-        .checked_add(output_bytes)
+        .checked_add(
+            live_output_row_bytes
+                .checked_mul(complete_rows as u64)
+                .ok_or_else(|| quantization_error("complete live output size overflow"))?,
+        )
         .ok_or_else(|| quantization_error("complete target working-set overflow"))?;
     let leading_batch_admissible = if row_axis == 1 {
         let one_matrix = target.source.select_bounded(
@@ -315,7 +327,7 @@ fn prepare_target(
                 end: 1,
             },
         )?;
-        let one_matrix_output = output_row_bytes
+        let one_matrix_output = live_output_row_bytes
             .checked_mul(rows as u64)
             .ok_or_else(|| quantization_error("one-matrix output size overflow"))?;
         one_matrix
@@ -338,6 +350,7 @@ fn prepare_target(
             rows,
             columns,
             output_row_bytes,
+            live_output_row_bytes,
             output_bytes,
             one_row_source_bytes,
             source_bytes,

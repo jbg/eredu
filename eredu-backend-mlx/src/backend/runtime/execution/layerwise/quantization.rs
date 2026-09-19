@@ -828,6 +828,13 @@ fn bounded_quantization_working_set(
             .checked_add(companion_row)
             .and_then(|bytes| bytes.checked_add(bias_row))
             .ok_or_else(|| Error::Quantization("packed output row size overflowed".into()))?;
+        let live_output_row = output_row
+            .checked_add(target.companion_cast_source_row_bytes(
+                quantization,
+                metadata.dtype(),
+                columns,
+            )?)
+            .ok_or_else(|| Error::Quantization("live packed output row size overflowed".into()))?;
         output_bytes = output_bytes
             .checked_add(
                 rows.checked_mul(output_row)
@@ -841,7 +848,7 @@ fn bounded_quantization_working_set(
             minimum_tile_bytes = minimum_tile_bytes.max(
                 one_row
                     .peak_materialization_bytes(store)?
-                    .checked_add(output_row)
+                    .checked_add(live_output_row)
                     .ok_or_else(|| Error::Quantization("conversion tile size overflowed".into()))?,
             );
         }

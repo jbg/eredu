@@ -80,6 +80,38 @@ impl BoundedQuantizationTarget {
         }
     }
 
+    /// Original quantizer companions retained by casts to the final precision.
+    /// These bytes are additional live tile payload, not encoded output storage.
+    pub(crate) fn companion_cast_source_row_bytes(
+        &self,
+        quantization: WeightQuantization,
+        source_dtype: &RecipeDtype,
+        columns: usize,
+    ) -> Result<u64, Error> {
+        if !quantization.has_biases() || *source_dtype == self.affine_companion_dtype {
+            return Ok(0);
+        }
+        let scalar_bytes = match source_dtype {
+            RecipeDtype::F16 | RecipeDtype::BF16 => 2,
+            RecipeDtype::F32 => 4,
+            _ => {
+                return Err(quantization_error(
+                    "affine quantizer source must be floating point",
+                ))
+            }
+        };
+        let group_size = u64::try_from(quantization.group_size())
+            .map_err(|_| quantization_error("affine quantizer group size is invalid"))?;
+        let groups = u64::try_from(columns)
+            .ok()
+            .and_then(|columns| columns.checked_div(group_size))
+            .ok_or_else(|| quantization_error("affine quantizer group count overflow"))?;
+        groups
+            .checked_mul(scalar_bytes)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| quantization_error("affine cast source row size overflow"))
+    }
+
     /// Returns the exact packed scale tensor name.
     pub fn scales_name(&self) -> &str {
         &self.scales_name

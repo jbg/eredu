@@ -754,6 +754,11 @@ working set before allocating any final output. Conversion retains those exact
 destinations and uses the same bounded tile worker, including its one- or two-slot
 completion window. The allocation stage has no native stream or tensor dependency.
 Bounded-read validation acquires its payload leases in the conversion stage.
+Affine tile sizing includes the original scales and biases while casts produce
+the selected companion precision, including F16/BF16 casts of equal byte width.
+Cold minimum-row checks, complete targets, leading batches and row candidates use
+that same live-output contribution. Final encoded output telemetry excludes these
+temporary cast sources.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

@@ -173,6 +173,36 @@ fn cold_failure(result: Result<ColdQuantization, Error>) -> Error {
 }
 
 #[test]
+fn load_working_set_includes_cast_sources_without_reading_payloads() {
+    for (source_dtype, output_dtype, expected) in [
+        (safetensors::Dtype::F16, RecipeDtype::F16, 164),
+        (safetensors::Dtype::F16, RecipeDtype::BF16, 168),
+        (safetensors::Dtype::F16, RecipeDtype::F32, 172),
+        (safetensors::Dtype::BF16, RecipeDtype::F16, 168),
+        (safetensors::Dtype::BF16, RecipeDtype::BF16, 164),
+        (safetensors::Dtype::BF16, RecipeDtype::F32, 172),
+        (safetensors::Dtype::F32, RecipeDtype::F16, 300),
+        (safetensors::Dtype::F32, RecipeDtype::BF16, 300),
+        (safetensors::Dtype::F32, RecipeDtype::F32, 296),
+    ] {
+        let source = NoReads(store(1, source_dtype));
+        let target = BoundedQuantizationTarget::from_recipe(
+            WEIGHT,
+            SCALE,
+            Some(BIAS),
+            DerivedWeightRecipe::source(SOURCE, TensorSelection::Full),
+        )
+        .unwrap()
+        .with_affine_companion_dtype(output_dtype)
+        .unwrap();
+        assert_eq!(
+            super::super::bounded_quantization_working_set(&source, &[target], affine()).unwrap(),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn cold_plans_use_real_projection_slots_and_preserve_source_precision_without_reads() {
     for (stored, safe, scalar, expected_affine, expected_mx) in [
         (StoredDtype::F16, safetensors::Dtype::F16, 2, 164, 162),
