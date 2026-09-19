@@ -716,6 +716,12 @@ population. Admitted attempts are finite. An ordinary recovery policy can retry
 only after its required pending owner actually retires. Foreground reads,
 background prefetch and resident borrowing retain their distinct I/O witnesses.
 
+Runtime resolves selected transformation source recipes without native tensors.
+It checks the complete admitted derived output before applying the retained
+rank's additional and primary placements. MLX materialization uses that same
+resolver, then verifies the resulting shape and dtype against its native source
+slots. Recipe resolution reads metadata only and grants no storage admission.
+
 Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
 allocating their metadata and payload. Publication moves those bytes into the
 immutable memory store; leases, detached readers and weak storage identities

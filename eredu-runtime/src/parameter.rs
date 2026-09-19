@@ -19,6 +19,8 @@ use crate::{
 };
 
 mod binding;
+mod transform;
+pub use transform::{resolve_replicated_text_transform_source, TransformSourceError};
 pub use binding::{
     bind_prepared_parameter_values, prepared_parameter_binding_control_bytes,
     PreparedParameterBinding, PreparedParameterBindingError,

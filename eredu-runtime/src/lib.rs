@@ -262,7 +262,8 @@ pub use parameter::{
     bind_prepared_parameter_values, bindings_from_recipe_set, build_exact_replicated_text_bindings,
     build_exact_replicated_text_bindings_for_targets, build_module_binding_plan,
     materialize_bindings, materialize_selected_bindings, preflight_bindings,
-    prepared_parameter_binding_control_bytes, select_bindings,
+    prepared_parameter_binding_control_bytes, resolve_replicated_text_transform_source,
+    select_bindings, TransformSourceError,
 };
 pub use partition::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,

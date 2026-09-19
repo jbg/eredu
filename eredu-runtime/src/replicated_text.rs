@@ -3877,6 +3877,7 @@ pub(crate) fn placement_is_compatible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod transform_source;
     use crate::{
         ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
         ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitecturePartition,

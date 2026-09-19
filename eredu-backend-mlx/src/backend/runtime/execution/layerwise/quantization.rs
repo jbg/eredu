@@ -315,52 +315,16 @@ where
                     "selected materialization task {name:?} is absent from its source module"
                 ))
             })?;
-        let mut recipe = task
-            .source_recipe()
-            .map_err(|error| Error::Quantization(error.to_string()))?;
-        let mut metadata = recipe.infer(store)?;
-        // Admission describes the complete derived source recipe. Validate it
-        // before applying this rank's separately admitted placement. The local
-        // metadata is checked against the actual source module below.
-        if let Some(expected) = task.derived_output() {
-            if expected != &metadata {
-                return Err(Error::Quantization(format!(
-                    "selected materialization task {:?} differs from its admitted derived output",
-                    task.name()
-                )));
-            }
-        }
-        if let Some(layout) = source_layout {
-            let tensor = layout.tensor(task.name()).ok_or_else(|| {
-                Error::Quantization(format!(
-                    "selected materialization task {:?} has no source local placement",
-                    task.name()
-                ))
-            })?;
-            for placement in tensor
-                .additional_placements()
-                .iter()
-                .chain(std::iter::once(tensor.placement()))
-            {
-                let selection =
-                    eredu_runtime::placement_selection(tensor, placement, metadata.shape())
-                        .map_err(|error| Error::Parallel(error.to_string()))?;
-                if selection != TensorSelection::Full {
-                    recipe = recipe.select_bounded(store, selection)?;
-                    metadata = recipe.infer(store)?;
-                }
-            }
-        }
-        if !matches!(
-            metadata.dtype(),
-            RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-        ) || metadata.shape().len() < 2
-        {
-            return Err(Error::Quantization(format!(
-                "selected materialization task {:?} does not resolve to a floating matrix",
-                task.name()
-            )));
-        }
+        let (recipe, metadata) = eredu_runtime::resolve_replicated_text_transform_source(
+            store,
+            task,
+            source_layout,
+        )
+        .map_err(|error| match error {
+            eredu_runtime::TransformSourceError::Task { details } => Error::Quantization(details),
+            eredu_runtime::TransformSourceError::Placement(cause) => Error::Parallel(cause.to_string()),
+            eredu_runtime::TransformSourceError::Recipe(cause) => cause.into(),
+        })?;
         if metadata.shape() != source_shape {
             return Err(Error::Quantization(format!(
                 "selected materialization task {:?} source recipe has shape {:?}, native source module requires {:?}",
