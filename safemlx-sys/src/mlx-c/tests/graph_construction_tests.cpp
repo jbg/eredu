@@ -1393,7 +1393,7 @@ TEST_CASE("CPU reshape source matches scalar aliases and distinguishes actual co
   CHECK(actual.worker_graph_extents==0);CHECK(actual.request_counts[3]==0);CHECK(actual.request_counts[6]==0);
   auto matrix=reshape(source,Shape{2,3},stream);REQUIRE(cpu::reshape_alias_eval_storage(matrix,actual));
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
-  CHECK_FALSE(cpu::reshape_alias_eval_layout(6,0,false,actual));CHECK_FALSE(cpu::reshape_alias_eval_layout(3,6,false,actual));
+  CHECK_FALSE(cpu::reshape_alias_eval_layout(SIZE_MAX,0,false,actual));CHECK_FALSE(cpu::reshape_alias_eval_layout(3,SIZE_MAX,false,actual));
   auto bad_declared=array(Shape{2,3},float32,std::make_shared<Reshape>(stream,Shape{3,2}),{source});
   auto bad_size=array(Shape{2,2},float32,std::make_shared<Reshape>(stream,Shape{2,2}),{source});
   auto bad_type=array(Shape{2,3},uint32,std::make_shared<Reshape>(stream,Shape{2,3}),{source});
@@ -3427,7 +3427,7 @@ TEST_CASE("CPU fixed reshape source preserves collapse decisions and rejects mal
   CHECK_FALSE(cpu::reshape_eval_layout(huge,input.strides().data(),2,small,1,false,actual));
   auto negative=input.strides();negative[1]=-negative[1];
   CHECK_FALSE(cpu::reshape_eval_layout(input.shape().data(),negative.data(),4,copied_shape,3,false,actual));
-  CHECK_FALSE(cpu::reshape_eval_layout(input.shape().data(),input.strides().data(),6,copied_shape,3,false,actual));
+  CHECK_FALSE(cpu::reshape_eval_layout(input.shape().data(),input.strides().data(),SIZE_MAX,copied_shape,3,false,actual));
   CHECK(std::memcmp(&saved,&actual,sizeof(actual))==0);
   mlx_cpu_copy_eval_layout raw{};
   REQUIRE(mlx_operation_event_cpu_reshape_eval_layout(&raw,input.shape().data(),input.strides().data(),4,copied_shape,3,false));
@@ -4355,7 +4355,7 @@ TEST_CASE("CPU byte frame uses exact reshape concatenate slice and alignment sou
   CHECK(actual.backing_births==1);CHECK(actual.allocation_extents==copy.allocation_extents);
   mlx_cpu_copy_eval_layout raw{};REQUIRE(mlx_operation_event_cpu_reshape_copy_eval_layout(&raw,2,1,false));
   CHECK(raw.graph_extents==copy.allocation_extents);CHECK(raw.backing_births==1);
-  auto prior=raw;CHECK_FALSE(mlx_operation_event_cpu_reshape_copy_eval_layout(&raw,6,1,false));
+  auto prior=raw;CHECK_FALSE(mlx_operation_event_cpu_reshape_copy_eval_layout(&raw,SIZE_MAX,1,false));
   CHECK(std::memcmp(&prior,&raw,sizeof(raw))==0);
   eval(flat);const uint8_t flat_expected[]={1,2,3,4,5,6};
   CHECK(std::memcmp(flat.data<uint8_t>(),flat_expected,sizeof(flat_expected))==0);
@@ -5425,3 +5425,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "affine_construction_tests.cpp"
 
 #include "mxfp4_construction_tests.cpp"
+
+#include "ranked_reshape_tests.cpp"

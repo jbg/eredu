@@ -196,14 +196,14 @@ impl OperationEvent {
         unsafe { safemlx_sys::mlx_operation_event_cpu_greedy_eval_layout(&mut native,
             rank, 0, 0, false, tracer) }.then_some(CpuCopyEvalLayout { native })
     }
-    /// Bound the fixed-rank row-contiguous Reshape alias and its actual cleanup.
+    /// Bound a row-contiguous Reshape alias, including rank-dependent strides.
     pub fn cpu_reshape_alias_layout(rank: usize, output_rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: pure scalar query writes initialized output only on success.
         unsafe { safemlx_sys::mlx_operation_event_cpu_reshape_alias_eval_layout(&mut native,
             rank, output_rank, tracer) }.then_some(CpuCopyEvalLayout { native })
     }
-    /// Price the existing fixed-rank Reshape's possible General-copy branch
+    /// Price Reshape's possible General-copy branch and stride storage
     /// when a cold integer layout does not carry stride evidence. Native Eval
     /// still validates the actual complete source geometry and chooses its branch.
     pub fn cpu_reshape_copy_layout(rank: usize, output_rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -212,7 +212,7 @@ impl OperationEvent {
         unsafe { safemlx_sys::mlx_operation_event_cpu_reshape_copy_eval_layout(&mut native,
             rank, output_rank, tracer) }.then_some(CpuCopyEvalLayout { native })
     }
-    /// Same fixed native reshape planner over proved physical strides. The
+    /// Shared borrowed native reshape planner over proved physical strides. The
     /// returned birth count distinguishes the actual copy from a storage alias.
     pub fn cpu_reshape_layout(source_shape:&[i32],source_strides:&[i64],
         output_shape:&[i32],tracer:bool)->Option<CpuCopyEvalLayout> {
@@ -836,5 +836,36 @@ mod affine_converter_tests {
         }
         assert!(OperationEvent::cpu_affine_quantize_layout(
             Dtype::Int32, 2, 2, 64, 32, 4, false, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ranked_reshape_tests {
+    use super::*;
+
+    #[test]
+    fn reshape_queries_cover_out_of_line_strides_and_copy_decisions() {
+        let qualified = OperationEvent::cpu_reshape_alias_layout(2, 2, false).is_some();
+        for rank in [2, 5, 11, 21] {
+            let mut shape = vec![1; rank];
+            shape[0] = 2;
+            shape[rank - 1] = 64;
+            let mut strides = vec![128; rank];
+            strides[0] = 1;
+            strides[rank - 1] = 2;
+            let alias = OperationEvent::cpu_reshape_alias_layout(rank, rank, false);
+            let copy = OperationEvent::cpu_reshape_layout(&shape, &strides, &[4, 32], false);
+            assert_eq!(alias.is_some(), qualified);
+            assert_eq!(copy.is_some(), qualified);
+            if let (Some(alias), Some(copy)) = (alias, copy) {
+                assert_eq!(alias.backing_births(), 0);
+                assert_eq!(copy.backing_births(), 1);
+                assert!(copy.graph_allocation_extents() > 0);
+            }
+        }
+        assert!(OperationEvent::cpu_reshape_alias_layout(usize::MAX, 2, false).is_none());
+        assert!(OperationEvent::cpu_reshape_copy_layout(2, usize::MAX, false).is_none());
+        assert!(OperationEvent::cpu_reshape_layout(&[2, 64], &[1, 2], &[127], false).is_none());
+        assert!(OperationEvent::cpu_reshape_layout(&[2, 64], &[1], &[128], false).is_none());
     }
 }

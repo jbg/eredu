@@ -526,7 +526,7 @@ strides and output at evaluation. Scalar facts alone create neither cache
 ownership nor completion authority.
 
 CPU reshape admission validates the physical stride span, so GQA broadcasts may
-repeat a smaller backing. The same fixed reshape planner determines and prices
+repeat a smaller backing. The same borrowed reshape planner determines and prices
 aliasing or copying from the actual shape and strides. Integer unit-axis and
 transpose views retain their exact scalar dtype and source backing without
 floating stride evidence. Transpose facts require the canonical retained axis
@@ -794,6 +794,12 @@ ordinary allocator calls during that construction. Fixed C result handles feed
 the same safe Rust quantization API for ordinary and prepared calls; failure
 leaves each published prefix under its result guard. Graph quota extents include
 alignment headroom; they are not a process-wide memory ceiling.
+CPU reshape planning scans borrowed dimensions in collapse order, with no
+rank-sized temporary shape table. Its admitted alias/copy layouts include
+out-of-line destination strides, and the General-copy worker retains its existing
+rank-dependent storage quote. Ordinary and prepared evaluation use the same
+planner, including higher-rank matrix banks.
+
 CPU MXFP4 construction uses the same resident bank, with a source-derived bound
 for binary/Select casts and broadcasts, unary operators, views, reductions and
 range construction. Its six eager constants expose individual payload requests;

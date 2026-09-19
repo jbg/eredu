@@ -1,0 +1,266 @@
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -5,10 +5,31 @@
+ #include "mlx/submission.h"
+ #include <typeinfo>
+ #include <algorithm>
++#include <climits>
+ namespace mlx::core::cpu {
+ namespace {
+ bool product(size_t a,size_t b,size_t& out) noexcept {
+   if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++bool ranks_fit(size_t rank,size_t output_rank) noexcept {
++  return rank<=size_t(INT_MAX)&&output_rank<=size_t(INT_MAX)&&
++      rank<=Shape::max_size()&&rank<=Strides::max_size()&&
++      output_rank<=Shape::max_size()&&output_rank<=Strides::max_size();
++}
++bool append_reshape_strides(size_t output_rank,CopyEvalStorage& value) noexcept {
++  // prepare_reshape owns the computed/copied strides; buffer sharing can also
++  // reserve the final descriptor's strides before publishing its Data owner.
++  if(output_rank>Strides::inline_capacity) {
++    size_t bytes=0;
++    if(!product(output_rank,sizeof(Strides::value_type),bytes)||value.request_counts[8]>SIZE_MAX-2)return false;
++    value.request_bytes[8]=std::max(value.request_bytes[8],bytes);
++    value.request_alignments[8]=std::max(value.request_alignments[8],alignof(Strides::value_type));
++    value.request_counts[8]+=2;
++  }
++  const size_t controls=sizeof(output_rank)+sizeof(CopyEvalStorage*)+sizeof(size_t)*3+sizeof(bool);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;
++  return submission::GraphConstruction::complete_layout(value);
+ }
+ }
+ bool is_reshape_alias_eval_primitive(const array& out) noexcept {
+@@ -16,11 +37,10 @@
+       typeid(out.primitive())==typeid(Reshape);
+ }
+ bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  if(!ranks_fit(rank,output_rank))return false;
+   CopyEvalStorage value;
+-  // Actual prepare_reshape takes the empty or row-contiguous branch, copies at most
+-  // five inline strides and delegates the same shared_buffer_reshape worker.
+-  // No Data, output backing, copy task or collapse scratch is produced.
++  // The empty/row-contiguous branch shares its source Data. Only destination
++  // stride storage can exceed inline capacity; no copy task/backing is born.
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+   const size_t controls=empty_alias_input_geometry_control_bytes()+sizeof(bool)+sizeof(size_t)+
+@@ -32,10 +52,12 @@
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+-  value.named_control_bytes+=controls;out=value;return true;
++  value.named_control_bytes+=controls;
++  if(!append_reshape_strides(output_rank,value))return false;
++  out=value;return true;
+ }
+ bool reshape_copy_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  if(!ranks_fit(rank,output_rank))return false;
+   CopyEvalStorage value;
+   if(!copy_eval_layout(std::max(rank,output_rank),1,true,tracer,value))return false;
+   const size_t controls=sizeof(bool)+sizeof(size_t)+fixed_reshape_plan_control_bytes()+sizeof(FixedReshapePlan)+sizeof(value)+sizeof(out)+
+@@ -43,13 +65,16 @@
+       sizeof(const array*)*2+sizeof(bool)+sizeof(const int*)*2+sizeof(const int64_t*)+
+       sizeof(size_t)*2+sizeof(bool)+sizeof(CopyEvalStorage*);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+-  value.named_control_bytes+=controls;out=value;return true;
++  value.named_control_bytes+=controls;
++  if(!append_reshape_strides(output_rank,value))return false;
++  out=value;return true;
+ }
+ bool reshape_eval_layout(const int* source_shape,const int64_t* source_strides,
+     size_t rank,const int* output_shape,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  FixedReshapePlan plan;
+-  if(!fixed_reshape_plan(source_shape,source_strides,rank,false,output_shape,output_rank,plan))return false;
+-  if(plan.copy) {
++  bool copy=false;
++  if(!ranks_fit(rank,output_rank)||!borrowed_reshape_plan(source_shape,source_strides,rank,false,
++      output_shape,output_rank,nullptr,copy))return false;
++  if(copy) {
+     // This source includes the fixed planner/caller controls as well as the
+     // shared General copy. The scalar cold query and actual copy branch use
+     // the same complete census; do not append that planner a second time.
+@@ -57,7 +82,7 @@
+   }
+   CopyEvalStorage value;
+   if(!reshape_alias_eval_layout(rank,output_rank,tracer,value))return false;
+-  const size_t controls=fixed_reshape_plan_control_bytes()+sizeof(plan)+sizeof(value)+sizeof(out)+
++  const size_t controls=fixed_reshape_plan_control_bytes()+sizeof(copy)+sizeof(value)+sizeof(out)+
+       sizeof(source_shape)+sizeof(source_strides)+sizeof(rank)+sizeof(output_shape)+sizeof(output_rank)+sizeof(tracer)+
+       sizeof(std::pair<bool,Strides>)+sizeof(Strides)+sizeof(const array*)*2+sizeof(bool);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+@@ -68,7 +93,7 @@
+   if(!is_reshape_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];const auto& shape=static_cast<const Reshape&>(output.primitive()).shape_ref();
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+-  if(rank>5||output_rank>5||shape.size()!=output_rank||
++  if(!ranks_fit(rank,output_rank)||shape.size()!=output_rank||
+       input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+         (input.dtype()==uint8&&input.itemsize()==sizeof(uint8_t))||
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -10,7 +10,6 @@
+   if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
+ }
+ bool shape_elements(const array& value,size_t& elements,bool empty=false) noexcept {
+-  if(value.ndim()>5)return false;
+   elements=1;
+   for(int extent:value.shape())
+     if(extent<0||(!empty&&extent==0)||!product(elements,size_t(extent),elements))return false;
+@@ -39,7 +38,7 @@
+       product(elements,size_t(input.itemsize()),bytes);
+ }
+ bool empty_alias_input_geometry(const array& input) noexcept {
+-  if(input.ndim()>5||input.strides().size()!=input.ndim()||input.size()!=0)return false;
++  if(input.strides().size()!=input.ndim()||input.size()!=0)return false;
+   size_t elements=1;
+   for(int extent:input.shape())
+     if(extent<0||!product(elements,size_t(extent),elements))return false;
+@@ -88,6 +87,7 @@
+   if(!is_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];
+   const size_t rank=input.ndim(),output_rank=output.ndim();
++  if(rank>5||output_rank>5)return false;
+   size_t input_elements=0,output_elements=0,bytes=0;
+   const bool empty_broadcast=typeid(output.primitive())==typeid(Broadcast)&&output.size()==0;
+   // Empty broadcast does not read or alias the input's backing. Its declared
+diff --git a/mlx/backend/common/utils.h b/mlx/backend/common/utils.h
+--- a/mlx/backend/common/utils.h
++++ b/mlx/backend/common/utils.h
+@@ -293,6 +293,12 @@
+ 
+ // Fixed geometry counterpart of the same ordinary reshape planner. Scalar
+ // metadata only; no array, allocator, source or execution authority is retained.
++// Borrowed, positive-extent reshape planning. A null output_strides requests
++// only the copy decision. Invalid input leaves copy unchanged; supplied stride
++// storage may contain a prefix and is used only after a successful alias result.
++bool borrowed_reshape_plan(const int*,const int64_t*,size_t,bool,
++    const int*,size_t,int64_t* output_strides,bool& copy) noexcept;
++size_t borrowed_reshape_plan_control_bytes() noexcept;
+ struct FixedReshapePlan { bool copy{false}; int64_t strides[5]{}; };
+ MLX_API bool fixed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
+     bool row_contiguous,const int* output_shape,size_t output_rank,FixedReshapePlan&) noexcept;
+diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
+--- a/mlx/backend/common/common.cpp
++++ b/mlx/backend/common/common.cpp
+@@ -163,13 +163,15 @@
+   }
+ }
+ 
+-size_t fixed_reshape_plan_control_bytes() noexcept {
+-  return sizeof(FixedReshapePlan)*2+sizeof(int64_t[5])*2+sizeof(const int*)*2+
+-      sizeof(const int64_t*)+sizeof(size_t)*9+sizeof(int64_t)*5+sizeof(bool)*2;
+-}
+-bool fixed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
+-    bool row_contiguous,const int* output_shape,size_t output_rank,FixedReshapePlan& out) noexcept {
+-  if(rank>5||output_rank>5||(rank&&(!shape||!strides))||(output_rank&&!output_shape))return false;
++size_t borrowed_reshape_plan_control_bytes() noexcept {
++  return sizeof(const int*)*2+sizeof(const int64_t*)+sizeof(int64_t*)+
++      sizeof(size_t)*8+sizeof(int64_t)*5+sizeof(bool)*5+sizeof(bool*);
++}
++bool borrowed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
++    bool row_contiguous,const int* output_shape,size_t output_rank,
++    int64_t* output_strides,bool& copy) noexcept {
++  if(rank>size_t(INT_MAX)||output_rank>size_t(INT_MAX)||
++      (rank&&(!shape||!strides))||(output_rank&&!output_shape))return false;
+   size_t source_elements=1,output_elements=1;
+   for(size_t i=0;i!=rank;++i) {
+     if(shape[i]<=0||strides[i]<0||source_elements>size_t(INT_MAX)/size_t(shape[i]))return false;
+@@ -180,34 +182,53 @@
+     output_elements*=size_t(output_shape[i]);
+   }
+   if(source_elements!=output_elements)return false;
+-  FixedReshapePlan value;
+   if(row_contiguous||rank==0) {
+     int64_t stride=rank==0?0:1;
+-    for(size_t i=output_rank;i--;) {value.strides[i]=stride;stride*=output_shape[i];}
+-    out=value;return true;
+-  }
+-  // Same collapse_contiguous_dims order, singleton removal and divisibility
+-  // decisions as the unbounded path below. All dimensions fit its int cap.
+-  int64_t collapsed_shape[5]{},collapsed_strides[5]{};
+-  size_t count=1;collapsed_shape[0]=shape[0];collapsed_strides[0]=strides[0];
+-  for(size_t i=1;i!=rank;++i) {
+-    if(shape[i]==1)continue;
+-    if(strides[i]>INT64_MAX/shape[i])return false;
+-    if(strides[i]*shape[i]!=collapsed_strides[count-1]) {
+-      collapsed_shape[count]=shape[i];collapsed_strides[count]=strides[i];++count;
+-    } else {collapsed_shape[count-1]*=shape[i];collapsed_strides[count-1]=strides[i];}
+-  }
+-  size_t j=0;
++    for(size_t i=output_rank;i--;) {
++      if(output_strides)output_strides[i]=stride;
++      stride*=output_shape[i];
++    }
++    copy=false;return true;
++  }
++  // Consume each collapsed source group once, preserving the ordinary
++  // collapse order and singleton rules without retaining a shape/stride table.
++  size_t cursor=0;
++  int64_t remaining=1,group_stride=0,previous_stride=0;
++  bool have_group=false;
+   for(size_t i=0;i!=output_rank;++i) {
++    if(!have_group&&cursor<rank) {
++      remaining=shape[cursor];group_stride=strides[cursor];++cursor;
++      while(cursor<rank) {
++        if(shape[cursor]==1){++cursor;continue;}
++        if(strides[cursor]>INT64_MAX/shape[cursor])return false;
++        if(strides[cursor]*shape[cursor]!=group_stride)break;
++        remaining*=shape[cursor];group_stride=strides[cursor];++cursor;
++      }
++      have_group=true;
++    }
+     const int64_t dimension=output_shape[i];
+-    if(j<count&&collapsed_shape[j]%dimension==0) {
+-      collapsed_shape[j]/=dimension;
+-      if(collapsed_shape[j]&&collapsed_strides[j]>INT64_MAX/collapsed_shape[j])return false;
+-      value.strides[i]=collapsed_shape[j]*collapsed_strides[j];
+-      j+=size_t(collapsed_shape[j]==1);
+-    } else if(dimension==1&&i) {value.strides[i]=value.strides[i-1];}
+-    else {value.copy=true;break;}
+-  }
++    if(have_group&&remaining%dimension==0) {
++      remaining/=dimension;
++      if(remaining&&group_stride>INT64_MAX/remaining)return false;
++      previous_stride=remaining*group_stride;
++      if(output_strides)output_strides[i]=previous_stride;
++      have_group=remaining!=1;
++    } else if(dimension==1&&i) {
++      if(output_strides)output_strides[i]=previous_stride;
++    } else {copy=true;return true;}
++  }
++  copy=false;return true;
++}
++size_t fixed_reshape_plan_control_bytes() noexcept {
++  return borrowed_reshape_plan_control_bytes()+sizeof(FixedReshapePlan)+
++      sizeof(const int*)*2+sizeof(const int64_t*)+sizeof(size_t)*2+sizeof(bool)+sizeof(FixedReshapePlan*);
++}
++bool fixed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
++    bool row_contiguous,const int* output_shape,size_t output_rank,FixedReshapePlan& out) noexcept {
++  if(rank>5||output_rank>5)return false;
++  FixedReshapePlan value;
++  if(!borrowed_reshape_plan(shape,strides,rank,row_contiguous,output_shape,output_rank,
++      value.strides,value.copy))return false;
+   out=value;return true;
+ }
+ 
+@@ -226,6 +247,13 @@
+   if(fixed_reshape_plan(in.shape().data(),in.strides().data(),in.ndim(),false,
+       out.shape().data(),out.ndim(),fixed)) {
+     return {fixed.copy,Strides(fixed.strides,fixed.strides+out.ndim())};
++  }
++
++  Strides prepared(out.ndim(),0);
++  bool copied=false;
++  if(borrowed_reshape_plan(in.shape().data(),in.strides().data(),in.ndim(),false,
++      out.shape().data(),out.ndim(),prepared.data(),copied)) {
++    return {copied,std::move(prepared)};
+   }
+ 
+   // Firstly let's collapse all the contiguous dimensions of the input
