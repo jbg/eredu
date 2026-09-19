@@ -1185,13 +1185,52 @@ impl EvaluatedArray<'_> {
             "inconsistent evaluated host layout"
         );
         let mut bytes = Vec::with_capacity(span.size * array.item_size());
+        self.visit_native_bytes(|value| bytes.extend_from_slice(value))
+            .expect("invalid evaluated host data");
+        bytes
+    }
+
+    /// Copies logical values into an exact-sized native-endian byte destination.
+    /// Supports signed strides, broadcast and unaligned storage without a
+    /// numerical staging allocation. The source is already evaluated; this
+    /// operation neither evaluates nor compacts it. Errors leave the destination
+    /// unchanged, including when its length differs from the logical byte count.
+    pub fn try_copy_native_bytes_into(
+        &self,
+        destination: &mut [u8],
+    ) -> Result<(), crate::error::NativeBytesCopyError> {
+        let array = self.as_array();
+        let span = host_read::checked_layout(
+            array.shape(),
+            array.signed_strides(),
+            array.item_size(),
+        )?;
+        if span.size != array.size() {
+            return Err(AsSliceError::InvalidLayout.into());
+        }
+        let expected = span
+            .size
+            .checked_mul(array.item_size())
+            .ok_or(AsSliceError::TooLarge)?;
+        if destination.len() != expected {
+            return Err(crate::error::NativeBytesCopyError::DestinationLength {
+                expected,
+                found: destination.len(),
+            });
+        }
+        let mut offset = 0;
+        self.visit_native_bytes(|value| {
+            destination[offset..offset + value.len()].copy_from_slice(value);
+            offset += value.len();
+        })?;
+        Ok(())
+    }
+
+    fn visit_native_bytes(&self, mut visit: impl FnMut(&[u8])) -> Result<(), AsSliceError> {
         macro_rules! extend_bytes {
             ($ty:ty, $encode:expr) => {{
-                for value in self
-                    .host_values::<$ty>()
-                    .expect("invalid evaluated host data")
-                {
-                    bytes.extend_from_slice(&$encode(value));
+                for value in self.host_values::<$ty>()? {
+                    visit(&$encode(value));
                 }
             }};
         }
@@ -1216,7 +1255,7 @@ impl EvaluatedArray<'_> {
                 out
             }),
         }
-        bytes
+        Ok(())
     }
 
     /// Compare two evaluated arrays for equal dtype, shape, and values.

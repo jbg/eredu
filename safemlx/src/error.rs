@@ -71,6 +71,22 @@ impl From<RawException> for IoError {
     }
 }
 
+/// A failed copy of evaluated values into caller-owned native-endian bytes.
+#[derive(Debug, PartialEq, Error)]
+pub enum NativeBytesCopyError {
+    /// The destination must hold exactly the logical array's bytes.
+    #[error("native byte destination has {found} bytes, expected {expected}")]
+    DestinationLength {
+        /// Required logical byte count.
+        expected: usize,
+        /// Supplied byte count.
+        found: usize,
+    },
+    /// The evaluated source cannot be read with its declared layout.
+    #[error(transparent)]
+    Source(#[from] AsSliceError),
+}
+
 /// Error associated with `Array::try_as_slice()`
 #[derive(Debug, PartialEq, Error)]
 pub enum AsSliceError {

@@ -754,6 +754,9 @@ working set before allocating any final output. Conversion retains those exact
 destinations and uses the same bounded tile worker, including its one- or two-slot
 completion window. The allocation stage has no native stream or tensor dependency.
 Bounded-read validation acquires its payload leases in the conversion stage.
+Completed tiles copy logical native-endian values directly into the final encoded
+buffers. This copy checks the exact destination length and supports signed strides,
+broadcast and unaligned views without allocating an intermediate byte payload.
 
 Runtime's original memory-tensor constructor reserves qualified fresh payload
 capacity before allocation and authenticates it through private source custody.

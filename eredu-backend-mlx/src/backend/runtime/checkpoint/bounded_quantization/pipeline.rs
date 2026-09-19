@@ -745,7 +745,9 @@ fn write_tile(
             )));
         }
     }
-    destination.copy_from_slice(&evaluated.to_native_bytes());
+    evaluated
+        .try_copy_native_bytes_into(destination)
+        .map_err(|cause| Error::Other(Box::new(cause)))?;
     Ok(())
 }
 

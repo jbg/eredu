@@ -190,3 +190,6 @@ impl EvaluatedArray<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_copy_tests;
