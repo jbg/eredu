@@ -729,6 +729,11 @@ retain the same control. Allocation failures and duplicate-name rejections prese
 their custody and actual constructed prefix. MLX quantization writes into these
 buffers. Buffer construction itself grants no admission; the caller also owns
 funding for catalog construction and subsequent reader/selection controls.
+Quantization preflights every selected target's source geometry and minimum
+working set before allocating any final output. Conversion retains those exact
+destinations and uses the same bounded tile worker, including its one- or two-slot
+completion window. The allocation stage has no native stream or tensor dependency.
+Bounded-read validation acquires its payload leases in the conversion stage.
 
 Layerwise cold binding and the selected native unit populator share one
 immutable independent-parameter exclusion owner. The pre-load manager source

@@ -50,6 +50,7 @@ mod layout;
 mod pipeline;
 mod plan;
 mod preflight;
+mod preparation;
 
 pub use pipeline::BoundedQuantizedWeightStore;
 pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};

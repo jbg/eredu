@@ -10,6 +10,7 @@ use safetensors::tensor::{serialize_to_file, TensorView};
 use tempfile::TempDir;
 
 use super::*;
+mod preparation;
 use crate::backend::runtime::{
     checkpoint::store::test_support::open_gguf_checkpoint_source_for_test,
     residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},

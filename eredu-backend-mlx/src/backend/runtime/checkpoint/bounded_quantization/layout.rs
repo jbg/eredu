@@ -11,6 +11,7 @@ pub(super) struct OutputLayout {
 }
 
 pub(super) struct OutputShard {
+    pub(super) geometry: super::preparation::ConversionGeometry,
     pub(super) layouts: Vec<OutputLayout>,
     pub(super) buffers: Vec<eredu_checkpoint::store::MemoryTensorBuffer>,
     pub(super) pending_tiles: usize,
