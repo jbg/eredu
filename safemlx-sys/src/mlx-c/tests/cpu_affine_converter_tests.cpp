@@ -92,9 +92,6 @@ void exercise(Stream stream,Dtype dtype,int rank,int group,int bits,bool copy,in
       REQUIRE(role.error.get()->borrow());
       try {std::rethrow_exception(role.error.get()->borrow()->exception);FAIL("physical refusal must retain its cause");}
       catch(const allocator::OriginalBufferError& error){CHECK(error.cause()==allocator::OriginalBufferCause::capacity);}
-      // A copy accepted before the refusal remains encoder-owned. Retire that
-      // temporary only after its record establishes completion.
-      auto temporaries=cpu::get_command_encoder(stream).take_temporaries();
     } else {
       if(submitted!=0) {
         settle(role);

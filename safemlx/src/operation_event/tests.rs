@@ -4,6 +4,7 @@ mod eval_traversal;
 mod exact_roots;
 mod graph_construction;
 mod quantize_submission;
+mod affine_quantize_submission;
 mod original_array;
 mod owned_host_copy;
 mod prepared_clones;

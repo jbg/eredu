@@ -20,6 +20,8 @@ mod graph_construction;
 mod resident_graph;
 mod quantize_payload;
 mod quantize_submission;
+mod affine_quantize_submission;
+pub use affine_quantize_submission::CpuAffineQuantizeSubmissionLayout;
 pub(crate) use eval_traversal::submit_original_prepared_traversal;
 pub use eval_traversal::{OperationEvalTraversalLayout, OperationEvalTraversalLimits};
 pub use gpu_eval_prologue::{GpuEvalPrologueLayout, GpuEvalProloguePopulation};

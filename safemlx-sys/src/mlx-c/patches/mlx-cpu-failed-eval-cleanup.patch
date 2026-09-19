@@ -1,0 +1,52 @@
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -161,7 +161,23 @@
+     if (arr.is_tracer()) {
+       inputs = arr.inputs();
+     }
+-    arr.primitive().eval_cpu(arr.inputs(), outputs);
++    try {
++      arr.primitive().eval_cpu(arr.inputs(), outputs);
++    } catch (...) {
++      // A primitive can enqueue a copy before a later allocation fails. Its
++      // already prepared cleanup must follow that work on the same stream.
++      if (encoder.has_temporaries()) {
++        cleanup.body().data.fill(
++            arr.inputs(), arr.siblings(), arr.data_shared_ptr().get());
++        try {
++          encoder.dispatch_cleanup(std::move(cleanup));
++        } catch (...) {
++          // dispatch_cleanup restores unaccepted temporary batches to the
++          // encoder. Keep that custody and preserve the primitive's cause.
++        }
++      }
++      throw;
++    }
+   }
+ 
+   // Donation has finished. The fixed destination has enough slots for all
+@@ -199,7 +215,8 @@
+       sizeof(scheduler::TaskOwner) + sizeof(cpu::detail::Cleanup) +
+       sizeof(GraphAllocator<cpu::detail::DataRetention::Value>) +
+       sizeof(GraphAllocator<scheduler::TaskNode<cpu::detail::Cleanup>>) +
+-      sizeof(cpu::CommandEncoder*) + sizeof(array*) + sizeof(Stream);
++      sizeof(cpu::CommandEncoder*) + sizeof(array*) + sizeof(Stream) +
++      sizeof(const cpu::CommandEncoder*) + sizeof(size_t) + sizeof(bool);
+   if (!GraphConstruction::complete_layout(value)) return false;
+   output = value;
+   return true;
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -61,6 +61,10 @@
+           submission::GraphFailure::invalid_layout);
+     return detail::PreparedCleanup(
+         std::move(context), layout.maximum_data_slots);
++  }
++
++  bool has_temporaries() const noexcept {
++    return temporaries_.size() != 0;
+   }
+ 
+   detail::TemporaryStorage take_temporaries() noexcept {

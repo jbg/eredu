@@ -794,6 +794,16 @@ ordinary allocator calls during that construction. Fixed C result handles feed
 the same safe Rust quantization API for ordinary and prepared calls; failure
 leaves each published prefix under its result guard. Graph quota extents include
 alignment headroom; they are not a process-wide memory ceiling.
+A shared CPU affine submission layout composes that constructor, optional scale
+and bias casts, all three output roots, the completion Synchronizer and finite
+traversal storage. It includes possible input compaction and prices each physical
+allocation with the selected allocator without assuming donation or early release.
+Completed detached input custody, arena and failure owners, runtime/stream/cache
+preparation and final encoded host destinations require separate admission.
+If a CPU primitive fails after retaining encoder temporaries, its prepared cleanup
+is queued behind accepted work on the same stream. Refusals without temporaries
+enqueue no cleanup work. Cleanup submission failure preserves encoder custody and
+the original primitive error.
 CPU reshape planning scans borrowed dimensions in collapse order, with no
 rank-sized temporary shape table. Its admitted alias/copy layouts include
 out-of-line destination strides, and the General-copy worker retains its existing

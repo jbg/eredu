@@ -264,6 +264,7 @@ else()
       mlx-cpu-quantization-integer-source.patch
       mlx-cpu-quantization-half-source.patch
       mlx-cpu-affine-converter-source.patch
+      mlx-cpu-failed-eval-cleanup.patch
       mlx-affine-quantize-construction.patch
       mlx-cpu-empty-buffer-birth.patch
       mlx-cpu-event-dispatch-layout.patch
