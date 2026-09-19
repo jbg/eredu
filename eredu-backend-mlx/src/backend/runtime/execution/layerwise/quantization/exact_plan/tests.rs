@@ -450,6 +450,7 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
     )
     .unwrap();
     let pool = WorkingMemoryPool::new(1024 * 1024, 0).unwrap();
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let prepared = cold
         .allocate_original(
             &pool,
@@ -457,10 +458,10 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
                 fixed_bytes: 1024,
                 bytes_per_input_byte: 8,
             },
+            context.stream(),
         )
         .unwrap();
     let native_owner = pool.acquire_unquoted().unwrap();
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let completed = prepared.materialize_handoff(context.stream()).unwrap();
     let residency_source = completed.store().clone();
     let dense = MlxNeuralBackend::linear(spec(2, None), context.stream()).unwrap();

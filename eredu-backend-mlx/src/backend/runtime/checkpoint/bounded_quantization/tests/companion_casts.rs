@@ -92,7 +92,7 @@ fn companion_cast_minimum_precedes_output_allocation_and_source_reads() {
             .unwrap();
             let allocations = Cell::new(0);
             let result = ColdQuantization::prepare(source.clone().into(), plan).and_then(|cold| {
-                cold.allocate(|layout| {
+                cold.allocate(cpu_context().stream(), |layout| {
                     allocations.set(allocations.get() + 1);
                     eredu_checkpoint::store::MemoryTensorBuffer::allocate(
                         &layout.name,

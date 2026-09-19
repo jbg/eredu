@@ -752,8 +752,10 @@ funding for catalog construction and subsequent reader/selection controls.
 Quantization preflights every selected target's source geometry and minimum
 working set before allocating any final output. Conversion retains those exact
 destinations and uses the same bounded tile worker, including its one- or two-slot
-completion window. The allocation stage has no native stream or tensor dependency.
-Bounded-read validation acquires its payload leases in the conversion stage.
+completion window. Before invoking any destination allocator, allocation borrows
+an existing stream to qualify every target's workspace for its device. This also
+applies to pool-funded final buffers. It creates no conversion streams or tensors
+and acquires no payload leases; bounded reads belong to the conversion stage.
 Affine tile sizing includes the original scales and biases while casts produce
 the selected companion precision, including F16/BF16 casts of equal byte width.
 Cold minimum-row checks, complete targets, leading batches and row candidates use

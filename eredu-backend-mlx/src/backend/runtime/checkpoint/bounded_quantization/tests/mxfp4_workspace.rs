@@ -77,9 +77,8 @@ fn cpu_mxfp4_minimum_is_checked_before_output_allocation_or_source_reads() {
         for budget in [minimum - 1, minimum] {
             let allocations = Cell::new(0);
             let result = ColdQuantization::prepare(source.clone().into(), plan(budget))
-                .and_then(|cold| cold.for_stream(context.stream()))
                 .and_then(|cold| {
-                    cold.allocate(|layout| {
+                    cold.allocate(context.stream(), |layout| {
                         allocations.set(allocations.get() + 1);
                         MemoryTensorBuffer::allocate(
                             &layout.name,
@@ -105,6 +104,104 @@ fn cpu_mxfp4_minimum_is_checked_before_output_allocation_or_source_reads() {
             assert_eq!(source.reads.load(Ordering::SeqCst), 0);
         }
     }
+}
+
+#[test]
+fn cpu_mxfp4_public_allocators_qualify_before_original_pool_admission() {
+    use eredu_runtime::working_memory::{DependencyMemoryPolicy, WorkingMemoryError, WorkingMemoryPool};
+    let context = cpu_context();
+    let policy = DependencyMemoryPolicy {
+        fixed_bytes: 1024,
+        bytes_per_input_byte: 8,
+    };
+    let output_quote = [("model.proj.weight", [8, 8], 256), ("model.proj.scales", [8, 2], 16)]
+        .into_iter()
+        .map(|(name, shape, bytes)| {
+            WorkingMemoryPool::memory_tensor_buffer_quote(name, &shape, bytes, policy)
+                .map(|quote| quote.total_bytes())
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let output_quote = match output_quote {
+        Ok(quotes) => quotes.into_iter().sum(),
+        Err(WorkingMemoryError::UnknownBound)
+            if std::env::var_os("EREDU_REQUIRE_QUALIFIED_MEMORY_TENSOR_SOURCE").is_none() =>
+        {
+            return;
+        }
+        Err(cause) => panic!("original output quote: {cause}"),
+    };
+    for (dtype, minimum) in [
+        (SafeDtype::F16, 5372),
+        (SafeDtype::BF16, 5372),
+        (SafeDtype::F32, 9988),
+    ] {
+        let source = fixture(dtype, &[8, 64]);
+        for original in [false, true] {
+            for budget in [minimum - 1, minimum] {
+                // A destination constructor would fail admission at zero. The
+                // workspace refusal must win before any such constructor runs.
+                let pool = WorkingMemoryPool::new(
+                    if budget < minimum { 0 } else { output_quote },
+                    0,
+                )
+                .unwrap();
+                let cold = ColdQuantization::prepare(source.clone().into(), plan(budget)).unwrap();
+                let result = if original {
+                    cold.allocate_original(&pool, policy, context.stream())
+                } else {
+                    cold.allocate_ordinary(context.stream())
+                };
+                if budget < minimum {
+                    let Err(error) = result else {
+                        panic!("insufficient CPU workspace accepted")
+                    };
+                    assert!(error
+                        .to_string()
+                        .contains(&format!("requires at least {minimum} working-set bytes")));
+                } else {
+                    let prepared = result.unwrap();
+                    assert_eq!(pool.used_bytes().unwrap(), if original { output_quote } else { 0 });
+                    drop(prepared);
+                }
+                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn later_cpu_mxfp4_target_is_qualified_before_any_destination_allocation() {
+    let context = cpu_context();
+    let source = Arc::new(Source {
+        store: MemoryWeightStore::from_safetensors([
+            ("a.weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
+            ("b.weight".into(), SafeDtype::F32, vec![1, 64], vec![0; 256]),
+        ])
+        .unwrap(),
+        reads: AtomicUsize::new(0),
+    });
+    let plan = BoundedQuantizationPlan::new(
+        WeightQuantization::MxFp4,
+        5070,
+        [direct_test_target("a.weight"), direct_test_target("b.weight")],
+    )
+    .unwrap();
+    let allocations = Cell::new(0);
+    let result = ColdQuantization::prepare(source.clone().into(), plan)
+        .unwrap()
+        .allocate(context.stream(), |layout| {
+            allocations.set(allocations.get() + 1);
+            MemoryTensorBuffer::allocate(&layout.name, layout.dtype, &layout.shape, layout.byte_len)
+                .map_err(|cause| Error::Other(Box::new(cause)))
+        });
+    let Err(error) = result else {
+        panic!("second target must exceed the CPU workspace")
+    };
+    assert!(error.to_string().contains("b.weight"));
+    assert!(error.to_string().contains("requires at least 9988 working-set bytes"));
+    assert_eq!(allocations.get(), 0);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -162,10 +259,12 @@ fn stream_profile_cannot_borrow_direct_quantizer_geometry_for_cpu_fallback() {
     use super::super::workspace::QuantizerWorkspace;
     let context = cpu_context();
     let source = fixture(SafeDtype::F32, &[8, 64]);
-    let unqualified = ColdQuantization::prepare(source.clone().into(), plan(9988))
+    let mut unqualified = ColdQuantization::prepare(source.clone().into(), plan(9988))
         .unwrap()
-        .allocate_ordinary()
+        .allocate_ordinary(context.stream())
         .unwrap();
+    // Emulate a destination prepared for a different native quantizer profile.
+    unqualified.workspace = QuantizerWorkspace::Direct;
     let error = unqualified.materialize(context.stream()).unwrap_err();
     assert!(error
         .to_string()

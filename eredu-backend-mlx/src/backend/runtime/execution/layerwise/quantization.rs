@@ -548,8 +548,7 @@ where
         tasks,
     )?;
     Ok(cold
-        .for_stream(stream)?
-        .allocate_ordinary()?
+        .allocate_ordinary(stream)?
         .materialize_handoff(stream)?
         .into_parts())
 }

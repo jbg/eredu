@@ -67,7 +67,7 @@ fn complete(
         &[task],
     )
     .unwrap()
-    .allocate_ordinary()
+    .allocate_ordinary(stream)
     .unwrap();
     assert_eq!(source.reads.load(Ordering::SeqCst), 0);
     let converted = prepared.materialize_handoff(stream).unwrap();

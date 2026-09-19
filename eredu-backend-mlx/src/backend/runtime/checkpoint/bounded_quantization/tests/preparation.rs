@@ -39,7 +39,7 @@ fn later_target_working_set_failure_precedes_every_output_allocation() {
     .unwrap();
     let allocations = Cell::new(0);
     let result = ColdQuantization::prepare(source.into(), plan).and_then(|plan| {
-        plan.allocate(|layout| {
+        plan.allocate(cpu_context().stream(), |layout| {
             allocations.set(allocations.get() + 1);
             MemoryTensorBuffer::allocate(&layout.name, layout.dtype, &layout.shape, layout.byte_len)
                 .map_err(|cause| Error::Other(Box::new(cause)))
@@ -71,7 +71,7 @@ fn conversion_fills_the_original_destinations_and_readers_retain_their_custody()
     let allocations = Cell::new(0);
     let original = Cell::new(std::ptr::null());
     let prepared = cold
-        .allocate(|layout| {
+        .allocate(cpu_context().stream(), |layout| {
             allocations.set(allocations.get() + 1);
             let mut buffer = MemoryTensorBuffer::allocate_with_custody(
                 &layout.name,
@@ -95,7 +95,6 @@ fn conversion_fills_the_original_destinations_and_readers_retain_their_custody()
     );
     assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-    // Conversion context creation follows complete destination construction.
     let context = cpu_context();
     let transformed = prepared.materialize(context.stream()).unwrap();
     assert_eq!(transformed.report().transformed_weights, 1);
@@ -130,7 +129,7 @@ fn output_allocation_failure_retires_prefix_and_retains_failed_constructor_custo
     let drops = Arc::new(AtomicUsize::new(0));
     let custody = Arc::new(Custody(drops.clone()));
     let allocations = Cell::new(0);
-    let result = cold.allocate(|layout| {
+    let result = cold.allocate(cpu_context().stream(), |layout| {
         let ordinal = allocations.get();
         allocations.set(ordinal + 1);
         let bytes = layout.byte_len - u64::from(ordinal == 2);
@@ -210,7 +209,7 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
     .unwrap();
     let prepared = ColdQuantization::prepare(source.clone().into(), plan)
         .unwrap()
-        .allocate_original(&pool, ORIGINAL_METADATA_POLICY)
+        .allocate_original(&pool, ORIGINAL_METADATA_POLICY, cpu_context().stream())
         .unwrap();
     assert_eq!(pool.used_bytes().unwrap(), quotes.iter().sum::<u64>());
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, reads);
@@ -267,7 +266,7 @@ fn original_output_admission_failure_retires_the_allocated_prefix_without_reads(
     .unwrap();
     let result = ColdQuantization::prepare(source.clone().into(), plan)
         .unwrap()
-        .allocate_original(&pool, ORIGINAL_METADATA_POLICY);
+        .allocate_original(&pool, ORIGINAL_METADATA_POLICY, cpu_context().stream());
     let Err(Error::Other(error)) = result else {
         panic!("third output must fail original admission");
     };

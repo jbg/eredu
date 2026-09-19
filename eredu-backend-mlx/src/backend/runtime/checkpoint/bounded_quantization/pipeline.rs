@@ -50,8 +50,7 @@ impl BoundedQuantizedWeightStore {
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
         super::preparation::ColdQuantization::prepare(source.into(), plan)?
-            .for_stream(conversion_stream)?
-            .allocate_ordinary()?
+            .allocate_ordinary(conversion_stream)?
             .materialize(conversion_stream)
     }
 

@@ -62,9 +62,9 @@ impl ColdQuantization {
         converted.validate(&self.source, &self.plan)
     }
 
-    /// Common metadata preflight. Qualify the selected stream with `for_stream`
-    /// before allocating CPU MXFP4 destinations; materialization checks this
-    /// profile again before constructing conversion streams or reading payloads.
+    /// Common metadata preflight. Allocation qualifies the selected stream;
+    /// materialization checks that profile again before constructing conversion
+    /// streams or reading payloads.
     pub(crate) fn prepare(
         source: eredu_checkpoint::store::RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,
@@ -73,7 +73,7 @@ impl ColdQuantization {
     }
 
     /// Qualifies the actual quantizer before allocating final output buffers.
-    pub(crate) fn for_stream(self, stream: &Stream) -> Result<Self, Error> {
+    fn for_stream(self, stream: &Stream) -> Result<Self, Error> {
         let workspace =
             QuantizerWorkspace::selected(self.plan.quantization, stream.get_device()?.get_type()?);
         if self.workspace == workspace {
@@ -162,8 +162,8 @@ impl ColdQuantization {
         Ok(())
     }
 
-    pub(crate) fn allocate_ordinary(self) -> Result<PreparedQuantization, Error> {
-        self.allocate(|layout| {
+    pub(crate) fn allocate_ordinary(self, stream: &Stream) -> Result<PreparedQuantization, Error> {
+        self.allocate(stream, |layout| {
             eredu_checkpoint::store::MemoryTensorBuffer::allocate(
                 &layout.name,
                 layout.dtype,
@@ -174,15 +174,18 @@ impl ColdQuantization {
         })
     }
 
+    /// Qualify all targets for the stream before invoking any output allocator.
     /// The allocator must establish custody before creating each destination.
     /// Neither preflight nor this callback boundary grants pool admission.
     pub(super) fn allocate(
         self,
+        stream: &Stream,
         mut allocate: impl FnMut(
             &OutputLayout,
         ) -> Result<eredu_checkpoint::store::MemoryTensorBuffer, Error>,
     ) -> Result<PreparedQuantization, Error> {
-        let output_shards = self
+        let qualified = self.for_stream(stream)?;
+        let output_shards = qualified
             .targets
             .into_iter()
             .map(|target| {
@@ -201,13 +204,13 @@ impl ColdQuantization {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(PreparedQuantization {
-            workspace: self.workspace,
-            source: self.source,
-            plan: self.plan,
+            workspace: qualified.workspace,
+            source: qualified.source,
+            plan: qualified.plan,
             output_shards,
-            transformed_keys: self.transformed_keys,
-            materialized_source_keys: self.materialized_source_keys,
-            materialized_source_shards: self.materialized_source_shards,
+            transformed_keys: qualified.transformed_keys,
+            materialized_source_keys: qualified.materialized_source_keys,
+            materialized_source_shards: qualified.materialized_source_shards,
         })
     }
 
@@ -217,8 +220,9 @@ impl ColdQuantization {
         self,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         metadata_policy: eredu_runtime::working_memory::DependencyMemoryPolicy,
+        stream: &Stream,
     ) -> Result<PreparedQuantization, Error> {
-        self.allocate(|layout| {
+        self.allocate(stream, |layout| {
             pool.allocate_memory_tensor_buffer(
                 &layout.name,
                 layout.dtype,
