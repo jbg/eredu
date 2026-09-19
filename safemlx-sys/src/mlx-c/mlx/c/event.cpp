@@ -1213,6 +1213,25 @@ extern "C" bool mlx_operation_event_cpu_typed_arg_reduce_eval_layout(mlx_cpu_cop
 }
 
 #include "mlx/quantize_construction.h"
+extern "C" bool mlx_operation_event_cpu_mxfp4_quantize_payload_layout(
+    mlx_cpu_mxfp4_quantize_payload_layout* out,mlx_dtype dtype,size_t rows,size_t columns) {
+  if(!out||dtype<MLX_BOOL||dtype>MLX_COMPLEX64)return false;
+  mlx::core::submission::CpuMxFp4QuantizePayloadLayout native;
+  if(!mlx::core::submission::cpu_mxfp4_quantize_payload_layout(
+      mlx_dtype_to_cpp(dtype),rows,columns,native))return false;
+  mlx_cpu_mxfp4_quantize_payload_layout value{};
+  std::copy_n(native.request_bytes,29,value.request_bytes);
+  value.request_count=native.request_count;
+  value.temporary_row_bytes=native.temporary_row_bytes;
+  value.temporary_fixed_bytes=native.temporary_fixed_bytes;
+  std::copy_n(native.output_bytes,2,value.output_bytes);
+  const size_t controls=sizeof(out)+sizeof(dtype)+sizeof(rows)+sizeof(columns)+
+      sizeof(native)+sizeof(value)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  value.named_control_bytes=native.named_control_bytes+controls;
+  *out=value;return true;
+}
+
 extern "C" bool mlx_operation_event_cpu_mxfp4_quantize_construction_layout(
     mlx_cpu_mxfp4_quantize_construction_layout* out,mlx_dtype dtype,
     size_t rank,size_t rows,size_t columns) {

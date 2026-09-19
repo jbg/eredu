@@ -32,7 +32,7 @@ pub mod error;
 mod event;
 mod operation_event;
 pub use operation_event::{
-    AffineQuantizeConstructionLayout, CpuMxFp4QuantizeConstructionLayout, OperationEvalRecordLayout, OperationEvalTraversalLayout, OperationEvalTraversalLimits,
+    AffineQuantizeConstructionLayout, CpuMxFp4QuantizeConstructionLayout, CpuMxFp4QuantizePayloadLayout, OperationEvalRecordLayout, OperationEvalTraversalLayout, OperationEvalTraversalLimits,
     OperationEvent, OperationRootStorageLayout, OperationWaitRecordLayout, PointwiseGraphLayout,
     PreparedNestedRoots, PreparedNestedRootsCause, PreparedNestedRootsFailure,
     PreparedPointwiseGraph, PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout,

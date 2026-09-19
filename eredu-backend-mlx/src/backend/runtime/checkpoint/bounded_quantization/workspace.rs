@@ -30,42 +30,19 @@ impl QuantizerWorkspace {
                 fixed_bytes: 0,
             });
         }
-        let scalar = match dtype {
-            RecipeDtype::F16 | RecipeDtype::BF16 => 2u64,
-            RecipeDtype::F32 => 4,
-            _ => {
-                return Err(quantization_error(
-                    "CPU MXFP4 requires F16, BF16 or F32 input",
-                ))
-            }
+        let dtype = match dtype {
+            RecipeDtype::F16 => Dtype::Float16,
+            RecipeDtype::BF16 => Dtype::Bfloat16,
+            RecipeDtype::F32 => Dtype::Float32,
+            _ => return Err(quantization_error("CPU MXFP4 requires F16, BF16 or F32 input")),
         };
-        let columns = u64::try_from(columns)
-            .map_err(|_| quantization_error("CPU MXFP4 column count overflow"))?;
-        if columns == 0 || columns % 32 != 0 {
-            return Err(quantization_error(
-                "CPU MXFP4 columns must be a positive multiple of 32",
-            ));
-        }
-        // The CPU fp_quantize fallback retains the input precision throughout
-        // its floating arithmetic, including Select/Power after I32 casts.
-        // Reserve all potential numerical destinations without relying on
-        // donation or early retirement:
-        // - one input compaction, Abs and normalized values: 3N floating;
-        // - Subtract and Abs distances to 16 codebook entries: 32N floating;
-        // - ArgReduce indices and shifted packed codes: 2N U32;
-        // - max, scale division, log, round, cast back, Select, Power and Add:
-        //   eight floating values per group, plus I32 and Boolean values.
-        let row_bytes = columns
-            .checked_mul(35 * scalar + 8)
-            .and_then(|bytes| bytes.checked_add((columns / 32).checked_mul(8 * scalar + 5)?))
-            .ok_or_else(|| quantization_error("CPU MXFP4 temporary payload overflow"))?;
-        // Four floating scalars, two 32-bit scalars, a 16-entry F32 codebook,
-        // eight U32 shifts plus their eight Arange inputs, and the codebook
-        // conversion when the source precision is narrower than F32.
-        let fixed_bytes = 136 + 4 * scalar + if scalar == 2 { 16 * scalar } else { 0 };
+        let layout = safemlx::OperationEvent::cpu_mxfp4_quantize_payload_layout(dtype, 1, columns)
+            .ok_or_else(|| quantization_error("CPU MXFP4 payload geometry is not representable"))?;
         Ok(QuantizerPayload {
-            row_bytes,
-            fixed_bytes,
+            row_bytes: u64::try_from(layout.temporary_row_bytes())
+                .map_err(|_| quantization_error("CPU MXFP4 temporary row payload overflow"))?,
+            fixed_bytes: u64::try_from(layout.temporary_fixed_bytes())
+                .map_err(|_| quantization_error("CPU MXFP4 fixed payload overflow"))?,
         })
     }
 

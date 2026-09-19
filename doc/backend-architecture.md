@@ -804,6 +804,12 @@ CPU MXFP4 construction uses the same resident bank, with a source-derived bound
 for binary/Select casts and broadcasts, unary operators, views, reductions and
 range construction. Its six eager constants expose individual payload requests;
 their physical capacities are admitted separately with the selected allocator.
+The shared payload inventory also lists possible evaluation allocations,
+including input compaction, both codebook-distance destinations and integer
+packing intermediates. Physical capacity sums the selected allocator's request
+layout for each entry, without relying on donation or early retirement. The
+bounded converter's logical temporary workspace uses this same inventory;
+source input custody and final encoded host buffers remain separate.
 The bank also covers the two fixed C result handles. Identity elision may consume
 less than the reserved population. Eval, physical buffers, source preparation
 and streams require separate admission. Failed allocation prefixes retain their

@@ -5427,3 +5427,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "mxfp4_construction_tests.cpp"
 
 #include "ranked_reshape_tests.cpp"
+
+#include "mxfp4_payload_tests.cpp"

@@ -314,6 +314,16 @@ unsigned mlx_operation_event_prepare_resident_graph_with_shells(void**, mlx_subm
     size_t additional_shells);
 void mlx_operation_event_finish_resident_graph(void*);
 
+typedef struct mlx_cpu_mxfp4_quantize_payload_layout_ {
+  size_t request_bytes[29];
+  size_t request_count;
+  size_t temporary_row_bytes, temporary_fixed_bytes;
+  size_t output_bytes[2];
+  size_t named_control_bytes;
+} mlx_cpu_mxfp4_quantize_payload_layout;
+bool mlx_operation_event_cpu_mxfp4_quantize_payload_layout(
+    mlx_cpu_mxfp4_quantize_payload_layout*,mlx_dtype,size_t rows,size_t columns);
+
 typedef struct mlx_cpu_mxfp4_quantize_construction_layout_ {
   mlx_resident_graph_layout graph;
   size_t seed_request_bytes[6];

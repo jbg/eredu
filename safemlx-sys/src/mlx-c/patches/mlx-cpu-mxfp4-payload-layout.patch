@@ -1,0 +1,102 @@
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -608,6 +608,54 @@
+   output = value; return true;
+ #endif
+ }
++bool cpu_mxfp4_quantize_payload_layout(Dtype dtype,size_t rows,size_t columns,
++    CpuMxFp4QuantizePayloadLayout& output) noexcept {
++  if((dtype!=float16&&dtype!=bfloat16&&dtype!=float32)||!rows||!columns||columns%32||
++      columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/16/columns)return false;
++  const size_t scalar=dtype.size(),elements=rows*columns,groups=elements/32;
++  size_t distance_bytes=0;
++  if(!resident_multiply(elements,16*scalar,distance_bytes))return false;
++  CpuMxFp4QuantizePayloadLayout value;
++  size_t variable_temporary=0;
++  auto append=[&](size_t bytes,bool fixed,bool final_output=false) {
++    if(!bytes||value.request_count==std::size(value.request_bytes))return false;
++    value.request_bytes[value.request_count++]=bytes;
++    if(final_output)return true;
++    return fixed?add(value.temporary_fixed_bytes,bytes,value.temporary_fixed_bytes):
++        add(variable_temporary,bytes,variable_temporary);
++  };
++  // Actual eager constant order: maximum code, zero, scale base, exponent
++  // offset, F32 codebook, packing base. The I32 offset's dtype conversion is
++  // a separate lazy scalar request below.
++  for(size_t bytes:{scalar,scalar,scalar,sizeof(int32_t),16*sizeof(float),sizeof(uint32_t)})
++    if(!append(bytes,true))return false;
++  // Reshape input compaction, Abs, group maximum and scale division.
++  if(!append(elements*scalar,false)||!append(elements*scalar,false)||
++      !append(groups*scalar,false)||!append(groups*scalar,false))return false;
++  // Equality, Log2, Round, I32 exponent and its conversion back to source
++  // precision for Select, then Select, scale Power and normalized weights.
++  if(!append(groups,false)||!append(groups*scalar,false)||!append(groups*scalar,false)||
++      !append(groups*sizeof(int32_t),false)||!append(groups*scalar,false)||
++      !append(groups*scalar,false)||!append(groups*scalar,false)||!append(elements*scalar,false))return false;
++  if(!append(scalar,true)||!append(groups*scalar,false))return false;
++  value.output_bytes[1]=groups;
++  if(!append(value.output_bytes[1],false,true))return false;
++  if(dtype!=float32&&!append(16*scalar,true))return false;
++  // Both codebook-distance destinations and ArgMin indices. Their rank-three
++  // index geometry is checked above before multiplication.
++  if(!append(distance_bytes,false)||!append(distance_bytes,false)||
++      !append(elements*sizeof(uint32_t),false))return false;
++  // Eight integer shifts, their Arange input, shifted codes and packed Sum.
++  if(!append(8*sizeof(uint32_t),true)||!append(8*sizeof(uint32_t),true)||
++      !append(elements*sizeof(uint32_t),false))return false;
++  value.output_bytes[0]=elements/8*sizeof(uint32_t);
++  if(!append(value.output_bytes[0],false,true)||variable_temporary%rows)return false;
++  value.temporary_row_bytes=variable_temporary/rows;
++  value.named_control_bytes=sizeof(value)+sizeof(output)+sizeof(dtype)+sizeof(rows)+
++      sizeof(columns)+sizeof(scalar)+sizeof(elements)+sizeof(groups)+sizeof(variable_temporary)+sizeof(distance_bytes)+
++      sizeof(append)+sizeof(size_t)*6+sizeof(bool)*2+sizeof(std::initializer_list<size_t>);
++  output=value;return true;
++}
+ bool cpu_mxfp4_quantize_construction_layout(Dtype dtype,size_t rank,
+     size_t rows,size_t columns,CpuMxFp4QuantizeConstructionLayout& output) noexcept {
+   if((dtype!=float16&&dtype!=bfloat16&&dtype!=float32)||rank<2||rank>size_t(INT_MAX)||
+@@ -627,16 +675,16 @@
+   CpuMxFp4QuantizeConstructionLayout value;
+   if(!resident_graph_layout(candidates,6,std::max(rank,size_t(3)),value.graph))return false;
+   // maxval, zero, power base, exponent offset, F32 lookup table, packing base.
+-  const size_t requests[]={dtype.size(),dtype.size(),dtype.size(),sizeof(int32_t),
+-      16*sizeof(float),sizeof(uint32_t)};
+-  std::copy(std::begin(requests),std::end(requests),std::begin(value.seed_request_bytes));
++  CpuMxFp4QuantizePayloadLayout payload;
++  if(!cpu_mxfp4_quantize_payload_layout(dtype,rows,columns,payload))return false;
++  std::copy_n(payload.request_bytes,6,value.seed_request_bytes);
+   // Named quantizer/query frames and a conservative sum of the potential
+   // frontend call transports; descriptor and callable storage is in Graph.
+   const size_t frontend_controls=sizeof(StreamOrDevice)+sizeof(Stream)+sizeof(Dtype)*3+
+       sizeof(array)*3+sizeof(ArrayVector)*3+sizeof(Shape)*4+sizeof(AxisView)*2+
+       sizeof(std::optional<bool>)+sizeof(int)*4+sizeof(size_t)*4;
+   const size_t controls[]={sizeof(value),sizeof(output),sizeof(dtype),sizeof(rank),
+-      sizeof(rows),sizeof(columns),sizeof(requests),sizeof(frontend_controls),
++      sizeof(rows),sizeof(columns),sizeof(payload),payload.named_control_bytes,sizeof(frontend_controls),
+       sizeof(FpQuantizeFallback),sizeof(array)*9,sizeof(ArrayVector)*3,sizeof(Shape)*3,
+       sizeof(StreamOrDevice),sizeof(Stream),sizeof(std::optional<int>)*2,
+       sizeof(std::optional<array>),sizeof(std::string),sizeof(QuantizationMode),
+diff --git a/mlx/quantize_construction.h b/mlx/quantize_construction.h
+--- a/mlx/quantize_construction.h
++++ b/mlx/quantize_construction.h
+@@ -14,6 +14,19 @@
+   ArrayVector operator()(const ArrayVector& inputs) const;
+ };
+ namespace submission {
++struct CpuMxFp4QuantizePayloadLayout {
++  // Constants precede possible Eval allocations; the six eager constants form
++  // the prefix. Identity casts, donation and retirement may consume less.
++  size_t request_bytes[29]{};
++  size_t request_count{0};
++  size_t temporary_row_bytes{0}, temporary_fixed_bytes{0};
++  size_t output_bytes[2]{};
++  size_t named_control_bytes{0};
++};
++// Payload requests exclude the caller's input and final encoded host buffers.
++// Each request requires the selected allocator's separate physical layout.
++MLX_API bool cpu_mxfp4_quantize_payload_layout(Dtype,size_t rows,size_t columns,
++    CpuMxFp4QuantizePayloadLayout&) noexcept;
+ struct CpuMxFp4QuantizeConstructionLayout {
+   ResidentGraphLayout graph;
+   size_t seed_request_bytes[6]{};

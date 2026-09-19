@@ -7466,3 +7466,19 @@ unsafe extern "C" {
         out: *mut mlx_cpu_mxfp4_quantize_construction_layout, dtype: mlx_dtype,
         rank: usize, rows: usize, columns: usize) -> bool;
 }
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct mlx_cpu_mxfp4_quantize_payload_layout {
+    pub request_bytes: [usize; 29],
+    pub request_count: usize,
+    pub temporary_row_bytes: usize,
+    pub temporary_fixed_bytes: usize,
+    pub output_bytes: [usize; 2],
+    pub named_control_bytes: usize,
+}
+unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_mxfp4_quantize_payload_layout(
+        out: *mut mlx_cpu_mxfp4_quantize_payload_layout, dtype: mlx_dtype,
+        rows: usize, columns: usize) -> bool;
+}

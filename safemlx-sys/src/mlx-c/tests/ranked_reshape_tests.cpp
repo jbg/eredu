@@ -79,38 +79,49 @@ TEST_CASE("CPU ranked reshape planner preserves independent collapse decisions")
   }
 }
 
-TEST_CASE("CPU MXFP4 composed constructor and Eval preserve codes at high rank") {
+namespace mxfp4_composed_tests {
+void exercise(mlx::core::Dtype dtype,int rank,size_t rows,size_t columns,int variant) {
   using namespace affine_construction_tests;
   const float codebook[]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-  for(auto dtype:{float16,bfloat16,float32})for(int rank:{2,3,4,11,21})for(int variant:{0,1,2}) {
-    CAPTURE(dtype);CAPTURE(rank);CAPTURE(variant);
+  const size_t elements=rows*columns;
+  {
+    CAPTURE(dtype);CAPTURE(rank);CAPTURE(variant);CAPTURE(rows);CAPTURE(columns);
     const bool strided=variant==1;
     auto stream=new_stream(Device::cpu);prepare(stream,stream);
-    Shape shape(rank,1);shape[0]=2;shape.back()=64*(strided?2:1);
-    std::vector<float> data(2*shape.back(),99.f);
-    for(size_t i=0;i<128;++i)data[i*(strided?2:1)]=std::ldexp(codebook[i%16],int(i/32)-1);
+    Shape shape(rank,1);shape[0]=int(rows);shape.back()=int(columns)*(strided?2:1);
+    std::vector<float> data(rows*shape.back(),99.f);
+    for(size_t i=0;i<elements;++i)data[i*(strided?2:1)]=std::ldexp(codebook[i%16],int((i/32)%4)-1);
     auto input=astype(array(data.begin(),shape),dtype,stream);
     if(strided){Shape starts(rank,0),steps(rank,1);steps.back()=2;input=slice(input,starts,shape,steps,stream);}
     if(variant==2) {
-      std::vector<float> transposed(128);
-      for(size_t i=0;i<128;++i)transposed[(i%64)*2+i/64]=std::ldexp(codebook[i%16],int(i/32)-1);
-      auto base=astype(array(transposed.begin(),Shape{64,2}),dtype,stream);
+      std::vector<float> transposed(elements);
+      for(size_t i=0;i<elements;++i)transposed[(i%columns)*rows+i/columns]=std::ldexp(codebook[i%16],int((i/32)%4)-1);
+      auto base=astype(array(transposed.begin(),Shape{int(columns),int(rows)}),dtype,stream);
       input=reshape(transpose(base,stream),shape,stream);
     }
     eval(input);input.eval();
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     unsigned retired=0;
     struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
-    // The shared fixture arenas isolate composed numerical execution and
-    // custody; their capacity is not a cold producer reservation.
-    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,2<<20,&retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
+    mlx_cpu_mxfp4_quantize_payload_layout payload{};
+    const auto input_scalar=dtype==float16?MLX_FLOAT16:dtype==bfloat16?MLX_BFLOAT16:MLX_FLOAT32;
+    REQUIRE(mlx_operation_event_cpu_mxfp4_quantize_payload_layout(&payload,input_scalar,rows,columns));
+    size_t capacity=0;
+    for(size_t i=0;i<payload.request_count;++i) {
+      mlx_original_buffer_population_layout physical{};
+      REQUIRE(mlx_original_buffer_request_layout_for(&physical,runtime,payload.request_bytes[i])==0);
+      capacity+=physical.capacity;
+    }
+    // The physical budget comes from the cold per-request inventory. The
+    // fixture's Graph/Record arenas still isolate evaluation/custody coverage.
+    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
     std::array<std::optional<array>,2> escaped;
     {
       Role role;Observer observer;Bank bank;Outputs outputs;
       REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
       mlx_cpu_mxfp4_quantize_construction_layout layout{};
       const auto scalar=dtype==float16?MLX_FLOAT16:dtype==bfloat16?MLX_BFLOAT16:MLX_FLOAT32;
-      REQUIRE(mlx_operation_event_cpu_mxfp4_quantize_construction_layout(&layout,scalar,rank,2,64));
+      REQUIRE(mlx_operation_event_cpu_mxfp4_quantize_construction_layout(&layout,scalar,rank,rows,columns));
       REQUIRE(mlx_operation_event_prepare_resident_graph(&bank.value,observer.value,layout.graph.primitives,layout.graph.seeds,layout.graph.maximum_rank)==0);
       REQUIRE(mlx_quantize_fixed(&outputs.values[0],&outputs.values[1],&outputs.values[2],{&input},32,4,"mxfp4",{&stream})==0);
       bank.reset();Operation operation;
@@ -133,11 +144,18 @@ TEST_CASE("CPU MXFP4 composed constructor and Eval preserve codes at high rank")
         mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,outputs.values[i],budget.value)==0);CHECK(info.known);escaped[i].emplace(value);
       }
     }
-    for(size_t i=0;i<128;++i) {
+    for(size_t i=0;i<elements;++i) {
       const unsigned expected=i%16==8?0:i%16;
       CHECK(((escaped[0]->data<uint32_t>()[i/8]>>((i%8)*4))&15u)==expected);
     }
-    for(size_t i=0;i<4;++i)CHECK(escaped[1]->data<uint8_t>()[i]==126+i);
+    for(size_t i=0;i<elements/32;++i)CHECK(escaped[1]->data<uint8_t>()[i]==126+i%4);
     mlx_original_buffer_budget_release(budget.value);budget.value={};CHECK(retired==0);escaped={};CHECK(retired==1);
   }
+}
+} // namespace mxfp4_composed_tests
+
+TEST_CASE("CPU MXFP4 composed constructor and Eval preserve codes at high rank") {
+  for(auto dtype:{mlx::core::float16,mlx::core::bfloat16,mlx::core::float32})
+    for(int rank:{2,3,4,11,21})for(int variant:{0,1,2})
+      mxfp4_composed_tests::exercise(dtype,rank,2,64,variant);
 }

@@ -18,10 +18,12 @@ pub use nested_roots::{PreparedNestedRoots, PreparedNestedRootsCause, PreparedNe
 mod gpu_eval_prologue;
 mod graph_construction;
 mod resident_graph;
+mod quantize_payload;
 pub(crate) use eval_traversal::submit_original_prepared_traversal;
 pub use eval_traversal::{OperationEvalTraversalLayout, OperationEvalTraversalLimits};
 pub use gpu_eval_prologue::{GpuEvalPrologueLayout, GpuEvalProloguePopulation};
 pub use graph_construction::{PointwiseGraphLayout, PreparedPointwiseGraph};
+pub use quantize_payload::CpuMxFp4QuantizePayloadLayout;
 pub use resident_graph::{AffineQuantizeConstructionLayout, CpuMxFp4QuantizeConstructionLayout, PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout};
 mod exact_roots;
 mod wait_records;
