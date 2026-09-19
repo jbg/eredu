@@ -67,10 +67,13 @@ void numerical(Device device, bool expect_cpu_source_refusal = false) {
     mlx_original_buffer_population_layout physical{};
     // The actual cast and two binary outputs need at most three positive
     // births. A missing physical source must not mask the CPU Eval refusal.
-    const size_t bytes = (a_values.size() + 2 * c_values.size()) * sizeof(float);
-    REQUIRE(mlx_original_buffer_metal_population_layout_for(&physical, runtime, bytes, 3) == 0);
+    size_t capacity=0;
+    for(size_t bytes:{a_values.size()*sizeof(float),c_values.size()*sizeof(float),c_values.size()*sizeof(float)}) {
+      REQUIRE(mlx_original_buffer_request_layout_for(&physical,runtime,bytes)==0);
+      capacity+=physical.capacity;
+    }
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime,
-        physical.capacity, &physical_retired,
+        capacity, &physical_retired,
         [](void* owner) { ++*static_cast<unsigned*>(owner); }) == 0);
   }
   Role role;
@@ -1268,7 +1271,7 @@ TEST_CASE("CPU Softmax source counts actual optional copy and rejects malformed 
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
   CHECK_FALSE(cpu::softmax_eval_layout(2,0,1,false,actual));
   CHECK_FALSE(cpu::softmax_eval_layout(2,4,SIZE_MAX,false,actual));
-  CHECK_FALSE(cpu::softmax_eval_layout(4,4,1,false,actual));
+  CHECK_FALSE(cpu::softmax_eval_layout(6,4,1,false,actual));
   auto wrong=array(Shape{4,1},float32,std::make_shared<Softmax>(stream,true),{source});
   auto dtype=array(Shape{1,4},int32,std::make_shared<Softmax>(stream,true),{source});
   struct Derived final:Softmax{using Softmax::Softmax;};
@@ -3487,7 +3490,12 @@ TEST_CASE("CPU head joining reshape preserves ordinary values and copy or alias 
 TEST_CASE("ordinary Eval uses the same ready input availability transition"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
   using namespace pointwise_graph_tests;
-  const auto stream = new_stream(Device::gpu);
+  for(auto device:{Device::cpu
+#ifdef MLX_C_PATCH_TEST_METAL
+      ,Device::gpu
+#endif
+  }) {
+  const auto stream = new_stream(device);
   prepare(stream, stream);
   array input({-1.5f, 0.25f, 2.75f});
   auto first = add(input, input, stream);
@@ -3503,6 +3511,7 @@ TEST_CASE("ordinary Eval uses the same ready input availability transition"
   CHECK(second.data<float>()[0] == -4.5f);
   CHECK(second.data<float>()[1] == 0.75f);
   CHECK(second.data<float>()[2] == 8.25f);
+  }
 }
 
 TEST_CASE("CPU preview reuses exact rank-one Slice and retains original flattened backing"
@@ -3595,8 +3604,19 @@ TEST_CASE("CPU flat count and maximum sources validate complete scalar reduction
     }
     for(size_t width:{size_t(0),size_t(1),SIZE_MAX})
       CHECK_FALSE(cpu::reduction_eval_layout(source,1,width,1,false,actual));
-    CHECK_FALSE(cpu::reduction_eval_layout(source,2,6,1,false,actual));
+    if(!count)for(size_t rank:{size_t(2),size_t(3)}) {
+      Shape shape(rank,1);shape.back()=6;
+      array shaped_input(values,shape,float32);
+      auto shaped_max=max(shaped_input,-1,true,stream);
+      cpu::CopyEvalStorage supported;
+      REQUIRE(cpu::reduction_eval_storage(shaped_max,supported));
+      REQUIRE(cpu::reduction_eval_layout(source,rank,6,1,false,cold));
+      CHECK(supported.allocation_extents==cold.allocation_extents);
+      eval(shaped_max);CHECK(shaped_max.item<float>()==9.f);
+    }
+    CHECK_FALSE(cpu::reduction_eval_layout(source,count?2:4,6,1,false,actual));
     CHECK_FALSE(cpu::reduction_eval_layout(source,1,6,2,false,actual));
+    REQUIRE(cpu::reduction_eval_layout(source,1,6,1,false,cold));
     mlx_cpu_copy_eval_layout raw{};
     REQUIRE(mlx_operation_event_cpu_reduction_eval_layout(&raw,count?5:6,1,6,1,false));
     CHECK(raw.graph_extents==cold.allocation_extents);
@@ -4222,7 +4242,7 @@ TEST_CASE("CPU half SDPA shares precise masked and unmasked GQA sources and esca
         dtype==float16?MLX_FLOAT16:MLX_BFLOAT16,5,heads*queries*keys,false));
     CHECK(raw.graph_extents==selection.allocation_extents);CHECK(raw.backing_births==selection.backing_births);
     auto prior=raw;
-    CHECK_FALSE(mlx_operation_event_cpu_typed_select_broadcast_eval_layout(&raw,MLX_INT32,5,heads*queries*keys,false));
+    CHECK_FALSE(mlx_operation_event_cpu_typed_select_broadcast_eval_layout(&raw,MLX_FLOAT64,5,heads*queries*keys,false));
     CHECK(std::memcmp(&raw,&prior,sizeof(raw))==0);
     const float scale=1.0f/std::sqrt(float(width));
     auto ordinary=fast::scaled_dot_product_attention(q,k,v,scale,mode,mask_arg,{},selected);eval(ordinary);
@@ -4502,7 +4522,7 @@ TEST_CASE("CPU ordered member Stack shares exact N copy jobs and escaped half or
     CHECK(raw.graph_extents==cold.allocation_extents);CHECK(raw.worker_graph_extents==cold.worker_graph_extents);
     const auto prior=raw;
     CHECK_FALSE(mlx_operation_event_cpu_concatenate_many_eval_layout(&raw,raw_dtype,3,1,6,false));
-    CHECK_FALSE(mlx_operation_event_cpu_concatenate_many_eval_layout(&raw,raw_dtype,3,count,count-1,false));
+    CHECK_FALSE(mlx_operation_event_cpu_concatenate_many_eval_layout(&raw,raw_dtype,3,count,SIZE_MAX,false));
     CHECK(std::memcmp(&prior,&raw,sizeof(raw))==0);
     eval(ordinary);
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
