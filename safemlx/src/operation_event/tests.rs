@@ -31,6 +31,14 @@ impl Original {
     fn new() -> Self {
         Self::with_failure_owner(())
     }
+    fn for_stream(stream: &Stream, pipelines: usize) -> Self {
+        let pipelines = if stream.get_device().unwrap().get_type().unwrap() == DeviceType::Gpu {
+            pipelines
+        } else {
+            0
+        };
+        Self::with_resources((), GRAPH_CAPACITY, 1 << 20, pipelines)
+    }
     fn with_failure_owner(owner: impl Send + 'static) -> Self {
         Self::with_capacities(owner, GRAPH_CAPACITY, 1 << 20)
     }
@@ -145,12 +153,7 @@ fn round_trip(stream: &Stream) {
         destinations.push(plan.construct_copy_destination(&arena).unwrap());
     }
     // Shared-Metal stores each select one actual vector-copy pipeline.
-    let pipelines = if stream.get_device().unwrap().get_type().unwrap() == DeviceType::Gpu {
-        2
-    } else {
-        0
-    };
-    let mut original = Original::with_resources((), GRAPH_CAPACITY, 1 << 20, pipelines);
+    let mut original = Original::for_stream(stream, 2);
     original.scope.bind_original_buffer_budget(&budget).unwrap();
     let observer = OriginalScopeObserver::try_current().unwrap().unwrap();
     let baseline = original.graph.occupied_bytes();
@@ -230,24 +233,25 @@ fn original_operation_cpu_round_trip_reclaims_each_active_role_window_without_ho
     round_trip(&stream);
 }
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
-#[test]
-fn original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks() {
-    const CHILD: &str = "SAFEMLX_PREPARED_HOST_ROUND_TRIP_CHILD";
-    if std::env::var_os(CHILD).is_none() {
+// Prepared singleton ownership must precede ordinary fixture initialization.
+// Each selected test establishes those owners in its own process.
+fn with_prepared_metal_stream(test: &str, run: impl FnOnce(&Stream)) {
+    const CHILD: &str = "SAFEMLX_PREPARED_OPERATION_STREAM_CHILD";
+    if std::env::var(CHILD).ok().as_deref() != Some(test) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "operation_event::tests::original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks",
+                test,
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, test)
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
+            output.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         return;
@@ -271,8 +275,17 @@ fn original_operation_metal_round_trip_reclaims_each_active_role_window_without_
         .try_initialize(target)
         .unwrap();
     stream.try_borrow().unwrap();
-    round_trip(stream.as_stream());
+    run(stream.as_stream());
     stream.try_observe_idle().unwrap();
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+#[test]
+fn original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks() {
+    with_prepared_metal_stream(
+        "operation_event::tests::original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks",
+        round_trip,
+    );
 }
 
 #[test]

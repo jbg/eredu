@@ -15,9 +15,8 @@ impl Drop for SourceCustody {
 fn reclaim() {
     crate::allocation_retention::reclaim_allocation_owners();
 }
-fn copied_completion(kind: DeviceType) {
-    let stream = Stream::new_with_device(&Device::new(kind, 0));
-    let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+fn copied_completion(stream: &Stream) {
+    let _runtime = PrefillRootsRuntime::prepare_for_stream(stream, stream).unwrap();
     let runtime = PreparedInputRuntime::prepare().unwrap();
     let values = vec![2.0_f32, -3.0, 7.0];
     let plan = OwnedHostCopyPlan::<f32>::new(&runtime, &[3], values.capacity()).unwrap();
@@ -35,7 +34,7 @@ fn copied_completion(kind: DeviceType) {
     )
     .unwrap();
     let slot = plan.prepare(preparation).unwrap();
-    let original = Original::new();
+    let original = Original::for_stream(stream, 1);
     let observer = OriginalScopeObserver::require_current().unwrap();
     let graph = original.graph.occupied_bytes();
     let records = original._records.occupied_bytes();
@@ -43,11 +42,11 @@ fn copied_completion(kind: DeviceType) {
     let hooks = Hook;
     HOOKS.with(|value| value.set(0));
     let copied = slot.try_fill(values, &observer).unwrap();
-    let doubled = copied.add(&copied, &stream).unwrap();
+    let doubled = copied.add(&copied, stream).unwrap();
     let event = crate::transforms::async_eval_with_original_operation_event_on_stream_exact(
         std::slice::from_ref(&doubled),
         &observer,
-        &stream,
+        stream,
     )
     .unwrap();
     event.synchronize().unwrap();
@@ -80,12 +79,16 @@ fn copied_completion(kind: DeviceType) {
 }
 #[test]
 fn prepared_owned_copy_cpu_preserves_completion_and_shared_final_handle_custody() {
-    copied_completion(DeviceType::Cpu);
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    copied_completion(&stream);
 }
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn prepared_owned_copy_metal_preserves_completion_and_shared_final_handle_custody() {
-    copied_completion(DeviceType::Gpu);
+    with_prepared_metal_stream(
+        "operation_event::tests::owned_host_copy::prepared_owned_copy_metal_preserves_completion_and_shared_final_handle_custody",
+        copied_completion,
+    );
 }
 #[test]
 fn prepared_owned_copy_busy_and_foreign_owner_keep_actual_vec_and_ready_slot() {

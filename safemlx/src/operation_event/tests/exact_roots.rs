@@ -68,12 +68,11 @@ fn exact_root_reserve_error_retires_partial_native_wrapper_and_keeps_actual_caus
     );
 }
 
-fn exact_frontier(kind: DeviceType) {
-    let stream = Stream::new_with_device(&Device::new(kind, 0));
-    let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+fn exact_frontier(stream: &Stream) {
+    let _runtime = PrefillRootsRuntime::prepare_for_stream(stream, stream).unwrap();
     let input = Array::from_slice(&[2.0_f32, -3.0, 7.0], &[3]);
     input.evaluated().unwrap();
-    let mut original = Original::new();
+    let mut original = Original::for_stream(stream, 1);
     let observer = OriginalScopeObserver::require_current().unwrap();
     let graph = original.graph.occupied_bytes();
     let records = original._records.occupied_bytes();
@@ -81,13 +80,13 @@ fn exact_frontier(kind: DeviceType) {
         let roots = [
             input.clone(),
             input.clone(),
-            input.add(&input, &stream).unwrap(),
+            input.add(&input, stream).unwrap(),
         ];
         let selected = if empty { &roots[..0] } else { &roots[..] };
         crate::register_thread_runtime_housekeeping(hook);
         let hooks = Hook;
         HOOKS.with(|value| value.set(0));
-        let event = exact(selected, &observer, &stream).unwrap();
+        let event = exact(selected, &observer, stream).unwrap();
         event.synchronize().unwrap();
         assert_eq!(HOOKS.with(Cell::get), 0);
         drop(hooks);
@@ -104,7 +103,7 @@ fn exact_frontier(kind: DeviceType) {
                     .unwrap(),
                 &[4.0, -6.0, 14.0]
             );
-            let identity = exact(&roots, &observer, &stream).unwrap();
+            let identity = exact(&roots, &observer, stream).unwrap();
             identity.synchronize().unwrap();
             settle(&observer);
             drop(identity);
@@ -120,13 +119,17 @@ fn exact_frontier(kind: DeviceType) {
 
 #[test]
 fn exact_root_cpu_slice_keeps_duplicates_values_and_empty_frontier_without_hooks() {
-    exact_frontier(DeviceType::Cpu);
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    exact_frontier(&stream);
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn exact_root_metal_slice_keeps_duplicates_values_and_empty_frontier_without_hooks() {
-    exact_frontier(DeviceType::Gpu);
+    with_prepared_metal_stream(
+        "operation_event::tests::exact_roots::exact_root_metal_slice_keeps_duplicates_values_and_empty_frontier_without_hooks",
+        exact_frontier,
+    );
 }
 
 #[test]

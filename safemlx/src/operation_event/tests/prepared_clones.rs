@@ -1,18 +1,17 @@
 use super::*;
 use crate::PreparedArrayClone;
 
-fn clone_completion(kind: DeviceType) {
-    let stream = Stream::new_with_device(&Device::new(kind, 0));
-    let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+fn clone_completion(stream: &Stream) {
+    let _runtime = PrefillRootsRuntime::prepare_for_stream(stream, stream).unwrap();
     let input = Array::from_slice(&[2.0_f32, -3.0, 7.0], &[3]);
     input.evaluated().unwrap();
     let mut slot = PreparedArrayClone::try_new().unwrap();
     let unused = PreparedArrayClone::try_new().unwrap();
-    let original = Original::new();
+    let original = Original::for_stream(stream, 1);
     let observer = OriginalScopeObserver::require_current().unwrap();
     let graph = original.graph.occupied_bytes();
     let records = original._records.occupied_bytes();
-    let source = input.add(&input, &stream).unwrap();
+    let source = input.add(&input, stream).unwrap();
     crate::register_thread_runtime_housekeeping(hook);
     let hooks = Hook;
     HOOKS.with(|value| value.set(0));
@@ -26,7 +25,7 @@ fn clone_completion(kind: DeviceType) {
     let event = crate::transforms::async_eval_with_original_operation_event_on_stream_exact(
         std::slice::from_ref(&cloned),
         &observer,
-        &stream,
+        stream,
     )
     .unwrap();
     event.synchronize().unwrap();
@@ -54,12 +53,16 @@ fn clone_completion(kind: DeviceType) {
 
 #[test]
 fn prepared_clone_cpu_nonzero_roots_retire_through_ordinary_array_drop() {
-    clone_completion(DeviceType::Cpu);
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    clone_completion(&stream);
 }
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn prepared_clone_metal_nonzero_roots_retire_through_ordinary_array_drop() {
-    clone_completion(DeviceType::Gpu);
+    with_prepared_metal_stream(
+        "operation_event::tests::prepared_clones::prepared_clone_metal_nonzero_roots_retire_through_ordinary_array_drop",
+        clone_completion,
+    );
 }
 
 #[test]
