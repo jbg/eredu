@@ -205,9 +205,9 @@ fn load_working_set_includes_cast_sources_without_reading_payloads() {
 #[test]
 fn cold_plans_use_real_projection_slots_and_preserve_source_precision_without_reads() {
     for (stored, safe, scalar, expected_affine, expected_mx) in [
-        (StoredDtype::F16, safetensors::Dtype::F16, 2, 164, 162),
-        (StoredDtype::BF16, safetensors::Dtype::BF16, 2, 164, 162),
-        (StoredDtype::F32, safetensors::Dtype::F32, 4, 296, 290),
+        (StoredDtype::F16, safetensors::Dtype::F16, 2, 164, 5372),
+        (StoredDtype::BF16, safetensors::Dtype::BF16, 2, 164, 5372),
+        (StoredDtype::F32, safetensors::Dtype::F32, 4, 296, 9988),
     ] {
         for quantization in [affine(), WeightQuantization::MxFp4] {
             let source = Arc::new(NoReads(store(2, safe)));

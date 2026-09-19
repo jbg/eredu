@@ -548,6 +548,7 @@ where
         tasks,
     )?;
     Ok(cold
+        .for_stream(stream)?
         .allocate_ordinary()?
         .materialize_handoff(stream)?
         .into_parts())
@@ -828,12 +829,16 @@ fn bounded_quantization_working_set(
             .checked_add(companion_row)
             .and_then(|bytes| bytes.checked_add(bias_row))
             .ok_or_else(|| Error::Quantization("packed output row size overflowed".into()))?;
+        let temporary_row = crate::backend::runtime::checkpoint::bounded_quantization::cpu_quantization_temporary_row_bytes(
+            quantization, metadata.dtype(), columns,
+        )?;
         let live_output_row = output_row
             .checked_add(target.companion_cast_source_row_bytes(
                 quantization,
                 metadata.dtype(),
                 columns,
             )?)
+            .and_then(|bytes| bytes.checked_add(temporary_row))
             .ok_or_else(|| Error::Quantization("live packed output row size overflowed".into()))?;
         output_bytes = output_bytes
             .checked_add(

@@ -52,6 +52,8 @@ mod pipeline;
 mod plan;
 mod preflight;
 mod preparation;
+mod workspace;
+pub(crate) use workspace::cpu_quantization_temporary_row_bytes;
 
 pub use pipeline::BoundedQuantizedWeightStore;
 pub(crate) use handoff::ConvertedQuantization;

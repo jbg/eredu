@@ -759,6 +759,14 @@ the selected companion precision, including F16/BF16 casts of equal byte width.
 Cold minimum-row checks, complete targets, leading batches and row candidates use
 that same live-output contribution. Final encoded output telemetry excludes these
 temporary cast sources.
+Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
+codebook distances, reduction/index values, scale intermediates, constants and
+a possible input compaction. Sizing sums potential destinations without assuming
+donation or early retirement, and limits submissions for the 16-way expansion.
+Direct GPU quantization keeps its own payload profile. Model-load minimum sizing
+covers the CPU fallback; final output telemetry still reports only encoded bytes.
+These logical payload contributions exclude allocator rounding and native
+graph/worker controls, which require their own producer admission.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

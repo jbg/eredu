@@ -3,6 +3,7 @@ use super::layout::{output_layouts, OutputLayout, OutputShard};
 use super::preflight::{
     checked_product, output_names_for, preflight_source_collisions, quantization_error,
 };
+use super::workspace::QuantizerWorkspace;
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -12,6 +13,8 @@ pub(super) struct ConversionGeometry {
     pub(super) columns: usize,
     pub(super) output_row_bytes: u64,
     pub(super) live_output_row_bytes: u64,
+    pub(super) fixed_working_set_bytes: u64,
+    pub(super) maximum_submission_elements: usize,
     pub(super) output_bytes: u64,
     pub(super) one_row_source_bytes: u64,
     pub(super) source_bytes: u64,
@@ -30,6 +33,7 @@ struct TargetOutputs {
 
 /// Retains the exact source and validated metadata without native state or payloads.
 pub(crate) struct ColdQuantization {
+    workspace: QuantizerWorkspace,
     source: eredu_checkpoint::store::RetainedCheckpointSource,
     plan: BoundedQuantizationPlan,
     targets: Vec<TargetOutputs>,
@@ -40,6 +44,7 @@ pub(crate) struct ColdQuantization {
 
 /// Owns the final destinations before the conversion streams are constructed.
 pub(crate) struct PreparedQuantization {
+    pub(super) workspace: QuantizerWorkspace,
     pub(super) source: eredu_checkpoint::store::RetainedCheckpointSource,
     pub(super) plan: BoundedQuantizationPlan,
     pub(super) output_shards: Vec<OutputShard>,
@@ -57,9 +62,30 @@ impl ColdQuantization {
         converted.validate(&self.source, &self.plan)
     }
 
+    /// Common metadata preflight. Qualify the selected stream with `for_stream`
+    /// before allocating CPU MXFP4 destinations; materialization checks this
+    /// profile again before constructing conversion streams or reading payloads.
     pub(crate) fn prepare(
         source: eredu_checkpoint::store::RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,
+    ) -> Result<Self, Error> {
+        Self::prepare_with_workspace(source, plan, QuantizerWorkspace::Direct)
+    }
+
+    /// Qualifies the actual quantizer before allocating final output buffers.
+    pub(crate) fn for_stream(self, stream: &Stream) -> Result<Self, Error> {
+        let workspace =
+            QuantizerWorkspace::selected(self.plan.quantization, stream.get_device()?.get_type()?);
+        if self.workspace == workspace {
+            return Ok(self);
+        }
+        Self::prepare_with_workspace(self.source, self.plan, workspace)
+    }
+
+    fn prepare_with_workspace(
+        source: eredu_checkpoint::store::RetainedCheckpointSource,
+        plan: BoundedQuantizationPlan,
+        workspace: QuantizerWorkspace,
     ) -> Result<Self, Error> {
         if !cfg!(target_endian = "little") {
             return Err(quantization_error(
@@ -85,10 +111,11 @@ impl ColdQuantization {
         let mut transformed_keys = BTreeSet::new();
         let mut targets = Vec::with_capacity(plan.targets.len());
         for target in &plan.targets {
-            targets.push(prepare_target(source.as_ref(), target, &plan)?);
+            targets.push(prepare_target(source.as_ref(), target, &plan, workspace)?);
             transformed_keys.extend(output_names_for(target, plan.quantization)?);
         }
         Ok(Self {
+            workspace,
             source,
             plan,
             targets,
@@ -174,6 +201,7 @@ impl ColdQuantization {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(PreparedQuantization {
+            workspace: self.workspace,
             source: self.source,
             plan: self.plan,
             output_shards,
@@ -207,6 +235,7 @@ fn prepare_target(
     source: &dyn CheckpointSource,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
+    workspace: QuantizerWorkspace,
 ) -> Result<TargetOutputs, Error> {
     let metadata = target.source.infer(source)?;
     if metadata.shape().len() < 2
@@ -262,12 +291,21 @@ fn prepare_target(
             .checked_add(layout.row_bytes)
             .ok_or_else(|| quantization_error("quantized output row size overflow"))
     })?;
+    let temporary = workspace.payload(metadata.dtype(), columns)?;
+    let fixed_working_set_bytes = temporary.fixed_bytes;
+    let maximum_submission_elements = workspace.maximum_submission_elements();
+    if columns > maximum_submission_elements {
+        return Err(quantization_error(
+            "one quantization row exceeds the native submission element limit",
+        ));
+    }
     let live_output_row_bytes = output_row_bytes
         .checked_add(target.companion_cast_source_row_bytes(
             plan.quantization,
             metadata.dtype(),
             columns,
         )?)
+        .and_then(|bytes| bytes.checked_add(temporary.row_bytes))
         .ok_or_else(|| quantization_error("live quantized output row size overflow"))?;
     let mut one_row_source_bytes = 0u64;
     let mut one_row_peak = 0u64;
@@ -280,6 +318,7 @@ fn prepare_target(
             one_row
                 .peak_materialization_bytes(source)?
                 .checked_add(live_output_row_bytes)
+                .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                 .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?,
         );
     }
@@ -317,6 +356,7 @@ fn prepare_target(
                 .checked_mul(complete_rows as u64)
                 .ok_or_else(|| quantization_error("complete live output size overflow"))?,
         )
+        .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
         .ok_or_else(|| quantization_error("complete target working-set overflow"))?;
     let leading_batch_admissible = if row_axis == 1 {
         let one_matrix = target.source.select_bounded(
@@ -333,16 +373,17 @@ fn prepare_target(
         one_matrix
             .peak_materialization_bytes(source)?
             .checked_add(one_matrix_output)
+            .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
             .is_some_and(|peak| peak <= tile_budget)
             && rows
                 .checked_mul(columns)
-                .is_some_and(|elements| elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS)
+                .is_some_and(|elements| elements <= maximum_submission_elements)
     } else {
         false
     };
     let source_bytes = metadata.byte_len();
     let complete_admissible =
-        complete_peak <= tile_budget && complete_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS;
+        complete_peak <= tile_budget && complete_elements <= maximum_submission_elements;
     Ok(TargetOutputs {
         layouts,
         geometry: ConversionGeometry {
@@ -351,6 +392,8 @@ fn prepare_target(
             columns,
             output_row_bytes,
             live_output_row_bytes,
+            fixed_working_set_bytes,
+            maximum_submission_elements,
             output_bytes,
             one_row_source_bytes,
             source_bytes,

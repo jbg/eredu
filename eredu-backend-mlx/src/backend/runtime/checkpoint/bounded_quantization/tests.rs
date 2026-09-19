@@ -13,6 +13,7 @@ use super::*;
 mod preparation;
 mod read_window;
 mod companion_casts;
+mod mxfp4_workspace;
 use crate::backend::runtime::{
     checkpoint::store::test_support::open_gguf_checkpoint_source_for_test,
     residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},
@@ -307,12 +308,12 @@ fn mxfp4_conversion_double_buffers_across_target_boundaries() {
     let (_directory, source, values) = two_target_fixture();
     let context = cpu_context();
     let quantization = WeightQuantization::MxFp4;
-    // Each complete target needs 2,320 bytes: 2,048 source bytes plus
-    // 272 packed output bytes. Both targets therefore fit as one tile in
+    // Each complete CPU target needs 78,840 logical payload bytes, including
+    // the fallback's temporary arrays. Both targets fit as one tile in
     // the two-slot window, making cross-target overlap observable.
     let plan = BoundedQuantizationPlan::new(
         quantization,
-        4_640,
+        157_680,
         [
             direct_test_target("model.first.weight"),
             direct_test_target("model.second.weight"),
@@ -325,7 +326,7 @@ fn mxfp4_conversion_double_buffers_across_target_boundaries() {
     assert_eq!(report.transformed_weights, 2);
     assert_eq!(report.source_tiles, 2);
     assert_eq!(report.peak_in_flight_tiles, 2);
-    assert_eq!(report.peak_planned_working_set_bytes, 4_640);
+    assert_eq!(report.peak_planned_working_set_bytes, 157_680);
     assert_eq!(report.source_bytes_read, 4_096);
     assert_eq!(report.output_bytes, 544);
 
@@ -723,7 +724,7 @@ fn mxfp4_layout_has_byte_scales_and_no_biases() {
     let context = cpu_context();
     let plan = BoundedQuantizationPlan::new(
         WeightQuantization::MxFp4,
-        290,
+        9_988,
         [direct_test_target("model.proj.weight")],
     )
     .unwrap();

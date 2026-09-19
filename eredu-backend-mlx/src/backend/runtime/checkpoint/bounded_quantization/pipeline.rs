@@ -50,6 +50,7 @@ impl BoundedQuantizedWeightStore {
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
         super::preparation::ColdQuantization::prepare(source.into(), plan)?
+            .for_stream(conversion_stream)?
             .allocate_ordinary()?
             .materialize(conversion_stream)
     }
@@ -89,6 +90,7 @@ impl super::preparation::PreparedQuantization {
         conversion_stream: &Stream,
     ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
         let Self {
+            workspace,
             source,
             plan,
             mut output_shards,
@@ -97,6 +99,13 @@ impl super::preparation::PreparedQuantization {
             materialized_source_shards,
         } = self;
         let device = conversion_stream.get_device()?;
+        if workspace
+            != super::workspace::QuantizerWorkspace::selected(plan.quantization, device.get_type()?)
+        {
+            return Err(quantization_error(
+                "quantization destinations require preparation for the selected stream",
+            ));
+        }
         let tile_streams = [conversion_stream.clone(), Stream::new_with_device(&device)];
         let tile_contexts = tile_streams
             .each_ref()
@@ -354,6 +363,8 @@ fn transform_target(
         columns,
         output_row_bytes,
         live_output_row_bytes,
+        fixed_working_set_bytes,
+        maximum_submission_elements,
         output_bytes,
         one_row_source_bytes,
         source_bytes,
@@ -414,8 +425,9 @@ fn transform_target(
                 let candidate_peak = candidate
                     .peak_materialization_bytes(source)?
                     .checked_add(candidate_output_bytes)
+                    .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                     .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
-                if candidate_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS
+                if candidate_elements <= maximum_submission_elements
                     && candidate_peak <= tile_budget
                 {
                     matrix_end = candidate_end;
@@ -444,6 +456,7 @@ fn transform_target(
                         .checked_mul(batch_rows as u64)
                         .ok_or_else(|| quantization_error("leading batch live output size overflow"))?,
                 )
+                .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                 .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
             if batch_peak > tile_budget {
                 return Err(quantization_error(format!(
@@ -494,8 +507,13 @@ fn transform_target(
                     let peak = candidate
                         .peak_materialization_bytes(source)?
                         .checked_add(output_bytes)
+                        .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                         .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
-                    if peak <= tile_budget {
+                    if peak <= tile_budget
+                        && candidate_rows
+                            .checked_mul(columns)
+                            .is_some_and(|elements| elements <= maximum_submission_elements)
+                    {
                         end = candidate_end;
                     } else {
                         rejected_end = candidate_end;
@@ -515,6 +533,7 @@ fn transform_target(
                             .checked_mul(tile_rows as u64)
                             .ok_or_else(|| quantization_error("tile live output size overflow"))?,
                     )
+                    .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                     .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
                 if tile_peak > tile_budget {
                     return Err(quantization_error(format!(
