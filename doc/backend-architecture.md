@@ -823,6 +823,14 @@ completed input and two output roots on the same CPU stream. Physical buffers,
 input custody, arena owners, runtime/stream/cache setup, failure ownership and
 encoded host outputs remain separate contributions. Completed output access
 uses the original scope's read-only completed view rather than another evaluation.
+Prepared host-transfer storage follows the selected native allocator: CPU
+backing includes its size header before page rounding, while shared Metal
+backing has no in-band header. Immutable Rust metadata and source witnesses
+retain that actual storage kind, physical capacity and constructor provenance.
+CPU transfers accept CPU or shared Metal storage; GPU transfers require shared
+Metal storage. Host output destinations are prepared before original submission,
+and completed source descriptors are validated by their retained observer before
+copying. Escaped source arrays keep the source arena and attached custody alive.
 CPU-only event dispatch quotes use the actual named wait and signal tasks,
 including their retained Event owners and Graph allocator extents. No GPU
 handler allocation is included in that CPU-only backend's query.

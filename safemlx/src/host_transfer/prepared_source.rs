@@ -5,6 +5,10 @@ use super::{
 use crate::{
     Dtype, PreparedInputArena, PreparedInputCause, PreparedInputRuntime, utils::runtime_lock,
 };
+use safemlx_sys::{
+    mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CPU as CPU_STORAGE,
+    mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_METAL_SHARED as METAL_STORAGE,
+};
 use std::{ffi::c_void, mem::size_of, ptr};
 
 /// Borrowed exact shape and initialized allocator facts. This plan creates no
@@ -14,6 +18,7 @@ pub struct PreparedHostTransferPlan<'a> {
     runtime: &'a PreparedInputRuntime,
     shape: &'a [i32],
     dtype: Dtype,
+    storage_kind: HostTransferStorageKind,
     array_handles: usize,
     layout: safemlx_sys::mlx_prepared_host_transfer_layout,
 }
@@ -54,10 +59,16 @@ impl<'a> PreparedHostTransferPlan<'a> {
         if status != 0 {
             return Err(cause(status));
         }
+        let storage_kind = match runtime.raw().storage_kind {
+            CPU_STORAGE => HostTransferStorageKind::Cpu,
+            METAL_STORAGE => HostTransferStorageKind::MetalShared,
+            _ => return Err(PreparedInputCause::Unsupported),
+        };
         Ok(Self {
             runtime,
             shape,
             dtype,
+            storage_kind,
             array_handles,
             layout,
         })
@@ -112,7 +123,7 @@ impl<'a> PreparedHostTransferPlan<'a> {
         }
         crate::PreparedHostTransferWriter::new(self.construct(arena)?)
     }
-    /// Construct an exclusive GPU-to-Host destination. No writable byte view
+    /// Construct an exclusive array-to-Host destination. No writable byte view
     /// or source Array handle escapes before its completed copy is published.
     pub fn construct_copy_destination(
         self,
@@ -166,7 +177,7 @@ impl<'a> PreparedHostTransferPlan<'a> {
                 true,
             ),
             policy: HostTransferPolicy::Transfer,
-            storage_kind: HostTransferStorageKind::MetalShared,
+            storage_kind: self.storage_kind,
         };
         Ok(HostTransferBuffer {
             raw,
@@ -233,3 +244,6 @@ impl Drop for NativeSource {
         unsafe { safemlx_sys::mlx_prepared_host_transfer_free(self.owner) };
     }
 }
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod tests;

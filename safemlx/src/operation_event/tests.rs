@@ -34,11 +34,30 @@ impl Original {
     fn with_failure_owner(owner: impl Send + 'static) -> Self {
         Self::with_capacities(owner, GRAPH_CAPACITY, 1 << 20)
     }
-    fn with_capacities(owner: impl Send + 'static, graph_bytes: usize, record_bytes: usize) -> Self {
+    fn with_capacities(
+        owner: impl Send + 'static,
+        graph_bytes: usize,
+        record_bytes: usize,
+    ) -> Self {
+        Self::with_resources(owner, graph_bytes, record_bytes, 0)
+    }
+    fn with_resources(
+        owner: impl Send + 'static,
+        graph_bytes: usize,
+        record_bytes: usize,
+        pipelines: usize,
+    ) -> Self {
         let graph = PreparedSubmissionGraphQuota::try_new(graph_bytes, ())
             .unwrap()
             .try_allocate()
             .unwrap();
+        if pipelines != 0 {
+            crate::PreparedPipelineCachePlan::new(pipelines)
+                .realize(())
+                .unwrap()
+                .install(&graph)
+                .unwrap();
+        }
         let records = PreparedSubmissionRecordQuota::try_new(record_bytes, ())
             .unwrap()
             .try_allocate()
@@ -66,6 +85,7 @@ impl Original {
         }
     }
 }
+
 thread_local! { static HOOKS: Cell<usize> = const { Cell::new(0) }; }
 fn hook() {
     HOOKS.with(|value| value.set(value.get() + 1));
@@ -93,10 +113,9 @@ fn settle(observer: &OriginalScopeObserver) {
         SubmissionRetirement::CompleteSnapshot
     );
 }
-fn round_trip(kind: DeviceType) {
+fn round_trip(stream: &Stream) {
     let source_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let stream = Stream::new_with_device(&Device::new(kind, 0));
-    let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &source_stream).unwrap();
+    let _runtime = PrefillRootsRuntime::prepare_for_stream(stream, &source_stream).unwrap();
     let mut source =
         HostTransferBuffer::new(&[3], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
     let expected = [2.0f32, -3.0, 7.0];
@@ -109,48 +128,85 @@ fn round_trip(kind: DeviceType) {
         destination.copy_from_slice(&value.to_ne_bytes());
     }
     let source = source.freeze();
-    let mut original = Original::new();
+    let allocator = crate::PreparedInputRuntime::prepare().unwrap();
+    let physical = crate::OriginalBufferBudget::request_layout(&allocator, 3 * size_of::<f32>())
+        .unwrap()
+        .capacity();
+    let budget = crate::PreparedOriginalBufferBudget::try_new(&allocator, physical * 2, ())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let mut destinations = Vec::new();
+    for _ in 0..2 {
+        let plan =
+            crate::PreparedHostTransferPlan::new(&allocator, &[3], Dtype::Float32, 0).unwrap();
+        let quota = PreparedSubmissionGraphQuota::try_new(plan.metadata_bytes(), ()).unwrap();
+        let arena = crate::PreparedInputArena::try_allocate(quota).unwrap();
+        destinations.push(plan.construct_copy_destination(&arena).unwrap());
+    }
+    // Shared-Metal stores each select one actual vector-copy pipeline.
+    let pipelines = if stream.get_device().unwrap().get_type().unwrap() == DeviceType::Gpu {
+        2
+    } else {
+        0
+    };
+    let mut original = Original::with_resources((), GRAPH_CAPACITY, 1 << 20, pipelines);
+    original.scope.bind_original_buffer_budget(&budget).unwrap();
     let observer = OriginalScopeObserver::try_current().unwrap().unwrap();
     let baseline = original.graph.occupied_bytes();
-    for _ in 0..2 {
+    for mut destination in destinations {
+        let layout = OperationEvent::resident_graph_layout(3, 1, 1).unwrap();
+        let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
+            roots: 1,
+            arrays: 4,
+            tape_entries: 3,
+            input_edges: 3,
+            output_slots: 3,
+            streams: 1,
+            captures: 8,
+        })
+        .unwrap();
+        let mut bank = OperationEvent::prepare_resident_graph(layout, &observer).unwrap();
+        bank.configure_nested_completions(&traversal, 2).unwrap();
         crate::register_thread_runtime_housekeeping(hook);
         let handler = crate::error::mlx_error_handler_state_for_test();
         let hooks = Hook;
         HOOKS.with(|value| value.set(0));
         let (value, producer) = source
-            .copy_to_array_in_original_scope(&stream, &observer)
+            .copy_to_array_in_original_scope(stream, &observer)
             .unwrap();
-        producer.wait_on(&stream).unwrap();
-        if kind == DeviceType::Gpu {
-            // The consumer-stream WaitRecord is real but uncommitted. Whole
-            // owner observation must not pretend the producer alone settles it.
-            assert_eq!(
-                producer
-                    .synchronize()
-                    .unwrap_err()
-                    .scoped_evaluation_cause(),
-                Some(crate::error::ScopedEvaluationCause::NeedsFundedProgress)
-            );
-            assert!(!observer.status().failed());
-        } else {
-            producer.synchronize().unwrap();
-        }
+        producer.wait_on(stream).unwrap();
+        // The original wait submits its own receipt on the consumer stream.
+        producer.synchronize().unwrap();
+        observer.validate_completed_array(&value).unwrap();
         assert_eq!(HOOKS.with(Cell::get), 0);
         assert_eq!(crate::error::mlx_error_handler_state_for_test(), handler);
         drop(hooks);
-        // This actual same-stream copy is the selected consumer submission;
-        // its normal finalization closes the pending wait frontier.
-        let (copied, completion) = HostTransferBuffer::copy_from_array_in_original_scope(
-            &value,
-            HostTransferPolicy::Transfer,
-            &stream,
-            &observer,
-        )
-        .unwrap();
-        completion.synchronize().unwrap();
+        // The prepared destination owns its final backing before submission.
+        destination
+            .submit(&value, stream, &observer)
+            .unwrap_or_else(|cause| {
+                panic!(
+                    "{cause:?}; native source: {:?}",
+                    original
+                        ._failure
+                        .error()
+                        .map(|source| String::from_utf8_lossy(
+                            source.message_bytes().unwrap_or_default()
+                        )
+                        .into_owned())
+                )
+            });
+        drop(bank);
+        destination.synchronize().unwrap();
+        let copied = destination.take_completed().unwrap();
         producer.synchronize().unwrap();
         assert_eq!(
-            value.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+            value
+                .completed_in_original_scope(&observer)
+                .unwrap()
+                .try_as_slice::<f32>()
+                .unwrap(),
             expected
         );
         let expected_bytes: Vec<u8> = expected
@@ -158,10 +214,11 @@ fn round_trip(kind: DeviceType) {
             .flat_map(|value| value.to_ne_bytes())
             .collect();
         assert_eq!(copied.as_bytes().unwrap(), expected_bytes);
-        crate::try_with_submission_retirement(|| drop((copied, completion, value, producer)))
+        crate::try_with_submission_retirement(|| drop((copied, destination, value, producer)))
             .unwrap();
         settle(&observer);
         assert_eq!(original.graph.occupied_bytes(), baseline);
+        assert_eq!(budget.occupied_bytes(), 0);
         assert!(OriginalScopeObserver::try_current().unwrap().is_some());
     }
     original.scope.seal();
@@ -169,13 +226,55 @@ fn round_trip(kind: DeviceType) {
 }
 #[test]
 fn original_operation_cpu_round_trip_reclaims_each_active_role_window_without_hooks() {
-    round_trip(DeviceType::Cpu);
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    round_trip(&stream);
 }
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks() {
-    round_trip(DeviceType::Gpu);
+    const CHILD: &str = "SAFEMLX_PREPARED_HOST_ROUND_TRIP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "operation_event::tests::original_operation_metal_round_trip_reclaims_each_active_role_window_without_hooks",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let device = crate::PreparedMetalDevice::try_new(())
+        .unwrap()
+        .try_initialize()
+        .unwrap();
+    let scheduler = crate::PreparedScheduler::try_new(())
+        .unwrap()
+        .try_initialize()
+        .unwrap();
+    let _allocator = crate::PreparedInputAllocator::try_new(())
+        .unwrap()
+        .try_initialize()
+        .unwrap();
+    let target = crate::GpuStreamTarget::for_initialized(&device, &scheduler).unwrap();
+    let layout = crate::PreparedGpuStream::<()>::layout().unwrap();
+    let stream = crate::PreparedGpuStream::with_layout(layout, ())
+        .unwrap()
+        .try_initialize(target)
+        .unwrap();
+    stream.try_borrow().unwrap();
+    round_trip(stream.as_stream());
+    stream.try_observe_idle().unwrap();
 }
+
 #[test]
 fn original_operation_rejects_explicit_child_and_observes_after_role_seal() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));

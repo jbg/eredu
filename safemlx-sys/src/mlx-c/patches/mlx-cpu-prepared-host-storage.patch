@@ -1,0 +1,82 @@
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -204,14 +204,20 @@
+     const int* shape, size_t rank, Dtype dtype, size_t array_handles, PreparedHostTransferLayout& out) noexcept {
+   if (!shape || !rank || rank > Shape::inline_capacity || !facts.page_size ||
+       (facts.page_size & (facts.page_size - 1)) ||
+-      facts.kind != HostTransferStorageKind::metal_shared) return false;
++      (facts.kind != HostTransferStorageKind::metal_shared &&
++       facts.kind != HostTransferStorageKind::cpu)) return false;
+   size_t bytes = size_of(dtype);
+   for (size_t i = 0; i < rank; ++i) {
+     if (shape[i] <= 0 || bytes > static_cast<size_t>(PTRDIFF_MAX) / static_cast<size_t>(shape[i])) return false;
+     bytes *= static_cast<size_t>(shape[i]);
+   }
+-  if (bytes > static_cast<size_t>(PTRDIFF_MAX) - (facts.page_size - 1)) return false;
+-  const size_t backing = (bytes + facts.page_size - 1) & ~(facts.page_size - 1);
++  // The CPU prepared allocator stores its size word before the logical data.
++  // Metal's prepared buffer has no such in-band header.
++  const size_t header = facts.kind == HostTransferStorageKind::cpu ? sizeof(size_t) : 0;
++  if (bytes > static_cast<size_t>(PTRDIFF_MAX) - header) return false;
++  const size_t charged = bytes + header;
++  if (charged > static_cast<size_t>(PTRDIFF_MAX) - (facts.page_size - 1)) return false;
++  const size_t backing = (charged + facts.page_size - 1) & ~(facts.page_size - 1);
+   if (backing > facts.maximum) return false;
+   HostSourceConstruction c;
+   if (!host_source_requests(c.requests)) return false;
+@@ -240,7 +246,7 @@
+       sizeof(HostSourceConstruction) + sizeof(HostSourceBlocks) + sizeof(HostSourceIncoming) +
+       sizeof(HostTransferBuffer) + sizeof(Shape) + sizeof(submission::GraphAllocator<HostTransferStorage>) +
+       sizeof(std::shared_ptr<HostTransferStorage>) + sizeof(allocator::PreparedInputFacts) +
+-      sizeof(HostSourceCause) + sizeof(size_t) * 6 + facts.controls +
++      sizeof(HostSourceCause) + sizeof(size_t) * 8 + facts.controls +
+       sizeof(std::optional<array>) + sizeof(array) + sizeof(Deleter) +
+       sizeof(HostTransferArrayDeleter) + sizeof(allocator::Buffer) + host_source_function_bytes() +
+       sizeof(HostSourceQuota::Request)*5 + sizeof(size_t)*4 +
+@@ -522,6 +528,17 @@
+   return {std::move(buffer), std::move(transfer.completion)};
+ }
+ 
++namespace {
++// CPU workers can address CPU pages and shared Metal storage. GPU workers
++// retain the shared-Metal contract; ordinary CPU pages are not GPU buffers.
++bool original_host_storage_matches(const HostTransferBuffer& buffer, Stream selected) {
++  const auto kind = buffer.storage_kind();
++  return (kind == HostTransferStorageKind::metal_shared &&
++          (selected.device.type == Device::gpu || selected.device.type == Device::cpu)) ||
++      (kind == HostTransferStorageKind::cpu && selected.device.type == Device::cpu);
++}
++}
++
+ DeviceTransfer copy_to_host_into(
+     const array& source,
+     const HostTransferBuffer& destination,
+@@ -538,8 +555,7 @@
+         source.dtype() != destination.dtype() ||
+         source.status() != array::Status::available ||
+         destination.policy() != HostTransferPolicy::transfer ||
+-        destination.storage_kind() != HostTransferStorageKind::metal_shared ||
+-        (selected.device.type != Device::gpu && selected.device.type != Device::cpu) ||
++        !original_host_storage_matches(destination, selected) ||
+         !original_host_store_control_bytes(source.ndim(), source.dtype(), original_controls))
+       throw ScopedEvaluationError(ScopedEvaluation::unobservable);
+     const auto ready = preflight_original_submission_stream(*submission::current_scope(), selected);
+@@ -610,6 +626,7 @@
+       2 * sizeof(array) + sizeof(ArrayVector) + sizeof(Shape) + sizeof(Strides) +
+       sizeof(DeviceTransfer) + sizeof(Completion) + sizeof(StreamOrDevice) +
+       sizeof(Stream) + sizeof(Dtype) + sizeof(submission::NativeControlBinding) +
++      sizeof(const HostTransferBuffer*) + sizeof(Stream) + sizeof(HostTransferStorageKind) + sizeof(bool) +
+       sizeof(submission::GraphNestedEvaluation) + sizeof(CompletionEvalTraversalLimits) +
+       sizeof(CompletionEvalRecordLayout) + sizeof(submission::ScopedProgress) +
+       sizeof(ScopedEvaluation) + 3 * sizeof(size_t) + 3 * sizeof(void*);
+@@ -632,8 +649,7 @@
+     if (!controls.graph || !submission::current_scope())
+       throw ScopedEvaluationError(ScopedEvaluation::domain);
+     if (source.policy() != HostTransferPolicy::transfer ||
+-        source.storage_kind() != HostTransferStorageKind::metal_shared ||
+-        (selected.device.type != Device::gpu && selected.device.type != Device::cpu) ||
++        !original_host_storage_matches(source, selected) ||
+         !original_host_copy_control_bytes(source.shape().size(), source.dtype(), original_controls))
+       throw ScopedEvaluationError(ScopedEvaluation::unobservable);
+     const auto ready = preflight_original_submission_stream(*submission::current_scope(), selected);
