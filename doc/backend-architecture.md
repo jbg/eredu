@@ -787,9 +787,16 @@ storage query includes each output allocation, weak descriptor and optional
 General-copy input temporary; cleanup retains that temporary through completion.
 The source accepts F16/BF16/F32 inputs, group sizes 32/64/128 and bit widths
 2/3/4/5/6/8 with checked positive geometry and nonnegative readable strides.
-Eval admission is separate from public quantizer graph construction and physical
-buffer capacity. Failed allocation prefixes retain their accounts without
-publishing the failed outputs as completed values.
+Affine graph construction has its own bank for one primitive, its retained
+fallback, three sibling descriptors, shape/stride storage and three C result
+handles. Stack-held shape/dtype metadata and a reserved output vector avoid
+ordinary allocator calls during that construction. Fixed C result handles feed
+the same safe Rust quantization API for ordinary and prepared calls; failure
+leaves each published prefix under its result guard. Graph quota extents include
+alignment headroom; they are not a process-wide memory ceiling.
+Eval, physical buffers, source preparation, streams and composed MXFP4 graph
+construction require separate admission. Failed allocation prefixes retain their
+accounts without publishing failed outputs as completed values.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

@@ -4,7 +4,7 @@ use safemlx_internal_macros::generate_macro;
 
 use crate::{
     error::Result,
-    utils::{guard::Guarded, VectorArray},
+    utils::guard::{Guard, Guarded, MaybeUninitArray},
     Array, Stream,
 };
 
@@ -53,6 +53,36 @@ pub struct QuantizedArrays {
     pub scales: Array,
     /// Per-group affine biases, absent for MXFP4.
     pub biases: Option<Array>,
+}
+
+// Fixed native destinations keep every published prefix in a guard, including
+// a failed third handle, without a generic native vector or Rust Vec owner.
+#[derive(Default)]
+pub(crate) struct QuantizedArraysGuard {
+    arrays: [MaybeUninitArray; 3],
+}
+impl Guard<QuantizedArrays> for QuantizedArraysGuard {
+    type MutRawPtr = [*mut safemlx_sys::mlx_array; 3];
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        self.arrays.each_mut().map(|array| array.as_mut_raw_ptr())
+    }
+    fn set_init_success(&mut self, success: bool) {
+        for array in &mut self.arrays {
+            array.set_init_success(success && !array.ptr.ctx.is_null());
+        }
+    }
+    fn try_into_guarded(self) -> Result<QuantizedArrays> {
+        let [weight, scales, biases] = self.arrays;
+        let has_biases = !biases.ptr.ctx.is_null();
+        Ok(QuantizedArrays {
+            weight: weight.try_into_guarded()?,
+            scales: scales.try_into_guarded()?,
+            biases: if has_biases { Some(biases.try_into_guarded()?) } else { None },
+        })
+    }
+}
+impl Guarded for QuantizedArrays {
+    type Guard = QuantizedArraysGuard;
 }
 
 /// Returns the number of `u32` values used to store one packed quantized row.
@@ -126,34 +156,11 @@ pub fn quantize_with_mode(
     stream: impl AsRef<Stream>,
 ) -> Result<QuantizedArrays> {
     mode.validate(group_size, bits)?;
-    let group_size = optional_int(Some(group_size), DEFAULT_GROUP_SIZE);
-    let bits = optional_int(Some(bits), DEFAULT_BITS);
-
-    let result = VectorArray::try_from_op(|res| unsafe {
-        safemlx_sys::mlx_quantize(
-            res,
-            w.as_ref().as_ptr(),
-            group_size,
-            bits,
-            mode.as_c_str().as_ptr(),
-            safemlx_sys::mlx_array_new(),
-            stream.as_ref().as_ptr(),
-        )
-    })?;
-
-    let arrays: Vec<Array> = result.try_into_values()?;
-    let expected = if mode.has_biases() { 3 } else { 2 };
-    if arrays.len() != expected {
-        return Err(crate::error::Exception::custom(format!(
-            "Expected {expected} arrays from {mode:?} quantize, got {}",
-            arrays.len()
-        )));
-    }
-    let mut iter = arrays.into_iter();
-    Ok(QuantizedArrays {
-        weight: iter.next().unwrap(),
-        scales: iter.next().unwrap(),
-        biases: iter.next(),
+    // SAFETY: the guard lends three distinct empty destinations, retains the
+    // input and stream for this call, and owns every published failure prefix.
+    QuantizedArrays::try_from_op(|[weight, scales, biases]| unsafe {
+        safemlx_sys::mlx_quantize_fixed(weight, scales, biases, w.as_ref().as_ptr(),
+            group_size, bits, mode.as_c_str().as_ptr(), stream.as_ref().as_ptr())
     })
 }
 

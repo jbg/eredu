@@ -102,6 +102,15 @@ typedef struct mlx_cpu_copy_eval_layout_ {
 } mlx_cpu_copy_eval_layout;
 bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype,size_t rank,bool store,bool tracer);
+typedef struct mlx_affine_quantize_construction_layout_ {
+  size_t rank;
+  size_t graph_extents;
+  size_t named_control_bytes;
+} mlx_affine_quantize_construction_layout;
+bool mlx_operation_event_affine_quantize_construction_layout(
+    mlx_affine_quantize_construction_layout*,size_t rank);
+unsigned mlx_operation_event_prepare_affine_quantize_graph(
+    void** out,mlx_submission_observer,size_t rank);
 // Three-output affine converter Eval, with optional input compaction.
 bool mlx_operation_event_cpu_affine_quantize_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype,size_t rank,size_t rows,size_t columns,int group_size,int bits,bool copy,bool tracer);

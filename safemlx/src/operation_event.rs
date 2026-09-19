@@ -22,7 +22,7 @@ pub(crate) use eval_traversal::submit_original_prepared_traversal;
 pub use eval_traversal::{OperationEvalTraversalLayout, OperationEvalTraversalLimits};
 pub use gpu_eval_prologue::{GpuEvalPrologueLayout, GpuEvalProloguePopulation};
 pub use graph_construction::{PointwiseGraphLayout, PreparedPointwiseGraph};
-pub use resident_graph::{PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout};
+pub use resident_graph::{AffineQuantizeConstructionLayout, PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout};
 mod exact_roots;
 mod wait_records;
 pub use eval_records::OperationEvalRecordLayout;

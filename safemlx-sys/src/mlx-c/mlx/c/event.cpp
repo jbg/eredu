@@ -1212,6 +1212,34 @@ extern "C" bool mlx_operation_event_cpu_typed_arg_reduce_eval_layout(mlx_cpu_cop
   *out=value;return true;
 }
 
+#include "mlx/quantize_construction.h"
+extern "C" bool mlx_operation_event_affine_quantize_construction_layout(
+    mlx_affine_quantize_construction_layout* out,size_t rank) {
+  if(!out)return false;
+  mlx::core::submission::AffineQuantizeConstructionLayout native;
+  if(!mlx::core::submission::affine_quantize_construction_layout(rank,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(rank)+sizeof(size_t)+
+      sizeof(mlx_array)*4+sizeof(mlx_array*)*3+sizeof(mlx_stream)+sizeof(int)*3+sizeof(const char*)+
+      sizeof(mlx::core::ArrayVector)+sizeof(mlx::core::submission::NativeControlBinding)+
+      sizeof(mlx::core::submission::GraphQuota*)+sizeof(mlx::core::PreparedInputArray*);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  *out={rank,native.allocation_extents,native.named_control_bytes+controls};return true;
+}
+extern "C" unsigned mlx_operation_event_prepare_affine_quantize_graph(
+    void** out,mlx_submission_observer observer,size_t rank) {
+  using namespace mlx::core::submission;
+  if(!out||*out)return 4;
+  if(auto status=mlx_operation_event_validate_traversal_context(observer))return status;
+  auto* scope=static_cast<Scope*>(observer.ctx);
+  GraphConstruction* owner=nullptr;
+  const auto failure=GraphConstruction::create_affine_quantize_graph(
+      *scope->graph_quota(),scope->identity(),rank,owner);
+  if(failure==GraphFailure::exhausted)return 2;
+  if(failure==GraphFailure::construction_busy)return 10;
+  if(static_cast<unsigned>(failure))return 4;
+  *out=owner;return 0;
+}
+
 #include "mlx/backend/cpu/quantize_storage.h"
 extern "C" bool mlx_operation_event_cpu_affine_quantize_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype dtype,size_t rank,size_t rows,size_t columns,int group_size,int bits,bool copy,bool tracer) {

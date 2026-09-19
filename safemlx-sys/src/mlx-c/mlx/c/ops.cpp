@@ -2633,6 +2633,29 @@ extern "C" int mlx_quantize(
   }
   return 0;
 }
+extern "C" int mlx_quantize_fixed(
+    mlx_array* weight,mlx_array* scales,mlx_array* biases,const mlx_array input,
+    int group_size,int bits,const char* mode,const mlx_stream stream) {
+  if(!weight||!scales||!biases||weight==scales||weight==biases||scales==biases||
+      weight->ctx||scales->ctx||biases->ctx||!mode) {
+    mlx_error("quantize fixed outputs require three distinct empty destinations");return 1;
+  }
+  try {
+    auto outputs=mlx::core::quantize(mlx_array_get_(input),group_size,bits,
+        std::string(mode),std::nullopt,mlx_stream_get_(stream));
+    if(outputs.size()!=2&&outputs.size()!=3)
+      throw std::runtime_error("quantize must return two or three outputs");
+    // Each published prefix stays in caller-owned destinations on failure.
+    // The safe guard retires all prefixes through the ordinary array protocol.
+    mlx_array_set_(*weight,std::move(outputs[0]));
+    mlx_array_set_(*scales,std::move(outputs[1]));
+    if(outputs.size()==3)mlx_array_set_(*biases,std::move(outputs[2]));
+  } catch(const std::exception& error) {
+    mlx_error(error.what());return 1;
+  }
+  return 0;
+}
+
 extern "C" int mlx_quantized_matmul(
     mlx_array* res,
     const mlx_array x,

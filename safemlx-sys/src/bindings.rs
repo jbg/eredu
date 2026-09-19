@@ -7262,6 +7262,13 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_quantize_fixed(weight: *mut mlx_array, scales: *mut mlx_array,
+        biases: *mut mlx_array, input: mlx_array, group_size: ::std::os::raw::c_int,
+        bits: ::std::os::raw::c_int, mode: *const ::std::os::raw::c_char, stream: mlx_stream) -> ::std::os::raw::c_int;
+    pub fn mlx_operation_event_affine_quantize_construction_layout(
+        out: *mut mlx_affine_quantize_construction_layout, rank: usize) -> bool;
+    pub fn mlx_operation_event_prepare_affine_quantize_graph(out: *mut *mut ::std::os::raw::c_void,
+        observer: mlx_submission_observer, rank: usize) -> ::std::os::raw::c_uint;
     pub fn mlx_operation_event_cpu_affine_quantize_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         dtype: mlx_dtype, rank: usize, rows: usize, columns: usize, group_size: ::std::os::raw::c_int,
         bits: ::std::os::raw::c_int, copy: bool, tracer: bool) -> bool;
@@ -7437,4 +7444,12 @@ unsafe extern "C" {
         dtype: mlx_dtype,
         maximum_receive_rows: usize,
     ) -> bool;
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct mlx_affine_quantize_construction_layout {
+    pub rank: usize,
+    pub graph_extents: usize,
+    pub named_control_bytes: usize,
 }

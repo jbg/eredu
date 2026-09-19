@@ -810,6 +810,10 @@ int mlx_quantize(
     const char* mode,
     const mlx_array global_scale /* may be null */,
     const mlx_stream s);
+// Fixed empty destinations avoid a generic vector owner. On error, the caller
+// owns every published prefix and must free all three handles.
+int mlx_quantize_fixed(mlx_array* weight,mlx_array* scales,mlx_array* biases,
+    mlx_array input,int group_size,int bits,const char* mode,mlx_stream stream);
 int mlx_quantized_matmul(
     mlx_array* res,
     const mlx_array x,

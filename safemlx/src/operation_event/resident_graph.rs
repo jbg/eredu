@@ -73,6 +73,33 @@ impl ResidentGraphLayout {
     }
 }
 
+/// Native affine graph construction: one primitive and retained fallback,
+/// three sibling descriptors and three fixed C result handles. Input custody,
+/// physical buffers and Eval storage are separate contributions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineQuantizeConstructionLayout {
+    native: safemlx_sys::mlx_affine_quantize_construction_layout,
+}
+impl AffineQuantizeConstructionLayout {
+    /// Graph quota extent bound, including per-block alignment headroom.
+    pub fn graph_allocation_extents(self) -> usize { self.native.graph_extents }
+    /// Rank used to size the constructor's shape and stride storage.
+    pub fn rank(self) -> usize { self.native.rank }
+    /// Named native and safe query, constructor and owner transports.
+    pub fn control_bytes(self) -> Option<usize> {
+        use std::mem::size_of;
+        let parts = [size_of::<Self>(), size_of::<Option<Self>>(),
+            size_of::<PreparedResidentGraph>(), size_of::<Result<PreparedResidentGraph>>(),
+            size_of::<Option<runtime_lock::RuntimeLockGuard>>(), size_of::<*mut c_void>(),
+            size_of::<u32>(), OriginalScopeObserver::control_bytes()?,
+            size_of::<<crate::ops::QuantizedArrays as crate::utils::guard::Guarded>::Guard>(),
+            size_of::<crate::ops::QuantizedArrays>(), size_of::<Result<crate::ops::QuantizedArrays>>(),
+            size_of::<crate::ops::QuantizationMode>(), size_of::<[safemlx_sys::mlx_array; 3]>(),
+            size_of::<[*mut safemlx_sys::mlx_array; 3]>()];
+        parts.into_iter().try_fold(self.native.named_control_bytes.checked_add(std::mem::size_of_val(&parts))?, usize::checked_add)
+    }
+}
+
 /// Once-owned physical reservation in an existing exact role. Drop frees unused
 /// blocks before releasing the retained role; consumed blocks keep their birth.
 /// This owner must retire before entering Eval and creates no work authority.
@@ -129,6 +156,25 @@ impl PreparedResidentGraph {
 }
 
 impl OperationEvent {
+    /// Query the actual fixed affine constructor, including its three results.
+    pub fn affine_quantize_construction_layout(rank: usize) -> Option<AffineQuantizeConstructionLayout> {
+        let mut native = safemlx_sys::mlx_affine_quantize_construction_layout::default();
+        // SAFETY: scalar-only query writes initialized output on success.
+        unsafe { safemlx_sys::mlx_operation_event_affine_quantize_construction_layout(&mut native, rank) }
+            .then_some(AffineQuantizeConstructionLayout { native })
+    }
+    /// Reserve the affine constructor bank in the current original role.
+    /// Drop this bank before Eval; its consumed blocks retain their owners.
+    pub fn prepare_affine_quantize_graph(layout: AffineQuantizeConstructionLayout,
+        observer: &OriginalScopeObserver) -> Result<PreparedResidentGraph> {
+        let Some(_guard) = runtime_lock::try_enter_for_recovery() else { return Err(observer.error(10)); };
+        let mut owner = ptr::null_mut();
+        // SAFETY: live observer and empty unique destination; native rechecks the role.
+        let status = unsafe { safemlx_sys::mlx_operation_event_prepare_affine_quantize_graph(
+            &mut owner, observer.raw, layout.rank()) };
+        if status != 0 { return Err(observer.error(status)); }
+        Ok(PreparedResidentGraph { owner, _observer: observer.clone() })
+    }
     /// Pure qualified host layout for an actual closed resident lowering recipe.
     /// Scalar counts are diagnostics; preparation still needs the current original role.
     pub fn resident_graph_layout(
@@ -467,5 +513,29 @@ mod frontier_tests {
         assert!(query(0, 0).is_none());
         assert!(query(usize::MAX, 0).is_none());
         assert!(query(1, usize::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod affine_construction_tests {
+    use super::*;
+    #[test]
+    fn affine_quantize_construction_layout_tracks_rank_storage() {
+        let qualified = OperationEvent::resident_graph_layout(1, 0, 2).is_some();
+        let mut previous = 0;
+        for rank in [2, 4, 11, 21] {
+            let layout = OperationEvent::affine_quantize_construction_layout(rank);
+            assert_eq!(layout.is_some(), qualified);
+            if let Some(layout) = layout {
+                assert_eq!(layout.rank(), rank);
+                assert!(layout.graph_allocation_extents() > 0);
+                assert!(layout.graph_allocation_extents() >= previous);
+                assert!(layout.control_bytes().unwrap() > 0);
+                previous = layout.graph_allocation_extents();
+            }
+        }
+        for rank in [0, 1, usize::MAX] {
+            assert!(OperationEvent::affine_quantize_construction_layout(rank).is_none());
+        }
     }
 }

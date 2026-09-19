@@ -1,0 +1,209 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -66,6 +66,7 @@
+     const std::shared_ptr<Primitive>& primitive,
+     const ArrayVector& inputs) {
+   ArrayVector outputs;
++  outputs.reserve(shapes.size());
+   for (size_t i = 0; i < shapes.size(); ++i) {
+     outputs.emplace_back(shapes[i], dtypes[i], primitive, inputs);
+   }
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -163,6 +163,8 @@
+   static GraphFailure create_distributed_variable_with_resident_loan(GraphQuota&, uint64_t scope,
+       const distributed::Group&, const array&, std::span<const size_t>, bool transposed,
+       GraphConstruction*&, GraphNestedConstruction&) noexcept;
++  static GraphFailure create_affine_quantize_graph(GraphQuota&, uint64_t scope,
++      size_t rank, GraphConstruction*&) noexcept;
+   static GraphFailure create_resident(GraphQuota&, uint64_t scope,
+       const ResidentGraphLayout&, GraphConstruction*&) noexcept;
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+@@ -236,7 +238,7 @@
+   size_t count_;
+   SizeClass classes_[GraphConstructionLayout::classes]{};
+   bool exclusive_host_;
+-  // Only create_resident supplies this tag; worker/pointwise banks cannot nest.
++  // Host construction banks supply this tag; worker/pointwise banks cannot nest.
+   bool resident_host_;
+   NestedGraphEvaluationLimits nested_limits_{};
+   size_t nested_remaining_{0};
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -1,4 +1,5 @@
+ #include "mlx/dequantize_fallback.h"
++#include "mlx/quantize_construction.h"
+ #include "mlx/backend/common/pipeline_cache.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/graph_quota.h"
+@@ -420,6 +421,59 @@
+   if (b && a > std::numeric_limits<size_t>::max() / b) return false;
+   output = a * b; return true;
+ }
++}
++bool affine_quantize_construction_layout(size_t rank,
++    AffineQuantizeConstructionLayout& output) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if(rank<2 || rank>size_t(INT_MAX) || rank>Shape::max_size() || rank>Strides::max_size())return false;
++  GraphQuota::Request leaf[5]{};size_t count=0;
++  if(!PreparedInputLeaf::append_array_requests(0,leaf,count)||count!=3)return false;
++  const size_t fallback=graph_function_control_bytes<ArrayVector(ArrayVector),AffineQuantizeFallback>();
++  if(!fallback)return false;
++  AffineQuantizeConstructionLayout value;value.rank=rank;
++  value.request_bytes[0]=leaf[0].bytes;value.request_alignments[0]=leaf[0].alignment;value.request_counts[0]=3;
++  value.request_bytes[1]=leaf[1].bytes;value.request_alignments[1]=leaf[1].alignment;value.request_counts[1]=3;
++  value.request_bytes[2]=std::max(fallback,resident_primitive_control<fast::Quantize>());
++  value.request_alignments[2]=alignof(std::max_align_t);value.request_counts[2]=2;
++  // One input vector, three descriptor input copies, one reserved output
++  // vector and three sibling copies. No geometric vector growth is required.
++  value.request_bytes[3]=3*sizeof(array);value.request_alignments[3]=alignof(array);value.request_counts[3]=8;
++  if(rank>Shape::inline_capacity) {
++    if(!resident_multiply(rank,sizeof(Shape::value_type),value.request_bytes[4]))return false;
++    value.request_alignments[4]=alignof(Shape::value_type);value.request_counts[4]=7;
++  }
++  if(rank>Strides::inline_capacity) {
++    if(!resident_multiply(std::max(rank,2*Strides::inline_capacity),sizeof(Strides::value_type),value.request_bytes[5]))return false;
++    value.request_alignments[5]=alignof(Strides::value_type);value.request_counts[5]=3;
++  }
++  value.request_bytes[6]=sizeof(PreparedInputArray);value.request_alignments[6]=alignof(PreparedInputArray);value.request_counts[6]=3;
++  for(size_t i=0;i<GraphConstructionLayout::classes;++i)if(!value.request_alignments[i])value.request_alignments[i]=1;
++  const size_t controls[]={sizeof(value),sizeof(output),sizeof(rank),sizeof(leaf),sizeof(count),sizeof(fallback),
++      sizeof(size_t)*12,sizeof(bool)*4,sizeof(int)*6,sizeof(Dtype)*5,sizeof(Stream)*4,sizeof(StreamOrDevice)*2,
++      sizeof(std::optional<int>)*2,sizeof(std::optional<array>),sizeof(std::string),sizeof(array)*3,
++      sizeof(std::array<Shape,3>),sizeof(std::array<Dtype,3>),sizeof(Shape)*7,sizeof(Strides)*3,
++      sizeof(std::span<const Shape>),sizeof(std::span<const Dtype>),sizeof(ArrayVector)*7,
++      sizeof(GraphAllocator<array>)*7,sizeof(GraphAllocator<fast::Quantize>)*2,
++      sizeof(GraphAllocator<AffineQuantizeFallback>)*2,sizeof(AffineQuantizeFallback)*2,
++      sizeof(std::shared_ptr<AffineQuantizeFallback>)*3,sizeof(std::shared_ptr<Primitive>)*4,
++      sizeof(std::function<ArrayVector(ArrayVector)>)*3,sizeof(const array*)*4,
++      sizeof(GraphConstructionContext),sizeof(GraphConstruction*),sizeof(GraphFailure),sizeof(GraphQuota*)};
++  value.named_control_bytes=sizeof(controls)+sizeof(size_t);
++  for(size_t bytes:controls)if(!add(value.named_control_bytes,bytes,value.named_control_bytes))return false;
++  if(!GraphConstruction::complete_layout(value))return false;
++  output=value;return true;
++#endif
++}
++GraphFailure GraphConstruction::create_affine_quantize_graph(GraphQuota& quota,
++    uint64_t scope,size_t rank,GraphConstruction*& output) noexcept {
++  const auto context=current_graph_construction_context();
++  if(output||!scope||context.worker||context.dispatch||context.scope!=scope||
++      current_graph_quota()!=&quota)return GraphFailure::foreign_parent;
++  AffineQuantizeConstructionLayout actual;
++  if(!affine_quantize_construction_layout(rank,actual))return GraphFailure::invalid_layout;
++  return create_layout(quota,scope,nullptr,actual,output,false,true);
+ }
+ bool resident_graph_layout(size_t primitives, size_t seeds, size_t rank,
+     ResidentGraphLayout& output) noexcept {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -15,6 +15,7 @@
+ #include "mlx/fast_primitives.h"
+ #include "mlx/ops.h"
+ #include "mlx/dequantize_fallback.h"
++#include "mlx/quantize_construction.h"
+ #include "mlx/primitives.h"
+ #include "mlx/transforms.h"
+ #include "mlx/transforms_impl.h"
+@@ -5066,25 +5067,7 @@
+   return packed_w;
+ }
+ 
+-ArrayVector
+-affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
+-  auto s = to_stream(s_);
+-  if (group_size != 32 && group_size != 64 && group_size != 128) {
+-    std::ostringstream msg;
+-    msg << "[quantize] The requested group size " << group_size
+-        << " is not supported. The supported group sizes are 32, 64, and 128.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  if (bits < 2 || bits > 8 || bits == 7) {
+-    std::ostringstream msg;
+-    msg << "[quantize] The requested number of bits " << bits
+-        << " is not supported. The supported bits are 2, 3, 4, 5, 6 and 8.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  auto fallback = [group_size, bits, s](
+-                      const ArrayVector& inputs) -> ArrayVector {
++ArrayVector AffineQuantizeFallback::operator()(const ArrayVector& inputs) {
+     auto& w = inputs[0];
+     auto wshape = w.shape();
+     wshape.back() = -1;
+@@ -5118,17 +5101,39 @@
+         reshape(scales, wshape, s),
+         reshape(biases, wshape, s),
+     };
+-  };
++}
++
++ArrayVector
++affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
++  auto s = to_stream(s_);
++  if (group_size != 32 && group_size != 64 && group_size != 128) {
++    std::ostringstream msg;
++    msg << "[quantize] The requested group size " << group_size
++        << " is not supported. The supported group sizes are 32, 64, and 128.";
++    throw std::invalid_argument(msg.str());
++  }
++
++  if (bits < 2 || bits > 8 || bits == 7) {
++    std::ostringstream msg;
++    msg << "[quantize] The requested number of bits " << bits
++        << " is not supported. The supported bits are 2, 3, 4, 5, 6 and 8.";
++    throw std::invalid_argument(msg.str());
++  }
++
++
+ 
+   auto wq_shape = w.shape();
+   wq_shape.back() = w.shape(-1) * bits / 32;
+   auto sshape = w.shape();
+   sshape.back() = w.shape(-1) / group_size;
+-  return array::make_arrays(
+-      {std::move(wq_shape), sshape, sshape},
+-      {uint32, w.dtype(), w.dtype()},
++  const std::array<Shape, 3> shapes{std::move(wq_shape), sshape, sshape};
++  const std::array<Dtype, 3> dtypes{uint32, w.dtype(), w.dtype()};
++  return array::make_arrays_borrowed(
++      shapes, dtypes,
+       submission::make_graph_primitive<fast::Quantize>(
+-          s, fallback, group_size, bits, QuantizationMode::Affine, false),
++          s, submission::make_graph_function<ArrayVector(ArrayVector)>(
++                 AffineQuantizeFallback{group_size, bits, s}),
++          group_size, bits, QuantizationMode::Affine, false),
+       {w});
+ }
+ 
+diff --git a/mlx/quantize_construction.h b/mlx/quantize_construction.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/quantize_construction.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/graph_construction.h"
++
++namespace mlx::core {
++struct AffineQuantizeFallback {
++  int group_size, bits;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs);
++};
++namespace submission {
++struct AffineQuantizeConstructionLayout : GraphConstructionLayout {
++  size_t rank{0};
++};
++// One primitive, one retained fallback, three sibling descriptors and the
++// three C result handles. Eval, physical backing and source custody are separate.
++MLX_API bool affine_quantize_construction_layout(size_t rank,
++    AffineQuantizeConstructionLayout&) noexcept;
++} // namespace submission
++} // namespace mlx::core
