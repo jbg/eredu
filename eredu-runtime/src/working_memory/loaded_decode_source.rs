@@ -22,7 +22,7 @@ pub(super) struct Allowance {
     phase: Phase,
 }
 impl Allowance {
-    pub(super) fn into_gguf_source_account(mut self) -> super::gguf_source::SourceAccount {
+    pub(super) fn into_source_account(mut self) -> super::gguf_source::SourceAccount {
         debug_assert_eq!(self.phase, Phase::Compiling);
         let account = super::gguf_source::SourceAccount::new_unarmed(&self.pool, self.bytes);
         self.phase = Phase::Uncharged;

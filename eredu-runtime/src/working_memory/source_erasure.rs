@@ -176,7 +176,7 @@ impl WorkingMemoryPool {
             Ok(allowance) => allowance,
             Err(cause) => return Err(refused(source, cause)),
         };
-        let account = allowance.into_gguf_source_account();
+        let account = allowance.into_source_account();
         let completed = source.retain(ErasureCustody(account.share()));
         if let Err(cause) = account.finish() {
             return Err(OriginalRetainedSourceError {

@@ -144,7 +144,7 @@ impl WorkingMemoryPool {
             Ok(allowance) => allowance,
             Err(cause) => return Err(refused(plan, cause)),
         };
-        let account = allowance.into_gguf_source_account();
+        let account = allowance.into_source_account();
         match plan.build_with_custody(CompositeCustody(account.share())) {
             Err(construction) => Err(OriginalGgufCompositeError {
                 accounting: None,

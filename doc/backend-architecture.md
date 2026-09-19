@@ -735,6 +735,16 @@ destinations and uses the same bounded tile worker, including its one- or two-sl
 completion window. The allocation stage has no native stream or tensor dependency.
 Bounded-read validation acquires its payload leases in the conversion stage.
 
+Runtime's original memory-tensor constructor reserves qualified fresh payload
+capacity before allocation and authenticates it through private source custody.
+Its quote separately exposes configurable metadata headroom for names, shapes,
+sharing controls and catalog publication; that contribution is an estimate.
+Subsequent recipe caches, readers, selections and native conversion need their
+own funding. Settlement allows the later native load owner while payloads,
+independent readers and weak source identities retain the original reservation.
+Same-pool inventory registration recognizes those prepaid payload bytes;
+foreign pools charge the complete capacity and ordinary buffers gain no credit.
+
 Layerwise cold binding and the selected native unit populator share one
 immutable independent-parameter exclusion owner. The pre-load manager source
 constructor prices and copies its exact sorted names before publication; its

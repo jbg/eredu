@@ -57,6 +57,8 @@ pub use gguf_composite::OriginalGgufCompositeError;
 mod source_erasure;
 pub use source_erasure::OriginalRetainedSourceError;
 mod gguf_source;
+mod memory_tensor_source;
+pub use memory_tensor_source::{MemoryTensorBufferQuote, OriginalMemoryTensorError};
 pub use gguf_catalog::{OriginalGgufCatalog, OriginalGgufCatalogError};
 pub use gguf_source::{GgufSourceStorageKey, OriginalGgufSourceError};
 

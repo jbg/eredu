@@ -124,6 +124,25 @@ impl ColdQuantization {
             materialized_source_shards: self.materialized_source_shards,
         })
     }
+
+    /// Creates final payloads under the pool's original source constructor.
+    /// Plan/overlay metadata and native conversion work remain separately funded.
+    pub(super) fn allocate_original(
+        self,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        metadata_policy: eredu_runtime::working_memory::DependencyMemoryPolicy,
+    ) -> Result<PreparedQuantization, Error> {
+        self.allocate(|layout| {
+            pool.allocate_memory_tensor_buffer(
+                &layout.name,
+                layout.dtype,
+                &layout.shape,
+                layout.byte_len,
+                metadata_policy,
+            )
+            .map_err(|cause| Error::Other(Box::new(cause)))
+        })
+    }
 }
 
 fn prepare_target(

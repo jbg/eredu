@@ -229,7 +229,7 @@ fn source_inventory_registration_preserves_full_capacity_and_charges_only_same_p
     };
     let catalog = fixture.plan().compile(()).unwrap();
     let (physical, prepaid) = catalog
-        .source_storage_request::<ReaderCustody>()
+        .source_storage_request::<SourcePayloadCustody>()
         .unwrap()
         .inventory_bytes();
     assert!(prepaid > 0 && physical >= prepaid);
@@ -348,7 +348,7 @@ fn source_registration_comparison_unwind_retires_candidates_after_usage_without_
         .unwrap()
         .into_prepared();
     let (physical, prepaid) = catalog
-        .source_storage_request::<ReaderCustody>()
+        .source_storage_request::<SourcePayloadCustody>()
         .unwrap()
         .inventory_bytes();
     let source = pool.compile_gguf_source(catalog).unwrap();
@@ -395,7 +395,7 @@ fn native_publication_reuses_actual_source_origin_and_rejects_absent_or_foreign_
     };
     let catalog = fixture.plan().compile(()).unwrap();
     let (physical, _) = catalog
-        .source_storage_request::<ReaderCustody>()
+        .source_storage_request::<SourcePayloadCustody>()
         .unwrap()
         .inventory_bytes();
     let capacity = catalog_bytes + source_bytes + 2 * physical + 64;

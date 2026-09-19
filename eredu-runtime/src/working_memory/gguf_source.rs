@@ -88,14 +88,30 @@ impl SourceAccount {
         Ok(())
     }
 }
+// Shared only by runtime-owned constructors that reserve storage before birth.
+// Providers cannot construct or extract this physical-inventory credit.
 #[derive(Debug)]
-struct ReaderCustody {
+pub(super) struct SourcePayloadCustody {
     account: SourceAccount,
     physical_inventory: u64,
     prepaid_inventory: u64,
 }
 
-/// Key projection for inventories that can contain a built-in GGUF source.
+impl SourcePayloadCustody {
+    pub(super) fn new(
+        account: SourceAccount,
+        physical_inventory: u64,
+        prepaid_inventory: u64,
+    ) -> Self {
+        Self {
+            account,
+            physical_inventory,
+            prepaid_inventory,
+        }
+    }
+}
+
+/// Key projection for checkpoint-owned encoded payload or reader inventories.
 /// This returns only the genuine opaque identity already held in that key;
 /// it provides no amount, coverage callback or grant. Key equality must retain
 /// the ordinary physical-identity contract of register_storage.
@@ -127,7 +143,7 @@ impl SourceInventoryOrigin {
     pub(in crate::working_memory) fn has_original_constructor(
         identity: &eredu_checkpoint::store::SourceStorageIdentity,
     ) -> bool {
-        identity.constructor_control_owner::<ReaderCustody>().is_some()
+        identity.constructor_control_owner::<SourcePayloadCustody>().is_some()
     }
 
     pub(in crate::working_memory) fn inspect(
@@ -135,7 +151,7 @@ impl SourceInventoryOrigin {
         bytes: u64,
         pool: &WorkingMemoryPool,
     ) -> Result<Option<Self>, WorkingMemoryError> {
-        let Some(custody) = identity.constructor_control_owner::<ReaderCustody>() else {
+        let Some(custody) = identity.constructor_control_owner::<SourcePayloadCustody>() else {
             return Ok(None);
         };
         if bytes != custody.physical_inventory {
@@ -267,7 +283,7 @@ impl WorkingMemoryPool {
             return Err(WorkingMemoryError::UnknownBound);
         }
         let request = catalog
-            .source_storage_request::<ReaderCustody>()
+            .source_storage_request::<SourcePayloadCustody>()
             .ok_or(WorkingMemoryError::Overflow)?;
         let mutex =
             super::fixed_baseline::pal_mutex_bytes().ok_or(WorkingMemoryError::UnknownBound)?;
@@ -277,7 +293,7 @@ impl WorkingMemoryPool {
             size_of::<Option<GgufSourceStorageRequest>>(),
             size_of::<super::loaded_decode_source::Allowance>(),
             size_of::<SourceAccount>(),
-            size_of::<ReaderCustody>(),
+            size_of::<SourcePayloadCustody>(),
             size_of::<OriginalGgufSourceError>(),
             size_of::<Result<GgufWeightStore, OriginalGgufSourceError>>(),
             size_of::<Result<(), WorkingMemoryError>>(),
@@ -341,11 +357,11 @@ impl WorkingMemoryPool {
             Err(e) => return Err(refused(catalog, e)),
         };
         let inventory = catalog
-            .source_storage_request::<ReaderCustody>()
+            .source_storage_request::<SourcePayloadCustody>()
             .expect("same qualified immutable input")
             .inventory_bytes();
-        let account = allowance.into_gguf_source_account();
-        match catalog.build_with_source_custody(ReaderCustody {
+        let account = allowance.into_source_account();
+        match catalog.build_with_source_custody(SourcePayloadCustody {
             account: account.share(),
             physical_inventory: inventory.0,
             prepaid_inventory: inventory.1,
@@ -378,7 +394,7 @@ impl WorkingMemoryPool {
         source: &GgufWeightStore,
     ) -> Result<(), WorkingMemoryError> {
         let custody = source
-            .source_control_owner::<ReaderCustody>()
+            .source_control_owner::<SourcePayloadCustody>()
             .ok_or(WorkingMemoryError::UnknownBound)?;
         if custody.account.matches_pool(self) {
             Ok(())

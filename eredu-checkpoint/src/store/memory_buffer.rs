@@ -15,6 +15,18 @@ pub struct MemoryTensorBuffer {
 }
 
 impl MemoryTensorBuffer {
+    /// Input size for a caller's metadata headroom policy, excluding payloads.
+    /// Includes tensor/store shells, names and dimension storage for construction
+    /// and publication. This is not a measurement or bound on allocator, map,
+    /// sharing-control or later reader/cache storage.
+    pub fn metadata_estimate_input_bytes(name: &str, shape: &[usize]) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<MemoryWeightStore>())?
+            .checked_add(name.len().checked_mul(2)?)?
+            .checked_add(std::mem::size_of_val(shape).checked_mul(2)?)?
+            .checked_add("<memory>".len())
+    }
+
     /// Allocates zeroed storage after validating its complete encoded geometry.
     pub fn allocate(
         name: &str,
@@ -86,6 +98,12 @@ impl MemoryTensorBuffer {
     /// Borrows the final byte destination while its ownership is still unique.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.tensor.bytes
+    }
+
+    /// Actual retained payload capacity, excluding metadata and sharing controls.
+    /// Read-only observation grants no allocation or admission authority.
+    pub fn payload_capacity(&self) -> usize {
+        self.tensor.bytes.capacity()
     }
 }
 
