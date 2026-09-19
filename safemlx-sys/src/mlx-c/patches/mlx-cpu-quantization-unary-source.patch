@@ -1,0 +1,87 @@
+diff --git a/mlx/backend/cpu/unary.h b/mlx/backend/cpu/unary.h
+--- a/mlx/backend/cpu/unary.h
++++ b/mlx/backend/cpu/unary.h
+@@ -189,14 +189,10 @@
+ }
+ 
+ template <typename Op>
+-void unary_signed(const array& a, array& out, Op op, Stream stream) {
+-  set_unary_output_data(a, out);
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(a);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    out = array::unsafe_weak_copy(out),
+-                    op = op]() mutable {
++struct UnarySignedTask {
++  array a, out;
++  Op op;
++  void operator()() {
+     switch (out.dtype()) {
+       case int8:
+         unary_op<int8_t>(a, out, op);
+@@ -228,7 +224,17 @@
+       default:
+         throw std::runtime_error("[Abs] Called on unsigned type");
+     }
+-  });
++  }
++};
++
++template <typename Op>
++void unary_signed(const array& a, array& out, Op op, Stream stream) {
++  set_unary_output_data(a, out);
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(a);
++  encoder.set_output_array(out);
++  encoder.dispatch(UnarySignedTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(out), op});
+ }
+ 
+ template <typename Op>
+diff --git a/mlx/backend/cpu/unary.cpp b/mlx/backend/cpu/unary.cpp
+--- a/mlx/backend/cpu/unary.cpp
++++ b/mlx/backend/cpu/unary.cpp
+@@ -304,6 +304,7 @@
+     FLOATING(expm1, Expm1)
+     FLOATING(log, Log)
+     FLOATING(log2, Log2)
++    FLOATING(round, Round)
+     FLOATING(log10, Log10)
+     FLOATING(log1p, Log1p)
+     FLOATING(sigmoid, Sigmoid)
+@@ -313,6 +314,10 @@
+     FLOATING(sqrt, Sqrt)
+     FLOATING(rsqrt, Rsqrt)
+ #undef FLOATING
++    case UnaryEvalKind::absolute:
++      return (floating_dtype(dtype, false) || dtype == int8 || dtype == int16 ||
++          dtype == int32 || dtype == int64) &&
++          unary_task_storage<UnarySignedTask<::mlx::core::detail::Abs>>(rank, out);
+     case UnaryEvalKind::square:
+       return all_dtype(dtype) && unary_task_storage<UnaryTask<::mlx::core::detail::Square>>(rank, out);
+     case UnaryEvalKind::negative:
+diff --git a/mlx/backend/cpu/unary_storage.h b/mlx/backend/cpu/unary_storage.h
+--- a/mlx/backend/cpu/unary_storage.h
++++ b/mlx/backend/cpu/unary_storage.h
+@@ -7,7 +7,7 @@
+ // permission. Native construction matches the actual primitive, dtype and shape.
+ enum class UnaryEvalKind {
+   exponential, expm1, log, log2, log10, log1p, sigmoid, tanh, sine, cosine,
+-  sqrt, rsqrt, square, negative, erf, logical_not
++  sqrt, rsqrt, square, negative, erf, logical_not, absolute, round
+ };
+ struct UnaryEvalStorage : SingleOutputEvalStorage {
+   UnaryEvalKind kind{UnaryEvalKind::exponential};
+diff --git a/mlx/backend/cpu/unary_storage.cpp b/mlx/backend/cpu/unary_storage.cpp
+--- a/mlx/backend/cpu/unary_storage.cpp
++++ b/mlx/backend/cpu/unary_storage.cpp
+@@ -12,6 +12,8 @@
+ }
+ bool kind(const Primitive& primitive, UnaryEvalKind& out) noexcept {
+ #define SIMPLE(Type, Kind) if (typeid(primitive) == typeid(Type)) { out = UnaryEvalKind::Kind; return true; }
++  SIMPLE(Abs, absolute)
++  SIMPLE(Round, round)
+   SIMPLE(Exp, exponential)
+   SIMPLE(Expm1, expm1)
+   SIMPLE(Log1p, log1p)

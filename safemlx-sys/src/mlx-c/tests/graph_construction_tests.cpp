@@ -5393,3 +5393,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 
 #include "cpu_routing_selection_tests.cpp"
 #include "cpu_empty_slice_tests.cpp"
+
+#include "cpu_quantization_unary_tests.cpp"

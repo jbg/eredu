@@ -1045,7 +1045,7 @@ extern "C" bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_e
 extern "C" bool mlx_operation_event_cpu_unary_eval_layout(mlx_cpu_unary_eval_layout* out,
     uint32_t operation, mlx_dtype dtype, size_t rank, bool tracer) {
   using namespace mlx::core;
-  if (!out || operation > uint32_t(cpu::UnaryEvalKind::logical_not) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
+  if (!out || operation > uint32_t(cpu::UnaryEvalKind::round) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
   cpu::UnaryEvalStorage native;
   if (!cpu::unary_eval_layout(static_cast<cpu::UnaryEvalKind>(operation), mlx_dtype_to_cpp(dtype),
       rank, tracer, native)) return false;

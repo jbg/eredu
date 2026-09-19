@@ -40,6 +40,10 @@ pub enum CpuUnaryOperation {
     Erf = 14,
     /// Existing boolean logical-not equation.
     LogicalNot = 15,
+    /// Existing signed-integer or floating absolute-value worker.
+    Absolute = 16,
+    /// Existing floating round-to-nearest-even worker.
+    Round = 17,
 }
 /// CPU unary host and worker population, separate from physical allocator,
 /// completion event, role, and source authority.
@@ -70,5 +74,38 @@ impl OperationEvent {
         // SAFETY: scalar pure query changes the initialized output only on success.
         unsafe { safemlx_sys::mlx_operation_event_cpu_unary_eval_layout(&mut native,
             operation as u32, dtype.into(), rank, tracer) }.then_some(CpuUnaryEvalLayout {native})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantization_unary_layouts_use_the_existing_cpu_source() {
+        // Native layout qualification is platform-specific. Compare with the
+        // same producer's existing floating task before requiring availability.
+        let qualified = OperationEvent::cpu_unary_layout(
+            CpuUnaryOperation::Exponential, Dtype::Float32, 2, false,
+        ).is_some();
+        for operation in [CpuUnaryOperation::Absolute, CpuUnaryOperation::Round] {
+            for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
+                let layout = OperationEvent::cpu_unary_layout(operation, dtype, 2, false);
+                assert_eq!(layout.is_some(), qualified);
+                if let Some(layout) = layout {
+                    assert!(layout.graph_allocation_extents() > 0);
+                    let high = OperationEvent::cpu_unary_layout(operation, dtype, 14, false).unwrap();
+                    assert!(high.worker_graph_allocation_extents() > layout.worker_graph_allocation_extents());
+                    assert_eq!(layout.backing_births(), 1);
+                    assert!(layout.control_bytes().unwrap() > 0);
+                }
+            }
+            for dtype in [Dtype::Bool, Dtype::Uint32] {
+                assert!(OperationEvent::cpu_unary_layout(operation, dtype, 2, false).is_none());
+            }
+            assert!(OperationEvent::cpu_unary_layout(
+                operation, Dtype::Float32, usize::MAX, false,
+            ).is_none());
+        }
     }
 }

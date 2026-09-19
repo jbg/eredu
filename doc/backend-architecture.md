@@ -769,6 +769,9 @@ Direct GPU quantization keeps its own payload profile. Model-load minimum sizing
 covers the CPU fallback; final output telemetry still reports only encoded bytes.
 These logical payload contributions exclude allocator rounding and native
 graph/worker controls, which require their own producer admission.
+CPU Abs and floating Round expose the same unary task storage source used by
+their native evaluator. Their cold queries cover task, descriptor, output and
+strided-iterator storage; physical backing remains separately admitted.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.
