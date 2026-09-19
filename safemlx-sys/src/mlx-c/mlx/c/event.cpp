@@ -1212,6 +1212,21 @@ extern "C" bool mlx_operation_event_cpu_typed_arg_reduce_eval_layout(mlx_cpu_cop
   *out=value;return true;
 }
 
+#include "mlx/backend/cpu/quantize_storage.h"
+extern "C" bool mlx_operation_event_cpu_affine_quantize_eval_layout(mlx_cpu_copy_eval_layout* out,
+    mlx_dtype dtype,size_t rank,size_t rows,size_t columns,int group_size,int bits,bool copy,bool tracer) {
+  if(!out||dtype<MLX_BOOL||dtype>MLX_COMPLEX64)return false;
+  mlx::core::cpu::QuantizeEvalStorage native;
+  if(!mlx::core::cpu::affine_quantize_eval_layout(mlx_dtype_to_cpp(dtype),rank,rows,columns,
+      group_size,bits,copy,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(dtype)+sizeof(rank)+
+      sizeof(rows)+sizeof(columns)+sizeof(group_size)+sizeof(bits)+sizeof(copy)+sizeof(tracer)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
+      native.backing_births,native.named_control_bytes+controls,0};
+  *out=value;return true;
+}
+
 #include "mlx/backend/cpu/reshape_storage.h"
 extern "C" bool mlx_operation_event_cpu_reshape_alias_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank,size_t output_rank,bool tracer) {

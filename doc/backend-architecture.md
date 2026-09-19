@@ -781,6 +781,15 @@ ordinary comparison workers, including SIMD NaN handling and first-index ties.
 Their source checks authenticate the reduction axes, output dtype, shape and
 readable backing before admitting the task and its separately funded output.
 The largest arg-reduction row index also fits the worker's signed location cursor.
+CPU affine conversion authenticates the ordered packed-weight, scale and bias
+siblings and shares one Eval task and cleanup across all three outputs. Its
+storage query includes each output allocation, weak descriptor and optional
+General-copy input temporary; cleanup retains that temporary through completion.
+The source accepts F16/BF16/F32 inputs, group sizes 32/64/128 and bit widths
+2/3/4/5/6/8 with checked positive geometry and nonnegative readable strides.
+Eval admission is separate from public quantizer graph construction and physical
+buffer capacity. Failed allocation prefixes retain their accounts without
+publishing the failed outputs as completed values.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

@@ -169,6 +169,26 @@ impl OperationEvent {
         )?;
         Some(CpuCopyEvalLayout { native })
     }
+    /// Affine conversion Eval with packed weights, scales and biases sharing
+    /// one task and cleanup. Input compaction adds one backing and retained
+    /// temporary. Physical allocation sizes and graph construction are separate.
+    pub fn cpu_affine_quantize_layout(
+        dtype: Dtype, rank: usize, rows: usize, columns: usize,
+        group_size: i32, bits: i32, copy: bool, tracer: bool,
+    ) -> Option<CpuCopyEvalLayout> {
+        let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: scalar-only query publishes initialized output on success.
+        if !unsafe { safemlx_sys::mlx_operation_event_cpu_affine_quantize_eval_layout(
+            &mut native, dtype.into(), rank, rows, columns, group_size, bits, copy, tracer,
+        ) } { return None; }
+        let controls = [size_of::<(Dtype, usize, usize, usize, i32, i32, bool, bool)>(),
+            size_of::<safemlx_sys::mlx_dtype>(), size_of_val(&native),
+            size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes = native.named_control_bytes.checked_add(
+            controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)?,
+        )?;
+        Some(CpuCopyEvalLayout { native })
+    }
     /// Bound the existing fixed-rank Squeeze alias and its actual cleanup.
     pub fn cpu_squeeze_layout(rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
@@ -777,5 +797,41 @@ mod quantization_half_tests {
             assert!(OperationEvent::cpu_typed_arg_reduce_layout(dtype, 2, 7, 3, false).is_none());
             assert!(OperationEvent::cpu_half_row_max_layout(dtype, 2, 7, 3, false).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod affine_converter_tests {
+    use super::*;
+    #[test]
+    fn affine_converter_layout_prices_outputs_and_compaction() {
+        let qualified = OperationEvent::cpu_arg_reduce_layout(2, 7, 3, false).is_some();
+        for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
+            for rank in [2, 4, 11] {
+                for group in [32, 64, 128] {
+                    for bits in [2, 3, 4, 5, 6, 8] {
+                        for copy in [false, true] {
+                            let layout = OperationEvent::cpu_affine_quantize_layout(
+                                dtype, rank, 2, group as usize * 2, group, bits, copy, false);
+                            assert_eq!(layout.is_some(), qualified);
+                            if let Some(layout) = layout {
+                                assert_eq!(layout.backing_births(), 3 + usize::from(copy));
+                                assert!(layout.graph_allocation_extents() > 0);
+                                assert!(layout.control_bytes().unwrap() > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (rank, rows, width, group, bits) in [
+            (1, 2, 64, 32, 4), (2, 0, 64, 32, 4), (2, 2, 63, 32, 4),
+            (2, 2, 64, 16, 4), (2, 2, 64, 32, 7), (2, usize::MAX, 64, 32, 4),
+        ] {
+            assert!(OperationEvent::cpu_affine_quantize_layout(
+                Dtype::Float32, rank, rows, width, group, bits, false, false).is_none());
+        }
+        assert!(OperationEvent::cpu_affine_quantize_layout(
+            Dtype::Int32, 2, 2, 64, 32, 4, false, false).is_none());
     }
 }

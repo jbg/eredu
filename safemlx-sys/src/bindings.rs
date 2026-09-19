@@ -7262,6 +7262,9 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_affine_quantize_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
+        dtype: mlx_dtype, rank: usize, rows: usize, columns: usize, group_size: ::std::os::raw::c_int,
+        bits: ::std::os::raw::c_int, copy: bool, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_typed_arg_reduce_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         dtype: mlx_dtype, rank: usize, columns: usize, rows: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_greedy_eval_layout(out: *mut mlx_cpu_copy_eval_layout,

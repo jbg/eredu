@@ -1,0 +1,469 @@
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -22,7 +22,7 @@
+   if (b && a > size_t(PTRDIFF_MAX) / b) return false;
+   out = a * b; return true;
+ }
+-bool append(SingleOutputEvalStorage& out, size_t slot, size_t bytes, size_t alignment,
++bool append(OutputEvalStorage& out, size_t slot, size_t bytes, size_t alignment,
+     size_t count) noexcept {
+   if (!count) return true;
+   if (!bytes || !alignment || (alignment & (alignment - 1)) ||
+@@ -102,8 +102,9 @@
+        typeid(output.primitive())==typeid(CopyToHostTransfer) ||
+        typeid(output.primitive())==typeid(CopyFromHostTransfer) || is_completion_synchronizer(output));
+ }
+-static bool single_output_layout(size_t rank, size_t inputs, bool tracer,
+-    const EvalDispatchStorage* dispatch_source, bool raw_task, SingleOutputEvalStorage& out) noexcept {
++static bool output_layout(size_t rank, size_t inputs, size_t outputs, bool tracer,
++    const EvalDispatchStorage* dispatch_source, bool raw_task, OutputEvalStorage& out) noexcept {
++  if (!outputs || outputs > size_t(UINT16_MAX) + 1 || (!dispatch_source && outputs != 1)) return false;
+   const bool copy = dispatch_source != nullptr;
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+@@ -112,14 +113,14 @@
+   SingleOutputEvalStorage value;
+   value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+-  if (!submission::cpu_eval_cleanup_layout(inputs, 0, cleanup)) return false;
++  if (!submission::cpu_eval_cleanup_layout(inputs, outputs - 1, cleanup)) return false;
+   for (size_t i = 0; i != 2; ++i)
+     if (!append(value, i, cleanup.request_bytes[i], cleanup.request_alignments[i],
+                 cleanup.request_counts[i])) return false;
+-  // outputs() has one entry. The optional tracer input copy occurs at its
++  // outputs() retains the whole sibling group. The tracer input copy occurs at its
+   // unchanged point before eval_cpu. Empty input vectors allocate no backing.
+   size_t input_bytes;
+-  if (!multiply(std::max(size_t{1}, inputs), sizeof(array), input_bytes) ||
++  if (!multiply(std::max(outputs, inputs), sizeof(array), input_bytes) ||
+       !append(value, 2, input_bytes, alignof(array), 1 + size_t(tracer && inputs))) return false;
+   value.named_control_bytes = single_output_controls() + sizeof(SingleOutputEvalStorage) +
+       sizeof(submission::CpuEvalCleanupLayout) + sizeof(size_t) * 9 + sizeof(bool) * 3 +
+@@ -129,12 +130,12 @@
+       sizeof(submission::GraphConstruction*) + sizeof(submission::GraphFailure) +
+       sizeof(submission::NativeControlBinding) + sizeof(detail::PreparedCleanup) +
+       sizeof(CommandEncoder*) + sizeof(array*) + sizeof(scheduler::TaskContext) + sizeof(bool) +
+-      sizeof(rank) + sizeof(inputs) + sizeof(tracer) + sizeof(dispatch_source) + sizeof(out) +
++      sizeof(rank) + sizeof(inputs) + sizeof(outputs) + sizeof(tracer) + sizeof(dispatch_source) + sizeof(out) +
+       sizeof(scheduler::TaskOwner);
+   if (!add(value.named_control_bytes, cleanup.named_control_bytes)) return false;
+   if (copy) {
+     const auto& dispatch = *dispatch_source;
+-    const size_t weak_copies = raw_task ? 0 : inputs + 1;
++    const size_t weak_copies = raw_task ? 0 : inputs + outputs;
+     WeakCopyStorage weak;
+     submission::OriginalBufferRoutingLayout routing;
+     size_t allocation_controls = 0;
+@@ -142,46 +143,54 @@
+         (weak.count != 3 && weak.count != 6) ||
+         !submission::original_buffer_routing_layout(routing) ||
+         !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
+-    // One possible fresh output allocation plus the actual task weak Data owners.
++    // One possible fresh allocation per output plus the actual weak Data owners.
+     // Lazy flags and donation cannot reduce the declared bound. The existing
+     // primitive may alias instead; no fresh output descriptor is then created.
+-    if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, weak_copies + 1) ||
++    if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, weak_copies + outputs) ||
+         !append(value, 4, weak.requests[0].bytes, weak.requests[0].alignment, weak_copies) ||
+         !append(value, 5, weak.requests[1].bytes, weak.requests[1].alignment, weak_copies) ||
+         !append(value, 6, dispatch.task_bytes, dispatch.task_alignment, 1) ||
+-        !append(value, 7, routing.birth_bytes, routing.birth_alignment, 1)) return false;
++        !append(value, 7, routing.birth_bytes, routing.birth_alignment, outputs)) return false;
+     // Each weak descriptor owns copied shape, initial strides and copied
+     // replacement strides. Output adoption separately builds contiguous strides.
+     for (size_t i = 3; i != weak.count; ++i)
+       if (!append(value, 8, weak.requests[i].bytes, weak.requests[i].alignment, weak_copies)) return false;
+     if (weak.count > 3 && !append(value, 8, weak.requests[4].bytes,
+-                                weak.requests[4].alignment, 1)) return false;
+-    value.backing_births = 1;
++                                weak.requests[4].alignment, outputs)) return false;
++    value.backing_births = outputs;
+     value.worker_graph_extents = dispatch.worker_graph_extents;
+     const auto adoption = array::buffer_adoption_layout();
+     const size_t controls = sizeof(EvalDispatchStorage) + sizeof(WeakCopyStorage) +
+         sizeof(submission::OriginalBufferRoutingLayout) + sizeof(array::BufferAdoptionLayout) +
+-        sizeof(std::function<allocator::Buffer(size_t)>) * 2 + sizeof(EvalDispatchStorage*) +
++        sizeof(EvalDispatchStorage*);
++    size_t allocation_bytes = 0;
++    const size_t per_output_controls = sizeof(std::function<allocator::Buffer(size_t)>) * 2 +
+         sizeof(allocator::Buffer) * 2 + sizeof(array::Flags) + sizeof(Shape) + sizeof(Strides) * 2 +
+         sizeof(bool) * 2 + sizeof(size_t) * 4 + sizeof(submission::CaptureSlot) +
+         sizeof(std::shared_ptr<array::Data>) + sizeof(submission::GraphAllocator<array::Data>) +
+         adoption.incoming_bytes + adoption.scratch_owner_bytes + adoption.deleter_bytes +
+         adoption.allocator_callable_bytes + adoption.prepared_strides_bytes;
+-    if (!add(value.named_control_bytes, controls) ||
++    if (!add(allocation_controls, per_output_controls) ||
++        !multiply(outputs, allocation_controls, allocation_bytes) ||
++        !add(value.named_control_bytes, controls + sizeof(allocation_bytes) + sizeof(per_output_controls)) ||
+         !add(value.named_control_bytes, dispatch.controls) ||
+-        !add(value.named_control_bytes, allocation_controls)) return false;
++        !add(value.named_control_bytes, allocation_bytes)) return false;
+   }
+   if (!submission::GraphConstruction::complete_layout(value)) return false;
+   out = value; return true;
+ #endif
+ }
++bool multiple_output_eval_layout(size_t rank, size_t inputs, size_t outputs, bool tracer,
++    const EvalDispatchStorage& dispatch_source, OutputEvalStorage& out) noexcept {
++  return output_layout(rank,inputs,outputs,tracer,&dispatch_source,false,out);
++}
+ bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
+-  return single_output_layout(rank,inputs,tracer,dispatch_source,false,out);
++  return output_layout(rank,inputs,1,tracer,dispatch_source,false,out);
+ }
+ bool single_output_raw_task_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage& dispatch_source, SingleOutputEvalStorage& out) noexcept {
+-  return single_output_layout(rank,inputs,tracer,&dispatch_source,true,out);
++  return output_layout(rank,inputs,1,tracer,&dispatch_source,true,out);
+ }
+ bool single_output_raw_task_layout(size_t rank, bool tracer,
+     const EvalDispatchStorage& dispatch_source, SingleOutputEvalStorage& out) noexcept {
+@@ -239,13 +248,12 @@
+   return host_transfer_eval_layout(input.dtype(),input.ndim(),store,output.is_tracer(),out);
+ }
+ 
+-bool append_copy_temporary_layout(size_t rank,CopyEvalStorage& out) noexcept {
+-  if(rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++bool append_copy_temporary_output_layout(size_t rank,OutputEvalStorage& out) noexcept {
+   CopyEvalStorage copy;
+   submission::GraphQuota::Request descriptor[5]{};size_t count=0;
+   if(!copy_eval_layout(rank,1,true,false,copy)||
+-      !PreparedInputLeaf::append_array_requests(rank,descriptor,count)||count!=3)return false;
+-  CopyEvalStorage value=out;value.copy=true;
++      !PreparedInputLeaf::append_array_requests(rank,descriptor,count)||(count!=3&&count!=5))return false;
++  OutputEvalStorage value=out;
+   // Reuse the actual copy's Data, weak descriptors, task and backing birth.
+   // Slots 0..2 describe its standalone Eval/cleanup and do not occur here.
+   for(size_t slot=3;slot!=9;++slot) {
+@@ -253,9 +261,11 @@
+         copy.request_counts[slot]))return false;
+   }
+   // The parent constructs one fresh destination descriptor, then copy_cpu
+-  // installs the Data already included above. Both copied ranks are inline.
++  // installs the Data already included above. Heap shape/strides are separate.
+   for(size_t i=0;i!=2;++i)
+     if(!append(value,4+i,descriptor[i].bytes,descriptor[i].alignment,1))return false;
++  for(size_t i=3;i<count;++i)
++    if(!append(value,8,descriptor[i].bytes,descriptor[i].alignment,1))return false;
+   if(!add(value.backing_births,copy.backing_births)||
+       !add(value.worker_graph_extents,copy.worker_graph_extents)||
+       !add(value.named_control_bytes,copy.named_control_bytes)||
+@@ -267,6 +277,14 @@
+   if(!add(value.named_control_bytes,controls)||
+       !submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
++}
++
++bool append_copy_temporary_layout(size_t rank,CopyEvalStorage& out) noexcept {
++  if(rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  CopyEvalStorage value=out;
++  if(!append_copy_temporary_output_layout(rank,value)||
++      !add(value.named_control_bytes,sizeof(rank)+sizeof(out)+sizeof(value)))return false;
++  value.copy=true;out=value;return true;
+ }
+ 
+ namespace {
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -19,2 +19,3 @@
+ #include "mlx/backend/cpu/copy_storage.h"
++#include "mlx/backend/cpu/quantize_storage.h"
+ #include "mlx/backend/cpu/gather_storage.h"
+@@ -67,2 +68,3 @@
+   const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
++  const bool fixed_affine_quantize = fixed && cpu::is_affine_quantize_eval_primitive(arr);
+   const bool fixed_unary = fixed && cpu::is_unary_eval_primitive(arr);
+@@ -85,3 +87,3 @@
+   } extended_bank;
+-  if (extended) {
++  if (extended || fixed_affine_quantize) {
+     extended_prologue.emplace(arr);
+@@ -131,2 +133,4 @@
+         ? submission::GraphConstruction::create_cpu_distributed(*extended_prologue, extended_bank.value)
++        : fixed_affine_quantize
++            ? submission::GraphConstruction::create_cpu_affine_quantize_eval(*extended_prologue, extended_bank.value)
+         : fixed_copy
+@@ -143,3 +147,3 @@
+     Bank bank;
+-    if (!extended && fixed) {
++    if (!extended && !fixed_affine_quantize && fixed) {
+       prologue.emplace(arr);
+diff --git a/mlx/backend/cpu/eval_storage.h b/mlx/backend/cpu/eval_storage.h
+--- a/mlx/backend/cpu/eval_storage.h
++++ b/mlx/backend/cpu/eval_storage.h
+@@ -2,9 +2,8 @@
+ #include "mlx/graph_construction.h"
+ 
+ namespace mlx::core::cpu {
+-// Empty fixed destinations for one output, its ordinary cleanup and optional
+-// one/two-input task and its output alias. The caller supplies an exact task query; only a private
+-// actual-primitive constructor can install this bank in an Eval prologue.
++// Fixed destinations for outputs, their shared cleanup and the actual task.
++// Only a private actual-primitive constructor can install this bank in Eval.
+ struct EvalDispatchStorage {
+   size_t task_bytes{0}, task_alignment{0};
+   size_t worker_graph_extents{0}, controls{0};
+@@ -14,6 +13,12 @@
+   size_t worker_graph_extents{0};
+   bool tracer{false};
+ };
++// Preserve the single-output API record while sharing its population fields.
++using OutputEvalStorage = SingleOutputEvalStorage;
++bool multiple_output_eval_layout(size_t rank, size_t inputs, size_t outputs, bool tracer,
++    const EvalDispatchStorage&, OutputEvalStorage&) noexcept;
++// One General-copy temporary inside an existing Eval, without another cleanup.
++bool append_copy_temporary_output_layout(size_t rank, OutputEvalStorage&) noexcept;
+ bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage*, SingleOutputEvalStorage&) noexcept;
+ // One-input raw-pointer worker: the encoder/cleanup retains original arrays,
+diff --git a/mlx/backend/cpu/quantize_storage.h b/mlx/backend/cpu/quantize_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/quantize_storage.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/backend/cpu/eval_storage.h"
++
++namespace mlx::core::cpu {
++struct QuantizeEvalStorage : OutputEvalStorage {
++  bool copy{false};
++};
++// Affine conversion owns packed weights, scales and biases in one Eval. An
++// optional General-copy temporary has its own backing and cleanup retention.
++MLX_API bool affine_quantize_eval_layout(Dtype, size_t rank, size_t rows,
++    size_t columns, int group_size, int bits, bool copy, bool tracer,
++    QuantizeEvalStorage&) noexcept;
++MLX_API bool is_affine_quantize_eval_primitive(const array&) noexcept;
++MLX_API bool affine_quantize_eval_storage(const array&, QuantizeEvalStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -1,4 +1,11 @@
+ // Copyright © 2023 Apple Inc.
++
++#include "mlx/backend/cpu/quantize_storage.h"
++#include "mlx/backend/cpu/copy_storage.h"
++#include "mlx/prepared_input.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
+ 
+ #include "mlx/backend/common/quantized.h"
+ #include "mlx/backend/common/unary.h"
+@@ -1384,28 +1391,11 @@
+       w_ptr, out_ptr, scales_ptr, biases_ptr, bits, group_size, w.size());
+ }
+ 
+-void fast::Quantize::eval_cpu(
+-    const ArrayVector& inputs,
+-    ArrayVector& outputs) {
+-  auto& encoder = cpu::get_command_encoder(stream());
+-  auto w = ensure_row_contiguous(inputs[0], encoder, stream());
+-  auto& out = outputs[0];
+-  out.allocate_data(out.nbytes());
+-
+-  auto& scales = outputs[1];
+-  auto& biases = outputs[2];
+-  scales.allocate_data(scales.nbytes());
+-  biases.allocate_data(biases.nbytes());
+-  encoder.set_input_array(w);
+-  encoder.set_input_array(scales);
+-  encoder.set_input_array(biases);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([w = array::unsafe_weak_copy(w),
+-                    out = array::unsafe_weak_copy(out),
+-                    scales = array::unsafe_weak_copy(scales),
+-                    biases = array::unsafe_weak_copy(biases),
+-                    group_size_ = group_size_,
+-                    bits_ = bits_]() mutable {
++namespace {
++struct AffineQuantizeTask {
++  array w, out, scales, biases;
++  int group_size_, bits_;
++  void operator()() {
+     if (w.dtype() == float16) {
+       if (is_power_of_2(bits_)) {
+         dispatch_quantize<float16_t, uint32_t>(
+@@ -1434,7 +1424,165 @@
+       throw std::runtime_error(
+           "[fast::Quantize::eval_cpu] Only supports floating point inputs");
+     }
+-  });
++  }
++};
++bool quantize_add(size_t& value, size_t more) noexcept {
++  if (more > SIZE_MAX - value) return false;
++  value += more; return true;
++}
++bool quantize_product(size_t a, size_t b, size_t& value) noexcept {
++  if (b && a > size_t(PTRDIFF_MAX) / b) return false;
++  value = a * b; return true;
++}
++} // namespace
++namespace cpu {
++bool affine_quantize_eval_layout(Dtype dtype, size_t rank, size_t rows,
++    size_t columns, int group_size, int bits, bool copy, bool tracer,
++    QuantizeEvalStorage& out) noexcept {
++  if ((dtype != float16 && dtype != bfloat16 && dtype != float32) ||
++      dtype.size() != (dtype == float32 ? 4 : 2) || rank < 2 || rank > size_t(INT_MAX) ||
++      !rows || !columns || (group_size != 32 && group_size != 64 && group_size != 128) ||
++      (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
++      columns % size_t(group_size)) return false;
++  size_t elements, packed_bits, bytes;
++  if (!quantize_product(rows, columns, elements) || elements > size_t(INT_MAX) ||
++      !quantize_product(columns, size_t(bits), packed_bits) || packed_bits > size_t(INT_MAX) ||
++      !quantize_product(elements, dtype.size(), bytes)) return false;
++  DispatchLayout task;
++  WeakCopyStorage weak;
++  if (!CommandEncoder::dispatch_layout<AffineQuantizeTask>(task) ||
++      !PreparedInputLeaf::weak_copy_storage(rank, weak)) return false;
++  // The scalar worker borrows four pointers. Its group min/max and rounding
++  // operands are float for all input dtypes; packing uses a uint64_t accumulator.
++  EvalDispatchStorage dispatch{task.task_bytes, task.task_alignment, 0, 0};
++  const size_t controls[] = {
++      task.controls, weak.controls, weak.controls, weak.controls, weak.controls,
++      sizeof(AffineQuantizeTask) * 2, sizeof(const array*) * 5, sizeof(array*) * 3,
++      sizeof(const void*) * 4, sizeof(float) * 12, sizeof(uint64_t) * 2,
++      sizeof(int) * 12, sizeof(size_t) * 9, sizeof(bool) * 3, size_t(dtype.size()) * 2,
++      sizeof(array) * 2, sizeof(Stream) * 3, sizeof(CommandEncoder*) * 3,
++      sizeof(dtype), sizeof(rank), sizeof(rows), sizeof(columns), sizeof(group_size),
++      sizeof(bits), sizeof(copy), sizeof(tracer), sizeof(out), sizeof(elements),
++      sizeof(packed_bits), sizeof(bytes), sizeof(task), sizeof(weak), sizeof(dispatch)};
++  dispatch.controls = sizeof(controls) + sizeof(size_t);
++  for (size_t amount : controls) if (!quantize_add(dispatch.controls, amount)) return false;
++  QuantizeEvalStorage value;
++  if (!multiple_output_eval_layout(rank, 1, 3, tracer, dispatch, value)) return false;
++  value.copy = copy;
++  if (copy) {
++    RetentionLayout retention;
++    if (!append_copy_temporary_output_layout(rank, value) ||
++        !CommandEncoder::retention_layout(1, 2, retention)) return false;
++    value.request_bytes[9] = retention.temporary_batch.bytes;
++    value.request_alignments[9] = retention.temporary_batch.alignment;
++    value.request_counts[9] = 1;
++    const size_t temporary_controls = sizeof(retention) + sizeof(detail::TemporaryOwner) * 2 +
++        sizeof(detail::TemporaryStorage) + sizeof(detail::TemporaryBatch*) * 3 +
++        sizeof(submission::GraphAllocator<detail::TemporaryBatch>) * 2 +
++        sizeof(std::optional<array>) + sizeof(submission::NativeControlFailure) +
++        sizeof(submission::NativeControlError) + sizeof(size_t);
++    if (!quantize_add(value.named_control_bytes, temporary_controls)) return false;
++  }
++  const size_t source_controls[] = {
++      sizeof(value), sizeof(const array*) * 12, sizeof(const fast::Quantize*),
++      sizeof(std::tuple<std::nullptr_t, int, int, QuantizationMode, bool>),
++      sizeof(Dtype) * 2, sizeof(int) * 6, sizeof(size_t) * 20, sizeof(bool) * 5,
++      sizeof(submission::FixedEvalPrologueGuard*), sizeof(submission::Record*),
++      sizeof(submission::GraphQuota*), sizeof(submission::GraphConstruction*),
++      sizeof(submission::GraphConstructionContext), sizeof(submission::GraphFailure)};
++  if (!quantize_add(value.named_control_bytes, sizeof(source_controls))) return false;
++  for (size_t amount : source_controls)
++    if (!quantize_add(value.named_control_bytes, amount)) return false;
++  if (!submission::GraphConstruction::complete_layout(value)) return false;
++  out = value; return true;
++}
++bool is_affine_quantize_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      typeid(output.primitive()) == typeid(fast::Quantize);
++}
++bool affine_quantize_eval_storage(const array& output, QuantizeEvalStorage& out) noexcept {
++  if (!is_affine_quantize_eval_primitive(output) || output.inputs().size() != 1 ||
++      output.siblings().size() != 2 || output.sibling_position() > 2) return false;
++  const auto [unused, group, bits, mode, dequantize] =
++      static_cast<const fast::Quantize&>(output.primitive()).state();
++  if (mode != QuantizationMode::Affine || dequantize || group <= 0 || bits <= 0) return false;
++  const auto& input = output.inputs()[0];
++  const size_t rank = input.ndim();
++  if (rank < 2 || input.strides().size() != rank) return false;
++  // Authenticate the complete ordered sibling clique without outputs(), which
++  // allocates the very vector this source must reserve before entering Eval.
++  const array* roots[3]{};
++  for (size_t i = 0; i < 3; ++i)
++    roots[i] = i == size_t(output.sibling_position()) ? &output :
++        &output.siblings()[i - size_t(i > size_t(output.sibling_position()))];
++  size_t rows = 1, span = 1, delta, stride = 1, packed_bits;
++  for (size_t axis = rank; axis--;) {
++    if (input.shape(axis) <= 0 || input.strides()[axis] < 0 ||
++        !quantize_product(size_t(input.shape(axis) - 1), size_t(input.strides()[axis]), delta) ||
++        !quantize_add(span, delta) || span > size_t(PTRDIFF_MAX)) return false;
++    if (input.flags().row_contiguous && input.shape(axis) > 1 &&
++        size_t(input.strides()[axis]) != stride) return false;
++    if (!quantize_product(stride, size_t(input.shape(axis)), stride) ||
++        (axis + 1 < rank && !quantize_product(rows, size_t(input.shape(axis)), rows))) return false;
++  }
++  const size_t columns = input.shape(-1);
++  if (stride != input.size() || span > input.data_size() ||
++      !quantize_product(span, input.itemsize(), delta) ||
++      !quantize_product(columns, size_t(bits), packed_bits) || packed_bits % 32) return false;
++  for (size_t i = 0; i < 3; ++i) {
++    const auto& root = *roots[i];
++    const auto dtype = i == 0 ? uint32 : input.dtype();
++    if (!root.has_primitive() || &root.primitive() != &output.primitive() ||
++        root.sibling_position() != i || root.siblings().size() != 2 ||
++        root.inputs().size() != 1 || root.inputs()[0].id() != input.id() ||
++        root.dtype() != dtype || root.itemsize() != dtype.size() || root.ndim() != rank) return false;
++    for (size_t j = 0; j < 3; ++j)
++      if (j != i && root.siblings()[j - size_t(j > i)].id() != roots[j]->id()) return false;
++    for (size_t axis = 0; axis + 1 < rank; ++axis)
++      if (root.shape(axis) != input.shape(axis)) return false;
++    const size_t last = i == 0 ? packed_bits / 32 : columns / size_t(group);
++    if (root.shape(-1) <= 0 || size_t(root.shape(-1)) != last ||
++        !quantize_product(rows, last, delta) || root.size() != delta) return false;
++  }
++  return affine_quantize_eval_layout(input.dtype(), rank, rows, columns, group, bits,
++      !input.flags().row_contiguous, output.is_tracer(), out);
++}
++} // namespace cpu
++namespace submission {
++GraphFailure GraphConstruction::create_cpu_affine_quantize_eval(
++    const FixedEvalPrologueGuard& guard, GraphConstruction*& out) noexcept {
++  auto& record = guard.record();
++  auto* graph = record.graph_quota();
++  auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph)
++    return GraphFailure::foreign_parent;
++  cpu::QuantizeEvalStorage actual;
++  if (!cpu::affine_quantize_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace submission
++
++void fast::Quantize::eval_cpu(
++    const ArrayVector& inputs,
++    ArrayVector& outputs) {
++  auto& encoder = cpu::get_command_encoder(stream());
++  auto w = ensure_row_contiguous(inputs[0], encoder, stream());
++  auto& out = outputs[0];
++  out.allocate_data(out.nbytes());
++
++  auto& scales = outputs[1];
++  auto& biases = outputs[2];
++  scales.allocate_data(scales.nbytes());
++  biases.allocate_data(biases.nbytes());
++  encoder.set_input_array(w);
++  encoder.set_input_array(scales);
++  encoder.set_input_array(biases);
++  encoder.set_output_array(out);
++  encoder.dispatch(AffineQuantizeTask{
++      array::unsafe_weak_copy(w), array::unsafe_weak_copy(out),
++      array::unsafe_weak_copy(scales), array::unsafe_weak_copy(biases),
++      group_size_, bits_});
+ }
+ 
+ void fast::ConvertFP8::eval_cpu(
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -168,6 +168,7 @@
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+       const Record& dispatch, GraphConstruction*&) noexcept;
+   static GraphFailure create_gpu_prologue(const GpuEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_affine_quantize_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
