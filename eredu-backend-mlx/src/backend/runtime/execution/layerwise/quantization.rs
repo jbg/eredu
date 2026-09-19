@@ -1,12 +1,10 @@
 //! On-load quantization recipes, bounds, and task materialization.
 
 use super::*;
+mod exact_plan;
+pub(crate) use exact_plan::prepare_exact_quantization_from_destinations;
 
-/// Residency-owned execution engine for generalized adapters.
-///
-/// Group windows, lease lifetime, retained-state evaluation, stream
-/// synchronization, and telemetry stay centralized here. Adapter code owns only
-/// architecture math, cache validation, and runtime-unit construction.
+/// Architecture-declared identities and scalar format of packed companions.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct PackedWeightCompanions {
     weight_name: String,
@@ -29,7 +27,11 @@ where
     }
 
     impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a crate::MlxTensor,
+        ) {
             if self.error.is_some() {
                 return;
             }
@@ -139,93 +141,6 @@ where
         .map(|targets| targets.into_iter().flatten().collect())
 }
 
-fn exact_task_weight_companions<M>(
-    module: &M,
-    quantization: WeightQuantization,
-    tasks: &[&ReplicatedTextMaterializationTask],
-) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>
-where
-    M: Parameterized<crate::MlxTensor>,
-{
-    struct Collector {
-        parameters: BTreeMap<String, Dtype>,
-    }
-    impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
-            self.parameters
-                .insert(metadata.id().as_str().to_owned(), value.as_array().dtype());
-        }
-    }
-    let mut collector = Collector {
-        parameters: BTreeMap::new(),
-    };
-    module.visit_parameters(&mut collector)?;
-    let mut selected = BTreeMap::new();
-    for task in tasks {
-        let Some(weight_dtype) = collector.parameters.get(task.name()) else {
-            continue;
-        };
-        if *weight_dtype != Dtype::Uint32 {
-            return Err(Error::Quantization(format!(
-                "selected packed output {:?} has native dtype {weight_dtype:?}, expected Uint32",
-                task.name()
-            )));
-        }
-        let mut scales = None;
-        let mut biases = None;
-        let mut companion_dtype = None;
-        for companion in task.output_companions() {
-            let dtype = collector.parameters.get(companion.name()).ok_or_else(|| {
-                Error::Quantization(format!(
-                    "selected materialization task {:?} names absent companion {:?}",
-                    task.name(),
-                    companion.name()
-                ))
-            })?;
-            let dtype = match *dtype {
-                Dtype::Float16 => RecipeDtype::F16,
-                Dtype::Bfloat16 => RecipeDtype::BF16,
-                Dtype::Float32 => RecipeDtype::F32,
-                Dtype::Uint8 if !quantization.has_biases() => RecipeDtype::F32,
-                dtype => {
-                    return Err(Error::Quantization(format!(
-                        "selected companion {:?} has unsupported dtype {dtype:?}",
-                        companion.name()
-                    )))
-                }
-            };
-            if companion_dtype
-                .replace(dtype.clone())
-                .is_some_and(|prior| prior != dtype)
-            {
-                return Err(Error::Quantization(format!(
-                    "selected task {:?} has mismatched companion dtypes",
-                    task.name()
-                )));
-            }
-            match companion.role() {
-                LinearCompanionRole::Scale => scales = Some(companion.name().to_owned()),
-                LinearCompanionRole::AffineBias => biases = Some(companion.name().to_owned()),
-            }
-        }
-        selected.insert(
-            task.name().to_owned(),
-            PackedWeightCompanions {
-                weight_name: task.name().to_owned(),
-                scales_name: scales.ok_or_else(|| {
-                    Error::Quantization(format!(
-                        "selected task {:?} has no declared scale companion",
-                        task.name()
-                    ))
-                })?,
-                biases_name: biases,
-                affine_companion_dtype: companion_dtype.expect("scale companion supplies dtype"),
-            },
-        );
-    }
-    Ok(selected)
-}
-
 type QuantizationRecipes = BTreeMap<String, (DerivedWeightRecipe, PackedWeightCompanions)>;
 
 fn collect_quantization_recipes(
@@ -269,13 +184,45 @@ fn collect_quantization_recipes(
     Ok(())
 }
 
-fn collect_exact_quantization_recipes<M>(
+fn collect_exact_target_parameters<M: Parameterized<crate::MlxTensor>>(
+    module: &M,
+) -> Result<BTreeMap<String, eredu_runtime::ParameterBindingTarget>, Error> {
+    #[derive(Default)]
+    struct Collector {
+        parameters: BTreeMap<String, eredu_runtime::ParameterBindingTarget>,
+        invalid: Option<String>,
+    }
+    impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a crate::MlxTensor,
+        ) {
+            let name = metadata.id().as_str().to_owned();
+            match crate::backend::runtime::checkpoint::binding::mlx_parameter_binding_target(value)
+            {
+                Some(target) => {
+                    self.parameters.insert(name, target);
+                }
+                None => self.invalid = Some(name),
+            }
+        }
+    }
+    let mut collector = Collector::default();
+    module.visit_parameters(&mut collector)?;
+    if let Some(name) = collector.invalid {
+        return Err(Error::Quantization(format!(
+            "invalid native quantization destination {name:?}"
+        )));
+    }
+    Ok(collector.parameters)
+}
+
+fn validate_exact_quantization_sources<M>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     source: &M,
-    source_layout: Option<&eredu_runtime::LocalModelLayout>,
-    selected: &BTreeMap<String, PackedWeightCompanions>,
-    requested: &BTreeMap<&str, &ReplicatedTextMaterializationTask>,
-    recipes: &mut QuantizationRecipes,
+    destinations: &BTreeMap<String, eredu_runtime::ParameterBindingTarget>,
+    plan: &BoundedQuantizationPlan,
 ) -> Result<(), Error>
 where
     M: Parameterized<crate::MlxTensor>,
@@ -284,7 +231,11 @@ where
         parameters: BTreeMap<String, (Vec<usize>, Dtype)>,
     }
     impl<'a> ParameterVisitor<'a, crate::MlxTensor> for SourceCollector {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a crate::MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a crate::MlxTensor,
+        ) {
             let shape = value
                 .as_array()
                 .shape()
@@ -303,32 +254,23 @@ where
         parameters: BTreeMap::new(),
     };
     source.visit_parameters(&mut source_parameters)?;
-    for name in selected.keys() {
-        let task = requested.get(name.as_str()).copied().ok_or_else(|| {
-            Error::Quantization(format!(
-                "native packed target {name:?} has no exact materialization task"
-            ))
-        })?;
+    for target in plan
+        .targets()
+        .iter()
+        .filter(|target| destinations.contains_key(target.weight_name()))
+    {
+        let name = target.weight_name();
         let (source_shape, source_dtype) =
             source_parameters.parameters.get(name).ok_or_else(|| {
                 Error::Quantization(format!(
                     "selected materialization task {name:?} is absent from its source module"
                 ))
             })?;
-        let (recipe, metadata) = eredu_runtime::resolve_replicated_text_transform_source(
-            store,
-            task,
-            source_layout,
-        )
-        .map_err(|error| match error {
-            eredu_runtime::TransformSourceError::Task { details } => Error::Quantization(details),
-            eredu_runtime::TransformSourceError::Placement(cause) => Error::Parallel(cause.to_string()),
-            eredu_runtime::TransformSourceError::Recipe(cause) => cause.into(),
-        })?;
+        let metadata = target.source().infer(store)?;
         if metadata.shape() != source_shape {
             return Err(Error::Quantization(format!(
                 "selected materialization task {:?} source recipe has shape {:?}, native source module requires {:?}",
-                task.name(),
+                name,
                 metadata.shape(),
                 source_shape
             )));
@@ -340,35 +282,16 @@ where
             dtype => {
                 return Err(Error::Quantization(format!(
                 "selected materialization task {:?} source module has unsupported dtype {dtype:?}",
-                task.name()
+                name
             )))
             }
         };
         if metadata.dtype() != &native_source_dtype {
             return Err(Error::Quantization(format!(
                 "selected materialization task {:?} source recipe dtype {:?} differs from native source dtype {:?}",
-                task.name(),
+                name,
                 metadata.dtype(),
                 native_source_dtype
-            )));
-        }
-        let mut companions = selected.get(name).cloned().ok_or_else(|| {
-            Error::Quantization(format!(
-                "selected materialization task {:?} has no exact packed companion topology",
-                task.name()
-            ))
-        })?;
-        // Floating destination handles are unloaded placeholders, not a request
-        // to cast generated values. Match the admitted source precision used by
-        // independent bank transforms and their selected byte accounting.
-        companions.affine_companion_dtype = metadata.dtype().clone();
-        let target = companions.weight_name.clone();
-        if recipes
-            .insert(target.clone(), (recipe, companions))
-            .is_some()
-        {
-            return Err(Error::Quantization(format!(
-                "selected materialization task {target:?} was bound more than once"
             )));
         }
     }
@@ -619,87 +542,36 @@ where
             "exact source and target materialization units differ in cardinality".into(),
         ));
     }
-    let mut requested = BTreeMap::new();
-    for task in tasks {
-        if !matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        ) {
-            return Err(Error::Quantization(format!(
-                "exact materialization task {:?} did not select a transform lowering",
-                task.name()
-            )));
-        }
-        if task.executable().weight_quantization() != Some(quantization) {
-            return Err(Error::Quantization(format!(
-                "exact materialization task {:?} does not match its format group",
-                task.name()
-            )));
-        }
-        if requested.insert(task.name(), *task).is_some() {
-            return Err(Error::Quantization(format!(
-                "exact materialization task {:?} was requested more than once",
-                task.name()
-            )));
-        }
-    }
-    if requested.is_empty() {
-        return Err(Error::Quantization(
-            "exact replicated-text materialization received no tasks".into(),
-        ));
-    }
-    let requested_names = requested.keys().copied().collect::<BTreeSet<_>>();
-
-    let mut recipes = BTreeMap::new();
-    collect_exact_quantization_recipes(
+    let target_parameters = std::iter::once(collect_exact_target_parameters(target_static))
+        .chain(target_units.iter().map(collect_exact_target_parameters))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (plan, destinations) = exact_plan::build(
+        store.as_ref(),
+        &target_parameters,
+        source_layout,
+        quantization,
+        tasks,
+    )?;
+    validate_exact_quantization_sources(
         store.as_ref(),
         source_static,
-        source_layout,
-        &exact_task_weight_companions(target_static, quantization, tasks)?,
-        &requested,
-        &mut recipes,
+        &target_parameters[0],
+        &plan,
     )?;
-    for (source, target) in source_units.iter().zip(target_units) {
-        let companions = exact_task_weight_companions(target, quantization, tasks)?;
-        collect_exact_quantization_recipes(
+    for (index, source) in source_units.iter().enumerate() {
+        validate_exact_quantization_sources(
             store.as_ref(),
             source,
-            source_layout,
-            &companions,
-            &requested,
-            &mut recipes,
+            &target_parameters[index + 1],
+            &plan,
         )?;
     }
-
-    validate_exact_consumption(&requested_names, &recipes)?;
-
-    let targets = recipes
-        .into_iter()
-        .map(|(target, (recipe, companions))| {
-            let target = BoundedQuantizationTarget::from_recipe(
-                target,
-                companions.scales_name,
-                companions.biases_name,
-                recipe,
-            )?;
-            match quantization {
-                WeightQuantization::Affine(_) => {
-                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
-                }
-                WeightQuantization::MxFp4 => Ok(target),
-                WeightQuantization::GgufIQuant { .. } => unreachable!(
-                    "load-time materialization rejects checkpoint-native GGUF encodings"
-                ),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let working_set_bytes =
-        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
-        store,
-        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
-        stream,
-    )?);
+    let cold =
+        crate::backend::runtime::checkpoint::bounded_quantization::ColdQuantization::prepare(
+            store, plan,
+        )?;
+    cold.validate_destinations(&destinations)?;
+    let transformed = Arc::new(cold.allocate_ordinary()?.materialize(stream)?);
     let report = transformed.report().clone();
     let transformed: RetainedCheckpointSource = transformed.into();
     Ok((transformed, report))
@@ -906,7 +778,6 @@ fn bounded_quantization_working_set(
             let one_row = target
                 .source()
                 .select_bounded_matrix_rows(store, matrix, 0, 1)?;
-            one_row.preflight_bounded(store)?;
             minimum_tile_bytes = minimum_tile_bytes.max(
                 one_row
                     .peak_materialization_bytes(store)?

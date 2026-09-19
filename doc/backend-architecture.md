@@ -722,6 +722,14 @@ rank's additional and primary placements. MLX materialization uses that same
 resolver, then verifies the resulting shape and dtype against its native source
 slots. Recipe resolution reads metadata only and grants no storage admission.
 
+MLX cold quantization translates architecture-projected destination slots through
+the same scalar binding descriptions as native parameter traversal. Both routes
+use one exact-task planner for format groups, complete target consumption,
+companion identities, packed output shapes and compatible dtypes. Working-set
+sizing uses metadata only; bounded payload acquisition belongs to conversion.
+Ordinary native loading additionally validates the actual source tensor handles
+before using that plan. Destination projection and planning grant no admission.
+
 Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
 allocating their metadata and payload. Publication moves those bytes into the
 immutable memory store; leases, detached readers and weak storage identities

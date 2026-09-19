@@ -50,15 +50,7 @@ impl BoundedQuantizedWeightStore {
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
         super::preparation::ColdQuantization::prepare(source.into(), plan)?
-            .allocate(|layout| {
-                eredu_checkpoint::store::MemoryTensorBuffer::allocate(
-                    &layout.name,
-                    layout.dtype,
-                    &layout.shape,
-                    layout.byte_len,
-                )
-                .map_err(|cause| Error::Other(Box::new(cause)))
-            })?
+            .allocate_ordinary()?
             .materialize(conversion_stream)
     }
 
@@ -74,7 +66,7 @@ impl BoundedQuantizedWeightStore {
 }
 
 impl super::preparation::PreparedQuantization {
-    pub(super) fn materialize(
+    pub(crate) fn materialize(
         self,
         conversion_stream: &Stream,
     ) -> Result<BoundedQuantizedWeightStore, Error> {

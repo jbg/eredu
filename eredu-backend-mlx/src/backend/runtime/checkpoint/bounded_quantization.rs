@@ -53,6 +53,7 @@ mod preflight;
 mod preparation;
 
 pub use pipeline::BoundedQuantizedWeightStore;
+pub(crate) use preparation::{ColdQuantization, PreparedQuantization};
 pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};
 
 #[cfg(test)]

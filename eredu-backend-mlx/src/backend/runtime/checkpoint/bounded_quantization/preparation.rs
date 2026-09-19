@@ -28,7 +28,7 @@ struct TargetOutputs {
 }
 
 /// Retains the exact source and validated metadata without native state or payloads.
-pub(super) struct ColdQuantization {
+pub(crate) struct ColdQuantization {
     source: eredu_checkpoint::store::RetainedCheckpointSource,
     plan: BoundedQuantizationPlan,
     targets: Vec<TargetOutputs>,
@@ -38,7 +38,7 @@ pub(super) struct ColdQuantization {
 }
 
 /// Owns the final destinations before the conversion streams are constructed.
-pub(super) struct PreparedQuantization {
+pub(crate) struct PreparedQuantization {
     pub(super) source: eredu_checkpoint::store::RetainedCheckpointSource,
     pub(super) plan: BoundedQuantizationPlan,
     pub(super) output_shards: Vec<OutputShard>,
@@ -48,7 +48,7 @@ pub(super) struct PreparedQuantization {
 }
 
 impl ColdQuantization {
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         source: eredu_checkpoint::store::RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,
     ) -> Result<Self, Error> {
@@ -86,6 +86,55 @@ impl ColdQuantization {
             transformed_keys,
             materialized_source_keys,
             materialized_source_shards,
+        })
+    }
+
+    /// Compares all encoded outputs with the actual selected destination slots.
+    pub(crate) fn validate_destinations(
+        &self,
+        destinations: &std::collections::BTreeMap<String, eredu_runtime::ParameterBindingTarget>,
+    ) -> Result<(), Error> {
+        for layout in self.targets.iter().flat_map(|target| &target.layouts) {
+            let destination = destinations.get(&layout.name).ok_or_else(|| {
+                quantization_error(format!(
+                    "quantized output {:?} has no selected destination",
+                    layout.name
+                ))
+            })?;
+            let dtype = match layout.dtype {
+                SafeDtype::U32 => RecipeDtype::U32,
+                SafeDtype::U8 => RecipeDtype::U8,
+                SafeDtype::F16 => RecipeDtype::F16,
+                SafeDtype::BF16 => RecipeDtype::BF16,
+                SafeDtype::F32 => RecipeDtype::F32,
+                other => {
+                    return Err(quantization_error(format!(
+                        "unsupported quantized output dtype {other:?}"
+                    )))
+                }
+            };
+            if destination.shape != layout.shape
+                || (destination.dtype != dtype
+                    && !destination.permitted_source_dtypes.contains(&dtype))
+            {
+                return Err(quantization_error(format!(
+                    "quantized output {:?} has shape {:?} and dtype {:?}, incompatible with selected destination {:?}",
+                    layout.name, layout.shape, dtype, destination,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocate_ordinary(self) -> Result<PreparedQuantization, Error> {
+        self.allocate(|layout| {
+            eredu_checkpoint::store::MemoryTensorBuffer::allocate(
+                &layout.name,
+                layout.dtype,
+                &layout.shape,
+                layout.byte_len,
+            )
+            .map_err(|cause| Error::Other(Box::new(cause)))
         })
     }
 
@@ -127,7 +176,7 @@ impl ColdQuantization {
 
     /// Creates final payloads under the pool's original source constructor.
     /// Plan/overlay metadata and native conversion work remain separately funded.
-    pub(super) fn allocate_original(
+    pub(crate) fn allocate_original(
         self,
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         metadata_policy: eredu_runtime::working_memory::DependencyMemoryPolicy,

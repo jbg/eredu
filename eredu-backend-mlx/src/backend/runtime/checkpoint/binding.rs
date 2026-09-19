@@ -398,7 +398,7 @@ where
     .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<ParameterBindingTarget> {
+pub(crate) fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<ParameterBindingTarget> {
     let shape = parameter
         .as_array()
         .shape()
