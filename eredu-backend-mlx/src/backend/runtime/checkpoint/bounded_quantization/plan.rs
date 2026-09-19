@@ -92,7 +92,7 @@ impl BoundedQuantizationTarget {
 }
 
 /// A validated collection of source-bounded, memory-resident transformations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoundedQuantizationPlan {
     pub(super) quantization: WeightQuantization,
     pub(super) max_working_set_bytes: u64,

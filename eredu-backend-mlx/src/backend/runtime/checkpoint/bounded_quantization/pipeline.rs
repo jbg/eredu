@@ -70,6 +70,24 @@ impl super::preparation::PreparedQuantization {
         self,
         conversion_stream: &Stream,
     ) -> Result<BoundedQuantizedWeightStore, Error> {
+        self.materialize_with_plan(conversion_stream)
+            .map(|(store, _)| store)
+    }
+
+    /// Retain the actual plan for later adoption by typed model construction.
+    pub(crate) fn materialize_handoff(
+        self,
+        conversion_stream: &Stream,
+    ) -> Result<ConvertedQuantization, Error> {
+        let source = self.source.clone();
+        let (store, plan) = self.materialize_with_plan(conversion_stream)?;
+        Ok(ConvertedQuantization::new(source, plan, store))
+    }
+
+    fn materialize_with_plan(
+        self,
+        conversion_stream: &Stream,
+    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
         let Self {
             source,
             plan,
@@ -117,14 +135,17 @@ impl super::preparation::PreparedQuantization {
             output_shards.into_iter().flat_map(|shard| shard.buffers),
         )
         .map_err(|cause| Error::Other(Box::new(cause)))?;
-        Ok(BoundedQuantizedWeightStore {
-            source,
-            transformed,
-            transformed_keys,
-            materialized_source_keys,
-            materialized_source_shards,
-            report,
-        })
+        Ok((
+            BoundedQuantizedWeightStore {
+                source,
+                transformed,
+                transformed_keys,
+                materialized_source_keys,
+                materialized_source_shards,
+                report,
+            },
+            plan,
+        ))
     }
 }
 

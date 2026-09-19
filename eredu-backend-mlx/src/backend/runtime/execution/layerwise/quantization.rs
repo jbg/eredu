@@ -537,6 +537,69 @@ where
     SM: Parameterized<crate::MlxTensor>,
     U: Parameterized<crate::MlxTensor>,
 {
+    let cold = prepare_exact_native_quantization(
+        store,
+        source_static,
+        target_static,
+        source_units,
+        target_units,
+        source_layout,
+        quantization,
+        tasks,
+    )?;
+    Ok(cold
+        .allocate_ordinary()?
+        .materialize_handoff(stream)?
+        .into_parts())
+}
+
+/// Adopts the actual converted overlay after checking the selected native slots.
+/// Metadata validation and identity comparison perform no payload reads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adopt_exact_replicated_text_quantization<SM, U>(
+    converted: crate::backend::runtime::checkpoint::bounded_quantization::ConvertedQuantization,
+    store: RetainedCheckpointSource,
+    source_static: &SM,
+    target_static: &SM,
+    source_units: &[U],
+    target_units: &[U],
+    source_layout: Option<&eredu_runtime::LocalModelLayout>,
+    quantization: WeightQuantization,
+    tasks: &[&ReplicatedTextMaterializationTask],
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
+where
+    SM: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor>,
+{
+    let cold = prepare_exact_native_quantization(
+        store,
+        source_static,
+        target_static,
+        source_units,
+        target_units,
+        source_layout,
+        quantization,
+        tasks,
+    )?;
+    cold.validate_conversion(&converted)?;
+    Ok(converted.into_parts())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_exact_native_quantization<SM, U>(
+    store: RetainedCheckpointSource,
+    source_static: &SM,
+    target_static: &SM,
+    source_units: &[U],
+    target_units: &[U],
+    source_layout: Option<&eredu_runtime::LocalModelLayout>,
+    quantization: WeightQuantization,
+    tasks: &[&ReplicatedTextMaterializationTask],
+) -> Result<crate::backend::runtime::checkpoint::bounded_quantization::ColdQuantization, Error>
+where
+    SM: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor>,
+{
     if source_units.len() != target_units.len() {
         return Err(Error::Quantization(
             "exact source and target materialization units differ in cardinality".into(),
@@ -571,10 +634,7 @@ where
             store, plan,
         )?;
     cold.validate_destinations(&destinations)?;
-    let transformed = Arc::new(cold.allocate_ordinary()?.materialize(stream)?);
-    let report = transformed.report().clone();
-    let transformed: RetainedCheckpointSource = transformed.into();
-    Ok((transformed, report))
+    Ok(cold)
 }
 
 /// Builds a bounded packed overlay from architecture-selected realtime tasks.

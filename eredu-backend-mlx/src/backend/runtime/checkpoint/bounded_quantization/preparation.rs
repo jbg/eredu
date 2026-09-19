@@ -48,6 +48,14 @@ pub(crate) struct PreparedQuantization {
 }
 
 impl ColdQuantization {
+    /// Authenticate a completed conversion against this source and exact plan.
+    pub(crate) fn validate_conversion(
+        &self,
+        converted: &ConvertedQuantization,
+    ) -> Result<(), Error> {
+        converted.validate(&self.source, &self.plan)
+    }
+
     pub(crate) fn prepare(
         source: eredu_checkpoint::store::RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,

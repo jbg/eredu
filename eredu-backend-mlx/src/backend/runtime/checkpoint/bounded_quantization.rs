@@ -47,12 +47,14 @@ const BOUNDED_QUANTIZATION_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_QUANTIZATION_SUBMISSION_ELEMENTS: usize = i32::MAX as usize;
 
 mod layout;
+mod handoff;
 mod pipeline;
 mod plan;
 mod preflight;
 mod preparation;
 
 pub use pipeline::BoundedQuantizedWeightStore;
+pub(crate) use handoff::ConvertedQuantization;
 pub(crate) use preparation::{ColdQuantization, PreparedQuantization};
 pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};
 

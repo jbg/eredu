@@ -735,6 +735,13 @@ proofs or materializing source bytes. Rejected sizing candidates perform no
 payload reads. Conversion retains bounded-read refusals and pending completion
 ownership on failure.
 
+Completed quantization can retain its exact plan and immutable source identity
+in a move-only handoff. Residency preparation may borrow the resulting overlay;
+native adoption uses the same source/destination validation as ordinary loading,
+compares the retained plan and source, and returns that same overlay and report.
+Adoption reads metadata only. It neither requantizes the payload nor grants new
+storage admission; output buffers retain their original constructor custody.
+
 Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
 allocating their metadata and payload. Publication moves those bytes into the
 immutable memory store; leases, detached readers and weak storage identities

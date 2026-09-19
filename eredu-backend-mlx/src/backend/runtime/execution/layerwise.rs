@@ -52,7 +52,9 @@ pub use dense_stream::{
 };
 
 mod quantization;
-pub(crate) use quantization::prepare_exact_quantization_from_destinations;
+pub(crate) use quantization::{
+    adopt_exact_replicated_text_quantization, prepare_exact_quantization_from_destinations,
+};
 #[allow(unused_imports)]
 pub(crate) use quantization::{packed_weight_companions, PackedWeightCompanions};
 pub use quantization::{

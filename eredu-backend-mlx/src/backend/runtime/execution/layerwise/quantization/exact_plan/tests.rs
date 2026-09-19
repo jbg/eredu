@@ -431,10 +431,25 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
         .unwrap();
     let native_owner = pool.acquire_unquoted().unwrap();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let original = prepared.materialize(context.stream()).unwrap();
+    let completed = prepared.materialize_handoff(context.stream()).unwrap();
+    let residency_source = completed.store().clone();
     let dense = MlxNeuralBackend::linear(spec(2, None), context.stream()).unwrap();
     let packed = MlxNeuralBackend::linear(spec(2, Some(affine())), context.stream()).unwrap();
     let empty = &std::slice::from_ref(&dense)[..0];
+    let (original, original_report) = adopt_exact_replicated_text_quantization(
+        completed,
+        source.clone(),
+        &dense,
+        &packed,
+        empty,
+        empty,
+        None,
+        affine(),
+        &[&task],
+    )
+    .unwrap();
+    assert!(original.same_source(&residency_source));
+    assert_eq!(original_report.transformed_weights, 1);
     let (ordinary, _) = quantize_exact_replicated_text_tasks(
         source.clone(),
         &dense,
@@ -447,10 +462,13 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
         context.stream(),
     )
     .unwrap();
-    check_values(&original, &values);
+    check_values(original.as_ref(), &values);
     check_values(ordinary.as_ref(), &values);
     for key in [WEIGHT, SCALE, BIAS] {
-        assert_eq!(output(&original, key), output(ordinary.as_ref(), key));
+        assert_eq!(
+            output(original.as_ref(), key),
+            output(ordinary.as_ref(), key)
+        );
     }
     let wrong_shape = MlxNeuralBackend::linear(spec(3, None), context.stream()).unwrap();
     let error = quantize_exact_replicated_text_tasks(
@@ -484,6 +502,7 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
         .to_string()
         .contains("differs from native source dtype"));
     drop((
+        residency_source,
         original,
         ordinary,
         wrong_shape,
@@ -494,3 +513,5 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
     ));
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+mod handoff;
