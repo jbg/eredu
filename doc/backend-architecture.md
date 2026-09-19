@@ -800,6 +800,12 @@ out-of-line destination strides, and the General-copy worker retains its existin
 rank-dependent storage quote. Ordinary and prepared evaluation use the same
 planner, including higher-rank matrix banks.
 
+The backend quantizer passes the retained input geometry directly to the native
+constructor. Packing changes the final dimension; leading bank dimensions remain
+in the weights and companion outputs. Native allocation queries describe that
+same geometry, with source preparation and companion dtype conversion funded
+separately.
+
 CPU MXFP4 construction uses the same resident bank, with a source-derived bound
 for binary/Select casts and broadcasts, unary operators, views, reductions and
 range construction. Its six eager constants expose individual payload requests;

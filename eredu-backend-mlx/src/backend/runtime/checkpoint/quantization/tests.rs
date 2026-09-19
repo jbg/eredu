@@ -378,3 +378,5 @@ fn saved_checkpoint_matches_direct_tensor_quantization() {
     assert!(output.join("auxiliary.safetensors").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+mod direct_geometry;

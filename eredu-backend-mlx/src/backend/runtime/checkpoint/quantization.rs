@@ -174,8 +174,8 @@ impl QuantizedTensor {
 
 /// Quantizes one floating-point weight using an explicit execution stream.
 ///
-/// The last dimension is grouped and packed. Leading dimensions, including an
-/// leading bank dimensions are retained. Both on-the-fly model loading and
+/// The last dimension is grouped and packed. Leading dimensions, including
+/// expert-bank dimensions, are retained. Both on-the-fly model loading and
 /// checkpoint conversion call this function.
 pub fn quantize_tensor(
     weight: &Array,
@@ -204,33 +204,12 @@ pub fn quantize_tensor(
             input_dims, group_size
         )));
     }
-    let original_shape = weight.shape();
-    let matrix = if weight.ndim() == 2 {
-        weight.clone()
-    } else {
-        weight.reshape(&[geometry.leading_size.get(), input_dims.get()], stream)?
-    };
-    let packed_dims = packed_dimension(input_dims, bits)?;
-    let group_dims = NonZeroI32::new(input_dims.get() / group_size.get()).ok_or_else(|| {
-        Error::Quantization("quantization group dimension must be nonzero".into())
-    })?;
-    let arrays = ops::quantize_with_mode(&matrix, group_size.get(), bits.get(), mode, stream)?;
-    let restore_shape = |array: Array, last_dim: NonZeroI32| -> Result<Array, Error> {
-        if weight.ndim() == 2 {
-            Ok(array)
-        } else {
-            let mut shape = original_shape[..original_shape.len() - 1].to_vec();
-            shape.push(last_dim.get());
-            Ok(array.reshape(&shape, stream)?)
-        }
-    };
+    packed_dimension(input_dims, bits)?;
+    let arrays = ops::quantize_with_mode(weight, group_size.get(), bits.get(), mode, stream)?;
     Ok(QuantizedTensor {
-        weight: restore_shape(arrays.weight, packed_dims)?,
-        scales: restore_shape(arrays.scales, group_dims)?,
-        biases: arrays
-            .biases
-            .map(|biases| restore_shape(biases, group_dims))
-            .transpose()?,
+        weight: arrays.weight,
+        scales: arrays.scales,
+        biases: arrays.biases,
     })
 }
 
