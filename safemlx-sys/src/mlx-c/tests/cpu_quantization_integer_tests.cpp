@@ -1,4 +1,4 @@
-namespace quantization_integer_tests {
+namespace quantization_source_tests {
 using namespace pointwise_graph_tests;
 
 // A single real producer must fit its exact physical request, and the escaped
@@ -68,7 +68,7 @@ void exercise(Stream stream, size_t bytes, size_t rank, Make make, Check check,
   }
   CHECK(retired == 1);
 }
-} // namespace quantization_integer_tests
+} // namespace quantization_source_tests
 
 TEST_CASE("CPU quantization integer range checks integral steps and final increment"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
@@ -89,7 +89,7 @@ TEST_CASE("CPU quantization integer range checks integral steps and final increm
       CHECK(actual.named_control_bytes == cold.named_control_bytes);
       CHECK(actual.inputs == 0); CHECK(actual.backing_births == 1);
       CHECK(actual.worker_graph_extents == 0);
-      quantization_integer_tests::exercise(stream, count*4, 1,
+      quantization_source_tests::exercise(stream, count*4, 1,
           [&] { return arange(endpoints[0], endpoints[1], endpoints[2], dtype, stream); },
           [&](const array& result) {
             CHECK(result.dtype() == dtype); CHECK(result.size() == count);
@@ -115,7 +115,7 @@ TEST_CASE("CPU quantization integer range checks integral steps and final increm
       CHECK_FALSE(cpu::arange_int_eval_storage(bad, actual));
       CHECK(std::memcmp(&saved, &actual, sizeof(actual)) == 0);
     }
-    quantization_integer_tests::exercise(stream, 7*4, 1,
+    quantization_source_tests::exercise(stream, 7*4, 1,
         [&] { return arange(0.0,28.0,4.0,dtype,stream); }, [](const array&) {}, true);
   }
 }
@@ -187,7 +187,7 @@ TEST_CASE("CPU quantization U32 row sum preserves SIMD tails packed bits and esc
         }
         array input(data.data(),shape,uint32);
         auto make=[&] { return sum(input,std::vector<int>{rank-1},true,stream); };
-        quantization_integer_tests::exercise(stream,size_t(rows)*4,rank,make,
+        quantization_source_tests::exercise(stream,size_t(rows)*4,rank,make,
             [&](const array& result) {
               CHECK(result.dtype() == uint32); CHECK(result.size() == size_t(rows));
               auto output_shape=shape; output_shape.back()=1;
@@ -195,7 +195,7 @@ TEST_CASE("CPU quantization U32 row sum preserves SIMD tails packed bits and esc
               for (int row=0; row<rows; ++row) CHECK(result.data<uint32_t>()[row] == expected[row]);
             });
         if (width==8 && rows==6)
-          quantization_integer_tests::exercise(stream,size_t(rows)*4,rank,make,[](const array&) {},true);
+          quantization_source_tests::exercise(stream,size_t(rows)*4,rank,make,[](const array&) {},true);
       }
     }
   }

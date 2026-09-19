@@ -1,0 +1,177 @@
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows, Uint32Rows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows, Uint32Rows, Float16MaximumRows, Bfloat16MaximumRows };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -28,6 +28,7 @@
+     case ReductionEvalKind::Float32StridedRows:
+       if(rank<2||width<=1)return false;break;
+     case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
++    case ReductionEvalKind::Float16MaximumRows:case ReductionEvalKind::Bfloat16MaximumRows:
+       if(width<=1)return false;break;
+     case ReductionEvalKind::Float32All:if(rank<2||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32MinimumRows:case ReductionEvalKind::Float32MaximumRows:
+@@ -103,17 +104,20 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
+     selected=ReductionEvalKind::Uint32Rows;
+-  } else if(kind==Reduce::Sum&&(input.dtype()==float16||input.dtype()==bfloat16)) {
+-    // The weightless normalization worker first squares in its input precision.
+-    // That dense half array selects the ordinary typed contiguous SumReduce;
+-    // never substitute the F32 cascade or its different rounding tree.
++  } else if((kind==Reduce::Sum||kind==Reduce::Max)&&
++      (input.dtype()==float16||input.dtype()==bfloat16)) {
++    // Preserve the ordinary typed contiguous SumReduce or MaxReduce, including
++    // half precision, the reduction order and maximum's NaN comparisons.
+     if(output.dtype()!=input.dtype()||input.itemsize()!=2||output.itemsize()!=2||
+         !input.flags().row_contiguous||axes.size()!=1||axes[0]!=int(rank)-1)return false;
+     width=size_t(input.shape(rank-1));rows=elements/width;
+     if(width<=1||input.strides()[rank-1]!=1||output.size()!=rows)return false;
+     for(size_t axis=0;axis!=rank;++axis)
+       if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
+-    selected=input.dtype()==float16?ReductionEvalKind::Float16Rows:ReductionEvalKind::Bfloat16Rows;
++    if(kind==Reduce::Max&&span!=elements)return false;
++    selected=kind==Reduce::Max?
++        (input.dtype()==float16?ReductionEvalKind::Float16MaximumRows:ReductionEvalKind::Bfloat16MaximumRows):
++        (input.dtype()==float16?ReductionEvalKind::Float16Rows:ReductionEvalKind::Bfloat16Rows);
+   } else if(kind==Reduce::Sum&&rank>1&&axes.size()==rank) {
+     // This is the exact get_reduction_plan ContiguousAllReduce branch, not
+     // the last-axis cascade. Preserve the ordinary SIMD SumReduce order.
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -668,6 +668,19 @@
+       sizeof(T)*6+sizeof(const T*)*3+sizeof(T*)*3+sizeof(int)*8+sizeof(size_t)*6+
+       sizeof(lanes);
+ }
++// Typed maximum shares the all-contiguous or one-row reduction worker.
++// Include its vector comparisons/NaN masks, horizontal half-vector reduction,
++// scalar SIMD tail and half-to-float comparisons alongside the inline plan.
++template <typename T>
++constexpr size_t contiguous_row_max_controls() noexcept {
++  constexpr int lanes=simd::max_size<T>;
++  return sizeof(ReductionPlan)*2+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(AxisView)*3+sizeof(MaxReduce)*3+sizeof(simd::Simd<T,lanes>)*6+
++      sizeof(simd::Simd<bool,lanes>)*2+
++      sizeof(T[lanes>1?lanes/2:1])+
++      sizeof(simd::Simd<T,1>)*4+sizeof(T)*6+sizeof(float)*2+sizeof(bool)*2+
++      sizeof(const T*)*3+sizeof(T*)*3+sizeof(int)*8+sizeof(size_t)*6+sizeof(lanes);
++}
+ bool reduction_dispatch_storage(ReductionEvalKind kind,size_t rank,
+     EvalDispatchStorage& out) noexcept {
+   if(!rank||rank>4)return false;
+@@ -677,7 +690,8 @@
+     case ReductionEvalKind::Float32All:case ReductionEvalKind::Uint32FlatSum:
+     case ReductionEvalKind::Float32FlatMaximum:case ReductionEvalKind::Float32MaximumRows:
+     case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
+-    case ReductionEvalKind::Float32StridedRows:case ReductionEvalKind::Uint32Rows:break;
++    case ReductionEvalKind::Float32StridedRows:case ReductionEvalKind::Uint32Rows:
++    case ReductionEvalKind::Float16MaximumRows:case ReductionEvalKind::Bfloat16MaximumRows:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+@@ -747,7 +761,9 @@
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(simd::Simd<bool,minimum_lanes>)*2+
+       sizeof(float)*6+sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
+   const size_t half_rows=kind==ReductionEvalKind::Float16Rows?contiguous_row_sum_controls<float16_t>():
+-      kind==ReductionEvalKind::Bfloat16Rows?contiguous_row_sum_controls<bfloat16_t>():0;
++      kind==ReductionEvalKind::Bfloat16Rows?contiguous_row_sum_controls<bfloat16_t>():
++      kind==ReductionEvalKind::Float16MaximumRows?contiguous_row_max_controls<float16_t>():
++      kind==ReductionEvalKind::Bfloat16MaximumRows?contiguous_row_max_controls<bfloat16_t>():0;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+       half_rows?half_rows:kind==ReductionEvalKind::Float32Rows?std::max(cascade,sum_rows):
+           kind==ReductionEvalKind::Float32MinimumRows?minimum:
+diff --git a/mlx/backend/cpu/greedy_storage.cpp b/mlx/backend/cpu/greedy_storage.cpp
+--- a/mlx/backend/cpu/greedy_storage.cpp
++++ b/mlx/backend/cpu/greedy_storage.cpp
+@@ -14,14 +14,19 @@
+       (typeid(out.primitive())==typeid(ArgReduce)||typeid(out.primitive())==typeid(Squeeze));
+ }
+ bool arg_reduce_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage& out) noexcept {
++  return typed_arg_reduce_eval_layout(float32,rank,columns,rows,tracer,out);
++}
++bool typed_arg_reduce_eval_layout(Dtype dtype,size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage& out) noexcept {
++  if(dtype!=float32&&dtype!=float16&&dtype!=bfloat16)return false;
+   size_t elements,bytes;
+-  if(rank<1||rank>4||!columns||columns>size_t(INT_MAX)||!rows||rows>UINT32_MAX||!product(columns,rows,elements)||
+-      !product(elements,sizeof(float),bytes))return false;
++  if(rank<1||rank>4||!columns||columns>size_t(INT_MAX)||!rows||rows-1>size_t(INT_MAX)||!product(columns,rows,elements)||
++      !product(elements,size_t(dtype.size()),bytes)||!product(rows,sizeof(uint32_t),bytes))return false;
+   EvalDispatchStorage task;SingleOutputEvalStorage common;
+-  if(!arg_reduce_dispatch_storage(task)||!single_output_eval_layout(rank,1,tracer,&task,common))return false;
++  if(!typed_arg_reduce_dispatch_storage(dtype,task)||!single_output_eval_layout(rank,1,tracer,&task,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+   const size_t controls=sizeof(value)+sizeof(task)+sizeof(common)+sizeof(rank)+sizeof(columns)+sizeof(rows)+
+       sizeof(tracer)+sizeof(out)+sizeof(elements)+sizeof(bytes)+sizeof(std::pair<ArgReduce::ReduceType,int>)+
++      sizeof(dtype)+sizeof(size_t)*3+sizeof(bool)+sizeof(CopyEvalStorage*)+
+       sizeof(size_t)*10+sizeof(bool)*2+sizeof(const array*)*2+sizeof(const ArgReduce*)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+@@ -47,7 +52,8 @@
+   if(typeid(output.primitive())==typeid(ArgReduce)) {
+     const auto [kind,axis]=static_cast<const ArgReduce&>(output.primitive()).state();
+     if(!input.size()||!output.size()||rank>4||(kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
+-        input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=uint32||
++        (input.dtype()!=float32&&input.dtype()!=float16&&input.dtype()!=bfloat16)||
++        input.itemsize()!=input.dtype().size()||output.dtype()!=uint32||
+         output.itemsize()!=sizeof(uint32_t)||output.ndim()!=rank)return false;
+     if(input.strides().size()!=rank)return false;
+     size_t rows=1,span=1,delta=0,bytes=0;
+@@ -58,8 +64,8 @@
+       span+=delta;
+       if(i!=size_t(axis)&&!product(rows,size_t(input.shape(i)),rows))return false;
+     }
+-    if(rows!=output.size()||span>input.data_size()||!product(span,sizeof(float),bytes))return false;
+-    return arg_reduce_eval_layout(rank,size_t(input.shape(axis)),rows,output.is_tracer(),out);
++    if(rows!=output.size()||span>input.data_size()||!product(span,size_t(input.itemsize()),bytes))return false;
++    return typed_arg_reduce_eval_layout(input.dtype(),rank,size_t(input.shape(axis)),rows,output.is_tracer(),out);
+   }
+   const auto& axes=static_cast<const Squeeze&>(output.primitive()).axes_ref();
+   if(axes.empty()||axes.size()>rank||output.ndim()!=rank-axes.size()||input.dtype()!=output.dtype()||
+diff --git a/mlx/backend/cpu/arg_reduce.cpp b/mlx/backend/cpu/arg_reduce.cpp
+--- a/mlx/backend/cpu/arg_reduce.cpp
++++ b/mlx/backend/cpu/arg_reduce.cpp
+@@ -118,11 +118,20 @@
+ 
+ namespace cpu {
+ bool arg_reduce_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  return typed_arg_reduce_dispatch_storage(float32,out);
++}
++bool typed_arg_reduce_dispatch_storage(Dtype dtype,EvalDispatchStorage& out) noexcept {
++  if(dtype!=float32&&dtype!=float16&&dtype!=bfloat16)return false;
++  // Half comparisons retain their typed scalar operands and the float
++  // conversions used by the ordinary comparison operators.
++  const size_t scalars=dtype==float32?sizeof(float)*3:
++      (dtype==float16?sizeof(float16_t):sizeof(bfloat16_t))*5+sizeof(float)*2+sizeof(bool);
+   DispatchLayout task;
+   if(!CommandEncoder::dispatch_layout<ArgReduceTask>(task))return false;
+   const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+sizeof(ArgReduceTask)*2+
+       sizeof(array)*2+sizeof(ArgReduce::ReduceType)*2+sizeof(int)*3+sizeof(Strides)+sizeof(Shape)+
+-      sizeof(void*)*6+sizeof(size_t)*3+sizeof(uint32_t)*6+sizeof(float)*3+sizeof(Stream);
++      sizeof(void*)*6+sizeof(size_t)*3+sizeof(uint32_t)*6+scalars+sizeof(Stream)+
++      sizeof(dtype)+sizeof(scalars)+sizeof(EvalDispatchStorage*);
+   if(task.controls>SIZE_MAX-controls)return false;
+   out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
+ }
+diff --git a/mlx/backend/cpu/greedy_storage.h b/mlx/backend/cpu/greedy_storage.h
+--- a/mlx/backend/cpu/greedy_storage.h
++++ b/mlx/backend/cpu/greedy_storage.h
+@@ -2,6 +2,8 @@
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+ MLX_API bool arg_reduce_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool typed_arg_reduce_dispatch_storage(Dtype,EvalDispatchStorage&) noexcept;
++MLX_API bool typed_arg_reduce_eval_layout(Dtype,size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool arg_reduce_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool squeeze_eval_layout(size_t rank,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_greedy_eval_primitive(const array&) noexcept;

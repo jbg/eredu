@@ -152,6 +152,23 @@ impl OperationEvent {
         unsafe { safemlx_sys::mlx_operation_event_cpu_greedy_eval_layout(&mut native,
             rank, columns, rows, true, tracer) }.then_some(CpuCopyEvalLayout { native })
     }
+    /// Existing F16/BF16/F32 ArgMin/ArgMax with U32 indices. Native Eval checks
+    /// the actual axis, shape and readable strided source; first ties are retained.
+    pub fn cpu_typed_arg_reduce_layout(dtype: Dtype, rank: usize, columns: usize,
+        rows: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+        let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: scalar-only query publishes an initialized layout on success.
+        if !unsafe { safemlx_sys::mlx_operation_event_cpu_typed_arg_reduce_eval_layout(
+            &mut native, dtype.into(), rank, columns, rows, tracer,
+        ) } { return None; }
+        let controls = [size_of::<(Dtype, usize, usize, usize, bool)>(),
+            size_of::<safemlx_sys::mlx_dtype>(), size_of_val(&native),
+            size_of::<Option<CpuCopyEvalLayout>>()];
+        native.named_control_bytes = native.named_control_bytes.checked_add(
+            controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)?,
+        )?;
+        Some(CpuCopyEvalLayout { native })
+    }
     /// Bound the existing fixed-rank Squeeze alias and its actual cleanup.
     pub fn cpu_squeeze_layout(rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
@@ -384,6 +401,18 @@ impl OperationEvent {
         value.native.named_control_bytes=value.native.named_control_bytes.checked_add(
             size_of::<(Dtype,usize,usize,usize,bool)>()+size_of::<u32>()+
             size_of::<CpuCopyEvalLayout>()+size_of::<Option<CpuCopyEvalLayout>>())?;
+        Some(value)
+    }
+    /// Existing half-precision final-axis maximum over compact rank-one through
+    /// rank-four input. Retains the typed SIMD comparison and NaN/tail order.
+    pub fn cpu_half_row_max_layout(dtype: Dtype, rank: usize, width: usize,
+        rows: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
+        let kind = match dtype { Dtype::Float16 => 12, Dtype::Bfloat16 => 13, _ => return None };
+        let mut value = Self::cpu_reduction_layout(kind, rank, width, rows, tracer)?;
+        value.native.named_control_bytes = value.native.named_control_bytes.checked_add(
+            size_of::<(Dtype, usize, usize, usize, bool)>() + size_of::<u32>()
+                + size_of::<CpuCopyEvalLayout>() + size_of::<Option<CpuCopyEvalLayout>>(),
+        )?;
         Some(value)
     }
     /// Bound the ordinary contiguous all-axis F32 SIMD sum, at rank 2..=4.
@@ -707,6 +736,46 @@ mod quantization_integer_tests {
         }
         for rank in [0, 1, 5, usize::MAX] {
             assert!(OperationEvent::cpu_u32_row_sum_layout(rank, 7, 6, false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod quantization_half_tests {
+    use super::*;
+
+    #[test]
+    fn typed_reduction_queries_preserve_dtype_and_geometry_checks() {
+        let qualified = OperationEvent::cpu_arg_reduce_layout(2, 7, 3, false).is_some();
+        for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
+            for rank in 1..=4 {
+                let arg = OperationEvent::cpu_typed_arg_reduce_layout(dtype, rank, 7, 3, false);
+                assert_eq!(arg.is_some(), qualified);
+                if let Some(arg) = arg {
+                    assert_eq!(arg.backing_births(), 1);
+                    assert_eq!(arg.worker_graph_allocation_extents(), 0);
+                    assert!(arg.graph_allocation_extents() > 0);
+                    assert!(arg.control_bytes().unwrap() > 0);
+                }
+                let max = OperationEvent::cpu_half_row_max_layout(dtype, rank, 7, 3, false);
+                assert_eq!(max.is_some(), qualified && dtype != Dtype::Float32);
+                if let Some(max) = max {
+                    assert_eq!(max.backing_births(), 1);
+                    assert_eq!(max.worker_graph_allocation_extents(), 0);
+                    assert!(max.control_bytes().unwrap() > 0);
+                }
+            }
+            for rank in [0, 5, usize::MAX] {
+                assert!(OperationEvent::cpu_typed_arg_reduce_layout(dtype, rank, 7, 3, false).is_none());
+                assert!(OperationEvent::cpu_half_row_max_layout(dtype, rank, 7, 3, false).is_none());
+            }
+            assert!(OperationEvent::cpu_typed_arg_reduce_layout(dtype, 2, 7, i32::MAX as usize + 2, false).is_none());
+            assert!(OperationEvent::cpu_typed_arg_reduce_layout(dtype, 2, 0, 3, false).is_none());
+            assert!(OperationEvent::cpu_half_row_max_layout(dtype, 2, 1, 3, false).is_none());
+        }
+        for dtype in [Dtype::Bool, Dtype::Int32, Dtype::Uint32, Dtype::Float64] {
+            assert!(OperationEvent::cpu_typed_arg_reduce_layout(dtype, 2, 7, 3, false).is_none());
+            assert!(OperationEvent::cpu_half_row_max_layout(dtype, 2, 7, 3, false).is_none());
         }
     }
 }

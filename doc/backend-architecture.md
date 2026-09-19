@@ -776,6 +776,11 @@ range admission accepts nonnegative integral coordinates and positive integral
 steps whose final increment remains within I32. Compact U32 final-axis sums at
 ranks two through four share the ordinary typed reduction task and SIMD order.
 Both sources retain separate physical-buffer admission and completion custody.
+Half-precision row maxima and typed F16/BF16/F32 arg-reductions expose their
+ordinary comparison workers, including SIMD NaN handling and first-index ties.
+Their source checks authenticate the reduction axes, output dtype, shape and
+readable backing before admitting the task and its separately funded output.
+The largest arg-reduction row index also fits the worker's signed location cursor.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

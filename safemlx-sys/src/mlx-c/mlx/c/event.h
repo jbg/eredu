@@ -102,6 +102,9 @@ typedef struct mlx_cpu_copy_eval_layout_ {
 } mlx_cpu_copy_eval_layout;
 bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype,size_t rank,bool store,bool tracer);
+// Typed F16/BF16/F32 ArgMin/ArgMax source; numerical task and U32 output are shared.
+bool mlx_operation_event_cpu_typed_arg_reduce_eval_layout(mlx_cpu_copy_eval_layout*,
+    mlx_dtype,size_t rank,size_t columns,size_t rows,bool tracer);
 bool mlx_operation_event_cpu_greedy_eval_layout(mlx_cpu_copy_eval_layout*,
     size_t rank,size_t columns,size_t rows,bool reduction,bool tracer);
 bool mlx_operation_event_cpu_reshape_alias_eval_layout(mlx_cpu_copy_eval_layout* out,
