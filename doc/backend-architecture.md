@@ -729,6 +729,11 @@ companion identities, packed output shapes and compatible dtypes. Working-set
 sizing uses metadata only; bounded payload acquisition belongs to conversion.
 Ordinary native loading additionally validates the actual source tensor handles
 before using that plan. Destination projection and planning grant no admission.
+Conversion chooses row and leading-matrix tiles using metadata alone. It checks
+the selected tile alongside pending submissions before acquiring bounded-read
+proofs or materializing source bytes. Rejected sizing candidates perform no
+payload reads. Conversion retains bounded-read refusals and pending completion
+ownership on failure.
 
 Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
 allocating their metadata and payload. Publication moves those bytes into the

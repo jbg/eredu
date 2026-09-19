@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 use super::*;
 mod preparation;
+mod read_window;
 use crate::backend::runtime::{
     checkpoint::store::test_support::open_gguf_checkpoint_source_for_test,
     residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},

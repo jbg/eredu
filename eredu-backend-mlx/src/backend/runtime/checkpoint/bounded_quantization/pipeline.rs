@@ -78,19 +78,6 @@ impl super::preparation::PreparedQuantization {
             materialized_source_keys,
             materialized_source_shards,
         } = self;
-        // Bounded-read verification acquires payload leases, so it belongs to
-        // conversion after the final destinations have been constructed.
-        for (target, shard) in plan.targets.iter().zip(&output_shards) {
-            for matrix in 0..shard.geometry.leading {
-                target
-                    .source
-                    .select_bounded_matrix_rows(source.as_ref(), matrix, 0, 1)?
-                    .preflight_bounded(source.as_ref())?;
-            }
-            if shard.geometry.complete_admissible {
-                target.source.preflight_bounded(source.as_ref())?;
-            }
-        }
         let device = conversion_stream.get_device()?;
         let tile_streams = [conversion_stream.clone(), Stream::new_with_device(&device)];
         let tile_contexts = tile_streams
@@ -197,9 +184,16 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
     }
 
     fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
-        match (self.source.source_storage_slot_bound()?, self.transformed.source_storage_slot_bound()?) {
-            (Some(source), Some(transformed)) => source.checked_add(transformed).map(Some)
-                .ok_or_else(|| StoreError::Overflow { context: "transformed source storage slots".into() }),
+        match (
+            self.source.source_storage_slot_bound()?,
+            self.transformed.source_storage_slot_bound()?,
+        ) {
+            (Some(source), Some(transformed)) => source
+                .checked_add(transformed)
+                .map(Some)
+                .ok_or_else(|| StoreError::Overflow {
+                    context: "transformed source storage slots".into(),
+                }),
             _ => Ok(None),
         }
     }
@@ -386,7 +380,6 @@ fn transform_target(
                         end: candidate_end,
                     },
                 )?;
-                candidate.preflight_bounded(source)?;
                 let candidate_rows = (candidate_end - matrix_start)
                     .checked_mul(rows)
                     .ok_or_else(|| quantization_error("leading batch row count overflow"))?;
@@ -416,7 +409,6 @@ fn transform_target(
                     end: matrix_end,
                 },
             )?;
-            recipe.preflight_bounded(source)?;
             let batch_rows = (matrix_end - matrix_start)
                 .checked_mul(rows)
                 .ok_or_else(|| quantization_error("leading batch row count overflow"))?;
@@ -469,7 +461,6 @@ fn transform_target(
                         start,
                         candidate_end,
                     )?;
-                    candidate.preflight_bounded(source)?;
                     let candidate_rows = candidate_end - start;
                     let output_bytes = output_row_bytes
                         .checked_mul(candidate_rows as u64)
@@ -488,7 +479,6 @@ fn transform_target(
                 let tile_recipe = target
                     .source
                     .select_bounded_matrix_rows(source, matrix, start, end)?;
-                tile_recipe.preflight_bounded(source)?;
                 let tile_output_bytes = output_row_bytes
                     .checked_mul(tile_rows as u64)
                     .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
@@ -567,6 +557,9 @@ fn submit_quantization_tile(
         queued_working_set_bytes(pending_tiles)?,
         planned_working_set_bytes,
     )?;
+    // Verification acquires real payload leases. Only the selected tile may
+    // read them, after its peak fits alongside the still-pending submissions.
+    recipe.preflight_bounded(source)?;
     let metadata = recipe.infer(source)?;
     let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
     let tile_stream = tile_context.source_stream();
@@ -642,7 +635,13 @@ impl SubmittedQuantizationTile {
             .zip(self.completion.outputs())
             .zip(&mut shard.buffers)
         {
-            write_tile(buffer.bytes_mut(), layout, self.output_start, self.rows, output)?;
+            write_tile(
+                buffer.bytes_mut(),
+                layout,
+                self.output_start,
+                self.rows,
+                output,
+            )?;
         }
         Ok(())
     }
