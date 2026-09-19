@@ -12,7 +12,7 @@ pub(super) struct OutputLayout {
 
 pub(super) struct OutputShard {
     pub(super) layouts: Vec<OutputLayout>,
-    pub(super) buffers: Vec<Vec<u8>>,
+    pub(super) buffers: Vec<eredu_checkpoint::store::MemoryTensorBuffer>,
     pub(super) pending_tiles: usize,
     pub(super) sealed: bool,
 }
@@ -227,17 +227,4 @@ fn layout(
         row_bytes,
         byte_len,
     })
-}
-
-pub(super) fn allocate_output_buffer(name: &str, byte_len: u64) -> Result<Vec<u8>, Error> {
-    let byte_len = usize::try_from(byte_len)
-        .map_err(|_| quantization_error(format!("output {name:?} is too large for memory")))?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(byte_len).map_err(|error| {
-        quantization_error(format!(
-            "cannot allocate {byte_len} bytes for in-memory quantized output {name:?}: {error}"
-        ))
-    })?;
-    bytes.resize(byte_len, 0);
-    Ok(bytes)
 }

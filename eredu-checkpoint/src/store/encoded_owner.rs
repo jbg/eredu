@@ -27,7 +27,7 @@ enum Owner {
     },
     Memory {
         selected: Option<Arc<[u8]>>,
-        tensor: Arc<MemoryTensor>,
+        tensor: storage::SourceHandle<MemoryTensor>,
         span: Range<usize>,
     },
 }
@@ -71,7 +71,7 @@ impl MemoryLease {
         PinnedEncodedBytes {
             owner: Owner::Memory {
                 selected: self.selected_bytes.clone(),
-                tensor: Arc::clone(&self.tensor),
+                tensor: self.tensor.clone(),
                 span: self.span.clone(),
             },
         }

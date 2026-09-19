@@ -1,7 +1,7 @@
 use super::*;
 use super::{
     layout::{
-        allocate_output_buffer, output_layouts, BoundedAllocatorCache, OutputLayout, OutputShard,
+        output_layouts, BoundedAllocatorCache, OutputLayout, OutputShard,
     },
     preflight::{
         checked_product, output_names_for, preflight_source_collisions, quantization_error,
@@ -115,14 +115,10 @@ impl BoundedQuantizedWeightStore {
             .all(|shard| shard.sealed && shard.pending_tiles == 0));
         allocator_cache.finish()?;
 
-        let transformed =
-            MemoryWeightStore::from_safetensors(output_shards.into_iter().flat_map(|shard| {
-                shard
-                    .layouts
-                    .into_iter()
-                    .zip(shard.buffers)
-                    .map(|(layout, bytes)| (layout.name, layout.dtype, layout.shape, bytes))
-            }))?;
+        let transformed = MemoryWeightStore::from_buffers(
+            output_shards.into_iter().flat_map(|shard| shard.buffers),
+        )
+        .map_err(|cause| Error::Other(Box::new(cause)))?;
         Ok(Self {
             source,
             transformed,
@@ -437,7 +433,15 @@ fn transform_target(
     let output_shard = output_shards.len();
     let buffers = layouts
         .iter()
-        .map(|layout| allocate_output_buffer(&layout.name, layout.byte_len))
+        .map(|layout| {
+            eredu_checkpoint::store::MemoryTensorBuffer::allocate(
+                &layout.name,
+                layout.dtype,
+                &layout.shape,
+                layout.byte_len,
+            )
+            .map_err(|cause| Error::Other(Box::new(cause)))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     output_shards.push(OutputShard {
         layouts,
@@ -768,7 +772,7 @@ impl SubmittedQuantizationTile {
             .zip(self.completion.outputs())
             .zip(&mut shard.buffers)
         {
-            write_tile(buffer, layout, self.output_start, self.rows, output)?;
+            write_tile(buffer.bytes_mut(), layout, self.output_start, self.rows, output)?;
         }
         Ok(())
     }

@@ -162,7 +162,7 @@ pub(super) struct Prepared {
     policy: ReadPolicy,
     span: Range<usize>,
     // Retained last: failed copy/scratch/final byte owners retire first.
-    tensor: Arc<MemoryTensor>,
+    tensor: storage::SourceHandle<MemoryTensor>,
 }
 impl Prepared {
     pub(crate) fn retained_payload_capacity(&self) -> Option<(usize, usize)> {
@@ -258,7 +258,7 @@ impl Prepared {
         store
             .tensors
             .get(&request.key)
-            .is_some_and(|tensor| Arc::ptr_eq(tensor, &self.tensor))
+            .is_some_and(|tensor| tensor.same(&self.tensor))
             && self.selection == request.selection
             && self.policy == request.policy
     }

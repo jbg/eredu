@@ -38,7 +38,7 @@ fn encoded_pin_keeps_actual_memory_spans_after_lease_and_source_retirement() {
             let expected = lease.encoded_bytes().unwrap().to_vec();
             let pointer = lease.encoded_bytes().unwrap().as_ptr();
             let weak = match &lease {
-                CheckpointLease::Memory(lease) => Arc::downgrade(&lease.tensor),
+                CheckpointLease::Memory(lease) => lease.tensor.ordinary_weak(),
                 _ => panic!("memory source"),
             };
             let pin = lease.pin_encoded_bytes().unwrap();

@@ -223,7 +223,7 @@ impl EncodedReadBatch {
             size_of::<ReadShard>(),
             size_of::<ReadSpan>(),
             size_of::<memory::ReadMemory>(),
-            size_of::<Arc<MemoryTensor>>(),
+            size_of::<storage::SourceHandle<MemoryTensor>>(),
             size_of::<PathBuf>(),
             size_of::<String>(),
             size_of::<Vec<usize>>(),

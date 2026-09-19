@@ -87,8 +87,8 @@ fn borrowed_source_fact_keeps_exact_arc_and_weak_identity_without_wrapper_owner(
 #[test]
 fn memory_source_visits_actual_spare_capacities_and_retains_payload_after_source_drop() {
     let (source, total) = memory();
-    let selected = Arc::downgrade(&source.tensors["selected"]);
-    let hidden = Arc::downgrade(&source.tensors["hidden"]);
+    let selected = source.tensors["selected"].ordinary_weak();
+    let hidden = source.tensors["hidden"].ordinary_weak();
     let legacy = source.source_storage().unwrap().unwrap();
     let expected: BTreeMap<_, _> = legacy.capacities().collect();
     let (complete, owners) = visit(source.as_ref());
@@ -108,7 +108,7 @@ fn memory_source_visits_actual_spare_capacities_and_retains_payload_after_source
 #[test]
 fn authorization_forwarders_visit_hidden_physical_sources_and_repeat_aliases() {
     let (source, total) = memory();
-    let weak = Arc::downgrade(&source.tensors["hidden"]);
+    let weak = source.tensors["hidden"].ordinary_weak();
     let selected: SharedCheckpointSource = Arc::new(
         RestrictedCheckpointSource::including(
             source.clone(),

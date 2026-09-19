@@ -716,6 +716,14 @@ population. Admitted attempts are finite. An ordinary recovery policy can retry
 only after its required pending owner actually retires. Foreground reads,
 background prefetch and resident borrowing retain their distinct I/O witnesses.
 
+Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
+allocating their metadata and payload. Publication moves those bytes into the
+immutable memory store; leases, detached readers and weak storage identities
+retain the same control. Allocation failures and duplicate-name rejections preserve
+their custody and actual constructed prefix. MLX quantization writes into these
+buffers. Buffer construction itself grants no admission; the caller also owns
+funding for catalog construction and subsequent reader/selection controls.
+
 Layerwise cold binding and the selected native unit populator share one
 immutable independent-parameter exclusion owner. The pre-load manager source
 constructor prices and copies its exact sorted names before publication; its

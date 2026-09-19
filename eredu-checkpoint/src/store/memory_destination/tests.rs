@@ -294,7 +294,7 @@ fn actual_memory_matrix_matches_untouched_acquire_and_preserves_borrow_or_final_
                         let CheckpointLease::Memory(inner) = &lease else {
                             panic!("real Memory lease")
                         };
-                        assert!(Arc::ptr_eq(&inner.tensor, &source.tensors["weight"]));
+                        assert!(inner.tensor.same(&source.tensors["weight"]));
                         assert_eq!(inner.selected_bytes.is_some(), old.selected_bytes.is_some());
                         assert_eq!(
                             lease.encoded_bytes().unwrap().as_ptr(),
@@ -570,7 +570,7 @@ fn snapshot(source: SharedCheckpointSource) -> PreparedCheckpointSource {
 #[test]
 fn closed_memory_route_preserves_wrapper_authorization_actual_tensor_and_final_owner() {
     let source = memory(Dtype::U8, vec![2, 4], vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    let tensor = Arc::downgrade(&source.tensors["weight"]);
+    let tensor = source.tensors["weight"].ordinary_weak();
     let restricted: SharedCheckpointSource = Arc::new(
         RestrictedCheckpointSource::including(
             source.clone(),
@@ -660,7 +660,7 @@ impl CheckpointSource for Switching {
 fn equal_bytes_foreign_tensor_refusal_keeps_destination_source_until_error_retirement() {
     let first = memory(Dtype::U8, vec![2, 4], vec![1, 2, 3, 4, 5, 6, 7, 8]);
     let second = memory(Dtype::U8, vec![2, 4], vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    let tensor = Arc::downgrade(&first.tensors["weight"]);
+    let tensor = first.tensors["weight"].ordinary_weak();
     let read = request(
         TensorSelection::Indices {
             axis: 0,
@@ -700,7 +700,7 @@ fn equal_bytes_foreign_tensor_refusal_keeps_destination_source_until_error_retir
 #[test]
 fn invalid_packed_preparation_and_failed_copy_retain_actual_tensor_and_written_prefix() {
     let source = memory(Dtype::F4, vec![2, 4], vec![0x12, 0x34, 0x56, 0x78]);
-    let tensor = Arc::downgrade(&source.tensors["weight"]);
+    let tensor = source.tensors["weight"].ordinary_weak();
     let read = request(
         TensorSelection::Indices {
             axis: 1,

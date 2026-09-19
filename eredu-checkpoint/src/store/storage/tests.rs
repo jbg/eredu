@@ -104,7 +104,7 @@ fn memory() -> (Arc<MemoryWeightStore>, u64) {
 #[test]
 fn restricted_prepared_and_resolved_views_keep_full_physical_capacity_once() {
     let (source, capacity) = memory();
-    let weak = Arc::downgrade(&source.tensors["selected"]);
+    let weak = source.tensors["selected"].ordinary_weak();
     let target: SharedCheckpointSource = Arc::new(
         RestrictedCheckpointSource::including(
             source.clone(),

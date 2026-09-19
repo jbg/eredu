@@ -196,7 +196,7 @@ impl EncodedTensorLease for CheckpointLease {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct MemoryTensor {
     metadata: TensorMetadata,
     dtype: Dtype,
@@ -206,7 +206,7 @@ struct MemoryTensor {
 /// Encoded tensor selection retaining immutable in-memory storage.
 #[derive(Debug, Clone)]
 pub struct MemoryLease {
-    tensor: Arc<MemoryTensor>,
+    tensor: storage::SourceHandle<MemoryTensor>,
     selection: TensorSelection,
     output_shape: Vec<usize>,
     proof: BoundedReadProof,
@@ -244,7 +244,7 @@ impl EncodedTensorLease for MemoryLease {
 #[derive(Debug, Default)]
 pub struct MemoryWeightStore {
     recipes: RecipeInferenceCache,
-    tensors: BTreeMap<String, Arc<MemoryTensor>>,
+    tensors: BTreeMap<String, storage::SourceHandle<MemoryTensor>>,
 }
 
 impl MemoryWeightStore {
@@ -257,11 +257,14 @@ impl MemoryWeightStore {
             let mut metadata =
                 metadata_for_parts(&name, Path::new("<memory>"), dtype, &shape, bytes.len())?;
             metadata.backing_shard = None;
-            let tensor = Arc::new(MemoryTensor {
-                metadata,
-                dtype,
-                bytes,
-            });
+            let tensor = storage::SourceHandle::new(
+                MemoryTensor {
+                    metadata,
+                    dtype,
+                    bytes,
+                },
+                None,
+            );
             if catalog.insert(name.clone(), tensor).is_some() {
                 return Err(StoreError::Internal(format!(
                     "duplicate in-memory tensor {name:?}"
@@ -410,7 +413,7 @@ impl CheckpointSource for MemoryWeightStore {
                 u64::try_from(tensor.bytes.capacity()).map_err(|_| StoreError::Overflow {
                     context: "in-memory checkpoint payload capacity".into(),
                 })?;
-            visitor(SourceStorageRef::new(tensor, bytes));
+            visitor(tensor.storage_ref(bytes));
         }
         Ok(true)
     }
@@ -422,7 +425,7 @@ impl CheckpointSource for MemoryWeightStore {
                 u64::try_from(tensor.bytes.capacity()).map_err(|_| StoreError::Overflow {
                     context: "in-memory checkpoint payload capacity".into(),
                 })?;
-            storage.insert(Arc::clone(tensor), bytes)?;
+            storage.include_ref(tensor.storage_ref(bytes))?;
         }
         storage.bytes()?;
         Ok(Some(storage))
@@ -615,6 +618,8 @@ pub use retained_source::{
 
 pub(crate) mod acquisition;
 mod memory_destination;
+mod memory_buffer;
+pub use memory_buffer::{MemoryTensorBuffer, MemoryTensorBufferError, MemoryWeightStoreBuildError};
 pub use acquisition::{
     PreparedAcquisitionBank, PreparedAcquisitionBankError, PreparedAcquisitionFailure,
     PreparedAcquisitionOwner, PreparedAcquisitionRefusal, PreparedAcquisitionSource,

@@ -99,7 +99,7 @@ where
             size_of::<DetachedRead>(),
             size_of::<DetachedShard>(),
             size_of::<memory::ReadMemory>(),
-            size_of::<Arc<MemoryTensor>>(),
+            size_of::<storage::SourceHandle<MemoryTensor>>(),
             size_of::<DetachedSource>(),
             size_of::<AdmittedFile>(),
             size_of::<AdmittedFileIdentity>(),

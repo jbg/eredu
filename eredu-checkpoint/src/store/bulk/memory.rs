@@ -2,12 +2,12 @@
 use super::*;
 #[derive(Clone)]
 pub(super) struct ReadMemory {
-    pub(super) tensor: Arc<MemoryTensor>,
+    pub(super) tensor: storage::SourceHandle<MemoryTensor>,
     pub(super) spans: Vec<ReadSpan>,
 }
 impl ReadMemory {
     pub(super) fn matches(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.tensor, &other.tensor)
+        self.tensor.same(&other.tensor)
             && self.spans.len() == other.spans.len()
             && self
                 .spans
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn memory_encoded_projection_detaches_exact_owner_without_file_or_staging() {
         let store = store();
-        let alive = Arc::downgrade(store.tensors.get("packed").unwrap());
+        let alive = store.tensors.get("packed").unwrap().ordinary_weak();
         let selection = TensorSelection::Indices {
             axis: 0,
             indices: vec![2, 0, 2],
