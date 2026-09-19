@@ -2978,7 +2978,7 @@ TEST_CASE("CPU I32 coordinate source checks exact endpoints and final increment"
     CHECK(actual.inputs==0);CHECK(actual.backing_births==1);CHECK(actual.worker_graph_extents==0);
     std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
     for(const auto& endpoints:std::array<std::array<double,3>,5>{{
-        {{-1.0,6.0,1.0}},{{0.5,7.5,1.0}},{{0.0,14.0,2.0}},
+        {{-1.0,6.0,1.0}},{{0.5,7.5,1.0}},{{0.0,15.0,2.0}},
         {{double(INT_MAX)-6.0,double(INT_MAX)+1.0,1.0}},{{7.0,0.0,-1.0}}}}) {
       auto malformed=array(Shape{7},int32,std::make_shared<Arange>(stream,endpoints[0],endpoints[1],endpoints[2]),{});
       CHECK_FALSE(cpu::arange_int_eval_storage(malformed,actual));
@@ -5395,3 +5395,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "cpu_empty_slice_tests.cpp"
 
 #include "cpu_quantization_unary_tests.cpp"
+
+#include "cpu_quantization_integer_tests.cpp"

@@ -406,6 +406,13 @@ impl OperationEvent {
         tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_reduction_layout(9, rank, width, rows, tracer)
     }
+    /// Existing U32 final-axis SIMD sum over compact rank-two through rank-four
+    /// input. Native Eval checks the actual dtype, axes, shape and readable span.
+    /// Width one is an alias and has no Reduce worker.
+    pub fn cpu_u32_row_sum_layout(rank: usize, width: usize, rows: usize,
+        tracer: bool) -> Option<CpuCopyEvalLayout> {
+        Self::cpu_reduction_layout(11, rank, width, rows, tracer)
+    }
     /// Existing rank-one U32 complete-axis sum. Native Eval checks the exact
     /// contiguous input, dtype, axes and scalar output before admitting its task.
     pub fn cpu_flat_u32_sum_layout(elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -672,5 +679,34 @@ impl OperationEvent {
         native.named_control_bytes=native.named_control_bytes.checked_add(
             parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)?)?;
         Some(CpuCopyEvalLayout{native})
+    }
+}
+
+#[cfg(test)]
+mod quantization_integer_tests {
+    use super::*;
+
+    #[test]
+    fn u32_row_sum_layout_checks_the_native_geometry() {
+        let qualified = OperationEvent::cpu_flat_u32_sum_layout(7, false).is_some();
+        for rank in 2..=4 {
+            for rows in [1, 6] {
+                let layout = OperationEvent::cpu_u32_row_sum_layout(rank, 7, rows, false);
+                assert_eq!(layout.is_some(), qualified);
+                if let Some(layout) = layout {
+                    assert!(layout.graph_allocation_extents() > 0);
+                    assert_eq!(layout.backing_births(), 1);
+                    assert_eq!(layout.worker_graph_allocation_extents(), 0);
+                    assert!(layout.control_bytes().unwrap() > 0);
+                }
+            }
+            for width in [0, 1, usize::MAX] {
+                assert!(OperationEvent::cpu_u32_row_sum_layout(rank, width, 6, false).is_none());
+            }
+            assert!(OperationEvent::cpu_u32_row_sum_layout(rank, 7, 0, false).is_none());
+        }
+        for rank in [0, 1, 5, usize::MAX] {
+            assert!(OperationEvent::cpu_u32_row_sum_layout(rank, 7, 6, false).is_none());
+        }
     }
 }

@@ -1,0 +1,110 @@
+diff --git a/mlx/backend/cpu/arange_storage.cpp b/mlx/backend/cpu/arange_storage.cpp
+--- a/mlx/backend/cpu/arange_storage.cpp
++++ b/mlx/backend/cpu/arange_storage.cpp
+@@ -54,10 +54,14 @@
+       (value.dtype()!=int32&&value.dtype()!=uint32)||value.itemsize()!=sizeof(int32_t)||value.shape(0)<=0||
+       size_t(value.shape(0))!=value.size())return false;
+   const auto [start,stop,step]=static_cast<const Arange&>(value.primitive()).state();
+-  // This exact coordinate producer also keeps the final loop increment in I32.
+-  // No float coordinate conversion or signed wraparound is used by the mask.
+-  if(!std::isfinite(start)||!std::isfinite(stop)||step!=1.0||start<0.0||stop>double(INT_MAX)||
+-      start!=std::floor(start)||stop!=std::floor(stop)||stop-start!=double(value.size()))return false;
++  // Integral nonnegative coordinates and a positive integral step keep both
++  // endpoint casts and every increment, including the final one, within I32.
++  // Accepted coordinates and increments are exactly representable in double.
++  if(!std::isfinite(start)||!std::isfinite(stop)||!std::isfinite(step)||
++      start<0.0||stop>double(INT_MAX)||step<=0.0||
++      start!=std::floor(start)||stop!=std::floor(stop)||step!=std::floor(step)||
++      std::ceil((stop-start)/step)!=double(value.size())||
++      start+step*double(value.size())>double(INT_MAX))return false;
+   return arange_int_eval_layout(value.dtype(),value.size(),value.is_tracer(),out);
+ }
+ }
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows, Uint32Rows };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -677,7 +677,7 @@
+     case ReductionEvalKind::Float32All:case ReductionEvalKind::Uint32FlatSum:
+     case ReductionEvalKind::Float32FlatMaximum:case ReductionEvalKind::Float32MaximumRows:
+     case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
+-    case ReductionEvalKind::Float32StridedRows:break;
++    case ReductionEvalKind::Float32StridedRows:case ReductionEvalKind::Uint32Rows:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+@@ -739,6 +739,10 @@
+       sizeof(simd::Simd<uint32_t,uint_sum_lanes>)*2+sizeof(simd::Simd<int32_t,uint_sum_lanes>)*4+
+       sizeof(uint32_t)*3+sizeof(int32_t)*4+sizeof(const uint32_t*)*3+sizeof(int32_t*)*3+
+       sizeof(int)*4+sizeof(size_t)*3;
++  // A compact U32 final axis uses the same mixed U32/I32 accumulator as
++  // the flat source, plus the inline one-axis plan and contiguous-row loop.
++  const size_t uint_rows=uint_sum+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(int)*4+sizeof(size_t)*3;
+   const size_t maximum=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(MaxReduce)*3+
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(simd::Simd<bool,minimum_lanes>)*2+
+       sizeof(float)*6+sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
+@@ -751,11 +755,12 @@
+           kind==ReductionEvalKind::Float32All?sum_all:
+           kind==ReductionEvalKind::Float32StridedRows?nonfinal_rows:
+           kind==ReductionEvalKind::Uint32FlatSum?uint_sum:
++          kind==ReductionEvalKind::Uint32Rows?uint_rows:
+           kind==ReductionEvalKind::Float32FlatMaximum?maximum:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)+sizeof(strided_rows)+sizeof(nonfinal_rows)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)+sizeof(strided_rows)+sizeof(nonfinal_rows)+sizeof(uint_rows)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -32,6 +32,8 @@
+     case ReductionEvalKind::Float32All:if(rank<2||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32MinimumRows:case ReductionEvalKind::Float32MaximumRows:
+       if(width<=1)return false;break;
++    case ReductionEvalKind::Uint32Rows:
++      if(rank<2||width<=1)return false;break;
+     case ReductionEvalKind::Uint32FlatSum:
+       if(rank!=1||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32FlatMaximum:
+@@ -78,7 +80,7 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
+     selected=kind==Reduce::And?ReductionEvalKind::BooleanAll:ReductionEvalKind::BooleanAny;
+-  } else if((kind==Reduce::Sum&&input.dtype()==uint32)||(kind==Reduce::Max&&input.dtype()==float32&&rank<=3&&output.size()==1)) {
++  } else if((kind==Reduce::Sum&&input.dtype()==uint32&&rank==1)||(kind==Reduce::Max&&input.dtype()==float32&&rank<=3&&output.size()==1)) {
+     // The summary count/extremum source is a complete rank-one buffer. This
+     // proves the ordinary ContiguousAllReduce path before admitting its task.
+     const Dtype dtype=kind==Reduce::Sum?uint32:float32;
+@@ -90,6 +92,17 @@
+     for(size_t axis=0;axis<rank;++axis)
+       if(output.shape(axis)!=1||(axis+1<rank&&input.shape(axis)!=1))return false;
+     selected=kind==Reduce::Sum?ReductionEvalKind::Uint32FlatSum:ReductionEvalKind::Float32FlatMaximum;
++  } else if(kind==Reduce::Sum&&input.dtype()==uint32) {
++    // The compact final axis produces the ordinary one-row ContiguousReduce
++    // plan. Keep the native U32 input and I32 accumulator representation.
++    if(rank<2||output.dtype()!=uint32||input.itemsize()!=4||output.itemsize()!=4||
++        !input.flags().row_contiguous||span!=elements||
++        axes.size()!=1||axes[0]!=int(rank)-1)return false;
++    width=size_t(input.shape(rank-1));rows=elements/width;
++    if(width<=1||input.strides()[rank-1]!=1||output.size()!=rows)return false;
++    for(size_t axis=0;axis!=rank;++axis)
++      if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
++    selected=ReductionEvalKind::Uint32Rows;
+   } else if(kind==Reduce::Sum&&(input.dtype()==float16||input.dtype()==bfloat16)) {
+     // The weightless normalization worker first squares in its input precision.
+     // That dense half array selects the ordinary typed contiguous SumReduce;
