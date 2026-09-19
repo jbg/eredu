@@ -79,7 +79,7 @@ impl OperationEvent {
         Some(CpuCopyEvalLayout{native})
     }
     /// Exact positive-step CPU Slice at fixed rank 1..4: nonempty alias or
-    /// empty zero-Data construction, with no physical backing birth.
+    /// empty zero-byte Data construction with the selected allocator's backing birth.
     /// Native Eval validates the actual normalized source geometry before use.
     pub fn cpu_slice_layout(rank: usize, empty: bool, tracer: bool) -> Option<CpuCopyEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
@@ -235,7 +235,8 @@ impl OperationEvent {
         Self::cpu_shape_alias_layout(1, rank, output_rank, tracer)
     }
     /// Empty Broadcast executes its existing zero-byte Data construction,
-    /// without aliasing the source or creating a physical backing owner.
+    /// without aliasing the source. The selected allocator determines whether
+    /// the zero-byte request creates a physical backing owner.
     pub fn cpu_empty_broadcast_layout(rank: usize, output_rank: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
         Self::cpu_shape_alias_layout(3, rank, output_rank, tracer)
     }
@@ -322,8 +323,9 @@ impl OperationEvent {
     /// joined source/index rank is at most five, including the rank-three
     /// centroid selection of an ordered readout. Actual native geometry is
     /// checked at Eval; index validity remains the ordinary Gather precondition.
-    /// Empty indices retain the task and Data metadata without a physical
-    /// backing birth. An empty source is valid only with empty indices.
+    /// Empty indices retain the task and Data metadata, plus the selected
+    /// allocator's zero-byte backing birth. An empty source is valid only with
+    /// empty indices.
     pub fn cpu_gather_layout(source: Dtype, index: Dtype, source_rank: usize,
         index_rank: usize, source_elements: usize, index_elements: usize,
         slice_elements: usize, tracer: bool) -> Option<CpuCopyEvalLayout> {
@@ -573,7 +575,8 @@ impl OperationEvent {
 
 impl OperationEvent {
     /// Same CPU concatenation over the exact input count: one destination
-    /// slice/copy job per input and a backing birth only for nonempty output.
+    /// slice/copy job per input. Empty output includes the selected allocator's
+    /// zero-byte backing birth.
     pub fn cpu_concatenate_many_layout(dtype:Dtype,rank:usize,inputs:usize,
         elements:usize,tracer:bool)->Option<CpuCopyEvalLayout> {
         let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
