@@ -797,6 +797,9 @@ alignment headroom; they are not a process-wide memory ceiling.
 Eval, physical buffers, source preparation, streams and composed MXFP4 graph
 construction require separate admission. Failed allocation prefixes retain their
 accounts without publishing failed outputs as completed values.
+CPU-only event dispatch quotes use the actual named wait and signal tasks,
+including their retained Event owners and Graph allocator extents. No GPU
+handler allocation is included in that CPU-only backend's query.
 Empty CPU operator outputs reserve the selected allocator's real zero-byte
 backing: the CPU allocator retains a charged header/page, while Metal has no
 physical allocation. Shared empty-output layouts preserve that distinction and

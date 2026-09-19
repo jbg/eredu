@@ -1,0 +1,87 @@
+diff --git a/mlx/event.h b/mlx/event.h
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -120,6 +120,7 @@
+ 
+  private:
+   friend struct EventControlTestAccess;
++  friend struct NoGpuEventCpuSignal;
+   FailureCarrierRef failure_;
+   // Default constructed stream should never be used
+   // since the event is not yet valid
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -110,20 +110,53 @@
+   }
+ }
+ 
++namespace {
++struct NoGpuEventCpuWait {
++  Event event;
++  void operator()() { event.wait_dependency(); }
++};
++}
++struct NoGpuEventCpuSignal {
++  Event event;
++  Stream stream;
++  void operator()() {
++    auto* ec = static_cast<EventCounter*>(event.event_.get());
++    {
++      std::lock_guard<std::mutex> lock(ec->mtx);
++      if (!event.scope_identity_) ec->error = scheduler::stream_error(stream);
++      ec->value = event.value();
++    }
++    ec->cv.notify_all();
++  }
++};
++
++bool event_dispatch_control_layout(EventDispatchControlLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus < 202002L
++  return false;
++#else
++  using Wait = scheduler::TaskNode<NoGpuEventCpuWait>;
++  using Signal = scheduler::TaskNode<NoGpuEventCpuSignal>;
++  size_t wait_extent=0, signal_extent=0;
++  if(!scheduler::task_graph_extent<NoGpuEventCpuWait>(wait_extent)||
++      !scheduler::task_graph_extent<NoGpuEventCpuSignal>(signal_extent))return false;
++  const size_t controls=sizeof(EventDispatchControlLayout)+sizeof(size_t)*2+
++      sizeof(NoGpuEventCpuWait)+sizeof(NoGpuEventCpuSignal)+sizeof(Stream)+
++      sizeof(EventCounter*)*2+sizeof(bool)+sizeof(std::unique_lock<std::mutex>)+
++      sizeof(std::lock_guard<std::mutex>)+sizeof(std::chrono::milliseconds)+
++      sizeof(scheduler::TaskOwner)+sizeof(scheduler::TaskContext)+
++      sizeof(submission::GraphAllocator<Wait>)+sizeof(submission::GraphAllocator<Signal>);
++  out={sizeof(Wait),alignof(Wait),wait_extent,
++       sizeof(Signal),alignof(Signal),signal_extent,0,1,0,controls};
++  return true;
++#endif
++}
++
+ void Event::wait(Stream stream) const {
+-  scheduler::enqueue(stream, [*this]() mutable { wait_dependency(); });
++  scheduler::enqueue(stream, NoGpuEventCpuWait{*this});
+ }
+ 
+ void Event::signal(Stream stream) {
+-  scheduler::enqueue(stream, [*this, stream]() mutable {
+-    auto ec = static_cast<EventCounter*>(event_.get());
+-    {
+-      std::lock_guard<std::mutex> lk(ec->mtx);
+-      if (!scope_identity_) ec->error = scheduler::stream_error(stream);
+-      ec->value = value();
+-    }
+-    ec->cv.notify_all();
+-  });
++  scheduler::enqueue(stream, NoGpuEventCpuSignal{*this,stream});
+ }
+ 
+ bool Event::is_signaled() const {
+@@ -184,8 +217,3 @@
+ 
+ void Event::progress_side_effects() noexcept {}
+ } // namespace mlx::core
+-
+-#include "mlx/event.h"
+-namespace mlx::core {
+-bool event_dispatch_control_layout(EventDispatchControlLayout&) noexcept { return false; }
+-}
