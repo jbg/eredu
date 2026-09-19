@@ -1,4 +1,6 @@
 //! Request-bound reservations for shared inference working memory.
+mod dependency_memory;
+pub use dependency_memory::DependencyMemoryPolicy;
 mod realtime_frame;
 pub use realtime_frame::{RealtimeFrameRequirements,RealtimeNativeRequirements,RealtimeFrameAdmissionError,
     OriginalRealtimeFrame,OriginalRealtimeNative,OriginalRealtimeBudgetCustody};
