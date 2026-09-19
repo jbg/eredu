@@ -2,6 +2,7 @@
 #include "mlx/backend/cpu/sampling_storage.h"
 #include "mlx/backend/cpu/alias_storage.h"
 #include "mlx/c/original_buffer.h"
+#include "empty_buffer_fixture.h"
 #include <numeric>
 // Included after the prepared Eval fixtures. Only changed host construction and
 // its transition into the existing real Eval/worker path are exercised here.
@@ -1901,8 +1902,8 @@ TEST_CASE("CPU Gather source validates exact one-index geometry counts and failu
   CHECK(actual.request_counts[5]==3);CHECK(actual.request_counts[9]==1);
   cpu::CopyEvalStorage empty;
   REQUIRE(cpu::gather_eval_layout(float32,int32,2,2,12,0,3,false,empty));
-  CHECK(empty.backing_births==0);CHECK(empty.request_counts[3]==4);
-  CHECK(empty.request_counts[6]==1);CHECK(empty.request_counts[7]==0);CHECK(empty.request_counts[9]==1);
+  CHECK(empty.backing_births==size_t(empty_buffer_tests::has_backing()));CHECK(empty.request_counts[3]==4);
+  CHECK(empty.request_counts[6]==1);CHECK(empty.request_counts[7]==size_t(empty_buffer_tests::has_backing()));CHECK(empty.request_counts[9]==1);
   std::array<unsigned char,sizeof(actual)> saved;std::memcpy(saved.data(),&actual,sizeof(actual));
   CHECK_FALSE(cpu::gather_eval_layout(float64,int32,2,2,12,4,3,false,actual));
   CHECK_FALSE(cpu::gather_eval_layout(float32,uint64,2,2,12,4,3,false,actual));

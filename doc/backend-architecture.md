@@ -797,6 +797,10 @@ alignment headroom; they are not a process-wide memory ceiling.
 Eval, physical buffers, source preparation, streams and composed MXFP4 graph
 construction require separate admission. Failed allocation prefixes retain their
 accounts without publishing failed outputs as completed values.
+Empty CPU operator outputs reserve the selected allocator's real zero-byte
+backing: the CPU allocator retains a charged header/page, while Metal has no
+physical allocation. Shared empty-output layouts preserve that distinction and
+retain each physical account until its final owner is released.
 Completed tiles copy logical native-endian values directly into the final encoded
 buffers. This copy checks the exact destination length and supports signed strides,
 broadcast and unaligned views without allocating an intermediate byte payload.

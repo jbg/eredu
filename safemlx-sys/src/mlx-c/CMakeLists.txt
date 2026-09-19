@@ -264,7 +264,8 @@ else()
       mlx-cpu-quantization-integer-source.patch
       mlx-cpu-quantization-half-source.patch
       mlx-cpu-affine-converter-source.patch
-      mlx-affine-quantize-construction.patch)
+      mlx-affine-quantize-construction.patch
+      mlx-cpu-empty-buffer-birth.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")

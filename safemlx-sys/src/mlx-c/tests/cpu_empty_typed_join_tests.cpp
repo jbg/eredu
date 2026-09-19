@@ -1,8 +1,10 @@
+#include "empty_buffer_fixture.h"
 // Included by graph_construction_tests.cpp; actual source queries and the same
 // original Graph/Record/physical-owner fixtures used by the nonempty workers.
 TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and original completion"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
   using namespace pointwise_graph_tests;
+  const bool zero_backing=empty_buffer_tests::has_backing();
   auto stream=new_stream(Device::cpu);prepare(stream,stream);
   for(auto dtype:{float32,float16,bfloat16,int32})for(const Shape shape:{Shape{0,1},Shape{2,0,3}}) {
     array seed(7,dtype);
@@ -12,15 +14,15 @@ TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and orig
     REQUIRE(cpu::alias_eval_storage(ordinary.inputs()[0],actual));
     CHECK(actual.allocation_extents==cold.allocation_extents);
     CHECK(actual.named_control_bytes==cold.named_control_bytes);
-    CHECK(actual.backing_births==0);CHECK(actual.request_counts[3]==1);
-    CHECK(actual.request_counts[6]==0);CHECK(actual.request_counts[7]==0);
+    CHECK(actual.backing_births==size_t(zero_backing));CHECK(actual.request_counts[3]==1);
+    CHECK(actual.request_counts[6]==0);CHECK(actual.request_counts[7]==size_t(zero_backing));
     eval(ordinary.inputs());
     REQUIRE(cpu::scalar_full_eval_layout(dtype,shape.size(),0,false,cold));
     REQUIRE(cpu::selection_eval_storage(ordinary,actual));
     CHECK(actual.allocation_extents==cold.allocation_extents);
     CHECK(actual.named_control_bytes==cold.named_control_bytes);
-    CHECK(actual.backing_births==0);CHECK(actual.request_counts[3]==3);
-    CHECK(actual.request_counts[6]==1);CHECK(actual.request_counts[7]==0);
+    CHECK(actual.backing_births==size_t(zero_backing));CHECK(actual.request_counts[3]==3);
+    CHECK(actual.request_counts[6]==1);CHECK(actual.request_counts[7]==size_t(zero_backing));
     const auto prior=actual;
     CHECK_FALSE(cpu::scalar_full_eval_layout(dtype,0,0,false,actual));
     CHECK_FALSE(cpu::scalar_full_eval_layout(float64,shape.size(),0,false,actual));
@@ -30,8 +32,9 @@ TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and orig
     CHECK(std::memcmp(&prior,&actual,sizeof(actual))==0);
     eval(ordinary);CHECK(ordinary.size()==0);CHECK(ordinary.data_size()==0);
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
+    unsigned retired=0;
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
-    unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
+    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
         [](void*p){++*static_cast<unsigned*>(p);})==0);
     std::optional<array> escaped;
     {
@@ -43,7 +46,7 @@ TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and orig
       eval_traversal_tests::complete(role,operation,output);
       CHECK(output.shape()==shape);CHECK(output.dtype()==dtype);CHECK(output.size()==0);CHECK(output.data_size()==0);
       mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&output},budget.value)==0);
-      CHECK_FALSE(info.known);escaped.emplace(output);
+      CHECK(info.known==zero_backing);escaped.emplace(output);
     }
     mlx_original_buffer_budget_release(budget.value);budget.value={};
     CHECK(escaped->shape()==shape);CHECK(escaped->size()==0);
@@ -54,6 +57,7 @@ TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and orig
 namespace empty_typed_join_tests {
 template<class T>void check(Dtype dtype,Stream stream,const std::vector<int>& counts) {
   using namespace pointwise_graph_tests;
+  const bool zero_backing=empty_buffer_tests::has_backing();
   ArrayVector inputs;std::vector<T> expected;
   for(size_t i=0;i<counts.size();++i) {
     std::vector<T> values(size_t(counts[i])*3);
@@ -67,10 +71,10 @@ template<class T>void check(Dtype dtype,Stream stream,const std::vector<int>& co
   REQUIRE(cpu::concatenate_eval_storage(ordinary,actual));
   CHECK(actual.allocation_extents==cold.allocation_extents);
   CHECK(actual.named_control_bytes==cold.named_control_bytes);
-  CHECK(actual.backing_births==size_t(!expected.empty()));
+  CHECK(actual.backing_births==size_t(!expected.empty()||zero_backing));
   CHECK(actual.request_counts[3]==2*inputs.size()+1);
   CHECK(actual.request_counts[6]==inputs.size());
-  CHECK(actual.request_counts[7]==size_t(!expected.empty()));
+  CHECK(actual.request_counts[7]==size_t(!expected.empty()||zero_backing));
   // The Rust quote crosses this C ABI before reaching the same native source.
   // Retain coverage of its exact scalar type and empty/populated geometry.
   const mlx_dtype scalar=dtype==int32?MLX_INT32:MLX_FLOAT32;
@@ -105,8 +109,9 @@ template<class T>void check(Dtype dtype,Stream stream,const std::vector<int>& co
   eval(ordinary);
   if(!expected.empty())CHECK(std::vector<T>(ordinary.data<T>(),ordinary.data<T>()+expected.size())==expected);
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
+  unsigned retired=0;
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
-  unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
+  REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
       [](void*p){++*static_cast<unsigned*>(p);})==0);
   std::optional<array> escaped;
   {
@@ -119,9 +124,10 @@ template<class T>void check(Dtype dtype,Stream stream,const std::vector<int>& co
     CHECK(output.shape()==ordinary.shape());CHECK(output.dtype()==dtype);CHECK(output.size()==expected.size());
     if(!expected.empty())CHECK(std::vector<T>(output.data<T>(),output.data<T>()+expected.size())==expected);
     mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&output},budget.value)==0);
-    CHECK(info.known==!expected.empty());escaped.emplace(output);
+    CHECK(info.known==(!expected.empty()||zero_backing));escaped.emplace(output);
   }
   mlx_original_buffer_budget_release(budget.value);budget.value={};
+  CHECK(retired==unsigned(expected.empty()&&!zero_backing));
   if(!expected.empty()){CHECK(retired==0);CHECK(std::vector<T>(escaped->data<T>(),escaped->data<T>()+expected.size())==expected);}
   escaped.reset();CHECK(retired==1);
 }

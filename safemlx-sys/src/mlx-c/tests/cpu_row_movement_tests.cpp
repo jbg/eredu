@@ -1,3 +1,4 @@
+#include "empty_buffer_fixture.h"
 // Shared ordinary row movement, with exact native facts and real original
 // Graph/Record completion. Included after the canonical graph fixtures.
 namespace row_movement_tests {
@@ -26,6 +27,7 @@ void values(const array& output,const std::vector<float>& expected) {
 TEST_CASE("CPU row Gather retains empty and typed index workers with exact original custody"
     * doctest::skip(!wait_record_facts::layout_qualified)) {
   using namespace pointwise_graph_tests;
+  const bool zero_backing=empty_buffer_tests::has_backing();
   auto stream=new_stream(Device::cpu);prepare(stream,stream);
   for(bool signed_index:{false,true})for(int rows:{0,4})for(int count:{0,1,7}) {
     if(rows==0&&count!=0)continue;
@@ -47,7 +49,7 @@ TEST_CASE("CPU row Gather retains empty and typed index workers with exact origi
     REQUIRE(cpu::gather_eval_storage(ordinary,actual));
     row_movement_tests::same_layout(cold,actual);
     CHECK(actual.request_counts[3]==4);CHECK(actual.request_counts[6]==1);
-    CHECK(actual.request_counts[7]==size_t(count!=0));CHECK(actual.request_counts[9]==1);
+    CHECK(actual.request_counts[7]==size_t(count!=0||zero_backing));CHECK(actual.request_counts[9]==1);
     mlx_cpu_copy_eval_layout raw{};
     REQUIRE(mlx_operation_event_cpu_gather_eval_layout(&raw,MLX_FLOAT32,signed_index?MLX_INT32:MLX_UINT32,
         2,1,data.size(),count,width,false));
@@ -60,7 +62,7 @@ TEST_CASE("CPU row Gather retains empty and typed index workers with exact origi
     CHECK_FALSE(cpu::gather_eval_storage(invalid,actual));
     CHECK(std::memcmp(&prior,&actual,sizeof(actual))==0);
     eval(ordinary);row_movement_tests::values(ordinary,expected);
-    row_movement_tests::Budget budget;unsigned retired=0;budget.prepare(retired);
+    unsigned retired=0;row_movement_tests::Budget budget;budget.prepare(retired);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -73,9 +75,9 @@ TEST_CASE("CPU row Gather retains empty and typed index workers with exact origi
       row_movement_tests::values(output,expected);CHECK(output.dtype()==float32);
       CHECK(output.shape()==Shape{count,1,width});CHECK(role.records->occupied_bytes()==0);
       mlx_original_buffer_info info{};REQUIRE(mlx_original_buffer_array_info(&info,{&output},budget.value)==0);
-      CHECK(info.known==(count!=0));escaped.emplace(output);
+      CHECK(info.known==(count!=0||zero_backing));escaped.emplace(output);
     }
-    budget.release();if(count!=0)CHECK(retired==0);
+    budget.release();CHECK(retired==unsigned(count==0&&!zero_backing));
     row_movement_tests::values(*escaped,expected);escaped.reset();CHECK(retired==1);
     row_movement_tests::values(source,data);
   }
@@ -119,7 +121,7 @@ TEST_CASE("CPU row ScatterAxis sum preserves duplicate arithmetic zero updates a
     CHECK_FALSE(cpu::scatter_axis_eval_storage(invalid,actual));
     CHECK(std::memcmp(&prior,&actual,sizeof(actual))==0);
     eval(ordinary);row_movement_tests::values(ordinary,expected);
-    row_movement_tests::Budget budget;unsigned retired=0;budget.prepare(retired);
+    unsigned retired=0;row_movement_tests::Budget budget;budget.prepare(retired);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

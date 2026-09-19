@@ -1,0 +1,136 @@
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -169,6 +169,9 @@
+ MLX_API void free_original(Buffer) noexcept;
+ // The same callable entry selects a bound original budget before any ordinary
+ // allocator/cache access. A refused original route never falls through.
++// Pure backend fact for the bound original allocator: CPU zero-byte requests
++// own a header/page; Metal zero-byte requests have no physical backing.
++MLX_API bool original_buffer_zero_has_backing(bool& out) noexcept;
+ MLX_API Buffer malloc(size_t size);
+ 
+ inline void free(Buffer buffer) {
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -447,3 +447,7 @@
+ }
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::allocator {
++bool original_buffer_zero_has_backing(bool& out) noexcept { out = true; return true; }
++}
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -464,3 +464,7 @@
+   return metal::input_allocator_slot.borrow(identity, output);
+ }
+ } // namespace mlx::core::allocator
++
++namespace mlx::core::allocator {
++bool original_buffer_zero_has_backing(bool& out) noexcept { out = false; return true; }
++}
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -508,3 +508,7 @@
+ }
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::allocator {
++bool original_buffer_zero_has_backing(bool& out) noexcept { return false; }
++}
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -11,6 +11,8 @@
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
++// Replace the output birth contribution with the allocator's zero-byte path.
++MLX_API bool set_empty_buffer_birth_layout(CopyEvalStorage&) noexcept;
+ // Shared zero-byte allocate_data constructor within one existing Eval.
+ MLX_API bool append_empty_data_layout(CopyEvalStorage&) noexcept;
+ // Existing immutable Host transfer through the same General copy worker.
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -67,7 +67,21 @@
+       sizeof(submission::GraphConstructionContext) + sizeof(submission::GraphFailure);
+ }
+ } // namespace
+-// Shared allocate_data(0) branch: one Data owner, no physical backing or task.
++// Shared zero-byte allocation: CPU retains a physical header/page, Metal does not.
++bool set_empty_buffer_birth_layout(CopyEvalStorage& value) noexcept {
++  bool backing=false;
++  submission::OriginalBufferRoutingLayout routing;
++  if(!allocator::original_buffer_zero_has_backing(backing)||
++      !submission::original_buffer_routing_layout(routing))return false;
++  value.backing_births=size_t(backing);
++  value.request_counts[7]=size_t(backing);
++  value.request_bytes[7]=backing?routing.birth_bytes:0;
++  value.request_alignments[7]=backing?routing.birth_alignment:1;
++  const size_t controls=sizeof(backing)+sizeof(routing)+sizeof(value)+sizeof(size_t);
++  if(!add(value.named_control_bytes,controls))return false;
++  return submission::GraphConstruction::complete_layout(value);
++}
++// Shared allocate_data(0) branch: one Data owner and the allocator's actual birth.
+ bool append_empty_data_layout(CopyEvalStorage& value) noexcept {
+   if(value.request_counts[3] || value.backing_births || value.copy)return false;
+   WeakCopyStorage descriptor;
+@@ -91,7 +105,7 @@
+   }
+   if(sizeof(size_t)>SIZE_MAX-value.named_control_bytes)return false;
+   value.named_control_bytes+=sizeof(size_t);
+-  if(!submission::GraphConstruction::complete_layout(value))return false;
++  if(!set_empty_buffer_birth_layout(value))return false;
+   if(!add(value.named_control_bytes,sizeof(CopyEvalStorage&)))return false;
+   return true;
+ }
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -77,11 +77,9 @@
+   CopyEvalStorage value;
+   if(!copy_eval_layout(rank,1,true,tracer,value))return false;
+   if(elements==0) {
+-    // Full still executes the existing copy worker (unless donated). Its
+-    // zero-byte allocation publishes Data but creates no physical owner.
+-    value.backing_births=0;
+-    value.request_counts[7]=value.request_bytes[7]=value.request_alignments[7]=0;
+-    if(!submission::GraphConstruction::complete_layout(value))return false;
++    // Full still executes the existing copy worker unless donated. A fresh
++    // zero-byte allocation retains the selected allocator's actual backing.
++    if(!set_empty_buffer_birth_layout(value))return false;
+   }
+   const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+
+       sizeof(value)+sizeof(const array*)*4+sizeof(size_t)*13+sizeof(int)*2+sizeof(bool)*5+sizeof(Strides::const_iterator)+sizeof(int64_t)+sizeof(Shape::const_iterator)+sizeof(int)+
+diff --git a/mlx/backend/cpu/gather_storage.cpp b/mlx/backend/cpu/gather_storage.cpp
+--- a/mlx/backend/cpu/gather_storage.cpp
++++ b/mlx/backend/cpu/gather_storage.cpp
+@@ -56,8 +56,8 @@
+       !single_output_eval_layout(source_rank+index_rank,2,tracer,&dispatch,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+   // Empty Gather still constructs output Data, weak descriptors, the index
+-  // vector and the ordinary queued task. Only its physical birth is absent.
+-  if(output_elements==0) {value.backing_births=0;value.request_counts[7]=0;}
++  // vector and the ordinary queued task. The allocator determines its birth.
++  if(output_elements==0&&!set_empty_buffer_birth_layout(value))return false;
+   // The one-index ArrayVector grows once. Its actual backing stays in the
+   // queued task until task death. Worker iterator storage is independently
+   // charged through dispatch.worker_graph_extents under that task's Graph loan.
+diff --git a/mlx/backend/cpu/concatenate_storage.cpp b/mlx/backend/cpu/concatenate_storage.cpp
+--- a/mlx/backend/cpu/concatenate_storage.cpp
++++ b/mlx/backend/cpu/concatenate_storage.cpp
+@@ -45,6 +45,7 @@
+   const submission::GraphQuota::Request birth{routing.birth_bytes,routing.birth_alignment};
+   if(!append(value,6,task,inputs)||(elements&&!append(value,7,birth,1)))return false;
+   value.rank=rank;value.copy=true;value.backing_births=elements?1:0;
++  if(!elements&&!set_empty_buffer_birth_layout(value))return false;
+   if(dispatch.worker_graph_extent_bound>SIZE_MAX/inputs)return false;
+   value.worker_graph_extents=dispatch.worker_graph_extent_bound*inputs;
+   const auto adoption=array::buffer_adoption_layout();
