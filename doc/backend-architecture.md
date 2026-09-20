@@ -858,8 +858,15 @@ Recursive byte-preserving recipe mappings likewise bind source, selection or
 interleaved-child coordinates in a counted destination plan. Counting and filling
 share the same adjacency coalescing and slice traversal. Child mappings remain
 borrowed during output construction; exact range storage replaces geometric
-growth, with an additional geometry pass. These layouts alone do not reserve
-storage or cover source metadata, recipe inference and child-array construction.
+growth, with an additional geometry pass. Runtime implements its shared initializer directly for the checkpoint mapping
+plan, comparing before the exact requested range-vector allocation. Source,
+selection and interleaving use this same worker in ordinary compilation and
+admitted construction. Completed mappings retain their original account after
+borrowed children retire; rejected construction leaves existing child accounts
+intact. Construction retains typed allocation errors and publishes no native
+alias. Child-reference arrays remain borrowed prerequisites. This mapping
+admission does not cover source metadata, inference, projected read spans or
+child-array construction, and does not establish whole-compiler admission.
 Encoded recipe reads share one source-key traversal for structural qualification,
 counting and construction. The ordered occurrence list preserves duplicates and
 uses exact requested vector/string capacities. Runtime implements its existing

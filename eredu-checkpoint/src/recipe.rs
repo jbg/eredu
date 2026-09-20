@@ -10,6 +10,7 @@ use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection
 use crate::StoredDtype;
 
 mod encoded_projection;
+pub use encoded_projection::{EncodedRecipeMapping, EncodedRecipeMappingPlan};
 mod read_catalog;
 mod read_keys;
 pub use read_keys::{EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys};
@@ -2509,6 +2510,8 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 #[derive(Debug, Clone, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum RecipeError {
+    #[error("encoded recipe projection reserve failed")]
+    ProjectionReserve(#[source] std::collections::TryReserveError),
     #[error("finite encoded-read inference is unavailable")]
     InferenceUnavailable,
     #[error("finite encoded-read inference reserve failed")]

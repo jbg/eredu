@@ -17,7 +17,9 @@ fn product(shape: &[usize]) -> Result<usize, RecipeError> {
 }
 
 mod mapping;
-use mapping::{Mapping, MappingInput, MappingPlan};
+pub use mapping::{EncodedRecipeMapping, EncodedRecipeMappingPlan};
+use mapping::{Children, EncodedRecipeMappingInput as MappingInput};
+use {EncodedRecipeMapping as Mapping, EncodedRecipeMappingPlan as MappingPlan};
 
 struct Compiler<'a, C: ?Sized> {
     catalog: &'a C,
@@ -111,7 +113,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                     children.push(child);
                 }
                 MappingPlan::new(MappingInput::Interleaved {
-                    children: &children,
+                    children: Children::Owned(&children),
                     chunks: &chunks,
                     outer,
                 })?

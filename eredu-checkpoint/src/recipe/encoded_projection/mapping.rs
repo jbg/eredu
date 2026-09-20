@@ -2,24 +2,61 @@
 use super::{EncodedRange, RecipeError, overflow};
 use std::{alloc::Layout, ops::Range};
 
-pub(super) struct Mapping {
+/// Owned byte coordinates for one encoded recipe node. Source coordinates refer
+/// to the original concatenated batch; destination coordinates are contiguous.
+/// No payload or source owner is copied into this mapping.
+#[derive(Debug)]
+pub struct EncodedRecipeMapping {
     pub(super) ranges: Vec<EncodedRange>,
     pub(super) length: usize,
 }
 
-pub(super) enum MappingInput<'a> {
+pub(super) enum EncodedRecipeMappingInput<'a> {
     Source(Range<usize>),
     Selected {
-        input: &'a Mapping,
+        input: &'a EncodedRecipeMapping,
         ranges: &'a [Range<usize>],
     },
     Interleaved {
-        children: &'a [Mapping],
+        children: Children<'a>,
         chunks: &'a [usize],
         outer: usize,
     },
 }
-impl MappingInput<'_> {
+pub(super) enum Children<'a> {
+    Owned(&'a [EncodedRecipeMapping]),
+    Borrowed(&'a [&'a EncodedRecipeMapping]),
+}
+impl Children<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(rows) => rows.len(),
+            Self::Borrowed(rows) => rows.len(),
+        }
+    }
+    fn get(&self, index: usize) -> &EncodedRecipeMapping {
+        match self {
+            Self::Owned(rows) => &rows[index],
+            Self::Borrowed(rows) => rows[index],
+        }
+    }
+}
+
+impl EncodedRecipeMapping {
+    /// Total encoded destination length, without reading payloads.
+    pub fn byte_len(&self) -> usize {
+        self.length
+    }
+    /// Source and destination coordinates in output order. Adjacent source
+    /// ranges are coalesced. Returned ranges contain only scalar offsets.
+    pub fn ranges(&self) -> impl ExactSizeIterator<Item = (Range<usize>, Range<usize>)> + '_ {
+        self.ranges
+            .iter()
+            .map(|row| (row.source.clone(), row.destination.clone()))
+    }
+}
+
+impl EncodedRecipeMappingInput<'_> {
     fn write(&self, writer: &mut Writer<'_>) -> Result<(), RecipeError> {
         match self {
             Self::Source(range) => writer.push(range.clone())?,
@@ -36,13 +73,15 @@ impl MappingInput<'_> {
                 if children.len() != chunks.len() {
                     return Err(overflow());
                 }
-                for (child, chunk) in children.iter().zip(chunks.iter().copied()) {
+                for (child_index, chunk) in chunks.iter().copied().enumerate() {
+                    let child = children.get(child_index);
                     if outer.checked_mul(chunk).ok_or_else(overflow)? != child.length {
                         return Err(overflow());
                     }
                 }
                 for index in 0..*outer {
-                    for (child, chunk) in children.iter().zip(chunks.iter().copied()) {
+                    for (child_index, chunk) in chunks.iter().copied().enumerate() {
+                        let child = children.get(child_index);
                         let start = index.checked_mul(chunk).ok_or_else(overflow)?;
                         writer.append_slice(
                             child,
@@ -56,14 +95,56 @@ impl MappingInput<'_> {
     }
 }
 
-pub(super) struct MappingPlan<'a> {
-    input: MappingInput<'a>,
+/// Counted construction over immutable borrowed child mappings. Counting and
+/// filling use the same traversal; construction owns its output independently
+/// of all input mappings. Caller admission and child-array storage are separate.
+pub struct EncodedRecipeMappingPlan<'a> {
+    input: EncodedRecipeMappingInput<'a>,
     count: usize,
     length: usize,
     layout: Layout,
 }
-impl<'a> MappingPlan<'a> {
-    pub(super) fn new(input: MappingInput<'a>) -> Result<Self, RecipeError> {
+impl<'a> EncodedRecipeMappingPlan<'a> {
+    /// Plan one source interval in the concatenated original batch.
+    pub fn source(range: Range<usize>) -> Result<Self, RecipeError> {
+        Self::new(EncodedRecipeMappingInput::Source(range))
+    }
+    /// Select output intervals from an existing mapping, preserving repetitions
+    /// and selection order. The interval slice remains a borrowed prerequisite.
+    pub fn selected(
+        input: &'a EncodedRecipeMapping,
+        ranges: &'a [Range<usize>],
+    ) -> Result<Self, RecipeError> {
+        Self::new(EncodedRecipeMappingInput::Selected { input, ranges })
+    }
+    /// Interleave equally many chunks from borrowed child mappings. Each child
+    /// contributes `chunks[index]` bytes to each of `outer` output rows.
+    pub fn interleaved(
+        children: &'a [&'a EncodedRecipeMapping],
+        chunks: &'a [usize],
+        outer: usize,
+    ) -> Result<Self, RecipeError> {
+        Self::new(EncodedRecipeMappingInput::Interleaved {
+            children: Children::Borrowed(children),
+            chunks,
+            outer,
+        })
+    }
+    /// Exact requested range backing plus fixed constructor/result controls.
+    /// Borrowed child arrays, allocator overhead and machine stack are excluded.
+    pub fn required_bytes(&self) -> Option<usize> {
+        [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<EncodedRecipeMapping>(),
+            std::mem::size_of::<RecipeError>(),
+            std::mem::size_of::<Writer<'static>>(),
+            std::mem::size_of::<Result<(), std::collections::TryReserveError>>(),
+            std::mem::size_of::<Result<EncodedRecipeMapping, RecipeError>>(),
+        ]
+        .into_iter()
+        .try_fold(self.layout.size(), usize::checked_add)
+    }
+    pub(super) fn new(input: EncodedRecipeMappingInput<'a>) -> Result<Self, RecipeError> {
         let mut writer = Writer {
             ranges: Destination::Count {
                 count: 0,
@@ -98,16 +179,23 @@ impl<'a> MappingPlan<'a> {
         }
         Ok(())
     }
-    pub(super) fn build(self) -> Result<Mapping, RecipeError> {
-        let mut ranges = vec![
+    /// Allocate one exact requested range vector and fill it with the shared
+    /// traversal. Allocation failure remains a typed cause; partial storage
+    /// retires synchronously, without publishing a source or native alias.
+    pub fn build(self) -> Result<EncodedRecipeMapping, RecipeError> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(self.count)
+            .map_err(RecipeError::ProjectionReserve)?;
+        ranges.resize(
+            self.count,
             EncodedRange {
                 source: 0..0,
-                destination: 0..0
-            };
-            self.count
-        ];
+                destination: 0..0,
+            },
+        );
         self.fill_into(&mut ranges)?;
-        Ok(Mapping {
+        Ok(EncodedRecipeMapping {
             ranges,
             length: self.length,
         })
@@ -180,7 +268,11 @@ impl Writer<'_> {
         self.length = end;
         Ok(())
     }
-    fn append_slice(&mut self, input: &Mapping, selected: Range<usize>) -> Result<(), RecipeError> {
+    fn append_slice(
+        &mut self,
+        input: &EncodedRecipeMapping,
+        selected: Range<usize>,
+    ) -> Result<(), RecipeError> {
         if selected.start > selected.end || selected.end > input.length {
             return Err(overflow());
         }

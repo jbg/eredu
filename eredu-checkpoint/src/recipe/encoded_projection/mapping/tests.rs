@@ -1,4 +1,8 @@
 use super::*;
+use {
+    EncodedRecipeMapping as Mapping, EncodedRecipeMappingInput as MappingInput,
+    EncodedRecipeMappingPlan as MappingPlan,
+};
 
 fn coords(mapping: &Mapping) -> Vec<(Range<usize>, Range<usize>)> {
     mapping
@@ -90,7 +94,7 @@ fn counted_sources_and_selections_keep_coalescing_and_refuse_wrong_destinations(
 fn interleaved_children_preserve_row_order_and_cross_child_adjacency() {
     let children = [source(0..6), source(100..104)];
     let plan = MappingPlan::new(MappingInput::Interleaved {
-        children: &children,
+        children: Children::Owned(&children),
         chunks: &[3, 2],
         outer: 2,
     })
@@ -107,7 +111,7 @@ fn interleaved_children_preserve_row_order_and_cross_child_adjacency() {
     );
     let adjacent = [source(0..4), source(4..8)];
     let plan = MappingPlan::new(MappingInput::Interleaved {
-        children: &adjacent,
+        children: Children::Owned(&adjacent),
         chunks: &[4, 4],
         outer: 1,
     })
@@ -133,7 +137,7 @@ fn mapping_count_refuses_bad_geometry_and_output_length_overflow() {
     for (chunks, outer) in [(vec![], 1), (vec![3], 2), (vec![2], usize::MAX)] {
         assert!(
             MappingPlan::new(MappingInput::Interleaved {
-                children: &children,
+                children: Children::Owned(&children),
                 chunks: &chunks,
                 outer
             })
