@@ -761,6 +761,13 @@ the selected companion precision, including F16/BF16 casts of equal byte width.
 Cold minimum-row checks, complete targets, leading batches and row candidates use
 that same live-output contribution. Final encoded output telemetry excludes these
 temporary cast sources.
+The tile's completion owner reserves output slots before quantization and retains
+all native siblings before converting either companion. Each successful cast
+replaces its retained root; a later failure leaves the accepted prefix and its
+sources with the same recovery owner. Original materialization owners use their
+prepared vector capacity and reject growth. They can submit a caller-supplied
+finite traversal on an explicit stream through that same owner; source preparation,
+native fit and producer admission remain the caller's separate obligations.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

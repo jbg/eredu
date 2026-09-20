@@ -203,7 +203,7 @@ pub fn materialize_module_bindings(
                             .copy(execution_stream)
                             .map_err(WeightRecipeError::from)?
                     };
-                    prepared.retain_output(output);
+                    prepared.retain_output(output)?;
                 }
                 let names = bindings
                     .iter()

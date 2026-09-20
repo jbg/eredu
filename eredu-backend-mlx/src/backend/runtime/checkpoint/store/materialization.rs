@@ -387,12 +387,47 @@ impl WeightMaterialization {
         Ok(sources)
     }
 
+    /// Establishes output destinations before a producer can start native work.
+    /// Original owners use only the storage supplied by their prepared slot.
+    pub(crate) fn prepare_output_capacity(
+        &mut self,
+        required: usize,
+    ) -> Result<(), CheckpointMaterializationError> {
+        if let Some(observer) = self.retained.original_observer() {
+            validate_operation(observer)?;
+        }
+        let original = self.retained.original_observer().is_some();
+        let outputs = &mut Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .outputs;
+        if original {
+            operation_slots::require_capacity(outputs, required, "materialization outputs")?;
+        } else {
+            outputs.reserve(required.saturating_sub(outputs.len()));
+        }
+        Ok(())
+    }
+
     /// Retains each prepared output before preparing another fallible operation.
-    pub(crate) fn retain_output(&mut self, output: Array) {
+    pub(crate) fn retain_output(
+        &mut self,
+        output: Array,
+    ) -> Result<(), CheckpointMaterializationError> {
+        self.prepare_output_capacity(self.outputs().len() + 1)?;
         Rc::get_mut(self.retained.retention_mut())
             .expect("unpublished owner")
             .outputs
             .push(output);
+        Ok(())
+    }
+
+    /// Replace a retained root only after its conversion has succeeded. The new
+    /// native graph owns any dependency on the old root; a failed constructor
+    /// leaves the old root with this completion owner.
+    pub(crate) fn replace_output(&mut self, index: usize, output: Array) {
+        Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .outputs[index] = output;
     }
 
     pub(crate) fn submit_outputs(
@@ -417,15 +452,43 @@ impl WeightMaterialization {
         self.submit_prepared_outputs()
     }
 
-    pub(crate) fn submit_prepared_outputs(
-        mut self,
+    pub(crate) fn submit_prepared_outputs(self) -> Result<Self, CheckpointMaterializationError> {
+        self.submit_prepared_outputs_impl(None)
+    }
+
+    /// Submit a closed traversal using this owner's existing original observer.
+    /// The caller supplies the selected stream and separately established fit;
+    /// completion and failure retain the same source and output populations.
+    pub(crate) fn submit_prepared_outputs_with_traversal(
+        self,
+        stream: &Stream,
+        traversal: &safemlx::OperationEvalTraversalLayout,
     ) -> Result<Self, CheckpointMaterializationError> {
-        let result = match self.retained.original_observer() {
-            Some(observer) => safemlx::transforms::async_eval_with_original_operation_event(
-                self.outputs().iter(),
-                observer,
-            ),
-            None => async_eval_with_event(self.outputs().iter()),
+        self.submit_prepared_outputs_impl(Some((stream, traversal)))
+    }
+
+    fn submit_prepared_outputs_impl(
+        mut self,
+        traversal: Option<(&Stream, &safemlx::OperationEvalTraversalLayout)>,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        let result = match (self.retained.original_observer(), traversal) {
+            (Some(observer), Some((stream, traversal))) => {
+                validate_operation(observer)?;
+                safemlx::transforms::async_eval_with_original_prepared_traversal(
+                    self.outputs().iter(),
+                    observer,
+                    stream,
+                    traversal,
+                )
+            }
+            (None, Some(_)) => return Err(CheckpointMaterializationError::OriginalOperationDomain),
+            (Some(observer), None) => {
+                safemlx::transforms::async_eval_with_original_operation_event(
+                    self.outputs().iter(),
+                    observer,
+                )
+            }
+            (None, None) => async_eval_with_event(self.outputs().iter()),
         };
         self.retained.seal();
         if result.is_err() && self.retained.original_observer().is_none() {

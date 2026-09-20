@@ -613,9 +613,9 @@ fn submit_quantization_tile(
     let tile_stream = tile_context.source_stream();
     let pending = recipe.prepare_borrowed_materialization(source, tile_context)?;
     let (dense, source_leases) = pending.into_parts();
-    let prepared = WeightMaterialization::prepare_retained(vec![dense], source_leases)?;
-    let outputs = quantize_tile_outputs(&prepared.inputs()[0], quantization, target, tile_stream)?;
-    let completion = prepared.submit_outputs(outputs)?;
+    let mut prepared = WeightMaterialization::prepare_retained(vec![dense], source_leases)?;
+    prepare_quantized_outputs(&mut prepared, quantization, target, tile_stream)?;
+    let completion = prepared.submit_prepared_outputs()?;
     output_shards[output_shard].tile_submitted();
     pending_tiles.push_back(SubmittedQuantizationTile {
         completion,
@@ -641,30 +641,56 @@ fn submit_quantization_tile(
     Ok(())
 }
 
-fn quantize_tile_outputs(
-    dense: &Array,
+fn prepare_quantized_outputs(
+    prepared: &mut WeightMaterialization,
     quantization: WeightQuantization,
     target: &BoundedQuantizationTarget,
     stream: &Stream,
-) -> Result<Vec<Array>, Error> {
-    let quantized = quantize_tensor(dense, quantization, stream)?;
+) -> Result<(), Error> {
+    prepare_quantized_outputs_with(
+        prepared,
+        quantization,
+        target,
+        stream,
+        |array, dtype, stream| array.as_dtype(dtype, stream),
+    )
+}
+
+fn prepare_quantized_outputs_with(
+    prepared: &mut WeightMaterialization,
+    quantization: WeightQuantization,
+    target: &BoundedQuantizationTarget,
+    stream: &Stream,
+    mut convert: impl FnMut(&Array, Dtype, &Stream) -> Result<Array, safemlx::error::Exception>,
+) -> Result<(), Error> {
+    prepared.prepare_output_capacity(if matches!(quantization, WeightQuantization::MxFp4) {
+        2
+    } else {
+        3
+    })?;
+    let quantized = quantize_tensor(&prepared.inputs()[0], quantization, stream)?;
+    prepared.retain_output(quantized.weight)?;
+    prepared.retain_output(quantized.scales)?;
+    if let Some(biases) = quantized.biases {
+        prepared.retain_output(biases)?;
+    }
     let companion_dtype = match target.affine_companion_dtype {
         RecipeDtype::F16 => Dtype::Float16,
         RecipeDtype::BF16 => Dtype::Bfloat16,
         RecipeDtype::F32 => Dtype::Float32,
         _ => unreachable!("validated bounded companion dtype"),
     };
-    let scales = if matches!(quantization, WeightQuantization::MxFp4) {
-        quantized.scales
-    } else {
-        quantized.scales.as_dtype(companion_dtype, stream)?
-    };
-    let mut outputs = vec![quantized.weight, scales];
-    if let Some(biases) = quantized.biases {
-        outputs.push(biases.as_dtype(companion_dtype, stream)?);
+    if !matches!(quantization, WeightQuantization::MxFp4) {
+        for index in 1..prepared.outputs().len() {
+            let converted = convert(&prepared.outputs()[index], companion_dtype, stream)?;
+            prepared.replace_output(index, converted);
+        }
     }
-    Ok(outputs)
+    Ok(())
 }
+
+#[cfg(test)]
+mod output_tests;
 
 struct SubmittedQuantizationTile {
     completion: WeightMaterialization,

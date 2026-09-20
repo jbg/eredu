@@ -213,6 +213,35 @@ fn component_destinations_with_retained_account<T>(
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
+    component_destinations_with_retained_account_and_controls(
+        source_bytes,
+        attempts,
+        partitions,
+        destinations,
+        existing,
+        additional_ceiling,
+        retained_account,
+        0,
+        operation,
+    )
+}
+
+fn component_destinations_with_retained_account_and_controls<T>(
+    source_bytes: u64,
+    attempts: usize,
+    partitions: usize,
+    destinations: Option<(u64, usize, usize)>,
+    existing: u64,
+    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    retained_account: u64,
+    additional_controls: u64,
+    operation: impl FnOnce(
+        &OriginalTextControlGuard,
+        &OriginalScopeObserver,
+        &WorkingMemoryPool,
+        OriginalHostDestinationBank,
+    ) -> T,
+) -> T {
     let support = SupportFacts::new();
     let source = HostSourceConstructionFacts::new(
         source_bytes + support.bytes(),
@@ -297,7 +326,7 @@ fn component_destinations_with_retained_account<T>(
     let controls = PreparedTextControlWorkspace::prepare_controls(
         geometry,
         quote.span_workspace().plan(),
-        TextHostControlFacts::new(Some(0), Some(named), Some(0)),
+        TextHostControlFacts::new(Some(0), Some(named + additional_controls), Some(0)),
     )
     .unwrap()
     .with_host_destinations(host)
@@ -719,6 +748,9 @@ mod cache_metadata;
 #[path = "funded_component/acquisition.rs"]
 mod acquisition;
 
+#[path = "funded_component/materialization_submission.rs"]
+mod materialization_submission;
+
 #[test]
 fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_alias() {
     use crate::backend::runtime::residency::{manager::ResidencyError, storage::RetainedStorage};
@@ -773,7 +805,11 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
                 assert!(matches!(
                     first.include_array(&distinct),
                     Err(ResidencyError::OriginalInventory(
-                        WorkingMemoryError::ExecutionFenced
+                        WorkingMemoryError::CollectorCapacity {
+                            kind: eredu_runtime::working_memory::CollectorCapacityKind::InventoryRows,
+                            used: 1,
+                            capacity: 1,
+                        }
                     ))
                 ));
                 // The actual fixed clone worker was never entered by either
