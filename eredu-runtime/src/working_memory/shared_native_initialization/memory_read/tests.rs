@@ -113,11 +113,11 @@ enum FailedRead {
     #[error("read metadata construction failed: {0}")]
     Build(#[from] MemoryEncodedReadBuildError<SharedNativeInitializationCustody>),
     #[error("later producer refused after read metadata construction")]
-    Later(PreparedMemoryEncodedRead<SharedNativeInitializationCustody>),
+    Later(PreparedEncodedRead<SharedNativeInitializationCustody>),
 }
 struct FailingProducer<'a>(MemoryEncodedReadPlan<'a>);
 impl SharedNativeInitializer for FailingProducer<'_> {
-    type Output = PreparedMemoryEncodedRead<SharedNativeInitializationCustody>;
+    type Output = PreparedEncodedRead<SharedNativeInitializationCustody>;
     type Error = FailedRead;
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         self.0.required_storage_bytes()

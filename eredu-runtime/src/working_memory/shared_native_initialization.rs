@@ -12,6 +12,7 @@ mod file_read;
 mod recipe_inference;
 mod recipe_mapping;
 mod selection_ranges;
+mod read_projection;
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public

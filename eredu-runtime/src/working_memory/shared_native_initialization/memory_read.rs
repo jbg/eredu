@@ -1,11 +1,11 @@
 //! Admission directly on the checkpoint-owned read constructor.
 use super::*;
 use eredu_checkpoint::store::{
-    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, PreparedMemoryEncodedRead,
+    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, PreparedEncodedRead,
 };
 
 impl SharedNativeInitializer for MemoryEncodedReadPlan<'_> {
-    type Output = PreparedMemoryEncodedRead<SharedNativeInitializationCustody>;
+    type Output = PreparedEncodedRead<SharedNativeInitializationCustody>;
     type Error = MemoryEncodedReadBuildError<SharedNativeInitializationCustody>;
 
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {

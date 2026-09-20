@@ -49,7 +49,7 @@ fn counted_projection_preserves_repeated_intersections_and_exact_destinations() 
             length
         ];
         assert!(
-            matches!(plan.fill_into(&mut destination), Err(ProjectionError::Destination { expected: 4, actual }) if actual == length)
+            matches!(plan.fill_into(&mut destination), Err(EncodedProjectionError::Destination { expected: 4, actual }) if actual == length)
         );
         assert_eq!(coordinates(&destination), vec![(91..97, 31..37); length]);
     }
@@ -144,7 +144,7 @@ fn projection_plan_rejects_invalid_original_spans() {
     ] {
         assert!(matches!(
             SpanProjectionPlan::new(&spans, &ranges),
-            Err(ProjectionError::Invalid)
+            Err(EncodedProjectionError::Invalid)
         ));
     }
 }
@@ -203,4 +203,56 @@ fn projected_file_and_memory_batches_retain_sources_and_exact_output() {
         projected.read_into(&mut output).unwrap();
         assert_eq!(output, [13, 14, 1, 2, 3, 13]);
     }
+}
+
+fn prepared_memory(custody: Arc<()>) -> PreparedEncodedRead<Arc<()>> {
+    let store = MemoryWeightStore::from_safetensors([
+        ("a".into(), Dtype::U8, vec![4], vec![1, 2, 3, 4]),
+        ("b".into(), Dtype::U8, vec![4], vec![11, 12, 13, 14]),
+    ]).unwrap();
+    MemoryEncodedReadPlan::new(&store, &["a".into(), "b".into()]).unwrap().construct(custody).unwrap()
+}
+
+#[test]
+fn invalid_projection_keeps_the_original_read_and_custody() {
+    let custody = Arc::new(());
+    let alive = Arc::downgrade(&custody);
+    let read = prepared_memory(custody);
+    let mapping = crate::recipe::EncodedRecipeMappingPlan::source(0..9).unwrap().build().unwrap();
+    let failure = match read.project(&mapping) {
+        Ok(_) => panic!("mapping exceeds the original read"),
+        Err(error) => error,
+    };
+    drop(mapping);
+    assert!(matches!(failure.cause(), EncodedProjectionError::Invalid));
+    assert_eq!(failure.retained_tensors().len(), 2);
+    assert!(alive.upgrade().is_some());
+    drop(failure);
+    assert!(alive.upgrade().is_none());
+}
+
+#[test]
+fn later_projection_failure_retains_replaced_prefix_and_both_custodies() {
+    let original = Arc::new(());
+    let source_alive = Arc::downgrade(&original);
+    let projected = Arc::new(());
+    let projection_alive = Arc::downgrade(&projected);
+    let read = prepared_memory(original);
+    let full = crate::recipe::EncodedRecipeMappingPlan::source(0..8).unwrap().build().unwrap();
+    let mapping = crate::recipe::EncodedRecipeMappingPlan::selected(&full, &[6..8, 0..3, 6..7]).unwrap().build().unwrap();
+    let mut plan = read.project(&mapping).unwrap();
+    // Inject a later invalid span to exercise prefix ownership after the first
+    // source has been replaced. Public plans expose no mutable source geometry.
+    plan.read.batch.memory[1].spans[0].source = 9..8;
+    let failure = plan.construct(projected).unwrap_err();
+    drop((mapping, full));
+    assert!(matches!(failure.cause(), EncodedProjectionError::Invalid));
+    assert_eq!(coordinates(&failure.partial.batch.memory[0].spans), [(0..3, 2..5)]);
+    assert_eq!(failure.retained_tensors().len(), 2);
+    assert!(source_alive.upgrade().is_some());
+    assert!(projection_alive.upgrade().is_some());
+    assert!(std::error::Error::source(&failure).unwrap().is::<EncodedProjectionError>());
+    drop(failure);
+    assert!(source_alive.upgrade().is_none());
+    assert!(projection_alive.upgrade().is_none());
 }

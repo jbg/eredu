@@ -10,65 +10,194 @@ pub(crate) struct EncodedRange {
     pub(crate) destination: Range<usize>,
 }
 
-fn invalid() -> StoreError {
-    StoreError::Internal("encoded recipe range projection is inconsistent".into())
-}
-
 impl EncodedReadBatch {
-    /// Consume the exact admission, changing only its finite range geometry.
-    /// No file is opened, no payload is read and no source identity is replaced.
+    /// Preserve original source identities while replacing only read geometry.
     pub(crate) fn project_ranges(
-        mut self,
+        self,
         ranges: &[EncodedRange],
         output_bytes: usize,
     ) -> Result<Self, StoreError> {
-        let mut end = 0;
-        for row in ranges {
-            if row.source.start > row.source.end
-                || row.source.end > self.byte_len
-                || row.destination.start != end
-                || row.destination.start > row.destination.end
-                || row.destination.end > output_bytes
-                || row.source.len() != row.destination.len()
-            {
-                return Err(invalid());
+        let read = PreparedEncodedRead {
+            batch: self,
+            _custody: (),
+        };
+        let plan = EncodedReadProjectionPlan::from_ranges(read, ranges, output_bytes)
+            .map_err(|error| StoreError::from(error.cause))?;
+        let projected = plan
+            .construct(())
+            .map_err(|error| StoreError::from(error.cause))?;
+        Ok(projected.batch)
+    }
+}
+
+/// Projection over exact retained source records. Counting may reorder existing
+/// span metadata in place, but allocates nothing and reads no payload. The plan
+/// owns the original read and its custody, including on later admission refusal.
+pub struct EncodedReadProjectionPlan<'a, C> {
+    read: PreparedEncodedRead<C>,
+    ranges: &'a [EncodedRange],
+    output_bytes: usize,
+    backing_bytes: usize,
+}
+impl<'a, C> EncodedReadProjectionPlan<'a, C> {
+    pub(super) fn new(
+        read: PreparedEncodedRead<C>,
+        mapping: &'a crate::recipe::EncodedRecipeMapping,
+    ) -> Result<Self, EncodedProjectionBuildError<C>> {
+        Self::from_ranges(read, mapping.encoded_ranges(), mapping.byte_len())
+    }
+    fn from_ranges(
+        mut read: PreparedEncodedRead<C>,
+        ranges: &'a [EncodedRange],
+        output_bytes: usize,
+    ) -> Result<Self, EncodedProjectionBuildError<C>> {
+        let inspect = (|| {
+            let mut end = 0;
+            for row in ranges {
+                if row.source.start > row.source.end
+                    || row.source.end > read.batch.byte_len
+                    || row.destination.start != end
+                    || row.destination.start > row.destination.end
+                    || row.destination.end > output_bytes
+                    || row.source.len() != row.destination.len()
+                {
+                    return Err(EncodedProjectionError::Invalid);
+                }
+                end = row.destination.end;
             }
-            end = row.destination.end;
+            if end != output_bytes {
+                return Err(EncodedProjectionError::Invalid);
+            }
+            let mut covered = 0usize;
+            let mut backing = 0usize;
+            for spans in read
+                .batch
+                .shards
+                .iter_mut()
+                .map(|(_, source)| &mut source.spans)
+                .chain(read.batch.memory.iter_mut().map(|source| &mut source.spans))
+            {
+                spans.sort_unstable_by_key(|span| span.destination.start);
+                let plan = SpanProjectionPlan::new(spans, ranges)?;
+                covered = covered
+                    .checked_add(plan.covered)
+                    .ok_or(EncodedProjectionError::Invalid)?;
+                backing = backing
+                    .checked_add(plan.layout.size())
+                    .ok_or(EncodedProjectionError::Layout)?;
+            }
+            if covered != output_bytes {
+                return Err(EncodedProjectionError::Invalid);
+            }
+            Ok(backing)
+        })();
+        match inspect {
+            Ok(backing_bytes) => Ok(Self {
+                read,
+                ranges,
+                output_bytes,
+                backing_bytes,
+            }),
+            Err(cause) => Err(EncodedProjectionBuildError {
+                cause,
+                partial: read,
+            }),
         }
-        if end != output_bytes {
-            return Err(invalid());
+    }
+    /// New projected span backing and fixed constructor/result controls.
+    /// Original read storage, mapping, allocator overhead, stack and subsequent
+    /// read scratch remain separate. No source handle or tensor metadata is cloned.
+    pub fn required_bytes<D>(&self) -> Option<usize> {
+        [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<SpanProjectionPlan<'static>>(),
+            std::mem::size_of::<PreparedEncodedRead<(C, D)>>(),
+            std::mem::size_of::<EncodedProjectionBuildError<(C, D)>>(),
+            std::mem::size_of::<
+                Result<PreparedEncodedRead<(C, D)>, EncodedProjectionBuildError<(C, D)>>,
+            >(),
+            std::mem::size_of::<Vec<ReadSpan>>(),
+            std::mem::size_of::<ReadSpan>(),
+            std::mem::size_of::<Result<(), EncodedProjectionError>>(),
+        ]
+        .into_iter()
+        .try_fold(self.backing_bytes, usize::checked_add)
+    }
+    /// Construct projected spans under the supplied custody. Every replaced or
+    /// untouched source record remains in the same owner. Reserve or geometry
+    /// failure returns that exact partial read before either custody can retire.
+    pub fn construct<D>(
+        self,
+        custody: D,
+    ) -> Result<PreparedEncodedRead<(C, D)>, EncodedProjectionBuildError<(C, D)>> {
+        let mut read = self.read.with_custody(custody);
+        let result = (|| {
+            let mut covered = 0usize;
+            for spans in read
+                .batch
+                .shards
+                .iter_mut()
+                .map(|(_, source)| &mut source.spans)
+                .chain(read.batch.memory.iter_mut().map(|source| &mut source.spans))
+            {
+                let plan = SpanProjectionPlan::new(spans, self.ranges)?;
+                covered = covered
+                    .checked_add(plan.covered)
+                    .ok_or(EncodedProjectionError::Invalid)?;
+                *spans = plan.build()?;
+            }
+            if covered != self.output_bytes {
+                return Err(EncodedProjectionError::Invalid);
+            }
+            read.batch
+                .shards
+                .retain(|(_, shard)| !shard.spans.is_empty());
+            read.batch.memory.retain(|source| !source.spans.is_empty());
+            read.batch.byte_len = self.output_bytes;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(read),
+            Err(cause) => Err(EncodedProjectionBuildError {
+                cause,
+                partial: read,
+            }),
         }
-        let mut covered = 0usize;
-        for spans in self
-            .shards
-            .iter_mut()
-            .map(|(_, source)| &mut source.spans)
-            .chain(self.memory.iter_mut().map(|source| &mut source.spans))
-        {
-            // Original batch spans have disjoint source coordinates even when
-            // a physical tensor occurs repeatedly. Source order is restored below.
-            spans.sort_unstable_by_key(|span| span.destination.start);
-            let plan = SpanProjectionPlan::new(spans, ranges).map_err(StoreError::from)?;
-            let mut projected = vec![
-                ReadSpan {
-                    source: 0..0,
-                    destination: 0..0
-                };
-                plan.count
-            ];
-            plan.fill_into(&mut projected).map_err(StoreError::from)?;
-            covered = covered.checked_add(plan.covered).ok_or_else(invalid)?;
-            *spans = projected;
-        }
-        // This also rejects a gap in the original admitted source coordinates.
-        // Repeated source rows count independently: each owns distinct output.
-        if covered != output_bytes {
-            return Err(invalid());
-        }
-        self.shards.retain(|(_, shard)| !shard.spans.is_empty());
-        self.memory.retain(|source| !source.spans.is_empty());
-        self.byte_len = output_bytes;
-        Ok(self)
+    }
+}
+
+/// Projection refusal retaining every original or replaced source record and
+/// its existing custody. An incomplete projection is not exposed as a read.
+pub struct EncodedProjectionBuildError<C> {
+    cause: EncodedProjectionError,
+    partial: PreparedEncodedRead<C>,
+}
+impl<C> EncodedProjectionBuildError<C> {
+    /// Fixed geometry or allocator cause, without formatting or owner erasure.
+    pub fn cause(&self) -> &EncodedProjectionError {
+        &self.cause
+    }
+    /// Original tensor occurrences retained with the failed construction prefix.
+    pub fn retained_tensors(&self) -> &[TensorMetadata] {
+        self.partial.tensors()
+    }
+}
+impl<C> std::fmt::Debug for EncodedProjectionBuildError<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedProjectionBuildError")
+            .field("cause", &self.cause)
+            .field("partial", &self.partial)
+            .finish()
+    }
+}
+impl<C> std::fmt::Display for EncodedProjectionBuildError<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl<C> std::error::Error for EncodedProjectionBuildError<C> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -81,27 +210,32 @@ struct SpanProjectionPlan<'a> {
     covered: usize,
     layout: std::alloc::Layout,
 }
-#[derive(Clone, Copy, Debug)]
-enum ProjectionError {
+/// Fixed encoded projection geometry or allocation refusal.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum EncodedProjectionError {
+    /// Source or destination coordinates do not describe the same bytes.
+    #[error("encoded recipe range projection is inconsistent")]
     Invalid,
+    /// Span backing or aggregate construction storage is not representable.
+    #[error("encoded projection span layout overflow")]
     Layout,
-    Destination { expected: usize, actual: usize },
-}
-impl From<ProjectionError> for StoreError {
-    fn from(error: ProjectionError) -> Self {
-        match error {
-            ProjectionError::Invalid => invalid(),
-            ProjectionError::Layout => {
-                StoreError::Internal("encoded projection span layout overflow".into())
-            }
-            ProjectionError::Destination { expected, actual } => StoreError::Internal(format!(
-                "encoded projection destination has {actual} spans; expected {expected}"
-            )),
-        }
-    }
+    /// A supplied destination has a different count from the immutable plan.
+    #[error("encoded projection destination has {actual} spans; expected {expected}")]
+    Destination {
+        /// Count established by the shared projection traversal.
+        expected: usize,
+        /// Number of supplied destination slots.
+        actual: usize,
+    },
+    /// Exact projected-span backing could not be reserved.
+    #[error("encoded projection span reserve failed: {0}")]
+    Reserve(#[source] std::collections::TryReserveError),
 }
 impl<'a> SpanProjectionPlan<'a> {
-    fn new(spans: &'a [ReadSpan], ranges: &'a [EncodedRange]) -> Result<Self, ProjectionError> {
+    fn new(
+        spans: &'a [ReadSpan],
+        ranges: &'a [EncodedRange],
+    ) -> Result<Self, EncodedProjectionError> {
         let mut previous = 0;
         for span in spans {
             if span.source.start > span.source.end
@@ -110,17 +244,17 @@ impl<'a> SpanProjectionPlan<'a> {
                 || u64::try_from(span.destination.len()).ok()
                     != Some(span.source.end - span.source.start)
             {
-                return Err(ProjectionError::Invalid);
+                return Err(EncodedProjectionError::Invalid);
             }
             previous = span.destination.end;
         }
         let mut count = 0usize;
         let covered = project(spans, ranges, |_| {
-            count = count.checked_add(1).ok_or(ProjectionError::Layout)?;
+            count = count.checked_add(1).ok_or(EncodedProjectionError::Layout)?;
             Ok(())
         })?;
-        let layout =
-            std::alloc::Layout::array::<ReadSpan>(count).map_err(|_| ProjectionError::Layout)?;
+        let layout = std::alloc::Layout::array::<ReadSpan>(count)
+            .map_err(|_| EncodedProjectionError::Layout)?;
         Ok(Self {
             spans,
             ranges,
@@ -129,16 +263,33 @@ impl<'a> SpanProjectionPlan<'a> {
             layout,
         })
     }
-    fn fill_into(&self, destination: &mut [ReadSpan]) -> Result<(), ProjectionError> {
+    fn build(&self) -> Result<Vec<ReadSpan>, EncodedProjectionError> {
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(self.count)
+            .map_err(EncodedProjectionError::Reserve)?;
+        spans.resize(
+            self.count,
+            ReadSpan {
+                source: 0..0,
+                destination: 0..0,
+            },
+        );
+        self.fill_into(&mut spans)?;
+        Ok(spans)
+    }
+    fn fill_into(&self, destination: &mut [ReadSpan]) -> Result<(), EncodedProjectionError> {
         if destination.len() != self.layout.size() / std::mem::size_of::<ReadSpan>() {
-            return Err(ProjectionError::Destination {
+            return Err(EncodedProjectionError::Destination {
                 expected: self.count,
                 actual: destination.len(),
             });
         }
         let mut next = 0;
         project(self.spans, self.ranges, |span| {
-            let slot = destination.get_mut(next).ok_or(ProjectionError::Invalid)?;
+            let slot = destination
+                .get_mut(next)
+                .ok_or(EncodedProjectionError::Invalid)?;
             *slot = span;
             next += 1;
             Ok(())
@@ -153,8 +304,8 @@ impl<'a> SpanProjectionPlan<'a> {
 fn project(
     spans: &[ReadSpan],
     ranges: &[EncodedRange],
-    mut emit: impl FnMut(ReadSpan) -> Result<(), ProjectionError>,
-) -> Result<usize, ProjectionError> {
+    mut emit: impl FnMut(ReadSpan) -> Result<(), EncodedProjectionError>,
+) -> Result<usize, EncodedProjectionError> {
     let mut covered = 0usize;
     for row in ranges {
         let first = spans.partition_point(|span| span.destination.end <= row.source.start);
@@ -173,24 +324,24 @@ fn project(
                 .start
                 .checked_add(
                     u64::try_from(start - span.destination.start)
-                        .map_err(|_| ProjectionError::Invalid)?,
+                        .map_err(|_| EncodedProjectionError::Invalid)?,
                 )
-                .ok_or(ProjectionError::Invalid)?;
+                .ok_or(EncodedProjectionError::Invalid)?;
             let file_end = file_start
-                .checked_add(u64::try_from(length).map_err(|_| ProjectionError::Invalid)?)
+                .checked_add(u64::try_from(length).map_err(|_| EncodedProjectionError::Invalid)?)
                 .filter(|end| *end <= span.source.end)
-                .ok_or(ProjectionError::Invalid)?;
+                .ok_or(EncodedProjectionError::Invalid)?;
             let destination_start = row
                 .destination
                 .start
                 .checked_add(start - row.source.start)
-                .ok_or(ProjectionError::Invalid)?;
+                .ok_or(EncodedProjectionError::Invalid)?;
             let destination_end = destination_start
                 .checked_add(length)
-                .ok_or(ProjectionError::Invalid)?;
+                .ok_or(EncodedProjectionError::Invalid)?;
             covered = covered
                 .checked_add(length)
-                .ok_or(ProjectionError::Invalid)?;
+                .ok_or(EncodedProjectionError::Invalid)?;
             emit(ReadSpan {
                 source: file_start..file_end,
                 destination: destination_start..destination_end,

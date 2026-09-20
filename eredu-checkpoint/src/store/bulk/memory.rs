@@ -3,7 +3,7 @@ use super::*;
 mod plan;
 pub use plan::{
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
-    MemoryEncodedReadRouteError, PreparedMemoryEncodedRead,
+    MemoryEncodedReadRouteError,
 };
 #[derive(Clone)]
 pub(super) struct ReadMemory {

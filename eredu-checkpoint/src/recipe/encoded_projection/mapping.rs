@@ -43,6 +43,8 @@ impl Children<'_> {
 }
 
 impl EncodedRecipeMapping {
+    pub(crate) fn encoded_ranges(&self) -> &[EncodedRange] { &self.ranges }
+
     /// Total encoded destination length, without reading payloads.
     pub fn byte_len(&self) -> usize {
         self.length

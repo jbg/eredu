@@ -919,6 +919,24 @@ can compose key, batch, catalog and inference admission in the same pool. These
 reservations remain separate from recursive mapping, projected spans, child-array
 storage and complete producer construction.
 
+File and memory encoded-read constructors return one move-only prepared read
+owner. Memory reads retain their direct, scratch-free copy worker; file reads
+retain original file validation and diagnostics through the borrowed worker.
+Runtime can move a completed read out of its initialization result only by
+transferring that result's actual account into the read's custody. No generic
+unfunded output extraction is exposed.
+
+Projected reads consume this exact owner. Planning validates coverage and counts
+new spans without allocation or payload reads. Construction reserves each exact
+span destination and shares the ordinary projection worker, retaining replaced
+and untouched source records with both the original and projection custody on
+failure. Ordinary recipe compilation uses the same constructor. Source handles
+and tensor metadata are moved, not cloned; errors retain typed geometry or
+allocator causes. Runtime compares before construction and preserves the read
+inside a rejected plan. Completed projections remain charged after source stores
+and mappings retire. Keys, shape/child/recipe/overlay storage, later read scratch
+and full producer construction retain separate admission.
+
 Memory-backed encoded reads inspect their actual immutable store and ordered
 keys before constructing metadata records and source spans. Ordinary reads and
 the runtime-admitted constructor share that worker. Runtime compares the original

@@ -146,9 +146,9 @@ impl<'a> MemoryEncodedReadPlan<'a> {
     pub fn required_bytes<C>(&self) -> Option<usize> {
         [
             size_of::<Self>(),
-            size_of::<PreparedMemoryEncodedRead<C>>(),
+            size_of::<PreparedEncodedRead<C>>(),
             size_of::<MemoryEncodedReadBuildError<C>>(),
-            size_of::<Result<PreparedMemoryEncodedRead<C>, MemoryEncodedReadBuildError<C>>>(),
+            size_of::<Result<PreparedEncodedRead<C>, MemoryEncodedReadBuildError<C>>>(),
             size_of::<ReadMemory>(),
             size_of::<ReadSpan>(),
             size_of::<TensorMetadata>(),
@@ -166,8 +166,8 @@ impl<'a> MemoryEncodedReadPlan<'a> {
     pub fn construct<C>(
         self,
         custody: C,
-    ) -> Result<PreparedMemoryEncodedRead<C>, MemoryEncodedReadBuildError<C>> {
-        let mut owner = PreparedMemoryEncodedRead {
+    ) -> Result<PreparedEncodedRead<C>, MemoryEncodedReadBuildError<C>> {
+        let mut owner = PreparedEncodedRead {
             batch: EncodedReadBatch {
                 tensors: Vec::new(),
                 shards: Vec::new(),
@@ -211,56 +211,10 @@ impl<'a> MemoryEncodedReadPlan<'a> {
     }
 }
 
-/// Move-only original read records with caller custody retained after all source
-/// and metadata fields. Only metadata loans and direct destination reads escape.
-///
-/// ```compile_fail
-/// use eredu_checkpoint::store::PreparedMemoryEncodedRead;
-/// fn copy(read: PreparedMemoryEncodedRead<()>) { let _ = read.clone(); }
-/// ```
-pub struct PreparedMemoryEncodedRead<C> {
-    pub(super) batch: EncodedReadBatch,
-    _custody: C,
-}
-impl<C> PreparedMemoryEncodedRead<C> {
-    /// Immutable metadata in requested occurrence order.
-    pub fn tensors(&self) -> &[TensorMetadata] {
-        self.batch.tensors()
-    }
-    /// Required caller-owned payload destination length, not constructor storage.
-    pub fn byte_len(&self) -> usize {
-        self.batch.byte_len()
-    }
-    /// Read the original immutable payloads without allocating scratch or staging.
-    /// A wrong destination length refuses before any output byte is changed.
-    pub fn read_into(&self, destination: &mut [u8]) -> Result<(), EncodedReadFailure> {
-        if destination.len() != self.byte_len() {
-            return Err(EncodedReadFailure {
-                batch: None,
-                shard: None,
-                completed_shards: 0,
-                cause: EncodedReadFailureCause::DestinationLengths,
-            });
-        }
-        for source in &self.batch.memory {
-            source.copy_into(destination)?;
-        }
-        Ok(())
-    }
-}
-impl<C> fmt::Debug for PreparedMemoryEncodedRead<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedMemoryEncodedRead")
-            .field("tensors", &self.batch.tensors.len())
-            .field("byte_len", &self.byte_len())
-            .finish_non_exhaustive()
-    }
-}
-
 /// A failed reserve retains the actual constructed batch prefix and custody.
 pub struct MemoryEncodedReadBuildError<C> {
     cause: TryReserveError,
-    partial: PreparedMemoryEncodedRead<C>,
+    partial: PreparedEncodedRead<C>,
 }
 impl<C> MemoryEncodedReadBuildError<C> {
     /// Metadata rows completely constructed before the failed reserve.

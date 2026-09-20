@@ -672,9 +672,9 @@ pub use bulk::{
     DetachedEncodedReadPlan, DetachedEncodedReadSlice, DetachedEncodedReads,
     DetachedReadBuildCause, DetachedReadBuildError, DetachedReadFailure, EncodedReadBatch,
     EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
+    EncodedProjectionError, EncodedProjectionBuildError, EncodedReadProjectionPlan,
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
-    PreparedMemoryEncodedRead,
-    PreparedSafetensorsEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    PreparedEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
     SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
 };
 
@@ -1774,6 +1774,9 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// Fixed geometry or allocation failure from encoded source projection.
+    #[error(transparent)]
+    EncodedProjection(#[from] EncodedProjectionError),
     /// Typed refusal from source discovery or store metadata admission.
     #[error("SafeTensors source admission failed: {0}")]
     SafetensorsSourceAdmission(#[source] Arc<dyn std::error::Error + Send + Sync>),

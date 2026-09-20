@@ -5,17 +5,19 @@ use std::io::{self, IoSliceMut};
 
 mod borrowed;
 mod projection;
+mod prepared;
+pub use prepared::PreparedEncodedRead;
+pub use projection::{EncodedProjectionError, EncodedProjectionBuildError, EncodedReadProjectionPlan};
 pub(crate) use projection::EncodedRange;
 mod detached;
 mod memory;
 mod file;
 pub use file::{
-    PreparedSafetensorsEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
     SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
 };
 pub use memory::{
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
-    PreparedMemoryEncodedRead,
 };
 pub use borrowed::{EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout};
 pub use detached::{

@@ -221,9 +221,9 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     /// storage uses a conservative selected-path maximum; allocator-private and
     /// OS storage, existing headers/diagnostics and later read scratch are excluded.
     pub fn required_bytes<C>(&self) -> Option<usize> {
-        [size_of::<Self>(), size_of::<PreparedSafetensorsEncodedRead<C>>(),
+        [size_of::<Self>(), size_of::<PreparedEncodedRead<C>>(),
             size_of::<SafetensorsEncodedReadBuildError<C>>(),
-            size_of::<Result<PreparedSafetensorsEncodedRead<C>, SafetensorsEncodedReadBuildError<C>>>(),
+            size_of::<Result<PreparedEncodedRead<C>, SafetensorsEncodedReadBuildError<C>>>(),
             size_of::<Vec<Entry<'_>>>(), size_of::<Entry<'_>>(), size_of::<TensorMetadata>(),
             size_of::<ReadShard>(), size_of::<ReadSpan>(), size_of::<Vec<ReadSpan>>(),
             size_of::<MutexGuard<'_, CacheState>>(), size_of::<Result<(), SafetensorsEncodedReadBuildCause>>()]
@@ -235,8 +235,8 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     pub fn construct<C>(
         self,
         custody: C,
-    ) -> Result<PreparedSafetensorsEncodedRead<C>, SafetensorsEncodedReadBuildError<C>> {
-        let mut owner = PreparedSafetensorsEncodedRead {
+    ) -> Result<PreparedEncodedRead<C>, SafetensorsEncodedReadBuildError<C>> {
+        let mut owner = PreparedEncodedRead {
             batch: EncodedReadBatch {
                 tensors: Vec::new(),
                 shards: Vec::new(),
@@ -322,44 +322,6 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     }
 }
 
-/// Move-only original file read batch retaining its constructor custody.
-/// Later read scratch and caller-owned destinations require separate admission.
-///
-/// ```compile_fail
-/// use eredu_checkpoint::store::PreparedSafetensorsEncodedRead;
-/// fn copy(read: PreparedSafetensorsEncodedRead<()>) { let _ = read.clone(); }
-/// ```
-pub struct PreparedSafetensorsEncodedRead<C> {
-    pub(super) batch: EncodedReadBatch,
-    _custody: C,
-}
-impl<C> PreparedSafetensorsEncodedRead<C> {
-    /// Metadata in original occurrence order, including repeated sources.
-    pub fn tensors(&self) -> &[TensorMetadata] {
-        self.batch.tensors()
-    }
-    /// Exact caller-owned payload destination length.
-    pub fn byte_len(&self) -> usize {
-        self.batch.byte_len()
-    }
-    /// Separate scratch contribution for a read over these completed records.
-    pub fn read_layout(&self) -> Option<EncodedReadLayout> {
-        EncodedReadLayout::inspect(std::iter::once(&self.batch))
-    }
-    /// Use the existing borrowed worker after separately admitting read scratch.
-    /// It validates original file identity and updates the same finite diagnostics.
-    pub fn read_into(&self, destination: &mut [u8]) -> Result<(), EncodedReadFailure> {
-        borrowed::read_many(std::iter::once(&self.batch), &mut [destination], || {})
-    }
-}
-impl<C> fmt::Debug for PreparedSafetensorsEncodedRead<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedSafetensorsEncodedRead")
-            .field("tensors", &self.batch.tensors.len())
-            .field("byte_len", &self.byte_len())
-            .finish_non_exhaustive()
-    }
-}
 /// Fixed construction refusal, independent of source/header error storage.
 #[derive(Debug, thiserror::Error)]
 pub enum SafetensorsEncodedReadBuildCause {
@@ -376,7 +338,7 @@ pub enum SafetensorsEncodedReadBuildCause {
 /// Retains the actual constructed prefix and custody through error retirement.
 pub struct SafetensorsEncodedReadBuildError<C> {
     cause: SafetensorsEncodedReadBuildCause,
-    partial: PreparedSafetensorsEncodedRead<C>,
+    partial: PreparedEncodedRead<C>,
 }
 impl<C> SafetensorsEncodedReadBuildError<C> {
     /// The fixed underlying reserve or diagnostic refusal.
