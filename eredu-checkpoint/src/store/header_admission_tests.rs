@@ -6,31 +6,57 @@ struct Policy {
     calls: AtomicUsize,
     retired: Arc<AtomicUsize>,
     refuse: bool,
+    completed: Arc<AtomicUsize>,
+    refuse_completion: bool,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("header admission refused")]
 struct Refused;
 #[derive(Debug)]
-struct Hold(Arc<AtomicUsize>);
+struct Hold {
+    retired: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    refuse_completion: bool,
+}
+impl Hold {
+    fn complete(&self) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_completion {
+            Err(Arc::new(CompletionRefused))
+        } else {
+            Ok(())
+        }
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("header completion refused")]
+struct CompletionRefused;
 impl Drop for Hold {
     fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 impl SafetensorsHeaderAdmission for Policy {
     fn reserve(
         &self,
         request: SafetensorsHeaderRequest,
-    ) -> Result<SafetensorsHeaderReservation, Arc<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SafetensorsHeaderReservation, Arc<SafetensorsHeaderFailure>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(request.buffer_bytes, request.json_bytes + 8);
         assert!(request.path_bytes > 0);
         if self.refuse {
-            Err(Arc::new(Refused))
+            Err(Arc::new(SafetensorsHeaderFailure::refused(Arc::new(
+                Refused,
+            ))))
         } else {
-            Ok(SafetensorsHeaderReservation::new(Hold(
-                self.retired.clone(),
-            )))
+            Ok(SafetensorsHeaderReservation::with_completion(
+                Hold {
+                    retired: self.retired.clone(),
+                    completed: self.completed.clone(),
+                    refuse_completion: self.refuse_completion,
+                },
+                Hold::complete,
+            ))
         }
     }
 }
@@ -96,6 +122,7 @@ fn successful_header_hold_outlives_store_with_a_payload_lease() {
         .unwrap();
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     drop(store);
+    assert_eq!(policy.completed.load(Ordering::SeqCst), 1);
     assert_eq!(policy.retired.load(Ordering::SeqCst), 0);
     assert_eq!(lease.encoded_bytes().unwrap(), [11, 19]);
     drop(lease);
@@ -135,6 +162,7 @@ fn concurrent_failed_headers_share_one_admission_and_errors_retain_it() {
         .map(|thread| thread.join().unwrap())
         .collect();
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(policy.completed.load(Ordering::SeqCst), 1);
     let StoreError::SafetensorsHeader(first) = &errors[0] else {
         panic!("retained header failure")
     };
@@ -233,6 +261,7 @@ fn strict_discovery_reuses_admitted_headers_and_preserves_refusal_sources() {
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     assert_eq!(policy.retired.load(Ordering::SeqCst), 0);
     drop(store);
+    assert_eq!(policy.completed.load(Ordering::SeqCst), 1);
     assert_eq!(policy.retired.load(Ordering::SeqCst), 1);
     let refused = Arc::new(Policy {
         refuse: true,
@@ -247,5 +276,72 @@ fn strict_discovery_reuses_admitted_headers_and_preserves_refusal_sources() {
     let mut cause: &dyn std::error::Error = &error;
     while !cause.is::<Refused>() {
         cause = cause.source().expect("strict typed refusal");
+    }
+}
+
+#[test]
+fn completion_failure_keeps_completed_metadata_and_original_parse_failure() {
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let json: &[u8] = if malformed {
+            b"xxxxxxxx"
+        } else {
+            br#"{"weight":{"dtype":"U8","shape":[2],"data_offsets":[0,2]}}"#
+        };
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(json);
+        bytes.extend_from_slice(&[11, 19]);
+        std::fs::write(dir.path().join("weights.safetensors"), bytes).unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"weights.safetensors"}}"#,
+        )
+        .unwrap();
+        let policy = Arc::new(Policy {
+            refuse_completion: true,
+            ..Default::default()
+        });
+        let store = SafetensorsWeightStore::open_with_header_admission(
+            dir.path(),
+            1,
+            SafetensorsDiscoveryLimits::default(),
+            policy.clone(),
+        )
+        .unwrap();
+        let error = WeightStore::metadata(&store, "weight").unwrap_err();
+        let StoreError::SafetensorsHeader(failure) = &error else {
+            panic!("shared failure")
+        };
+        assert!(
+            failure
+                .completion_failure()
+                .unwrap()
+                .is::<CompletionRefused>()
+        );
+        if malformed {
+            assert!(
+                std::error::Error::source(failure.as_ref())
+                    .unwrap()
+                    .is::<StoreError>()
+            );
+            assert!(error.to_string().contains("malformed safetensors shard"));
+        } else {
+            assert!(
+                std::error::Error::source(failure.as_ref())
+                    .unwrap()
+                    .is::<CompletionRefused>()
+            );
+        }
+        let again = WeightStore::metadata(&store, "weight").unwrap_err();
+        let StoreError::SafetensorsHeader(other) = &again else {
+            panic!("shared failure")
+        };
+        assert!(Arc::ptr_eq(failure, other));
+        assert_eq!(policy.completed.load(Ordering::SeqCst), 1);
+        drop(store);
+        drop(again);
+        assert_eq!(policy.retired.load(Ordering::SeqCst), 0);
+        drop(error);
+        assert_eq!(policy.retired.load(Ordering::SeqCst), 1);
     }
 }

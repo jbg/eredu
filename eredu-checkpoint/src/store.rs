@@ -2091,11 +2091,20 @@ impl AdmittedShard {
                         _reservation: reservation.clone(),
                     })
                 })();
-                match (result, reservation) {
-                    (Err(error), Some(reservation)) => Err(StoreError::SafetensorsHeader(
-                        Arc::new(SafetensorsHeaderFailure::new(error, Some(reservation))),
-                    )),
-                    (result, _) => result,
+                let completion = reservation.as_ref().and_then(|hold| hold.complete().err());
+                match (result, reservation, completion) {
+                    (Err(error), Some(reservation), completion) => {
+                        Err(StoreError::SafetensorsHeader(Arc::new(
+                            SafetensorsHeaderFailure::new(error, Some(reservation), completion),
+                        )))
+                    }
+                    (Ok(header), Some(reservation), Some(cause)) => {
+                        Err(StoreError::SafetensorsHeader(Arc::new(
+                            SafetensorsHeaderFailure::completion_failed(cause, header, reservation),
+                        )))
+                    }
+                    (result, _, None) => result,
+                    (_, None, Some(_)) => unreachable!("completion requires a reservation"),
                 }
             })
             .as_ref()
@@ -2631,11 +2640,7 @@ fn read_safetensors_metadata_from_admitted(
                     buffer_bytes: 8 + header_len,
                     path_bytes: path.as_os_str().len(),
                 })
-                .map_err(|cause| {
-                    StoreError::SafetensorsHeader(Arc::new(SafetensorsHeaderFailure::refused(
-                        cause,
-                    )))
-                })?,
+                .map_err(StoreError::SafetensorsHeader)?,
         );
     }
     let mut encoded_header = Vec::with_capacity(8 + header_len);

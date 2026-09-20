@@ -59,6 +59,8 @@ pub use source_erasure::OriginalRetainedSourceError;
 mod gguf_source;
 mod memory_tensor_source;
 pub use memory_tensor_source::{MemoryTensorBufferQuote, OriginalMemoryTensorError};
+mod safetensors_header_source;
+pub use safetensors_header_source::{SafetensorsHeaderPolicyError, SafetensorsHeaderQuote};
 pub use gguf_catalog::{OriginalGgufCatalog, OriginalGgufCatalogError};
 pub use gguf_source::{GgufSourceStorageKey, OriginalGgufSourceError};
 

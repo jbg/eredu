@@ -905,9 +905,23 @@ parse, index-consistency and geometry failures retain it in the cached error.
 Error clones share that failure and its custody, preserving the typed source.
 Concurrent initialization invokes admission once per shard. Header limits and
 file-identity checks still run, and ordinary opening uses the same reader.
-This header contract does not reserve discovery/index/catalog storage, later
-metadata clones, caches or read payloads; runtime policy must fund those owners
-separately and supply its own header estimate/reservation implementation.
+The reservation completion callback runs once after header construction,
+before publishing its result. It ends active construction while retaining bytes;
+completion errors retain any completed metadata and preserve a simultaneous
+construction error as the primary source.
+Runtime supplies header admission through the existing working-memory pool.
+Its quote separates the encoded buffer, configurable metadata/dependency
+headroom and qualified fixed reservation/error controls. The metadata portion is
+an input-derived estimate, not a dependency-wide or process-wide ceiling.
+A policy has a finite lifetime header-initialization allowance, sized for the
+source inventory. Each attempted initialization consumes one slot, including a
+refusal; aliases of an initialized shard consume none. Fixed policy controls and
+refusal wrappers are prepaid, and calls beyond the allowance share one retained
+limit error. Accepted byte reservations remain through the last header/error
+alias, while active-construction exclusion ends after parsing and validation.
+Policy and failure custody use weak pool references to avoid registry cycles.
+This header policy does not reserve discovery/index/catalog storage, later
+metadata clones, caches or read payloads; those owners need separate admission.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
