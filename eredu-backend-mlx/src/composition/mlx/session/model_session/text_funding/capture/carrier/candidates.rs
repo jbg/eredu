@@ -1,5 +1,6 @@
 //! Canonical terminal prefill carrier uses the shared typed candidate readout.
 use super::*;
+use eredu_core::capture::CaptureTokenDomain;
 use crate::backend::array_copy::CandidateExtraction;
 use eredu_runtime::working_memory::{CaptureCandidateClaim, ClaimedCaptureCandidates};
 
@@ -10,6 +11,7 @@ impl FundedWork {
         claim: CaptureCandidateClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
     ) -> Result<ClaimedCaptureCandidates, Error> {
         let mut slot = self.capture.try_borrow_mut().map_err(error)?;
         let capture: &mut CaptureCarrier = slot
@@ -26,6 +28,7 @@ impl FundedWork {
             claim,
             stream,
             completion,
+            domain,
             &capture.roots,
             &capture.publications,
             Some(segment),

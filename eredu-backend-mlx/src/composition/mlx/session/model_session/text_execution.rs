@@ -58,6 +58,7 @@ fn prefill_inner(
             permission,
             collector,
             &bound,
+            decision.capture_domain(),
         )?;
         let Some(submission) = submission else {
             return Ok(None);
@@ -207,6 +208,7 @@ fn decode_inner(
             permission,
             capture.collector_mut(),
             prediction,
+            decision.capture_domain(),
         )?;
 
         return sample_text_submission(runtime.session(), submission, filter, state, stream);

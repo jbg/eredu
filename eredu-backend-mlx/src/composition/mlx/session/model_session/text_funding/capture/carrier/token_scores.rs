@@ -1,5 +1,6 @@
 //! Same terminal source carrier and scalar worker, with no replacement scope.
 use super::*;
+use eredu_core::capture::CaptureTokenDomain;
 use crate::backend::array_copy::TokenScoreProgram;
 use eredu_runtime::working_memory::{CaptureTokenScoreClaim, ClaimedCaptureTokenScores};
 impl FundedWork {
@@ -9,6 +10,7 @@ impl FundedWork {
         claim: CaptureTokenScoreClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
     ) -> Result<ClaimedCaptureTokenScores, Error> {
         let population = TokenScoreProgram::from_geometry(claim.geometry())
             .and_then(|program| program.population())
@@ -33,6 +35,7 @@ impl FundedWork {
             claim,
             stream,
             completion,
+            domain,
             &capture.roots,
             &capture.publications,
             Some(segment),

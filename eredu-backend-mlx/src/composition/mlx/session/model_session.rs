@@ -2058,12 +2058,13 @@ impl MlxModelSession {
         permission: text_step::TextOperation<'_>,
         capture: &mut eredu_runtime::capture::FundedCaptureSession,
         prediction: u64,
+        domain: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
     ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
         self.submit_decode_input_with_capture_permission(
             backend,
             input,
             Some(permission),
-            Some((capture, prediction)),
+            Some((capture, prediction, domain)),
         )
     }
 
@@ -2072,7 +2073,11 @@ impl MlxModelSession {
         backend: &MlxBackend<'_>,
         input: impl FnOnce() -> Result<Array, Error>,
         permission: Option<text_step::TextOperation<'_>>,
-        capture: Option<(&mut eredu_runtime::capture::FundedCaptureSession, u64)>,
+        capture: Option<(
+            &mut eredu_runtime::capture::FundedCaptureSession,
+            u64,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        )>,
     ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
         let metadata = permission
             .as_ref()
@@ -2100,8 +2105,8 @@ impl MlxModelSession {
                 };
 
             let output = match capture {
-                Some((capture, prediction)) => {
-                    operation.with_funded_capture(backend, capture, prediction, execute)
+                Some((capture, prediction, domain)) => {
+                    operation.with_funded_capture(backend, capture, prediction, domain, execute)
                 }
                 None => execute(operation.model(), &mut eredu_runtime::NoopObserver),
             };
@@ -2456,6 +2461,7 @@ impl MlxModelSession {
         permission: text_step::TextOperation<'_>,
         capture: &mut eredu_runtime::capture::FundedCaptureSession,
         bound: &text_capture::InstalledPrefillCapture<'_>,
+        domain: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
     ) -> Result<Option<Submission<Array, MlxSessionCompletion>>, Error> {
         let capture_geometry = match bound {
             text_capture::InstalledPrefillCapture::Prompt(_) => {
@@ -2473,7 +2479,7 @@ impl MlxModelSession {
             false,
             &mut eredu_runtime::NoopObserver,
             Some(permission),
-            Some((capture, bound)),
+            Some((capture, bound, domain)),
         )
     }
 
@@ -2490,6 +2496,7 @@ impl MlxModelSession {
         capture: Option<(
             &mut eredu_runtime::capture::FundedCaptureSession,
             &text_capture::InstalledPrefillCapture<'_>,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
         )>,
     ) -> Result<Option<Submission<Array, MlxSessionCompletion>>, Error> {
         let mut operation = self.begin_text_submission(backend, permission)?;
@@ -2526,11 +2533,11 @@ impl MlxModelSession {
                 }
             };
         let output = match capture {
-            Some((capture, text_capture::InstalledPrefillCapture::Prompt(bound))) => {
-                operation.with_funded_prefill_capture(backend, capture, bound, execute)
+            Some((capture, text_capture::InstalledPrefillCapture::Prompt(bound), domain)) => {
+                operation.with_funded_prefill_capture(backend, capture, bound, domain, execute)
             }
-            Some((capture, text_capture::InstalledPrefillCapture::Continuation(bound))) => {
-                operation.with_funded_continuation_capture(backend, capture, bound, execute)
+            Some((capture, text_capture::InstalledPrefillCapture::Continuation(bound), domain)) => {
+                operation.with_funded_continuation_capture(backend, capture, bound, domain, execute)
             }
             None => {
                 let output = execute(

@@ -8,7 +8,7 @@ use crate::composition::mlx::session::{
     bounded_capture::estimate_tensor_geometry, model_session::SessionOperation,
 };
 use eredu_core::{
-    capture::{CaptureError, CaptureUsage},
+    capture::{CaptureError, CaptureTokenDomain, CaptureUsage},
     checkpoint::TensorDtype,
 };
 use eredu_runtime::capture::{FundedCaptureError, FundedCaptureSession, ScheduledCaptureBackend};
@@ -21,6 +21,7 @@ pub(super) struct NativeScheduledCapture<'a> {
     stream: &'a Stream,
     owner: Option<super::super::super::SubmissionResourcesOwner>,
     prefill: bool,
+    domain: Option<CaptureTokenDomain<'a>>,
     partition: Option<&'a mut (dyn eredu_runtime::capture::partition::ScheduledPartitionCapture + 'a)>,
 }
 #[cfg(test)]
@@ -31,6 +32,7 @@ impl<'a> NativeScheduledCapture<'a> {
             stream,
             owner: None,
             prefill: false,
+            domain: None,
             partition: None,
         }
     }
@@ -534,7 +536,7 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 .as_ref()
                 .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
             self.work
-                .capture_candidates_with_completion(source, claim, self.stream, completion)
+                .capture_candidates_with_completion(source, claim, self.stream, completion, self.domain)
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
@@ -577,7 +579,7 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
 
             self.work
-                .capture_token_scores_with_completion(source, claim, self.stream, completion)
+                .capture_token_scores_with_completion(source, claim, self.stream, completion, self.domain)
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
@@ -608,6 +610,8 @@ pub(super) fn error_control_bytes() -> Option<usize> {
         eredu_nn::Error::retained_source_construction_bytes::<Error>()?,
         crate::backend::array_copy::capture_original_error_control_bytes()?.checked_mul(2)?,
         size_of::<NativeScheduledCapture<'static>>(),
+        // Borrowed decision through submission, scheduled entry and callback.
+        size_of::<[Option<CaptureTokenDomain<'static>>; 4]>(),
         size_of::<Option<safemlx::OriginalScopeObserver>>(),
         size_of::<Result<Option<safemlx::OriginalScopeObserver>, Error>>(),
         size_of::<FundedCaptureError<Error>>(),
@@ -638,12 +642,13 @@ impl<P: Probe> SessionOperation<'_, P> {
         backend: &MlxBackend<'_>,
         capture: &mut FundedCaptureSession,
         prediction: u64,
+        domain: Option<CaptureTokenDomain<'_>>,
         operation: impl FnOnce(
             &mut Executable,
             &mut dyn RuntimeActivationObserver<Array, Error>,
         ) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        self.with_funded_capture_inner(backend, capture, prediction, None, None, false, operation)
+        self.with_funded_capture_inner(backend, capture, prediction, None, None, false, domain, operation)
     }
 
     /// Use the same work owner with the original installed prefill companion.
@@ -652,12 +657,13 @@ impl<P: Probe> SessionOperation<'_, P> {
         backend: &MlxBackend<'_>,
         capture: &mut FundedCaptureSession,
         bound: &eredu_runtime::working_memory::AdmittedPrefillCapture<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
         operation: impl FnOnce(
             &mut Executable,
             &mut dyn RuntimeActivationObserver<Array, Error>,
         ) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        self.with_funded_capture_inner(backend, capture, 0, Some(bound), None, true, operation)
+        self.with_funded_capture_inner(backend, capture, 0, Some(bound), None, true, domain, operation)
     }
 
     pub(in crate::composition::mlx::session::model_session) fn with_funded_continuation_capture<
@@ -667,6 +673,7 @@ impl<P: Probe> SessionOperation<'_, P> {
         backend: &MlxBackend<'_>,
         capture: &mut FundedCaptureSession,
         admitted: &eredu_runtime::working_memory::AdmittedCaptureContinuation<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
         operation: impl FnOnce(
             &mut Executable,
             &mut dyn RuntimeActivationObserver<Array, Error>,
@@ -679,6 +686,7 @@ impl<P: Probe> SessionOperation<'_, P> {
             None,
             Some(admitted),
             true,
+            domain,
             operation,
         )
     }
@@ -691,6 +699,7 @@ impl<P: Probe> SessionOperation<'_, P> {
         bound: Option<&eredu_runtime::working_memory::AdmittedPrefillCapture<'_>>,
         continuation: Option<&eredu_runtime::working_memory::AdmittedCaptureContinuation<'_>>,
         physical_prefill: bool,
+        domain: Option<CaptureTokenDomain<'_>>,
         operation: impl FnOnce(
             &mut Executable,
             &mut dyn RuntimeActivationObserver<Array, Error>,
@@ -752,6 +761,7 @@ impl<P: Probe> SessionOperation<'_, P> {
             stream: backend.stream(),
             owner: Some(self.owner.clone()),
             prefill: physical_prefill,
+            domain,
             partition: partition_program.as_mut().map(|program| program as
                 &mut dyn eredu_runtime::capture::partition::ScheduledPartitionCapture),
         };

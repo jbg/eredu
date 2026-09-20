@@ -1,7 +1,7 @@
 //! Existing sorted candidate worker under the same original source/readout owner.
 use super::*;
 use crate::backend::array_copy::{CandidateExtraction, CaptureTensorNativeError};
-use eredu_core::capture::CapturePhase;
+use eredu_core::capture::{CandidateDomain, CapturePhase, CaptureTokenDomain};
 use eredu_runtime::working_memory::{
     CaptureCandidateClaim, CaptureSourceSegment, ClaimedCaptureCandidates,
 };
@@ -9,23 +9,16 @@ fn error<E: std::error::Error + Send + Sync + 'static>(cause: E) -> Error {
     Error::Other(Box::new(cause))
 }
 impl FundedWork {
-    pub(in crate::composition::mlx::session::model_session::text_funding) fn capture_candidates(
-        &self,
-        source: &Array,
-        claim: CaptureCandidateClaim<'_, '_>,
-        stream: &Stream,
-    ) -> Result<ClaimedCaptureCandidates, Error> {
-        self.capture_candidates_with_completion(source, claim, stream, CaptureCompletion::Ordinary)
-    }
     pub(in crate::composition::mlx::session::model_session::text_funding) fn capture_candidates_with_completion(
         &self,
         source: &Array,
         claim: CaptureCandidateClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
     ) -> Result<ClaimedCaptureCandidates, Error> {
         if claim.geometry().phase() == CapturePhase::Prefill {
-            return self.capture_prefill_candidates(source, claim, stream, completion);
+            return self.capture_prefill_candidates(source, claim, stream, completion, domain);
         }
         let first = self.roots.try_borrow().map_err(error)?.len();
         let receipt = self.capture_candidates_into(
@@ -33,6 +26,7 @@ impl FundedWork {
             claim,
             stream,
             completion,
+            domain,
             &self.roots,
             &self.publications,
             None,
@@ -46,12 +40,14 @@ impl FundedWork {
         claim: CaptureCandidateClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
         roots: &RefCell<Vec<Array>>,
         publications: &RefCell<Vec<RetainedStoragePublication>>,
         segment: Option<&mut CaptureSourceSegment>,
     ) -> Result<ClaimedCaptureCandidates, Error> {
         let program = CandidateExtraction::from_geometry(claim.geometry()).map_err(error)?;
         program.validate_source(source).map_err(error)?;
+        let summary = domain.map(|domain| domain.summary(claim.geometry().vocabulary() as u32));
         self.with_capture_readout(
             source,
             claim,
@@ -64,9 +60,9 @@ impl FundedWork {
             |claim, scope, segment, source_pin, retain| {
                 let mut destination = match segment {
                     Some(segment) => {
-                        claim.prepare_with_segment_source(scope, segment, source_pin, None)
+                        claim.prepare_with_segment_source(scope, segment, source_pin, summary)
                     }
-                    None => claim.prepare_with_source(scope, source_pin, None),
+                    None => claim.prepare_with_source(scope, source_pin, summary),
                 }
                 .map_err(error)?;
                 destination.validate().map_err(error)?;
@@ -76,7 +72,7 @@ impl FundedWork {
                 program
                     .read_with_completion(&ids, &scores, stream, completion, |id, score| {
                         destination
-                            .push(id, score, true)
+                            .push(id, score, domain.is_none_or(|domain| domain.filter.allows(id)))
                             .map_err(CaptureTensorNativeError::from)
                     })
                     .map_err(error)?;
@@ -94,6 +90,8 @@ pub(super) fn control_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     type Transfer = ScheduledCaptureCandidatesTransfer<'static, 'static, 'static, StorageIdentity>;
     let frames = [
+        size_of::<[Option<CaptureTokenDomain<'static>>; 5]>(),
+        size_of::<[Option<CandidateDomain>; 2]>(),
         size_of::<CandidateExtraction>(), // validated local survives through callback
         size_of::<(
             CandidateExtraction,

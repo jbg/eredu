@@ -2,7 +2,7 @@
 use super::*;
 use crate::backend::array_copy::{CaptureTensorNativeError, TokenScoreProgram};
 use crate::backend::runtime::residency::storage::StorageIdentity;
-use eredu_core::capture::CapturePhase;
+use eredu_core::capture::{CandidateDomain, CapturePhase, CaptureTokenDomain};
 use eredu_runtime::working_memory::{
     CaptureSourceSegment, CaptureTokenScoreClaim, ClaimedCaptureTokenScores, WorkingMemoryError,
 };
@@ -17,9 +17,10 @@ impl FundedWork {
         claim: CaptureTokenScoreClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
     ) -> Result<ClaimedCaptureTokenScores, Error> {
         if claim.geometry().phase() == CapturePhase::Prefill {
-            return self.capture_prefill_token_scores(source, claim, stream, completion);
+            return self.capture_prefill_token_scores(source, claim, stream, completion, domain);
         }
         // Successful decode readout roots are private scratch, not model/state.
         // Failure keeps the whole prefix in the existing original Work owner.
@@ -29,6 +30,7 @@ impl FundedWork {
             claim,
             stream,
             completion,
+            domain,
             &self.roots,
             &self.publications,
             None,
@@ -42,12 +44,14 @@ impl FundedWork {
         claim: CaptureTokenScoreClaim<'_, '_>,
         stream: &Stream,
         completion: CaptureCompletion<'_>,
+        domain: Option<CaptureTokenDomain<'_>>,
         roots: &RefCell<Vec<Array>>,
         publications: &RefCell<Vec<RetainedStoragePublication>>,
         segment: Option<&mut CaptureSourceSegment>,
     ) -> Result<ClaimedCaptureTokenScores, Error> {
         let program = TokenScoreProgram::from_geometry(claim.geometry()).map_err(error)?;
         program.validate_source(source).map_err(error)?;
+        let summary = domain.map(|domain| domain.summary(claim.geometry().vocabulary() as u32));
         let population = program.population().map_err(error)?;
         let roots_count = population
             .retained_outputs
@@ -65,9 +69,9 @@ impl FundedWork {
             |claim, scope, segment, source_pin, retain| {
                 let mut destination = match segment {
                     Some(segment) => {
-                        claim.prepare_with_segment_source(scope, segment, source_pin, None)
+                        claim.prepare_with_segment_source(scope, segment, source_pin, summary)
                     }
-                    None => claim.prepare_with_source(scope, source_pin, None),
+                    None => claim.prepare_with_source(scope, source_pin, summary),
                 }
                 .map_err(error)?;
                 destination.validate().map_err(error)?;
@@ -85,7 +89,7 @@ impl FundedWork {
                             #[cfg(not(test))]
                             let _ = count;
                         },
-                        |_| true,
+                        |id| domain.is_none_or(|domain| domain.filter.allows(id)),
                         |score| {
                             destination
                                 .push(score)
@@ -109,6 +113,8 @@ pub(super) fn control_bytes() -> Option<usize> {
     };
     use std::mem::{size_of, size_of_val};
     let frames = [
+        size_of::<[Option<CaptureTokenDomain<'static>>; 5]>(),
+        size_of::<[Option<CandidateDomain>; 2]>(),
         size_of::<TokenScoreProgram<'static>>(),
         size_of::<CaptureTokenScoreClaim<'static, 'static>>(),
         size_of::<ScheduledCaptureTokenScoresTransfer<'static, 'static, 'static, StorageIdentity>>(

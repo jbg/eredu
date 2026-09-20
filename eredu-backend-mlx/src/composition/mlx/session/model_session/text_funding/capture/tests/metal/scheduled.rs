@@ -404,7 +404,7 @@ fn bridge_lends_exclusive_model_without_holding_native_scope_and_releases_observ
     let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
     let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
     operation
-        .with_funded_capture(&backend, &mut f.capture, 0, |model, observer| {
+        .with_funded_capture(&backend, &mut f.capture, 0, None, |model, observer| {
             assert!(std::ptr::eq(model, expected_model));
             assert!(f.work.scope.try_borrow_mut().is_ok());
             observed(observer, &source, 0)?;
@@ -441,7 +441,7 @@ fn bridge_without_installed_funding_rejects_before_callback_or_claim() {
     let mut operation = installed_operation(runtime.session_mut(), None);
     let invoked = Cell::new(false);
     let error = operation
-        .with_funded_capture(&backend, &mut f.capture, 0, |_, _| {
+        .with_funded_capture(&backend, &mut f.capture, 0, None, |_, _| {
             invoked.set(true);
             Ok(())
         })
@@ -477,7 +477,7 @@ fn bridge_error_and_unwind_detach_aborted_frame_while_original_recovery_keeps_ro
             FAIL_PUBLICATION.set(true);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            operation.with_funded_capture(&backend, &mut f.capture, 0, |_, observer| {
+            operation.with_funded_capture(&backend, &mut f.capture, 0, None, |_, observer| {
                 observed(observer, &source, 0)
             })
         }));
@@ -565,7 +565,7 @@ fn bridge_rejects_same_pool_foreign_bank_before_lending_model_or_spending_claim(
     let invoked = Cell::new(false);
     let before = (f.pool.used_bytes().unwrap(), f.pool.peak_bytes().unwrap());
     let error = operation
-        .with_funded_capture(&backend, &mut foreign, 0, |_, _| {
+        .with_funded_capture(&backend, &mut foreign, 0, None, |_, _| {
             invoked.set(true);
             Ok(())
         })
@@ -616,7 +616,7 @@ fn bridge_rechecks_closed_or_quarantined_bank_before_model_callback() {
         let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
         let invoked = Cell::new(false);
         let error = operation
-            .with_funded_capture(&backend, &mut f.capture, 0, |_, _| {
+            .with_funded_capture(&backend, &mut f.capture, 0, None, |_, _| {
                 invoked.set(true);
                 Ok(())
             })
