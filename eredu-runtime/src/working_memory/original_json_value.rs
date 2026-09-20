@@ -1,38 +1,51 @@
-//! Source-bound full JSON validation through the existing paid serde event parser.
+//! Source-bound JSON validation with stock serde and retained host admission.
+use super::DependencyMemoryPolicy;
 use eredu_core::{HostPreparationAuthority, SemanticText, SemanticTextAllocationError};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
-use serde_json::bounded_events::{Event, Plan, PlanError, Sink};
-use std::mem::{size_of, size_of_val};
+use serde::Deserialize;
+use std::mem::size_of;
 
 pub use eredu_text::json_fragments::JsonValueKind as OriginalJsonValueKind;
 #[derive(Debug, thiserror::Error)]
 enum Cause {
-    #[error(transparent)]
-    Plan(#[from] PlanError),
     #[error(transparent)]
     Syntax(#[from] serde_json::Error),
     #[error(transparent)]
     Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
     Text(#[from] SemanticTextAllocationError),
-    #[error("original JSON field source has no root value")]
-    Source,
-    #[error("original JSON field control extent overflow")]
+    #[error("JSON validation admission estimate overflow")]
     Overflow,
 }
-/// A syntax, destination or funding refusal retaining the actual decoded prefix.
-/// Syntax failure after a root string does not discard that string's custody.
-#[derive(Debug, thiserror::Error)]
-#[error("{cause}")]
+
+#[cfg(test)]
+#[path = "original_json_value/tests.rs"]
+mod tests;
+/// A syntax, destination or funding refusal retaining a decoded root string.
+/// A trailing-input error does not discard that string's original custody.
+#[derive(Debug)]
 pub struct OriginalJsonValueError {
-    #[source]
     cause: Cause,
-    event_failure: Option<Cause>,
     partial: Option<SemanticText>,
     funding: HostMetadataFunding,
 }
-/// Validated root and exact borrowed input. An object certificate cannot be
-/// detached from the JSON bytes consumed by the actual parser.
+impl std::fmt::Display for OriginalJsonValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, f)
+    }
+}
+impl std::error::Error for OriginalJsonValueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match &self.cause {
+            Cause::Funding(error) => error,
+            Cause::Syntax(error) => error,
+            Cause::Text(error) => error,
+            Cause::Overflow => &self.cause,
+        })
+    }
+}
+/// Validated root and exact borrowed input. The certificate cannot be detached
+/// from the original JSON bytes, and its decoded root string retains its payer.
 #[derive(Debug)]
 pub struct OriginalJsonValue<'a> {
     input: &'a str,
@@ -40,149 +53,64 @@ pub struct OriginalJsonValue<'a> {
     text: Option<SemanticText>,
     funding: HostMetadataFunding,
 }
-#[derive(Debug)]
-struct Probe {
-    kind: Option<OriginalJsonValueKind>,
-    text: Option<SemanticText>,
-    failure: Option<Cause>,
-    funding: HostMetadataFunding,
-}
-impl Probe {
-    fn copy_text(&mut self, value: &str) -> Result<(), Cause> {
-        let bytes = SemanticText::retained_control_bytes(value.len())
-            .and_then(|n| {
-                n.checked_add(HostPreparationAuthority::retention_bytes::<
-                    HostMetadataFunding,
-                >()?)
-            })
-            .ok_or(Cause::Overflow)?;
-        self.funding.reserve_metadata(bytes)?;
-        self.text = Some(SemanticText::try_copy_retained(
-            value,
-            HostPreparationAuthority::retain(self.funding.clone()),
-        )?);
-        Ok(())
-    }
-}
-impl Sink for Probe {
-    fn stopped(&self) -> bool {
-        self.failure.is_some()
-    }
-    fn event(&mut self, event: Event<'_>) {
-        if self.kind.is_some() || self.failure.is_some() {
-            return;
-        }
-        self.kind = Some(match event {
-            Event::Object => OriginalJsonValueKind::Object,
-            Event::Array => OriginalJsonValueKind::Array,
-            Event::String(value) => {
-                if let Err(cause) = self.copy_text(value) {
-                    self.failure = Some(cause);
-                }
-                OriginalJsonValueKind::String
-            }
-            Event::I64(_) | Event::U64(_) | Event::F64(_) | Event::Number(_) => {
-                OriginalJsonValueKind::Number
-            }
-            Event::Bool(_) => OriginalJsonValueKind::Bool,
-            Event::Null => OriginalJsonValueKind::Null,
-            Event::Key(_) | Event::EndObject | Event::EndArray => {
-                self.failure = Some(Cause::Source);
-                return;
-            }
-        });
-    }
-}
 impl<'a> OriginalJsonValue<'a> {
-    fn controls() -> Option<usize> {
-        let parts = [
-            size_of::<Self>(),
-            size_of::<Probe>(),
-            size_of::<OriginalJsonValueKind>(),
-            size_of::<OriginalJsonValueError>(),
-            size_of::<Cause>(),
-            size_of::<Option<Cause>>(),
-            size_of::<HostMetadataFunding>(),
-            size_of::<Option<SemanticText>>(),
-            size_of::<Option<OriginalJsonValueKind>>(),
-            size_of::<Event<'_>>(),
-            size_of::<Result<Self, OriginalJsonValueError>>(),
-            size_of::<Result<(), Cause>>(),
-            size_of::<Result<(), serde_json::Error>>(),
-            size_of::<Result<(), HostMetadataFundingError>>(),
-            size_of::<Result<SemanticText, SemanticTextAllocationError>>(),
-            size_of::<Result<Plan<'_>, PlanError>>(),
-            size_of::<Plan<'_>>(),
-            size_of::<serde_json::bounded_events::Requirements>(),
-            size_of::<Result<serde_json::bounded_events::Requirements, PlanError>>(),
-            size_of::<(&str, &HostMetadataFunding)>(),
-            size_of::<(&mut Probe, &str)>(),
-            size_of::<HostPreparationAuthority>(),
-        ];
-        parts
-            .into_iter()
-            .try_fold(size_of_val(&parts), usize::checked_add)
-    }
-    /// Validates all input with the exact existing serde deserializer, reserving
-    /// its concrete source-derived parser storage before the first callback.
-    /// Root strings additionally pay their own immutable output destination.
+    /// Validates all input through stock serde_json under default dependency
+    /// headroom. A root string additionally pays for its first-party destination.
     pub fn parse(
         input: &'a str,
         funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalJsonValueError> {
-        let retain = |cause| OriginalJsonValueError {
-            cause,
-            event_failure: None,
-            partial: None,
-            funding: funding.clone(),
-        };
-        funding
-            .reserve_metadata(Self::controls().ok_or_else(|| retain(Cause::Overflow))?)
-            .map_err(|cause| retain(cause.into()))?;
-        let plan = Plan::prepare(input.as_bytes()).map_err(|cause| retain(cause.into()))?;
-        let requirements = plan
-            .requirements::<Probe>()
-            .map_err(|cause| retain(cause.into()))?;
-        funding
-            .reserve_metadata(requirements.required_bytes())
-            .map_err(|cause| retain(cause.into()))?;
-        let mut probe = Probe {
-            kind: None,
-            text: None,
-            failure: None,
-            funding: funding.clone(),
-        };
-        let allocation = super::original_json_allocation::JsonAllocation::new(funding)
-            .map_err(|cause| retain(cause.into()))?;
-        let parsed = plan.parse(&mut probe, &allocation);
-        if let Some(cause) = allocation.failure() {
-            return Err(retain(cause.into()));
-        }
-        if let Some(cause) = probe.failure {
-            return Err(OriginalJsonValueError {
+        Self::parse_with_memory_policy(input, funding, DependencyMemoryPolicy::default())
+    }
+    /// Sets upstream scratch headroom. This is an estimate, not a bound on the
+    /// temporary JSON value's allocation or a process-wide memory ceiling.
+    pub fn parse_with_memory_policy(
+        input: &'a str,
+        funding: &HostMetadataFunding,
+        policy: DependencyMemoryPolicy,
+    ) -> Result<Self, OriginalJsonValueError> {
+        let mut text = None;
+        let result = (|| -> Result<OriginalJsonValueKind, Cause> {
+            let bytes = policy
+                .estimate(input.len())
+                .and_then(|n| {
+                    n.checked_add(size_of::<Self>() + size_of::<OriginalJsonValueError>())
+                })
+                .ok_or(Cause::Overflow)?;
+            funding.reserve_metadata(bytes)?;
+            let mut parser = serde_json::Deserializer::from_str(input);
+            let value = serde_json::Value::deserialize(&mut parser)?;
+            let kind = OriginalJsonValueKind::of(&value);
+            if let Some(value) = value.as_str() {
+                let bytes = SemanticText::retained_control_bytes(value.len())
+                    .and_then(|n| {
+                        n.checked_add(HostPreparationAuthority::retention_bytes::<
+                            HostMetadataFunding,
+                        >()?)
+                    })
+                    .ok_or(Cause::Overflow)?;
+                funding.reserve_metadata(bytes)?;
+                text = Some(SemanticText::try_copy_retained(
+                    value,
+                    HostPreparationAuthority::retain(funding.clone()),
+                )?);
+            }
+            parser.end()?;
+            Ok(kind)
+        })();
+        match result {
+            Ok(kind) => Ok(Self {
+                input,
+                kind,
+                text,
+                funding: funding.clone(),
+            }),
+            Err(cause) => Err(OriginalJsonValueError {
                 cause,
-                event_failure: None,
-                partial: probe.text,
-                funding: probe.funding,
-            });
+                partial: text,
+                funding: funding.clone(),
+            }),
         }
-        if let Err(cause) = parsed {
-            return Err(OriginalJsonValueError {
-                cause: cause.into(),
-                event_failure: None,
-                partial: probe.text,
-                funding: probe.funding,
-            });
-        }
-        let Some(kind) = probe.kind else {
-            return Err(retain(Cause::Source));
-        };
-        Ok(Self {
-            input,
-            kind,
-            text: probe.text,
-            funding: probe.funding,
-        })
     }
     /// Exact bytes whose complete syntax was validated.
     pub fn source(&self) -> &'a str {

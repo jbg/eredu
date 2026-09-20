@@ -1,7 +1,7 @@
 //! Structurally recognized Gemma channel protocol.
 
 use super::grammar_text::{Error as GrammarError};
-use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 use crate::runtime::chat::tool_schema::ToolDefinition;
 use serde_json::Value;
 
@@ -66,7 +66,7 @@ impl FormatDialect for GemmaToolDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         DECLARATIVE_DIALECT.constraint_configuration(
             parameters,
@@ -126,7 +126,7 @@ impl FormatDialect for GemmaChannelDialect {
         _tool_choice: ToolChoice,
         _parallel_tool_calls: ParallelToolCallPolicy,
         _resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         Err("Gemma channel semantics do not imply constrained tool generation".into())
     }
@@ -136,7 +136,7 @@ impl FormatDialect for GemmaChannelDialect {
         _parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         if resolved_structural_token_ids.len() < 2 {
             return Err(funding.try_format(format_args!(

@@ -1,5 +1,8 @@
-//! Synthetic checkpoint writers shared by native and facade conformance.
-//! These preserve released tensor encodings but are not released checkpoints.
+//! Reference fixtures and synthetic checkpoint writers for native and facade conformance.
+//! Synthetic writers preserve released tensor encodings but are not released checkpoints.
+
+/// Packaged numerical and text references for K2 Horizon conformance.
+pub mod k2_horizon;
 use std::{io::Write, path::Path};
 use eredu_checkpoint::{schema::StoredDtypeConstraint, StoredDtype};
 

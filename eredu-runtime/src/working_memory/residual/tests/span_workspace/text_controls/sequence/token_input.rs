@@ -77,7 +77,8 @@ fn original_input_real_claim_all_routes_capture_zero_and_source_borrow_end() {
                     ..geometry()
                 };
                 let options = capture.then(|| TextPreparationOptions {
-                    interventions: None, capture: Some(capture_source_for_geometry(g)),
+                    interventions: None,
+                    capture: Some(capture_source_for_geometry(g)),
                 });
                 let sequence = extract_input(&mut runtime, route, &ids, maximum, options).unwrap();
                 ids.fill(99);
@@ -96,11 +97,10 @@ fn original_input_real_claim_all_routes_capture_zero_and_source_borrow_end() {
             assert!(original.owner.borrow_mut().take_token_input_bank().is_none());
             <Backend as eredu_core::TextGenerationBackend>::prepare_original_text_prompt_admitted(runtime.backend(), &original).unwrap_err()
         }).collect();
-                assert!(rejected.iter().all(|e| e
-                    .source()
-                    .unwrap()
-                    .downcast_ref::<TokenInputRejection>()
-                    == Some(&TokenInputRejection::Unavailable)));
+                assert!(rejected.iter().all(|e| {
+                    e.source().unwrap().downcast_ref::<TokenInputRejection>()
+                        == Some(&TokenInputRejection::Unavailable)
+                }));
                 drop(original);
                 let (pool, held) = retire_request(&state);
                 drop(runtime);
@@ -162,11 +162,13 @@ fn consumed_foreign_input_bank_error_retains_only_original_account_not_new_sourc
     let (mut new, b) = runtime(Mode::default());
     b.borrow_mut().pending_input = Some(bank);
     let error = extract_input(&mut new, 1, &ids, 3, None).unwrap_err();
-    assert!(error
-        .source()
-        .unwrap()
-        .downcast_ref::<OriginalTokenInputFailure>()
-        .is_some());
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<OriginalTokenInputFailure>()
+            .is_some()
+    );
     assert_eq!(b.borrow().input_builds, 0);
     let untouched = b
         .borrow()
@@ -206,12 +208,14 @@ fn real_input_reserve_failure_and_fenced_failure_escape_with_original_custody() 
             .unwrap();
         if fault == 1 {
             assert_eq!(source.partial_tokens(), Some([].as_slice()));
-            assert!(source
-                .source()
-                .unwrap()
-                .source()
-                .unwrap()
-                .is::<std::collections::TryReserveError>());
+            assert!(
+                source
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<std::collections::TryReserveError>()
+            );
         } else {
             assert!(source.partial_tokens().is_none());
         }
@@ -233,15 +237,17 @@ fn input_postfill_unwind_spends_bank_and_retires_destination_before_original_hol
         })
     }));
     assert!(panic.is_err());
-    assert!(state
-        .borrow()
-        .active
-        .as_ref()
-        .unwrap()
-        .owner
-        .borrow_mut()
-        .take_token_input_bank()
-        .is_none());
+    assert!(
+        state
+            .borrow()
+            .active
+            .as_ref()
+            .unwrap()
+            .owner
+            .borrow_mut()
+            .take_token_input_bank()
+            .is_none()
+    );
     let (pool, _) = retire_request(&state);
     drop(runtime);
     assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -366,9 +372,6 @@ fn original_encoded_input(profile: u8) {
             )
             .unwrap();
         assert_eq!(encoded.ids(), [3, 11, 2, 17, 5]);
-        if profile == 5 {
-            assert_eq!(encoded.normalization_capacities(), [5, 5, 6]);
-        }
         let e = encoded.original_bytes();
         let ptr = encoded.ids().as_ptr();
         state.borrow_mut().loaded_bytes = c + e;

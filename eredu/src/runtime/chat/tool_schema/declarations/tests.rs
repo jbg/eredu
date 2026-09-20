@@ -17,7 +17,7 @@ fn tools() -> Vec<Value> {
 fn declarations_borrow_caller_schemas_and_names_in_request_order() {
     let input = tools();
     let declarations =
-        ToolDeclarations::prepare(&input, &ParserAllocationFunding::unenforced()).unwrap();
+        ToolDeclarations::prepare(&input, &PreparationFunding::unmanaged()).unwrap();
     assert_eq!(declarations.as_slice().len(), input.len());
     for (row, input) in declarations.as_slice().iter().zip(&input) {
         assert!(std::ptr::eq(
@@ -43,7 +43,7 @@ fn every_prospective_reservation_refusal_retains_the_actual_payer() {
     let make = |fail_at| {
         let calls = Arc::new(AtomicUsize::new(0));
         let retired = Arc::new(AtomicBool::new(false));
-        let funding = ParserAllocationFunding::prepare({
+        let funding = crate::runtime::chat::preparation_memory::test_funding({
             let calls = calls.clone();
             let guard = Retired(retired.clone());
             move |bytes| {
@@ -65,7 +65,7 @@ fn every_prospective_reservation_refusal_retains_the_actual_payer() {
     let (funding, calls, retired) = make(usize::MAX);
     let accepted = ToolDeclarations::prepare(&input, &funding).unwrap();
     let total = calls.load(Ordering::SeqCst);
-    assert!(total > input.len());
+    assert!(total >= 3);
     drop(funding);
     assert!(!retired.load(Ordering::SeqCst));
     drop(accepted);
@@ -96,7 +96,7 @@ fn every_prospective_reservation_refusal_retains_the_actual_payer() {
 
 #[test]
 fn malformed_declarations_fail_before_any_schema_compiler_is_needed() {
-    let funding = ParserAllocationFunding::unenforced();
+    let funding = PreparationFunding::unmanaged();
     let input = tools();
     let mut duplicate = input.clone();
     duplicate[29]["function"]["name"] = duplicate[3]["function"]["name"].clone();

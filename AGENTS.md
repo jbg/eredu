@@ -23,6 +23,11 @@ are applied when building the published crate, without downstream Cargo
 overrides. This exception does not permit patching Rust dependencies.
 
 Use the public APIs of unmodified upstream Rust releases available through crates.io.
+Host-memory policy may reserve input-derived estimates with configurable headroom
+for dependency internals. Label those estimates explicitly; they are not an
+enforceable dependency-wide or process-wide ceiling. Preserve input, cache and
+concurrency limits, reservation lifetimes, and admission for the model, native
+resources and fixed buffers that Eredu controls.
 Local path dependencies between Eredu crates are permitted for workspace
 development only when their versioned dependencies also support publication and
 consumption through crates.io. A successful build inside this workspace is not

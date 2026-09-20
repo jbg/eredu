@@ -1,18 +1,13 @@
 //! Retained original grammar, trie and compilation before mutable parser admission.
 mod controller;
 mod declaration;
-pub(crate) use lexer::OriginalPreparedGrammarController;
-mod lexer;
-mod slicer;
+pub(crate) use session::OriginalPreparedGrammarController;
+mod session;
 mod tokenize;
 use super::{ConstraintBlueprint, GenerationRuntimePlan};
 use eredu_core::SharedControllerBytes;
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{OriginalControllerCompilation, OriginalTokenTrieSource};
-pub(super) use slicer::{
-    OriginalGrammarSlicer, OriginalGrammarSlicerError, OriginalGrammarSlicerStep,
-    OriginalGrammarSlicerStepError,
-};
 use std::mem::{size_of, size_of_val};
 
 /// Immutable source only: it cannot impersonate a parser, mask or controller.
@@ -32,15 +27,6 @@ impl OriginalGrammarVocabulary {
     /// Exact originally copied compiled declaration for the future parser constructor.
     pub(super) fn compiled_declaration(&self) -> &llguidance::earley::CGrammar {
         self.declaration.grammar()
-    }
-    pub(in crate::runtime::chat::constraints) fn grammar_owner(
-        &self,
-    ) -> llguidance::earley::SharedGrammar {
-        self.declaration.grammar_owner()
-    }
-    /// Recognition records borrowed from the same registered historical owner.
-    pub(super) fn slicer_source(&self) -> Option<llguidance::earley::SlicerSourceView<'_>> {
-        self.recipe.slicer_source()
     }
     /// Historical request identity, never byte equality or a caller token.
     pub(super) fn matches_plan(&self, plan: &GenerationRuntimePlan) -> bool {
@@ -117,11 +103,10 @@ impl ConstraintBlueprint {
             let trie = self.recipe.original_trie().ok_or(Cause::Source)?;
             let source = self.declaration.as_ref().ok_or(Cause::Source)?;
             compilation.validate_grammar_sources(self.recipe.source(), source.source(), trie)?;
-            let slicer = self.recipe.slicer_source().ok_or(Cause::Source)?;
-            if !slicer.matches_trie(trie.trie()) {
+            let declaration = self.original_grammar_declaration(funding)?;
+            if !declaration.template().matches_source(trie) {
                 return Err(Cause::Source);
             }
-            let declaration = self.original_grammar_declaration(funding)?;
             Ok(OriginalGrammarVocabulary {
                 trie: trie.clone(),
                 declaration,
@@ -140,13 +125,8 @@ pub(super) use tokenize::{
 
 pub(super) use declaration::{OriginalGrammarDeclaration, OriginalGrammarDeclarationError};
 
-pub(super) use lexer::{
-    OriginalGrammarLexerInputError, OriginalGrammarLexerInputs, OriginalGrammarLexerVector,
-    OriginalGrammarLexerVectorError,
-};
-
-pub(super) use lexer::OriginalPreparedGrammarControllerError;
-pub(super) use lexer::{
+pub(super) use session::OriginalPreparedGrammarControllerError;
+pub(super) use session::{
     OriginalGrammarStartupError, OriginalGrammarState, OriginalGrammarStateCopyError,
     OriginalGrammarStateError,
 };

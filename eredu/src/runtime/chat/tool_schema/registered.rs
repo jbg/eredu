@@ -1,6 +1,9 @@
 //! Original full-schema declarations, retained source custody and paid callbacks.
 use super::original::{self, Source};
 use crate::runtime::chat::constraints::recipe::ConstraintRecipe;
+use crate::runtime::chat::preparation_memory::{
+    PreparationFailure as FundingFailure, PreparationFunding, StorageFailure,
+};
 use eredu_core::{
     BackendFailure, ControllerDeclarationData, HostPreparationAuthority,
     SharedControllerDeclaration, SharedStorageIdentity,
@@ -9,7 +12,6 @@ use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError, Workspa
 use eredu_runtime::working_memory::{
     OriginalSemanticControllerSource, OriginalToolValidation, WorkingMemoryError, WorkingMemoryPool,
 };
-use llguidance::derivre::{ParserAllocationFailure, ParserAllocationFunding, ParserStorageError};
 use std::{
     alloc::Layout,
     fmt,
@@ -21,11 +23,8 @@ mod tagged;
 
 struct CompiledSchemas {
     rows: Vec<(String, Source, Option<tagged::Tagged>)>,
-    // An unsupported source is released while the cold exclusion remains live.
-    // Its fixed typed cause is retained; ordinary preparation keeps its behavior.
-    refusal: Option<original::CompilationFailure>,
     bytes: u64,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
 }
 struct Data {
     schemas: CompiledSchemas,
@@ -33,18 +32,22 @@ struct Data {
 }
 impl ControllerDeclarationData for Data {
     fn owned_capacity_bytes(&self) -> Option<u64> {
+        None
+    }
+    fn admission_bytes(&self) -> Option<u64> {
         Some(self.schemas.bytes)
     }
 }
 #[derive(Debug, thiserror::Error)]
 enum CompilationCause {
-    #[error(transparent)] Parameter(original::CompilationFailure),
-    #[error(transparent)] TaggedGrammar(#[from] crate::runtime::chat::grammar_text::Error),
-    #[error(transparent)] Json(serde_json::allocation::AllocationError),
     #[error(transparent)]
-    Funding(#[from] ParserAllocationFailure),
+    Parameter(original::CompilationFailure),
     #[error(transparent)]
-    Storage(#[from] ParserStorageError),
+    TaggedGrammar(#[from] crate::runtime::chat::grammar_text::Error),
+    #[error(transparent)]
+    Funding(#[from] FundingFailure),
+    #[error(transparent)]
+    Storage(#[from] StorageFailure),
     #[error("tools[{index}].function.parameters: {cause}")]
     Schema {
         index: usize,
@@ -59,12 +62,12 @@ enum CompilationCause {
 pub(crate) struct CompilationFailure {
     #[source]
     cause: CompilationCause,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
     authority: HostPreparationAuthority,
 }
 fn compile_data(
     tools: &[super::ToolDefinition<'_>],
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
     authority: &HostPreparationAuthority,
     tagged: bool,
 ) -> Result<CompiledSchemas, CompilationFailure> {
@@ -91,7 +94,7 @@ fn compile_data(
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, super::ToolDefinition<'_>>>>(),
             size_of::<(
                 &[super::ToolDefinition<'_>],
-                &ParserAllocationFunding,
+                &PreparationFunding,
                 &HostPreparationAuthority,
             )>(),
         ];
@@ -103,50 +106,32 @@ fn compile_data(
         )?;
         let mut rows = Vec::new();
         funding.try_grow_vec(&mut rows, tools.len())?;
-        let mut refusal = None;
         let mut bytes = shell;
         for (index, definition) in tools.iter().enumerate() {
             let validator = Source::compile(definition.parameters, authority, funding)
                 .map_err(|cause| CompilationCause::Schema { index, cause })?;
-            // Continue validating declarations even after the first source is
-            // unqualified; an invalid later schema remains an admission error.
-            if refusal.is_some() {
-                continue;
-            }
-            match validator.capacity_bytes() {
-                Ok(capacity) => {
-                    let name = funding.try_copy_str(definition.name)?;
-                    bytes = bytes
-                        .checked_add(capacity)
-                        .and_then(|n| n.checked_add(name.capacity()))
-                        .ok_or(CompilationCause::Overflow)?;
-                    let tagged = tagged.then(|| tagged::Tagged::compile(definition.parameters, authority, funding)).transpose()?;
-                    bytes = bytes.checked_add(tagged.as_ref().map_or(Ok(0), tagged::Tagged::bytes)?).ok_or(CompilationCause::Overflow)?;
-                    rows.push((name, validator, tagged));
-                }
-                Err(cause) if !funding.is_enforced() && cause.is_unqualified() => {
-                    refusal = Some(cause);
-                }
-                Err(cause) => return Err(CompilationCause::Schema { index, cause }),
-            }
-        }
-        if refusal.is_some() {
-            // Unknown source storage is never priced as zero or published.
-            drop(rows);
-            rows = Vec::new();
-            bytes = shell;
-        } else {
+            let name = funding.try_copy_str(definition.name)?;
             bytes = bytes
-                .checked_add(
-                    Layout::array::<(String, Source, Option<tagged::Tagged>)>(rows.capacity())
-                        .map_err(|_| CompilationCause::Overflow)?
-                        .size(),
-                )
+                .checked_add(validator.admission_bytes())
+                .and_then(|n| n.checked_add(name.capacity()))
                 .ok_or(CompilationCause::Overflow)?;
+            let tagged = tagged
+                .then(|| tagged::Tagged::compile(definition.parameters, authority, funding))
+                .transpose()?;
+            bytes = bytes
+                .checked_add(tagged.as_ref().map_or(Ok(0), tagged::Tagged::bytes)?)
+                .ok_or(CompilationCause::Overflow)?;
+            rows.push((name, validator, tagged));
         }
+        bytes = bytes
+            .checked_add(
+                Layout::array::<(String, Source, Option<tagged::Tagged>)>(rows.capacity())
+                    .map_err(|_| CompilationCause::Overflow)?
+                    .size(),
+            )
+            .ok_or(CompilationCause::Overflow)?;
         Ok(CompiledSchemas {
             rows,
-            refusal,
             bytes: u64::try_from(bytes).map_err(|_| CompilationCause::Overflow)?,
             funding: funding.clone(),
         })
@@ -166,7 +151,7 @@ pub(crate) struct PendingSchemas {
 impl PendingSchemas {
     pub(crate) fn compile(
         tools: &[super::ToolDefinition<'_>],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
         authority: &HostPreparationAuthority,
         tagged: bool,
     ) -> Result<Self, CompilationFailure> {
@@ -177,10 +162,13 @@ impl PendingSchemas {
     }
     pub(crate) fn bind(self, recipe: &ConstraintRecipe) -> Historical {
         Historical {
-            source: SharedControllerDeclaration::new(Data {
-                schemas: self.schemas,
-                recipe: *recipe.source().identity(),
-            }, self.authority.clone()),
+            source: SharedControllerDeclaration::new(
+                Data {
+                    schemas: self.schemas,
+                    recipe: *recipe.source().identity(),
+                },
+                self.authority.clone(),
+            ),
         }
     }
 }
@@ -230,9 +218,7 @@ impl Historical {
                     .try_fold(size_of_val(&parts), usize::checked_add)
                     .ok_or(PreparationCause::Overflow)?,
             )?;
-            if self.data(recipe)?.schemas.refusal.is_some() {
-                return Err(PreparationCause::Refused);
-            }
+            self.data(recipe)?;
             Ok(Arc::new(Callback {
                 source: self.clone(),
                 recipe: recipe.clone(),
@@ -251,8 +237,6 @@ impl Historical {
 enum PreparationCause {
     #[error("tool schema declaration does not match its exact compiled recipe")]
     Source,
-    #[error("original tool schema source requires an unqualified constructor")]
-    Refused,
     #[error("original tool schema callback extent overflow")]
     Overflow,
     #[error(transparent)]
@@ -267,27 +251,12 @@ pub(crate) struct PreparationFailure {
 }
 impl fmt::Display for PreparationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let PreparationCause::Refused = self.cause {
-            if let Ok(data) = self.source.data(&self.recipe) {
-                if let Some(error) = &data.schemas.refusal {
-                    return fmt::Display::fmt(error, f);
-                }
-            }
-        }
         fmt::Display::fmt(&self.cause, f)
     }
 }
 impl std::error::Error for PreparationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
-            PreparationCause::Refused => self
-                .source
-                .data(&self.recipe)
-                .ok()?
-                .schemas
-                .refusal
-                .as_ref()
-                .map(|e| e as _),
             PreparationCause::Funding(error) => Some(error),
             cause => Some(cause),
         }
@@ -301,7 +270,8 @@ struct Callback {
 }
 #[derive(Debug, thiserror::Error)]
 enum CallbackCause {
-    #[error(transparent)] Tagged(#[from] tagged::ParseFailure),
+    #[error(transparent)]
+    Tagged(#[from] tagged::ParseFailure),
     #[error("tool function is absent from the exact compiled source")]
     UnknownTool,
     #[error("original tool source identity changed")]
@@ -332,26 +302,60 @@ impl std::error::Error for CallbackFailure {
 }
 impl OriginalToolValidation for Callback {
     fn contains_tagged_tool(&self, name: &str) -> bool {
-        self.source.data(&self.recipe).ok().is_some_and(|data| data.schemas.rows.iter()
-            .any(|(actual, _, tagged)| actual == name && tagged.is_some()))
+        self.source.data(&self.recipe).ok().is_some_and(|data| {
+            data.schemas
+                .rows
+                .iter()
+                .any(|(actual, _, tagged)| actual == name && tagged.is_some())
+        })
     }
-    fn tagged_missing_required(&self, name: &str, parameters: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool {
-        self.source.data(&self.recipe).ok().and_then(|data| data.schemas.rows.iter()
-            .find(|(actual, _, _)| actual == name)).and_then(|row| row.2.as_ref())
+    fn tagged_missing_required(
+        &self,
+        name: &str,
+        parameters: &eredu_text::semantic_channels::tagged::TaggedParameters,
+    ) -> bool {
+        self.source
+            .data(&self.recipe)
+            .ok()
+            .and_then(|data| {
+                data.schemas
+                    .rows
+                    .iter()
+                    .find(|(actual, _, _)| actual == name)
+            })
+            .and_then(|row| row.2.as_ref())
             .is_none_or(|tagged| tagged.missing(parameters))
     }
-    fn parse_tagged_parameter(&self, name: &str, parameter: &str, declared: Option<&str>, raw: &str,
-        allocation: &dyn serde_json::allocation::Allocation, funding: &HostMetadataFunding)
-        -> Result<serde_json::Value, BackendFailure> {
+    fn parse_tagged_parameter(
+        &self,
+        name: &str,
+        parameter: &str,
+        declared: Option<&str>,
+        raw: &str,
+        funding: &HostMetadataFunding,
+    ) -> Result<serde_json::Value, BackendFailure> {
         let result = (|| {
-            let data = self.source.data(&self.recipe).map_err(|_| CallbackCause::Source)?;
-            let tagged = data.schemas.rows.iter().find(|(actual, _, _)| actual == name)
-                .and_then(|row| row.2.as_ref()).ok_or(CallbackCause::UnknownTool)?;
-            Ok(tagged.parse(parameter, declared, raw, allocation, funding)?)
+            let data = self
+                .source
+                .data(&self.recipe)
+                .map_err(|_| CallbackCause::Source)?;
+            let tagged = data
+                .schemas
+                .rows
+                .iter()
+                .find(|(actual, _, _)| actual == name)
+                .and_then(|row| row.2.as_ref())
+                .ok_or(CallbackCause::UnknownTool)?;
+            Ok(tagged.parse(parameter, declared, raw, funding)?)
         })();
-        result.map_err(|cause| BackendFailure::from_error(CallbackFailure {
-            cause, source: self.source.clone(), recipe: self.recipe.clone(), funding: funding.clone(),
-        }))
+        result.map_err(|cause| {
+            BackendFailure::from_error(CallbackFailure {
+                cause,
+                source: self.source.clone(),
+                recipe: self.recipe.clone(),
+                funding: funding.clone(),
+            })
+        })
     }
     fn validate_source(
         &self,
@@ -362,18 +366,17 @@ impl OriginalToolValidation for Callback {
             return Err(WorkingMemoryError::IdentityMismatch);
         };
         if !self.recipe.source().same_storage(grammar.recipe())
-            || self
-                .source
-                .data(&self.recipe)
-                .map_or(true, |data| data.schemas.refusal.is_some())
+            || self.source.data(&self.recipe).is_err()
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let trie = grammar.tokenizer()
+        let trie = grammar
+            .tokenizer()
             .downcast_ref::<eredu_runtime::working_memory::OriginalTokenTrieSource>()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         trie.validate_grammar_source(grammar, pool)?;
-        grammar.compilation()
+        grammar
+            .compilation()
             .downcast_ref::<eredu_runtime::working_memory::OriginalControllerCompilation>()
             .ok_or(WorkingMemoryError::IdentityMismatch)?
             .validate_validation_sources(self.recipe.source(), &self.source.source)

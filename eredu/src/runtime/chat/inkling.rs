@@ -1,7 +1,7 @@
 //! Inkling's structurally framed reasoning and visible-text protocol.
 
 use super::grammar_text::{repeated_rule, Error as GrammarError, Text as GrammarText, structural_literal};
-use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 use crate::runtime::chat::tool_schema::ToolDefinition;
 use serde_json::Value;
 
@@ -79,7 +79,7 @@ impl InklingToolDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         if TOOL_STRUCTURAL_TOKENS.len() != structural_token_ids.len() {
             return Err(funding.try_format(format_args!(
@@ -205,7 +205,7 @@ impl FormatDialect for InklingMessageDialect {
         _tool_choice: ToolChoice,
         _parallel_tool_calls: ParallelToolCallPolicy,
         _resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<InklingMessageParameters>()?;
         Err("Inkling message semantics do not imply constrained tool generation".into())
@@ -216,7 +216,7 @@ impl FormatDialect for InklingMessageDialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         _eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<InklingMessageParameters>()?;
         if resolved_structural_token_ids.len() != MESSAGE_STRUCTURAL_TOKENS.len() {
@@ -313,7 +313,7 @@ impl FormatDialect for InklingToolDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<InklingMessageParameters>()?;
         Ok(ConstraintConfiguration {

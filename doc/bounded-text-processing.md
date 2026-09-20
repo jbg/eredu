@@ -1,89 +1,95 @@
-# Bounded tokenizer and text processing
+# Tokenizer and text memory policy
 
-## Retained configuration and model workers
+## Stock tokenizer execution
 
-The tokenizer source compiler retains the exact model, normalizer, pre-tokenizer,
-postprocessor and decoder configuration. Ordinary and admitted execution use
-the same model equations. Unsupported profiles return typed refusals before
-execution. BPE, WordLevel and deterministic Unigram produce IDs from their
-retained models rather than reconstructed vocabularies.
+Eredu uses the published Hugging Face `tokenizers` implementation for model
+construction, normalization, added-token matching, pre-tokenization,
+postprocessing and encoding. Ordinary and managed encoding consume the same
+serialized model configuration through upstream public APIs. BPE, WordLevel and
+deterministic Unigram keep their model semantics; Eredu does not implement a
+second tokenization engine.
 
-Unigram preserves score comparisons, tie ordering, unknown fusion and byte
-fallback through a shared Viterbi worker. Sampling with `alpha`/`nbest_size` is
-not part of the deterministic admitted source. `ModelCachePolicy { capacity }`
-sets an entry count; zero disables the cache. It is neither a byte bound nor
-native allocator-cache policy.
+Managed sources own an immutable stock tokenizer, a vocabulary index and Eredu's
+fixed-buffer decoder program. The decoder compiler checks whether the selected
+decoder profile supports incremental generation. A grammar input derivative
+removes `Prepend` normalizers and changes Metaspace's prepend scheme to `Never`
+through the public serialized configuration, retaining its relationship to the
+original source. Changes to that derivative do not mutate the original tokenizer.
 
-Template processing retains one immutable set of tables. Builder, serde,
-comparison, serialization and bounded ID projection borrow the same ownership.
-Source compilation rejects undefined special references even when ordinary
-encoding with special tokens disabled can avoid them.
+Encoding calls the upstream worker once and retains its complete `Encoding`
+with the returned ID slice. Offsets, masks and other upstream fields remain
+owned with it. An upstream error is retained through the public cause chain;
+failed encoding does not publish partial IDs.
 
-## Added vocabulary
+## Admission estimates
 
-One packed matcher supplies ordinary and admitted added-token extraction.
-Duplicate spellings preserve first ID, final flags and sticky special membership.
-Normalization, Unicode word and whitespace flags and special-token skipping are
-profile semantics, not choices of matcher representation.
+`TokenizerMemoryEstimate` reserves 64 KiB plus 128 bytes per serialized source
+byte for construction, and 64 KiB plus 512 bytes per UTF-8 input byte for each
+encoding operation. `TokenizerPlan::with_memory_estimate` selects different
+fixed and proportional estimates; the compiled source retains that policy.
+Planning checks arithmetic without constructing the tokenizer. Malformed
+configuration is diagnosed by the admitted upstream construction attempt.
 
-For `N` raw declarations and `B` total spelling bytes, including duplicates,
-construction reserves five targets: `N` entries, `B` bytes, two `N` indexes and
-`B + 2` nodes. Layout and arithmetic are checked before reservation; partial
-failure retains allocated buffers. Nodes contain the construction queue, so
-failure links need no auxiliary heap or recursive stack.
+These allowances cover opaque dependency storage, transient model copies,
+regular-expression work and upstream encoding output. They are estimates,
+not measured capacities or enforceable dependency/process memory ceilings.
+Reservations remain associated with the source, completed output or failure
+until retirement. Independently owned operations require their own admission.
 
-On arm64, the retained buffer bound is `56*N + 29*B + 56` bytes, with 11,844
-bytes of fixed construction controls. Search uses a 56-byte iterator and fixed
-locals, without heap scratch. These are requested storage bounds, not RSS.
-Overlapping patterns can require input-length times competitor-length work;
-there is no universal linear-time claim.
+Eredu's decoder and generation-domain buffers retain their own checked geometry
+and destination admission. Model weights, state/KV caches, activations,
+transfers, residency and native execution use separate resource contracts.
+Host dependency estimates do not replace those contracts. Input and concurrency
+limits must also be selected for the application; a small estimate does not
+constrain an upstream allocator or interrupt an expensive regex operation.
 
-## Composition and regular expressions
+## Cache policy
 
-Ordered normalizers and pre-tokenizers preserve their configured order,
-including Unicode transforms, literal replacement, ByteLevel and Metaspace.
-The grammar tokenizer derivative removes `Prepend` normalizers and uses
-`Metaspace` prepend scheme `Never` through the same configuration workers.
-Refreshing a normalizer updates normalized added-token spellings and matching.
+`ModelCachePolicy { capacity }` configures upstream BPE and Unigram cache entry
+limits. The default is 10,000 entries; zero prevents new cached entries. Managed
+tokenizer construction disables model caches before encoding. The cache policy
+is an entry count, not a byte limit or native allocator-cache policy.
 
-`Split` and `ByteLevel` own closed checked regex sources and reuse one workspace
-across normalized segments. Admitted construction installs its source eagerly;
-ordinary ByteLevel initialization is lazy and does not affect serde or equality.
-General regex syntax and Oniguruma remain selected engine mechanisms. Regex
-execution errors propagate rather than producing a partial successful encoding.
+BPE caches are per model and per thread. Applying a different policy through
+upstream's public tokenizer API clones and replaces the model, so both copies
+coexist temporarily. Clearing a cache invalidates entries but does not reclaim
+retired BPE cache generations held by other threads. Construction headroom and
+application worker limits must account for these behaviors.
 
-Checked patterns preserve the selected default-Oniguruma behavior, including
-contextual Unicode boundaries and span ordering. Independent coverage includes
-10,008,576 contextual comparisons. Unknown custom patterns, callbacks and
-unqualified normalization profiles require explicit support and bounds.
+## Chat templates
 
-## Storage and search cost
+Ordinary and prepared chat use stock MiniJinja with shared compatibility helpers.
+Signed `range` supports descending progressions and checked wide intermediates,
+and rejects zero steps and more than 100,000 elements. Source normalization
+uses MiniJinja's public parser to rewrite slice expressions into one shared
+filter. The filter preserves omitted negative bounds, empty slices and Unicode
+scalar indexing. Upstream still compiles and executes the complete template.
+The MiniJinja version is pinned because its public parser API does not carry a
+semver stability guarantee.
 
-The arm64 release measurement uses Rust 1.98.0, repeats hot-input searches for at
-least 350 ms and checks matches with an independent `str::find` leftmost/longest
-oracle. DAAC is a separate reference implementation, not a production option.
+`ChatMemoryEstimate` defaults to 64 KiB plus 128 bytes per serialized source byte
+for construction and per serialized request-input byte for rendering. Temporary
+normalization and filter storage are covered by these estimates. Rendering also
+admits its first-party output destinations.
 
-| Input | Patterns / matches | DAAC reference MiB/s | Packed matcher MiB/s |
-| --- | ---: | ---: | ---: |
-| 33,792-byte chat with delimiters | 256 / 512 | 828.32 | 1,303.57 |
-| 30,208-byte prose without delimiters | 256 / 0 | 1,146.90 | 94,446.39 |
-| 32,768-byte shared prefixes without matches | 32 / 0 | 620.61 | 370.26 |
-| 32,768-byte nested matching prefixes | 63 / 521 | 327.99 | 393.51 |
-| 32,768-byte delayed short match | 2 / 32,768 | 1.43 | 1.70 |
-| 34,816-byte Unicode | 4 / 6,144 | 378.37 | 398.46 |
+`ChatRenderLimits` defaults to 8 MiB of serialized input, input depth 128, 1 MiB
+per output variant, 10 million VM instructions per variant and recursion limit
+256. Each variant renders once with the same request clock observation. Output
+limits and fuel do not bound intermediate dependency allocations or elapsed
+time. Failed rendering retains its partial output under the original account.
 
-The unmatched shared-prefix case costs about 34 additional microseconds per
-32 KiB. The delayed-match case scans a long competitor before committing each
-short match. These workload-specific measurements do not imply universal speedup
-or generation throughput. Exact generators and independent expected matches are
-in `third-party/tokenizers-0.23.2/src/tokenizer/added_vocabulary/benchmark.rs`.
+Managed grammar and tool-schema work has its own configurable
+`DependencyMemoryPolicy`, selected through
+`LoadedModel::prepare_chat_with_grammar_memory`. Its default is 64 KiB plus
+128 bytes per logical input byte. Grammar sessions, snapshots and activation
+tokenization retain the selected policy; template and tokenizer estimates remain
+separate. See [backend architecture](backend-architecture.md#bounded-inference-ownership)
+for the source, lifetime and admission contracts.
 
-```sh
-CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml \
-  --release --lib added_matcher --no-default-features --features fancy-regex \
-  -- --ignored --nocapture
-```
+## Validation
 
-The reference build uses the tokenizer sources identified by revision `77e08045`
-and the same benchmark module. Dependency archive and local-source provenance
-are in `third-party/tokenizers-upstream.json` and `third-party/parser-upstream.json`.
+The text and runtime suites cover tokenizer composition, Unicode, added tokens,
+cache policy, incremental decoding, shared range/slice behavior, source identity
+and refusal lifetimes. Portable facade conformance compares ordinary and
+controlled generation, including non-default grammar headroom. These behavior
+tests do not establish dependency peak memory or tokenization throughput.

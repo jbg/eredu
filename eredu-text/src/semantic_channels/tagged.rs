@@ -260,47 +260,28 @@ pub fn tagged_value_kind(schema: &Value) -> TaggedValueKind {
 }
 
 pub fn tagged_schema_has_union(schema: &Value) -> bool {
-    schema_has_union_with_allocations(schema, &serde_json::allocation::Unenforced)
-        .expect("ordinary schema union traversal")
-}
-fn schema_has_union_with_allocations(
-    schema: &Value,
-    funding: &dyn serde_json::allocation::Allocation,
-) -> Result<bool, serde_json::allocation::AllocationError> {
-    use std::mem::size_of;
-    funding.reserve(
-        size_of::<(&Value, &dyn serde_json::allocation::Allocation)>()
-            + size_of::<Option<serde_json::map::Values<'_>>>()
-            + size_of::<Result<bool, serde_json::allocation::AllocationError>>()
-            + size_of::<Option<&Value>>()
-            + size_of::<bool>(),
-    )?;
-    if schema
-        .get("oneOf")
-        .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
-        || schema
-            .get("anyOf")
-            .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
-        || schema
+    let mut pending = vec![schema];
+    while let Some(schema) = pending.pop() {
+        if ["oneOf", "anyOf"].iter().any(|key| {
+            schema
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+        }) || schema
             .get("type")
             .and_then(Value::as_array)
             .is_some_and(|types| types.len() > 1)
-    {
-        return Ok(true);
-    }
-    if let Some(items) = schema.get("items") {
-        if schema_has_union_with_allocations(items, funding)? {
-            return Ok(true);
+        {
+            return true;
+        }
+        if let Some(items) = schema.get("items") {
+            pending.push(items);
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            pending.extend(properties.values());
         }
     }
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for value in properties.values() {
-            if schema_has_union_with_allocations(value, funding)? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    false
 }
 
 /// Compact JSON-schema type spelling used by tagged argument annotations.
@@ -367,13 +348,11 @@ impl fmt::Display for TaggedTypeName<'_> {
     }
 }
 
-/// Interpretation failure; the caller retains actual pending bytes and funding.
+/// Interpretation failure; the enclosing parser retains its input and source.
 #[derive(Debug, thiserror::Error)]
 pub enum TaggedValueError<E: std::error::Error + 'static> {
     #[error(transparent)]
-    Allocation(#[from] serde_json::allocation::AllocationError),
-    #[error(transparent)]
-    Json(#[from] serde_json::bounded_events::ValueError),
+    Json(#[from] serde_json::Error),
     #[error("tagged parameter declares a different JSON type")]
     DeclaredType,
     #[error("tagged parameter has the wrong type or value")]
@@ -382,20 +361,19 @@ pub enum TaggedValueError<E: std::error::Error + 'static> {
     Validation(#[source] E),
 }
 /// Apply raw-string/JSON, enum/nullable and declared-type rules once for both
-/// consumers. Only malformed JSON may fall back to raw text; funding never does.
+/// consumers. Validation failures propagate; they never fall back to raw text.
 pub fn parse_tagged_value<E, F>(
     schema: &Value,
     declared: Option<&str>,
     raw: &str,
-    funding: &dyn serde_json::allocation::Allocation,
     validate: F,
 ) -> Result<Value, TaggedValueError<E>>
 where
     E: std::error::Error + 'static,
     F: FnMut(&Value) -> Result<bool, E>,
 {
-    let policy = TaggedValuePolicy::prepare(schema, funding)?;
-    parse_tagged_value_policy(&policy, declared, raw, funding, validate)
+    let policy = TaggedValuePolicy::prepare(schema);
+    parse_tagged_value_policy(&policy, declared, raw, validate)
 }
 /// Retained semantic projection; actual schema validation stays with its source.
 #[derive(Debug, Clone)]
@@ -405,18 +383,18 @@ pub struct TaggedValuePolicy {
     pub type_name: String,
 }
 impl TaggedValuePolicy {
-    pub fn prepare(
-        schema: &Value,
-        funding: &dyn serde_json::allocation::Allocation,
-    ) -> Result<Self, serde_json::allocation::AllocationError> {
-        Ok(Self {
+    /// Projects parameter semantics using ordinary host allocations. The caller
+    /// accounts for schema preparation together with its retained validator.
+    pub fn prepare(schema: &Value) -> Self {
+        Self {
             kind: tagged_value_kind(schema),
-            union: schema_has_union_with_allocations(schema, funding)?,
-            type_name: serde_json::allocation::Allocator::new(funding).format(TaggedTypeName {
+            union: tagged_schema_has_union(schema),
+            type_name: TaggedTypeName {
                 schema,
                 value: None,
-            })?,
-        })
+            }
+            .to_string(),
+        }
     }
     pub fn any() -> Self {
         Self {
@@ -447,36 +425,24 @@ pub fn parse_tagged_value_policy<E, F>(
     policy: &TaggedValuePolicy,
     declared: Option<&str>,
     raw: &str,
-    funding: &dyn serde_json::allocation::Allocation,
     mut validate: F,
 ) -> Result<Value, TaggedValueError<E>>
 where
     E: std::error::Error + 'static,
     F: FnMut(&Value) -> Result<bool, E>,
 {
-    use serde_json::allocation::Allocator;
-    let allocator = Allocator::new(funding);
     let kind = match declared {
         Some("string") => TaggedValueKind::RawString,
         Some(_) if policy.union => TaggedValueKind::Json,
         _ => policy.kind,
     };
     let value = match kind {
-        TaggedValueKind::RawString => Value::String(allocator.copy_string(raw)?),
-        TaggedValueKind::Json => {
-            serde_json::bounded_events::from_slice_with_allocations(raw.as_bytes(), funding)?
-        }
-        TaggedValueKind::RawStringOrJson => {
-            match serde_json::bounded_events::from_slice_with_allocations(raw.as_bytes(), funding) {
-                Ok(value) if validate(&value).map_err(TaggedValueError::Validation)? => value,
-                Ok(_)
-                | Err(serde_json::bounded_events::ValueError::Syntax(_))
-                | Err(serde_json::bounded_events::ValueError::Empty) => {
-                    Value::String(allocator.copy_string(raw)?)
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
+        TaggedValueKind::RawString => Value::String(raw.to_owned()),
+        TaggedValueKind::Json => serde_json::from_str(raw)?,
+        TaggedValueKind::RawStringOrJson => match serde_json::from_str(raw) {
+            Ok(value) if validate(&value).map_err(TaggedValueError::Validation)? => value,
+            Ok(_) | Err(_) => Value::String(raw.to_owned()),
+        },
     };
     if let Some(declared) = declared {
         let expected = policy.type_name(&value);
@@ -490,9 +456,9 @@ where
     Ok(value)
 }
 
-/// Completed parameter names, in output order, with an admitted hash index.
+/// Completed parameter names in output order, with a hash index for membership.
 /// Lookup never rescans all preceding arguments.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TaggedParameters {
     names: Vec<String>,
     index: hashbrown::HashTable<usize>,
@@ -508,25 +474,6 @@ impl TaggedParameters {
     /// Borrows completed names in their original output order.
     pub fn iter(&self) -> std::slice::Iter<'_, String> {
         self.names.iter()
-    }
-    fn reserve_index(
-        &mut self,
-        additional: usize,
-        funding: &dyn serde_json::allocation::Allocation,
-    ) -> Result<(), serde_json::allocation::AllocationError> {
-        use serde_json::allocation::AllocationError;
-        if let Some(layout) = self
-            .index
-            .try_reserve_layout(additional)
-            .map_err(|_| AllocationError::SizeOverflow)?
-        {
-            funding.reserve(layout.size())?;
-        }
-        let names = &self.names;
-        let hasher = &self.hasher;
-        self.index
-            .try_reserve(additional, |i| hasher.hash_one(&names[*i]))
-            .map_err(|_| AllocationError::HostAllocation)
     }
     fn publish(&mut self, name: String) {
         let hash = self.hasher.hash_one(&name);
@@ -554,13 +501,12 @@ pub trait TaggedSchemas {
         parameter: &str,
         declared: Option<&str>,
         raw: &str,
-        funding: &dyn serde_json::allocation::Allocation,
     ) -> Result<Value, Self::Error>;
 }
 /// Owning call storage shared by ordinary and paid semantic consumers. The
 /// argument object is serialized in parameter insertion order, as the selected
 /// preserve-order serde map does, without retaining a second parsed value tree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaggedCall {
     state: TaggedState,
     name: String,
@@ -581,12 +527,6 @@ impl Default for TaggedCall {
         }
     }
 }
-impl Clone for TaggedCall {
-    fn clone(&self) -> Self {
-        self.try_clone_with_allocations(&serde_json::allocation::Unenforced)
-            .expect("ordinary tagged call copy")
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedEvent {
     None,
@@ -598,9 +538,7 @@ pub enum TaggedCallError<E: std::error::Error + 'static> {
     #[error(transparent)]
     Syntax(#[from] TaggedError),
     #[error(transparent)]
-    Allocation(#[from] serde_json::allocation::AllocationError),
-    #[error(transparent)]
-    Serialization(#[from] serde_json::value::ValueWriteError),
+    Serialization(#[from] serde_json::Error),
     #[error("unknown tagged tool function")]
     UnknownTool,
     #[error("tagged tool repeats a parameter")]
@@ -611,6 +549,19 @@ pub enum TaggedCallError<E: std::error::Error + 'static> {
     Schema(#[source] E),
 }
 impl TaggedCall {
+    /// Logical owned snapshot payload, including live parameter records and
+    /// index entries. Allocator capacities and hash-table overhead are excluded;
+    /// callers supply their dependency headroom separately.
+    pub fn logical_snapshot_bytes(&self) -> Option<usize> {
+        let strings = self.name.len().checked_add(self.parameter.len())?
+            .checked_add(self.declared.as_ref().map_or(0, String::len))?
+            .checked_add(self.arguments.len())?;
+        self.parameters.iter().try_fold(strings, |bytes, name| {
+            bytes.checked_add(std::mem::size_of::<String>())?
+                .checked_add(std::mem::size_of::<usize>())?
+                .checked_add(name.len())
+        })
+    }
     /// The function name accepted from this call.
     pub fn name(&self) -> &str {
         &self.name
@@ -619,89 +570,15 @@ impl TaggedCall {
     pub fn arguments(&self) -> &str {
         &self.arguments
     }
-    /// Actual independently copied destination backing, excluding fixed caller
-    /// controls. Copy grows every destination once to its actual source length.
-    pub fn copy_bytes(&self) -> Option<usize> {
-        let mut bytes = self
-            .name
-            .len()
-            .checked_add(self.parameter.len())?
-            .checked_add(self.declared.as_ref().map_or(0, String::len))?
-            .checked_add(self.arguments.len())?
-            .checked_add(
-                std::alloc::Layout::array::<String>(self.parameters.names.len())
-                    .ok()?
-                    .size(),
-            )?;
-        for name in &self.parameters.names {
-            bytes = bytes.checked_add(name.len())?;
-        }
-        bytes = bytes.checked_add(
-            hashbrown::HashTable::<usize>::new()
-                .try_reserve_layout(self.parameters.names.len())
-                .ok()?
-                .map_or(0, |layout| layout.size()),
-        )?;
-        Some(bytes)
-    }
-    /// Actual retained backing capacities, excluding the fixed owner itself.
-    pub fn retained_bytes(&self) -> Option<usize> {
-        let mut bytes = self
-            .name
-            .capacity()
-            .checked_add(self.parameter.capacity())?
-            .checked_add(self.declared.as_ref().map_or(0, String::capacity))?
-            .checked_add(self.arguments.capacity())?
-            .checked_add(
-                std::alloc::Layout::array::<String>(self.parameters.names.capacity())
-                    .ok()?
-                    .size(),
-            )?;
-        for name in &self.parameters.names {
-            bytes = bytes.checked_add(name.capacity())?;
-        }
-        Some(bytes.checked_add(self.parameters.index.allocation_size())?)
-    }
-    /// Copies independent mutable state through the same prospective producers.
-    pub fn try_clone_with_allocations(
-        &self,
-        funding: &dyn serde_json::allocation::Allocation,
-    ) -> Result<Self, serde_json::allocation::AllocationError> {
-        let a = serde_json::allocation::Allocator::new(funding);
-        let mut copy = Self {
-            state: self.state,
-            name: a.copy_string(&self.name)?,
-            parameter: a.copy_string(&self.parameter)?,
-            declared: self
-                .declared
-                .as_deref()
-                .map(|s| a.copy_string(s))
-                .transpose()?,
-            parameters: TaggedParameters::default(),
-            arguments: a.copy_string(&self.arguments)?,
-        };
-        a.grow(&mut copy.parameters.names, self.parameters.names.len())?;
-        copy.parameters
-            .reserve_index(self.parameters.names.len(), funding)?;
-        for name in &self.parameters.names {
-            copy.parameters.publish(a.copy_string(name)?);
-        }
-        Ok(copy)
-    }
     /// One canonical owning transition. A failure leaves every already-published
-    /// owned prefix in this call; callers retain it with the source and payer.
+    /// owned prefix in this call. Callers impose input limits and retain source
+    /// custody; upstream JSON and hash-table allocation sizes are not controlled here.
     pub fn advance<S: TaggedSchemas + ?Sized>(
         &mut self,
         encoding: TaggedEncoding<'_>,
         pending: &str,
         schemas: &S,
-        funding: &dyn serde_json::allocation::Allocation,
     ) -> Result<(usize, bool, TaggedEvent), TaggedCallError<S::Error>> {
-        funding.reserve(
-            tagged_control_bytes::<S::Error>()
-                .ok_or(serde_json::allocation::AllocationError::SizeOverflow)?,
-        )?;
-        let a = serde_json::allocation::Allocator::new(funding);
         let step = tagged_step(encoding, self.state, pending)?;
         let mut event = TaggedEvent::None;
         match step.action {
@@ -711,8 +588,8 @@ impl TaggedCall {
                 if !schemas.contains_tool(name) {
                     return Err(TaggedCallError::UnknownTool);
                 }
-                self.name = a.copy_string(name)?;
-                a.append(&mut self.arguments, "{")?;
+                self.name = name.to_owned();
+                self.arguments.push('{');
                 event = TaggedEvent::Start;
             }
             TaggedAction::Parameter(range) => {
@@ -720,13 +597,11 @@ impl TaggedCall {
                 if self.parameters.contains(name) {
                     return Err(TaggedCallError::Duplicate);
                 }
-                self.parameter = a.copy_string(name)?;
+                self.parameter = name.to_owned();
                 self.declared = None;
             }
             TaggedAction::Header(declared) => {
-                self.declared = declared
-                    .map(|range| a.copy_string(&pending[range]))
-                    .transpose()?;
+                self.declared = declared.map(|range| pending[range].to_owned());
             }
             TaggedAction::Value(range) => {
                 let value = schemas
@@ -735,27 +610,16 @@ impl TaggedCall {
                         &self.parameter,
                         self.declared.as_deref(),
                         &pending[range],
-                        funding,
                     )
                     .map_err(TaggedCallError::Schema)?;
-                let value = value.to_string_with_allocations(funding)?;
-                let key = Value::String(a.copy_string(&self.parameter)?)
-                    .to_string_with_allocations(funding)?;
+                let value = serde_json::to_string(&value)?;
+                let key = serde_json::to_string(&self.parameter)?;
                 if !self.parameters.names.is_empty() {
-                    a.append(&mut self.arguments, ",")?;
+                    self.arguments.push(',');
                 }
-                a.append(&mut self.arguments, &key)?;
-                a.append(&mut self.arguments, ":")?;
-                a.append(&mut self.arguments, &value)?;
-                // Reserve before moving the name; a refused row retains it.
-                let required = self
-                    .parameters
-                    .names
-                    .len()
-                    .checked_add(1)
-                    .ok_or(serde_json::allocation::AllocationError::SizeOverflow)?;
-                a.grow(&mut self.parameters.names, required)?;
-                self.parameters.reserve_index(1, funding)?;
+                self.arguments.push_str(&key);
+                self.arguments.push(':');
+                self.arguments.push_str(&value);
                 self.parameters.publish(std::mem::take(&mut self.parameter));
                 self.declared = None;
             }
@@ -763,7 +627,7 @@ impl TaggedCall {
                 if schemas.missing_required(&self.name, &self.parameters) {
                     return Err(TaggedCallError::Missing);
                 }
-                a.append(&mut self.arguments, "}")?;
+                self.arguments.push('}');
                 event = TaggedEvent::Complete;
             }
         }
@@ -923,39 +787,5 @@ pub fn tagged_frame_step(
         F::Payload | F::Outside => Err(TaggedError::State),
     }
 }
-/// Fixed owning transition, iterator, serializer and copy transport controls.
-pub fn tagged_control_bytes<E: std::error::Error + 'static>() -> Option<usize> {
-    use std::mem::{size_of, size_of_val};
-    let parts = [
-        size_of::<TaggedCall>(),
-        size_of::<TaggedParameters>(),
-        size_of::<std::collections::hash_map::DefaultHasher>(),
-        size_of::<std::alloc::Layout>(),
-        size_of::<Result<(), hashbrown::TryReserveError>>(),
-        size_of::<TaggedCallError<E>>(),
-        size_of::<TaggedStep>(),
-        size_of::<TaggedFrameStep>(),
-        size_of::<TaggedToolProgram<'_>>(),
-        size_of::<TaggedEncoding<'_>>(),
-        size_of::<TaggedAction>(),
-        size_of::<TaggedEvent>(),
-        size_of::<Value>(),
-        size_of::<String>(),
-        size_of::<Option<String>>(),
-        size_of::<Result<(usize, bool, TaggedEvent), TaggedCallError<E>>>(),
-        size_of::<Result<TaggedFrameStep, TaggedError>>(),
-        size_of::<serde_json::allocation::Allocator<'_>>(),
-        size_of::<Result<Value, E>>(),
-        size_of::<Result<String, serde_json::value::ValueWriteError>>(),
-        size_of::<std::slice::Iter<'_, String>>(),
-        size_of::<Range<usize>>(),
-        size_of::<(&str, &str, usize, usize, bool)>(),
-        size_of::<Result<TaggedCall, serde_json::allocation::AllocationError>>(),
-    ];
-    parts
-        .into_iter()
-        .try_fold(size_of_val(&parts), usize::checked_add)
-}
-
 #[cfg(test)]
 mod tests;

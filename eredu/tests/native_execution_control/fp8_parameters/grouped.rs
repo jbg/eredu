@@ -3,9 +3,7 @@ use super::*;
 
 fn fixture_banks(partial: bool) -> (Fixture, serde_json::Value, Tensors, Tensors) {
     let root = fixture(false);
-    let source: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    ))
+    let source: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
     .unwrap();
     let mut config = source["moe"]["config"].clone();
     config["hidden_size"] = if partial { 130 } else { 128 }.into();

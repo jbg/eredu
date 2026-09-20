@@ -1,0 +1,42 @@
+[
+  {
+    "source": "eredu-architectures/tests/fixtures/k2_horizon/reference.json",
+    "packaged_file": "numerical.json",
+    "sha256": "3410f0b7cea0f44a547c7735023b2ed89e1227fff0f80c570eb3310e84e77166"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/reference.json",
+    "packaged_file": "text.json",
+    "sha256": "f3dee8b6569c43b643482f75a2966230c87ad6f8a5e51bb1a9f6b4180cea486c"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/dense-safetensors.jinja",
+    "packaged_file": "dense-safetensors.jinja",
+    "sha256": "5415a881f1c4391f8463187d1ffe80f2227d15ea060a54ce4c73eb626943bf01"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/dense-gguf.jinja",
+    "packaged_file": "dense-gguf.jinja",
+    "sha256": "f6e3cd6dbf0f95016fff531f41f921dee541025733c14580a881cf5a5f9fa750"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/mova-safetensors.jinja",
+    "packaged_file": "mova-safetensors.jinja",
+    "sha256": "a892cd0b0195599f283a8c706787520d9a6747640efb2f4dec4144b0abb62590"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/mova-gguf.jinja",
+    "packaged_file": "mova-gguf.jinja",
+    "sha256": "f6e3cd6dbf0f95016fff531f41f921dee541025733c14580a881cf5a5f9fa750"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/provenance.json",
+    "packaged_file": "provenance.json",
+    "sha256": "f690366d804ffd5dd5c4d24d273a8c0635f6a5073efc1bcbe69cb0f3907f112a"
+  },
+  {
+    "source": "eredu-text/tests/fixtures/k2_horizon/tool-generation.json",
+    "packaged_file": "tool-generation.json",
+    "sha256": "1f6f14eae130745fc66ff7e4314831c1b4461a129c9727e55f2d56b8f8985542"
+  }
+]

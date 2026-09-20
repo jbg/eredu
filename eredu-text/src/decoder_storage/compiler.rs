@@ -2,7 +2,7 @@
 
 use std::{alloc::Layout, collections::TryReserveError, mem::size_of};
 
-use tokenizers::tokenizer::DecodeVocabulary;
+use crate::tokenizer::metadata::{SnapshotMetadata, SnapshotVocabulary};
 
 use super::{DecodeSourceError, Mode, PreparedDecodeSource, Record, byte_for_char, fallback_byte};
 use crate::tokenizer::TokenizerSnapshot;
@@ -60,7 +60,7 @@ impl DecodeCompileRequirements {
 /// ```
 #[derive(Debug)]
 pub struct DecodeCompilePlan<'a> {
-    vocabulary: DecodeVocabulary<'a>,
+    vocabulary: &'a SnapshotVocabulary,
     mode: Mode,
     requirements: DecodeCompileRequirements,
     #[cfg(any(test, feature = "decode-compiler-test-support"))]
@@ -80,20 +80,19 @@ impl<'a> DecodeCompilePlan<'a> {
     /// These account for explicit representation/return overlaps; allocator and
     /// library call-stack overhead are outside this source-level byte fact.
     pub fn prepare(snapshot: &'a TokenizerSnapshot) -> Result<Self, DecodeSourceError> {
-        Self::prepare_hf(snapshot)
+        Self::prepare_metadata(&snapshot.metadata)
     }
 
-    // Exact fresh aggregate HF borrow; compatibility Snapshot entry delegates here.
-    pub(crate) fn prepare_hf(
-        tokenizer: &'a tokenizers::Tokenizer,
+    pub(crate) fn prepare_metadata(
+        metadata: &'a SnapshotMetadata,
     ) -> Result<Self, DecodeSourceError> {
-        Self::prepare_input(tokenizer.into())
-    }
-    pub(crate) fn prepare_input(input: tokenizers::tokenizer::TokenizerInput<'a>) -> Result<Self, DecodeSourceError> {
-        let mode = Mode::from_decoder(input.decoder()).ok_or(DecodeSourceError::UnsupportedDecoder)?;
-        let vocabulary = input.decode_vocabulary();
+        let mode = metadata.mode.ok_or(DecodeSourceError::UnsupportedDecoder)?;
+        let vocabulary = &metadata.vocabulary;
+        if let Some(id) = vocabulary.duplicate_model_id() {
+            return Err(DecodeSourceError::DuplicateModelId(id));
+        }
         let mut extents = Ok((0usize, 0usize));
-        vocabulary.visit_ids(&mut |id| {
+        for id in vocabulary.ids() {
             if let Ok((count, bytes)) = &mut extents {
                 let next = count.checked_add(1);
                 let piece = vocabulary
@@ -108,7 +107,7 @@ impl<'a> DecodeCompilePlan<'a> {
                     _ => extents = Err(DecodeSourceError::Overflow),
                 }
             }
-        });
+        }
         let (ids, pieces) = extents?;
         let requirements = requirements(ids, pieces)?;
         Ok(Self {
@@ -173,7 +172,7 @@ impl<'a> DecodeCompilePlan<'a> {
         partial
             .ids
             .try_reserve_exact(self.requested_capacity(0, self.requirements.ids))?;
-        self.vocabulary.visit_ids(&mut |id| partial.ids.push(id));
+        partial.ids.extend(self.vocabulary.ids());
         partial.ids.sort_unstable();
         partial.ids.dedup();
         let mut bytes = 0usize;
@@ -202,7 +201,7 @@ impl<'a> DecodeCompilePlan<'a> {
                 id: *id,
                 start,
                 end,
-                special: self.vocabulary.is_special_token(token),
+                special: self.vocabulary.is_special(*id),
                 byte: piece.byte,
             });
             partial.max_piece = partial.max_piece.max(end - start);
@@ -243,7 +242,6 @@ pub(crate) fn requirements(
         .and_then(|bytes| bytes.checked_add(pieces))
         .ok_or(DecodeSourceError::Overflow)?;
     let control_parts = [
-        Mode::control_bytes().ok_or(DecodeSourceError::Overflow)?,
         size_of::<DecodeCompilePlan<'_>>(),
         size_of::<Result<DecodeCompilePlan<'_>, DecodeSourceError>>(),
         size_of::<DecodeCompileRequirements>(),

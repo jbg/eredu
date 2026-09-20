@@ -23,16 +23,8 @@ fn literal_spelling_matches_json_for_controls_unicode_and_delimiters() {
     assert!(StructuralTokens::new(&["x"], &[]).is_err());
 }
 
-#[derive(Debug)]
-struct Refused;
-impl fmt::Display for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("original text funding refusal")
-    }
-}
-impl std::error::Error for Refused {}
 
-fn render(funding: &ParserAllocationFunding, schema: &serde_json::Value) -> Result<String, Error> {
+fn render(funding: &PreparationFunding, schema: &serde_json::Value) -> Result<String, Error> {
     let source = StructuralTokens::new(&["<call>"], &[19])?;
     let mut output = Text::new(funding)?;
     output.push_str("start: ")?;
@@ -55,9 +47,9 @@ fn every_reached_text_producer_refuses_with_original_cause() {
     let schema = serde_json::json!({"type":"object","properties":{"count":{"minimum":3}}});
     let calls = Arc::new(AtomicUsize::new(0));
     let tally = calls.clone();
-    let funding = ParserAllocationFunding::prepare(move |_| {
+    let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
         tally.fetch_add(1, Ordering::Relaxed);
-        Ok::<_, Refused>(())
+        Ok::<_, eredu_core::HostMetadataFundingError>(())
     })
     .unwrap();
     let expected = render(&funding, &schema).unwrap();
@@ -67,9 +59,9 @@ fn every_reached_text_producer_refuses_with_original_cause() {
     for fail in 1..reached {
         let calls = Arc::new(AtomicUsize::new(0));
         let tally = calls.clone();
-        let funding = ParserAllocationFunding::prepare(move |_| {
+        let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
             if tally.fetch_add(1, Ordering::Relaxed) == fail {
-                Err(Refused)
+                Err(eredu_core::HostMetadataFundingError::Capacity { required: 1, available: 0 })
             } else {
                 Ok(())
             }
@@ -80,7 +72,7 @@ fn every_reached_text_producer_refuses_with_original_cause() {
         while let Some(next) = cause.source() {
             cause = next;
         }
-        assert!(cause.is::<Refused>(), "failure {fail}: {error:?}");
+        assert!(cause.is::<eredu_core::HostMetadataFundingError>(), "failure {fail}: {error:?}");
         assert!(calls.load(Ordering::Relaxed) <= fail + 1);
     }
 }
@@ -93,7 +85,7 @@ fn changing_display_cannot_grow_a_destination_after_measurement() {
             f.write_str(if self.0.replace(true) { "longer" } else { "x" })
         }
     }
-    let funding = ParserAllocationFunding::unenforced();
+    let funding = PreparationFunding::unmanaged();
     let mut output = Text::new(&funding).unwrap();
     assert!(matches!(
         output.push_fmt(format_args!("{}", Changes(std::cell::Cell::new(false)))),
@@ -136,7 +128,7 @@ fn funded_protocol_producers_preserve_source_and_refuse_without_retry() {
             .map(|index| 100 + u32::try_from(index).unwrap())
             .collect::<Vec<_>>();
         for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {
-            let build = |funding: &ParserAllocationFunding| {
+            let build = |funding: &PreparationFunding| {
                 dialect.constraint_configuration(
                     parameters,
                     &tools,
@@ -146,12 +138,12 @@ fn funded_protocol_producers_preserve_source_and_refuse_without_retry() {
                     funding,
                 )
             };
-            let ordinary = build(&ParserAllocationFunding::unenforced()).unwrap();
+            let ordinary = build(&PreparationFunding::unmanaged()).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let tally = calls.clone();
-            let funding = ParserAllocationFunding::prepare(move |_| {
+            let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
                 tally.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, Refused>(())
+                Ok::<_, eredu_core::HostMetadataFundingError>(())
             })
             .unwrap();
             let funded = build(&funding).unwrap();
@@ -163,9 +155,9 @@ fn funded_protocol_producers_preserve_source_and_refuse_without_retry() {
             for fail in 1..count {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let tally = calls.clone();
-                let funding = ParserAllocationFunding::prepare(move |_| {
+                let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
                     if tally.fetch_add(1, Ordering::Relaxed) == fail {
-                        Err(Refused)
+                        Err(eredu_core::HostMetadataFundingError::Capacity { required: 1, available: 0 })
                     } else {
                         Ok(())
                     }
@@ -177,7 +169,7 @@ fn funded_protocol_producers_preserve_source_and_refuse_without_retry() {
                     cause = next;
                 }
                 assert!(
-                    cause.is::<Refused>(),
+                    cause.is::<eredu_core::HostMetadataFundingError>(),
                     "{choice:?} failed producer {fail}: {error:?}"
                 );
                 assert_eq!(calls.load(Ordering::Relaxed), fail + 1);

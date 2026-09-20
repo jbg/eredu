@@ -60,13 +60,7 @@ fn macro_destinations_and_argument_refusals_preserve_paid_prefix_custody() {
         .compile()
         .unwrap();
     let caller = json!({"row":{"text":"é\u{0}🦀"}});
-    for buffer in [
-        ChatRenderBuffer::MacroCalls,
-        ChatRenderBuffer::MacroArguments,
-        ChatRenderBuffer::MacroCaptures,
-        ChatRenderBuffer::ContextText,
-        ChatRenderBuffer::Borrowed,
-    ] {
+    for buffer in [ChatRenderBuffer::WithPrompt] {
         let context = ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap();
         let failure = source
             .render_plan_with_context(context)
@@ -80,7 +74,7 @@ fn macro_destinations_and_argument_refusals_preserve_paid_prefix_custody() {
     let failed = source
         .render_plan_with_context(context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::MacroArguments)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((source, caller));
@@ -98,6 +92,8 @@ fn macro_destinations_and_argument_refusals_preserve_paid_prefix_custody() {
         assert!(
             source
                 .render_plan_with_context(ChatRenderContext::from_json(&[], None, None).unwrap())
+                .unwrap()
+                .render()
                 .is_err()
         );
         assert!(

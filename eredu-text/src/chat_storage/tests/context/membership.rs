@@ -99,7 +99,7 @@ fn released_membership_conditions_preserve_short_circuit_and_escaped_custody() {
 }
 
 #[test]
-fn membership_refuses_unqualified_container_equality_and_coercion() {
+fn membership_matches_structured_equality_and_dynamic_coercion() {
     for caller in [
         json!({"needle":{"x":1},"values":[{"x":1}]}),
         json!({"needle":[1],"values":[[1]]}),
@@ -107,27 +107,24 @@ fn membership_refuses_unqualified_container_equality_and_coercion() {
         json!({"needle":"x","values":17}),
         json!({"needle":"x","values":null}),
     ] {
-        let source = ChatTemplatePlan::prepare_utf8("{{ needle in values }}", "membership")
-            .unwrap()
-            .compile()
-            .unwrap();
-        assert!(
-            source
-                .render_plan_with_context(
-                    ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-                )
-                .is_err()
-        );
+        compare_outcome("{{ needle in values }}", caller.as_object().unwrap());
     }
 }
 
 #[test]
-fn generated_membership_and_empty_macro_values_share_paid_string_consumers(){
-    let caller=json!({"needle":"界","left":"É","right":"界🙂","map":{"界界":7}});
+fn generated_membership_and_empty_macro_values_share_paid_string_consumers() {
+    let caller = json!({"needle":"界","left":"É","right":"界🙂","map":{"界界":7}});
     for template in [
         "{{ needle in (left+right) }}|{{ (needle+needle) in map }}",
         "{{ (left+right) in [left+right,'absent'] }}|{{ needle in ((left+right)|replace('🙂','!')) }}",
         "{% macro empty() %}{% endmacro %}{{ empty() == '' }}|{{ empty().endswith('') }}|{{ empty()|tojson }}",
         "{% macro content() %}{{ left }}{{ right }}{% endmacro %}{{ needle in content() }}|{{ content() == left+right }}",
-    ]{compare(template,&[],&serde_json::Map::new(),caller.as_object().unwrap());}
+    ] {
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
+    }
 }

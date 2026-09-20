@@ -7,7 +7,6 @@ use std::sync::Arc;
 pub(super) enum ToolCause {
     #[error(transparent)] Tagged(channels::tagged::TaggedCallError<BackendFailure>),
     #[error(transparent)] TaggedSyntax(channels::tagged::TaggedError),
-    #[error(transparent)] JsonAllocation(serde_json::allocation::AllocationError),
     #[error(transparent)] Text(eredu_core::SemanticTextAllocationError),
     #[error(transparent)] Schema(BackendFailure),
     #[error("incomplete tagged-parameter tool call")] Incomplete,

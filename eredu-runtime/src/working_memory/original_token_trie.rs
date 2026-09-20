@@ -1,10 +1,10 @@
-//! Originally constructed tokenizer trie with exact source and account custody.
+//! Stock tokenizer-trie construction with retained source identity and admission.
 use super::{
     OriginalTokenizer, WorkingMemoryError, WorkingMemoryPool, original_declaration_source::Account,
 };
 use eredu_text::token_trie_storage::{
-    PreparedTokenTrie, TokRxInfo, TokTrie, TokenTrieConstructionFailure, TokenTriePlan,
-    TokenTrieSourceError,
+    PreparedTokenTrie, TokRxInfo, TokTrie, TokenTrieConstructionFailure, TokenTrieMemoryPolicy,
+    TokenTriePlan, TokenTrieSourceError,
 };
 use std::{
     alloc::Layout,
@@ -40,37 +40,73 @@ impl Drop for OriginalTokenTrieSource {
 impl OriginalTokenTrieSource {
     /// Authenticate the original trie and immutable compilation outputs.
     /// Mutable state funding is checked separately against its retained payer.
-    pub fn validate_grammar_source(&self, source: eredu_core::speculative::PreparedGrammarSource<'_>, pool: &WorkingMemoryPool)
-        -> Result<(), WorkingMemoryError> {
-        let supplied = source.tokenizer().downcast_ref::<Self>().ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let compilation = source.compilation().downcast_ref::<super::OriginalControllerCompilation>()
+    pub fn validate_grammar_source(
+        &self,
+        source: eredu_core::speculative::PreparedGrammarSource<'_>,
+        pool: &WorkingMemoryPool,
+    ) -> Result<(), WorkingMemoryError> {
+        let supplied = source
+            .tokenizer()
+            .downcast_ref::<Self>()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !self.same_source(supplied) { return Err(WorkingMemoryError::IdentityMismatch); }
-        self.validate_grammar_inputs(source.validity(), source.recipe(), source.declaration(), compilation, pool)
+        let compilation = source
+            .compilation()
+            .downcast_ref::<super::OriginalControllerCompilation>()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        if !self.same_source(supplied) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.validate_grammar_inputs(
+            source.validity(),
+            source.recipe(),
+            source.declaration(),
+            compilation,
+            pool,
+        )
     }
     pub(super) fn validate_grammar_inputs(
-        &self, validity: &eredu_core::SharedTokenFilter, recipe: &eredu_core::SharedControllerBytes,
+        &self,
+        validity: &eredu_core::SharedTokenFilter,
+        recipe: &eredu_core::SharedControllerBytes,
         declaration: &eredu_core::SharedControllerDeclaration,
-        compilation: &super::OriginalControllerCompilation, pool: &WorkingMemoryPool,
+        compilation: &super::OriginalControllerCompilation,
+        pool: &WorkingMemoryPool,
     ) -> Result<(), WorkingMemoryError> {
         self.payload().account.validate(pool)?;
         self.payload().tokenizer.validate_pool(pool)?;
-        pool.validate_shared_controller_source(eredu_core::SharedControllerSource::Filter(validity))?;
+        pool.validate_shared_controller_source(eredu_core::SharedControllerSource::Filter(
+            validity,
+        ))?;
         compilation.validate_grammar_sources(recipe, declaration, self)
     }
     /// Exact read-only original grammar/source authentication frames.
     pub fn grammar_validation_control_bytes() -> Option<usize> {
-        let parts = [Self::validation_control_bytes()?,
+        let parts = [
+            Self::validation_control_bytes()?,
             WorkingMemoryPool::shared_controller_source_validation_control_bytes()?,
             super::OriginalControllerCompilation::validation_control_bytes()?,
             eredu_core::speculative::PreparedGrammarSource::control_bytes()?,
-            size_of::<(&Self, eredu_core::speculative::PreparedGrammarSource<'_>, &WorkingMemoryPool)>(),
-            size_of::<(&Self, &eredu_core::SharedTokenFilter, &eredu_core::SharedControllerBytes,
-                &eredu_core::SharedControllerDeclaration, &super::OriginalControllerCompilation, &WorkingMemoryPool)>(),
-            size_of::<Option<&Self>>(), size_of::<Option<&super::OriginalControllerCompilation>>(),
+            size_of::<(
+                &Self,
+                eredu_core::speculative::PreparedGrammarSource<'_>,
+                &WorkingMemoryPool,
+            )>(),
+            size_of::<(
+                &Self,
+                &eredu_core::SharedTokenFilter,
+                &eredu_core::SharedControllerBytes,
+                &eredu_core::SharedControllerDeclaration,
+                &super::OriginalControllerCompilation,
+                &WorkingMemoryPool,
+            )>(),
+            size_of::<Option<&Self>>(),
+            size_of::<Option<&super::OriginalControllerCompilation>>(),
             size_of::<eredu_core::SharedControllerSource<'_>>(),
-            size_of::<Result<(), WorkingMemoryError>>()];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+            size_of::<Result<(), WorkingMemoryError>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
     /// Encodes in the exact tokenizer/source pool retained by this trie. The
     /// existing original E producer admits each operation before construction;
@@ -129,7 +165,11 @@ impl OriginalTokenTrieSource {
         self.payload().tokenizer.validate_pool(pool)?;
         if !self.payload().tokenizer.same_source(tokenizer)
             || self.trie().info() != info
-            || self.trie().eos_tokens() != eos
+            || if eos.is_empty() {
+                self.trie().eos_tokens() != [eredu_text::token_trie_storage::INVALID_TOKEN]
+            } else {
+                eos.iter().any(|&id| id >= info.vocab_size) || self.trie().eos_tokens() != eos
+            }
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -250,32 +290,63 @@ fn required(plan: &TokenTriePlan<'_>) -> Result<u64, WorkingMemoryError> {
         .ok_or(WorkingMemoryError::Overflow)
 }
 impl WorkingMemoryPool {
-    /// Exact original tokenizer source geometry; no destination allocation or
-    /// account admission occurs while deriving this quote.
+    /// First-party destination sizing and default upstream headroom; deriving
+    /// this estimate neither constructs a trie nor admits an account.
     pub fn token_trie_source_required_bytes(
         tokenizer: &OriginalTokenizer,
         info: &TokRxInfo,
         eos: &[u32],
     ) -> Result<u64, OriginalTokenTrieSourceError> {
+        Self::token_trie_source_required_bytes_with_memory_policy(
+            tokenizer,
+            info,
+            eos,
+            TokenTrieMemoryPolicy::default(),
+        )
+    }
+    /// Estimates first-party destinations and configured upstream headroom.
+    pub fn token_trie_source_required_bytes_with_memory_policy(
+        tokenizer: &OriginalTokenizer,
+        info: &TokRxInfo,
+        eos: &[u32],
+        policy: TokenTrieMemoryPolicy,
+    ) -> Result<u64, OriginalTokenTrieSourceError> {
         let plan = tokenizer
             .token_trie_plan(info, eos)
+            .and_then(|plan| plan.with_memory_policy(policy))
             .map_err(OriginalTokenTrieSourceError::rejected)?;
         required(&plan).map_err(OriginalTokenTrieSourceError::rejected)
     }
-    /// Compares and admits the entire real constructor before creating packed
-    /// bytes, borrowed slice storage or trie nodes. Source facts cannot adopt an
-    /// existing trie or promote unregistered storage into this source account.
+    /// Admits default construction headroom before creating lexical buffers
+    /// and the stock trie. The source cannot adopt an existing trie.
     pub fn compile_token_trie_source(
         &self,
         tokenizer: &OriginalTokenizer,
         info: &TokRxInfo,
         eos: &[u32],
     ) -> Result<OriginalTokenTrieSource, OriginalTokenTrieSourceError> {
+        self.compile_token_trie_source_with_memory_policy(
+            tokenizer,
+            info,
+            eos,
+            TokenTrieMemoryPolicy::default(),
+        )
+    }
+    /// Admits configurable dependency headroom before stock trie construction.
+    /// The token-length limit bounds input depth, not upstream heap allocation.
+    pub fn compile_token_trie_source_with_memory_policy(
+        &self,
+        tokenizer: &OriginalTokenizer,
+        info: &TokRxInfo,
+        eos: &[u32],
+        policy: TokenTrieMemoryPolicy,
+    ) -> Result<OriginalTokenTrieSource, OriginalTokenTrieSourceError> {
         tokenizer
             .validate_pool(self)
             .map_err(OriginalTokenTrieSourceError::rejected)?;
         let plan = tokenizer
             .token_trie_plan(info, eos)
+            .and_then(|plan| plan.with_memory_policy(policy))
             .map_err(OriginalTokenTrieSourceError::rejected)?;
         let bytes = required(&plan).map_err(OriginalTokenTrieSourceError::rejected)?;
         let account =

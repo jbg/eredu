@@ -32,7 +32,9 @@ struct Payload {
 
 /// Closed shared source retaining its complete original compiler allowance.
 /// No Arc, Weak, source extraction/refill or independent-byte constructor escapes.
-/// This funds the accepted complete selected HF aggregate and its fresh decode program; caller JSON, chat rendering and encoding operation allocations remain separate.
+/// This retains construction headroom for stock HF and its fresh decode program.
+/// Dependency internals use estimates; caller JSON, chat rendering and encoding
+/// operation allocations have separate reservations.
 ///
 /// ```compile_fail
 /// # use eredu_runtime::working_memory::OriginalTokenizer;
@@ -48,9 +50,9 @@ struct Payload {
 /// ```
 pub struct OriginalTokenizer(Option<Arc<Payload>>);
 impl OriginalTokenizer {
-    /// Remove input prefixes using the same immutable model and a prospectively
-    /// funded added-vocabulary/decoder projection. Identity removal aliases this
-    /// exact source. A changed source retains this original owner and payer.
+    /// Remove input prefixes using a separately admitted tokenizer copy.
+    /// Identity removal aliases this exact source. A changed source reserves a
+    /// full construction estimate and retains the original identity and payer.
     pub fn input_prefix_normalized_source(&self) -> Result<Self, OriginalTokenizerPrefixError> {
         let plan = self.payload().model.input_prefix_plan().map_err(|error| OriginalTokenizerError {
             cause: Cause::Source(error), settlement: None, _completed: None, domain: None,
@@ -327,7 +329,7 @@ impl SourcePlan for PrefixSourcePlan<'_> {
 }
 
 impl WorkingMemoryPool {
-    /// Actual source-derived compiler plus closed owner/error control requirements.
+    /// Source-derived construction estimate plus closed owner/error controls.
     /// This query grants no budget and takes no ownership of the borrowed plan.
     pub fn tokenizer_required_bytes(plan: &TokenizerPlan<'_>) -> Result<u64, WorkingMemoryError> {
         Self::tokenizer_construction_required_bytes::<TokenizerPlan<'_>>(plan.requirements().required_bytes(), plan.generation_domain_extent())

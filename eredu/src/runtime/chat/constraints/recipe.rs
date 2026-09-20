@@ -1,16 +1,12 @@
 //! Closed immutable reconstruction data for one constraint configuration.
 
 use super::super::tokenizer_env::recipe::FrozenGrammarTokenizer;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
+use eredu_core::HostPreparationAuthority;
 use eredu_core::SharedControllerBytes;
-use llguidance::{
-    api::TopLevelGrammar,
-    earley::{SlicerSource, SlicerSourceDescriptor, SlicerSourceView},
-    toktrie::TokRxInfo,
-};
+use llguidance::{api::TopLevelGrammar, toktrie::TokRxInfo};
 use serde_json::Value;
 use std::fmt;
-use eredu_core::HostPreparationAuthority;
-use llguidance::derivre::ParserAllocationFunding;
 mod serialization;
 use serialization::Cause;
 
@@ -20,17 +16,13 @@ use serialization::Cause;
 pub(crate) struct RecipeBuildError {
     #[source]
     cause: Cause,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
 }
 
-// Version 4 also retains exact ordinary slicer recognition records.
-// Version 3 also retains the exact prefix-normalized tokenizer source.
-// Version 2 retained actual prepared trie metadata; version 1 fixed
-// ParserFactory::new_simple, quiet/default general slices, and
-// the existing tokenizer prefix-normalization policy. Changing reconstruction
-// settings requires a new recipe version, not an implicit reinterpretation.
+// This private format records normalized tokenizer, grammar and request policy.
+// Factory slicing uses the selected stock llguidance configuration.
 const MAGIC: &[u8; 8] = b"EREDUCR\0";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const HEADER_BYTES: usize = MAGIC.len() + std::mem::size_of::<u32>();
 const OFFSET_BYTES: usize = std::mem::size_of::<u64>();
 const TOKEN_BYTES: usize = std::mem::size_of::<u32>();
@@ -112,18 +104,11 @@ struct GrammarTokenizer {
 }
 
 #[derive(Clone, Copy)]
-struct SlicerLayout {
-    bytes: Span,
-    descriptor: SlicerSourceDescriptor,
-}
-
-#[derive(Clone, Copy)]
 struct Layout {
     tokenizer: Option<Span>,
     tokenizer_object: Option<Span>,
     trie_info: Option<Span>,
     grammar_tokenizer: Option<GrammarTokenizer>,
-    slicer: Option<SlicerLayout>,
     grammar: Span,
     max_tokens: Option<usize>,
     tools: Span,
@@ -134,7 +119,9 @@ struct Layout {
     trigger: Option<Span>,
 }
 
-fn overflow() -> Cause { Cause::Overflow }
+fn overflow() -> Cause {
+    Cause::Overflow
+}
 
 fn take_span(cursor: &mut usize, size: usize) -> Result<Span, Cause> {
     let end = cursor.checked_add(size).ok_or_else(overflow)?;
@@ -195,7 +182,9 @@ impl ConstraintRecipe {
         self.original_trie = source.cloned();
     }
 
-    pub(super) fn original_trie(&self) -> Option<&eredu_runtime::working_memory::OriginalTokenTrieSource> {
+    pub(super) fn original_trie(
+        &self,
+    ) -> Option<&eredu_runtime::working_memory::OriginalTokenTrieSource> {
         self.original_trie.as_ref()
     }
 
@@ -223,8 +212,7 @@ impl ConstraintRecipe {
             trigger,
             None,
             None,
-            None,
-            &ParserAllocationFunding::unenforced(),
+            &PreparationFunding::unmanaged(),
             &HostPreparationAuthority::unmanaged(),
         )
     }
@@ -242,8 +230,7 @@ impl ConstraintRecipe {
         trigger: Option<&str>,
         trie_info: TokRxInfo,
         grammar_tokenizer: Option<&FrozenGrammarTokenizer>,
-        slicer_source: Option<&SlicerSource>,
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
         authority: &HostPreparationAuthority,
     ) -> Result<Self, RecipeBuildError> {
         Self::build(
@@ -257,7 +244,6 @@ impl ConstraintRecipe {
             trigger,
             Some(trie_info),
             grammar_tokenizer,
-            slicer_source,
             funding,
             authority,
         )
@@ -275,138 +261,137 @@ impl ConstraintRecipe {
         trigger: Option<&str>,
         trie_info: Option<TokRxInfo>,
         grammar_tokenizer: Option<&FrozenGrammarTokenizer>,
-        slicer_source: Option<&SlicerSource>,
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
         authority: &HostPreparationAuthority,
     ) -> Result<Self, RecipeBuildError> {
         let result = (|| -> Result<Self, Cause> {
-        let controls = [
-            std::mem::size_of::<Self>(),
-            std::mem::size_of::<Layout>(),
-            std::mem::size_of::<RecipeBuildError>(),
-            std::mem::size_of::<Result<Self, RecipeBuildError>>(),
-            std::mem::size_of::<serialization::Count>(),
-            SharedControllerBytes::source_shell_bytes().ok_or(Cause::Overflow)?,
-        ];
-        funding.reserve(controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-            .ok_or(Cause::Overflow)?)?;
-        if structural_spellings.len() != structural_ids.len() {
-            return Err(Cause::Structural);
-        }
-        let mut grammar_json = serialization::Count::default();
-        serialization::value(&mut grammar_json, grammar, funding)?;
-        let mut tools_json = serialization::Count::default();
-        serialization::tools(&mut tools_json, tools, funding)?;
-        let mut total = HEADER_BYTES;
-        let mut layout = Layout {
-            tokenizer: tokenizer_json
-                .map(|value| take_span(&mut total, value.len()))
-                .transpose()?,
-            tokenizer_object: None,
-            grammar_tokenizer: grammar_tokenizer
-                .map(|source| {
-                    let root = take_span(&mut total, source.bytes().len())?;
-                    let range = source.object_range();
-                    Ok::<_, Cause>(GrammarTokenizer {
-                        root,
-                        object: Span {
-                            start: root.start.checked_add(range.start).ok_or_else(overflow)?,
-                            end: root.start.checked_add(range.end).ok_or_else(overflow)?,
-                        },
-                        encode_special_tokens: source.encode_special_tokens(),
-                        canonical: source.canonical(),
-                    })
-                })
-                .transpose()?,
-            slicer: slicer_source
-                .map(|source| {
-                    Ok::<_, Cause>(SlicerLayout {
-                        bytes: take_span(&mut total, source.as_bytes().len())?,
-                        descriptor: source.descriptor(),
-                    })
-                })
-                .transpose()?,
-            trie_info: trie_info
-                .map(|_| take_span(&mut total, 10 * TOKEN_BYTES))
-                .transpose()?,
-            grammar: take_span(&mut total, grammar_json.bytes())?,
-            max_tokens: grammar.max_tokens,
-            tools: take_span(&mut total, tools_json.bytes())?,
-            eos: take_span(&mut total, token_bytes(eos.len())?)?,
-            structural_ids: take_span(&mut total, token_bytes(structural_ids.len())?)?,
-            structural_spellings: Strings::plan(&mut total, structural_spellings)?,
-            stops: Strings::plan(&mut total, stops)?,
-            trigger: trigger
-                .map(|value| take_span(&mut total, value.len()))
-                .transpose()?,
-        };
-        if let (Some(root), Some(json)) = (layout.tokenizer, tokenizer_json) {
-            if let Some(span) = super::super::tokenizer_env::recipe::tokenizer_span(json) {
-                layout.tokenizer_object = Some(Span {
-                    start: root.start.checked_add(span.start).ok_or_else(overflow)?,
-                    end: root.start.checked_add(span.end).ok_or_else(overflow)?,
-                });
+            let controls = [
+                std::mem::size_of::<Self>(),
+                std::mem::size_of::<Layout>(),
+                std::mem::size_of::<RecipeBuildError>(),
+                std::mem::size_of::<Result<Self, RecipeBuildError>>(),
+                std::mem::size_of::<serialization::Count>(),
+                SharedControllerBytes::source_shell_bytes().ok_or(Cause::Overflow)?,
+            ];
+            funding.reserve(
+                controls
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+                    .ok_or(Cause::Overflow)?,
+            )?;
+            if structural_spellings.len() != structural_ids.len() {
+                return Err(Cause::Structural);
             }
-        }
-        let mut bytes = Vec::new();
-        funding.try_grow_vec(&mut bytes, total)?;
-        bytes.resize(total, 0);
-        bytes[..MAGIC.len()].copy_from_slice(MAGIC);
-        bytes[MAGIC.len()..HEADER_BYTES].copy_from_slice(&VERSION.to_le_bytes());
-        if let (Some(span), Some(json)) = (layout.tokenizer, tokenizer_json) {
-            span.write(&mut bytes, json);
-        }
-        if let (Some(layout), Some(source)) = (layout.grammar_tokenizer, grammar_tokenizer) {
-            layout.root.write(&mut bytes, source.bytes());
-        }
-        if let (Some(layout), Some(source)) = (layout.slicer, slicer_source) {
-            layout.bytes.write(&mut bytes, source.as_bytes());
-        }
-        if let (Some(span), Some(info)) = (layout.trie_info, trie_info) {
-            let option = |id: Option<u32>| [u32::from(id.is_some()), id.unwrap_or(0)];
-            let bos = option(info.tok_bos);
-            let pad = option(info.tok_pad);
-            let unk = option(info.tok_unk);
-            let eot = option(info.tok_end_of_turn);
-            write_tokens(
-                span,
-                &mut bytes,
-                &[
-                    info.vocab_size,
-                    info.tok_eos,
-                    bos[0],
-                    bos[1],
-                    pad[0],
-                    pad[1],
-                    unk[0],
-                    unk[1],
-                    eot[0],
-                    eot[1],
-                ],
-            );
-        }
-        let mut grammar_destination = &mut bytes[layout.grammar.start..layout.grammar.end];
-        serialization::value(&mut grammar_destination, grammar, funding)?;
-        if !grammar_destination.is_empty() { return Err(Cause::Destination); }
-        let mut tools_destination = &mut bytes[layout.tools.start..layout.tools.end];
-        serialization::tools(&mut tools_destination, tools, funding)?;
-        if !tools_destination.is_empty() { return Err(Cause::Destination); }
-        write_tokens(layout.eos, &mut bytes, eos);
-        write_tokens(layout.structural_ids, &mut bytes, structural_ids);
-        layout
-            .structural_spellings
-            .write(&mut bytes, structural_spellings);
-        layout.stops.write(&mut bytes, stops);
-        if let (Some(span), Some(trigger)) = (layout.trigger, trigger) {
-            span.write(&mut bytes, trigger.as_bytes());
-        }
-        Ok(Self {
-            bytes: SharedControllerBytes::new(bytes, authority.clone()),
-            layout,
-            original_trie: None,
-        })
+            let mut grammar_json = serialization::Count::default();
+            serialization::value(&mut grammar_json, grammar, funding)?;
+            let mut tools_json = serialization::Count::default();
+            serialization::tools(&mut tools_json, tools, funding)?;
+            let mut total = HEADER_BYTES;
+            let mut layout = Layout {
+                tokenizer: tokenizer_json
+                    .map(|value| take_span(&mut total, value.len()))
+                    .transpose()?,
+                tokenizer_object: None,
+                grammar_tokenizer: grammar_tokenizer
+                    .map(|source| {
+                        let root = take_span(&mut total, source.bytes().len())?;
+                        let range = source.object_range();
+                        Ok::<_, Cause>(GrammarTokenizer {
+                            root,
+                            object: Span {
+                                start: root.start.checked_add(range.start).ok_or_else(overflow)?,
+                                end: root.start.checked_add(range.end).ok_or_else(overflow)?,
+                            },
+                            encode_special_tokens: source.encode_special_tokens(),
+                            canonical: source.canonical(),
+                        })
+                    })
+                    .transpose()?,
+                trie_info: trie_info
+                    .map(|_| take_span(&mut total, 10 * TOKEN_BYTES))
+                    .transpose()?,
+                grammar: take_span(&mut total, grammar_json.bytes())?,
+                max_tokens: grammar.max_tokens,
+                tools: take_span(&mut total, tools_json.bytes())?,
+                eos: take_span(&mut total, token_bytes(eos.len())?)?,
+                structural_ids: take_span(&mut total, token_bytes(structural_ids.len())?)?,
+                structural_spellings: Strings::plan(&mut total, structural_spellings)?,
+                stops: Strings::plan(&mut total, stops)?,
+                trigger: trigger
+                    .map(|value| take_span(&mut total, value.len()))
+                    .transpose()?,
+            };
+            if let (Some(root), Some(json)) = (layout.tokenizer, tokenizer_json) {
+                if let Some(span) = super::super::tokenizer_env::recipe::tokenizer_span(json) {
+                    layout.tokenizer_object = Some(Span {
+                        start: root.start.checked_add(span.start).ok_or_else(overflow)?,
+                        end: root.start.checked_add(span.end).ok_or_else(overflow)?,
+                    });
+                }
+            }
+            let mut bytes = Vec::new();
+            funding.try_grow_vec(&mut bytes, total)?;
+            bytes.resize(total, 0);
+            bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+            bytes[MAGIC.len()..HEADER_BYTES].copy_from_slice(&VERSION.to_le_bytes());
+            if let (Some(span), Some(json)) = (layout.tokenizer, tokenizer_json) {
+                span.write(&mut bytes, json);
+            }
+            if let (Some(layout), Some(source)) = (layout.grammar_tokenizer, grammar_tokenizer) {
+                layout.root.write(&mut bytes, source.bytes());
+            }
+            if let (Some(span), Some(info)) = (layout.trie_info, trie_info) {
+                let option = |id: Option<u32>| [u32::from(id.is_some()), id.unwrap_or(0)];
+                let bos = option(info.tok_bos);
+                let pad = option(info.tok_pad);
+                let unk = option(info.tok_unk);
+                let eot = option(info.tok_end_of_turn);
+                write_tokens(
+                    span,
+                    &mut bytes,
+                    &[
+                        info.vocab_size,
+                        info.tok_eos,
+                        bos[0],
+                        bos[1],
+                        pad[0],
+                        pad[1],
+                        unk[0],
+                        unk[1],
+                        eot[0],
+                        eot[1],
+                    ],
+                );
+            }
+            let mut grammar_destination = &mut bytes[layout.grammar.start..layout.grammar.end];
+            serialization::value(&mut grammar_destination, grammar, funding)?;
+            if !grammar_destination.is_empty() {
+                return Err(Cause::Destination);
+            }
+            let mut tools_destination = &mut bytes[layout.tools.start..layout.tools.end];
+            serialization::tools(&mut tools_destination, tools, funding)?;
+            if !tools_destination.is_empty() {
+                return Err(Cause::Destination);
+            }
+            write_tokens(layout.eos, &mut bytes, eos);
+            write_tokens(layout.structural_ids, &mut bytes, structural_ids);
+            layout
+                .structural_spellings
+                .write(&mut bytes, structural_spellings);
+            layout.stops.write(&mut bytes, stops);
+            if let (Some(span), Some(trigger)) = (layout.trigger, trigger) {
+                span.write(&mut bytes, trigger.as_bytes());
+            }
+            Ok(Self {
+                bytes: SharedControllerBytes::new(bytes, authority.clone()),
+                layout,
+                original_trie: None,
+            })
         })();
-        result.map_err(|cause| RecipeBuildError { cause, funding: funding.clone() })
+        result.map_err(|cause| RecipeBuildError {
+            cause,
+            funding: funding.clone(),
+        })
     }
 
     pub(super) fn fingerprint(&self) -> [u8; 32] {
@@ -438,13 +423,6 @@ impl ConstraintRecipe {
     pub(crate) fn grammar_source_control_bytes(&self) -> Option<usize> {
         let mut words = self.eos_token_ids();
         let parts = [
-            self.layout
-                .slicer
-                .map(|layout| layout.descriptor.control_bytes())
-                .unwrap_or(Some(0))?,
-            std::mem::size_of::<Option<SlicerSourceView<'_>>>(),
-            std::mem::size_of::<Result<SlicerSourceView<'_>, llguidance::earley::SlicerSourceError>>(
-            ),
             std::mem::size_of::<Self>(),
             std::mem::size_of::<Layout>(),
             std::mem::size_of::<Span>(),
@@ -479,7 +457,9 @@ impl ConstraintRecipe {
     }
     /// Actual non-serde HF special-splitting policy retained by `freeze`.
     pub(crate) fn grammar_tokenizer_is_canonical(&self) -> Option<bool> {
-        self.original_trie.as_ref().map(|source| source.tokenization_is_canonical())
+        self.original_trie
+            .as_ref()
+            .map(|source| source.tokenization_is_canonical())
             .or_else(|| self.layout.grammar_tokenizer.map(|source| source.canonical))
     }
 
@@ -544,15 +524,6 @@ impl ConstraintRecipe {
         self.layout.trigger.map(|span| {
             std::str::from_utf8(span.bytes(self.bytes.as_ref())).expect("validated recipe trigger")
         })
-    }
-
-    /// Exact closed layout into this recipe's same registered byte owner.
-    pub(crate) fn slicer_source(&self) -> Option<SlicerSourceView<'_>> {
-        let layout = self.layout.slicer?;
-        layout
-            .descriptor
-            .checked_view(layout.bytes.bytes(self.bytes.as_ref()))
-            .ok()
     }
 
     pub(crate) fn source(&self) -> &SharedControllerBytes {

@@ -32,14 +32,14 @@ use eredu_text::tokenizer::Tokenizer;
 /// ```
 pub struct LoadedTokenizerView<'a> {
     tokenizer: &'a Tokenizer,
-    vocabulary: tokenizers::tokenizer::DecodeVocabulary<'a>,
+    vocabulary: eredu_text::tokenizer::TokenizerVocabulary<'a>,
     fingerprint: &'a [u8; 32],
 }
 
 impl<'a> LoadedTokenizerView<'a> {
     pub(super) fn new(tokenizer: &'a Tokenizer, fingerprint: &'a [u8; 32]) -> Self {
         Self {
-            vocabulary: tokenizer.decode_vocabulary(),
+            vocabulary: tokenizer.vocabulary(),
             tokenizer,
             fingerprint,
         }
@@ -63,12 +63,12 @@ impl<'a> LoadedTokenizerView<'a> {
         self.vocabulary.is_special_token(token)
     }
 
-    /// Iterates model forward-map IDs followed by added reverse-map IDs.
+    /// Iterates populated model and added reverse-map IDs.
     ///
     /// Order is unspecified and overlapping IDs can repeat. Sparse IDs are not
     /// filled in. This is the decoding vocabulary population, not a claim that
     /// every entry is eligible for generation. The iterator directly borrows
-    /// existing maps and invokes no user callback or allocating HF operation.
+    /// existing index and invokes no user callback or allocating HF operation.
     pub fn decode_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.vocabulary.ids()
     }

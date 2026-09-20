@@ -1,5 +1,5 @@
 use super::*;
-use tokenizers::ModelCachePolicy;
+use eredu_text::tokenizer::ModelCachePolicy;
 const JSON: &str = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[["a","b"]]},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}}"#;
 #[test]
 fn selected_policy_reaches_json_tiktoken_and_gguf_fallback_without_changing_defaults() {
@@ -26,7 +26,6 @@ fn selected_policy_reaches_json_tiktoken_and_gguf_fallback_without_changing_defa
     let rank_import =
         load_tokenizer_for_kind_with_cache_policy(ModelKind::KimiLinear, &dir, ModelCachePolicy::disabled())
             .unwrap();
-    assert_eq!(rank_import.model_cache_policy(), ModelCachePolicy::disabled());
     assert_eq!(
         rank_import.encode("abab", false).unwrap().get_ids(),
         &[2, 2]
@@ -35,8 +34,6 @@ fn selected_policy_reaches_json_tiktoken_and_gguf_fallback_without_changing_defa
     for kind in [ModelKind::Llama, ModelKind::KimiLinear] {
         let default = load_tokenizer_for_kind(kind, &dir).unwrap();
         let absent = load_tokenizer_for_kind_with_cache_policy(kind, &dir, ModelCachePolicy::disabled()).unwrap();
-        assert_eq!(default.model_cache_policy(), ModelCachePolicy::default());
-        assert_eq!(absent.model_cache_policy(), ModelCachePolicy::disabled());
         assert_eq!(
             default.encode("abab", false).unwrap().get_ids(),
             absent.encode("abab", false).unwrap().get_ids()
@@ -47,7 +44,7 @@ fn selected_policy_reaches_json_tiktoken_and_gguf_fallback_without_changing_defa
     let fallback =
         load_gguf_tokenizer_from_metadata_with_cache_policy(&artifact, &metadata, ModelCachePolicy::disabled())
             .unwrap();
-    assert_eq!(fallback.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
+    assert_eq!(fallback.tokenizer.encode("abab", false).unwrap().get_ids(), &[2, 2]);
     metadata.insert(
         "tokenizer.huggingface.json".into(),
         GgufMetadataValue::String(JSON.into()),
@@ -59,7 +56,6 @@ fn selected_policy_reaches_json_tiktoken_and_gguf_fallback_without_changing_defa
         embedded.tokenizer.encode("abab", false).unwrap().get_ids(),
         &[2, 2]
     );
-    assert_eq!(embedded.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
     std::fs::write(dir.join("tokenizer.json"), "{").unwrap();
     assert!(
         load_tokenizer_for_kind_with_cache_policy(ModelKind::Llama, &dir, ModelCachePolicy::disabled()).is_err()

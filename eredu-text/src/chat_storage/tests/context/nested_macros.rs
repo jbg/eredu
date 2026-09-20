@@ -43,7 +43,7 @@ fn nested_closure_destinations_keep_partial_custody_and_reject_unfunded_escape()
         )
         .unwrap();
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::MacroCaptures)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((source, caller));
@@ -56,6 +56,8 @@ fn nested_closure_destinations_keep_partial_custody_and_reject_unfunded_escape()
     assert!(
         source
             .render_plan_with_context(ChatRenderContext::from_json(&[], None, None).unwrap())
+            .unwrap()
+            .render()
             .is_err()
     );
 }

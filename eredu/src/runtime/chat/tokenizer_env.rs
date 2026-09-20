@@ -2,9 +2,10 @@ use std::{collections::HashSet, sync::Arc};
 
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use llguidance::toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
-use tokenizers::{NormalizerWrapper, PreTokenizerWrapper, Tokenizer, normalizers, pre_tokenizers};
+use tokenizers::Tokenizer;
 
 pub(crate) mod recipe;
+pub(crate) mod bytes;
 
 struct HuggingFaceTokenEnv {
     tokenizer: Tokenizer,
@@ -74,7 +75,8 @@ fn from_raw_with_info(
     selected_info: Option<&TokRxInfo>,
     authority: &eredu_core::HostPreparationAuthority,
 ) -> Result<TokEnv, String> {
-    remove_input_prefixes(&mut tokenizer)?;
+    eredu_text::tokenizer_storage::remove_input_prefixes(&mut tokenizer)
+        .map_err(|error| format!("failed to remove tokenizer input prefix: {error}"))?;
     from_prepared_raw_with_info(tokenizer, eos_token_ids, selected_info, authority)
 }
 
@@ -126,54 +128,6 @@ fn from_prepared_raw_with_info(
     }))
 }
 
-fn remove_input_prefixes(tokenizer: &mut Tokenizer) -> Result<(), String> {
-    fn without_prepend(normalizer: NormalizerWrapper) -> Option<NormalizerWrapper> {
-        match normalizer {
-            NormalizerWrapper::Prepend(_) => None,
-            NormalizerWrapper::Sequence(sequence) => {
-                let members = sequence
-                    .as_ref()
-                    .iter()
-                    .cloned()
-                    .filter_map(without_prepend)
-                    .collect::<Vec<_>>();
-                (!members.is_empty())
-                    .then(|| NormalizerWrapper::Sequence(normalizers::Sequence::new(members)))
-            }
-            other => Some(other),
-        }
-    }
-
-    fn without_metaspace_prefix(pre_tokenizer: PreTokenizerWrapper) -> PreTokenizerWrapper {
-        match pre_tokenizer {
-            PreTokenizerWrapper::Metaspace(mut metaspace) => {
-                metaspace.prepend_scheme = pre_tokenizers::metaspace::PrependScheme::Never;
-                PreTokenizerWrapper::Metaspace(metaspace)
-            }
-            PreTokenizerWrapper::Sequence(sequence) => {
-                PreTokenizerWrapper::Sequence(pre_tokenizers::sequence::Sequence::new(
-                    sequence
-                        .as_ref()
-                        .iter()
-                        .cloned()
-                        .map(without_metaspace_prefix)
-                        .collect(),
-                ))
-            }
-            other => other,
-        }
-    }
-
-    if let Some(normalizer) = tokenizer.get_normalizer().cloned() {
-        tokenizer
-            .with_normalizer(without_prepend(normalizer))
-            .map_err(|error| format!("failed to remove tokenizer input prefix: {error}"))?;
-    }
-    if let Some(pre_tokenizer) = tokenizer.get_pre_tokenizer().cloned() {
-        tokenizer.with_pre_tokenizer(Some(without_metaspace_prefix(pre_tokenizer)));
-    }
-    Ok(())
-}
 
 struct DecoderKind(eredu_text::token_bytes::TokenByteEncoding);
 

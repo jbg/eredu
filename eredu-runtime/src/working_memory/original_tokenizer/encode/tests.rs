@@ -65,55 +65,51 @@ fn exact_original_e_and_one_short_preserve_c_and_end_only_operation_activity() {
     }
 }
 #[test]
-fn real_partial_reserves_keep_exact_source_and_e_through_core_envelope_retirement() {
-    let (c, e) = sizes();
-    for stage in 0..3 {
-        let pool = WorkingMemoryPool::new(c + e, 0).unwrap();
-        let source = source(&pool, JSON);
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &source,
-                TEXT,
-                false,
-                |p| p.fail_reservation(stage),
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert!(error.matches_source(&source));
-        assert_eq!(error.retained_bytes(), e);
-        let failure = error.encoding_failure().unwrap();
-        for (index, capacity) in failure.capacities().iter().enumerate() {
-            assert_eq!(*capacity > 0, index < stage);
-        }
-        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(failure);
-        let mut reserve = false;
-        while let Some(error) = cause {
-            reserve |= error.is::<std::collections::TryReserveError>();
-            cause = error.source();
-        }
-        assert!(reserve);
-        drop(pool.acquire_unquoted().unwrap());
-        drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        let error = error.into_backend_failure();
-        assert_eq!(
-            error
-                .source()
-                .unwrap()
-                .downcast_ref::<OriginalTokenizerEncodeError>()
-                .unwrap()
-                .retained_bytes(),
-            e
-        );
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
+fn upstream_encoding_failure_retains_source_and_admission_through_core_envelope() {
+    let input = JSON.replace("\"unk_token\":\"?\"", "\"unk_token\":\"missing\"");
+    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let source = source(&pool, &input);
+    let c = source.original_bytes();
+    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&source, "<S>hz", false).unwrap();
+    let error = pool
+        .encode_tokenizer_ids(&source, "<S>hz", false)
+        .unwrap_err();
+    assert!(error.matches_source(&source));
+    assert_eq!(error.retained_bytes(), e);
+    assert!(matches!(
+        error.encoding_failure().unwrap().cause(),
+        EncodeIdsError::Upstream(_)
+    ));
+    assert!(error.encoding_failure().unwrap().source().is_some());
+    drop(pool.acquire_unquoted().unwrap());
+    drop((source, input));
+    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    let error = error.into_backend_failure();
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<OriginalTokenizerEncodeError>()
+            .unwrap()
+            .retained_bytes(),
+        e
+    );
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
 #[test]
-fn foreign_and_profile_rejections_do_not_clone_source_or_consume_any_allowance() {
+fn foreign_refusals_and_bytelevel_postprocessing_preserve_source_admission() {
     let (c, e) = sizes();
-    let pool = WorkingMemoryPool::new(c * 2 + e, 0).unwrap();
+    let transformed_json = JSON.replace(
+        "\"post_processor\":null",
+        "\"post_processor\":{\"type\":\"ByteLevel\",\"trim_offsets\":true,\"add_prefix_space\":false,\"use_regex\":false}",
+    );
+    let transformed_c = WorkingMemoryPool::tokenizer_required_bytes(
+        &TokenizerPlan::prepare_json(transformed_json.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let pool = WorkingMemoryPool::new(c + transformed_c + e, 0).unwrap();
     let source = source(&pool, JSON);
     let foreign = WorkingMemoryPool::new(c + e, 0).unwrap();
     let rejects: Vec<_> = (0..32)
@@ -128,27 +124,20 @@ fn foreign_and_profile_rejections_do_not_clone_source_or_consume_any_allowance()
         Some(WorkingMemoryError::IdentityMismatch)
     ) && e.retained_bytes() == 0));
     assert_eq!(foreign.used_bytes().unwrap(), 0);
-    let transformed = JSON.replace(
-        "\"post_processor\":null",
-        "\"post_processor\":{\"type\":\"ByteLevel\",\"trim_offsets\":true}",
-    );
-    let transformed = source_fn(&pool, &transformed);
-    let rejects2: Vec<_> = (0..32)
-        .map(|_| {
-            pool.encode_tokenizer_ids(&transformed, TEXT, false)
-                .unwrap_err()
-        })
-        .collect();
-    assert!(rejects2.iter().all(|e| matches!(
-        e.profile_failure(),
-        Some(EncodeIdsError::PipelineProfile)
-    ) && e.retained_bytes() == 0));
+    let transformed = source_fn(&pool, &transformed_json);
+    let transformed_ids = pool
+        .encode_tokenizer_ids(&transformed, TEXT, false)
+        .unwrap();
+    assert_eq!(transformed_ids.ids(), [2, 5, 2, 3, 4]);
+    assert!(transformed_ids.matches_source(&transformed));
+    assert!(!transformed_ids.matches_source(&source));
+    drop(transformed_ids);
     drop(transformed);
     let ids = pool.encode_tokenizer_ids(&source, TEXT, true).unwrap();
     assert_eq!(ids.ids(), [2, 5, 2, 3, 4]);
     drop((source, ids));
     assert_eq!(pool.used_bytes().unwrap(), 0);
-    drop((rejects, rejects2));
+    drop(rejects);
 }
 fn source_fn(pool: &WorkingMemoryPool, json: &str) -> OriginalTokenizer {
     source(pool, json)
@@ -165,12 +154,10 @@ fn unknown_token_terminal_failure_and_empty_success_keep_actual_operation_lifeti
         .unwrap_err();
     assert!(matches!(
         error.encoding_failure().unwrap().cause(),
-        EncodeIdsError::MissingUnknown
+        EncodeIdsError::Upstream(_)
     ));
-    assert_eq!(error.encoding_failure().unwrap().partial_id_count(), 1);
     let empty = pool.encode_tokenizer_ids(&source, "", true).unwrap();
     assert!(empty.ids().is_empty());
-    assert_eq!(empty.capacities(), [0, 0, 0]);
     let empty_e = empty.original_bytes();
     drop(source);
     assert_eq!(pool.used_bytes().unwrap(), c + e + empty_e);
@@ -188,9 +175,11 @@ fn unwind_case(json: &str, text: &str, special: bool) {
     let measured = source(&sizing, json);
     let c = measured.original_bytes();
     let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&measured, text, special).unwrap();
-    let normalization = EncodeIdsPlan::prepare(&measured.payload().model, text, special)
+    let expected_ids = sizing
+        .encode_tokenizer_ids(&measured, text, special)
         .unwrap()
-        .normalization_capacities();
+        .ids()
+        .to_vec();
     drop(measured);
     for phase in 0..2 {
         let pool = WorkingMemoryPool::new(c + e, 0).unwrap();
@@ -239,11 +228,7 @@ fn unwind_case(json: &str, text: &str, special: bool) {
         error.accounting_failure(),
         Some(WorkingMemoryError::Poisoned)
     ));
-    assert!(error.completed_capacities().unwrap().iter().all(|n| *n > 0));
-    assert_eq!(
-        error.completed_normalization_capacities(),
-        Some(normalization)
-    );
+    assert_eq!(error.completed_ids(), Some(expected_ids.as_slice()));
     drop((source, error));
     let usage = pool.0.usage.lock().unwrap_err().into_inner();
     assert_eq!(usage.reserved, c + e);
@@ -314,11 +299,6 @@ fn concurrent_case(json: &str, text: &str, special: bool) {
     let a = a.unwrap().unwrap().unwrap();
     let b = b.unwrap().unwrap().unwrap();
     assert_eq!(a.ids(), b.ids());
-    let normalization = EncodeIdsPlan::prepare(&source.payload().model, text, special)
-        .unwrap()
-        .normalization_capacities();
-    assert_eq!(a.normalization_capacities(), normalization);
-    assert_eq!(b.normalization_capacities(), normalization);
     assert_ne!(a.ids().as_ptr(), b.ids().as_ptr());
     assert!(a.matches_source(&source) && b.matches_source(&source));
     drop(source);
@@ -335,44 +315,65 @@ mod template;
 
 mod lfm;
 
-mod nfc;
 mod composition;
+mod nfc;
 
 #[test]
 fn wordlevel_whitespace_source_and_encoding_have_exact_original_custody() {
     const SOURCE: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"added_tokens":[],"model":{"type":"WordLevel","unk_token":"[UNK]","vocab":{"[UNK]":0,"alpha":2,"é":5,"中文":9}}}"#;
-    let c=WorkingMemoryPool::tokenizer_required_bytes(&TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap();
-    let short=WorkingMemoryPool::new(c-1,0).unwrap();
-    let refusal=short.compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap_err();
-    assert!(matches!(refusal.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{..})));
-    assert_eq!(short.used_bytes().unwrap(),0);
-    let pool=WorkingMemoryPool::new(64*1024*1024,0).unwrap();
-    let tokenizer=source(&pool,SOURCE);
-    assert_eq!(tokenizer.original_bytes(),c);
-    let input="alpha\u{a0}é 中文 missing";
-    let e=WorkingMemoryPool::tokenizer_encode_required_bytes(&tokenizer,input,false).unwrap();
-    let ids=pool.encode_tokenizer_ids(&tokenizer,input,false).unwrap();
-    assert_eq!(ids.ids(),[2,5,9,0]);
+    let c = WorkingMemoryPool::tokenizer_required_bytes(
+        &TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
+    let refusal = short
+        .compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap())
+        .unwrap_err();
+    assert!(matches!(
+        refusal.accounting_failure(),
+        Some(WorkingMemoryError::BudgetExceeded { .. })
+    ));
+    assert_eq!(short.used_bytes().unwrap(), 0);
+    let pool = WorkingMemoryPool::new(64 * 1024 * 1024, 0).unwrap();
+    let tokenizer = source(&pool, SOURCE);
+    assert_eq!(tokenizer.original_bytes(), c);
+    let input = "alpha\u{a0}é 中文 missing";
+    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&tokenizer, input, false).unwrap();
+    let ids = pool.encode_tokenizer_ids(&tokenizer, input, false).unwrap();
+    assert_eq!(ids.ids(), [2, 5, 9, 0]);
     assert!(ids.matches_source(&tokenizer));
-    assert_eq!(pool.used_bytes().unwrap(),c+e);
+    assert_eq!(pool.used_bytes().unwrap(), c + e);
     drop(tokenizer);
-    assert_eq!(pool.used_bytes().unwrap(),c+e);
+    assert_eq!(pool.used_bytes().unwrap(), c + e);
     drop(ids);
-    assert_eq!(pool.used_bytes().unwrap(),0);
-    let limited=WorkingMemoryPool::new(c+e-1,0).unwrap();
-    let tokenizer=source(&limited,SOURCE);
-    let error=limited.encode_tokenizer_ids(&tokenizer,input,false).unwrap_err();
-    assert!(matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{..})));
-    assert_eq!(limited.used_bytes().unwrap(),c);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let limited = WorkingMemoryPool::new(c + e - 1, 0).unwrap();
+    let tokenizer = source(&limited, SOURCE);
+    let error = limited
+        .encode_tokenizer_ids(&tokenizer, input, false)
+        .unwrap_err();
+    assert!(matches!(
+        error.accounting_failure(),
+        Some(WorkingMemoryError::BudgetExceeded { .. })
+    ));
+    assert_eq!(limited.used_bytes().unwrap(), c);
 }
 
 #[test]
 fn unigram_source_and_path_storage_retain_one_original_allowance() {
     const SOURCE: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"added_tokens":[],"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",-9.0],["a",-1.0],["ab",-1.0],["é",-1.0],[" ",-1.0]]}}"#;
-    let c = WorkingMemoryPool::tokenizer_required_bytes(&TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap();
+    let c = WorkingMemoryPool::tokenizer_required_bytes(
+        &TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
-    let refusal = short.compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap()).unwrap_err();
-    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    let refusal = short
+        .compile_tokenizer(TokenizerPlan::prepare_json(SOURCE.as_bytes()).unwrap())
+        .unwrap_err();
+    assert!(matches!(
+        refusal.accounting_failure(),
+        Some(WorkingMemoryError::BudgetExceeded { .. })
+    ));
     assert_eq!(short.used_bytes().unwrap(), 0);
     let pool = WorkingMemoryPool::new(64 * 1024 * 1024, 0).unwrap();
     let tokenizer = source(&pool, SOURCE);
@@ -388,8 +389,13 @@ fn unigram_source_and_path_storage_retain_one_original_allowance() {
     assert_eq!(pool.used_bytes().unwrap(), 0);
     let limited = WorkingMemoryPool::new(c + e - 1, 0).unwrap();
     let tokenizer = source(&limited, SOURCE);
-    let refusal = limited.encode_tokenizer_ids(&tokenizer, input, false).unwrap_err();
-    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    let refusal = limited
+        .encode_tokenizer_ids(&tokenizer, input, false)
+        .unwrap_err();
+    assert!(matches!(
+        refusal.accounting_failure(),
+        Some(WorkingMemoryError::BudgetExceeded { .. })
+    ));
     assert_eq!(limited.used_bytes().unwrap(), c);
 }
 

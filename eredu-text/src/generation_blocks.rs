@@ -145,48 +145,40 @@ fn classify(mut input: impl Iterator<Item = u8>) -> Option<(usize, usize, &'stat
         _ => None,
     }
 }
-pub(crate) fn control_bytes<I>() -> Option<usize> {
-    use std::mem::{size_of, size_of_val};
-    let parts = [
-        size_of::<Bytes<I>>(),
-        size_of::<I>(),
-        size_of::<I>(),
-        size_of::<std::iter::Take<std::iter::Skip<I>>>(),
-        size_of::<[u8; 13]>(),
-        size_of::<[u8; 4]>(),
-        size_of::<[usize; 6]>(),
-        size_of::<[u8; 4]>(),
-        size_of::<Option<Result<char, ()>>>(),
-        size_of::<Option<(usize, usize, &'static [u8])>>(),
-        size_of::<(&mut I, Option<u8>)>(),
-        size_of::<bool>(),
-    ];
-    parts
-        .into_iter()
-        .try_fold(size_of_val(&parts), usize::checked_add)
-}
 
 #[cfg(test)]
 mod tests {
     use super::Bytes;
     #[test]
     fn normalization_preserves_raw_scan_unicode_and_cloned_cursor() {
-        for (source,expected) in [
-            ("{% generation %}é{% endgeneration %}", "{% if true %}é{% endif %}"),
-            ("{%\u{2003}generation\u{2003}%}界{%endgeneration%}", "{%\u{2003}if true\u{2003}%}界{%endif%}"),
+        for (source, expected) in [
+            (
+                "{% generation %}é{% endgeneration %}",
+                "{% if true %}é{% endif %}",
+            ),
+            (
+                "{%\u{2003}generation\u{2003}%}界{%endgeneration%}",
+                "{%\u{2003}if true\u{2003}%}界{%endif%}",
+            ),
             ("{# {% generation %} #}", "{# {% if true %} #}"),
             ("{% generation", "{% generation"),
-            ("{% other '{% generation %}' %}", "{% other '{% generation %}' %}"),
+            (
+                "{% other '{% generation %}' %}",
+                "{% other '{% generation %}' %}",
+            ),
             ("{%- -- generation -%}", "{%- -- generation -%}"),
             ("{%}", "{%}"),
         ] {
-            let iterator=Bytes::new(source.bytes());
-            assert_eq!(String::from_utf8(iterator.clone().collect()).unwrap(),expected);
-            let mut partial=iterator;
-            let prefix:Vec<_>=partial.by_ref().take(4).collect();
-            let tail=partial.clone().collect::<Vec<_>>();
-            assert_eq!(partial.collect::<Vec<_>>(),tail);
-            assert_eq!([prefix,tail].concat(),expected.as_bytes());
+            let iterator = Bytes::new(source.bytes());
+            assert_eq!(
+                String::from_utf8(iterator.clone().collect()).unwrap(),
+                expected
+            );
+            let mut partial = iterator;
+            let prefix: Vec<_> = partial.by_ref().take(4).collect();
+            let tail = partial.clone().collect::<Vec<_>>();
+            assert_eq!(partial.collect::<Vec<_>>(), tail);
+            assert_eq!([prefix, tail].concat(), expected.as_bytes());
         }
     }
 }

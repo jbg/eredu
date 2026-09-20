@@ -1,6 +1,6 @@
 //! Paid pending bytes and escaped events over the ordinary channel transitions.
 //! Decoder/stop orchestration remains in the shared speculative semantic owner.
-use super::OriginalSemanticChannelSource;
+use super::{DependencyMemoryPolicy, OriginalSemanticChannelSource};
 use eredu_core::{
     HostPreparationAuthority, SpeculativeBuffer, SharedBackendFailure, BackendFailure, BackendFailureKind,
     generation::{SemanticEvent, SemanticText},
@@ -75,6 +75,7 @@ pub struct OriginalSemanticChannelParser {
     used: usize,
     fed: usize,
     limit: usize,
+    dependency_memory: DependencyMemoryPolicy,
     state: Cursor,
     ended: bool,
     failed: bool,
@@ -195,6 +196,17 @@ impl OriginalSemanticChannelParser {
         input_bytes: usize,
         funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalSemanticChannelParserError> {
+        Self::prepare_with_dependency_memory(source, input_bytes, funding, DependencyMemoryPolicy::default())
+    }
+    /// Uses configurable host-dependency headroom in addition to exact pending
+    /// and event-buffer admission. Tagged JSON work receives one estimate for
+    /// the full input limit; each independently mutable copy reserves its own.
+    pub fn prepare_with_dependency_memory(
+        source: &OriginalSemanticChannelSource,
+        input_bytes: usize,
+        funding: &HostMetadataFunding,
+        dependency_memory: DependencyMemoryPolicy,
+    ) -> Result<Self, OriginalSemanticChannelParserError> {
         let retain = |cause| OriginalSemanticChannelParserError {
             cause,
             funding: funding.clone(),
@@ -202,13 +214,17 @@ impl OriginalSemanticChannelParser {
         funding
             .reserve_metadata(Self::frames().ok_or_else(|| retain(Cause::Overflow))?)
             .map_err(|cause| retain(cause.into()))?;
-        Self::create(source, input_bytes, funding).map_err(retain)
+        Self::create(source, input_bytes, funding, dependency_memory).map_err(retain)
     }
     fn create(
         source: &OriginalSemanticChannelSource,
         input_bytes: usize,
         funding: &HostMetadataFunding,
+        dependency_memory: DependencyMemoryPolicy,
     ) -> Result<Self, Cause> {
+        if source.tagged_tools().is_some() {
+            funding.reserve_metadata(dependency_memory.estimate(input_bytes).ok_or(Cause::Overflow)?)?;
+        }
         let mut pending = Self::buffer(input_bytes, funding)?;
         pending
             .try_extend(std::iter::repeat(0).take(input_bytes))
@@ -224,6 +240,7 @@ impl OriginalSemanticChannelParser {
             used: 0,
             fed: 0,
             limit: input_bytes,
+            dependency_memory,
             state: Cursor::from_state(State::initial(&source.program())),
             ended: false,
             failed: false,
@@ -377,12 +394,13 @@ impl OriginalSemanticChannelParser {
         self.ended = true;
         self.used = 0;
     }
-    /// Exact independent mutable buffer and control copy population.
+    /// Independent fixed buffers plus configured tagged JSON/session headroom.
+    /// Dependency internals are estimated, not measured by this quote.
     pub fn copy_bytes(&self) -> Option<usize> {
         let parts = [
             Self::frames()?,
             self.call.as_ref().map_or(Some(0), Call::copy_bytes)?,
-            self.tagged.as_ref().map_or(Some(0), TaggedCall::copy_bytes)?,
+            if self.source.tagged_tools().is_some() { self.dependency_memory.estimate(self.limit)? } else { 0 },
             SpeculativeBuffer::<u8>::retained_control_bytes(self.limit)?,
             SpeculativeBuffer::<SemanticEvent>::retained_control_bytes(self.limit.checked_add(1)?)?,
         ];
@@ -438,9 +456,7 @@ impl OriginalSemanticChannelParser {
             let call = self.call.as_ref().map(|call| call.copy_prepaid(host.clone(), &self.funding))
                 .transpose().map_err(|cause| tool::retained(tool::ToolCause::Call(cause),
                     SpeculativeBuffer::default(), None, None, HostPreparationAuthority::unmanaged(), &self.source, &self.funding))?;
-            let tagged = self.tagged.as_ref().map(tagged::copy_prepaid).transpose()
-                .map_err(|cause| tool::retained(tool::ToolCause::JsonAllocation(cause),
-                    SpeculativeBuffer::default(), None, None, HostPreparationAuthority::unmanaged(), &self.source, &self.funding))?;
+            let tagged = self.tagged.clone();
             Ok(Self {
                 pending,
                 events,
@@ -451,6 +467,7 @@ impl OriginalSemanticChannelParser {
                 used: self.used,
                 fed: self.fed,
                 limit: self.limit,
+                dependency_memory: self.dependency_memory,
                 state: self.state,
                 ended: self.ended,
                 failed: self.failed,

@@ -38,7 +38,7 @@ fn borrowed_replace_preserves_unicode_empty_patterns_registers_and_retained_resu
         .unwrap();
     assert!(rendered.retained_buffer_bytes() <= plan.requirements().buffer_bytes());
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((messages, defaults, caller, source));
@@ -48,7 +48,7 @@ fn borrowed_replace_preserves_unicode_empty_patterns_registers_and_retained_resu
 }
 
 #[test]
-fn bounded_replace_rejects_unqualified_coercion_and_argument_profiles() {
+fn replace_matches_dynamic_coercion_and_argument_errors() {
     // Arbitrary scalar/container string coercion remains a distinct producer.
     for value in [json!(17), json!(null), json!(["x"]), json!({"x":"y"})] {
         for template in [
@@ -57,17 +57,7 @@ fn bounded_replace_rejects_unqualified_coercion_and_argument_profiles() {
             "{{ 'x'|replace('x', value) }}",
         ] {
             let caller = json!({"value":value});
-            let source = ChatTemplatePlan::prepare_utf8(template, "replace")
-                .unwrap()
-                .compile()
-                .unwrap();
-            assert!(
-                source
-                    .render_plan_with_context(
-                        ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-                    )
-                    .is_err()
-            );
+            compare_outcome(template, caller.as_object().unwrap());
         }
     }
     for template in [
@@ -76,19 +66,13 @@ fn bounded_replace_rejects_unqualified_coercion_and_argument_profiles() {
         "{{ 'x'|replace('x', 'y', 1) }}",
         "{{ 'x'|replace(from='x', to='y') }}",
     ] {
-        assert!(
-            ChatTemplatePlan::prepare_utf8(template, "replace")
-                .unwrap()
-                .compile()
-                .is_err(),
-            "{template}"
-        );
+        compare_outcome(template, &serde_json::Map::new());
     }
 }
 
 #[test]
-fn nested_generated_filter_inputs_use_the_existing_paid_text_materializer(){
-    let caller=json!({"left":"É","right":"界🙂","from":"界","to":"é"});
+fn nested_generated_filter_inputs_use_the_existing_paid_text_materializer() {
+    let caller = json!({"left":"É","right":"界🙂","from":"界","to":"é"});
     for template in [
         "{{ ('x' + 'y')|replace('x', 'z') }}",
         "{{ 'x'|replace('x'|join, 'y') }}",
@@ -96,7 +80,12 @@ fn nested_generated_filter_inputs_use_the_existing_paid_text_materializer(){
         "{{ 'x'|replace('x', 'y')|replace('y', 'z') }}",
         "{{ (left+right)|replace(from,to)|replace('🙂','!') }}",
         "{{ [left,right]|join(from+to) }}",
-    ]{
-        compare(template,&[],&serde_json::Map::new(),caller.as_object().unwrap());
+    ] {
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
     }
 }

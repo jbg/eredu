@@ -119,11 +119,12 @@ fn empty_configured_eos_does_not_reclassify_id_zero_or_detected_specials() {
     .unwrap();
     for trie in [compiler.trie(), ordinary.tok_trie()] {
         assert_eq!(trie.info().tok_eos, INVALID_TOKEN);
-        assert!(trie.eos_tokens().is_empty());
+        assert!(trie.eos_token_set().is_zero());
         assert_eq!(trie.token(0), b"a");
         assert!(!trie.eos_token_set().is_allowed(0));
     }
     assert_eq!(compiler.trie().info(), ordinary.tok_trie().info());
+    assert!(compiler.eos_token_ids.is_empty());
 }
 
 #[test]
@@ -159,22 +160,35 @@ fn declaration_shell_refusal_preserves_compiler_funding_after_source_retirement(
     let raw = tokenizer();
     let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
     let (funding, refuse, retired) = funding();
-    let compiler = ConstraintCompiler::from_original_tokenizer(source(&pool, &raw), &[], &funding).unwrap();
-    let grammar = compiler.compile_grammar(llguidance::api::TopLevelGrammar::from_lark("start: \"a\"".into())).unwrap();
+    let compiler =
+        ConstraintCompiler::from_original_tokenizer(source(&pool, &raw), &[], &funding).unwrap();
+    let grammar = compiler
+        .compile_grammar(llguidance::api::TopLevelGrammar::from_lark(
+            "start: \"a\"".into(),
+        ))
+        .unwrap();
     refuse.store(true, Ordering::SeqCst);
     let error = super::super::declaration::PendingGrammarDeclaration::from_compiled(
-        grammar, &compiler._authority, &compiler.allocation_funding).err().unwrap();
+        grammar,
+        &compiler._authority,
+        &compiler.allocation_funding,
+    )
+    .err()
+    .unwrap();
     drop((compiler, funding));
     assert!(!retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert!(pool.used_bytes().unwrap() > 0);
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     let mut found = false;
     while let Some(error) = cause {
-        found |= matches!(error.downcast_ref::<HostMetadataFundingError>(),
-            Some(HostMetadataFundingError::Capacity { available: 0, .. }));
+        found |= matches!(
+            error.downcast_ref::<HostMetadataFundingError>(),
+            Some(HostMetadataFundingError::Capacity { available: 0, .. })
+        );
         cause = error.source();
     }
     assert!(found);
     drop(error);
     assert!(retired.load(Ordering::SeqCst));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }

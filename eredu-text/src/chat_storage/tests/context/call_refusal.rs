@@ -25,10 +25,12 @@ fn absent_calls_preserve_ordinary_refusal_and_do_not_hide_known_worker_gaps() {
         .render_plan_with_context(
             ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap(),
         )
+        .unwrap()
+        .render()
         .unwrap_err();
-    assert!(failure.is_unknown_function());
+    assert!(failure.cause().is_unknown_function());
     drop((caller, source));
-    assert!(failure.is_unknown_function());
+    assert!(failure.cause().is_unknown_function());
     let success = compare(
         "{% macro raise_exception(value) %}{{ value }}{% endmacro %}{{ raise_exception(message) }}",
         &[],
@@ -41,8 +43,12 @@ fn absent_calls_preserve_ordinary_refusal_and_do_not_hide_known_worker_gaps() {
             .unwrap()
             .compile()
             .unwrap();
-        if let Err(failure) = source.render_plan(ChatMessages::from_text(&[])) {
-            assert!(!failure.is_unknown_function());
+        if let Err(failure) = source
+            .render_plan(ChatMessages::from_text(&[]))
+            .unwrap()
+            .render()
+        {
+            assert!(!failure.cause().is_unknown_function());
         }
     }
 }

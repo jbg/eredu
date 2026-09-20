@@ -100,7 +100,7 @@ fn range_refusals_and_paid_output_keep_source_custody_after_input_drop() {
         )
         .unwrap();
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::WithoutPrompt)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((source, caller));
@@ -123,6 +123,8 @@ fn range_refusals_and_paid_output_keep_source_custody_after_input_drop() {
         assert!(
             source
                 .render_plan_with_context(ChatRenderContext::from_json(&[], None, None).unwrap())
+                .unwrap()
+                .render()
                 .is_err(),
             "{template}"
         );

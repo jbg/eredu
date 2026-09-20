@@ -2,18 +2,18 @@
 
 use std::{collections::HashMap, fs, path::Path};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use tokenizers::{
+    AddedToken, SplitDelimiterBehavior, Tokenizer,
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
-    models::bpe::{Vocab, BPE},
+    models::bpe::{BPE, Vocab},
     pre_tokenizers::{
+        PreTokenizerWrapper,
         byte_level::ByteLevel,
         sequence::Sequence,
         split::{Split, SplitPattern},
-        PreTokenizerWrapper,
     },
-    AddedToken, SplitDelimiterBehavior, Tokenizer,
 };
 
 use crate::error::Error;
@@ -152,7 +152,7 @@ fn bpe_parts(ranks: &HashMap<Vec<u8>, usize>, token: &[u8], max_rank: usize) -> 
 
 fn build_byte_bpe(
     ranked: &[Vec<u8>],
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, Error> {
     let encoder = byte_encoder();
     let ranks = ranked
@@ -188,7 +188,7 @@ fn build_byte_bpe(
         .collect();
     let mut tokenizer = Tokenizer::new(
         BPE::builder()
-            .cache_policy(policy)
+            .cache_capacity(policy.capacity)
             .vocab_and_merges(vocab, merges)
             .build()?,
     );
@@ -242,14 +242,14 @@ fn special_tokens(config_path: &Path, base_count: usize) -> Result<Vec<AddedToke
 /// Loads the official Kimi/K2 `tiktoken.model` and registers its complete
 /// contiguous reserved-token range without permitting partial registration.
 pub fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
-    load_kimi_k2_with_cache_policy(model_dir, tokenizers::ModelCachePolicy::default())
+    load_kimi_k2_with_cache_policy(model_dir, crate::tokenizer::ModelCachePolicy::default())
 }
 
 /// Imports the same rank/merge/token policy with model caching selected before build.
 /// Input parsing and reconstruction still allocate without a finite admission bound.
 pub fn load_kimi_k2_with_cache_policy(
     model_dir: &Path,
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, Error> {
     let ranked = read_ranks(&model_dir.join("tiktoken.model"))?;
     let mut tokenizer = build_byte_bpe(&ranked, policy)?;
@@ -324,7 +324,7 @@ mod tests {
     }
     #[test]
     fn cache_policy_reaches_rank_import_and_survives_json_reload() {
-        use tokenizers::ModelCachePolicy;
+        use crate::tokenizer::ModelCachePolicy;
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "eredu-cache-ranks-{}-{}",
@@ -346,9 +346,8 @@ mod tests {
         )
         .unwrap();
         let legacy = load_kimi_k2(&path).unwrap();
-        let absent = super::load_kimi_k2_with_cache_policy(&path, ModelCachePolicy::disabled()).unwrap();
-        assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::default());
-        assert_eq!(absent.model_cache_policy(), ModelCachePolicy::disabled());
+        let absent =
+            super::load_kimi_k2_with_cache_policy(&path, ModelCachePolicy::disabled()).unwrap();
         assert_eq!(absent.encode("abab", false).unwrap().get_ids(), &[2, 2]);
         assert_eq!(
             legacy.encode("abab", false).unwrap().get_offsets(),
@@ -359,12 +358,12 @@ mod tests {
         }
         let file = path.join("tokenizer.json");
         absent.save(&file, false).unwrap();
-        let restored =
-            tokenizers::Tokenizer::from_file_with_cache_policy(&file, ModelCachePolicy::disabled()).unwrap();
-        assert_eq!(restored.model_cache_policy(), ModelCachePolicy::disabled());
+        let restored = ModelCachePolicy::disabled().from_file(&file).unwrap();
         assert_eq!(restored.encode("abab", false).unwrap().get_ids(), &[2, 2]);
         assert_eq!(restored.decode(&[2, 2], false).unwrap(), "abab");
         std::fs::write(path.join("tiktoken.model"), "YQ== 0\nYg== 0\n").unwrap();
-        assert!(super::load_kimi_k2_with_cache_policy(&path, ModelCachePolicy::disabled()).is_err());
+        assert!(
+            super::load_kimi_k2_with_cache_policy(&path, ModelCachePolicy::disabled()).is_err()
+        );
     }
 }

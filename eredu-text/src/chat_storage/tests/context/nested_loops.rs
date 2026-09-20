@@ -23,7 +23,7 @@ fn argument_mapping_loops_share_ordinary_unpacking_and_lexical_scopes() {
 }
 
 #[test]
-fn loop_workspace_follows_source_depth_and_assignment_arity() {
+fn nested_loops_preserve_source_depth_and_assignment_arity() {
     let caller = json!({"rows":[["one","two","三","four","five"],["a","b","c","d","e"]],"items":["kept"],"map":{"z":1,"a":2}});
     compare(
         "{% for a,b,c,d,e in rows %}{{ a }}:{{ b }}:{{ c }}:{{ d }}:{{ e }};{% endfor %}|{% for key in map %}{{ key }};{% endfor %}",
@@ -39,15 +39,6 @@ fn loop_workspace_follows_source_depth_and_assignment_arity() {
     for _ in 0..12 {
         template.push_str("{% endfor %}");
     }
-    let source = ChatTemplatePlan::prepare_utf8(&template, "nested")
-        .unwrap()
-        .compile()
-        .unwrap();
-    let small = ChatTemplatePlan::prepare_utf8("{% for v in items %}{{ v }}{% endfor %}", "small")
-        .unwrap()
-        .compile()
-        .unwrap();
-    assert!(source.render_prefix_bytes().unwrap() > small.render_prefix_bytes().unwrap());
     compare(
         &template,
         &[],
@@ -81,7 +72,7 @@ fn nested_loop_outputs_and_failed_destinations_outlive_all_borrowed_inputs() {
             ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap(),
         )
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::Borrowed)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     assert!(failure.retained_buffer_bytes() > 0);
@@ -91,7 +82,7 @@ fn nested_loop_outputs_and_failed_destinations_outlive_all_borrowed_inputs() {
 }
 
 #[test]
-fn wrong_unpack_lengths_and_unsupported_loop_protocols_refuse() {
+fn wrong_unpack_lengths_refuse_and_nested_loop_protocols_match_ordinary() {
     let source = ChatTemplatePlan::prepare_utf8(
         "{% for k,v in rows %}{{ k }}={{ v }}{% endfor %}",
         "unpack",
@@ -112,6 +103,8 @@ fn wrong_unpack_lengths_and_unsupported_loop_protocols_refuse() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
     }
@@ -120,9 +113,8 @@ fn wrong_unpack_lengths_and_unsupported_loop_protocols_refuse() {
         "{% for x in rows %}{{ x }}{% else %}empty{% endfor %}",
         "{% for k,(a,b) in rows %}{{ k }}{% endfor %}",
     ] {
-        assert!(match ChatTemplatePlan::prepare_utf8(template, "protocol") {
-            Ok(plan) => plan.compile().is_err(),
-            Err(_) => true,
-        });
+        for rows in [json!([]), json!([[1, [7, 11]]])] {
+            compare_outcome(template, json!({"rows":rows}).as_object().unwrap());
+        }
     }
 }

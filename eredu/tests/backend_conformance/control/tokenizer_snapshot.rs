@@ -25,7 +25,7 @@ fn loaded_decoder_snapshots_outlive_model_with_unicode_forks_and_special_modes()
     // templates did not clone or replace the tokenizer configuration.
     assert!(std::ptr::eq(
         model.tokenizer().id_to_token(first).unwrap(),
-        original.decode_vocabulary().id_to_token(first).unwrap(),
+        original.vocabulary().id_to_token(first).unwrap(),
     ));
     drop(original);
     drop(model);
@@ -95,7 +95,7 @@ fn loaded_tokenizer_view_preserves_sparse_normalized_and_overlapping_metadata() 
         let spelling = view.id_to_token(id).unwrap();
         assert!(std::ptr::eq(
             spelling,
-            original.decode_vocabulary().id_to_token(id).unwrap()
+            original.vocabulary().id_to_token(id).unwrap()
         ));
     }
     assert!(std::ptr::eq(

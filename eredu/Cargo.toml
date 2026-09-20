@@ -165,8 +165,9 @@ eredu-runtime.workspace = true
 eredu-architectures.workspace = true
 
 # External dependencies
+anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
-tokenizers = { version = "=0.23.2", path = "../third-party/tokenizers-0.23.2", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 thiserror = "2"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2.workspace = true
@@ -176,7 +177,6 @@ jsonschema = { version = "0.52.0", default-features = false }
 [dev-dependencies]
 half.workspace = true
 tempfile.workspace = true
-anyhow = "1"
 eredu-evaluation.workspace = true
 
 [[example]]

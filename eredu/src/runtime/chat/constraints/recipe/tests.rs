@@ -4,8 +4,8 @@ use serde_json::json;
 use std::{
     convert::Infallible,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -15,9 +15,6 @@ fn grammar() -> TopLevelGrammar {
 
 #[test]
 fn original_recipe_refuses_each_reached_reservation_and_retains_the_original_payer() {
-    #[derive(Debug, thiserror::Error)]
-    #[error("recipe test account refused")]
-    struct Refused;
     let tools = [json!({"type":"function","function":{
         "name":"measure_界", "parameters":{"type":"object","properties":{
             "z":{"default":[-0.0, 7, "É🙂"]},"a":{"type":"string"}}}}})];
@@ -26,17 +23,36 @@ fn original_recipe_refuses_each_reached_reservation_and_retains_the_original_pay
         let calls = Arc::new(AtomicUsize::new(0));
         let marker = Arc::new(());
         let weak = Arc::downgrade(&marker);
-        let funding = ParserAllocationFunding::prepare({
+        let funding = crate::runtime::chat::preparation_memory::test_funding({
             let calls = calls.clone();
             move |_| {
                 let _retained = &marker;
-                if calls.fetch_add(1, Ordering::SeqCst) == cutoff { Err(Refused) }
-                else { Ok(()) }
+                if calls.fetch_add(1, Ordering::SeqCst) == cutoff {
+                    Err(eredu_core::HostMetadataFundingError::Capacity {
+                        required: 1,
+                        available: 0,
+                    })
+                } else {
+                    Ok(())
+                }
             }
-        }).unwrap();
+        })
+        .unwrap();
         let authority = HostPreparationAuthority::retain(funding.clone());
-        let result = ConstraintRecipe::build(None, &grammar, &tools, &[3], &[], &[],
-            &[], None, None, None, None, &funding, &authority);
+        let result = ConstraintRecipe::build(
+            None,
+            &grammar,
+            &tools,
+            &[3],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &funding,
+            &authority,
+        );
         drop((authority, funding));
         (result, calls.load(Ordering::SeqCst), weak)
     };
@@ -46,18 +62,37 @@ fn original_recipe_refuses_each_reached_reservation_and_retains_the_original_pay
     let bytes = recipe.source().clone();
     let identity = *bytes.identity();
     drop(recipe);
-    assert!(weak.upgrade().is_some(), "escaped bytes retain original construction");
+    assert!(
+        weak.upgrade().is_some(),
+        "escaped bytes retain original construction"
+    );
     drop(bytes);
-    assert!(weak.upgrade().is_none(), "value identity needs no allocated custody");
+    assert!(
+        weak.upgrade().is_none(),
+        "value identity needs no allocated custody"
+    );
     let _ = identity;
     for cutoff in 1..calls {
         let (result, attempts, weak) = run(cutoff);
         let error = result.unwrap_err();
         assert!(attempts > cutoff);
-        assert!(error.to_string().contains("recipe test account refused"));
-        assert!(weak.upgrade().is_some(), "failure {cutoff} retains its actual payer");
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        assert!(matches!(
+            cause.downcast_ref::<eredu_core::HostMetadataFundingError>(),
+            Some(eredu_core::HostMetadataFundingError::Capacity { available: 0, .. })
+        ));
+        assert!(
+            weak.upgrade().is_some(),
+            "failure {cutoff} retains its actual payer"
+        );
         drop(error);
-        assert!(weak.upgrade().is_none(), "failure {cutoff} releases its payer last");
+        assert!(
+            weak.upgrade().is_none(),
+            "failure {cutoff} releases its payer last"
+        );
     }
 }
 
@@ -233,7 +268,12 @@ fn absent_and_empty_optional_sections_remain_distinct_with_exact_empty_iterators
 #[test]
 fn mismatched_token_metadata_and_checked_geometry_reject_without_partial_cursor_changes() {
     let mismatch = ConstraintRecipe::new(None, &grammar(), &[], &[], &["x".into()], &[], &[], None);
-    assert!(mismatch.unwrap_err().to_string().contains("differ in length"));
+    assert!(
+        mismatch
+            .unwrap_err()
+            .to_string()
+            .contains("differ in length")
+    );
     let mut cursor = usize::MAX;
     assert!(take_span(&mut cursor, 1).is_err());
     assert_eq!(cursor, usize::MAX);
@@ -268,18 +308,22 @@ fn preexisting_recipe_and_source_aliases_share_attachment_until_the_final_source
     let source = recipe.source().clone();
     let domain = SharedStorageDomain::default();
     let drops = Arc::new(AtomicUsize::new(0));
-    assert!(recipe
-        .source()
-        .try_attach(&domain, || {
-            Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Retired(Arc::clone(&drops))))
-        })
-        .unwrap());
-    assert!(!alias
-        .source()
-        .try_attach(&domain, || -> Result<Box<dyn Send + Sync>, Infallible> {
-            panic!("a preexisting alias must share the attached domain");
-        })
-        .unwrap());
+    assert!(
+        recipe
+            .source()
+            .try_attach(&domain, || {
+                Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Retired(Arc::clone(&drops))))
+            })
+            .unwrap()
+    );
+    assert!(
+        !alias
+            .source()
+            .try_attach(&domain, || -> Result<Box<dyn Send + Sync>, Infallible> {
+                panic!("a preexisting alias must share the attached domain");
+            })
+            .unwrap()
+    );
     drop(recipe);
     drop(alias);
     assert_eq!(drops.load(Ordering::SeqCst), 0);

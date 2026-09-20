@@ -78,7 +78,7 @@ fn short_circuit_conditions_preserve_selected_borrowed_operands_and_error_lifeti
     let failure = source
         .render_plan_with_context(context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((caller, base, source));
@@ -97,6 +97,8 @@ fn short_circuit_conditions_preserve_selected_borrowed_operands_and_error_lifeti
             .render_plan_with_context(
                 ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
             )
+            .unwrap()
+            .render()
             .is_err()
     );
     assert!(

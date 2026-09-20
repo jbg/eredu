@@ -1,7 +1,7 @@
 //! Harmony output syntax and incremental parser state.
 
 use super::grammar_text::{Error as GrammarError, Text as GrammarText, StructuralTokens};
-use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 use crate::runtime::chat::tool_schema::ToolDefinition;
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ impl HarmonyDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         let literals = StructuralTokens::new(STRUCTURAL_TOKENS, structural_token_ids)?;
         let (minimum, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
@@ -162,7 +162,7 @@ impl FormatDialect for HarmonyDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<HarmonyParameters>()?;
         Ok(ConstraintConfiguration {

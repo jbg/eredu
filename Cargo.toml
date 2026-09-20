@@ -21,24 +21,7 @@ members = [
     "eredu-evaluation",
     "eredu-cli",
     "examples/eredu-ios/native",
-    "third-party/derivre-0.3.12",
-    "third-party/llguidance-1.8.0",
-    "third-party/toktrie-1.8.0",
-    "third-party/regex-syntax-0.8.11",
-    "third-party/referencing-0.52.1",
-    "third-party/jsonschema-regex-0.52.1",
-    "third-party/email_address-0.2.9",
-    "third-party/num-bigint-0.4.8",
-    "third-party/num-rational-0.4.2",
-    "third-party/fraction-0.17.0",
-    "third-party/idna-1.1.0",
-    "third-party/idna_adapter-1.2.2",
-    "third-party/icu_normalizer-2.3.0",
-    "third-party/fancy-regex-0.19.0",
-    "third-party/regex-1.13.1",
 ]
-# Audited external dependencies retain their upstream lint boundaries.
-exclude = ["third-party/aho-corasick-1.1.5", "third-party/memchr-2.8.3", "third-party/indexmap-2.14.2", "third-party/fluent-uri-0.4.1", "third-party/jsonschema-value-0.52.1", "third-party/jsonschema-0.52.0", "third-party/hashbrown-0.17.1", "third-party/serde_json-1.0.151", "third-party/minijinja-2.24.0", "third-party/tokenizers-0.23.2", "third-party/regex-automata-0.4.18", "third-party/unicode-normalization-alignments-0.1.12"]
 resolver = "2"
 
 [workspace.lints.rust]
@@ -91,46 +74,3 @@ sha2 = "0.11"
 # SHA-2 compression kernels optimized while Eredu itself remains debuggable.
 [profile.dev.package.sha2]
 opt-level = 3
-
-# Pinned Rust parser sources provide allocation facts and checks before growth.
-# Provenance and the local Rust-only boundary are recorded in third-party/README.md.
-[patch.crates-io]
-# Original literal searchers with safe prospective source producers.
-aho-corasick = { path = "third-party/aho-corasick-1.1.5" }
-memchr = { path = "third-party/memchr-2.8.3" }
-num-bigint = { path = "third-party/num-bigint-0.4.8" }
-num-rational = { path = "third-party/num-rational-0.4.2" }
-fraction = { path = "third-party/fraction-0.17.0" }
-idna = { path = "third-party/idna-1.1.0" }
-idna_adapter = { path = "third-party/idna_adapter-1.2.2" }
-icu_normalizer = { path = "third-party/icu_normalizer-2.3.0" }
-email_address = { path = "third-party/email_address-0.2.9" }
-regex-syntax = { path = "third-party/regex-syntax-0.8.11" }
-regex = { path = "third-party/regex-1.13.1" }
-# Pinned full-schema engine with explicit original validation workspace.
-jsonschema = { path = "third-party/jsonschema-0.52.0" }
-jsonschema-value = { path = "third-party/jsonschema-value-0.52.1" }
-fluent-uri = { path = "third-party/fluent-uri-0.4.1" }
-referencing = { path = "third-party/referencing-0.52.1" }
-jsonschema-regex = { path = "third-party/jsonschema-regex-0.52.1" }
-# Exact prospective table allocation through the pinned ordinary hashbrown worker.
-hashbrown = { path = "third-party/hashbrown-0.17.1" }
-# Insertion-ordered entries use the same prospective table/vector reservation.
-indexmap = { path = "third-party/indexmap-2.14.2" }
-# Same pinned serde_json parser with dependency-owned scalar storage facts.
-serde_json = { path = "third-party/serde_json-1.0.151" }
-# Shared closed chat storage uses the pinned ordinary MiniJinja dispatcher.
-minijinja = { path = "third-party/minijinja-2.24.0" }
-unicode-normalization-alignments = { path = "third-party/unicode-normalization-alignments-0.1.12" }
-derivre = { path = "third-party/derivre-0.3.12" }
-llguidance = { path = "third-party/llguidance-1.8.0" }
-# Source-derived destinations around the same llguidance token trie builder.
-toktrie = { path = "third-party/toktrie-1.8.0" }
-# Safe borrowed decode accessors; provenance in third-party/tokenizers-upstream.json.
-tokenizers = { path = "third-party/tokenizers-0.23.2" }
-
-# Closed fallible PikeVM workspace; exact upstream provenance in third-party/regex-automata-upstream.json.
-regex-automata = { path = "third-party/regex-automata-0.4.18" }
-
-# Canonical 0.19 engine for tokenizer and schema consumers; original workers and explicit search storage.
-fancy-regex = { path = "third-party/fancy-regex-0.19.0" }

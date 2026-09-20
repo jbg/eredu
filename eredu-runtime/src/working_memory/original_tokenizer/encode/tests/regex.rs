@@ -1,7 +1,4 @@
 use super::*;
-use eredu_text::tokenizer_storage::{
-    RegexBuffer as B, RegexDelegateBuffer as D, RegexWorkspaceFailure as F,
-};
 pub(super) fn json(implicit: bool) -> String {
     if implicit {
         return JSON.replace("\"pre_tokenizer\":null",concat!("\"pre_tokenizer\":",r###"{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}]}"###))
@@ -76,7 +73,6 @@ fn profile_case_0(implicit: bool) {
                     &[2, 5, 2, 3, 4][..]
                 }
             );
-            assert_eq!(output.mapped_capacity(), text.len() * 2);
             assert!(output.matches_source(&source));
             drop(pool.acquire_unquoted().unwrap());
             drop(source);
@@ -85,100 +81,6 @@ fn profile_case_0(implicit: bool) {
             assert_eq!(pool.used_bytes().unwrap(), 0);
         }
     }
-}
-#[test]
-fn regex_real_nested_failures_keep_full_e_and_c_after_workspace_retirement() {
-    profile_case_1(false);
-}
-#[test]
-fn implicit_regex_real_nested_failures_keep_full_e_and_c_after_workspace_retirement() {
-    profile_case_1(true);
-}
-fn profile_case_1(implicit: bool) {
-    let text = if implicit { "hi12<S>hi ?" } else { TEXT };
-    let (c, e) = sizes(implicit);
-    let pool = WorkingMemoryPool::new(c + e, 0).unwrap();
-    let source = source(&pool, &json(implicit));
-    let delegates = EncodeIdsPlan::prepare(&source.payload().model, text, false)
-        .unwrap()
-        .regex_delegate_count();
-    assert_eq!(delegates, 0);
-    let inner = [
-        D::Epsilon,
-        D::CurrentDense,
-        D::CurrentSparse,
-        D::NextDense,
-        D::NextSparse,
-        D::CurrentSlots,
-        D::NextSlots,
-    ];
-    let outer = [B::Saves, B::Branches, B::Undo];
-    let targets = outer
-        .into_iter()
-        .map(F::Outer)
-        .chain((0..delegates).flat_map(|ordinal| {
-            inner
-                .into_iter()
-                .map(move |buffer| F::Delegate { ordinal, buffer })
-        }));
-    for target in targets {
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &source,
-                text,
-                false,
-                |p| p.fail_regex_reservation(target).unwrap(),
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert_eq!(error.retained_bytes(), e);
-        assert!(error.matches_source(&source));
-        let failure = error.encoding_failure().unwrap();
-        assert!(failure.capacities().iter().all(|&n| n > 0));
-        assert_eq!(failure.mapped_capacity(), 2 * text.len());
-        let EncodeIdsError::RegexPreparation(retired) = failure.cause() else {
-            panic!("actual retired regex prefix")
-        };
-        assert!(retired.reserve_error().is_some());
-        if let F::Delegate { ordinal, buffer } = target {
-            let (actual, nested) = retired.delegate_error().unwrap();
-            assert_eq!(actual, ordinal);
-            assert_eq!(nested.buffer(), buffer);
-            assert_eq!(retired.retired_delegates(), ordinal);
-        }
-        drop(pool.acquire_unquoted().unwrap());
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        let erased = error.into_backend_failure();
-        assert_eq!(
-            erased
-                .source()
-                .unwrap()
-                .downcast_ref::<OriginalTokenizerEncodeError>()
-                .unwrap()
-                .retained_bytes(),
-            e
-        );
-        drop(erased);
-        assert_eq!(pool.used_bytes().unwrap(), c);
-    }
-    let error = pool
-        .encode_tokenizer_ids_with(
-            &source,
-            text,
-            false,
-            |p| {
-                p.fail_regex_reservation(F::Outer(B::Undo))
-                .unwrap()
-            },
-            || {},
-            || {},
-        )
-        .unwrap_err();
-    drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
-    drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 #[test]
 fn same_regex_source_has_independent_concurrent_original_workspaces_and_no_foreign_custody() {
@@ -263,52 +165,20 @@ fn profile_case_2(implicit: bool) {
 }
 
 #[test]
-fn cold_regex_partial_and_completed_rejections_hold_one_original_c_until_error_drop() {
-    profile_case_3(false);
-}
-#[test]
-fn implicit_cold_regex_partial_and_completed_rejections_hold_one_original_c_until_error_drop() {
-    profile_case_3(true);
-}
-fn profile_case_3(implicit: bool) {
-    use eredu_text::tokenizer_storage::RegexConstructionFailure as F;
-    let json = json(implicit);
-    let c = WorkingMemoryPool::tokenizer_required_bytes(
-        &TokenizerPlan::prepare_json(json.as_bytes()).unwrap(),
-    )
-    .unwrap();
-    for target in [
-        F::Pattern,
-        F::Instructions,
-        F::FirstLiteral,
-        F::LastDelegate,
-        F::Completed,
-    ]
-    .into_iter()
-    .filter(|target| implicit || !matches!(target, F::FirstLiteral))
-    {
-        let pool = WorkingMemoryPool::new(c, 0).unwrap();
-        let error = pool
-            .compile_tokenizer(
-                TokenizerPlan::prepare_json(json.as_bytes())
-                    .unwrap()
-                    .fail_regex_construction(target),
-            )
-            .unwrap_err();
-        assert_eq!(error.retained_bytes(), c);
-        assert!(error.compiler_failure().is_some());
-        drop(pool.acquire_unquoted().unwrap());
-        assert_eq!(pool.used_bytes().unwrap(), c);
-        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-        let mut reserve = false;
-        while let Some(error) = cause {
-            reserve |= error.is::<std::collections::TryReserveError>();
-            cause = error.source();
-        }
-        if !matches!(target, F::Completed) {
-            assert!(reserve);
-        }
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
+fn malformed_regex_compilation_retains_admission_and_its_upstream_error() {
+    let mut value: serde_json::Value = serde_json::from_str(&json(false)).unwrap();
+    value["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = "[".into();
+    let input = value.to_string();
+    let plan = TokenizerPlan::prepare_json(input.as_bytes()).unwrap();
+    let c = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
+    let pool = WorkingMemoryPool::new(c, 0).unwrap();
+    let error = pool.compile_tokenizer(plan).unwrap_err();
+    assert_eq!(error.retained_bytes(), c);
+    assert!(error.compiler_failure().unwrap().root_failure().is_some());
+    assert!(error.source().is_some());
+    drop(input);
+    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.used_bytes().unwrap(), c);
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }

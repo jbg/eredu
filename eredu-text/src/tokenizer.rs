@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use minijinja::{Environment, Template};
@@ -14,7 +14,12 @@ use tokenizers::Encoding;
 
 use crate::error::Error;
 
+mod cache;
+pub(crate) mod clock;
 mod json;
+pub(crate) mod metadata;
+mod sequence_compat;
+pub use cache::ModelCachePolicy;
 /// Shared exact structural-token validation with caller-owned destinations.
 pub mod structural;
 
@@ -100,7 +105,10 @@ impl SelectedChatTemplate<'_> {
 }
 
 /// One allocation-free selection rule for borrowed metadata and config sources.
-pub(crate) fn selected_chat_template_name(has_tools: bool, has_tool_template: bool) -> &'static str {
+pub(crate) fn selected_chat_template_name(
+    has_tools: bool,
+    has_tool_template: bool,
+) -> &'static str {
     if has_tools && has_tool_template {
         TOOL_USE_CHAT_TEMPLATE_NAME
     } else {
@@ -117,9 +125,12 @@ impl ModelChatTemplate {
             Self::Single(template) => Some((template, None)),
             Self::Named(templates) => {
                 let name = selected_chat_template_name(
-                    has_tools, templates.contains_key(TOOL_USE_CHAT_TEMPLATE_NAME),
+                    has_tools,
+                    templates.contains_key(TOOL_USE_CHAT_TEMPLATE_NAME),
                 );
-                templates.get(name).map(|source| (source.as_str(), Some(name)))
+                templates
+                    .get(name)
+                    .map(|source| (source.as_str(), Some(name)))
             }
         }
     }
@@ -129,13 +140,20 @@ impl ModelChatTemplate {
         &self,
         tools: Option<&[serde_json::Value]>,
     ) -> Result<SelectedChatTemplate<'_>, Error> {
-        let (template, name) = self.selected_source(tools.is_some_and(|tools| !tools.is_empty()))
+        let (template, name) = self
+            .selected_source(tools.is_some_and(|tools| !tools.is_empty()))
             .ok_or_else(|| Error::AmbiguousChatTemplate {
-                available: match self { Self::Named(templates) => templates.keys().cloned().collect(),
-                    Self::Single(_) => Vec::new() },
+                available: match self {
+                    Self::Named(templates) => templates.keys().cloned().collect(),
+                    Self::Single(_) => Vec::new(),
+                },
             })?;
-        Ok(SelectedChatTemplate { template,
-            identity: name.map_or(ChatTemplateIdentity::Single, |name| ChatTemplateIdentity::Named(name.to_owned())) })
+        Ok(SelectedChatTemplate {
+            template,
+            identity: name.map_or(ChatTemplateIdentity::Single, |name| {
+                ChatTemplateIdentity::Named(name.to_owned())
+            }),
+        })
     }
 }
 
@@ -143,13 +161,16 @@ impl ModelChatTemplate {
 /// providing more utilities.
 pub struct Tokenizer {
     inner: Arc<tokenizers::Tokenizer>,
+    metadata: OnceLock<Arc<metadata::SnapshotMetadata>>,
+    cache_policy: Option<ModelCachePolicy>,
     env: Environment<'static>,
     template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Owning, read-only snapshot of one tokenizer configuration.
 ///
-/// Clones share only the HF tokenizer, not chat-template caches or variables.
+/// Clones share the HF tokenizer and vocabulary index, excluding chat-template
+/// caches and variables.
 /// Mutating the original wrapper preserves this snapshot through copy-on-write.
 /// Sharing is an ownership contract, not a storage bound or funding authority.
 ///
@@ -161,6 +182,48 @@ pub struct Tokenizer {
 #[derive(Clone)]
 pub struct TokenizerSnapshot {
     inner: Arc<tokenizers::Tokenizer>,
+    pub(crate) metadata: Arc<metadata::SnapshotMetadata>,
+    cache_policy: Option<ModelCachePolicy>,
+}
+
+/// Borrowed cold vocabulary index. Queries allocate no storage and cannot
+/// produce an owning tokenizer or snapshot.
+#[derive(Clone, Copy)]
+pub struct TokenizerVocabulary<'a> {
+    tokenizer: &'a tokenizers::Tokenizer,
+    vocabulary: &'a metadata::SnapshotVocabulary,
+}
+impl TokenizerVocabulary<'_> {
+    /// Borrows the canonical spelling with upstream added-token precedence.
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocabulary.id_to_token(id)
+    }
+    /// Reads special-token membership by exact spelling, without normalization.
+    pub fn is_special_token(&self, token: &str) -> bool {
+        self.tokenizer
+            .get_added_vocabulary()
+            .is_special_token(token)
+    }
+    /// Iterates populated model and added IDs, including overlapping aliases.
+    /// Ordering is unspecified; sparse holes are not visited.
+    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.vocabulary.ids()
+    }
+}
+
+impl TokenizerSnapshot {
+    /// Borrows the immutable vocabulary index shared by this snapshot's aliases.
+    pub fn vocabulary(&self) -> TokenizerVocabulary<'_> {
+        TokenizerVocabulary {
+            tokenizer: &self.inner,
+            vocabulary: &self.metadata.vocabulary,
+        }
+    }
+    /// Cache limit set by Eredu, or `None` for an imported or directly mutated
+    /// tokenizer whose effective cache configuration is not publicly inspectable.
+    pub fn model_cache_policy(&self) -> Option<ModelCachePolicy> {
+        self.cache_policy
+    }
 }
 
 impl Deref for TokenizerSnapshot {
@@ -180,7 +243,7 @@ impl FromStr for Tokenizer {
     type Err = tokenizers::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        tokenizers::Tokenizer::from_str(s).map(Self::from_tokenizer)
+        Self::from_bytes(s)
     }
 }
 
@@ -191,12 +254,41 @@ impl Tokenizer {
         let env = chat_environment();
         Self {
             inner: Arc::new(tokenizer),
+            metadata: OnceLock::new(),
+            cache_policy: None,
             env,
             template_kwargs: serde_json::Map::new(),
         }
     }
 
-    /// Retains this exact immutable tokenizer configuration without copying it.
+    /// Wraps a tokenizer after invalidating its cache and applying an entry limit.
+    pub fn from_tokenizer_with_cache_policy(
+        mut tokenizer: tokenizers::Tokenizer,
+        policy: ModelCachePolicy,
+    ) -> Self {
+        policy.apply(&mut tokenizer);
+        let mut result = Self::from_tokenizer(tokenizer);
+        result.cache_policy = Some(policy);
+        result
+    }
+
+    /// Cache limit set by Eredu, or `None` after unmanaged import or direct
+    /// mutable access. Upstream does not expose its current cache capacity.
+    pub fn model_cache_policy(&self) -> Option<ModelCachePolicy> {
+        self.cache_policy
+    }
+
+    /// Invalidates cached entries and sets the model-cache entry limit.
+    pub fn set_model_cache_policy(&mut self, policy: ModelCachePolicy) {
+        policy.apply(Arc::make_mut(&mut self.inner));
+        self.cache_policy = Some(policy);
+    }
+
+    /// Retains this exact immutable tokenizer configuration.
+    ///
+    /// The first snapshot builds an owned vocabulary index using upstream public
+    /// APIs. Later snapshots share that index. This cold-load allocation is not
+    /// covered by the separate fixed-buffer decoder compilation requirements.
     ///
     /// The snapshot may outlive the wrapper. It excludes mutable chat-template
     /// state and exposes no mutable or raw Arc exit. Wrapper mutation may copy
@@ -204,24 +296,45 @@ impl Tokenizer {
     pub fn snapshot(&self) -> TokenizerSnapshot {
         TokenizerSnapshot {
             inner: Arc::clone(&self.inner),
+            metadata: Arc::clone(
+                self.metadata
+                    .get_or_init(|| Arc::new(metadata::SnapshotMetadata::new(&self.inner))),
+            ),
+            cache_policy: self.cache_policy,
         }
     }
 
-    /// Constructs with an explicit model-cache policy before HF models are built.
-    /// This does not bound JSON parsing, HF residence, templates or tokenization.
+    /// Borrows the cold vocabulary index shared with snapshots. The first call
+    /// builds that index through stock HF's public APIs; later calls only borrow.
+    /// Consumers promising allocation-free queries must prepare it during load.
+    pub fn vocabulary(&self) -> TokenizerVocabulary<'_> {
+        let metadata = self
+            .metadata
+            .get_or_init(|| Arc::new(metadata::SnapshotMetadata::new(&self.inner)));
+        TokenizerVocabulary {
+            tokenizer: &self.inner,
+            vocabulary: &metadata.vocabulary,
+        }
+    }
+
+    /// Constructs with an explicit cache entry limit applied before first use.
+    /// Upstream JSON parsing and construction allocate before the limit is set.
     pub fn from_bytes_with_cache_policy(
         bytes: impl AsRef<[u8]>,
-        policy: tokenizers::ModelCachePolicy,
+        policy: ModelCachePolicy,
     ) -> tokenizers::Result<Self> {
-        tokenizers::Tokenizer::from_bytes_with_cache_policy(bytes, policy).map(Self::from_tokenizer)
+        let tokenizer = policy.from_bytes(bytes)?;
+        let mut result = Self::from_tokenizer(tokenizer);
+        result.cache_policy = Some(policy);
+        Ok(result)
     }
 
     /// Reads a tokenizer with an explicit model-cache construction policy.
     pub fn from_file_with_cache_policy(
         file: impl AsRef<Path>,
-        policy: tokenizers::ModelCachePolicy,
+        policy: ModelCachePolicy,
     ) -> tokenizers::Result<Self> {
-        tokenizers::Tokenizer::from_file_with_cache_policy(file, policy).map(Self::from_tokenizer)
+        Self::from_bytes_with_cache_policy(std::fs::read(file)?, policy)
     }
 
     /// Replaces the default variables supplied to chat templates.
@@ -246,12 +359,12 @@ impl Tokenizer {
 
     /// Loads and wraps a tokenizer from a `tokenizer.json` file.
     pub fn from_file(file: impl AsRef<Path>) -> tokenizers::Result<Self> {
-        tokenizers::Tokenizer::from_file(file).map(Self::from_tokenizer)
+        Self::from_file_with_cache_policy(file, ModelCachePolicy::default())
     }
 
     /// Loads and wraps a tokenizer from serialized `tokenizer.json` bytes.
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> tokenizers::Result<Self> {
-        tokenizers::Tokenizer::from_bytes(bytes).map(Self::from_tokenizer)
+        Self::from_bytes_with_cache_policy(bytes, ModelCachePolicy::default())
     }
 
     /// Renders a batch of structured conversations with a model chat template.
@@ -288,6 +401,7 @@ impl Tokenizer {
             inner,
             env,
             template_kwargs,
+            ..
         } = self;
 
         let rendered_chats = apply_chat_template_with_default_kwargs(
@@ -372,6 +486,10 @@ impl Deref for Tokenizer {
 
 impl DerefMut for Tokenizer {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // Raw mutation can replace the model or alter its cache. Do not report
+        // stale policy metadata as an observation of upstream private state.
+        self.cache_policy = None;
+        self.metadata.take();
         Arc::make_mut(&mut self.inner)
     }
 }
@@ -655,6 +773,7 @@ where
 }
 
 /// Renders structured conversations using a caller-provided MiniJinja environment.
+/// Installs the shared chat clock, signed range and slice compatibility helpers.
 pub fn apply_chat_template<'a, I, R, T>(
     env: &mut Environment<'static>,
     model_template: impl Into<ModelChatTemplate>,
@@ -679,20 +798,8 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
-    // One environmental snapshot keeps all calls within this render coherent.
-    let now = chrono::Local::now();
-    let clock = crate::chat_storage::ChatClockSnapshot::from_local(now.naive_local());
-    env.add_function("strftime_now", move |format: &str| {
-        if crate::chat_storage::ChatClockSnapshot::supports(format) {
-            let mut output = String::new();
-            clock
-                .write(&mut output, format)
-                .expect("validated local date format");
-            output
-        } else {
-            now.format(format).to_string()
-        }
-    });
+    install_chat_clock(env, clock::ChatClockSnapshot::now());
+    sequence_compat::install(env);
 
     let ApplyChatTemplateArgs {
         conversations,
@@ -994,8 +1101,10 @@ fn normalize_conditional_keyword_arguments(template: &str) -> String {
     output
 }
 
-fn normalize_chat_template(template: &str) -> String {
-    normalize_conditional_keyword_arguments(&normalize_generation_blocks(template))
+pub(crate) fn normalize_chat_template(template: &str) -> String {
+    sequence_compat::normalize_slices(&normalize_conditional_keyword_arguments(
+        &normalize_generation_blocks(template),
+    ))
 }
 
 fn render_jinja_template<'a, 'defaults, R, T>(
@@ -1736,7 +1845,7 @@ mod tests {
 #[path = "tokenizer/model_cache_tests.rs"]
 mod model_cache_tests;
 
-fn chat_environment() -> Environment<'static> {
+pub(crate) fn chat_environment() -> Environment<'static> {
     let mut env = Environment::new();
     // Match the Jinja environment used by Transformers chat templates.
     env.set_trim_blocks(true);
@@ -1744,7 +1853,12 @@ fn chat_environment() -> Environment<'static> {
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_filter("tojson", json::tojson);
     env.add_function("dict", python_dict);
+    sequence_compat::install(&mut env);
     env
+}
+
+pub(crate) fn install_chat_clock(env: &mut Environment<'_>, clock: clock::ChatClockSnapshot) {
+    env.add_function("strftime_now", move |format: &str| clock.format(format));
 }
 
 fn selected_template_id(model_id: &str, selected: &SelectedChatTemplate<'_>) -> String {

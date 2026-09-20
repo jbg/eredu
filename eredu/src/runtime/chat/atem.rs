@@ -4,7 +4,7 @@ use super::grammar_text::{
     Error as GrammarError, Literal, Quoted, StructuralTokens, Text, is_required, repeated_rule,
 };
 use crate::runtime::chat::tool_schema::ToolDefinition;
-use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 use serde_json::{Map, Value};
 use std::fmt::{self, Write as _};
 
@@ -44,7 +44,7 @@ impl AtemDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         let structural = StructuralTokens::new(STRUCTURAL_TOKENS, token_ids)?;
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
@@ -202,7 +202,7 @@ impl FormatDialect for AtemDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<()>()?;
         Ok(ConstraintConfiguration {
@@ -593,7 +593,7 @@ mod tests {
             ToolChoice::Required,
             ParallelToolCallPolicy::Disabled,
             &[101, 102, 103, 104],
-            &ParserAllocationFunding::unenforced(),
+            &PreparationFunding::unmanaged(),
         )
         .unwrap();
         let embedded = grammar

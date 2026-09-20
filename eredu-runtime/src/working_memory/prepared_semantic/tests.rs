@@ -310,7 +310,7 @@ fn channel_semantic_owner_preserves_structural_stop_snapshot_and_escaped_custody
             fn contains_tagged_tool(&self, name: &str) -> bool { name == "check" }
             fn tagged_missing_required(&self, _: &str, names: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool { !names.iter().any(|name| name == "value") }
             fn parse_tagged_parameter(&self, name: &str, parameter: &str, declared: Option<&str>, raw: &str,
-                _: &dyn serde_json::allocation::Allocation, _: &HostMetadataFunding) -> Result<serde_json::Value, eredu_core::BackendFailure> {
+                _: &HostMetadataFunding) -> Result<serde_json::Value, eredu_core::BackendFailure> {
                 assert_eq!((name, parameter, declared, raw), ("check", "value", None, "1"));
                 // Primitive fixture callback; facade tests exercise the actual
                 // source-owned schema conversion and validation producer.
@@ -370,6 +370,42 @@ fn channel_semantic_owner_preserves_structural_stop_snapshot_and_escaped_custody
             let prefix = "<call>\n<fn=check><p=value>1</p>";
             let suffix = "</fn>\r\n</call>";
             refused.store(false, Ordering::SeqCst);
+            // A copied tagged session receives independent dependency headroom;
+            // a refused copy leaves the original state available for completion.
+            #[derive(Debug)]
+            struct Limited(Arc<AtomicUsize>);
+            impl eredu_core::HostMetadataAccount for Limited {
+                fn reserve_metadata(&self, bytes: usize) -> Result<(), eredu_core::HostMetadataFundingError> {
+                    self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |available| available.checked_sub(bytes))
+                        .map(|_| ())
+                        .map_err(|available| eredu_core::HostMetadataFundingError::Capacity {
+                            required: bytes as u64, available: available as u64,
+                        })
+                }
+            }
+            let available = Arc::new(AtomicUsize::new(64 * 1024 * 1024));
+            let limited = HostMetadataFunding::new(Limited(available.clone())).unwrap();
+            let policy = super::super::DependencyMemoryPolicy { fixed_bytes: 1024 * 1024, bytes_per_input_byte: 64 };
+            let input_bytes = prefix.len() + suffix.len();
+            available.store(policy.estimate(input_bytes).unwrap() - 1, Ordering::SeqCst);
+            assert!(OriginalSemanticChannelParser::prepare_with_dependency_memory(&xml_source, input_bytes, &limited, policy).is_err());
+            available.store(64 * 1024 * 1024, Ordering::SeqCst);
+            let before = available.load(Ordering::SeqCst);
+            let mut measured = OriginalSemanticChannelParser::prepare_with_dependency_memory(&xml_source, input_bytes, &limited, policy).unwrap();
+            assert!(before - available.load(Ordering::SeqCst) >= policy.estimate(input_bytes).unwrap());
+            measured.push(prefix).unwrap();
+            available.store(policy.estimate(input_bytes).unwrap() - 1, Ordering::SeqCst);
+            assert!(measured.copy(&limited).is_err());
+            available.store(64 * 1024 * 1024, Ordering::SeqCst);
+            let before = available.load(Ordering::SeqCst);
+            let mut independent = measured.copy(&limited).unwrap();
+            assert!(before - available.load(Ordering::SeqCst) >= policy.estimate(input_bytes).unwrap());
+            independent.cancel();
+            measured.push(suffix).unwrap();
+            measured.finish().unwrap();
+            assert!(matches!(measured.take_events().unwrap().last(), Some(SemanticEvent::ToolCallEnd)));
+            assert!(!independent.take_events().unwrap().iter().any(|e| matches!(e, SemanticEvent::ToolCallEnd)));
+            drop((measured, independent, limited));
             let mut xml = OriginalSemanticChannelParser::prepare(&xml_source, prefix.len()+suffix.len(), &funding).unwrap();
             xml.push(prefix).unwrap();
             let mut fork = xml.copy(&funding).unwrap();

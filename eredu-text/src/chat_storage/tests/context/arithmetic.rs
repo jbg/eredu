@@ -35,6 +35,8 @@ fn released_mistral_role_alternation_uses_exact_numeric_modulo_and_shared_namesp
             .render_plan_with_context(
                 ChatRenderContext::from_json(invalid.as_array().unwrap(), None, None).unwrap()
             )
+            .unwrap()
+            .render()
             .is_err()
     );
     assert!(
@@ -53,7 +55,8 @@ fn released_mistral_role_alternation_uses_exact_numeric_modulo_and_shared_namesp
 
 #[test]
 fn scalar_arithmetic_preserves_signed_float_boolean_and_checked_power_results() {
-    let template = "{{a-b}}|{{a*b}}|{{a/b}}|{{a//b}}|{{a%b}}|{{a**exponent}}|{{true*b}}|{{ -(a-b) }}";
+    let template =
+        "{{a-b}}|{{a*b}}|{{a/b}}|{{a//b}}|{{a%b}}|{{a**exponent}}|{{true*b}}|{{ -(a-b) }}";
     let caller = json!({"a":-7,"b":3,"exponent":2});
     let output = compare(
         template,
@@ -109,6 +112,8 @@ fn arithmetic_errors_and_partial_render_destinations_keep_original_custody() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
         assert!(
@@ -142,32 +147,12 @@ fn arithmetic_errors_and_partial_render_destinations_keep_original_custody() {
     drop((source, caller));
     assert!(failure.retained_buffer_bytes() > 0);
 
-    // Dispatch preserves ordinary dynamic multiplication; it grants
-    // no repeated-string storage to the closed scalar producer.
-    let template = "{{value*count}}";
     let caller = json!({"value":"é界","count":3});
-    assert_eq!(
-        ordinary()
-            .apply_chat_template_json(
-                crate::tokenizer::ModelChatTemplate::Single(template.into()),
-                [Vec::<serde_json::Value>::new()],
-                None,
-                "ordinary-repeat",
-                false,
-                caller.as_object()
-            )
-            .unwrap()[0],
-        "é界é界é界"
+    let rendered = compare(
+        "{{value*count}}",
+        &[],
+        &serde_json::Map::new(),
+        caller.as_object().unwrap(),
     );
-    let source = ChatTemplatePlan::prepare_utf8(template, "ordinary-repeat")
-        .unwrap()
-        .compile()
-        .unwrap();
-    assert!(
-        source
-            .render_plan_with_context(
-                ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-            )
-            .is_err()
-    );
+    assert_eq!(rendered.prompt(false), "é界é界é界");
 }

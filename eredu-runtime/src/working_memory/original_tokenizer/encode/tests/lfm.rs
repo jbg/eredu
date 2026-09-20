@@ -14,7 +14,7 @@ fn two_phase_original_exact_one_short_empty_and_both_special_flags_keep_c_e_tail
     super::template::exact_case(&json(), INPUT, &[6, 5, 7, 3, 2]);
 }
 #[test]
-fn two_phase_real_reserve_errors_foreign_pool_and_nonzero_prefix_failure_keep_custody() {
+fn two_phase_foreign_pool_and_upstream_encoding_failure_keep_custody() {
     super::template::errors_case(&json(), INPUT);
     let input = json().replace("\"unk_token\":\"?\"", "\"unk_token\":\"missing\"");
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
@@ -27,9 +27,8 @@ fn two_phase_real_reserve_errors_foreign_pool_and_nonzero_prefix_failure_keep_cu
         .unwrap_err();
     assert!(matches!(
         error.encoding_failure().unwrap().cause(),
-        EncodeIdsError::MissingUnknown
+        EncodeIdsError::Upstream(_)
     ));
-    assert_eq!(error.encoding_failure().unwrap().partial_id_count(), 2);
     assert!(error.matches_source(&original));
     drop(original);
     assert_eq!(pool.used_bytes().unwrap(), c + e);

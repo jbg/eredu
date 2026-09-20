@@ -78,13 +78,13 @@ pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {
-    load_tokenizer_for_kind_with_cache_policy(kind, model_dir, tokenizers::ModelCachePolicy::default())
+    load_tokenizer_for_kind_with_cache_policy(kind, model_dir, eredu_text::tokenizer::ModelCachePolicy::default())
 }
 
 pub(super) fn load_tokenizer_for_kind_with_cache_policy(
     kind: ModelKind,
     model_dir: &Path,
-    policy: tokenizers::ModelCachePolicy,
+    policy: eredu_text::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, TextMetadataError> {
     if is_gguf_file(model_dir) {
         return Ok(load_gguf_tokenizer_with_cache_policy(model_dir, policy)?.tokenizer);
@@ -93,7 +93,7 @@ pub(super) fn load_tokenizer_for_kind_with_cache_policy(
         ModelKind::KimiLinear => {
             let converted = model_dir.join("tokenizer.json");
             if converted.exists() {
-                Ok(Tokenizer::from_file_with_cache_policy(converted, policy)?)
+                Ok(policy.from_file(converted)?)
             } else {
                 eredu_text::tiktoken::load_kimi_k2_with_cache_policy(model_dir, policy)
                     .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
@@ -102,7 +102,7 @@ pub(super) fn load_tokenizer_for_kind_with_cache_policy(
         ModelKind::Moshi => Err(TextMetadataError::UnsupportedArchitecture(
             "Moshi-family models use a realtime tokenizer contract; load it outside the chat tokenizer API".into(),
         )),
-        _ => Ok(Tokenizer::from_file_with_cache_policy(model_dir.join("tokenizer.json"), policy)?),
+        _ => Ok(policy.from_file(model_dir.join("tokenizer.json"))?),
     }
 }
 
@@ -165,12 +165,12 @@ pub(crate) fn gguf_sidecar_dir(path: &Path) -> &Path {
 }
 
 pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, TextMetadataError> {
-    load_gguf_tokenizer_with_cache_policy(gguf_file, tokenizers::ModelCachePolicy::default())
+    load_gguf_tokenizer_with_cache_policy(gguf_file, eredu_text::tokenizer::ModelCachePolicy::default())
 }
 
 fn load_gguf_tokenizer_with_cache_policy(
     gguf_file: &Path,
-    policy: tokenizers::ModelCachePolicy,
+    policy: eredu_text::tokenizer::ModelCachePolicy,
 ) -> Result<GgufTokenizer, TextMetadataError> {
     let metadata = portable_gguf_metadata(gguf_file)?;
     load_gguf_tokenizer_from_metadata_with_cache_policy(gguf_file, &metadata, policy)
@@ -194,14 +194,14 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
     load_gguf_tokenizer_from_metadata_with_cache_policy(
         gguf_file,
         metadata,
-        tokenizers::ModelCachePolicy::default(),
+        eredu_text::tokenizer::ModelCachePolicy::default(),
     )
 }
 
 pub(crate) fn load_gguf_tokenizer_from_metadata_with_cache_policy(
     gguf_file: &Path,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    policy: tokenizers::ModelCachePolicy,
+    policy: eredu_text::tokenizer::ModelCachePolicy,
 ) -> Result<GgufTokenizer, TextMetadataError> {
     let sidecar_dir = gguf_sidecar_dir(gguf_file);
     if let Some(mut embedded) = gguf_tokenizer::from_metadata_with_cache_policy(metadata, policy)
@@ -213,10 +213,7 @@ pub(crate) fn load_gguf_tokenizer_from_metadata_with_cache_policy(
         return Ok(embedded);
     }
     Ok(GgufTokenizer {
-        tokenizer: Tokenizer::from_file_with_cache_policy(
-            sidecar_dir.join("tokenizer.json"),
-            policy,
-        )?,
+        tokenizer: policy.from_file(sidecar_dir.join("tokenizer.json"))?,
         template_kwargs: load_tokenizer_template_kwargs(sidecar_dir)?,
     })
 }

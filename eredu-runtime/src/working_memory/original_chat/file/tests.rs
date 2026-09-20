@@ -1,5 +1,4 @@
 use super::*;
-use eredu_text::chat_storage::ChatSourceBuffer;
 use std::{fs::File, io::Write};
 const SOURCE: &str = include_str!("../tests/template.jinja");
 fn config() -> Vec<u8> {
@@ -139,22 +138,17 @@ fn chat_file_real_reserve_changed_file_and_late_j_errors_are_retained() {
     assert_eq!(error.filled_bytes(), 0);
     drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
+    let invalid = br#"{"chat_template":"{% if %}"}"#;
+    let i = WorkingMemoryPool::chat_template_file_required_bytes(&read(invalid)).unwrap();
+    let plan = ChatTemplatePlan::prepare_config(invalid, "chat", false).unwrap();
+    let j = WorkingMemoryPool::chat_template_required_bytes(&plan).unwrap();
     let error = pool
-        .compile_chat_template_file_with(
-            read(&bytes),
-            "chat",
-            false,
-            |_| {},
-            || {},
-            |pool, plan| {
-                pool.compile_chat_template(plan.fail_reservation(ChatSourceBuffer::Locations))
-            },
-        )
+        .compile_chat_template_file(read(invalid), "chat", false)
         .unwrap_err();
     assert_eq!(error.input_bytes(), i);
     let failed = error.compiler_failure().unwrap();
     assert_eq!(failed.retained_bytes(), j);
-    assert!(failed.compiler_failure().unwrap().retained_buffer_bytes() > 0);
+    assert!(failed.compiler_failure().is_some());
     assert_eq!(pool.used_bytes().unwrap(), i + j);
     drop(pool.acquire_unquoted().unwrap());
     drop(error);

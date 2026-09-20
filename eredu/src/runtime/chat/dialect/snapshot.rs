@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+use crate::runtime::generation::storage::{SnapshotStorage, snapshot_fields};
 
 impl DeclarativeParser {
     pub(super) fn continuation_bound(&self, input_bytes: u64) -> Option<u64> {
@@ -34,7 +34,14 @@ snapshot_fields!(TaggedToolSchema {
 });
 snapshot_fields!(IncrementalJsonCall { cursor, data });
 snapshot_fields!(JsonCallData {
-    fragment, fields, name, id, arguments, arguments_seen, arguments_emitted, started
+    fragment,
+    fields,
+    name,
+    id,
+    arguments,
+    arguments_seen,
+    arguments_emitted,
+    started
 });
 impl SnapshotStorage for eredu_text::json_fragments::ObjectCursor<String> {
     fn heap_bytes(&self) -> Option<u64> {
@@ -65,7 +72,7 @@ impl SnapshotStorage for DeclarativeParserState {
             }
             Self::JsonPayload(value) => value.heap_bytes(),
             Self::NamedJsonPayload { json, emitted: _ } => json.heap_bytes(),
-            Self::Tagged(call) => u64::try_from(call.retained_bytes()?).ok(),
+            Self::Tagged(call) => u64::try_from(call.logical_snapshot_bytes()?).ok(),
             Self::StructuralPayload { normalizer } => normalizer.heap_bytes(),
             Self::Outside
             | Self::ToolStart

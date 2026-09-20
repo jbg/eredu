@@ -31,7 +31,7 @@ fn retained_clock_formats_original_calendar_values_and_paid_generated_text() {
     let failure = source
         .render_plan_with_context(context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((base, caller, source));
@@ -56,11 +56,16 @@ fn clock_bindings_preserve_shadowing_and_reject_missing_offset_facts() {
             .unwrap()
             .compile()
             .unwrap();
-        assert!(source
-            .render_plan_with_context(
-                ChatRenderContext::from_messages(ChatMessages::from_text(&[])).with_clock(clock)
-            )
-            .is_err());
+        assert!(
+            source
+                .render_plan_with_context(
+                    ChatRenderContext::from_messages(ChatMessages::from_text(&[]))
+                        .with_clock(clock)
+                )
+                .unwrap()
+                .render()
+                .is_err()
+        );
     }
     let vars = json!({"strftime_now":null});
     let source=ChatTemplatePlan::prepare_utf8("{% if strftime_now is defined %}defined{% endif %}:{% if strftime_now is none %}none{% endif %}","clock").unwrap().compile().unwrap();

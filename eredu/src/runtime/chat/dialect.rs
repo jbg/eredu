@@ -4,7 +4,8 @@ use super::grammar_text::{
     Error as GrammarError, Literal, Quoted, StructuralTokens, Text as GrammarText, field_sequence,
     is_required, repeated_rule, structural_literal,
 };
-use llguidance::{api::TopLevelGrammar, derivre::ParserAllocationFunding};
+use llguidance::api::TopLevelGrammar;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 pub(crate) mod channels;
 mod profile;
 mod snapshot;
@@ -132,7 +133,7 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError>;
 
     fn semantic_constraint_configuration(
@@ -140,7 +141,7 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         let _ = eos_token_ids;
         self.constraint_configuration(
@@ -641,7 +642,7 @@ impl DeclarativeDialectSpec {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         self.validate_fixed()?;
         if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
@@ -918,7 +919,7 @@ impl DeclarativeDialectSpec {
         &self,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         self.validate_fixed()?;
         if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
@@ -1004,7 +1005,7 @@ impl DeclarativeDialectSpec {
 fn tagged_parameters_grammar(
     tools: &[ToolDefinition<'_>],
     encoding: TaggedParametersEncoding,
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<String, GrammarError> {
     let mut rules = GrammarText::new(funding)?;
     rules.push_str("tagged_ws: /[ \\t\\r\\n]*/\n")?;
@@ -1158,7 +1159,7 @@ impl fmt::Display for TaggedNameError<'_> {
     }
 }
 impl TaggedNameError<'_> {
-    fn grammar(self, funding: &ParserAllocationFunding) -> GrammarError {
+    fn grammar(self, funding: &PreparationFunding) -> GrammarError {
         match funding.try_format(format_args!("{self}")) {
             Ok(message) => GrammarError::Policy(message),
             Err(error) => error.into(),
@@ -1178,20 +1179,9 @@ struct TaggedToolSchema {
     required: BTreeSet<String>,
 }
 
-struct TaggedAllocation<'a>(&'a ParserAllocationFunding);
-impl serde_json::allocation::Allocation for TaggedAllocation<'_> {
-    fn reserve(&self, bytes: usize) -> Result<(), serde_json::allocation::AllocationError> {
-        self.0
-            .reserve(bytes)
-            .map_err(|_| serde_json::allocation::AllocationError::Refused)
-    }
-    fn is_enforced(&self) -> bool {
-        self.0.is_enforced()
-    }
-}
 pub(crate) fn tagged_properties<'a>(
     root: &'a Value,
-    funding: &'a ParserAllocationFunding,
+    funding: &'a PreparationFunding,
 ) -> Result<TaggedProperties<'a>, GrammarError> {
     let object = resolve_tagged_reference(root, root, funding)?;
     Ok(TaggedProperties {
@@ -1207,7 +1197,7 @@ pub(crate) fn tagged_properties<'a>(
 fn resolve_tagged_reference<'a>(
     mut schema: &'a Value,
     root: &'a Value,
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<&'a Value, GrammarError> {
     for _ in 0..64 {
         let Some(pointer) = schema
@@ -1217,14 +1207,8 @@ fn resolve_tagged_reference<'a>(
         else {
             break;
         };
-        let target = root
-            .pointer_with_allocations(pointer, &TaggedAllocation(funding))
-            .map_err(|error| {
-                funding.failure().map_or_else(
-                    || GrammarError::JsonAllocation(error),
-                    GrammarError::Funding,
-                )
-            })?;
+        funding.reserve_dependency(pointer.len())?;
+        let target = root.pointer(pointer);
         let Some(target) = target else {
             break;
         };
@@ -1234,7 +1218,7 @@ fn resolve_tagged_reference<'a>(
 }
 pub(crate) struct TaggedProperties<'a> {
     root: &'a Value,
-    funding: &'a ParserAllocationFunding,
+    funding: &'a PreparationFunding,
     fields: Option<serde_json::map::Iter<'a>>,
 }
 impl<'a> Iterator for TaggedProperties<'a> {
@@ -1259,7 +1243,7 @@ impl ExactSizeIterator for TaggedProperties<'_> {
 fn tagged_tool_catalog(
     tools: &[ToolDefinition<'_>],
 ) -> Result<BTreeMap<String, TaggedToolSchema>, String> {
-    let funding = ParserAllocationFunding::unenforced();
+    let funding = PreparationFunding::unmanaged();
     tools
         .iter()
         .map(|tool| {
@@ -1299,10 +1283,9 @@ impl eredu_text::semantic_channels::tagged::TaggedSchemas for OrdinaryTaggedSche
     fn missing_required(&self, tool: &str, parameters: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool {
         self.0.get(tool).is_none_or(|s| s.required.iter().any(|n| !parameters.contains(n)))
     }
-    fn parse_parameter(&self, tool: &str, parameter: &str, declared: Option<&str>, raw: &str,
-        funding: &dyn serde_json::allocation::Allocation) -> Result<Value, Self::Error> {
+    fn parse_parameter(&self, tool: &str, parameter: &str, declared: Option<&str>, raw: &str) -> Result<Value, Self::Error> {
         let schema = self.0.get(tool).and_then(|s| s.parameters.get(parameter)).unwrap_or(&Value::Bool(true));
-        eredu_text::semantic_channels::tagged::parse_tagged_value(schema, declared, raw, funding,
+        eredu_text::semantic_channels::tagged::parse_tagged_value(schema, declared, raw,
             |value| Ok(tagged_value_matches_schema(value, schema)))
     }
 }
@@ -1362,7 +1345,7 @@ fn structural_object_grammar(
     encoding: StructuralObjectEncoding,
     structural_tokens: &[&str],
     resolved_structural_token_ids: &[u32],
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<String, GrammarError> {
     if tools.is_empty() {
         return Ok(funding
@@ -1406,7 +1389,7 @@ structural_any_array: "[" (structural_value ("," structural_value)*)? "]"
 struct StructuralGrammarBuilder<'a> {
     encoding: StructuralObjectEncoding,
     tokens: StructuralTokens<'a>,
-    funding: &'a ParserAllocationFunding,
+    funding: &'a PreparationFunding,
     next_rule: usize,
     rules: GrammarText<'a>,
 }
@@ -1631,7 +1614,7 @@ impl FormatDialect for DeclarativeDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         let grammar = Self::spec_fixed(parameters)?.lark_grammar(
             tools,
@@ -1650,7 +1633,7 @@ impl FormatDialect for DeclarativeDialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         let spec = Self::spec_fixed(parameters)?;
         Ok(ConstraintConfiguration {
@@ -2109,7 +2092,7 @@ impl DeclarativeParser {
                         unreachable!("tagged state requires tagged declaration");
                     };
                     let (consumed, wait, event) = call.advance(encoding.program(), &self.pending,
-                        &OrdinaryTaggedSchemas(&self.tagged_tools), &serde_json::allocation::Unenforced)
+                        &OrdinaryTaggedSchemas(&self.tagged_tools))
                         .map_err(|error| error.to_string())?;
                     self.pending.drain(..consumed);
                     match event {
@@ -4351,7 +4334,7 @@ mod tests {
             _tool_choice: ToolChoice,
             _parallel_tool_calls: ParallelToolCallPolicy,
             _resolved_structural_token_ids: &[u32],
-            funding: &llguidance::derivre::ParserAllocationFunding,
+            funding: &crate::runtime::chat::preparation_memory::PreparationFunding,
         ) -> Result<ConstraintConfiguration, super::GrammarError> {
             let parameters = parameters.custom::<CustomParameters>()?;
             Ok(ConstraintConfiguration {

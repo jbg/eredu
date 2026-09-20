@@ -12,35 +12,23 @@ struct Field {
     policy: TaggedValuePolicy,
     validator: Option<Source>,
 }
-struct Allocation<'a>(&'a ParserAllocationFunding);
-impl serde_json::allocation::Allocation for Allocation<'_> {
-    fn reserve(&self, bytes: usize) -> Result<(), serde_json::allocation::AllocationError> {
-        self.0
-            .reserve(bytes)
-            .map_err(|_| serde_json::allocation::AllocationError::Refused)
-    }
-    fn is_enforced(&self) -> bool {
-        self.0.is_enforced()
-    }
-}
 impl Tagged {
     pub(super) fn compile(
         schema: &Value,
         authority: &HostPreparationAuthority,
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<Self, CompilationCause> {
         let controls = [
             size_of::<Self>(),
             size_of::<Field>(),
-            size_of::<Allocation<'_>>(),
             size_of::<Result<Self, CompilationCause>>(),
             size_of::<TaggedValuePolicy>(),
-            size_of::<Result<TaggedValuePolicy, serde_json::allocation::AllocationError>>(),
+            size_of::<TaggedValuePolicy>(),
             size_of::<crate::runtime::chat::dialect::TaggedProperties<'_>>(),
             size_of::<Option<Source>>(),
             size_of::<Result<Source, original::CompilationFailure>>(),
             size_of::<std::slice::Iter<'_, Value>>(),
-            size_of::<(&Value, &HostPreparationAuthority, &ParserAllocationFunding)>(),
+            size_of::<(&Value, &HostPreparationAuthority, &PreparationFunding)>(),
         ];
         funding.reserve(
             controls
@@ -48,18 +36,20 @@ impl Tagged {
                 .try_fold(size_of_val(&controls), usize::checked_add)
                 .ok_or(CompilationCause::Overflow)?,
         )?;
-        let allocation = Allocation(funding);
         let mut result = Self {
             fields: Vec::new(),
             required: Vec::new(),
         };
         for field in crate::runtime::chat::dialect::tagged_properties(schema, funding)? {
             let (name, schema) = field?;
-            let policy = TaggedValuePolicy::prepare(schema, &allocation).map_err(|error| {
-                funding
-                    .failure()
-                    .map_or(CompilationCause::Json(error), CompilationCause::Funding)
-            })?;
+            // Schema projection uses ordinary library containers. Reserve host
+            // headroom independently of the retained validator's admission.
+            let estimate = funding
+                .memory_policy()
+                .estimate_json(schema)
+                .ok_or(CompilationCause::Overflow)?;
+            funding.reserve(estimate)?;
+            let policy = TaggedValuePolicy::prepare(schema);
             let validator = match Source::compile(schema, authority, funding) {
                 Ok(source) => Some(source),
                 // The ordinary local-property validator defers unresolved/rooted
@@ -103,11 +93,7 @@ impl Tagged {
                 .ok_or(CompilationCause::Overflow)?;
             if let Some(source) = &field.validator {
                 bytes = bytes
-                    .checked_add(
-                        source
-                            .capacity_bytes()
-                            .map_err(CompilationCause::Parameter)?,
-                    )
+                    .checked_add(source.admission_bytes())
                     .ok_or(CompilationCause::Overflow)?;
             }
         }
@@ -129,7 +115,6 @@ impl Tagged {
         parameter: &str,
         declared: Option<&str>,
         raw: &str,
-        allocations: &dyn serde_json::allocation::Allocation,
         funding: &HostMetadataFunding,
     ) -> Result<Value, ParseFailure> {
         let field = self
@@ -142,11 +127,10 @@ impl Tagged {
             field.map_or(&any, |field| &field.policy),
             declared,
             raw,
-            allocations,
             |value| -> Result<bool, ValueValidation> {
                 match field.and_then(|field| field.validator.as_ref()) {
                     Some(source) => {
-                        let text = value.to_string_with_allocations(allocations)?;
+                        let text = serde_json::to_string(value)?;
                         Ok(source.matches(&text, funding)?)
                     }
                     None => Ok(true),
@@ -159,7 +143,7 @@ impl Tagged {
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ValueValidation {
     #[error(transparent)]
-    Serialization(#[from] serde_json::value::ValueWriteError),
+    Serialization(#[from] serde_json::Error),
     #[error(transparent)]
     Validation(#[from] original::Failure),
 }

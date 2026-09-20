@@ -1,5 +1,5 @@
 //! One borrowed tool declaration pass before grammar and validator construction.
-use llguidance::derivre::{ParserAllocationFailure, ParserAllocationFunding, ParserStorageError};
+use crate::runtime::chat::preparation_memory::{PreparationFailure, PreparationFunding, StorageFailure};
 use serde_json::{Map, Value};
 use std::mem::{size_of, size_of_val};
 
@@ -44,9 +44,9 @@ enum Cause {
     #[error(transparent)]
     Declaration(#[from] InvalidDeclaration),
     #[error(transparent)]
-    Funding(#[from] ParserAllocationFailure),
+    Funding(#[from] PreparationFailure),
     #[error(transparent)]
-    Storage(#[from] ParserStorageError),
+    Storage(#[from] StorageFailure),
     #[error("tool declaration extent overflow")]
     Overflow,
 }
@@ -58,18 +58,18 @@ enum Cause {
 pub(crate) struct Failure {
     #[source]
     cause: Cause,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
 }
 
 #[derive(Debug)]
 pub(crate) struct ToolDeclarations<'a> {
     rows: Vec<ToolDefinition<'a>>,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
 }
 impl<'a> ToolDeclarations<'a> {
     pub(crate) fn prepare(
         tools: &'a [Value],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<Self, Failure> {
         let result = (|| -> Result<_, Cause> {
             let controls = [
@@ -80,8 +80,8 @@ impl<'a> ToolDeclarations<'a> {
                 size_of::<Result<Self, Failure>>(),
                 size_of::<Result<Self, Cause>>(),
                 size_of::<ToolDefinition<'a>>(),
-                size_of::<hashbrown::HashSet<&str>>(),
-                size_of::<(&[Value], &ParserAllocationFunding)>(),
+                size_of::<Vec<&str>>(),
+                size_of::<(&[Value], &PreparationFunding)>(),
                 size_of::<(&Map<String, Value>, &[&str], usize, &'static str)>(),
                 size_of::<std::iter::Enumerate<std::slice::Iter<'a, Value>>>(),
                 size_of::<serde_json::map::Keys<'a>>(),
@@ -97,7 +97,8 @@ impl<'a> ToolDeclarations<'a> {
             )?;
             let mut rows = Vec::new();
             funding.try_grow_vec(&mut rows, tools.len())?;
-            let mut names = hashbrown::HashSet::new();
+            let mut names: Vec<&str> = Vec::new();
+            funding.try_grow_vec(&mut names, tools.len())?;
             for (index, tool) in tools.iter().enumerate() {
                 let object = tool
                     .as_object()
@@ -130,8 +131,9 @@ impl<'a> ToolDeclarations<'a> {
                 {
                     return Err(InvalidDeclaration::NameCharacters { index }.into());
                 }
-                if !funding.try_insert_set(&mut names, name)? {
-                    return Err(InvalidDeclaration::Duplicate { index }.into());
+                match names.binary_search(&name) {
+                    Ok(_) => return Err(InvalidDeclaration::Duplicate { index }.into()),
+                    Err(position) => names.insert(position, name),
                 }
                 if function
                     .get("description")

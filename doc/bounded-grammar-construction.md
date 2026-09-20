@@ -1,100 +1,77 @@
-# Bounded grammar and schema construction
+# Grammar and schema memory policy
 
-## Controller and semantic channels
+Prepared chat compiles tool policy before generation. Required and Auto tools,
+reasoning channels, tagged payloads, literal stops and semantic publication use
+shared committed-token drivers in ordinary and controlled sessions. Tool events
+describe requests; Eredu does not execute external tools.
 
-`ConstraintController` contains plain control, an original registered constraint,
-or a shared conditional control state. Prepared chat compiles policy before
-generation. Required and Auto tools, reasoning channels, tagged payloads, literal
-stops and semantic publication use the same committed-token driver.
+## Stock dependency APIs
+
+Eredu uses the published llguidance parser factory and token parser, Derivre,
+jsonschema, and their ordinary registry dependencies. Compiled templates retain
+stock parser state. An invocation or independent snapshot uses the public deep
+copy operation and receives its own tokenizer-error slot and mutable session.
+The immutable trie and upstream compiled grammar may remain shared. Preparation
+serializes access to the shared compiler environment so one request cannot
+consume another request's tokenizer failure.
+
+Schema compilation and validation use the stock jsonschema validator. URI,
+numeric, email, Unicode and regular-expression behavior comes from its selected
+published dependencies. Public upstream parser and regex resource limits retain
+their normal behavior. Eredu does not inspect dependency-private capacities or
+intercept allocations inside these libraries.
+
+## Admission and lifetime
+
+`DependencyMemoryPolicy` reserves estimated host headroom before dependency work.
+Its default estimate is 64 KiB plus 128 bytes per input byte. JSON estimates use
+the serialized input size without retaining an additional JSON string. Operations
+and independently mutable sessions have separate reservations; temporary
+operation spending is cumulative within its account.
+
+`LoadedModel::prepare_chat_with_grammar_memory` accepts a custom policy for the
+prepared grammar, schema operations, parser sessions and copies. Existing
+`prepare_chat` uses the default policy. Both methods preserve the request type
+and share the same preparation driver. Tokenizer, template-render, model and
+native resource policies remain separate.
+
+These reservations are planning estimates, not measurements or enforceable
+limits on dependency allocations or process memory. A checked estimate can
+refuse with a typed overflow or funding error before the dependency call. The
+estimate can still be smaller than the dependency's actual allocation. Input,
+cache and concurrency limits remain necessary; increasing headroom does not
+change a dependency's algorithmic limits.
+
+Eredu separately admits the buffers and ordered-map nodes it constructs. The
+`eredu-collections` map reports the prospective node layout before allocation;
+its consumers own keys, values and reservation lifetimes. Stock serde_json uses
+its upstream map implementation. Model weights, KV/state caches, activations,
+prefill chunks, transfers and native execution retain their own admission and
+completion contracts.
+
+Prepared sources, results and failures retain their original accounts. Parser
+copies retain the selected memory policy and independent mutable state. Restore
+and fork do not refund cumulative copy or observation spending. Funding,
+tokenizer and session failures propagate instead of becoming successful partial
+output. The existing schema-grammar fallback is restricted to compilation or
+grammar-diagnostic failures; it does not suppress funding refusals.
+
+## Semantic channels and validation
 
 Tagged-tool processing shares declaration validation and payload traversal with
-its funded runtime. JSON object/list and XML-style tool profiles keep their
-own syntax and terminal rules. Unsupported profiles are typed refusals rather
-than implicit plain-text fallback. Tool events describe requests; the library
-does not execute external tools.
+its prepared runtime. JSON object/list and XML-style tool profiles retain their
+own syntax and termination rules. Unsupported profiles produce typed refusals.
+Tentative speculative output remains separate from committed semantic events.
 
-## Allocation ownership
+Behavioral tests cover nonzero tool arguments, malformed declarations and
+payloads, parser-copy independence, ordinary/controlled parity, source identity,
+headroom refusal and retry, retained error custody, and final account retirement.
+The portable facade and backend-conformance suites use neutral backends. Native
+prepared-chat fixtures additionally exercise media, capture, snapshots and
+local parallel execution.
 
-Parser forks own their actual allocation facts and growth checks. Runtime owns
-admission policy, accounts and escaped source custody. Cold grammar/schema
-inspection, compilation, copy and JSON/Lark emission reserve before constructing
-their destinations. Funding a completed object cannot authorize its construction.
-
-The parser holds one borrowed frame workspace per chart operation. Derivre's
-shared frame mechanism pays its controls before construction and grows the paid
-capacity only when simultaneous recursive frames exceed the retained peak.
-Sequential temporary frames reuse that peak; persistent heap growth and
-copy/attempt spending remain cumulative. The mechanism has no ambient or
-thread-local funding fallback.
-
-Failures retain the first typed cause and the actual failing compiler prefix,
-including completed aggregates. Errors, compiled sources and invocation caches
-retain their payers through escaped ownership. A refused reserve cannot be
-converted into a different regex, partial schema or successful partial output.
-
-## Schema and reference producers
-
-The JSON Schema compiler funds registry construction, crawl/index work,
-resolvers, keyword contexts, source text, paths, diagnostics and numeric/format
-producers. URI, email, IDNA, normalization, fraction and number conversion use
-their selected dependency workers. Ordinary and funded construction preserve
-ordering, error precedence and schema semantics.
-
-The local JSON map uses `eredu-collections`' safe AVL worker. Prospective node
-callbacks report exact layouts before allocation. Map keys, values, diagnostics
-and account lifetime remain with the caller. IndexMap preserves insertion order
-and shares its ordinary and funded reservation worker.
-
-## Regular-expression compilation
-
-`jsonschema-regex` owns ECMA translation, AST traversal, capture names, literal
-optimization and witness construction. The selected fancy-regex 0.19.0 worker
-owns parsing, analysis, compilation, delegated engines and backtracking state.
-Its source census includes immutable programs and invocation-owned caches.
-
-Regex syntax funding covers AST/HIR construction, Unicode classes, interval
-operations and literal extraction. Thompson compilation funds state tables,
-literal and range tries, UTF-8 caches, capture metadata and suffix caches. Dense
-DFA construction funds transitions, starts, determinization, minimization,
-acceleration and shrinking. Lazy DFA caches fund prospective state/transition
-growth and cache reset without discarding cumulative work accounting.
-
-PikeVM and bounded backtracking use their selected search algorithms. Capture
-slots, active states, epsilon/restore stacks and UTF-8 empty-match handling have
-explicit workspace bounds. Literal prefilters use ordinary Aho-Corasick/memchr
-algorithms with prospective construction hooks; no alternate search policy is
-selected merely because funding is enforced.
-
-Safe workspace members inherit `unsafe_code = "forbid"`. External collection
-and literal-search dependencies retain their documented upstream implementation
-boundaries; local allocation hooks are safe Rust. Archive hashes, licenses and
-local source inventories are recorded under `third-party`.
-
-## Validation
-
-Behavioral coverage exercises independent matching/format oracles, reserve
-failure at reached construction cuts, retained immutable ownership, parser
-copies and refusal propagation. The dependency compiler suite has 90 passing
-cases and the facade controller suite 47 in the scoped validation record.
-These counts do not establish arbitrary custom callback bounds or every regex
-feature combination. [Validation](bounded-inference-validation.md) describes
-the public and native limits; `doc/validation/*-compare.rs` contains independent
-comparison harnesses.
-
-## Independent comparison harnesses
-
-Run `doc/validation/standard-regex-compare.rs` in an isolated Cargo project outside
-the workspace. Alias the local `third-party/regex-1.13.1` package as `current`,
-a pristine registry `regex = "=1.13.1"` as `reference`, and the local
-`regex-automata-0.4.18` as `current_automata`. The local wrapper's dependency path
-must resolve to the local automata/syntax workers; the reference dependency graph
-must resolve to pristine registry packages. Do not use a global patch that sends
-both aliases through the same implementation. Match feature selections and
-record `cargo tree` output with results to identify the actual reference graph.
-
-The harness compares acceptance, error variants, captures, replacements, byte
-matching and sets, then measures warmed search and construction independently.
-Other `*-compare.rs` harnesses declare their required aliases in their imports;
-use the pinned versions from the relevant upstream manifest. Check archive
-hashes before preparing pristine source copies and keep generated projects and
-outputs outside the tracked tree.
+[Text processing](bounded-text-processing.md) describes tokenizer limits and the
+shared template compatibility helpers. [Inference validation](bounded-inference-validation.md)
+describes native and released-checkpoint procedures and their limits. Exact
+selected dependency versions and archive checksums are recorded in Cargo.lock;
+the libraries consume versioned, unmodified crates.io dependencies.

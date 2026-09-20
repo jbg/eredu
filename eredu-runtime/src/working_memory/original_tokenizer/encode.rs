@@ -24,18 +24,6 @@ impl OriginalEncodedTokenIds {
     pub fn ids(&self) -> &[u32] {
         self.ids.ids()
     }
-    /// Retained mapped split capacity; synchronous regex workspaces have retired.
-    pub fn mapped_capacity(&self) -> usize {
-        self.ids.mapped_capacity()
-    }
-    /// Actual retired NFC storage capacities; the input borrow ended before publication.
-    pub fn normalization_capacities(&self) -> [usize; 3] {
-        self.ids.normalization_capacities()
-    }
-    /// Actual retained symbol, merge-heap and ID capacities.
-    pub fn capacities(&self) -> [usize; 3] {
-        self.ids.capacities()
-    }
     /// Original E only; source C is retained separately and is never requoted.
     pub fn original_bytes(&self) -> u64 {
         self.allowance.bytes()
@@ -86,7 +74,7 @@ impl OriginalTokenizerEncodeError {
             _ => None,
         }
     }
-    /// Actual owning encoding failure with real partial destination capacities.
+    /// Original upstream encoding failure; the operation reservation stays held.
     pub fn encoding_failure(&self) -> Option<&EncodeIdsFailure> {
         match &self.cause {
             Cause::Encoding(error) => Some(error),
@@ -106,15 +94,9 @@ impl OriginalTokenizerEncodeError {
             .as_ref()
             .is_some_and(|actual| actual.same_source(source))
     }
-    /// Completed destinations exist only when terminal accounting failed.
-    pub fn completed_capacities(&self) -> Option<[usize; 3]> {
-        self.completed.as_ref().map(EncodedTokenIds::capacities)
-    }
-    /// Completed NFC capacities if terminal settlement rejected successful encoding.
-    pub fn completed_normalization_capacities(&self) -> Option<[usize; 3]> {
-        self.completed
-            .as_ref()
-            .map(EncodedTokenIds::normalization_capacities)
+    /// Completed IDs retained when terminal accounting rejects successful encoding.
+    pub fn completed_ids(&self) -> Option<&[u32]> {
+        self.completed.as_ref().map(EncodedTokenIds::ids)
     }
     /// Direct neutral erasure: the core source allocation retires before this owner.
     pub fn into_backend_failure(self) -> BackendFailure {
@@ -129,7 +111,7 @@ impl OriginalTokenizerEncodeError {
             _ if self.profile_failure().is_some() => BackendFailureKind::Unsupported,
             _ if self
                 .encoding_failure()
-                .is_some_and(|e| matches!(e.cause(), EncodeIdsError::MissingUnknown)) =>
+                .is_some_and(|e| matches!(e.cause(), EncodeIdsError::Upstream(_))) =>
             {
                 BackendFailureKind::InvalidInput
             }
@@ -197,7 +179,7 @@ impl WorkingMemoryPool {
             .map_err(|e| OriginalTokenizerEncodeError::rejected(Cause::Profile(e)))?;
         required(&plan).map_err(|e| OriginalTokenizerEncodeError::rejected(Cause::Accounting(e)))
     }
-    /// Checks the actual source/profile, admits once, and encodes into original destinations.
+    /// Estimates dependency workspace, admits once, and performs upstream encoding.
     /// The borrowed input may retire on return; the immutable source stays under its C lease.
     pub fn encode_tokenizer_ids(
         &self,
@@ -221,7 +203,7 @@ impl WorkingMemoryPool {
             .map_err(|e| OriginalTokenizerEncodeError::rejected(Cause::Accounting(e)))?;
         let plan = EncodeIdsPlan::prepare(&source.payload().model, input, add_special_tokens)
             .map_err(|e| OriginalTokenizerEncodeError::rejected(Cause::Profile(e)))?;
-        // Private test configuration only changes the actual reserve request. Public identity closure.
+        // Private test configuration cannot change source ownership.
         let plan = configure(plan);
         let bytes = required(&plan)
             .map_err(|e| OriginalTokenizerEncodeError::rejected(Cause::Accounting(e)))?;
@@ -231,10 +213,9 @@ impl WorkingMemoryPool {
         // No fallible operation or allocation separates acceptance from the guard.
         let held_source = source.clone();
         after_admission();
-        // Borrowed regex workspaces retire inside this synchronous call. NFC
-        // destinations lose their input/cursor borrow and remain in the owning
-        // C/E result or failure, including all later execution/settlement errors.
-        // The full original E remains held; retirement does not partially refund it.
+        // Upstream owns temporary workspace retirement. The complete Encoding
+        // output or original error stays under the operation reservation; that
+        // reservation is an estimate and remains held through settlement errors.
         let encoded = plan.encode();
         after_encoding();
         let settlement = allowance.end_compilation();

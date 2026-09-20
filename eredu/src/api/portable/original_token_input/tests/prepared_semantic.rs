@@ -41,7 +41,7 @@ fn prepared_pause_resume_preserves_choices_and_matches_uninterrupted_events() {
         let (mut model, source, facts, pool) = fixture(text);
         let mut policy = request(choice);
         policy.tools[0]["function"]["parameters"]["$schema"] = serde_json::json!("http://json-schema.org/draft-07/schema#");
-        let chat = prepare_chat(&model, &source, policy);
+        let chat = prepare_chat_with_memory(&model, &source, policy, crate::runtime::chat::DependencyMemoryPolicy { fixed_bytes: 4096, bytes_per_input_byte: 16 });
         let cancel = GenerationCancellationToken::new();
         let control = GenerationControlHandle::new(cancel.clone());
         control.request_pause();
@@ -373,6 +373,14 @@ fn prepare_chat(
     tokenizer: &ManagedPlainTextSource,
     request: ChatTemplateRequest,
 ) -> crate::runtime::chat::PreparedChat {
+    prepare_chat_with_memory(model, tokenizer, request, Default::default())
+}
+fn prepare_chat_with_memory(
+    model: &LoadedModel<Backend>,
+    tokenizer: &ManagedPlainTextSource,
+    request: ChatTemplateRequest,
+    memory: crate::runtime::chat::DependencyMemoryPolicy,
+) -> crate::runtime::chat::PreparedChat {
     let template = match model.chat_template.as_ref().unwrap() {
         eredu_text::tokenizer::ModelChatTemplate::Single(template) => serde_json::json!(template),
         eredu_text::tokenizer::ModelChatTemplate::Named(templates) => serde_json::Value::Array(
@@ -391,7 +399,7 @@ fn prepare_chat(
         .unwrap()
         .unwrap();
     model
-        .prepare_chat(&source, &request, CAPACITY, &cancel)
+        .prepare_chat_with_grammar_memory(&source, &request, CAPACITY, memory, &cancel)
         .unwrap()
         .unwrap()
 }
@@ -608,6 +616,7 @@ fn source_bound_semantic_render_and_policy_use_real_tools_and_shared_sources() {
             Some(model.tokenizer.template_kwargs()),
             &model.eos_token_ids,
             CAPACITY,
+            Default::default(),
             &GenerationCancellationToken::new(),
         )
         .unwrap()
@@ -685,6 +694,7 @@ fn source_bound_policy_receipts_keep_the_actual_compiler_outputs() {
             Some(model.tokenizer.template_kwargs()),
             &model.eos_token_ids,
             CAPACITY,
+            Default::default(),
             &GenerationCancellationToken::new(),
         )
         .unwrap()
@@ -779,6 +789,7 @@ fn cancellation_after_policy_compilation_prevents_actual_request_rendering() {
                 &request,
                 &model.eos_token_ids,
                 profile.preparation(),
+                Default::default(),
             )?;
             probe_renders = Some(facts.borrow().chat_renders);
             cancellation.cancel();
@@ -827,6 +838,7 @@ fn source_bound_schema_rejection_precedes_actual_request_rendering() {
         Some(model.tokenizer.template_kwargs()),
         &model.eos_token_ids,
         CAPACITY,
+        Default::default(),
         &GenerationCancellationToken::new(),
     )
     .unwrap_err();
@@ -863,6 +875,7 @@ fn source_bound_schema_rejection_precedes_actual_request_rendering() {
         Some(model.tokenizer.template_kwargs()),
         &model.eos_token_ids,
         CAPACITY,
+        Default::default(),
         &GenerationCancellationToken::new(),
     )
     .unwrap_err();
@@ -1315,3 +1328,44 @@ fn explicit_prefix_refuses_unknown_ids_before_generation_admission() {
 
 #[path = "prepared_semantic/recorded.rs"]
 mod recorded;
+
+#[test]
+fn requested_grammar_headroom_refusal_is_typed_and_retry_preserves_semantics() {
+    use eredu_core::HostMetadataFundingError;
+    use crate::runtime::chat::DependencyMemoryPolicy;
+    let output = "<tool_call>\n{\"name\":\"reading\",\"arguments\":{\"value\":17}}\n</tool_call>";
+    let (mut model, tokenizer, facts, pool) = fixture(output);
+    let config = serde_json::json!({"chat_template": TEMPLATE}).to_string();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(config.as_bytes()).unwrap();
+    let cancel = GenerationCancellationToken::new();
+    let source = model.compile_managed_chat_source(&tokenizer, file, true, &cancel).unwrap().unwrap();
+    let before = pool.used_bytes().unwrap();
+    let policy = request(ToolChoice::Required);
+    let memory = DependencyMemoryPolicy { fixed_bytes: usize::MAX, bytes_per_input_byte: 0 };
+    let error = model.prepare_chat_with_grammar_memory(&source, &policy, CAPACITY, memory, &cancel).err().expect("overflowing headroom must refuse");
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut found = false;
+    while let Some(error) = cause {
+        found |= matches!(error.downcast_ref::<HostMetadataFundingError>(), Some(HostMetadataFundingError::Overflow));
+        cause = error.source();
+    }
+    assert!(found, "typed headroom refusal: {error:?}");
+    assert!(!facts.borrow().order.contains(&"submit"));
+    assert!(pool.used_bytes().unwrap() > before);
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), before);
+    let memory = DependencyMemoryPolicy { fixed_bytes: 4096, bytes_per_input_byte: 16 };
+    let chat = model.prepare_chat_with_grammar_memory(&source, &policy, CAPACITY, memory, &cancel).unwrap().unwrap();
+    let mut events = Vec::new();
+    let completed = model.start_prepared_chat(PreparedChatRequest::new(&chat, settings()), &cancel)
+        .unwrap().unwrap().run(&cancel, &mut |event| events.push(event)).unwrap();
+    assert!(matches!(completed.finish_reason, eredu_core::FinishReason::GrammarComplete));
+    let arguments: String = events.iter().filter_map(|event| match event {
+        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.as_str()),
+        _ => None,
+    }).collect();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&arguments).unwrap(), serde_json::json!({"value":17}));
+    drop((completed, events, chat, source, tokenizer, model));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}

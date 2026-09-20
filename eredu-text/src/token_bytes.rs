@@ -6,11 +6,14 @@ pub use packed::{PackedTokenBytePlan, PackedTokenByteView};
 #[cfg(test)]
 mod tests;
 use std::mem::{size_of, size_of_val};
-use tokenizers::{decoders::DecoderWrapper, normalizers::replace::ReplacePattern};
+use tokenizers::decoders::DecoderWrapper;
 
 /// Fixed errors from source inspection or an exact destination.
 #[derive(Debug, thiserror::Error)]
 pub enum TokenByteError {
+    /// The public decoder configuration could not be inspected.
+    #[error("token decoder configuration failed")]
+    Configuration(#[source] serde_json::Error),
     /// No ByteLevel or ByteFallback component was present.
     #[error("token decoder has no lexical byte encoding")]
     Encoding,
@@ -47,7 +50,8 @@ pub struct TokenByteEncoding {
     depth: usize,
 }
 impl TokenByteEncoding {
-    /// Borrows the decoder without serde, regex construction, tables or cloning.
+    /// Inspects the decoder through public fields and serde configuration.
+    /// Replace patterns require a temporary JSON value during this cold operation.
     /// Ordered sequence traversal preserves the last single-scalar space marker.
     pub fn inspect(decoder: Option<&DecoderWrapper>) -> Result<Self, TokenByteError> {
         fn visit(
@@ -60,7 +64,9 @@ impl TokenByteEncoding {
                 DecoderWrapper::ByteLevel(_) => parts.byte_level = true,
                 DecoderWrapper::ByteFallback(_) => parts.fallback = true,
                 DecoderWrapper::Replace(replace) if replace.content == " " => {
-                    if let ReplacePattern::String(pattern) = replace.pattern() {
+                    let config =
+                        serde_json::to_value(replace).map_err(TokenByteError::Configuration)?;
+                    if let Some(pattern) = config["pattern"]["String"].as_str() {
                         let mut chars = pattern.chars();
                         if let (Some(marker), None) = (chars.next(), chars.next()) {
                             parts.marker = Some(marker);
@@ -222,7 +228,8 @@ impl TokenByteEncoding {
         })
     }
     /// Named source/byte traversal frames, including actual nested decoder depth.
-    /// This describes host work and grants no source or allocation authority.
+    /// Excludes upstream configuration serialization and its temporary values.
+    /// This describes first-party host work and grants no allocation authority.
     pub fn control_bytes(self) -> Option<usize> {
         let recursive = size_of::<(&DecoderWrapper, &mut Parts, usize)>()
             .checked_add(size_of::<std::slice::Iter<'_, DecoderWrapper>>())?

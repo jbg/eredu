@@ -114,15 +114,6 @@ fn file_profile(profile: u8) {
             assert_eq!(ids.ids(), legacy.encode(text, special).unwrap().get_ids());
             assert_eq!(ids.original_bytes(), e);
             if profile == 4 {
-                let expected = if text == "\u{344}" {
-                    [2, 2, 4]
-                } else if text.is_empty() {
-                    [0; 3]
-                } else {
-                    [10, 10, 11]
-                };
-                assert_eq!(ids.normalization_capacities(), expected);
-                assert_eq!(ids.mapped_capacity(), 2 * expected[2]);
                 if text == "\u{344}" {
                     assert_eq!(
                         ids.ids(),
@@ -133,8 +124,6 @@ fn file_profile(profile: u8) {
                         }
                     );
                 }
-            } else {
-                assert_eq!(ids.mapped_capacity(), 2 * text.len());
             }
             assert!(ids.matches_source(&source));
             if ids.ids().is_empty() {

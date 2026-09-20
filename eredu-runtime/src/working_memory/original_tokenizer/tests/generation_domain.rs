@@ -10,9 +10,15 @@ fn overlapping_added_token_retains_paid_capacity_without_extending_logical_domai
     let bytes = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
     let source = pool.compile_tokenizer(plan).unwrap();
-    let Some(TokenFilter::Allowed(mask)) = source.generation_domain() else { panic!("original mask") };
+    let Some(TokenFilter::Allowed(mask)) = source.generation_domain() else {
+        panic!("original mask")
+    };
     assert_eq!(mask.as_slice(), &[true; 5]);
-    assert_eq!(mask.capacity(), 6, "logical canonicalization does not refund storage");
+    assert_eq!(
+        mask.capacity(),
+        6,
+        "logical canonicalization does not refund storage"
+    );
     assert_eq!(source.original_bytes(), bytes);
     assert_eq!(pool.used_bytes().unwrap(), bytes);
     drop(source);
@@ -219,9 +225,8 @@ fn original_text_error_wrappers_retain_actual_stop_reserve_prefix_and_late_encod
     assert!(cause.matches_source(&source));
     assert!(matches!(
         cause.encoding_failure().unwrap().cause(),
-        EncodeIdsError::MissingUnknown
+        EncodeIdsError::Upstream(_)
     ));
-    assert_eq!(cause.encoding_failure().unwrap().partial_id_count(), 1);
     drop(source);
     assert_eq!(pool.used_bytes().unwrap(), c + e);
     drop(error);

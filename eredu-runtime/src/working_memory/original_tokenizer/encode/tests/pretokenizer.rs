@@ -1,5 +1,4 @@
 use super::*;
-use eredu_text::tokenizer_storage::{RegexBuffer, RegexConstructionFailure, RegexWorkspaceFailure};
 
 fn json() -> String {
     let mut value: serde_json::Value = serde_json::from_str(JSON).unwrap();
@@ -16,17 +15,6 @@ fn json() -> String {
         "a":6,"1":7,"2":8,"12":9,"▁":10});
     value["model"]["merges"] = serde_json::json!([["h", "i"], ["1", "2"]]);
     value.to_string()
-}
-
-fn reserve_leaf(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cause = Some(error);
-    while let Some(error) = cause {
-        if error.is::<std::collections::TryReserveError>() {
-            return true;
-        }
-        cause = error.source();
-    }
-    false
 }
 
 #[test]
@@ -96,85 +84,6 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
     assert!(!original.matches_configuration(&changed));
     drop(original);
     assert_eq!(pool.used_bytes().unwrap(), 0);
-}
-
-#[test]
-fn ordered_pretokenizers_refuse_each_destination_and_late_regex_with_exact_custody() {
-    let input = json();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let original = source(&pool, &input);
-    let c = original.original_bytes();
-    let text = "HI12<S>hi ?";
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&original, text, false).unwrap();
-    // Actual stage table, first text/splits, second text/splits, prefix text.
-    for stage in 11..17 {
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &original,
-                text,
-                false,
-                |p| p.fail_reservation(stage),
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert!(reserve_leaf(&error));
-        assert!(error.matches_source(&original));
-        assert_eq!(error.retained_bytes(), e);
-        assert_eq!(error.encoding_failure().unwrap().partial_id_count(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        drop(error.into_backend_failure());
-        assert_eq!(pool.used_bytes().unwrap(), c);
-    }
-    for ordinal in 0..3 {
-        for buffer in [RegexBuffer::Saves, RegexBuffer::Branches, RegexBuffer::Undo] {
-            let error = pool
-                .encode_tokenizer_ids_with(
-                    &original,
-                    text,
-                    false,
-                    |p| {
-                        p.fail_regex_reservation_at(ordinal, RegexWorkspaceFailure::Outer(buffer))
-                            .unwrap()
-                    },
-                    || {},
-                    || {},
-                )
-                .unwrap_err();
-            assert!(reserve_leaf(&error));
-            assert_eq!(error.retained_bytes(), e);
-            assert_eq!(pool.used_bytes().unwrap(), c + e);
-            drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), c);
-        }
-    }
-    drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    // Fail after earlier regex sources have really completed, including the
-    // final constructor's complete-program transport.
-    for ordinal in 0..3 {
-        for target in [
-            RegexConstructionFailure::Pattern,
-            RegexConstructionFailure::Instructions,
-            RegexConstructionFailure::Completed,
-        ] {
-            let error = pool
-                .compile_tokenizer(
-                    TokenizerPlan::prepare_json(input.as_bytes())
-                        .unwrap()
-                        .fail_regex_construction_at(ordinal, target),
-                )
-                .unwrap_err();
-            assert_eq!(error.retained_bytes(), c);
-            assert!(error.compiler_failure().is_some());
-            if !matches!(target, RegexConstructionFailure::Completed) {
-                assert!(reserve_leaf(&error));
-            }
-            assert_eq!(pool.used_bytes().unwrap(), c);
-            drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-        }
-    }
 }
 
 #[test]

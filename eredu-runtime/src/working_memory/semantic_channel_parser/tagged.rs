@@ -3,24 +3,6 @@ use super::*;
 use eredu_text::semantic_channels::tagged::{
     self as shared, TaggedCall, TaggedEvent, TaggedFrame, TaggedSchemas,
 };
-use serde_json::allocation::{Allocation, AllocationError};
-use std::cell::RefCell;
-
-struct Loan<'a> {
-    funding: &'a HostMetadataFunding,
-    failure: RefCell<Option<HostMetadataFundingError>>,
-}
-impl Allocation for Loan<'_> {
-    fn reserve(&self, bytes: usize) -> Result<(), AllocationError> {
-        if self.failure.borrow().is_some() {
-            return Err(AllocationError::Refused);
-        }
-        self.funding.reserve_metadata(bytes).map_err(|error| {
-            *self.failure.borrow_mut() = Some(error);
-            AllocationError::Refused
-        })
-    }
-}
 struct Schemas<'a> {
     source: &'a dyn super::super::OriginalToolValidation,
     funding: &'a HostMetadataFunding,
@@ -43,21 +25,18 @@ impl TaggedSchemas for Schemas<'_> {
         parameter: &str,
         declared: Option<&str>,
         raw: &str,
-        allocation: &dyn Allocation,
     ) -> Result<serde_json::Value, BackendFailure> {
         self.source
-            .parse_tagged_parameter(name, parameter, declared, raw, allocation, self.funding)
+            .parse_tagged_parameter(name, parameter, declared, raw, self.funding)
     }
 }
 pub(super) fn controls() -> Option<usize> {
-    shared::tagged_control_bytes::<BackendFailure>()?
-        .checked_add(size_of::<Loan<'_>>())?
+    size_of::<TaggedCall>()
         .checked_add(size_of::<Schemas<'_>>())?
         .checked_add(size_of::<Result<SemanticText, Cause>>())?
         .checked_add(size_of::<
             [u8; eredu_text::json_fragments::GENERATED_CALL_ID_BYTES],
-        >())?
-        .checked_add(size_of::<Prepaid>())
+        >())
 }
 fn text(value: &str, funding: &HostMetadataFunding) -> Result<SemanticText, tool::ToolCause> {
     let bytes = SemanticText::retained_control_bytes(value.len())
@@ -101,20 +80,12 @@ impl OriginalSemanticChannelParser {
                 return Ok(true);
             }
             let call = self.tagged.get_or_insert_with(TaggedCall::default);
-            let loan = Loan {
-                funding: &self.funding,
-                failure: RefCell::new(None),
-            };
             let schemas = Schemas {
                 source: validation.as_ref(),
                 funding: &self.funding,
             };
             let pending = std::str::from_utf8(&self.pending[..self.used]).expect("UTF-8 input");
-            let result = call.advance(program.encoding, pending, &schemas, &loan);
-            let refused = loan.failure.into_inner();
-            if let Some(error) = refused {
-                return Err(self.tool_failure(error.into()));
-            }
+            let result = call.advance(program.encoding, pending, &schemas);
             let (consumed, wait, event) =
                 result.map_err(|error| self.tool_failure(tool::ToolCause::Tagged(error)))?;
             self.consume_tool_bytes(consumed);
@@ -184,31 +155,4 @@ impl OriginalSemanticChannelParser {
         };
         Ok(step.wait)
     }
-}
-// The enclosing copy owner has already reserved the exact source-derived fresh
-// destinations. This fixed counter verifies every original clone producer still
-// fits that declaration; it cannot mint or extend an allocation budget.
-struct Prepaid {
-    remaining: std::cell::Cell<usize>,
-}
-impl Allocation for Prepaid {
-    fn reserve(&self, bytes: usize) -> Result<(), AllocationError> {
-        let next = self
-            .remaining
-            .get()
-            .checked_sub(bytes)
-            .ok_or(AllocationError::Refused)?;
-        self.remaining.set(next);
-        Ok(())
-    }
-}
-pub(super) fn copy_prepaid(call: &TaggedCall) -> Result<TaggedCall, AllocationError> {
-    let funding = Prepaid {
-        remaining: std::cell::Cell::new(call.copy_bytes().ok_or(AllocationError::SizeOverflow)?),
-    };
-    let copy = call.try_clone_with_allocations(&funding)?;
-    if funding.remaining.get() != 0 {
-        return Err(AllocationError::HostAllocation);
-    }
-    Ok(copy)
 }

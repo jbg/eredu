@@ -105,10 +105,7 @@ fn write_k2_fp8_fixture_geometry(
     fused_tail: bool,
     attention_tail: bool,
 ) {
-    let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let source: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
     .unwrap();
     let mut config = source["mova"]["config"].clone();
     config["hidden_size"] = if partial { 130 } else { 128 }.into();

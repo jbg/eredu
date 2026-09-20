@@ -142,7 +142,6 @@ fn borrowed_context_render_and_partial_failure_retain_only_original_owned_storag
     drop(alias);
     assert_eq!(pool.used_bytes().unwrap(), base);
     for buffer in [
-        ChatRenderBuffer::Concat,
         ChatRenderBuffer::WithoutPrompt,
         ChatRenderBuffer::WithPrompt,
     ] {
@@ -155,7 +154,10 @@ fn borrowed_context_render_and_partial_failure_retain_only_original_owned_storag
             .unwrap_err();
         drop(caller);
         assert_eq!(error.retained_bytes(), expected);
-        assert!(error.render_failure().unwrap().retained_buffer_bytes() > 0);
+        assert_eq!(
+            error.render_failure().unwrap().retained_buffer_bytes() > 0,
+            buffer == ChatRenderBuffer::WithPrompt
+        );
         assert_eq!(pool.used_bytes().unwrap(), base + expected);
         drop(error);
         assert_eq!(pool.used_bytes().unwrap(), base);
@@ -182,7 +184,7 @@ fn nested_borrowed_context_retains_new_text_destination_and_original_h_until_ret
     let plan = pool
         .chat_render_plan(&j, &c, context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText);
+        .fail_reservation(ChatRenderBuffer::WithPrompt);
     let failure = pool
         .render_original_chat_plan(&j, &c, plan, || {})
         .unwrap_err();
@@ -215,7 +217,7 @@ fn typed_short_circuit_chat_keeps_actual_render_and_failure_custody_after_contex
     let plan = pool
         .chat_render_plan(&j, &c, context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText);
+        .fail_reservation(ChatRenderBuffer::WithPrompt);
     let failure = pool
         .render_original_chat_plan(&j, &c, plan, || {})
         .unwrap_err();
@@ -232,7 +234,7 @@ fn typed_short_circuit_chat_keeps_actual_render_and_failure_custody_after_contex
 }
 
 #[test]
-fn source_sized_measurement_is_admitted_before_nested_dispatch() {
+fn render_headroom_is_admitted_before_nested_dispatch() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let template = "{% for call in calls %}{% for key,value in call.items() %}{{ key + ':' + value }};{% endfor %}{% endfor %}";
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
@@ -241,14 +243,13 @@ fn source_sized_measurement_is_admitted_before_nested_dispatch() {
         .compile_chat_template(ChatTemplatePlan::prepare_utf8(template, "nested").unwrap())
         .unwrap();
     let base = pool.used_bytes().unwrap();
-    let prefix = measurement_required(&j.payload().source).unwrap();
     let caller = serde_json::json!({"calls":[{"é":"one"},{"界":"two"}]});
     let context = ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap();
     let measured = pool.chat_render_required_bytes(&j, &c, context).unwrap();
     assert_eq!(
         pool.used_bytes().unwrap(),
         base,
-        "measurement scratch actually retired"
+        "planning does not consume operation admission"
     );
     let rendered = pool.render_original_chat(&j, &c, context).unwrap();
     assert_eq!(pool.used_bytes().unwrap(), base + measured);
@@ -257,14 +258,14 @@ fn source_sized_measurement_is_admitted_before_nested_dispatch() {
     drop(rendered);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 
-    // Keep exactly the source owners and one byte less than real measurement.
-    let pool = WorkingMemoryPool::new(base + prefix - 1, 0).unwrap();
+    // Keep source owners and one byte less than the selected render reservation.
+    let pool = WorkingMemoryPool::new(base + measured - 1, 0).unwrap();
     let c = tokenizer(&pool);
     let j = pool
         .compile_chat_template(ChatTemplatePlan::prepare_utf8(template, "nested").unwrap())
         .unwrap();
     assert_eq!(pool.used_bytes().unwrap(), base);
-    let caller = serde_json::json!({"calls":[{"é":"one"}]});
+    let caller = serde_json::json!({"calls":[{"é":"one"},{"界":"two"}]});
     let error = pool
         .render_original_chat(
             &j,
@@ -282,7 +283,7 @@ fn source_sized_measurement_is_admitted_before_nested_dispatch() {
 }
 
 #[test]
-fn failed_loop_measurement_retains_its_source_and_paid_error_custody() {
+fn failed_loop_execution_retains_sources_and_render_admission() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let c = tokenizer(&pool);
@@ -296,8 +297,14 @@ fn failed_loop_measurement_retains_its_source_and_paid_error_custody() {
         )
         .unwrap();
     let base = pool.used_bytes().unwrap();
-    let prefix = measurement_required(&j.payload().source).unwrap();
     let caller = serde_json::json!({"rows":[["only one"]]});
+    let prefix = pool
+        .chat_render_required_bytes(
+            &j,
+            &c,
+            ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap(),
+        )
+        .unwrap();
     let error = pool
         .render_original_chat(
             &j,
@@ -306,7 +313,7 @@ fn failed_loop_measurement_retains_its_source_and_paid_error_custody() {
         )
         .unwrap_err();
     assert_eq!(error.retained_bytes(), prefix);
-    assert!(matches!(error.cause, Cause::Plan(_)));
+    assert!(matches!(error.cause, Cause::Render(_)));
     drop((caller, j, c));
     assert_eq!(pool.used_bytes().unwrap(), base + prefix);
     drop(error);
@@ -314,7 +321,7 @@ fn failed_loop_measurement_retains_its_source_and_paid_error_custody() {
 }
 
 #[test]
-fn original_json_attempts_and_escaped_outputs_keep_exact_sources_and_h() {
+fn json_outputs_and_output_reserve_errors_retain_sources_and_admission() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let c = tokenizer(&pool);
@@ -334,13 +341,13 @@ fn original_json_attempts_and_escaped_outputs_keep_exact_sources_and_h() {
     assert_eq!(
         pool.used_bytes().unwrap(),
         baseline,
-        "all temporary measurement scratch settled"
+        "planning consumes no operation admission"
     );
     let rendered = pool.render_original_chat_plan(&j, &c, plan, || {}).unwrap();
     let plan = pool
         .chat_render_plan(&j, &c, context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText);
+        .fail_reservation(ChatRenderBuffer::WithPrompt);
     let error = pool
         .render_original_chat_plan(&j, &c, plan, || {})
         .unwrap_err();
@@ -364,7 +371,7 @@ fn original_json_attempts_and_escaped_outputs_keep_exact_sources_and_h() {
 }
 
 #[test]
-fn original_generated_slice_attempts_retire_scratch_and_retain_escaped_sources() {
+fn generated_slices_and_output_reserve_errors_retain_sources() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let c = tokenizer(&pool);
@@ -384,13 +391,13 @@ fn original_generated_slice_attempts_retire_scratch_and_retain_escaped_sources()
     assert_eq!(
         pool.used_bytes().unwrap(),
         baseline,
-        "every fixed prefix attempt retires its temporary buffers"
+        "planning consumes no operation admission"
     );
     let rendered = pool.render_original_chat_plan(&j, &c, plan, || {}).unwrap();
     let plan = pool
         .chat_render_plan(&j, &c, context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText);
+        .fail_reservation(ChatRenderBuffer::WithPrompt);
     let error = pool
         .render_original_chat_plan(&j, &c, plan, || {})
         .unwrap_err();
@@ -414,7 +421,7 @@ fn original_generated_slice_attempts_retire_scratch_and_retain_escaped_sources()
 }
 
 #[test]
-fn original_generated_lists_retire_attempts_and_retain_failed_value_destinations() {
+fn generated_lists_and_output_reserve_errors_retain_sources() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let c = tokenizer(&pool);
@@ -434,13 +441,13 @@ fn original_generated_lists_retire_attempts_and_retain_failed_value_destinations
     assert_eq!(
         pool.used_bytes().unwrap(),
         baseline,
-        "every fixed prefix attempt retires its temporary buffers"
+        "planning consumes no operation admission"
     );
     let rendered = pool.render_original_chat_plan(&j, &c, plan, || {}).unwrap();
     let plan = pool
         .chat_render_plan(&j, &c, context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::Values);
+        .fail_reservation(ChatRenderBuffer::WithPrompt);
     let error = pool
         .render_original_chat_plan(&j, &c, plan, || {})
         .unwrap_err();
@@ -464,7 +471,7 @@ fn original_generated_lists_retire_attempts_and_retain_failed_value_destinations
 }
 
 #[test]
-fn amortized_measurement_falls_back_to_exact_reached_capacity_without_leaking_attempts() {
+fn generated_loop_output_preserves_unicode_and_enforces_admission() {
     use eredu_text::chat_storage::ChatTemplatePlan;
     let template = "{% for row in rows %}{{ (row + 'é')|upper }};{% endfor %}";
     let input = serde_json::json!({"rows":(0..33).map(|i|format!("row-{i}")).collect::<Vec<_>>()});
@@ -474,75 +481,39 @@ fn amortized_measurement_falls_back_to_exact_reached_capacity_without_leaking_at
     let j = pool
         .compile_chat_template(ChatTemplatePlan::prepare_utf8(template, "growth").unwrap())
         .unwrap();
-    let baseline = pool.used_bytes().unwrap();
-    let (mut json, mut text, mut values) = (
-        ChatJsonCapacity::default(),
-        ChatTextCapacity::default(),
-        ChatValueCapacity::default(),
-    );
-    let mut attempts = 0;
-    let exact_requirements = loop {
-        attempts += 1;
-        assert!(attempts < 1000, "finite reached storage");
-        match j
-            .payload()
-            .source
-            .render_plan_attempt_with_values(context, json, text, values)
-        {
-            Ok(plan) => break plan.requirements().required_bytes(),
-            Err(ChatRenderPlanError::JsonCapacity(next)) => json = json.union(next),
-            Err(ChatRenderPlanError::TextCapacity(next)) => text = text.union(next),
-            Err(ChatRenderPlanError::ValueCapacity(next)) => values = values.union(next),
-            Err(error) => panic!("unexpected measurement failure: {error:?}"),
-        }
-    };
-    assert!(
-        attempts > 8,
-        "fixture must require repeated generated prefix growth"
-    );
-    let minimum =
-        measurement_required_with_capacities(&j.payload().source, json, text, values).unwrap();
-    let rendered = pool
-        .chat_render_plan(&j, &c, context)
-        .unwrap()
-        .render()
-        .unwrap();
+    let base = pool.used_bytes().unwrap();
+    let admission = pool.chat_render_required_bytes(&j, &c, context).unwrap();
+    let rendered = pool.render_original_chat(&j, &c, context).unwrap();
     assert_eq!(
         rendered.prompt(false),
         (0..33).map(|i| format!("ROW-{i}É;")).collect::<String>()
     );
     drop((rendered, j, c));
     assert_eq!(pool.used_bytes().unwrap(), 0);
-
-    for short in [false, true] {
-        let pool = WorkingMemoryPool::new(baseline + minimum - u64::from(short), 0).unwrap();
+    for short in [true, false] {
+        let pool = WorkingMemoryPool::new(base + admission - u64::from(short), 0).unwrap();
         let c = tokenizer(&pool);
         let j = pool
             .compile_chat_template(ChatTemplatePlan::prepare_utf8(template, "growth").unwrap())
             .unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        let result = pool.chat_render_plan(&j, &c, context);
+        let result = pool.render_original_chat(&j, &c, context);
         if short {
             let error = result.unwrap_err();
             assert!(
-                matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded {required_bytes,available_bytes}) if *required_bytes==minimum && *available_bytes==minimum-1)
+                matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
+                if *required_bytes == admission && *available_bytes == admission - 1)
             );
-            assert_eq!(
-                error.retained_bytes(),
-                0,
-                "no destination exists for the refused attempt"
-            );
+            assert_eq!(error.retained_bytes(), 0);
         } else {
+            let output = result.unwrap();
             assert_eq!(
-                result.unwrap().requirements().required_bytes(),
-                exact_requirements
+                output.prompt(false),
+                (0..33).map(|i| format!("ROW-{i}É;")).collect::<String>()
             );
+            assert_eq!(pool.used_bytes().unwrap(), base + admission);
+            drop(output);
         }
-        assert_eq!(
-            pool.used_bytes().unwrap(),
-            baseline,
-            "every completed measurement actually retired"
-        );
+        assert_eq!(pool.used_bytes().unwrap(), base);
         drop((j, c));
         assert_eq!(pool.used_bytes().unwrap(), 0);
     }

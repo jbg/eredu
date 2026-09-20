@@ -65,9 +65,9 @@ three cached decode steps: eight finite 248,320-value rows, matching argmax and
 zero violations of `abs(actual-reference) <= 0.25 + 0.02*abs(reference)`.
 Ordinary numerical inference does not establish bounded tool admission.
 
-[Tokenizer measurements](bounded-text-processing.md#storage-and-search-cost)
-include a faster chat workload and a slower shared-prefix workload. Fixed
-storage bounds and semantic parity do not imply a universal throughput gain.
+[Tokenizer memory policy](bounded-text-processing.md) distinguishes estimated
+dependency headroom from first-party destinations. Behavioral parity does not
+establish tokenization throughput or a process-memory ceiling.
 
 The four released text/image tool runs use 3.13–3.19 GB peak RSS and
 5.61–5.68 GB peak process footprint. Framework capacity, retained buffer bounds,

@@ -1,23 +1,6 @@
 use super::*;
 
-const TEMPLATES: [(&str, &str); 4] = [
-    (
-        "dense-safetensors",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/dense-safetensors.jinja"),
-    ),
-    (
-        "dense-gguf",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/dense-gguf.jinja"),
-    ),
-    (
-        "mova-safetensors",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/mova-safetensors.jinja"),
-    ),
-    (
-        "mova-gguf",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/mova-gguf.jinja"),
-    ),
-];
+use eredu_evaluation::fixtures::k2_horizon::{CHAT_TEMPLATES as TEMPLATES, TEXT_REFERENCE_JSON};
 
 fn tokenizer() -> ChatTokenizer {
     llama_chat_tokenizer(
@@ -30,10 +13,7 @@ fn tokenizer() -> ChatTokenizer {
 
 #[test]
 fn ifm_released_templates_prepare_exact_prompts_and_recognize_all_formats() {
-    let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../../eredu-text/tests/fixtures/k2_horizon/reference.json"
-    ))
-    .unwrap();
+    let cases: Vec<serde_json::Value> = serde_json::from_str(TEXT_REFERENCE_JSON).unwrap();
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     for case in cases {
         let mut tokenizer = tokenizer();
@@ -93,15 +73,19 @@ fn ifm_reasoning_disable_is_established_per_artifact_template() {
             },
         );
         if name.ends_with("gguf") {
-            assert!(result
-                .unwrap()
-                .rendered_prompt()
-                .ends_with("<ifm|think>\n</ifm|think>\n"));
+            assert!(
+                result
+                    .unwrap()
+                    .rendered_prompt()
+                    .ends_with("<ifm|think>\n</ifm|think>\n")
+            );
         } else {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("reasoning-disable"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reasoning-disable")
+            );
         }
     }
 }

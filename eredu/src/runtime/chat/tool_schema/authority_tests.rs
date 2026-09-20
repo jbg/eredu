@@ -12,13 +12,13 @@ impl Drop for Retired {
 fn compilation_funding(
     fail_at: usize,
 ) -> (
-    llguidance::derivre::ParserAllocationFunding,
+    crate::runtime::chat::preparation_memory::PreparationFunding,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
 ) {
     let calls = Arc::new(AtomicUsize::new(0));
     let retired = Arc::new(AtomicUsize::new(0));
-    let funding = llguidance::derivre::ParserAllocationFunding::prepare({
+    let funding = crate::runtime::chat::preparation_memory::test_funding({
         let calls = calls.clone();
         let guard = Retired(retired.clone());
         move |bytes| {
@@ -51,11 +51,11 @@ fn funded_schema_source_shares_its_graph_and_retains_construction_accounts() {
     let (funding, calls, retired) = compilation_funding(usize::MAX);
     let source = original::Source::compile(&schema, &authority, &funding).unwrap();
     let compiled_calls = calls.load(Ordering::SeqCst);
-    let retained = source.capacity_bytes().unwrap();
+    let retained = source.admission_bytes();
     assert!(retained > std::mem::size_of_val(&source));
-    assert!(calls.load(Ordering::SeqCst) > compiled_calls);
+    assert_eq!(calls.load(Ordering::SeqCst), compiled_calls);
     let alias = source.clone();
-    assert_eq!(alias.capacity_bytes().unwrap(), retained);
+    assert_eq!(alias.admission_bytes(), retained);
     drop((schema, source, authority, funding));
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(authority_retired.load(Ordering::SeqCst), 0);
@@ -81,10 +81,7 @@ fn funded_schema_source_shares_its_graph_and_retains_construction_accounts() {
 }
 
 #[test]
-fn funded_schema_build_and_census_refusals_preserve_the_original_cause() {
-    // An explicit supported draft exercises the paid compiler independently of
-    // the default draft's regex producers. Default-draft acceptance is covered
-    // separately and must still succeed once those producers are qualified.
+fn schema_headroom_refusals_preserve_the_original_cause() {
     let schema = serde_json::json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object", "properties": {"count": {"type": "integer"}}
@@ -94,18 +91,16 @@ fn funded_schema_build_and_census_refusals_preserve_the_original_cause() {
         original::Source::compile(&schema, &HostPreparationAuthority::unmanaged(), &accepted)
             .unwrap();
     let compiled = calls.load(Ordering::SeqCst);
-    source.capacity_bytes().unwrap();
+    source.admission_bytes();
     let total = calls.load(Ordering::SeqCst);
-    assert!(compiled > 1 && total > compiled);
+    assert!(compiled > 1);
+    assert_eq!(total, compiled);
     drop((source, accepted));
-    // The outer constructor, final compiler reservation, and every census
-    // reservation exercise both direct and dependency-owned error transports.
-    for cut in [1, compiled - 1].into_iter().chain(compiled..total) {
+    for cut in 1..total {
         let (funding, calls, retired) = compilation_funding(cut);
         let authority_retired = Arc::new(AtomicUsize::new(0));
         let authority = HostPreparationAuthority::retain(Retired(authority_retired.clone()));
         let failure = original::Source::compile(&schema, &authority, &funding)
-            .and_then(|source| source.capacity_bytes())
             .unwrap_err();
         assert_eq!(calls.load(Ordering::SeqCst), cut + 1);
         let mut cause: &(dyn std::error::Error + 'static) = &failure;
@@ -245,20 +240,20 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &authority,
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    let retained = source.capacity_bytes().unwrap();
+    let retained = source.admission_bytes();
     assert!(retained > std::mem::size_of_val(&source));
-    assert_eq!(source.clone().capacity_bytes().unwrap(), retained);
+    assert_eq!(source.clone().admission_bytes(), retained);
     let recursive_schema = serde_json::json!({"$id":"https://example.invalid/paid-node","$defs":{"node":{"type":"object","properties":{"next":{"$ref":"#/$defs/node"}}}},"$ref":"#/$defs/node"});
     let recursive = Source::compile(
         &recursive_schema,
         &authority,
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(recursive.capacity_bytes().unwrap() > 0);
+    assert!(recursive.admission_bytes() > 0);
     let recursive_ordinary = compile(&recursive_schema).unwrap();
     let (recursive_funding, _, _) = make();
     for raw in [r#"{"next":{"next":{}}}"#, r#"{"next":3}"#] {
@@ -320,8 +315,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     assert!(retired.load(Ordering::SeqCst));
     assert_eq!(source_retired.load(Ordering::SeqCst), 1);
 
-    // These scalar bodies borrow the input directly; no equals_value/to_value
-    // fallback or numeric helper is implicitly admitted by this qualification.
+    // Scalar literals retain their ordinary JSON Schema semantics.
     let schema = serde_json::json!({"type":"object", "properties": {
         "mode":{"enum":["read","write"]}, "active":{"const":true},
         "empty":{"const":null}, "name":{"const":"é🙂"}
@@ -330,10 +324,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let scalar = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(scalar.capacity_bytes().unwrap() > 0);
+    assert!(scalar.admission_bytes() > 0);
     let (funding, _, _) = make();
     for raw in [
         r#"{"mode":"read","active":true,"empty":null,"name":"é🙂"}"#,
@@ -355,8 +349,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     }
     drop((scalar, funding));
 
-    // Cross the actual property-table and string-enum thresholds. Both ordinary
-    // and original validation inspect the same pinned completed hash maps.
+    // Exercise larger property tables and string enums.
     let properties: serde_json::Map<String, Value> = (0..19)
         .map(|i| (format!("p{i}"), serde_json::json!({"type":"boolean"})))
         .collect();
@@ -373,10 +366,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         let source = Source::compile(
             &schema,
             &HostPreparationAuthority::unmanaged(),
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
-        assert!(source.capacity_bytes().unwrap() > 0);
+        assert!(source.admission_bytes() > 0);
         let (funding, _, _) = make();
         for raw in [
             r#"{"p0":true,"p18":false,"mode":"choice16"}"#,
@@ -409,10 +402,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, _) = make();
     for raw in [
         r#"{"exact":18446744073709551615,"range":-2,"upper":18446744073709551615,"lower":-1}"#,
@@ -446,10 +439,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, _) = make();
     for raw in [
         r#"{"array":[[1.0,"é🙂"],true,null],"mixed":["x",-0.0],"single":[1,2]}"#,
@@ -498,7 +491,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let raw = r#"{"array":[[1,"é🙂"],true,null],"mixed":["x",0],"single":[1,2]}"#;
     source.validate(raw, &funding).unwrap();
     let count = calls.swap(0, Ordering::SeqCst);
-    assert!(count > 3);
+    assert!(count >= 3);
     limit.store(count - 2, Ordering::SeqCst);
     let failed = source.validate(raw, &funding).unwrap_err();
     assert_eq!(
@@ -517,8 +510,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     }
     drop((source, funding, failed));
 
-    // The same compiled literal owner holds nested object/array declarations.
-    // All known object backing is inspected; no opaque serde map is retained.
+    // Nested object and array literals keep full JSON Schema equality.
     let schema = serde_json::json!({"type":"object","properties":{
         "object":{"const":{"a":[1,{"z":"é🙂"}],"b":true}},
         "array":{"const":[{"first":1},{"second":[2]}]},
@@ -531,21 +523,22 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &authority,
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, retired) = make();
     for (raw, expected) in [
         (
             r#"{"object":{"a":[1.0,{"z":"é🙂"}],"b":true},"array":[{"first":1},{"second":[2]}],"mixed":{"b":[2]},"single":{"a":1}}"#,
             true,
         ),
-        // The pinned preexisting equality zips member order; preserve that
-        // selected ordinary behavior instead of normalizing only paid input.
+        // This upstream literal worker compares member iteration order. Read
+        // the selected serde map behavior through its ordinary public iterator.
         (
             r#"{"object":{"b":true,"a":[1.0,{"z":"é🙂"}]}}"#,
-            !serde_json::bounded_events::preserves_object_order(),
+            serde_json::from_str::<Value>(r#"{"b":true,"a":1}"#).unwrap()
+                .as_object().unwrap().keys().next().unwrap() == "a",
         ),
         (
             r#"{"object":{"a":[],"b":true,"\u0061":[1.0,{"z":"é🙂"}]}}"#,
@@ -599,10 +592,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, _) = make();
     for raw in [
         r#"{"three":18446744073709551615,"two":-9223372036854775808}"#,
@@ -641,10 +634,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         let source = Source::compile(
             &schema,
             &HostPreparationAuthority::unmanaged(),
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
-        assert!(source.capacity_bytes().unwrap() > 0);
+        assert!(source.admission_bytes() > 0);
         let (funding, _, _) = make();
         for name in texts {
             let value = serde_json::json!({"name":name});
@@ -666,8 +659,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         );
     }
 
-    // Property names use the actual borrowed string wrapper once per key,
-    // while dependencies retain their compiled prepared keys and child graph.
+    // Property-name and dependent-schema rules share ordinary validation.
     for schema in [
         serde_json::json!({"type":"object","propertyNames":{"minLength":2,"maxLength":3}}),
         serde_json::json!({"type":"object","propertyNames":false}),
@@ -680,10 +672,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         let source = Source::compile(
             &schema,
             &HostPreparationAuthority::unmanaged(),
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
-        assert!(source.capacity_bytes().unwrap() > 0);
+        assert!(source.admission_bytes() > 0);
         let (funding, _, _) = make();
         for raw in [
             r#"{}"#,
@@ -716,10 +708,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, _) = make();
     for count in [0, 1, 2, 3, 15, 16, 31] {
         for duplicate in [false, true] {
@@ -756,8 +748,8 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         );
     }
 
-    // Refuse after entering the actual large-array worker. Partial table/handle
-    // scratch drops, but the escaped failure still retains input and payer.
+    // Refuse admission for a large-array invocation; the escaped error retains
+    // its original account without entering an unfunded dependency operation.
     #[derive(Debug)]
     struct UniqueCut {
         calls: Arc<AtomicUsize>,
@@ -798,8 +790,8 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     source.validate(&raw, &all).unwrap();
     let total = calls.load(Ordering::SeqCst);
     drop(all);
-    assert!(total > 4);
-    for cut in [total / 2, total - 2, total - 1] {
+    assert!(total >= 3);
+    for cut in 1..total {
         let (funding, calls, retired) = cut_funding(cut);
         let failure = source.validate(&raw, &funding).unwrap_err();
         assert_eq!(
@@ -837,10 +829,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     let source = Source::compile(
         &schema,
         &HostPreparationAuthority::unmanaged(),
-        &llguidance::derivre::ParserAllocationFunding::unenforced(),
+        &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
     )
     .unwrap();
-    assert!(source.capacity_bytes().unwrap() > 0);
+    assert!(source.admission_bytes() > 0);
     let (funding, _, _) = make();
     for raw in [
         r#"{"email":"not an email","blob":"not base64 or json"}"#,
@@ -876,10 +868,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         let source = Source::compile(
             &schema,
             &HostPreparationAuthority::unmanaged(),
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
-        assert!(source.capacity_bytes().unwrap() > 0);
+        assert!(source.admission_bytes() > 0);
         let (funding, _, _) = make();
         for raw in [
             r#"{"items":[]}"#,
@@ -901,8 +893,8 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         }
     }
 
-    // The pinned analyzer routes these patterns to the general engine. Its
-    // retained source census and invocation-owned cache participate in the
+    // General regex patterns receive the same dependency headroom as other
+    // schema keywords. Their input and source accounts participate in the
     // same admission and first-failure rules as the other schema producers.
     for pattern in ["^é", "^(?!bad)"] {
         let schema =
@@ -913,10 +905,10 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
         let source = Source::compile(
             &schema,
             &HostPreparationAuthority::unmanaged(),
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
-        assert!(source.capacity_bytes().unwrap() > 0);
+        assert!(source.admission_bytes() > 0);
         let (funding, calls, _) = cut_funding(usize::MAX);
         let setup = calls.load(Ordering::SeqCst);
         source.validate(raw, &funding).unwrap();

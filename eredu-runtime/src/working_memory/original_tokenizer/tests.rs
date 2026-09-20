@@ -64,25 +64,17 @@ fn one_original_comparison_precedes_all_reserves_and_idle_aliases_keep_exact_sou
     drop(rejected);
 }
 #[test]
-fn actual_partial_frontiers_and_late_semantic_failure_hold_the_entire_original_aggregate() {
-    for stage in 0..11 {
+fn decoder_allocation_and_upstream_config_errors_retain_source_admission() {
+    for stage in 0..3 {
         let input = INPUT.to_owned();
-        let plan = match stage {
-            0 => plan(&input).fail_model_reservation(3),
-            1..=3 => plan(&input).fail_pipeline_reservation(stage - 1),
-            4..=7 => plan(&input).fail_added_reservation(stage - 4),
-            _ => plan(&input).fail_decode_reservation(stage - 8),
-        };
+        let plan = plan(&input).fail_decode_reservation(stage);
         let bytes = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
         let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
         let error = pool.compile_tokenizer(plan).unwrap_err();
         drop(input);
         assert_eq!(error.retained_bytes(), bytes);
         let failure = error.compiler_failure().unwrap();
-        assert_eq!(failure.completed_tokenizer(), stage >= 8);
-        if stage < 8 {
-            assert_eq!(failure.root_failure().unwrap().completed_model(), stage > 0);
-        }
+        assert!(failure.completed_tokenizer());
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(failure);
         let mut found = false;
         while let Some(e) = cause {
@@ -113,7 +105,14 @@ fn actual_partial_frontiers_and_late_semantic_failure_hold_the_entire_original_a
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
     let error = pool.compile_tokenizer(plan(&input)).unwrap_err();
     drop(input);
-    assert!(!error.compiler_failure().unwrap().completed_tokenizer());
+    let failure = error.compiler_failure().unwrap();
+    assert!(failure.completed_tokenizer());
+    assert!(matches!(
+        std::error::Error::source(failure)
+            .unwrap()
+            .downcast_ref::<eredu_text::decoder_storage::DecodeSourceError>(),
+        Some(eredu_text::decoder_storage::DecodeSourceError::DuplicateModelId(0))
+    ));
     assert_eq!(error.retained_bytes(), bytes);
     drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -318,10 +317,10 @@ fn original_fallback_literal_sources_hold_exact_custody_on_success_and_partial_a
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
     assert_eq!(short.used_bytes().unwrap(), 0);
-    for failure in [None, Some(3), Some(4)] {
+    for failure in [None, Some(0), Some(1), Some(2)] {
         let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
         let selected = match failure {
-            Some(stage) => plan(&input).fail_pipeline_reservation(stage),
+            Some(stage) => plan(&input).fail_decode_reservation(stage),
             None => plan(&input),
         };
         let result = pool.compile_tokenizer(selected);
@@ -335,8 +334,9 @@ fn original_fallback_literal_sources_hold_exact_custody_on_success_and_partial_a
                 drop(escaped);
             }
             Err(error) => {
-                let root = error.compiler_failure().unwrap().root_failure().unwrap();
-                assert!(root.completed_model() && root.allocation_error().is_some());
+                let failure = error.compiler_failure().unwrap();
+                assert!(failure.completed_tokenizer());
+                assert!(failure.decode_failure().is_some());
                 assert_eq!(error.retained_bytes(), bytes);
                 let escaped =
                     BackendFailure::new(eredu_core::BackendFailureKind::ResourceExhausted, error);
@@ -417,8 +417,8 @@ fn original_trie_keeps_exact_tokenizer_bytes_metadata_and_failed_prefix_custody(
     drop(alias);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 
-    // A real unrepresentable parent-pop chain fails after actual trie allocation;
-    // all source/copy custody survives type erasure, with no injected error path.
+    // Unrepresentable parent-pop geometry is rejected before calling the stock
+    // builder. Packed lexical buffers and source custody survive type erasure.
     let word = "x".repeat(1025);
     let input = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
         "normalizer":null,"pre_tokenizer":null,"post_processor":null,
@@ -428,14 +428,28 @@ fn original_trie_keeps_exact_tokenizer_bytes_metadata_and_failed_prefix_custody(
     let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
     let source = pool.compile_tokenizer(plan(&input)).unwrap();
     let info = TokRxInfo::new(1, 0);
-    let bytes = WorkingMemoryPool::token_trie_source_required_bytes(&source, &info, &[0]).unwrap();
-    let error = source.compile_token_trie_source(&info, &[0]).unwrap_err();
+    let policy = eredu_text::token_trie_storage::TokenTrieMemoryPolicy {
+        max_token_bytes: 2048,
+        ..Default::default()
+    };
+    let bytes = WorkingMemoryPool::token_trie_source_required_bytes_with_memory_policy(
+        &source,
+        &info,
+        &[0],
+        policy,
+    )
+    .unwrap();
+    let error = pool
+        .compile_token_trie_source_with_memory_policy(&source, &info, &[0], policy)
+        .unwrap_err();
     assert_eq!(error.retained_bytes(), bytes);
     let failure = error.construction_failure().unwrap();
     assert!(failure.packed_capacity() > 1025);
-    let partial = failure.trie_failure().unwrap();
-    assert!(partial.source_error().is_some());
-    assert!(partial.buffer_capacities().iter().all(|&n| n > 0));
+    assert!(matches!(
+        failure.source_error(),
+        Some(eredu_text::token_trie_storage::TokenTrieSourceError::NodeEncoding)
+    ));
+    assert!(failure.retained_buffer_bytes() > failure.packed_capacity());
     drop((source, input));
     let error = BackendFailure::new(eredu_core::BackendFailureKind::ResourceExhausted, error);
     assert_eq!(pool.used_bytes().unwrap(), tokenizer_bytes + bytes);

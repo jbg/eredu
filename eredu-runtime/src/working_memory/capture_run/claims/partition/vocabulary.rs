@@ -53,16 +53,12 @@ pub(in crate::working_memory::capture_run) fn decode_vocabulary_receipt<'a>(
         ||expected.identity.is_empty()||!matches!(expected.dtype,TensorDtype::F32|TensorDtype::F16|TensorDtype::Bf16) {
         return Err(error(Cause::Source("receipt differs from its scheduled vocabulary claim")));
     }
-    let plan=Plan::prepare(bytes).map_err(|cause|error(cause.into()))?;
-    let parser=plan.requirements::<TensorReader<'_,'_,'_>>().map_err(|cause|error(cause.into()))?;
-    funding.reserve_metadata(parser.required_bytes()).map_err(|cause|error(cause.into()))?;
+    reserve_parser_headroom(bytes, funding).map_err(|cause|error(cause.into()))?;
     let mut reader=match output {
         VocabularyDestination::Candidates(output)=>TensorReader::new_candidates(output,expected,source,index,shape),
         VocabularyDestination::Scores(output)=>TensorReader::new_scores(output,expected,source,index,shape),
     };
-    let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
-    let parsed=plan.parse(&mut reader,&allocation);
-    if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}let valid=reader.complete();let memory=reader.take_memory();
+    let parsed=json::parse(bytes, |event| reader.event(event));let valid=reader.complete();let memory=reader.take_memory();
     let metadata=reader.vocabulary_metadata();drop(reader);
     parsed.map_err(|cause|error(cause.into()))?;
     if let Some(cause)=memory {return Err(error(cause.into()));}

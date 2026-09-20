@@ -1,9 +1,8 @@
 # Eredu collections
 
-A dependency-free, `no_std` foundation for the safe ordered AVL map shared by
-portable source construction and the local JSON fork. Eredu owns this map's
-implementation; upstream JSON archive provenance and licenses are recorded
-under `third-party`.
+A dependency-free, `no_std` foundation for the safe ordered AVL map used by
+portable source construction. Eredu owns its implementation and prospective
+node-allocation contract.
 
 `Map::try_insert_with` calls the supplied policy with the exact new node layout
 before `Box::new`. Existing-key replacement, rotations, removals and iterators

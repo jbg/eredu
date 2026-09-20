@@ -772,7 +772,7 @@ fn conditional_intervention_requires_actual_application_before_commitment() {
                 .plan()
                 .clone()
                 .admit(&discovery, original.request(), original.session_id()),
-            Err(CaptureError::Unsupported(_))
+            Err(CaptureError::Intervention(eredu_core::intervention::InterventionDeclarationError::Unsupported(_)))
         ));
     }
 }

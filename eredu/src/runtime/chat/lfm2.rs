@@ -9,7 +9,7 @@ use super::grammar_text::{
     is_required, repeated_rule,
 };
 use crate::runtime::chat::tool_schema::ToolDefinition;
-use llguidance::derivre::ParserAllocationFunding;
+use crate::runtime::chat::preparation_memory::PreparationFunding;
 
 use serde_json::Value;
 
@@ -51,7 +51,7 @@ impl Lfm2Dialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<String, GrammarError> {
         if STRUCTURAL_TOKENS.len() != structural_token_ids.len() {
             return Err(funding
@@ -164,7 +164,7 @@ impl FormatDialect for Lfm2Dialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<Lfm2Parameters>()?;
         Ok(ConstraintConfiguration {
@@ -186,7 +186,7 @@ impl FormatDialect for Lfm2Dialect {
         parameters: DialectParameters,
         resolved_structural_token_ids: &[u32],
         eos_token_ids: &[u32],
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<ConstraintConfiguration, GrammarError> {
         parameters.custom_fixed::<Lfm2Parameters>()?;
         if resolved_structural_token_ids.len() != STRUCTURAL_TOKENS.len() {
@@ -266,7 +266,7 @@ impl std::fmt::Display for IdentifierError<'_> {
     }
 }
 impl IdentifierError<'_> {
-    fn grammar(self, funding: &ParserAllocationFunding) -> GrammarError {
+    fn grammar(self, funding: &PreparationFunding) -> GrammarError {
         match funding.try_format(format_args!("{self}")) {
             Ok(message) => GrammarError::Policy(message),
             Err(error) => error.into(),
@@ -305,7 +305,7 @@ const PYTHON_KEYWORDS: &[&str] = &[
 ];
 
 struct PythonGrammarBuilder<'a> {
-    funding: &'a ParserAllocationFunding,
+    funding: &'a PreparationFunding,
     next_rule: usize,
     rules: GrammarText<'a>,
 }

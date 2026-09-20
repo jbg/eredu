@@ -30,7 +30,7 @@ fn defaults_preserve_eager_arguments_truth_modes_borrowed_selection_and_retireme
         )
         .unwrap();
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((base, caller, source));
@@ -75,6 +75,8 @@ fn defaults_preserve_eager_arguments_truth_modes_borrowed_selection_and_retireme
     assert!(
         source
             .render_plan_with_context(ChatRenderContext::from_json(&[], None, None).unwrap())
+            .unwrap()
+            .render()
             .is_err()
     );
     assert!(

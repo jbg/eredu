@@ -46,7 +46,7 @@ fn hf_tojson_nested_tools_options_and_python_spelling_match_ordinary() {
 }
 
 #[test]
-fn hf_tojson_depth_and_sorted_keys_request_actual_fixed_scratch_before_growth() {
+fn hf_tojson_preserves_nested_sorted_keys_and_retained_output() {
     let source = ChatTemplatePlan::prepare_utf8(
         "{{ tools|tojson(sort_keys=true,indent='界') }}",
         "json-depth",
@@ -56,28 +56,7 @@ fn hf_tojson_depth_and_sorted_keys_request_actual_fixed_scratch_before_growth() 
     .unwrap();
     let input = json!({"tools":[{"z":7,"a":[{"z":-11,"a":{"z":23,"a":[{"z":31,"a":"É🙂"}]}}]}]});
     let context = ChatRenderContext::from_json(&[], None, input.as_object()).unwrap();
-    let mut capacity = ChatJsonCapacity::default();
-    let mut attempts = 0;
-    let plan = loop {
-        let before = source
-            .render_prefix_bytes_with_json_capacity(capacity)
-            .unwrap();
-        match source.render_plan_attempt(context, capacity) {
-            Err(ChatRenderPlanError::JsonCapacity(next)) => {
-                assert!(
-                    next.frames >= capacity.frames
-                        && next.keys >= capacity.keys
-                        && next != capacity
-                );
-                assert!(source.render_prefix_bytes_with_json_capacity(next).unwrap() > before);
-                capacity = next;
-                attempts += 1;
-            }
-            Ok(plan) => break plan,
-            Err(error) => panic!("unexpected JSON attempt failure: {error}"),
-        }
-    };
-    assert!(attempts >= 4 && capacity.frames >= 4 && capacity.keys >= 6);
+    let plan = source.render_plan_with_context(context).unwrap();
     let rendered = plan.render().unwrap();
     let expected = compare(
         "{{ tools|tojson(sort_keys=true,indent='界') }}",
@@ -106,12 +85,7 @@ fn hf_tojson_preserves_keyword_evaluation_order_and_refuses_invalid_options() {
         "{{ value|tojson(true,ensure_ascii=false) }}",
         "{{ value|tojson(separators=(',',)) }}",
     ] {
-        assert!(
-            ChatTemplatePlan::prepare_utf8(template, "json-invalid")
-                .unwrap()
-                .compile()
-                .is_err()
-        );
+        compare_outcome(template, values.as_object().unwrap());
     }
     for template in [
         "{{ value|tojson(indent=1.5) }}",
@@ -127,6 +101,8 @@ fn hf_tojson_preserves_keyword_evaluation_order_and_refuses_invalid_options() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, values.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
     }
@@ -142,17 +118,26 @@ fn hf_tojson_reads_generated_unicode_concatenation_and_sliced_json_prefixes() {
         "{{ (value ~ -11 ~ true ~ none ~ missing)|tojson }}",
         "{% set rendered = object|tojson %}{{ rendered[:-1]|tojson }}",
     ] {
-        compare(template, &[], &serde_json::Map::new(), values.as_object().unwrap());
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            values.as_object().unwrap(),
+        );
     }
-    let rendered = compare("{{ ('É' ~ '🙂')|tojson(ensure_ascii=true) }}",
-        &[], &serde_json::Map::new(), &serde_json::Map::new());
+    let rendered = compare(
+        "{{ ('É' ~ '🙂')|tojson(ensure_ascii=true) }}",
+        &[],
+        &serde_json::Map::new(),
+        &serde_json::Map::new(),
+    );
     assert_eq!(rendered.prompt(false), r#""\u00c9\ud83d\ude42""#);
 }
 
 #[test]
 fn hf_tojson_generated_containers_share_depth_sorting_and_borrowed_views() {
-    let input=json!([{"role":"user","content":"É🙂","arguments":{"z":7,"a":-11}},{"role":"assistant","content":"界"}]);
-    let empty=serde_json::Map::new();
+    let input = json!([{"role":"user","content":"É🙂","arguments":{"z":7,"a":-11}},{"role":"assistant","content":"界"}]);
+    let empty = serde_json::Map::new();
     for template in [
         "{% set item={'z':messages[0],'a':[messages[1].content,-11,true,none]} %}{{ item|tojson }}",
         "{% set item={'z':messages[0],'a':[messages[1].content,-11,true,none]} %}{{ item|tojson(sort_keys=true,indent='界') }}",
@@ -161,7 +146,17 @@ fn hf_tojson_generated_containers_share_depth_sorting_and_borrowed_views() {
         "{{ messages[0].arguments.items()|list|tojson }}|{{ messages[0].arguments.keys()|tojson }}",
         "{{ ['É 界'|tojson,range(3),messages[::-1],('a::界::b').split('::')[::-1]]|tojson(indent=2) }}",
         "{% set parts=[',',':'] %}{{ {'z':[-11,7],'a':'É🙂'}|tojson(separators=parts,sort_keys=true) }}",
-    ] { compare(template,input.as_array().unwrap(),&empty,&empty); }
-    let output=compare("{{ {'z':7,'a':[-11,'É🙂']}|tojson(sort_keys=true,separators=(',',':'),ensure_ascii=true) }}",&[],&empty,&empty);
-    assert_eq!(output.prompt(false),r#"{"a":[-11,"\u00c9\ud83d\ude42"],"z":7}"#);
+    ] {
+        compare(template, input.as_array().unwrap(), &empty, &empty);
+    }
+    let output = compare(
+        "{{ {'z':7,'a':[-11,'É🙂']}|tojson(sort_keys=true,separators=(',',':'),ensure_ascii=true) }}",
+        &[],
+        &empty,
+        &empty,
+    );
+    assert_eq!(
+        output.prompt(false),
+        r#"{"a":[-11,"\u00c9\ud83d\ude42"],"z":7}"#
+    );
 }

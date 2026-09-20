@@ -2,7 +2,8 @@
 use super::*;
 use eredu_core::capture::{PartitionCaptureContext, CaptureUsage};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
-use serde_json::bounded_events::{Event, Plan, PlanError, Sink};
+mod json;
+use json::Event;
 use std::mem::{size_of, size_of_val};
 mod reader;
 mod vocabulary;
@@ -10,6 +11,12 @@ pub(in crate::working_memory::capture_run) use vocabulary::{VocabularyDestinatio
 mod exchange;
 pub use exchange::{PreparedPartitionTensorDelivery, PartitionCaptureTensorDeliveryError};
 use reader::TensorReader;
+
+fn reserve_parser_headroom(bytes: &[u8], funding: &HostMetadataFunding) -> Result<(), HostMetadataFundingError> {
+    let estimate = crate::working_memory::DependencyMemoryPolicy::default().estimate(bytes.len())
+        .ok_or(HostMetadataFundingError::Overflow)?;
+    funding.reserve_metadata(estimate)
+}
 
 /// Retained expected receipt coordinates, supplied by the shared partition
 /// placement/admission. These scalar facts alone supply no native authority.
@@ -34,8 +41,6 @@ impl fmt::Debug for PartitionCaptureTensorReceipt<'_> {
 enum Cause {
     #[error("capture receipt source: {0}")]
     Source(&'static str),
-    #[error(transparent)]
-    Plan(#[from] PlanError),
     #[error(transparent)]
     Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
@@ -124,14 +129,10 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
         funding.reserve_metadata(TensorReader::construction_control_bytes()
             .ok_or_else(||error(Cause::Source("receipt reader construction controls overflow")))?)
             .map_err(|cause|error(cause.into()))?;
-        let plan = Plan::prepare(bytes).map_err(|cause|error(cause.into()))?;
-        let parser = plan.requirements::<TensorReader<'_, 'a, 'c>>().map_err(|cause|error(cause.into()))?;
-        funding.reserve_metadata(parser.required_bytes()).map_err(|cause|error(cause.into()))?;
+        reserve_parser_headroom(bytes, funding).map_err(|cause|error(cause.into()))?;
         let mut destination = self.prepare().map_err(|cause|error(cause.into()))?;
         let mut reader = TensorReader::new(&mut destination, expected, source, index, source_shape, selected_shape, source_rank).combined(combination);
-        let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
-        let parsed = plan.parse(&mut reader,&allocation);
-        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+        let parsed = json::parse(bytes, |event| reader.event(event));
         let valid = reader.complete();
         let memory = reader.take_memory();
         drop(reader);
@@ -192,15 +193,11 @@ pub(in crate::working_memory::capture_run) fn decode_summary_receipt(
     funding.reserve_metadata(TensorReader::construction_control_bytes()
         .ok_or_else(||error(Cause::Source("receipt reader construction controls overflow")))?)
         .map_err(|cause|error(cause.into()))?;
-    let plan = Plan::prepare(bytes).map_err(|cause| error(cause.into()))?;
-    let parser = plan.requirements::<TensorReader<'_, '_, '_>>().map_err(|cause| error(cause.into()))?;
-    funding.reserve_metadata(parser.required_bytes()).map_err(|cause| error(cause.into()))?;
+    reserve_parser_headroom(bytes, funding).map_err(|cause|error(cause.into()))?;
     let mut value = crate::capture::reduction::Summary::default().value();
     let mut reader = TensorReader::new_summary(&mut value, expected, geometry.admission(),
         geometry.selection_index(), source_shape, selected_shape, rank);
-    let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
-        let parsed = plan.parse(&mut reader,&allocation);
-        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+        let parsed = json::parse(bytes, |event| reader.event(event));
     let valid = reader.complete();
     let memory = reader.take_memory();
     drop(reader);
@@ -249,14 +246,10 @@ pub(in crate::working_memory::capture_run) fn decode_histogram_receipt(
     funding.reserve_metadata(TensorReader::construction_control_bytes()
         .ok_or_else(||error(Cause::Source("receipt reader construction controls overflow")))?)
         .map_err(|cause|error(cause.into()))?;
-    let plan = Plan::prepare(bytes).map_err(|cause| error(cause.into()))?;
-    let parser = plan.requirements::<TensorReader<'_, '_, '_>>().map_err(|cause| error(cause.into()))?;
-    funding.reserve_metadata(parser.required_bytes()).map_err(|cause| error(cause.into()))?;
+    reserve_parser_headroom(bytes, funding).map_err(|cause|error(cause.into()))?;
     let mut reader = TensorReader::new_histogram(value, expected, geometry.admission(),
         geometry.selection_index(), source_shape, selected_shape, rank);
-    let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|cause|error(cause.into()))?;
-        let parsed = plan.parse(&mut reader,&allocation);
-        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+        let parsed = json::parse(bytes, |event| reader.event(event));
     let valid = reader.complete();
     let memory = reader.take_memory();
     drop(reader);

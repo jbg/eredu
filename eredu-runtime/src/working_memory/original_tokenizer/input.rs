@@ -33,10 +33,7 @@ enum Cause {
     Read(ArtifactFileReadFailure),
     Plan(TokenizerSourceError),
     Compile(OriginalTokenizerError),
-    Serialize(
-        eredu_text::tokenizer_storage::TokenizerSerializationFailure,
-        Option<WorkingMemoryError>,
-    ),
+    Serialize(serde_json::Error, Option<WorkingMemoryError>),
 }
 /// Terminal file/aggregate failure retaining the actual input and compiler prefix.
 /// Opening/path preparation precedes this boundary. There is no consuming cause,
@@ -73,20 +70,13 @@ impl OriginalTokenizerInputError {
     }
     /// Actual file bytes written before failure (not initialized trailing bytes).
     pub fn filled_bytes(&self) -> usize {
-        match &self.cause {
-            Cause::Serialize(error, _) => error.bytes().len(),
-            _ => self.input.as_ref().map_or(0, |input| input.filled),
-        }
+        self.input.as_ref().map_or(0, |input| input.filled)
     }
     /// Actual backing capacity, including a successfully reserved partial input.
     pub fn input_capacity(&self) -> usize {
-        match &self.cause {
-            Cause::Serialize(error, _) => error.capacity(),
-            _ => self
-                .input
-                .as_ref()
-                .map_or(0, |input| input.bytes.capacity()),
-        }
+        self.input
+            .as_ref()
+            .map_or(0, |input| input.bytes.capacity())
     }
     /// Borrows the unchanged failed consuming read.
     pub fn read_failure(&self) -> Option<&ArtifactFileReadFailure> {
@@ -133,14 +123,7 @@ impl OriginalTokenizerInputError {
         match &self.cause {
             Cause::Read(_) => BackendFailureKind::Io,
             Cause::Plan(_) => BackendFailureKind::Unsupported,
-            Cause::Serialize(error, _)
-                if matches!(
-                    error.cause(),
-                    eredu_text::tokenizer_storage::TokenizerSerializationError::Unqualified(_)
-                ) =>
-            {
-                BackendFailureKind::Unsupported
-            }
+            Cause::Serialize(_, _) => BackendFailureKind::InvalidInput,
             _ => BackendFailureKind::ResourceExhausted,
         }
     }
@@ -238,6 +221,23 @@ impl WorkingMemoryPool {
         &self,
         input: OriginalTokenizerInput<'_>,
     ) -> Result<OriginalTokenizer, OriginalTokenizerInputError> {
+        self.compile_tokenizer_source_with_headroom(input, None)
+    }
+    /// Uses explicit headroom for upstream serialization scratch. The output
+    /// buffer is funded separately as it grows. This is an estimate, not a
+    /// dependency memory ceiling; file input does not use serialization scratch.
+    pub fn compile_tokenizer_source_for_generation_with_serialization_headroom(
+        &self,
+        input: OriginalTokenizerInput<'_>,
+        headroom: usize,
+    ) -> Result<OriginalTokenizer, OriginalTokenizerInputError> {
+        self.compile_tokenizer_source_with_headroom(input, Some(headroom))
+    }
+    fn compile_tokenizer_source_with_headroom(
+        &self,
+        input: OriginalTokenizerInput<'_>,
+        headroom: Option<usize>,
+    ) -> Result<OriginalTokenizer, OriginalTokenizerInputError> {
         match input {
             OriginalTokenizerInput::File(read) => self.compile_tokenizer_file_inner(
                 read,
@@ -247,7 +247,7 @@ impl WorkingMemoryPool {
                 |pool, plan| pool.compile_tokenizer(plan),
             ),
             OriginalTokenizerInput::Configuration(source) => {
-                let input = self.serialize_tokenizer_configuration(source)?;
+                let input = self.serialize_tokenizer_configuration(source, headroom)?;
                 self.compile_tokenizer_input_bytes(
                     input,
                     true,
@@ -260,103 +260,128 @@ impl WorkingMemoryPool {
     fn serialize_tokenizer_configuration(
         &self,
         source: &eredu_text::tokenizer::Tokenizer,
+        headroom: Option<usize>,
     ) -> Result<Input, OriginalTokenizerInputError> {
-        use crate::working_memory::loaded_decode_source::Allowance;
-        use std::cell::RefCell;
-        struct Loan {
-            allowance: RefCell<Allowance>,
-            failure: RefCell<Option<WorkingMemoryError>>,
+        use std::io;
+        struct Destination {
+            input: Input,
+            accounting: Option<WorkingMemoryError>,
+            reserve: Option<TryReserveError>,
         }
-        impl serde_json::allocation::Allocation for Loan {
-            fn reserve(&self, bytes: usize) -> Result<(), serde_json::allocation::AllocationError> {
-                use serde_json::allocation::AllocationError;
-                if self.failure.borrow().is_some() {
-                    return Err(AllocationError::Refused);
+        impl io::Write for Destination {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.accounting.is_some() || self.reserve.is_some() {
+                    return Err(io::ErrorKind::OutOfMemory.into());
                 }
-                let result = u64::try_from(bytes)
-                    .map_err(|_| WorkingMemoryError::Overflow)
-                    .and_then(|bytes| self.allowance.borrow_mut().reserve_more(bytes));
-                result.map_err(|error| {
-                    *self.failure.borrow_mut() = Some(error);
-                    AllocationError::Refused
-                })
+                let needed = self
+                    .input
+                    .bytes
+                    .len()
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| {
+                        self.accounting = Some(WorkingMemoryError::Overflow);
+                        io::Error::from(io::ErrorKind::OutOfMemory)
+                    })?;
+                if needed > self.input.bytes.capacity() {
+                    let capacity = needed
+                        .max(self.input.bytes.capacity().saturating_mul(2))
+                        .max(1024);
+                    // During reallocation the old allocation can coexist with
+                    // the replacement. Reserve the full new capacity and keep
+                    // that conservative charge until the input owner retires.
+                    let charge = u64::try_from(capacity)
+                        .map_err(|_| WorkingMemoryError::Overflow)
+                        .and_then(|bytes| self.input.allowance.reserve_more(bytes));
+                    if let Err(error) = charge {
+                        self.accounting = Some(error);
+                        return Err(io::ErrorKind::OutOfMemory.into());
+                    }
+                    if let Err(error) = self
+                        .input
+                        .bytes
+                        .try_reserve_exact(capacity - self.input.bytes.len())
+                    {
+                        self.reserve = Some(error);
+                        return Err(io::ErrorKind::OutOfMemory.into());
+                    }
+                }
+                self.input.bytes.extend_from_slice(bytes);
+                self.input.filled = self.input.bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
             }
         }
-        let controls = [
-            size_of::<Loan>(),
+        let rejected = |error| OriginalTokenizerInputError {
+            cause: Cause::Accounting(error),
+            settlement: None,
+            input: None,
+        };
+        // Public serialization may copy merge spellings and model tables before
+        // writing output. The default is 64 KiB plus 256 bytes per vocabulary
+        // entry; arbitrary token lengths can exceed this heuristic. Callers can
+        // select headroom explicitly, and output growth is admitted separately.
+        let headroom = headroom
+            .or_else(|| {
+                source
+                    .get_vocab_size(true)
+                    .checked_mul(256)?
+                    .checked_add(64 * 1024)
+            })
+            .ok_or_else(|| rejected(WorkingMemoryError::Overflow))?;
+        let bytes = [
+            headroom,
+            size_of::<Destination>(),
             size_of::<Input>(),
             size_of::<Cause>(),
             size_of::<OriginalTokenizerInputError>(),
-            size_of::<OriginalTokenizerInput<'_>>(),
             size_of::<TokenizerPlan<'_>>(),
-            size_of::<Result<TokenizerPlan<'_>, TokenizerSourceError>>(),
-            size_of::<Result<OriginalTokenizer, OriginalTokenizerError>>(),
-            size_of::<Result<Vec<u8>, eredu_text::tokenizer_storage::TokenizerSerializationFailure>>(
-            ),
-            size_of::<Result<OriginalTokenizer, OriginalTokenizerInputError>>(),
+            size_of::<Result<Vec<u8>, serde_json::Error>>(),
             BackendFailure::source_retention_peak_bytes::<OriginalTokenizerInputError>()
-                .ok_or(WorkingMemoryError::Overflow)
-                .map_err(|error| OriginalTokenizerInputError {
-                    cause: Cause::Accounting(error),
-                    settlement: None,
-                    input: None,
-                })?,
+                .ok_or_else(|| rejected(WorkingMemoryError::Overflow))?,
             super::OriginalTokenizerSourceError::tokenizer_controls()
-                .ok_or(WorkingMemoryError::Overflow)
-                .map_err(|error| OriginalTokenizerInputError {
-                    cause: Cause::Accounting(error),
-                    settlement: None,
-                    input: None,
-                })?,
-        ];
-        let bytes = controls
-            .into_iter()
-            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-            .and_then(|n| u64::try_from(n).ok())
-            .ok_or(WorkingMemoryError::Overflow)
-            .map_err(|error| OriginalTokenizerInputError {
-                cause: Cause::Accounting(error),
-                settlement: None,
-                input: None,
-            })?;
-        let allowance =
-            self.admit_source_compiler(bytes)
-                .map_err(|error| OriginalTokenizerInputError {
-                    cause: Cause::Accounting(error),
-                    settlement: None,
-                    input: None,
-                })?;
-        let loan = Loan {
-            allowance: RefCell::new(allowance),
-            failure: RefCell::new(None),
+                .ok_or_else(|| rejected(WorkingMemoryError::Overflow))?,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| rejected(WorkingMemoryError::Overflow))?;
+        let allowance = self.admit_source_compiler(bytes).map_err(rejected)?;
+        let mut destination = Destination {
+            input: Input {
+                read: None,
+                bytes: Vec::new(),
+                filled: 0,
+                allowance,
+            },
+            accounting: None,
+            reserve: None,
         };
-        let result = eredu_text::tokenizer_storage::serialize_configuration(source, &loan);
-        let accounting = loan.failure.into_inner();
-        let mut allowance = loan.allowance.into_inner();
-        let settlement = allowance.end_compilation().err();
-        let mut input = Input {
-            read: None,
-            bytes: Vec::new(),
-            filled: 0,
-            allowance,
-        };
-        match result {
-            Err(error) => Err(OriginalTokenizerInputError {
-                cause: Cause::Serialize(error, accounting),
+        let serialized = serde_json::to_writer(&mut destination, &**source);
+        let settlement = destination.input.allowance.end_compilation().err();
+        if let Some(error) = destination.reserve {
+            return Err(OriginalTokenizerInputError {
+                cause: Cause::Reserve(error),
                 settlement,
-                input: Some(input),
+                input: Some(destination.input),
+            });
+        }
+        match serialized {
+            Err(error) => Err(OriginalTokenizerInputError {
+                cause: Cause::Serialize(error, destination.accounting),
+                settlement,
+                input: Some(destination.input),
             }),
-            Ok(bytes) => {
-                input.filled = bytes.len();
-                input.bytes = bytes;
-                if let Some(error) = accounting.or(settlement) {
+            Ok(()) => {
+                if let Some(error) = destination.accounting.or(settlement) {
                     return Err(OriginalTokenizerInputError {
                         cause: Cause::Accounting(error),
                         settlement: None,
-                        input: Some(input),
+                        input: Some(destination.input),
                     });
                 }
-                Ok(input)
+                Ok(destination.input)
             }
         }
     }

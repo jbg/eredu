@@ -1,10 +1,12 @@
 //! One paid producer for immutable chat policy and its published metadata.
 use super::{Rejection, Selection};
+use crate::runtime::chat::preparation_memory::{
+    PreparationFailure as FundingFailure, PreparationFunding, StorageFailure,
+};
 use crate::runtime::chat::{
     ChatTemplateRequest, GenerationRuntimePlan, PreparedFormatProfile, ProfileStrings, ToolChoice,
     constraints::{ConstraintCompiler, PreparationFailure},
 };
-use llguidance::derivre::{ParserAllocationFailure, ParserAllocationFunding, ParserStorageError};
 use std::{
     alloc::Layout,
     error::Error,
@@ -22,15 +24,19 @@ pub(crate) struct Metadata {
     pub(crate) preserved_structural_token_ids: Vec<u32>,
     pub(crate) stop_sequences: Vec<String>,
     // Last: published allocations and the closed Arc retire before their payer.
-    _funding: ParserAllocationFunding,
+    _funding: PreparationFunding,
 }
 
 /// Closed immutable policy aliases never clone grammar or metadata storage.
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledChatPolicy(Option<Arc<Metadata>>);
 impl eredu_runtime::working_memory::ControllerCompilationOutput for CompiledChatPolicy {
-    fn controller_sources(&self) -> eredu_runtime::working_memory::ControllerCompilationSources<'_> {
-        self.metadata().generation_runtime_plan.as_ref()
+    fn controller_sources(
+        &self,
+    ) -> eredu_runtime::working_memory::ControllerCompilationSources<'_> {
+        self.metadata()
+            .generation_runtime_plan
+            .as_ref()
             .map_or_else(Default::default, GenerationRuntimePlan::controller_sources)
     }
 }
@@ -43,11 +49,11 @@ impl CompiledChatPolicy {
         request: &ChatTemplateRequest,
         eos: &[u32],
         compiler: Result<Option<&ConstraintCompiler>, &str>,
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
         resolve: F,
     ) -> Result<Self, Failure<E>>
     where
-        F: FnOnce(&[String], &ParserAllocationFunding) -> Result<Vec<u32>, E>,
+        F: FnOnce(&[String], &PreparationFunding) -> Result<Vec<u32>, E>,
     {
         let result = (|| -> Result<Self, Cause<E>> {
             let shell = Layout::new::<[AtomicUsize; 2]>()
@@ -72,7 +78,7 @@ impl CompiledChatPolicy {
                     &ChatTemplateRequest,
                     &[u32],
                     Result<Option<&ConstraintCompiler>, &str>,
-                    &ParserAllocationFunding,
+                    &PreparationFunding,
                 )>(),
                 size_of::<Result<GenerationRuntimePlan, PreparationFailure>>(),
                 size_of::<Vec<String>>(),
@@ -181,13 +187,13 @@ impl Eq for CompiledChatPolicy {}
 
 fn strings<E>(
     source: ProfileStrings,
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<Vec<String>, Cause<E>> {
     let controls = [
-        size_of::<(ProfileStrings, &ParserAllocationFunding)>(),
+        size_of::<(ProfileStrings, &PreparationFunding)>(),
         size_of::<Vec<String>>(),
         size_of::<String>(),
-        size_of::<Result<String, ParserStorageError>>(),
+        size_of::<Result<String, StorageFailure>>(),
         size_of::<Result<Vec<String>, Cause<E>>>(),
         size_of_val(&source.iter()),
     ];
@@ -211,15 +217,15 @@ enum Cause<E> {
     Policy(Rejection),
     MissingCompiler,
     Compiler(String),
-    Funding(ParserAllocationFailure),
-    Storage(ParserStorageError),
+    Funding(FundingFailure),
+    Storage(StorageFailure),
     Structural(E),
     Declaration(PreparationFailure),
 }
 #[derive(Debug)]
 pub(crate) struct Failure<E> {
     cause: Cause<E>,
-    funding: ParserAllocationFunding,
+    funding: PreparationFunding,
 }
 impl<E: fmt::Display> fmt::Display for Failure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -265,26 +271,19 @@ mod tests {
     use super::*;
     use std::{convert::Infallible, sync::atomic::Ordering};
 
-    #[derive(Debug, thiserror::Error)]
-    #[error("policy preparation funding refused")]
-    struct Refused;
-
-    fn funding(
-        refuse_at: usize,
-    ) -> (
-        ParserAllocationFunding,
-        Arc<AtomicUsize>,
-        std::sync::Weak<()>,
-    ) {
+    fn funding(refuse_at: usize) -> (PreparationFunding, Arc<AtomicUsize>, std::sync::Weak<()>) {
         let owner = Arc::new(());
         let weak = Arc::downgrade(&owner);
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = calls.clone();
-        let funding = ParserAllocationFunding::prepare(move |_| {
+        let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
             let _ = &owner;
             let index = callback_calls.fetch_add(1, Ordering::Relaxed);
             if index == refuse_at {
-                Err(Refused)
+                Err(eredu_core::HostMetadataFundingError::Capacity {
+                    required: 1,
+                    available: 0,
+                })
             } else {
                 Ok(())
             }
@@ -293,9 +292,7 @@ mod tests {
         (funding, calls, weak)
     }
 
-    fn compile(
-        funding: &ParserAllocationFunding,
-    ) -> Result<CompiledChatPolicy, Failure<Infallible>> {
+    fn compile(funding: &PreparationFunding) -> Result<CompiledChatPolicy, Failure<Infallible>> {
         let mut profile = crate::runtime::chat::prepare_format_profile("unrecognized template");
         profile.stop_sequences = ProfileStrings::new(&["stop", "終わり"]);
         CompiledChatPolicy::compile(
@@ -341,12 +338,15 @@ mod tests {
             let (funding, calls, owner) = funding(refuse_at);
             let error = compile(&funding).unwrap_err();
             assert_eq!(calls.load(Ordering::Relaxed), refuse_at + 1);
-            assert_eq!(error.to_string(), "policy preparation funding refused");
+            assert_eq!(
+                error.to_string(),
+                "workspace metadata funding requires 1 bytes, with 0 available"
+            );
             let mut cause: &(dyn Error + 'static) = &error;
             while let Some(next) = cause.source() {
                 cause = next;
             }
-            assert!(cause.is::<Refused>());
+            assert!(cause.is::<eredu_core::HostMetadataFundingError>());
             drop(funding);
             assert!(owner.upgrade().is_some());
             drop(error);

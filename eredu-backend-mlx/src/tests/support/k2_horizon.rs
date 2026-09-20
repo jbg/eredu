@@ -3,10 +3,7 @@
 pub(crate) fn gguf(format: eredu_gguf::GgmlType) -> tempfile::TempDir {
     use eredu_gguf::{GgmlType, MetadataValue as V, TensorInput, Writer};
     use std::collections::BTreeMap;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
     .unwrap();
     let mut config = fixture["mova"]["config"].clone();
     config["hidden_size"] = 64.into();
@@ -152,10 +149,7 @@ pub(crate) fn fp8() -> (tempfile::TempDir, tempfile::TempDir) {
         tensor::{serialize_to_file, TensorView},
         Dtype,
     };
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
     .unwrap();
     let mut config = fixture["mova"]["config"].clone();
     config["hidden_size"] = 256.into();

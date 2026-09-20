@@ -1,7 +1,7 @@
 //! Grammar text producers with prospective funding and no intermediate strings.
+use crate::runtime::chat::preparation_memory::{PreparationFailure, PreparationFunding, StorageFailure};
 use llguidance::{
     api::{GrammarWithLexer, TopLevelGrammar},
-    derivre::{ParserAllocationFailure, ParserAllocationFunding, ParserStorageError},
 };
 use serde::Serialize;
 use std::{
@@ -19,13 +19,11 @@ pub(crate) enum Error {
     #[error(transparent)]
     Declaration(#[from] super::dialect::DeclarationError),
     #[error(transparent)]
-    Funding(#[from] ParserAllocationFailure),
+    Funding(#[from] PreparationFailure),
     #[error(transparent)]
-    Storage(#[from] ParserStorageError),
+    Storage(#[from] StorageFailure),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    JsonAllocation(#[from] serde_json::allocation::AllocationError),
     #[error("grammar text extent overflow")]
     Overflow,
     #[error("grammar text changed its measured extent")]
@@ -95,10 +93,10 @@ impl io::Write for Destination<'_> {
 /// binding. Every append grows this one destination before writing into it.
 pub(crate) struct Text<'a> {
     bytes: Vec<u8>,
-    funding: &'a ParserAllocationFunding,
+    funding: &'a PreparationFunding,
 }
 impl<'a> Text<'a> {
-    pub(crate) fn new(funding: &'a ParserAllocationFunding) -> Result<Self, Error> {
+    pub(crate) fn new(funding: &'a PreparationFunding) -> Result<Self, Error> {
         let parts = [
             size_of::<Self>(),
             size_of::<Count>(),
@@ -144,13 +142,13 @@ impl<'a> Text<'a> {
         Ok(())
     }
     pub(crate) fn push_json<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
-        // Both serializer invocations and their fixed I/O error destination are
-        // paid before either pass. The value is a borrowed schema projection.
+        // Admit stock serializer headroom before either pass; the destination
+        // itself is an independently funded first-party buffer.
+        self.funding.reserve_dependency(0)?;
         let parts = [
             size_of::<serde_json::Serializer<&mut Count>>(),
             size_of::<serde_json::Serializer<&mut Destination<'_>>>(),
             size_of::<Result<(), serde_json::Error>>(),
-            serde_json::Error::io_storage_bytes(),
         ];
         self.funding.reserve(
             parts
@@ -249,7 +247,7 @@ pub(crate) fn structural_literal(
     text: &str,
     tokens: &[&str],
     ids: &[u32],
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<String, Error> {
     let source = StructuralTokens::new(tokens, ids)?;
     let mut output = Text::new(funding)?;
@@ -299,7 +297,7 @@ impl fmt::Display for StructuralLiteral<'_, '_> {
 /// The Lark source's actual outer row and name producers are also prospective.
 pub(crate) fn lark(
     text: String,
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<TopLevelGrammar, Error> {
     let mut grammars = Vec::new();
     funding.try_grow_vec(&mut grammars, 1)?;
@@ -319,7 +317,7 @@ pub(crate) struct Terminals(Vec<u32>);
 impl Terminals {
     pub(crate) fn new(
         ids: impl Iterator<Item = u32>,
-        funding: &ParserAllocationFunding,
+        funding: &PreparationFunding,
     ) -> Result<Self, Error> {
         funding.reserve(
             size_of::<Self>()
@@ -359,7 +357,7 @@ pub(crate) fn repeated_rule(
     separator: &str,
     minimum: usize,
     maximum: Option<usize>,
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<String, Error> {
     let mut text = Text::new(funding)?;
     if maximum == Some(0) {

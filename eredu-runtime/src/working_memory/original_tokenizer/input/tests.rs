@@ -185,9 +185,9 @@ fn actual_input_target_overflow_os_read_failure_and_changed_handle_keep_original
 }
 
 #[test]
-fn real_aggregate_partial_frontiers_keep_both_original_allowances_in_one_core_envelope() {
+fn decoder_reserve_failures_keep_input_and_source_admission_in_core_envelope() {
     let (i, c) = facts();
-    for stage in 0..11 {
+    for stage in 0..3 {
         let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
         let error = pool
             .compile_tokenizer_file_with(
@@ -195,12 +195,7 @@ fn real_aggregate_partial_frontiers_keep_both_original_allowances_in_one_core_en
                 |_| {},
                 || {},
                 |pool, plan| {
-                    let plan = match stage {
-                        0 => plan.fail_model_reservation(3),
-                        1..=3 => plan.fail_pipeline_reservation(stage - 1),
-                        4..=7 => plan.fail_added_reservation(stage - 4),
-                        _ => plan.fail_decode_reservation(stage - 8),
-                    };
+                    let plan = plan.fail_decode_reservation(stage);
                     pool.compile_tokenizer(plan)
                 },
             )
@@ -209,10 +204,7 @@ fn real_aggregate_partial_frontiers_keep_both_original_allowances_in_one_core_en
         assert_eq!(error.filled_bytes(), JSON.len());
         let compiler = error.compiler_failure().unwrap();
         assert_eq!(compiler.retained_bytes(), c);
-        assert_eq!(
-            compiler.compiler_failure().unwrap().completed_tokenizer(),
-            stage >= 8
-        );
+        assert!(compiler.compiler_failure().unwrap().completed_tokenizer());
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         let mut reserve = false;
         while let Some(error) = cause {
@@ -229,7 +221,7 @@ fn real_aggregate_partial_frontiers_keep_both_original_allowances_in_one_core_en
 }
 
 #[test]
-fn root_rejection_empty_and_late_semantics_keep_input_without_reclassifying_it_as_c() {
+fn source_compile_errors_retain_distinct_file_and_construction_admission() {
     // These regex producers require fresh source construction.
     // Preserve both as real C-admission refusals while I remains retained.
     for supported in [
@@ -257,12 +249,24 @@ fn root_rejection_empty_and_late_semantics_keep_input_without_reclassifying_it_a
     for bytes in [b"".as_slice(), b"invalid json".as_slice()] {
         let read = read(bytes);
         let i = WorkingMemoryPool::tokenizer_file_required_bytes(&read).unwrap();
-        let pool = WorkingMemoryPool::new(i, 0).unwrap();
+        let c = WorkingMemoryPool::tokenizer_required_bytes(
+            &TokenizerPlan::prepare_json(bytes).unwrap(),
+        )
+        .unwrap();
+        let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
         let error = pool.compile_tokenizer_file(read).unwrap_err();
-        assert!(error.planning_failure().is_some());
-        assert!(error.compiler_failure().is_none());
+        assert!(error.planning_failure().is_none());
+        let compiler = error.compiler_failure().unwrap();
+        assert!(
+            compiler
+                .compiler_failure()
+                .unwrap()
+                .root_failure()
+                .is_some()
+        );
+        assert_eq!(compiler.retained_bytes(), c);
         assert_eq!(error.filled_bytes(), bytes.len());
-        assert_eq!(pool.used_bytes().unwrap(), i);
+        assert_eq!(pool.used_bytes().unwrap(), i + c);
         drop(error);
         assert_eq!(pool.used_bytes().unwrap(), 0);
     }
@@ -481,4 +485,3 @@ fn retained_configuration_uses_fresh_compiler_preserves_flags_and_keeps_input_fa
     assert_eq!(error.input_capacity(), 0);
     assert_eq!(tiny.used_bytes().unwrap(), 0);
 }
-

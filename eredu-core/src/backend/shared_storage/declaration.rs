@@ -8,12 +8,16 @@ use std::{fmt, sync::Arc};
 
 /// Trusted immutable declaration producer used by neutral composition.
 ///
-/// Implementations must own all reported allocations independently: no mutable
-/// execution state, ordinary compiler/factory aliases, or hidden independently
-/// escaping numerical payload. Retained constructor funding may outlive the
-/// declaration; it must not retain an attachment back to this same source. The capacity is the exact
-/// completed allocation population from the producer's checked constructor,
-/// including spare capacity, and must remain fixed for this owner's lifetime.
+/// Implementations must keep their declaration semantically immutable, without
+/// independently mutable executable aliases or escaping numerical payloads. A
+/// closed, unstarted dependency parser may serve as a template only when it is
+/// never advanced or exported and every executable receives an independent deep
+/// copy. Shared immutable dependency data may remain in those copies.
+/// Retained constructor funding may outlive the declaration; it must not retain
+/// an attachment back to this same source. A reported exact capacity describes
+/// independently owned allocations, including spare capacity, and must remain
+/// fixed for this owner's lifetime. Opaque or shared dependency storage instead
+/// reports unknown capacity and may supply an admission estimate.
 /// Constructor scratch and fixed call frames are excluded. Reporting bytes
 /// grants no allocation permission, original-domain qualification or execution.
 pub trait ControllerDeclarationData: Send + Sync + 'static {

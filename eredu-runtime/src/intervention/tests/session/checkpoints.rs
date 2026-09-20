@@ -212,7 +212,9 @@ fn prospective_removal_keeps_inherited_accounting_and_original_provenance() {
     child.begin_step(CapturePhase::Decode, 1).unwrap();
     let record = child.take_step().unwrap();
     assert!(record.interventions.is_empty());
-    assert_eq!(record.cumulative_usage, saved.inherited_usage());
+    let mut expected = saved.inherited_usage();
+    expected.host_bytes += eredu_core::capture::PreparedCapturedStep::retained_control_bytes::<eredu_core::HostPreparationAuthority>().unwrap();
+    assert_eq!(record.cumulative_usage, expected);
     assert_eq!(
         saved.intervention_plan().unwrap().identity(),
         plan.identity()

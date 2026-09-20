@@ -4,8 +4,7 @@ use crate::working_memory::OriginalTokenizer;
 pub use consumer::{OriginalChatConsumer, OriginalChatConsumerError};
 use eredu_core::GenerationSequenceConsumerLayout;
 use eredu_text::chat_storage::{
-    ChatJsonCapacity, ChatRenderContext, ChatRenderFailure, ChatRenderPlan, ChatRenderPlanError,
-    ChatTextCapacity, ChatValueCapacity, PreparedChatRender,
+    ChatRenderContext, ChatRenderFailure, ChatRenderPlan, ChatRenderPlanError, PreparedChatRender,
 };
 use std::mem::size_of_val;
 
@@ -45,7 +44,7 @@ impl OriginalRenderedChat {
     pub fn template_source(&self) -> &OriginalChatTemplate {
         &self.payload().template
     }
-    /// Entire H construction allowance, including retained scratch.
+    /// Entire render reservation, including dependency headroom.
     pub fn original_bytes(&self) -> u64 {
         self.payload().allowance.bytes()
     }
@@ -136,7 +135,6 @@ impl OriginalChatRenderError {
     pub fn is_unknown_function(&self) -> bool {
         self.accounting_failure().is_none()
             && match &self.cause {
-                Cause::Plan(cause) => cause.is_unknown_function(),
                 Cause::Render(cause) => cause.cause().is_unknown_function(),
                 _ => false,
             }
@@ -147,7 +145,6 @@ impl OriginalChatRenderError {
     pub fn is_template_rejection(&self) -> bool {
         self.accounting_failure().is_none()
             && match &self.cause {
-                Cause::Plan(cause) => cause.is_template_rejection(),
                 Cause::Render(cause) => cause.cause().is_template_rejection(),
                 _ => false,
             }
@@ -227,50 +224,6 @@ fn required(plan: &ChatRenderPlan<'_>) -> Result<u64, WorkingMemoryError> {
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(WorkingMemoryError::Overflow)
 }
-#[cfg(test)]
-fn measurement_required(
-    source: &eredu_text::chat_storage::PreparedChatTemplate,
-) -> Result<u64, OriginalChatRenderError> {
-    measurement_required_with_capacities(
-        source,
-        ChatJsonCapacity::default(),
-        ChatTextCapacity::default(),
-        ChatValueCapacity::default(),
-    )
-}
-fn measurement_required_with_capacities(
-    source: &eredu_text::chat_storage::PreparedChatTemplate,
-    json: ChatJsonCapacity,
-    text: ChatTextCapacity,
-    values: ChatValueCapacity,
-) -> Result<u64, OriginalChatRenderError> {
-    let prefix = source
-        .render_prefix_bytes_with_values(json, text, values)
-        .map_err(|e| OriginalChatRenderError::rejected(Cause::Plan(e)))?;
-    let controls = [
-        size_of::<Allowance>(),
-        size_of::<Result<Allowance, WorkingMemoryError>>(),
-        size_of::<OriginalChatRenderError>(),
-        size_of::<Cause>(),
-        size_of::<Result<ChatRenderPlan<'_>, OriginalChatRenderError>>(),
-        size_of::<Option<WorkingMemoryError>>(),
-        size_of::<Result<(), WorkingMemoryError>>(),
-        size_of::<(OriginalChatTemplate, OriginalTokenizer)>(),
-        size_of::<ChatRenderContext<'_>>(),
-        size_of::<ChatJsonCapacity>() * 3,
-        size_of::<ChatTextCapacity>() * 4,
-        size_of::<ChatValueCapacity>() * 3,
-        size_of::<Result<ChatRenderPlan<'_>, ChatRenderPlanError>>(),
-    ];
-    let bytes = controls
-        .into_iter()
-        .try_fold(prefix, usize::checked_add)
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| {
-            OriginalChatRenderError::rejected(Cause::Accounting(WorkingMemoryError::Overflow))
-        })?;
-    Ok(bytes)
-}
 impl WorkingMemoryPool {
     fn chat_render_plan<'a>(
         &self,
@@ -287,94 +240,13 @@ impl WorkingMemoryPool {
         if tokenizer.generation_domain().is_none() {
             return Err(OriginalChatRenderError::rejected(Cause::Domain));
         }
-        // Each actual JSON container may request a larger finite scratch
-        // destination. Retire the completed measurement and settle its real
-        // allowance before admitting the next attempt. Never grow an admitted
-        // Vec or infer a depth limit from an unpriced recursive input walk.
-        let mut json = ChatJsonCapacity::default();
-        let mut text = ChatTextCapacity::default();
-        let mut values = ChatValueCapacity::default();
-        let mut minimum_json = json;
-        let mut minimum_text = text;
-        let mut minimum_values = values;
-        loop {
-            // Amortize repeated prefix execution when capacity permits. Keep
-            // the reached minimum separately so spare measurement capacity can
-            // never turn an otherwise feasible request into a budget refusal.
-            let bytes = match measurement_required_with_capacities(
-                &template.payload().source,
-                json,
-                text,
-                values,
-            ) {
-                Ok(bytes) => bytes,
-                Err(_) if (json, text, values) != (minimum_json, minimum_text, minimum_values) => {
-                    (json, text, values) = (minimum_json, minimum_text, minimum_values);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let mut allowance = match self.admit_source_compiler(bytes) {
-                Ok(allowance) => allowance,
-                Err(WorkingMemoryError::BudgetExceeded { .. })
-                    if (json, text, values) != (minimum_json, minimum_text, minimum_values) =>
-                {
-                    (json, text, values) = (minimum_json, minimum_text, minimum_values);
-                    continue;
-                }
-                Err(error) => {
-                    return Err(OriginalChatRenderError::rejected(Cause::Accounting(error)));
-                }
-            };
-            let result = template
-                .payload()
-                .source
-                .render_plan_attempt_with_values(context, json, text, values);
-            let settlement = allowance.end_compilation().err();
-            match (result, settlement) {
-                (Ok(plan), None) => return Ok(plan),
-                (Err(ChatRenderPlanError::ValueCapacity(next)), None)
-                    if next.slots > values.slots =>
-                {
-                    drop(allowance);
-                    minimum_values = minimum_values.union(next);
-                    values = values.grown_for(next);
-                }
-                (Err(ChatRenderPlanError::TextCapacity(next)), None)
-                    if text.union(next) != text =>
-                {
-                    drop(allowance);
-                    minimum_text = minimum_text.union(next);
-                    text = text.grown_for(next);
-                }
-                (Err(ChatRenderPlanError::JsonCapacity(next)), None)
-                    if json.union(next) != json =>
-                {
-                    // Scratch has already retired. This account is settled;
-                    // no saved model state can restore either attempt.
-                    drop(allowance);
-                    minimum_json = minimum_json.union(next);
-                    json = json.grown_for(next);
-                }
-                (result, settlement) => {
-                    let cause = match result {
-                        Err(error) => Cause::Plan(error),
-                        Ok(_) => Cause::Accounting(settlement.clone().expect("failed settlement")),
-                    };
-                    return Err(OriginalChatRenderError {
-                        cause,
-                        settlement,
-                        completed: None,
-                        template: Some(template.clone()),
-                        tokenizer: Some(tokenizer.clone()),
-                        allowance: Some(allowance),
-                    });
-                }
-            }
-        }
+        template
+            .payload()
+            .source
+            .render_plan_with_context(context)
+            .map_err(|error| OriginalChatRenderError::rejected(Cause::Plan(error)))
     }
-    /// Measure the selected defaults/caller context with temporary admitted scratch
-    /// before any final render destination is born.
+    /// Estimates dependency work and exact output capacities before execution.
     pub fn chat_render_required_bytes(
         &self,
         template: &OriginalChatTemplate,

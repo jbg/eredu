@@ -1,5 +1,8 @@
 //! Source-authenticated compilation through the same policy producer.
 use super::{CompilationFailure, CompiledChatPolicy};
+use crate::runtime::chat::preparation_memory::{
+    PreparationFailure, PreparationFunding, StorageFailure,
+};
 use crate::{
     api::request::probes::original::Tokens,
     runtime::chat::{
@@ -16,7 +19,6 @@ use eredu_runtime::working_memory::{
 use eredu_text::tokenizer::structural::{
     StructuralTokenFailure, resolve_structural_with, structural_control_bytes,
 };
-use llguidance::derivre::{ParserAllocationFailure, ParserAllocationFunding, ParserStorageError};
 use std::{
     error::Error,
     fmt,
@@ -27,10 +29,6 @@ use std::{
 enum Cause {
     #[error(transparent)]
     Metadata(#[from] HostMetadataFundingError),
-    #[error(transparent)]
-    Funding(
-        #[from] llguidance::derivre::ParserAllocationPreparationError<HostMetadataFundingError>,
-    ),
     #[error(transparent)]
     Compiler(#[from] ConstraintCompilerSourceError),
     #[error(transparent)]
@@ -51,6 +49,7 @@ pub(crate) fn compile_original<B: OriginalChatBackend>(
     request: &ChatTemplateRequest,
     eos: &[u32],
     preparation: &OriginalChatProfilePreparation,
+    memory: crate::runtime::chat::DependencyMemoryPolicy,
 ) -> Result<
     (CompiledChatPolicy, OriginalControllerCompilation),
     OriginalControllerCompilationError<Failure>,
@@ -61,6 +60,7 @@ pub(crate) fn compile_original<B: OriginalChatBackend>(
         profile,
         request,
         eos,
+        memory,
     })
 }
 
@@ -70,6 +70,7 @@ struct Compiler<'a, B: OriginalChatBackend> {
     profile: &'a PreparedFormatProfile,
     request: &'a ChatTemplateRequest,
     eos: &'a [u32],
+    memory: crate::runtime::chat::DependencyMemoryPolicy,
 }
 impl<B: OriginalChatBackend> OriginalControllerCompiler for Compiler<'_, B> {
     type Output = CompiledChatPolicy;
@@ -82,6 +83,7 @@ impl<B: OriginalChatBackend> OriginalControllerCompiler for Compiler<'_, B> {
             self.request,
             self.eos,
             funding,
+            self.memory,
         )
     }
 }
@@ -93,6 +95,7 @@ fn compile_policy<B: OriginalChatBackend>(
     request: &ChatTemplateRequest,
     eos: &[u32],
     funding: &HostMetadataFunding,
+    memory: crate::runtime::chat::DependencyMemoryPolicy,
 ) -> Result<CompiledChatPolicy, Failure> {
     let result = (|| -> Result<_, Cause> {
         let parts = [
@@ -107,13 +110,7 @@ fn compile_policy<B: OriginalChatBackend>(
             size_of::<HostMetadataFunding>(),
             size_of::<ConstraintCompiler>(),
             size_of::<Option<ConstraintCompiler>>(),
-            size_of::<Option<ParserAllocationFunding>>(),
-            size_of::<
-                Result<
-                    ParserAllocationFunding,
-                    llguidance::derivre::ParserAllocationPreparationError<HostMetadataFundingError>,
-                >,
-            >(),
+            size_of::<Option<PreparationFunding>>(),
             size_of::<Result<ConstraintCompiler, ConstraintCompilerSourceError>>(),
             size_of::<Cause>(),
             size_of::<Failure>(),
@@ -127,21 +124,21 @@ fn compile_policy<B: OriginalChatBackend>(
             .ok_or(HostMetadataFundingError::Overflow)?;
         funding.reserve_metadata(bytes)?;
         let compiler = if profile.dialect.is_some() || profile.tool_dialect.is_some() {
-            Some(ConstraintCompiler::from_original_tokenizer(
-                tokenizer.clone(),
-                eos,
-                funding,
-            )?)
+            Some(
+                ConstraintCompiler::from_original_tokenizer_with_memory_policy(
+                    tokenizer.clone(),
+                    eos,
+                    funding,
+                    memory,
+                )?,
+            )
         } else {
             None
         };
         // Literal text for an unrecognized protocol requires no grammar trie.
         // Its immutable policy metadata still uses the exact source account.
         let metadata_funding = if compiler.is_none() {
-            let owner = funding.clone();
-            Some(ParserAllocationFunding::prepare(move |bytes| {
-                owner.reserve_metadata(bytes)
-            })?)
+            Some(PreparationFunding::from_metadata(funding).with_memory_policy(memory))
         } else {
             None
         };
@@ -167,20 +164,20 @@ fn compile_policy<B: OriginalChatBackend>(
 
 #[derive(Debug)]
 enum StructuralCause {
-    Funding(ParserAllocationFailure),
-    Storage(ParserStorageError),
+    Funding(PreparationFailure),
+    Storage(StorageFailure),
     Validation(StructuralTokenFailure<OriginalTextSourceError, OriginalEncodedTokenIds>),
 }
 #[derive(Debug)]
 struct StructuralFailure {
     cause: StructuralCause,
-    _funding: ParserAllocationFunding,
+    _funding: PreparationFunding,
 }
 fn resolve<B: OriginalChatBackend>(
     runtime: &ModelRuntime<B>,
     tokenizer: &OriginalTokenizer,
     spellings: &[String],
-    funding: &ParserAllocationFunding,
+    funding: &PreparationFunding,
 ) -> Result<Vec<u32>, StructuralFailure> {
     let result = (|| -> Result<_, StructuralCause> {
         let parts = [
@@ -194,7 +191,7 @@ fn resolve<B: OriginalChatBackend>(
                 &ModelRuntime<B>,
                 &OriginalTokenizer,
                 &[String],
-                &ParserAllocationFunding,
+                &PreparationFunding,
             )>(),
         ];
         let controls = structural_control_bytes::<Tokens<'_, B>, String>()

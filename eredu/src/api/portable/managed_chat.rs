@@ -3,7 +3,7 @@ use super::original_token_input::chat::{
     OriginalChatError, compile_original_chat_file, prepare_original_chat,
 };
 use super::{LoadedModel, ManagedPlainTextSource};
-use crate::runtime::chat::ChatTemplateRequest;
+use crate::runtime::chat::{ChatTemplateRequest, DependencyMemoryPolicy};
 use eredu_core::{BackendFailure, GenerationCancellationToken, TokenInputRejection};
 use eredu_runtime::working_memory::{
     OriginalChatBackend, OriginalChatSourceError, OriginalChatTemplate,
@@ -179,6 +179,30 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         capacity: u64,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<crate::runtime::chat::PreparedChat>, ManagedChatError> {
+        self.prepare_chat_with_grammar_memory(
+            source,
+            request,
+            capacity,
+            DependencyMemoryPolicy::default(),
+            cancellation,
+        )
+    }
+
+    /// Prepares a chat with selected planning headroom for stock grammar and
+    /// tool-schema compilation, validation, sessions and snapshots. Controlled
+    /// and uninterrupted execution retain this same policy with the prepared source.
+    ///
+    /// The allowance is an estimate, not a dependency or process memory ceiling.
+    /// Tokenizer/trie, template rendering, native resources and first-party buffers
+    /// retain their separate policies and admission. Cancellation returns `None`.
+    pub fn prepare_chat_with_grammar_memory(
+        &self,
+        source: &ManagedChatSource,
+        request: &ChatTemplateRequest,
+        capacity: u64,
+        grammar_memory: DependencyMemoryPolicy,
+        cancellation: &GenerationCancellationToken,
+    ) -> Result<Option<crate::runtime::chat::PreparedChat>, ManagedChatError> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -196,6 +220,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             Some(self.tokenizer.template_kwargs()),
             &self.eos_token_ids,
             capacity,
+            grammar_memory,
             cancellation,
         )
         .map_err(ManagedChatError::new)?

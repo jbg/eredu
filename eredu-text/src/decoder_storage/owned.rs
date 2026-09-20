@@ -107,7 +107,7 @@ impl DecodeDestinations {
             size_of::<Result<Option<&'static str>, OwnedDecodeStorageError>>(),
             size_of::<Result<(), OwnedDecodeStorageError>>(),
             size_of::<OwnedDecodeStorageError>(),
-            size_of::<tokenizers::pre_tokenizers::metaspace::DecodePiece<'static>>(),
+            size_of::<std::str::Chars<'static>>(),
             size_of::<(usize, usize, bool, char, &str)>(),
         ]
         .into_iter()

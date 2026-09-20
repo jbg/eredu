@@ -1,175 +1,149 @@
-//! Fresh input projection sharing the original immutable tokenizer residence.
+//! Input-prefix normalization through public component replacement APIs.
 use super::*;
-use tokenizers::{AddedVocabulary, AddedVocabularyCompileFailure, AddedVocabularyRefreshPlan};
+use tokenizers::{NormalizerWrapper, PreTokenizerWrapper, normalizers, pre_tokenizers};
 
-#[derive(Debug)]
-pub(super) struct Projection {
-    pub(super) added: Option<AddedVocabulary>,
-    pub(super) decoder: Option<PreparedDecodeSource>,
-    failure: Option<Cause>,
+/// Removes Prepend normalizers and Metaspace pre-tokenizer prefixes recursively.
+/// Decoder semantics and every other component are preserved. Replacing a
+/// normalizer refreshes upstream's normalized added-token matcher.
+pub fn remove_input_prefixes(tokenizer: &mut tokenizers::Tokenizer) -> tokenizers::Result<()> {
+    fn without_prepend(normalizer: NormalizerWrapper) -> Option<NormalizerWrapper> {
+        match normalizer {
+            NormalizerWrapper::Prepend(_) => None,
+            NormalizerWrapper::Sequence(sequence) => {
+                let members = sequence
+                    .as_ref()
+                    .iter()
+                    .cloned()
+                    .filter_map(without_prepend)
+                    .collect::<Vec<_>>();
+                (!members.is_empty())
+                    .then(|| NormalizerWrapper::Sequence(normalizers::Sequence::new(members)))
+            }
+            other => Some(other),
+        }
+    }
+
+    fn without_metaspace_prefix(pre_tokenizer: PreTokenizerWrapper) -> PreTokenizerWrapper {
+        match pre_tokenizer {
+            PreTokenizerWrapper::Metaspace(mut metaspace) => {
+                metaspace.prepend_scheme = pre_tokenizers::metaspace::PrependScheme::Never;
+                PreTokenizerWrapper::Metaspace(metaspace)
+            }
+            PreTokenizerWrapper::Sequence(sequence) => {
+                PreTokenizerWrapper::Sequence(pre_tokenizers::sequence::Sequence::new(
+                    sequence
+                        .as_ref()
+                        .iter()
+                        .cloned()
+                        .map(without_metaspace_prefix)
+                        .collect(),
+                ))
+            }
+            other => other,
+        }
+    }
+
+    if let Some(normalizer) = tokenizer.get_normalizer().cloned() {
+        tokenizer.with_normalizer(without_prepend(normalizer))?;
+    }
+    if let Some(pre_tokenizer) = tokenizer.get_pre_tokenizer().cloned() {
+        tokenizer.with_pre_tokenizer(Some(without_metaspace_prefix(pre_tokenizer)));
+    }
+    Ok(())
 }
-/// One attempt over the same immutable root; no JSON reconstruction or model copy.
+
+pub(super) fn removal_is_identity(tokenizer: &tokenizers::Tokenizer) -> bool {
+    fn normalizer(n: &NormalizerWrapper) -> bool {
+        match n {
+            NormalizerWrapper::Prepend(_) => false,
+            NormalizerWrapper::Sequence(s) => s.as_ref().iter().all(normalizer),
+            _ => true,
+        }
+    }
+    fn pretokenizer(p: &PreTokenizerWrapper) -> bool {
+        match p {
+            PreTokenizerWrapper::Metaspace(m) => {
+                m.get_prepend_scheme() == pre_tokenizers::metaspace::PrependScheme::Never
+            }
+            PreTokenizerWrapper::Sequence(s) => s.as_ref().iter().all(pretokenizer),
+            _ => true,
+        }
+    }
+    tokenizer.get_normalizer().is_none_or(normalizer)
+        && tokenizer.get_pre_tokenizer().is_none_or(pretokenizer)
+}
+
+/// A prefix-normalized source requires an independent model copy. The estimate
+/// includes a complete construction footprint; its origin remains retained.
 #[derive(Debug)]
 pub struct InputPrefixPlan<'a> {
     source: &'a PreparedTokenizer,
-    added: Option<AddedVocabularyRefreshPlan<'a>>,
     requirements: TokenizerRequirements,
 }
 impl PreparedTokenizer {
-    /// Inspect the actual source projection before admission of its destinations.
-    /// Identity removal returns no plan and requires no new source residence.
+    /// Returns no plan when removal is the identity; otherwise estimates one copy.
     pub fn input_prefix_plan(&self) -> Result<Option<InputPrefixPlan<'_>>, TokenizerSourceError> {
         if self.input_prefix_removal_is_identity() {
             return Ok(None);
         }
-        let added = AddedVocabularyRefreshPlan::for_input_prefix_removal(&self.root().tokenizer)
-            .map_err(|e| TokenizerSourceError::Root(TokenizerCompileError::Added(e)))?;
-        let (buffers, controls) = if let Some(added) = &added {
-            let a = added.requirements();
-            (
-                a.buffer_bytes()
-                    .checked_add(self.root().envelope.buffer_bytes())
-                    .ok_or_else(TokenizerSourceError::overflow)?,
-                a.control_bytes()
-                    .checked_add(self.root().envelope.control_bytes())
-                    .ok_or_else(TokenizerSourceError::overflow)?,
-            )
-        } else {
-            (0, 0)
-        };
-        // One concrete destination exists before refresh starts. Success and
-        // failure retain that same owner, so returning a failure never boxes
-        // an already-large partial aggregate or allocates another error shell.
-        let buffers = buffers
-            .checked_add(size_of::<Projection>())
+        let estimated_bytes = self
+            .root()
+            .estimate
+            .construction(self.root().source_bytes)
             .ok_or_else(TokenizerSourceError::overflow)?;
-        let controls = [
-            controls,
-            size_of::<InputPrefixPlan<'_>>(),
-            size_of::<Result<Option<InputPrefixPlan<'_>>, TokenizerSourceError>>(),
-            size_of::<InputPrefixFailure>(),
-            size_of::<Cause>(),
-            size_of::<Projection>(),
-            size_of::<Box<Projection>>(),
-            size_of::<Option<Box<Projection>>>(),
-            size_of::<PreparedTokenizer>(),
-            size_of::<Option<AddedVocabulary>>(),
-            size_of::<Option<PreparedDecodeSource>>(),
-            size_of::<Arc<Root>>(),
-            size_of::<Result<PreparedTokenizer, InputPrefixFailure>>(),
-            size_of::<Result<DecodeCompilePlan<'_>, DecodeSourceError>>(),
-        ]
-        .into_iter()
-        .try_fold(0usize, usize::checked_add)
-        .ok_or_else(TokenizerSourceError::overflow)?;
-        let requirements = TokenizerRequirements {
-            buffers,
-            controls,
-            total: buffers
-                .checked_add(controls)
-                .ok_or_else(TokenizerSourceError::overflow)?,
-        };
         Ok(Some(InputPrefixPlan {
             source: self,
-            added,
-            requirements,
+            requirements: TokenizerRequirements { estimated_bytes },
         }))
     }
 }
 impl InputPrefixPlan<'_> {
-    /// Fresh changed-table/decoder buffers and named constructor controls.
+    /// Estimate for the independently resident model, matcher and decode program.
     pub fn requirements(&self) -> TokenizerRequirements {
         self.requirements
     }
-    /// Construct once. Root aliases allocate no new shell; the original root's
-    /// account must remain alive through this derivative's final retirement.
+    /// Copies and normalizes once after admission, retaining the original identity.
     pub fn compile(self) -> Result<PreparedTokenizer, InputPrefixFailure> {
-        let root = Arc::clone(self.source.root.as_ref().expect("live root"));
-        let mut projection = Box::new(Projection {
-            added: None,
-            decoder: None,
-            failure: None,
-        });
-        let result = (|| -> Result<Option<PreparedDecodeSource>, Cause> {
-            let Some(plan) = self.added else {
-                return Ok(None);
-            };
-            projection.added = Some(plan.compile().map_err(Cause::Added)?);
-            let view = root
-                .tokenizer
-                .input_prefix_view(projection.added.as_ref().expect("constructed projection"));
-            let plan = DecodeCompilePlan::prepare_input(view).map_err(Cause::Source)?;
-            let actual = plan.requirements();
-            if actual.id_slots() > root.envelope.id_slots()
-                || actual.piece_bytes() > root.envelope.piece_bytes()
-            {
-                return Err(Cause::Source(DecodeSourceError::Overflow));
-            }
-            Ok(Some(plan.compile().map_err(Cause::Decode)?))
-        })();
-        match result {
-            Ok(decoder) => {
-                projection.decoder = decoder;
-                Ok(PreparedTokenizer {
-                    projection: Some(projection),
-                    root: Some(root),
-                })
-            }
-            Err(cause) => {
-                projection.failure = Some(cause);
-                Err(InputPrefixFailure {
-                    projection: Some(projection),
-                    root: Some(root),
-                })
-            }
+        let root = self.source.root();
+        let mut tokenizer = root.tokenizer.clone();
+        if let Err(cause) = remove_input_prefixes(&mut tokenizer) {
+            return Err(InputPrefixFailure {
+                failure: TokenizerConstructionFailure {
+                    cause: Cause::Root(cause),
+                    tokenizer: Some(tokenizer),
+                    _metadata: None,
+                },
+                _origin: Arc::clone(&self.source.root),
+            });
         }
+        build(
+            tokenizer,
+            root.source_bytes,
+            root.estimate,
+            Some(Arc::clone(&self.source.root)),
+            #[cfg(feature = "tokenizer-compiler-test-support")]
+            None,
+        )
+        .map_err(|failure| InputPrefixFailure {
+            failure,
+            _origin: Arc::clone(&self.source.root),
+        })
     }
 }
-#[derive(Debug)]
-enum Cause {
-    Source(DecodeSourceError),
-    Added(AddedVocabularyCompileFailure),
-    Decode(DecodeCompileFailure),
-}
-/// The actual failed prefix and original shared source, without retry/extraction.
+/// Actual construction failure and the retained origin identity.
 #[derive(Debug)]
 pub struct InputPrefixFailure {
-    projection: Option<Box<Projection>>,
-    root: Option<Arc<Root>>,
+    failure: TokenizerConstructionFailure,
+    _origin: Arc<Root>,
 }
-impl Drop for InputPrefixFailure {
-    fn drop(&mut self) {
-        drop(self.projection.take());
-        if let Some(root) = self.root.take() {
-            drop(Arc::into_inner(root));
-        }
-    }
-}
+
 impl fmt::Display for InputPrefixFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.cause() {
-            Cause::Source(e) => fmt::Display::fmt(e, f),
-            Cause::Added(e) => fmt::Display::fmt(e, f),
-            Cause::Decode(e) => fmt::Display::fmt(e, f),
-        }
+        fmt::Display::fmt(&self.failure, f)
     }
 }
 impl std::error::Error for InputPrefixFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match self.cause() {
-            Cause::Source(e) => e,
-            Cause::Added(e) => e,
-            Cause::Decode(e) => e,
-        })
-    }
-}
-impl InputPrefixFailure {
-    fn cause(&self) -> &Cause {
-        self.projection
-            .as_ref()
-            .expect("live failed projection")
-            .failure
-            .as_ref()
-            .expect("failed projection cause")
+        Some(&self.failure)
     }
 }

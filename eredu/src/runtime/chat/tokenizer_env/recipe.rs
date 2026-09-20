@@ -4,14 +4,10 @@
 //! register the returned bytes or establish a finite parser/cache bound.
 
 use eredu_core::HostPreparationAuthority;
-use eredu_text::tokenizer::{Tokenizer as ChatTokenizer, token_id_vocabulary};
+use eredu_text::tokenizer::{ModelCachePolicy, Tokenizer as ChatTokenizer, token_id_vocabulary};
 use llguidance::toktrie::TokEnv;
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor},
-};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use tokenizers::Tokenizer;
-use tokenizers::{ModelCachePolicy, TokenizerSeed};
 
 const RECIPE_VERSION: u32 = 3;
 
@@ -70,13 +66,19 @@ pub(crate) fn freeze(
     eos: &[u32],
     authority: &HostPreparationAuthority,
 ) -> Result<FrozenTokenizer, String> {
-    let bytes = encode(&**tokenizer)?;
+    // Raw imports and mutable access expose no upstream cache-capacity getter.
+    // Unknown cache configuration is restored with caching disabled.
+    let policy = tokenizer
+        .model_cache_policy()
+        .unwrap_or_else(ModelCachePolicy::disabled);
+    let bytes = encode(&**tokenizer, policy)?;
     let mut restored = decode(&bytes)?;
     validate_configuration(&**tokenizer, &restored, &bytes)?;
 
     let original_environment = super::from_tokenizer_with_authority(tokenizer, eos, authority)?;
-    super::remove_input_prefixes(&mut restored)?;
-    let grammar_bytes = encode(&restored)?;
+    eredu_text::tokenizer_storage::remove_input_prefixes(&mut restored)
+        .map_err(|error| error.to_string())?;
+    let grammar_bytes = encode(&restored, policy)?;
     let object = tokenizer_span(&grammar_bytes)
         .ok_or("normalized tokenizer has no validated source object")?;
     let encode_special_tokens = restored.get_encode_special_tokens();
@@ -176,50 +178,22 @@ fn decode(bytes: &[u8]) -> Result<Tokenizer, String> {
         .map_err(|error| format!("failed to restore frozen tokenizer: {error}"))?;
     let policy = header.policy()?;
     let _ = header.tokenizer;
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let mut tokenizer = RecipeTokenizerSeed(policy)
-        .deserialize(&mut deserializer)
+    #[derive(Deserialize)]
+    struct RecipeBody {
+        tokenizer: Tokenizer,
+    }
+    let RecipeBody { mut tokenizer } = serde_json::from_slice(bytes)
         .map_err(|error| format!("failed to restore frozen tokenizer: {error}"))?;
-    deserializer
-        .end()
-        .map_err(|error| format!("failed to restore frozen tokenizer: {error}"))?;
+    policy.apply(&mut tokenizer);
     tokenizer.set_encode_special_tokens(header.encode_special_tokens);
     Ok(tokenizer)
 }
 
-struct RecipeTokenizerSeed(ModelCachePolicy);
-impl<'de> DeserializeSeed<'de> for RecipeTokenizerSeed {
-    type Value = Tokenizer;
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Tokenizer, D::Error> {
-        deserializer.deserialize_map(self)
-    }
-}
-impl<'de> Visitor<'de> for RecipeTokenizerSeed {
-    type Value = Tokenizer;
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a validated frozen tokenizer recipe")
-    }
-    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Tokenizer, M::Error> {
-        let mut tokenizer = None;
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "tokenizer" {
-                if tokenizer.is_some() {
-                    return Err(serde::de::Error::duplicate_field("tokenizer"));
-                }
-                tokenizer = Some(map.next_value_seed(TokenizerSeed(self.0))?);
-            } else {
-                let _ = map.next_value::<IgnoredAny>()?;
-            }
-        }
-        tokenizer.ok_or_else(|| serde::de::Error::missing_field("tokenizer"))
-    }
-}
-
-fn encode(tokenizer: &Tokenizer) -> Result<Vec<u8>, String> {
+fn encode(tokenizer: &Tokenizer, policy: ModelCachePolicy) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&RecipeRef {
         version: RECIPE_VERSION,
         tokenizer,
-        cache_policy: tokenizer.model_cache_policy(),
+        cache_policy: policy,
         encode_special_tokens: tokenizer.get_encode_special_tokens(),
     })
     .map_err(|error| format!("failed to serialize frozen tokenizer: {error}"))
@@ -234,7 +208,9 @@ fn validate_configuration(
     // options a different JSON-number representation from the text serializer.
     let original_value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("failed to inspect frozen tokenizer: {error}"))?;
-    let restored_bytes = encode(restored)?;
+    let header: RecipeHeader = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to inspect frozen tokenizer: {error}"))?;
+    let restored_bytes = encode(restored, header.policy()?)?;
     let restored_value: serde_json::Value = serde_json::from_slice(&restored_bytes)
         .map_err(|error| format!("failed to inspect restored tokenizer: {error}"))?;
     if original_value != restored_value {

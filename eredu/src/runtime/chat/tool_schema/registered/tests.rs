@@ -7,10 +7,10 @@ impl Drop for Retired {
         self.0.store(true, Ordering::SeqCst);
     }
 }
-fn funding(fail_at: usize) -> (ParserAllocationFunding, Arc<AtomicUsize>, Arc<AtomicBool>) {
+fn funding(fail_at: usize) -> (PreparationFunding, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let retired = Arc::new(AtomicBool::new(false));
-    let source = ParserAllocationFunding::prepare({
+    let source = crate::runtime::chat::preparation_memory::test_funding({
         let calls = calls.clone();
         let guard = Retired(retired.clone());
         move |bytes| {
@@ -94,7 +94,6 @@ fn facade_schema_row_reservations_refuse_before_growth_and_preserve_the_cause() 
                 // reached refusal must still stop at its first callback below.
                 assert!(calls.load(Ordering::SeqCst) <= cut,
                     "reached reservation {cut}/{count} was ignored");
-                assert!(funding.failure().is_none());
                 assert_eq!(pending.schemas.rows.len(), 3);
                 drop(funding);
                 assert!(!retired.load(Ordering::SeqCst));
@@ -144,7 +143,7 @@ fn tagged_parameter_rooted_references_defer_to_the_complete_source_validator() {
     let invocation = HostMetadataFunding::new(Invocation).unwrap();
     for count in [1, 2] {
         let raw = format!("{{\"count\":{count}}}");
-        let value = tagged.parse("nested", None, &raw, &serde_json::allocation::Unenforced, &invocation).unwrap();
+        let value = tagged.parse("nested", None, &raw, &invocation).unwrap();
         assert_eq!(value, serde_json::json!({"count":count}));
         let arguments = format!("{{\"nested\":{raw}}}");
         assert_eq!(complete.validate(&arguments, &invocation).is_ok(), count == 2);

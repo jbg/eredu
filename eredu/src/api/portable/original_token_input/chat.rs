@@ -70,14 +70,17 @@ pub(crate) struct PreparedChatRendering {
 impl PreparedChatRendering {
     #[cfg(test)]
     pub(crate) fn prompt(&self, generation: bool) -> &str {
-        self.render.prompt(self.profile.as_ref().unwrap().generation(generation))
+        self.render
+            .prompt(self.profile.as_ref().unwrap().generation(generation))
     }
     #[cfg(test)]
     pub(crate) fn profile(&self) -> &crate::runtime::chat::PreparedFormatProfile {
         self.profile.as_ref().unwrap().profile()
     }
     #[cfg(test)]
-    pub(crate) fn render(&self) -> &OriginalRenderedChat { &self.render }
+    pub(crate) fn render(&self) -> &OriginalRenderedChat {
+        &self.render
+    }
     #[cfg(test)]
     pub(crate) fn metadata_funding(&self) -> &eredu_core::HostMetadataFunding {
         self.profile.as_ref().unwrap().metadata_funding()
@@ -161,6 +164,7 @@ pub(crate) fn prepare_original_chat<B: OriginalChatBackend>(
     defaults: Option<&serde_json::Map<String, serde_json::Value>>,
     eos: &[u32],
     capacity: u64,
+    grammar_memory: crate::runtime::chat::DependencyMemoryPolicy,
     cancellation: &GenerationCancellationToken,
 ) -> Result<
     Option<(
@@ -175,10 +179,13 @@ pub(crate) fn prepare_original_chat<B: OriginalChatBackend>(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    let domain = tokenizer.generation_domain().ok_or_else(||
-        OriginalChatError::before_render(TokenInputRejection::Unavailable))?;
+    let domain = tokenizer
+        .generation_domain()
+        .ok_or_else(|| OriginalChatError::before_render(TokenInputRejection::Unavailable))?;
     if eos.iter().any(|&id| !domain.allows(id)) {
-        return Err(OriginalChatError::before_render(TokenInputRejection::InvalidToken));
+        return Err(OriginalChatError::before_render(
+            TokenInputRejection::InvalidToken,
+        ));
     }
     prepare_with_policy(
         runtime,
@@ -195,6 +202,7 @@ pub(crate) fn prepare_original_chat<B: OriginalChatBackend>(
                 request,
                 eos,
                 profile.preparation(),
+                grammar_memory,
             )
         },
     )

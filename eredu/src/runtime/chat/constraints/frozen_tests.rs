@@ -2,11 +2,11 @@
 //! parser oracles for token masks and fixed expected activation boundaries.
 use super::*;
 use crate::runtime::chat::dialect::{
-    DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope, GenerationPromptBehavior,
-    JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
+    DECLARATIVE_DIALECT, DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope,
+    GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
 };
 use std::sync::atomic::AtomicUsize;
-use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
 
 const FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
     envelope: ExactEnvelope {
@@ -248,15 +248,19 @@ fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
         original_plan(&pool, &tokenizer, &eos, &ordinary_tools(), ToolChoice::Auto);
     let copied = prepared.clone();
     assert_eq!(prepared, copied);
-    assert!(prepared
-        .generation_constraint()
-        .inner
-        .fixture_matcher
-        .is_none());
+    assert!(
+        prepared
+            .generation_constraint()
+            .inner
+            .fixture_matcher
+            .is_none()
+    );
     let recipe = &copied.generation_constraint().inner.recipe;
-    assert!(recipe
-        .source()
-        .same_storage(prepared.generation_constraint().inner.recipe.source()));
+    assert!(
+        recipe
+            .source()
+            .same_storage(prepared.generation_constraint().inner.recipe.source())
+    );
     assert_eq!(copied.tool_call_trigger(), Some(r#"{"calls":"#));
     assert_eq!(
         copied
@@ -289,7 +293,10 @@ fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
     );
     let mut state = commit_text(state, r#"{"calls":[{"name":"check","arguments":{"value":"#);
     let mut fork = state.try_copy(&funding).unwrap();
-    assert_eq!(state.parser().parser().tokens(), fork.parser().parser().tokens());
+    assert_eq!(
+        state.parser().parser().final_bytes(),
+        fork.parser().parser().final_bytes()
+    );
     state = state.compute_mask().unwrap();
     fork = fork.compute_mask().unwrap();
     assert_eq!(state.token_mask(), fork.token_mask());
@@ -382,14 +389,14 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
             PARAMETERS,
             ToolDeclarations::prepare(
                 &original_tools,
-                &llguidance::derivre::ParserAllocationFunding::unenforced(),
+                &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
             )
             .unwrap()
             .as_slice(),
             ToolChoice::Required,
             ParallelToolCallPolicy::Disabled,
             &[],
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
     assert!(
@@ -410,14 +417,14 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
             PARAMETERS,
             ToolDeclarations::prepare(
                 &syntax_tools,
-                &llguidance::derivre::ParserAllocationFunding::unenforced(),
+                &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
             )
             .unwrap()
             .as_slice(),
             ToolChoice::Required,
             ParallelToolCallPolicy::Disabled,
             &[],
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .unwrap();
     let recipe = &prepared.generation_constraint().inner.recipe;
@@ -448,9 +455,11 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
         .unwrap();
     let error = semantic.push(output).unwrap_err();
     assert!(error.contains("do not match its schema"), "{error}");
-    assert!(!semantic
-        .events()
-        .contains(&eredu_core::generation::SemanticEvent::ToolCallEnd));
+    assert!(
+        !semantic
+            .events()
+            .contains(&eredu_core::generation::SemanticEvent::ToolCallEnd)
+    );
     assert_eq!(prepared.generation_constraint().fingerprint, fingerprint);
     drop((prepared, grammar, destination));
     assert_eq!(destination_drops.load(Ordering::SeqCst), 0);
@@ -605,9 +614,11 @@ fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selectio
         )
         .err()
         .unwrap();
-        assert!(error
-            .to_string()
-            .contains("separately qualified grammar source"));
+        assert!(
+            error
+                .to_string()
+                .contains("separately qualified grammar source")
+        );
     }
     drop((
         original,
@@ -856,8 +867,9 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         .as_ref()
         .unwrap();
     let actual = historical
-        .grammar(&prepared.generation_constraint().inner.recipe)
-        .unwrap();
+        .template(&prepared.generation_constraint().inner.recipe)
+        .unwrap()
+        .grammar();
     assert!(std::ptr::eq(declared, actual));
     assert_eq!(declared.start(), actual.start());
     assert_eq!(
@@ -866,11 +878,12 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     );
     assert_eq!(declared.parametric(), actual.parametric());
     assert!(!source.matches_plan(&other));
-    assert!(source
-        .slicer_source()
-        .unwrap()
-        .matches_trie(source.trie_source().trie()));
-    assert!(source.slicer_source().unwrap().byte_len() > 0);
+    assert!(
+        historical
+            .template(&prepared.generation_constraint().inner.recipe)
+            .unwrap()
+            .matches_source(source.trie_source())
+    );
     assert_eq!(source.trie_source().trie().info(), &info);
     assert_eq!(source.trie_source().trie().eos_tokens(), eos);
     for id in 0..info.vocab_size {
@@ -921,297 +934,85 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     assert!(failed.retained_encoding_bytes() > 0);
     drop(foreign);
     let previous_charge = bytes.load(Ordering::SeqCst);
-    let source = source.compile_slicer().unwrap();
-    assert!(source.matches_plan(&prepared));
-    assert!(!source.matches_plan(&other));
+    let mut state = prepared
+        .generation_constraint()
+        .inner
+        .original_grammar_state(&compilation, &funding)
+        .unwrap();
     assert!(bytes.load(Ordering::SeqCst) > previous_charge);
-    assert_eq!(source.program().trie().info(), &info);
-    assert!(!source.program().extra_lexemes().is_empty());
-    let step_before = bytes.load(Ordering::SeqCst);
-    let step = source.prepare_step().unwrap();
-    assert!(step.matches_plan(&prepared));
-    assert!(bytes.load(Ordering::SeqCst) > step_before);
-    drop(step);
-    let lexical_before = bytes.load(Ordering::SeqCst);
-    let source = source.compile_lexer_inputs().unwrap();
-    assert!(bytes.load(Ordering::SeqCst) > lexical_before);
-    assert_eq!(
-        source.input().roots().len(),
-        source
-            .vocabulary()
-            .compiled_declaration()
-            .lexer_spec()
-            .lexemes
-            .len()
-    );
-    let mut limits = llguidance::api::ParserLimits::default();
-    let ordinary = source
-        .vocabulary()
-        .compiled_declaration()
-        .lexer_spec()
-        .to_regex_vec(&mut limits)
-        .unwrap();
-    assert_eq!(source.input().alphabet().len(), ordinary.alpha().len());
-    for byte in 0..=255 {
-        assert_eq!(
-            source.input().alphabet().map(byte),
-            ordinary.alpha().map(byte)
-        );
-    }
-    use llguidance::earley::{lexerspec::LexemeIdx, regexvec::LexemeSet};
-    let mut selected = LexemeSet::new(source.input().roots().len());
-    for index in 0..source.input().roots().len() {
-        selected.add(LexemeIdx::new(index));
-    }
-    let mut ordinary = ordinary;
-    let expected_state = ordinary.initial_state(&selected);
-    let before_vector = bytes.load(Ordering::SeqCst);
-    let mut vector_limits = llguidance::api::ParserLimits::default();
-    let mut source = source.compile_vector(&mut vector_limits).unwrap();
-    assert!(bytes.load(Ordering::SeqCst) > before_vector);
-    assert_eq!(vector_limits.initial_lexer_fuel, limits.initial_lexer_fuel);
-    let state = source.initial_state(&selected).unwrap();
-    assert_eq!(state, expected_state);
-    let descriptor = source.vector().state_desc(state).unwrap();
-    let expected_descriptor = ordinary.state_desc(expected_state);
-    assert_eq!(
-        descriptor.greedy_accepting.as_slice(),
-        expected_descriptor.greedy_accepting.as_slice()
-    );
-    assert_eq!(
-        descriptor.lazy_accepting.as_slice(),
-        expected_descriptor.lazy_accepting.as_slice()
-    );
-    assert_eq!(
-        descriptor.possible.iter().collect::<Vec<_>>(),
-        expected_descriptor.possible.iter().collect::<Vec<_>>()
-    );
-    let mut state = state;
-    let mut expected_state = expected_state;
-    for byte in b"{\"" {
-        expected_state = ordinary.transition(expected_state, *byte);
-        state = source.transition(state, *byte).unwrap();
-        assert_eq!(state, expected_state);
-        let descriptor = source.vector().state_desc(state).unwrap();
-        let expected_descriptor = ordinary.state_desc(expected_state);
-        assert_eq!(
-            descriptor.greedy_accepting.as_slice(),
-            expected_descriptor.greedy_accepting.as_slice()
-        );
-        assert_eq!(
-            descriptor.possible.iter().collect::<Vec<_>>(),
-            expected_descriptor.possible.iter().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            source.vector().expressions().cost(),
-            ordinary.total_fuel_spent()
-        );
-    }
-    drop(ordinary);
-    let mut lexer_limits = llguidance::api::ParserLimits::default();
-    let mut ordinary = llguidance::earley::Lexer::from(
-        source.vocabulary().compiled_declaration().lexer_spec(),
-        &mut lexer_limits,
-        false,
-    )
-    .unwrap();
-    let before_lexer = bytes.load(Ordering::SeqCst);
-    let mut source = source.compile_lexer().unwrap();
-    assert!(bytes.load(Ordering::SeqCst) > before_lexer);
-    ordinary
-        .precompute_for(source.vocabulary().trie_source().trie(), &selected)
-        .unwrap();
-    source.precompute_for(&selected).unwrap();
-    ordinary
-        .prepare_large_lexemes(source.vocabulary().trie_source().trie(), &lexer_limits)
-        .unwrap();
-    source.prepare_parser_lexer(&vector_limits).unwrap();
-    let mut actual_state = source.start_state(&selected).unwrap();
-    let mut expected_state = ordinary.start_state(&selected);
-    for &byte in b"{\"" {
-        use llguidance::earley::LexerResult;
-        let actual = source.advance(actual_state, byte).unwrap();
-        let expected = ordinary.advance(expected_state, byte, false);
-        match (actual, expected) {
-            (LexerResult::State(a, ab), LexerResult::State(b, bb)) => {
-                assert_eq!(ab, bb);
-                let descriptor = source.lexer().vector().state_desc(a).unwrap();
-                assert_eq!(
-                    descriptor.possible.iter().collect::<Vec<_>>(),
-                    ordinary.possible_lexemes(b).iter().collect::<Vec<_>>()
-                );
-                actual_state = a;
-                expected_state = b;
-            }
-            (LexerResult::Lexeme(a), LexerResult::Lexeme(b)) => {
-                assert_eq!(a.byte, b.byte);
-                assert_eq!(a.byte_next_row, b.byte_next_row);
-                break;
-            }
-            (actual, expected) => panic!("lexer decisions differ: {actual:?} vs {expected:?}"),
-        }
-    }
-    drop(ordinary);
-    let before_earley = bytes.load(Ordering::SeqCst);
-    let source = source.compile_earley_seed().unwrap();
-    assert!(bytes.load(Ordering::SeqCst) > before_earley);
-    assert!(source.seed().initial_item_count() > 0);
-    assert!(source.seed().initial_agenda_closed());
-    assert!(source.seed().initial_lexemes().is_some());
-    let source = source.publish_initial_row().unwrap();
-    assert!(source.seed().initial_lexer_state().is_some());
-    let source = source.compute_token_mask(&[]).unwrap();
-    assert!(source.seed().scanned_token_mask().is_some());
-    assert!(source.seed().bytes().is_empty());
+    assert!(state.parser().vocabulary().matches_plan(&prepared));
     let output = br#"{"calls":[{"name":"check","arguments":{"value":17}}]}"#;
     let mut ordinary = oracle.generation_constraint().grammar_matcher();
-    let mut source = source.into_token_parser().unwrap();
     for (position, &byte) in output.iter().enumerate() {
-        let expected_forced = ordinary.compute_ff_tokens();
-        let forced = source
-            .force_tokens()
-            .unwrap_or_else(|error| panic!("original canonical forcing {position}: {error:?}"));
+        state = state.compute_mask().unwrap();
         assert_eq!(
-            forced.tokens(),
-            expected_forced,
-            "forced tokens at {position}"
+            state.token_mask().unwrap(),
+            &ordinary.compute_mask_or_eos().unwrap(),
+            "canonical mask at {position}"
         );
-        assert!(output[position..].starts_with(forced.prefix()));
-        source = forced.into_parser();
-        let expected_mask = ordinary.compute_mask_or_eos().unwrap();
-        source = source
-            .compute_mask()
-            .unwrap_or_else(|error| panic!("original complete token mask {position}: {error:?}"));
-        assert_eq!(
-            source.parser().token_mask().unwrap(),
-            &expected_mask,
-            "token mask at {position}"
-        );
-
-        let token = source
+        let token = state
+            .parser()
             .vocabulary()
             .trie_source()
             .trie()
             .token_id_at_bytes(&[byte])
-            .expect("fixture has every actual emitted byte");
-        let (next, consumed) = source.try_consume_tokens(&[token]).unwrap_or_else(|error| {
-            panic!("prepared token session {position} ({byte}): {error:?}")
-        });
-        assert_eq!(consumed, 1);
+            .expect("fixture emits every byte");
+        state = state.commit(token).unwrap();
         ordinary.consume_token(token).unwrap();
-        source = next;
     }
-    assert_eq!(source.parser().bytes(), output);
-    assert_eq!(source.parser().chart().bytes(), output);
-    assert_eq!(
-        source.parser().chart().byte_token_indices(),
-        &(0..output.len() as u32).collect::<Vec<_>>()
-    );
-    let (mut source, accepted) = source.is_accepting().unwrap();
+    assert_eq!(state.parser().parser().final_bytes(), output);
+    let (mut state, accepted) = state.is_complete().unwrap();
     assert!(accepted);
-    assert!(std::ptr::eq(
-        source.parser().chart().grammar(),
-        source.vocabulary().compiled_declaration()
-    ));
-    #[derive(Debug)]
-    struct CopyAccount {
-        calls: Arc<AtomicUsize>,
-        fail_at: usize,
-        retired: Arc<AtomicBool>,
-    }
-    impl HostMetadataAccount for CopyAccount {
-        fn reserve_metadata(&self, n: usize) -> Result<(), HostMetadataFundingError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == self.fail_at {
-                return Err(HostMetadataFundingError::Capacity {
-                    required: u64::try_from(n).unwrap(),
-                    available: 0,
-                });
-            }
-            Ok(())
-        }
-    }
-    impl Drop for CopyAccount {
-        fn drop(&mut self) {
-            self.retired.store(true, Ordering::SeqCst);
-        }
-    }
-    let copy_calls = Arc::new(AtomicUsize::new(0));
     let copy_retired = Arc::new(AtomicBool::new(false));
-    let copy_funding = HostMetadataFunding::new(CopyAccount {
-        calls: copy_calls.clone(),
-        fail_at: usize::MAX,
+    let copy_funding = HostMetadataFunding::new(Account {
+        bytes: Arc::new(AtomicUsize::new(0)),
         retired: copy_retired.clone(),
+        refused: Arc::new(AtomicBool::new(false)),
     })
     .unwrap();
-    let mut copied = source.try_copy(&copy_funding).unwrap();
-    let copy_steps = copy_calls.load(Ordering::SeqCst);
-    assert!(copy_steps > 1);
-    assert_eq!(copied.parser().tokens(), source.parser().tokens());
-    assert_ne!(
-        copied.parser().tokens().as_ptr(),
-        source.parser().tokens().as_ptr()
+    let copied = state.try_copy(&copy_funding).unwrap();
+    assert_eq!(copied.parser().parser().final_bytes(), output);
+    assert!(
+        copied
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .same_source(state.parser().vocabulary().trie_source())
     );
-    assert_ne!(
-        copied.parser().bytes().as_ptr(),
-        source.parser().bytes().as_ptr()
-    );
-    assert!(std::ptr::eq(
-        copied.parser().chart().grammar(),
-        source.parser().chart().grammar()
-    ));
-    assert!(copied
-        .vocabulary()
-        .trie_source()
-        .same_source(source.vocabulary().trie_source()));
-    // Future copied operations, including canonical tokenization metadata, use
-    // the new account even while the historical source refuses every new debit.
+    // Copied execution uses its destination account after the original payer refuses.
     refused.store(true, Ordering::SeqCst);
-    ordinary.rollback(1).unwrap();
-    copied = copied.rollback(1).unwrap().compute_mask().unwrap();
+    let copied = copied.compute_mask().unwrap();
     assert_eq!(
-        copied.parser().token_mask().unwrap(),
+        copied.token_mask().unwrap(),
         &ordinary.compute_mask_or_eos().unwrap()
     );
-    assert_eq!(source.parser().bytes(), output);
-    let before_copy_force = copy_calls.load(Ordering::SeqCst);
-    let copied_forced = copied.force_tokens().unwrap();
-    assert_eq!(copied_forced.tokens(), ordinary.compute_ff_tokens());
-    copied = copied_forced.into_parser();
-    assert!(copy_calls.load(Ordering::SeqCst) > before_copy_force);
+    let copied = copied.commit(eos[1]).unwrap();
+    let (copied, terminal) = copied.is_terminal().unwrap();
+    assert!(terminal);
     refused.store(false, Ordering::SeqCst);
-    drop(copy_funding);
-    assert!(!copy_retired.load(Ordering::SeqCst));
-    drop(copied);
+    drop((copied, copy_funding));
     assert!(copy_retired.load(Ordering::SeqCst));
-    assert!(!retired.load(Ordering::SeqCst));
-    // The last paid destination refuses after the complete lexer copy. Keep
-    // that failed copy after the original pair retires to prove source custody.
+
     let failed_copy_retired = Arc::new(AtomicBool::new(false));
-    let fail_funding = HostMetadataFunding::new(CopyAccount {
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail_at: copy_steps - 1,
+    let failed_copy_refused = Arc::new(AtomicBool::new(false));
+    let fail_funding = HostMetadataFunding::new(Account {
+        bytes: Arc::new(AtomicUsize::new(0)),
         retired: failed_copy_retired.clone(),
+        refused: failed_copy_refused.clone(),
     })
     .unwrap();
-    let failed_copy = source.try_copy(&fail_funding).unwrap_err();
-    assert!(failed_copy.retains_completed_lexer());
-    assert_eq!(source.parser().bytes(), output);
+    failed_copy_refused.store(true, Ordering::SeqCst);
+    let failed_copy = state.try_copy(&fail_funding).unwrap_err();
+    assert_eq!(state.parser().parser().final_bytes(), output);
     drop(fail_funding);
     assert!(!failed_copy_retired.load(Ordering::SeqCst));
-    source = source.rollback(1).unwrap();
-    assert_eq!(source.parser().bytes(), &output[..output.len() - 1]);
-    let rollback_mask = ordinary.compute_mask_or_eos().unwrap();
-    source = source.compute_mask().unwrap();
-    assert_eq!(source.parser().token_mask().unwrap(), &rollback_mask);
-    ordinary.reset().unwrap();
-    source = source.reset().unwrap();
-    assert!(source.parser().tokens().is_empty());
-    assert!(source.parser().bytes().is_empty());
-    let initial_mask = ordinary.compute_mask_or_eos().unwrap();
-    source = source.compute_mask().unwrap();
-    assert_eq!(source.parser().token_mask().unwrap(), &initial_mask);
-
+    state = state.compute_mask().unwrap();
+    assert_eq!(
+        state.token_mask().unwrap(),
+        &ordinary.compute_mask_or_eos().unwrap()
+    );
     drop((
+        source,
         prepared,
         compilation,
         oracle,
@@ -1227,26 +1028,22 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     assert!(!retired.load(Ordering::SeqCst));
     assert!(pool.used_bytes().unwrap() > 0);
     assert_eq!(
-        source.vocabulary().trie_source().trie().token(eos[0]),
+        state
+            .parser()
+            .vocabulary()
+            .trie_source()
+            .trie()
+            .token(eos[0]),
         b"\xff<eos>"
     );
-    assert!(source
-        .vocabulary()
-        .slicer_source()
-        .unwrap()
-        .matches_trie(source.vocabulary().trie_source().trie()));
     refused.store(true, Ordering::SeqCst);
-    let forcing_failure = source.force_tokens().unwrap_err();
-    assert!(!retired.load(Ordering::SeqCst));
+    let failed_operation = state.compute_mask().unwrap_err();
     assert_eq!(escaped.ids(), expected);
     drop(escaped);
-    assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
     assert_eq!(failed.retained_encoding_chunks(), 2);
     drop(failed);
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
-    drop(forcing_failure);
+    drop(failed_operation);
     assert!(!retired.load(Ordering::SeqCst));
     assert!(!failed_copy_retired.load(Ordering::SeqCst));
     assert!(pool.used_bytes().unwrap() > 0);
@@ -1310,8 +1107,8 @@ fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspectio
         equal_recipe.source().as_ref()
     );
     let declaration = actual.declaration.as_ref().unwrap().clone();
-    assert!(declaration.grammar(equal_recipe).is_err());
-    assert!(declaration.grammar(&actual.recipe).is_ok());
+    assert!(declaration.template(equal_recipe).is_err());
+    assert!(declaration.template(&actual.recipe).is_ok());
     let wrong = ConstraintBlueprint {
         recipe: equal_recipe.clone(),
         declaration: Some(declaration.clone()),
@@ -1333,11 +1130,15 @@ fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspectio
     assert!(bytes.load(Ordering::SeqCst) > before);
     assert!(std::ptr::eq(
         destination.grammar(),
-        declaration.grammar(&actual.recipe).unwrap()
+        declaration.template(&actual.recipe).unwrap().grammar()
     ));
     assert_eq!(
         destination.grammar().start(),
-        declaration.grammar(&actual.recipe).unwrap().start()
+        declaration
+            .template(&actual.recipe)
+            .unwrap()
+            .grammar()
+            .start()
     );
     assert!(wrong.original_grammar_declaration(&funding).is_err());
     // Refuse the adapter's fixed controls before cloning the immutable owner.
@@ -1559,13 +1360,15 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
                 .history(),
             &[first]
         );
-        assert!(snapshot
-            .controller()
-            .prepared_grammar()
-            .unwrap()
-            .prepared_grammar_source()
-            .history()
-            .is_empty());
+        assert!(
+            snapshot
+                .controller()
+                .prepared_grammar()
+                .unwrap()
+                .prepared_grammar_source()
+                .history()
+                .is_empty()
+        );
         assert_eq!(
             <S<C> as SpeculativeSampler<B>>::control_pending_forced(&committed),
             None
@@ -1579,9 +1382,11 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         let ended = S::new(DefaultSampler, terminal.clone());
         let ended_plan =
             <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&ended).unwrap();
-        assert!(ended_plan
-            .prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding)
-            .unwrap());
+        assert!(
+            ended_plan
+                .prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding)
+                .unwrap()
+        );
         type A<C> = ConstrainedSampler<MirostatV2Sampler, C>;
         let adaptive = A::new(MirostatV2Sampler::new(3.5, 0.2).unwrap(), source.clone());
         let invalid = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive)
@@ -1666,9 +1471,11 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             }
         }
         let required = grammar.prepared_grammar_copy_bytes(capacity).unwrap();
-        assert!(grammar
-            .prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1)
-            .is_none());
+        assert!(
+            grammar
+                .prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1)
+                .is_none()
+        );
         for shortage in [0, 1] {
             let spent = Arc::new(AtomicUsize::new(0));
             let limit = Arc::new(AtomicUsize::new(usize::MAX));
@@ -1731,15 +1538,19 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             branch.controller().prepared_grammar_source().history(),
             tokens
         );
-        assert!(branch
-            .controller()
-            .prepared_grammar_source()
-            .funding()
-            .same_account(&decision_funding));
-        assert!(grammar
-            .prepared_grammar_source()
-            .tokenizer()
-            .same_borrowed_source(branch.controller().prepared_grammar_source().tokenizer()));
+        assert!(
+            branch
+                .controller()
+                .prepared_grammar_source()
+                .funding()
+                .same_account(&decision_funding)
+        );
+        assert!(
+            grammar
+                .prepared_grammar_source()
+                .tokenizer()
+                .same_borrowed_source(branch.controller().prepared_grammar_source().tokenizer())
+        );
         let mut expected = ordinary.deep_clone();
         for &token in tokens {
             expected.consume_token(token).unwrap();
@@ -1922,12 +1733,14 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             plan.fill(&mut only_forced).unwrap();
             assert_eq!(only_forced.iter().filter(|&&invalid| !invalid).count(), 2);
             assert!(!only_forced[forced as usize]);
-            assert!(eredu_runtime::generation::TokenMaskPlan::packed(
-                packed,
-                &shape,
-                Some(width as u32)
-            )
-            .is_err());
+            assert!(
+                eredu_runtime::generation::TokenMaskPlan::packed(
+                    packed,
+                    &shape,
+                    Some(width as u32)
+                )
+                .is_err()
+            );
         }
         let token = original
             .parser()
@@ -1967,8 +1780,8 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     let (copied, terminal) = copied.is_terminal().unwrap();
     assert!(terminal);
     assert_eq!(
-        copied.parser().parser().tokens(),
-        original.parser().parser().tokens()
+        copied.parser().parser().final_bytes(),
+        original.parser().parser().final_bytes()
     );
     drop(copy_funding);
     assert!(!copied_retired.load(Ordering::SeqCst));

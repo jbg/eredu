@@ -41,12 +41,14 @@ fn rich_message_aliases_and_overrides_preserve_input_and_error_custody() {
     let failure = source
         .render_plan_with_context(context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::Borrowed)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((source, base, caller));
-    assert!(rendered
-        .prompt(false)
-        .starts_with("first;second;missing:kept 🦀:"));
+    assert!(
+        rendered
+            .prompt(false)
+            .starts_with("first;second;missing:kept 🦀:")
+    );
     assert!(failure.retained_buffer_bytes() > 0);
 }

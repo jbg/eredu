@@ -85,34 +85,39 @@ fn released_length_conditions_share_short_circuit_and_retain_paid_outputs_on_ref
 }
 
 #[test]
-fn ordering_does_not_admit_recursive_containers_or_chained_comparisons() {
+fn ordering_preserves_recursive_containers_and_chained_comparisons() {
     for template in ["{{ left < right }}", "{{ left <= right }}"] {
         for caller in [
             json!({"left":[1],"right":[2]}),
             json!({"left":{"a":1},"right":{"a":2}}),
         ] {
-            let source = ChatTemplatePlan::prepare_utf8(template, "ordering")
-                .unwrap()
-                .compile()
-                .unwrap();
-            let context = ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap();
-            assert!(source.render_plan_with_context(context).is_err());
+            compare_outcome(template, caller.as_object().unwrap());
         }
     }
-    assert!(
-        ChatTemplatePlan::prepare_utf8("{{ left < middle < right }}", "ordering")
-            .unwrap()
-            .compile()
-            .is_err()
+    let rendered = compare(
+        "{{ left < middle < right }}",
+        &[],
+        &serde_json::Map::new(),
+        json!({"left":7,"middle":11,"right":13})
+            .as_object()
+            .unwrap(),
     );
+    assert_eq!(rendered.prompt(false), "True");
 }
 
 #[test]
-fn generated_text_comparisons_preserve_ordinary_order_and_equality(){
-    let caller=json!({"left":"É","right":"界🙂"});
+fn generated_text_comparisons_preserve_ordinary_order_and_equality() {
+    let caller = json!({"left":"É","right":"界🙂"});
     for template in [
         "{{ (left+right) < right }}|{{ (left+right) == (left+right) }}|{{ left != left+right }}",
         "{{ (left|replace('É','終')) >= right }}|{{ (left+right) > 7 }}|{{ (left+right) == 7 }}",
         "{% macro text() %}{{ left }}{{ right }}{% endmacro %}{{ text() == left+right }}|{{ text() > right }}",
-    ]{compare(template,&[],&serde_json::Map::new(),caller.as_object().unwrap());}
+    ] {
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
+    }
 }

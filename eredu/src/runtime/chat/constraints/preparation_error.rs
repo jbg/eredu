@@ -9,13 +9,13 @@ pub(super) enum Cause {
     #[error(transparent)]
     Declaration(#[from] DeclarationConstructionError<PendingGrammarDeclarationError>),
     #[error(transparent)]
-    Allocation(#[from] llguidance::derivre::ParserAllocationFailure),
+    Allocation(#[from] crate::runtime::chat::preparation_memory::PreparationFailure),
     #[error(transparent)]
     Recipe(#[from] super::recipe::RecipeBuildError),
     #[error(transparent)]
     Tools(#[from] crate::runtime::chat::tool_schema::declarations::Failure),
     #[error(transparent)]
-    Storage(#[from] llguidance::derivre::ParserStorageError),
+    Storage(#[from] crate::runtime::chat::preparation_memory::StorageFailure),
     #[error(transparent)]
     Schemas(#[from] crate::runtime::chat::tool_schema::registered::CompilationFailure),
     #[error(transparent)]
@@ -34,13 +34,13 @@ pub(crate) struct PreparationFailure {
     #[source]
     cause: Cause,
     authority: HostPreparationAuthority,
-    funding: llguidance::derivre::ParserAllocationFunding,
+    funding: crate::runtime::chat::preparation_memory::PreparationFunding,
 }
 impl PreparationFailure {
     pub(super) fn new(
         cause: impl Into<Cause>,
         authority: &HostPreparationAuthority,
-        funding: &llguidance::derivre::ParserAllocationFunding,
+        funding: &crate::runtime::chat::preparation_memory::PreparationFunding,
     ) -> Self {
         Self { cause: cause.into(), authority: authority.clone(), funding: funding.clone() }
     }

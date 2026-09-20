@@ -133,9 +133,6 @@ fn two_successive_requests(from_file: bool, profile: u8) {
                     &[2, 2, 4, 3, 2][..]
                 }
             );
-            if profile == 5 {
-                assert_eq!(ids.normalization_capacities(), [8, 8, 9]);
-            }
             assert!(ids.matches_source(&source));
             assert_eq!(pool.used_bytes().unwrap(), baseline + ids.original_bytes());
             drop(ids);
@@ -230,13 +227,13 @@ fn shared_preflight_foreign_pool_wrong_n_replay_and_one_short_preserve_cold_owne
     let failures: Vec<_> = (0..32)
         .map(|_| extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).unwrap_err())
         .collect();
-    assert!(failures.iter().all(|error| error
-        .source()
-        .unwrap()
-        .downcast_ref::<eredu_core::GenerationSequenceBankRejection>(
-    ) == Some(
-        &eredu_core::GenerationSequenceBankRejection::Unavailable
-    )));
+    assert!(failures.iter().all(|error| {
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<eredu_core::GenerationSequenceBankRejection>()
+            == Some(&eredu_core::GenerationSequenceBankRejection::Unavailable)
+    }));
     assert_eq!(state.borrow().decoder_takes, 1);
     let next = AggregateGenerationDecoderInput::new(&source, 3, true).unwrap();
     let sequence = extract_decoder(&mut runtime, 1, 3, &next, &consumer(), None).unwrap();

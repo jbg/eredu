@@ -4,6 +4,8 @@
 //! selected only from registered signatures of the selected template body;
 //! model architecture metadata is deliberately not a fallback.
 
+pub use eredu_runtime::working_memory::DependencyMemoryPolicy;
+
 pub(crate) mod atem;
 pub(crate) mod constraints;
 pub(crate) mod dialect;
@@ -13,6 +15,7 @@ pub(crate) mod harmony;
 pub(crate) mod ifm;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
+pub(crate) mod preparation_memory;
 mod tokenizer_env;
 pub(crate) mod tool_schema;
 
@@ -222,7 +225,7 @@ impl SemanticRuntimePlan {
         let tools = self.recipe.tools()?;
         let declarations = tool_schema::ToolDeclarations::prepare(
             &tools,
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .map_err(|e| e.to_string())?;
         let parser = self.dialect.incremental_parser_state_with_tools(
@@ -290,11 +293,17 @@ pub(crate) struct GenerationRuntimePlanParts {
 }
 
 impl GenerationRuntimePlan {
-    pub(crate) fn controller_sources(&self) -> eredu_runtime::working_memory::ControllerCompilationSources<'_> {
+    pub(crate) fn controller_sources(
+        &self,
+    ) -> eredu_runtime::working_memory::ControllerCompilationSources<'_> {
         eredu_runtime::working_memory::ControllerCompilationSources {
             recipe: Some(self.generation_constraint.inner.recipe.source()),
             grammar: self.generation_constraint.inner.compiled_grammar_source(),
-            validation: self.semantic.tool_schemas.as_ref().map(|source| source.source()),
+            validation: self
+                .semantic
+                .tool_schemas
+                .as_ref()
+                .map(|source| source.source()),
         }
     }
     pub(crate) fn new(parts: GenerationRuntimePlanParts) -> Self {
@@ -363,7 +372,7 @@ impl GenerationRuntimePlan {
         let tools = self.semantic.recipe.tools()?;
         let declarations = tool_schema::ToolDeclarations::prepare(
             &tools,
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .map_err(|e| e.to_string())?;
         let parser = self.semantic.dialect.incremental_parser_state_with_tools(

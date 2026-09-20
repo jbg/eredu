@@ -28,7 +28,7 @@ fn original_python_grammar_producers_refuse_every_reached_allocation() {
 
 #[test]
 fn python_literal_spelling_preserves_nested_values_and_escapes() {
-    let funding = ParserAllocationFunding::unenforced();
+    let funding = PreparationFunding::unmanaged();
     let mut output = GrammarText::new(&funding).unwrap();
     python_value_literal(&mut output, &json!([17, true, null, {"x": false}])).unwrap();
     assert_eq!(

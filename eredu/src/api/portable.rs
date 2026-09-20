@@ -342,6 +342,9 @@ impl<B: eredu_runtime::working_memory::LoadedDecodeSourceBackend> LoadedModel<B>
                         eredu_text::decoder_storage::DecodeSourceError::UnsupportedDecoder => {
                             eredu_core::BackendFailureKind::Unsupported
                         }
+                        eredu_text::decoder_storage::DecodeSourceError::DuplicateModelId(_) => {
+                            eredu_core::BackendFailureKind::InvalidInput
+                        }
                         _ => eredu_core::BackendFailureKind::ResourceExhausted,
                     };
                     eredu_core::BackendFailure::new(kind, error)
@@ -466,6 +469,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
     ) -> Result<Self, eredu_core::BackendFailure> {
+        // Prepare the borrowed vocabulary view while loading the model.
+        let _ = tokenizer.vocabulary();
         let mut tokenizer_fingerprint = [0; 32];
         let token_validity = B::prepare_shared_token_filter(&runtime, || {
             tokenizer_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);

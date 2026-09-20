@@ -23,7 +23,7 @@ eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-nn.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 safetensors = "0.8"
 thiserror.workspace = true
@@ -36,6 +36,6 @@ libc = "=0.2.189"
 sha2.workspace = true
 
 [dev-dependencies]
-eredu-text = { workspace = true, default-features = false, features = ["decode-compiler-test-support", "stop-compiler-test-support", "packed-bpe-test-support", "tokenizer-compiler-test-support"] }
+eredu-text = { workspace = true, default-features = false, features = ["tokenizer-compiler-test-support", "stop-compiler-test-support"] }
 eredu-gguf.workspace = true
 tempfile.workspace = true

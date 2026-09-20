@@ -1720,7 +1720,6 @@ pub(crate) use capture_run::{PartitionLocalCaptureHook,PartitionCaptureHookConti
 
 pub(crate) use capture_run::{PreparedPartitionFragmentDelivery,PartitionCaptureRankSource};
 
-mod original_json_allocation;
 mod original_json_tree;
 pub use original_json_tree::{
     OriginalJsonChildren, OriginalJsonNode, OriginalJsonNumber, OriginalJsonTree, OriginalJsonTreeError,

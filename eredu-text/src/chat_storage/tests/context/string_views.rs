@@ -81,16 +81,12 @@ fn nanbeige_reasoning_content_chains_retain_output_after_input_and_source_retire
 }
 
 #[test]
-fn split_view_refuses_invalid_arity_types_and_unowned_separator_storage() {
-    for template in [
-        "{{ text.split(sep=',')[0] }}",
-        "{{ text.strip('x', 'y') }}",
-    ] {
-        let refused = match ChatTemplatePlan::prepare_utf8(template, "arity") {
-            Ok(plan) => plan.compile().is_err(),
-            Err(_) => true,
-        };
-        assert!(refused);
+fn split_preserves_dynamic_separators_and_rejects_invalid_argument_types() {
+    for template in ["{{ text.split(sep=',')[0] }}", "{{ text.strip('x', 'y') }}"] {
+        compare_outcome(
+            template,
+            json!({"map":{},"text":"text"}).as_object().unwrap(),
+        );
     }
     for (template, caller) in [
         ("{{ text.split(',') }}", json!({"text":"a,b"})),
@@ -104,17 +100,7 @@ fn split_view_refuses_invalid_arity_types_and_unowned_separator_storage() {
             json!({"text":"abc","chars":["a"]}),
         ),
     ] {
-        let source = ChatTemplatePlan::prepare_utf8(template, "storage")
-            .unwrap()
-            .compile()
-            .unwrap();
-        assert!(
-            source
-                .render_plan_with_context(
-                    ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-                )
-                .is_err()
-        );
+        compare_outcome(template, caller.as_object().unwrap());
     }
     let skipped = compare(
         "{% if false and text.split(separator) %}wrong{% else %}skipped{% endif %}",
@@ -125,9 +111,17 @@ fn split_view_refuses_invalid_arity_types_and_unowned_separator_storage() {
     assert_eq!(skipped.prompt(false), "skipped");
     for (template, caller) in [
         ("{{ text.split(',', 1)[0] }}", json!({"text":"é,b,c"})),
-        ("{{ (left + right).strip() }}", json!({"left":" a","right":"b "})),
+        (
+            "{{ (left + right).strip() }}",
+            json!({"left":" a","right":"b "}),
+        ),
     ] {
-        compare(template, &[], &serde_json::Map::new(), caller.as_object().unwrap());
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
     }
 }
 
@@ -135,5 +129,10 @@ fn split_view_refuses_invalid_arity_types_and_unowned_separator_storage() {
 fn released_nanbeige_template_uses_supported_macro_state_and_slice_operations() {
     let full = include_str!("../../../../tests/fixtures/nanbeige/chat_template.jinja");
     let messages = [json!({"role":"user","content":"Preserve É and 世界."})];
-    compare(full, &messages, &serde_json::Map::new(), &serde_json::Map::new());
+    compare(
+        full,
+        &messages,
+        &serde_json::Map::new(),
+        &serde_json::Map::new(),
+    );
 }

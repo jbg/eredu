@@ -27,19 +27,3 @@ impl SourceIdentity {
         }
     }
 }
-pub(super) fn control_bytes<I>() -> Option<usize> {
-    use std::mem::{size_of, size_of_val};
-    let controls = [
-        size_of::<I>(),
-        size_of::<SourceIdentity>(),
-        size_of::<Sha256>(),
-        size_of::<[u8; 256]>(),
-        size_of::<[usize; 3]>(),
-        size_of::<Option<u8>>(),
-        size_of::<[u8; 32]>(),
-        size_of::<sha2::digest::Output<Sha256>>(),
-    ];
-    controls
-        .into_iter()
-        .try_fold(size_of_val(&controls), usize::checked_add)
-}

@@ -1,7 +1,4 @@
 use super::*;
-use eredu_text::tokenizer_storage::{
-    NormalizationBuffer as N, RegexBuffer as B, RegexWorkspaceFailure as F,
-};
 const TEXT_NFC: &str = "hi e\u{301} \u{344}<S>";
 fn json() -> String {
     let mut value: serde_json::Value = serde_json::from_str(&super::template::json()).unwrap();
@@ -27,16 +24,8 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
     let c = measured.original_bytes();
     for text in [TEXT_NFC, "", "\u{344}"] {
         for special in [false, true] {
-            let plan = EncodeIdsPlan::prepare(&measured.payload().model, text, special).unwrap();
-            let caps = plan.normalization_capacities();
             let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&measured, text, special)
                 .unwrap();
-            if text == TEXT_NFC {
-                assert_eq!(caps, [11, 11, 14]);
-            }
-            if text == "\u{344}" {
-                assert_eq!(caps, [2, 2, 4]);
-            }
             for short in [true, false] {
                 let pool = WorkingMemoryPool::new(c + e - u64::from(short), 0).unwrap();
                 let source = source(&pool, &input);
@@ -73,9 +62,6 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
                         expected.extend([4, 4, 4, 4]);
                     }
                     assert_eq!(output.ids(), expected);
-                    assert_eq!(output.normalization_capacities(), caps);
-                    assert_eq!(output.mapped_capacity(), 2 * caps[2]);
-                    assert_eq!(output.capacities()[2], caps[2] + usize::from(special));
                     assert!(output.matches_source(&source));
                     drop(pool.acquire_unquoted().unwrap());
                     let alias = source.clone();
@@ -92,62 +78,11 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
     assert_eq!(sizing.used_bytes().unwrap(), 0);
 }
 #[test]
-fn nfc_actual_seven_frontiers_and_later_regex_failure_preserve_original_c_e_and_causes() {
+fn nfc_foreign_operations_cannot_retain_source_or_admission() {
     let input = json();
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let source = source(&pool, &input);
     let c = source.original_bytes();
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&source, TEXT_NFC, true).unwrap();
-    let targets = [N::Decomposition, N::Recomposition, N::Text];
-    for stage in 0..8 {
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &source,
-                TEXT_NFC,
-                true,
-                |p| {
-                    if stage < 4 {
-                        p.fail_reservation(stage)
-                    } else if stage < 7 {
-                        p.fail_normalization_reservation(targets[stage - 4])
-                            .unwrap()
-                    } else {
-                        p.fail_regex_reservation(F::Outer(B::Undo)).unwrap()
-                    }
-                },
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert!(error.matches_source(&source));
-        assert_eq!(error.retained_bytes(), e);
-        let failure = error.encoding_failure().unwrap();
-        let caps = failure.normalization_capacities();
-        if stage < 4 {
-            assert_eq!(caps, [0; 3]);
-        } else if stage < 7 {
-            assert!(caps[..stage - 4].iter().all(|&n| n > 0));
-            assert!(caps[stage - 4..].iter().all(|&n| n == 0));
-            assert!(matches!(
-                failure.cause(),
-                EncodeIdsError::NormalizationPreparation(_)
-            ));
-        } else {
-            assert_eq!(caps, [11, 11, 14]);
-        }
-        let mut next: Option<&(dyn std::error::Error + 'static)> = Some(failure);
-        let mut reserve = false;
-        while let Some(cause) = next {
-            reserve |= cause.is::<std::collections::TryReserveError>();
-            next = cause.source();
-        }
-        assert!(reserve);
-        drop(pool.acquire_unquoted().unwrap());
-        let erased = error.into_backend_failure();
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        drop(erased);
-        assert_eq!(pool.used_bytes().unwrap(), c);
-    }
     let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let rejects: Vec<_> = (0..3)
         .map(|_| {
@@ -159,31 +94,17 @@ fn nfc_actual_seven_frontiers_and_later_regex_failure_preserve_original_c_e_and_
     assert!(
         rejects
             .iter()
-            .all(|e| e.retained_bytes() == 0 && !e.matches_source(&source))
+            .all(|error| error.retained_bytes() == 0 && !error.matches_source(&source))
     );
-    let error = pool
-        .encode_tokenizer_ids_with(
-            &source,
-            TEXT_NFC,
-            true,
-            |p| p.fail_normalization_reservation(N::Text).unwrap(),
-            || {},
-            || {},
-        )
-        .unwrap_err();
+    assert_eq!(pool.used_bytes().unwrap(), c);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
-    assert_eq!(
-        error.encoding_failure().unwrap().normalization_capacities(),
-        [11, 11, 0]
-    );
-    drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
     drop(rejects);
     assert_eq!(foreign.used_bytes().unwrap(), 0);
 }
+
 #[test]
-fn nfc_missing_unknown_after_real_ids_retains_completed_normalization_storage() {
+fn nfc_missing_unknown_retains_source_and_operation_admission() {
     let input = json().replace("\"unk_token\":\"?\"", "\"unk_token\":\"missing\"");
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let source = source(&pool, &input);
@@ -193,16 +114,11 @@ fn nfc_missing_unknown_after_real_ids_retains_completed_normalization_storage() 
     let failure = pool.encode_tokenizer_ids(&source, text, true).unwrap_err();
     assert!(matches!(
         failure.encoding_failure().unwrap().cause(),
-        EncodeIdsError::MissingUnknown
+        EncodeIdsError::Upstream(_)
     ));
-    assert_eq!(failure.encoding_failure().unwrap().partial_id_count(), 3); // BOS, hi, then the raw <S> boundary.
-    assert_eq!(
-        failure
-            .encoding_failure()
-            .unwrap()
-            .normalization_capacities(),
-        [7, 7, 9]
-    );
+    assert!(failure.matches_source(&source));
+    assert_eq!(failure.retained_bytes(), e);
+    assert!(failure.encoding_failure().unwrap().source().is_some());
     drop(source);
     assert_eq!(pool.used_bytes().unwrap(), c + e);
     drop(failure);

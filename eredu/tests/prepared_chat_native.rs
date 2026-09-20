@@ -171,13 +171,21 @@ fn fail<T>(error: impl std::error::Error + 'static) -> T {
 #[ignore = "requires an accessible Metal device"]
 fn ordinary_tool_capture_snapshot_restore_and_fork_preserve_committed_semantics() {
     for choice in [ToolChoice::Required, ToolChoice::Auto] {
-        check(choice);
+        check(choice, LocalDevice::Accelerator(0), true);
     }
 }
 
-fn check(choice: ToolChoice) {
+#[test]
+#[cfg_attr(feature = "metal", ignore = "run explicitly with native device access")]
+fn cpu_tools_preserve_ordinary_and_controlled_snapshot_semantics() {
+    for choice in [ToolChoice::Required, ToolChoice::Auto] {
+        check(choice, LocalDevice::Cpu, false);
+    }
+}
+
+fn check(choice: ToolChoice, device: LocalDevice, capture: bool) {
     let (root, tokenizer, script) = fixture(false);
-    let execution = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0").unwrap());
+    let execution = ExecutionPlan::fully_resident(local_device_plan(device).unwrap());
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), root.path(), &execution)
             .unwrap_or_else(fail)
@@ -230,6 +238,30 @@ fn check(choice: ToolChoice) {
         seed: 37,
         ..Default::default()
     };
+    if !capture {
+        let mut events = Vec::new();
+        let output = model
+            .start_prepared_chat(PreparedChatRequest::new(&chat, settings.clone()), &cancellation)
+            .unwrap_or_else(fail).unwrap()
+            .run(&cancellation, &mut |event| events.push(event)).unwrap_or_else(fail);
+        assert!(output.token_ids.starts_with(&script[..5]));
+        assert_eq!(output.finish_reason, eredu_core::FinishReason::GrammarComplete);
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            SemanticEvent::ToolCallStart { name, .. } if name == "reading")).count(), 1);
+        let arguments: String = events.iter().filter_map(|event| match event {
+            SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&arguments).unwrap(), serde_json::json!({"value":17}));
+        let ids = output.token_ids.to_vec();
+        let finish = output.finish_reason;
+        drop(output);
+        model.prepare_reset_ordinary().unwrap_or_else(fail)
+            .reset_admitted(eredu_core::SessionResetLimits::new(CAPACITY)).unwrap_or_else(fail);
+        model.synchronize().unwrap_or_else(fail);
+        sampling::check_recorded_child(&mut model, &chat, settings, &script, &ids, finish, &events);
+        return;
+    }
     let capture_lifecycle::Proof {
         events, expected_ids, expected_finish, budget, spent, terminal_budget, terminal_spent,
     } = capture_lifecycle::check(&mut model, &chat, &settings, &script, count, &cancellation);

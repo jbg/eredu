@@ -9,7 +9,6 @@ enum ReceiveCause {
     #[error(transparent)] Decode(#[from] PartitionCaptureTensorDecodeError),
     #[error(transparent)] Funding(#[from] HostMetadataFundingError),
     #[error(transparent)] Memory(#[from] WorkingMemoryError),
-    #[error(transparent)] Plan(#[from] PlanError),
     #[error(transparent)] Json(#[from] serde_json::Error),
     #[error(transparent)] Routed(#[from] RoutedReceiveCause),
 }
@@ -36,7 +35,7 @@ impl PreparedPartitionFragmentDestinations {
             size_of::<PartitionFragmentDestination<'_,'_>>(),size_of::<PartitionFragmentValue>(),
             size_of::<Option<(TensorDtype,CaptureUsage,CaptureUsage)>>(),size_of::<(TensorDtype,CaptureUsage,CaptureUsage)>(),
             size_of::<PartitionFragmentReceiveError>(),size_of::<ReceiveCause>(),size_of::<Result<(),PartitionFragmentReceiveError>>(),
-            size_of::<Plan<'_>>(),size_of::<TensorReader<'_,'_,'_>>(),size_of::<Option<&CaptureSlicePartition>>(),
+            size_of::<TensorReader<'_,'_,'_>>(),size_of::<Option<&CaptureSlicePartition>>(),
             size_of::<Option<TensorDtype>>(),size_of::<bool>(),
         ];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
@@ -51,13 +50,9 @@ impl PreparedPartitionFragmentDestinations {
             if !matches!(empty_dtype,None|Some(TensorDtype::F16|TensorDtype::F32|TensorDtype::Bf16)) {return Err(error(ReceiveCause::Source));}
             funding.reserve_metadata(TensorReader::construction_control_bytes().ok_or_else(||error(ReceiveCause::Source))?)
                 .map_err(|e|error(e.into()))?;
-            let plan=Plan::prepare(bytes).map_err(|e|error(e.into()))?;
-            let required=plan.requirements::<TensorReader<'_,'_,'_>>().map_err(|e|error(e.into()))?;
-            funding.reserve_metadata(required.required_bytes()).map_err(|e|error(e.into()))?;
+            reserve_parser_headroom(bytes, funding).map_err(|e|error(e.into()))?;
             let mut reader=TensorReader::new_empty(receipt.context(),receipt.identity(),producer,source.admission(),receipt.combination(),empty_dtype.cloned());
-            let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|e|error(e.into()))?;
-            let parsed=plan.parse(&mut reader,&allocation);
-            if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+            let parsed=json::parse(bytes, |event| reader.event(event));
             parsed.map_err(|e|error(e.into()))?;
             if !reader.complete(){return Err(error(ReceiveCause::Source));}
             return Ok(());
@@ -90,20 +85,16 @@ impl PreparedPartitionFragmentDestinations {
         let error=|cause|PartitionFragmentReceiveError{cause,_source:source.clone(),_custody:custody.share_scheduled(),_metadata:funding.clone()};
         let parts=[RoutedReceiver::control_bytes().ok_or_else(||error(ReceiveCause::Source))?,
             TensorReader::construction_control_bytes().ok_or_else(||error(ReceiveCause::Source))?,
-            size_of::<RoutedReceiver<'_>>(),size_of::<TensorReader<'_,'_,'_>>(),size_of::<Plan<'_>>(),
+            size_of::<RoutedReceiver<'_>>(),size_of::<TensorReader<'_,'_,'_>>(),
             size_of::<SharedCapturePlan>(),size_of::<CaptureTensorCustody>(),size_of::<PartitionFragmentReceiveError>(),
             size_of::<Result<(),PartitionFragmentReceiveError>>(),
             size_of::<(&mut Self,&PartitionCaptureReceiptPlan,usize,&[u8],Option<&TensorDtype>,&HostMetadataFunding)>()];
         funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
             .ok_or_else(||error(ReceiveCause::Source))?).map_err(|e|error(e.into()))?;
-        let plan=Plan::prepare(bytes).map_err(|e|error(e.into()))?;
-        funding.reserve_metadata(plan.requirements::<TensorReader<'_,'_,'_>>().map_err(|e|error(e.into()))?.required_bytes())
-            .map_err(|e|error(e.into()))?;
+        reserve_parser_headroom(bytes, funding).map_err(|e|error(e.into()))?;
         let mut destination=RoutedReceiver::new(self,receipt,producer,dtype).map_err(|e|error(e.into()))?;
         let mut reader=TensorReader::new_routed(&mut destination,receipt,producer,source.admission(),dtype.cloned());
-        let allocation=crate::working_memory::original_json_allocation::JsonAllocation::new(funding).map_err(|e|error(e.into()))?;
-        let parsed=plan.parse(&mut reader,&allocation);
-        if let Some(cause)=allocation.failure(){return Err(error(cause.into()));}
+        let parsed=json::parse(bytes, |event| reader.event(event));
         let complete=reader.complete();drop(reader);
         if let Some(cause)=destination.take_error(){return Err(error(cause.into()));}
         parsed.map_err(|e|error(e.into()))?;

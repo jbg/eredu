@@ -1,9 +1,10 @@
 //! Shared immutable grammar loan from its exact original declaration source.
+use super::super::stock_parser::Template;
 use super::super::{
     ConstraintBlueprint, declaration::HistoricalGrammarDeclaration, recipe::ConstraintRecipe,
 };
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
-use llguidance::earley::{CGrammar, SharedGrammar};
+use llguidance::earley::CGrammar;
 use std::{
     fmt,
     mem::{size_of, size_of_val},
@@ -22,7 +23,6 @@ enum Cause {
 }
 /// Shared original declaration; mutable parser/controller state is separate.
 pub(in crate::runtime::chat::constraints) struct OriginalGrammarDeclaration {
-    grammar: SharedGrammar,
     source: HistoricalGrammarDeclaration,
     recipe: ConstraintRecipe,
     funding: HostMetadataFunding,
@@ -48,19 +48,19 @@ impl ConstraintBlueprint {
         &self,
         funding: &HostMetadataFunding,
     ) -> Result<OriginalGrammarDeclaration, OriginalGrammarDeclarationError> {
-        let result = (|| -> Result<SharedGrammar, Cause> {
+        let result = (|| -> Result<(), Cause> {
             let parts = [
                 HistoricalGrammarDeclaration::inspection_control_bytes().ok_or(Cause::Overflow)?,
                 size_of::<Self>(),
                 size_of::<OriginalGrammarDeclaration>(),
                 size_of::<OriginalGrammarDeclarationError>(),
                 size_of::<Cause>(),
-                size_of::<SharedGrammar>(),
+                size_of::<&Template>(),
                 size_of::<HistoricalGrammarDeclaration>(),
                 size_of::<Option<HistoricalGrammarDeclaration>>(),
                 size_of::<ConstraintRecipe>(),
-                size_of::<Result<SharedGrammar, Cause>>(),
-                size_of::<Result<SharedGrammar, super::super::declaration::Cause>>(),
+                size_of::<Result<(), Cause>>(),
+                size_of::<Result<&Template, super::super::declaration::Cause>>(),
                 size_of::<Result<OriginalGrammarDeclaration, OriginalGrammarDeclarationError>>(),
                 size_of::<Result<(), HostMetadataFundingError>>(),
                 size_of::<(&Self, &HostMetadataFunding)>(),
@@ -72,11 +72,11 @@ impl ConstraintBlueprint {
                     .ok_or(Cause::Overflow)?,
             )?;
             let source = self.declaration.as_ref().ok_or(Cause::Missing)?;
-            Ok(source.shared_grammar(&self.recipe)?)
+            source.template(&self.recipe)?;
+            Ok(())
         })();
         match result {
-            Ok(grammar) => Ok(OriginalGrammarDeclaration {
-                grammar,
+            Ok(()) => Ok(OriginalGrammarDeclaration {
                 source: self.declaration.as_ref().expect("source checked").clone(),
                 recipe: self.recipe.clone(),
                 funding: funding.clone(),
@@ -96,16 +96,13 @@ impl OriginalGrammarDeclaration {
     ) -> &eredu_core::SharedControllerDeclaration {
         self.source.source()
     }
-    pub(in crate::runtime::chat::constraints) fn source_copy_control_bytes(
-        &self,
-    ) -> Result<usize, super::super::declaration::Cause> {
-        Ok(self.source.requirements(&self.recipe)?.control_bytes())
+    pub(in crate::runtime::chat::constraints) fn template(&self) -> &Template {
+        self.source
+            .template(&self.recipe)
+            .expect("validated immutable declaration")
     }
     pub(in crate::runtime::chat::constraints) fn grammar(&self) -> &CGrammar {
-        &self.grammar
-    }
-    pub(in crate::runtime::chat::constraints) fn grammar_owner(&self) -> SharedGrammar {
-        self.grammar.clone()
+        self.template().grammar()
     }
     pub(in crate::runtime::chat::constraints) fn matches_plan(
         &self,

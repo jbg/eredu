@@ -235,7 +235,7 @@ where
             inspection,
             plan,
             text_options,
-            tokenizers::ModelCachePolicy::default(),
+            eredu_text::tokenizer::ModelCachePolicy::default(),
         )
     }
 
@@ -246,7 +246,7 @@ where
         >,
         plan: &eredu_core::ExecutionPlan,
         text_options: TextModelOptions,
-        policy: tokenizers::ModelCachePolicy,
+        policy: eredu_text::tokenizer::ModelCachePolicy,
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
@@ -395,7 +395,7 @@ where
             artifact,
             options,
             text_options,
-            tokenizers::ModelCachePolicy::default(),
+            eredu_text::tokenizer::ModelCachePolicy::default(),
         )
     }
 
@@ -404,7 +404,7 @@ where
         artifact: impl AsRef<Path>,
         options: B::LoadOptions,
         text_options: TextModelOptions,
-        policy: tokenizers::ModelCachePolicy,
+        policy: eredu_text::tokenizer::ModelCachePolicy,
     ) -> Result<Self, LoadedModelLoadError> {
         let artifact = artifact.as_ref();
         let inspection = backend.inspect_model_artifact(artifact).map_err(map_model_load_error)?;
@@ -498,7 +498,7 @@ fn loaded_text_artifact_with_cache_policy(
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
     text_options: TextModelOptions,
-    policy: tokenizers::ModelCachePolicy,
+    policy: eredu_text::tokenizer::ModelCachePolicy,
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
@@ -526,7 +526,7 @@ fn loaded_text_artifact_with_cache_policy(
             let tokenizer =
                 super::tokenizer::load_tokenizer_for_kind_with_cache_policy(kind, path, policy)?;
             (
-                ChatTokenizer::from_tokenizer(tokenizer),
+                ChatTokenizer::from_tokenizer_with_cache_policy(tokenizer, policy),
                 resolve_chat_template(path, None, &text_options)?,
                 sidecar_eos_token_ids,
                 configuration.effective_model_type().to_owned(),
@@ -547,7 +547,7 @@ fn loaded_text_artifact_with_cache_policy(
             } = super::tokenizer::load_gguf_tokenizer_from_metadata_with_cache_policy(
                 path, &metadata, policy,
             )?;
-            let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
+            let mut tokenizer = ChatTokenizer::from_tokenizer_with_cache_policy(tokenizer, policy);
             tokenizer.set_template_kwargs(template_kwargs);
             (
                 tokenizer,

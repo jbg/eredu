@@ -24,7 +24,7 @@ fn borrowed_lengths_count_unicode_collections_and_trimmed_prefixes_with_retained
     let capacity = plan.requirements().buffer_bytes();
     assert!(rendered.retained_buffer_bytes() <= capacity);
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((base, defaults, caller, source));
@@ -43,6 +43,8 @@ fn borrowed_lengths_count_unicode_collections_and_trimmed_prefixes_with_retained
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
         assert!(
@@ -65,6 +67,8 @@ fn borrowed_lengths_count_unicode_collections_and_trimmed_prefixes_with_retained
     assert!(
         source
             .render_plan_with_context(ChatRenderContext::from_json(&[], None, None).unwrap())
+            .unwrap()
+            .render()
             .is_err()
     );
 }

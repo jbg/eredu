@@ -5,22 +5,22 @@
 
 use std::collections::BTreeMap;
 
-use minijinja::machinery::{get_compiled_template, Instruction, Instructions};
-use serde_json::{json, Value};
+use minijinja::machinery::{Instruction, Instructions, get_compiled_template};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    chat_environment, load_model_chat_template_from_str, normalize_chat_template,
-    normalize_conditional_keyword_arguments, normalize_generation_blocks, selected_template_id,
-    ChatTemplateIdentity,
+    ChatTemplateIdentity, chat_environment, load_model_chat_template_from_str,
+    normalize_chat_template, normalize_conditional_keyword_arguments, normalize_generation_blocks,
+    selected_template_id,
 };
 
 /// Emits the actual ordinary compiler image selected from a full tokenizer config.
 ///
 /// This development operation allocates freely and may initialize ordinary
 /// globals/TLS. No original source owner, accounting fact, or renderer is created.
-/// The caller must pin the exact MiniJinja source and this output before using it
-/// as input to a separately reviewed constructor.
+/// The image describes the pinned public MiniJinja compiler for diagnostics;
+/// prepared chat always compiles source through the ordinary public API.
 pub fn emit(
     config: &str,
     model_id: &str,
@@ -34,7 +34,6 @@ pub fn emit(
     let after_generation = normalize_generation_blocks(raw);
     let after_keywords = normalize_conditional_keyword_arguments(&after_generation);
     let normalized = normalize_chat_template(raw);
-    assert_eq!(after_keywords, normalized);
     let mut environment = chat_environment();
     environment.add_template_owned(name.clone(), normalized.clone())?;
     let template = environment.get_template(&name)?;
@@ -65,6 +64,7 @@ pub fn emit(
             "selected_source": raw,
             "after_generation_blocks": after_generation,
             "after_conditional_keywords": after_keywords,
+            "after_slice_compatibility": normalized,
             "compiled_source": compiled.instructions.source(),
             "unchanged": raw == normalized,
         },
@@ -82,7 +82,7 @@ pub fn emit(
         "free_names": free_names,
         "root": program(&compiled.instructions)?,
         "blocks": blocks,
-        "geometry_status": "raw compiler instructions and targets; checked closed-profile geometry pending",
+        "geometry_status": "compiler diagnostics without allocation guarantees",
         "accounting_authority": false,
     }))
 }
@@ -139,9 +139,11 @@ mod tests {
         let instructions = result["root"]["instructions"].as_array().unwrap();
         assert!(!instructions.is_empty());
         assert_eq!(result["root"]["instruction_count"], instructions.len());
-        assert!(instructions
-            .iter()
-            .any(|r| r["instruction"]["op"] == "PushLoop"));
+        assert!(
+            instructions
+                .iter()
+                .any(|r| r["instruction"]["op"] == "PushLoop")
+        );
         assert!(instructions.iter().all(|r| r["line"].as_u64().is_some()));
         for (pc, instruction) in instructions.iter().enumerate() {
             assert_eq!(instruction["pc"], pc);
@@ -176,6 +178,19 @@ mod tests {
             "{%- if true %}hello{%- endif %}"
         );
         assert_eq!(result["normalization"]["unchanged"], false);
+        let slice = emit(&config("{{ 'abc'[::-1] }}"), "chat").unwrap();
+        assert_eq!(
+            slice["normalization"]["after_conditional_keywords"],
+            "{{ 'abc'[::-1] }}"
+        );
+        assert_ne!(
+            slice["normalization"]["after_conditional_keywords"],
+            slice["normalization"]["compiled_source"]
+        );
+        assert_eq!(
+            slice["normalization"]["after_slice_compatibility"],
+            slice["normalization"]["compiled_source"]
+        );
     }
 
     #[test]

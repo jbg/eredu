@@ -17,17 +17,18 @@ use std::{
 
 /// Immutable full-schema completion source supplied by facade policy.
 /// Implementations retain their exact compiled source and paid source account.
-/// Validation uses the ordinary validator, paying every reached scratch worker;
-/// it must refuse before an unqualified worker and retain its first failure.
+/// Validation uses the ordinary validator with admitted host-work estimates,
+/// and retains the first failure with its source and funding account.
 pub trait OriginalToolValidation: std::fmt::Debug + Send + Sync {
     /// Whether this exact source retains tagged parameter semantics for a tool.
     fn contains_tagged_tool(&self, _name: &str) -> bool { false }
     /// Check the original required field list against actual consumed names.
     fn tagged_missing_required(&self, _name: &str, _parameters: &eredu_text::semantic_channels::tagged::TaggedParameters) -> bool { true }
     /// Interpret one tagged value through the shared text worker and its actual
-    /// original parameter validator. JSON-only sources do not provide this capability.
-    fn parse_tagged_parameter(&self, _name: &str, _parameter: &str, _declared: Option<&str>, _raw: &str,
-        _allocation: &dyn serde_json::allocation::Allocation, _funding: &eredu_nn::workspace::HostMetadataFunding)
+    /// original parameter validator. The caller reserves JSON/container headroom
+    /// for its finite input limit; `funding` admits the validator's separate work.
+    /// JSON-only sources do not provide this capability.
+    fn parse_tagged_parameter(&self, _name: &str, _parameter: &str, _declared: Option<&str>, _raw: &str, _funding: &eredu_nn::workspace::HostMetadataFunding)
         -> Result<serde_json::Value, eredu_core::BackendFailure> {
         Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure())
     }

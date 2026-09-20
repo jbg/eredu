@@ -5,6 +5,18 @@ use eredu_core::{AttentionPolicy, LayerSchedule, cache::*};
 #[derive(Debug)]
 struct Facts;
 impl WorkspaceMechanisms for Facts {
+    fn output_representation(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<eredu_nn::workspace::WorkspaceRepresentation> {
+        // Every floating source and primitive in this fixture uses f32.
+        Some(eredu_nn::workspace::WorkspaceRepresentation::new(
+            eredu_nn::workspace::WorkspaceFloatingType::Float32,
+            false,
+        ))
+    }
+
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,
@@ -16,7 +28,10 @@ impl WorkspaceMechanisms for Facts {
                 .map(|layout| {
                     if matches!(
                         op.kind,
-                        WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. } | WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)
+                        WorkspaceOperationKind::Index { .. }
+                            | WorkspaceOperationKind::StaticSlice { .. }
+                            | WorkspaceOperationKind::View(_)
+                            | WorkspaceOperationKind::Transpose(_)
                     ) {
                         Ok(WorkspaceOutputStorage::AliasInput(0))
                     } else {

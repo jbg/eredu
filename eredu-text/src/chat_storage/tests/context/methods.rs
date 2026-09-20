@@ -71,6 +71,8 @@ fn released_message_get_calls_keep_eager_arguments_and_escaped_output_custody() 
             .render_plan_with_context(
                 ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
             )
+            .unwrap()
+            .render()
             .is_err()
     );
     let skipped = compare(
@@ -83,18 +85,17 @@ fn released_message_get_calls_keep_eager_arguments_and_escaped_output_custody() 
 }
 
 #[test]
-fn mapping_get_refuses_other_receivers_calls_and_unavailable_generated_keys() {
+fn mapping_get_preserves_dynamic_receiver_errors_and_generated_keys() {
     for template in [
         "{{ map.get() }}",
         "{{ map.get('key', 1, 2) }}",
         "{{ map.get(key='key') }}",
         "{{ map.pop('key') }}",
     ] {
-        let refused = match ChatTemplatePlan::prepare_utf8(template, "refused") {
-            Ok(plan) => plan.compile().is_err(),
-            Err(_) => true,
-        };
-        assert!(refused);
+        compare_outcome(
+            template,
+            json!({"map":{},"text":"text"}).as_object().unwrap(),
+        );
     }
     for value in [json!([1, 2]), json!("text"), json!(null), json!(4)] {
         let source = ChatTemplatePlan::prepare_utf8("{{ value.get('key') }}", "receiver")
@@ -107,21 +108,19 @@ fn mapping_get_refuses_other_receivers_calls_and_unavailable_generated_keys() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
     }
-    let source = ChatTemplatePlan::prepare_utf8("{{ map.get(left + right, 'default') }}", "key")
-        .unwrap()
-        .compile()
-        .unwrap();
     let caller = json!({"map":{"ab":"found"},"left":"a","right":"b"});
-    assert!(
-        source
-            .render_plan_with_context(
-                ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-            )
-            .is_err()
+    let rendered = compare(
+        "{{ map.get(left + right, 'default') }}",
+        &[],
+        &serde_json::Map::new(),
+        caller.as_object().unwrap(),
     );
+    assert_eq!(rendered.prompt(false), "found");
 }
 
 #[test]
@@ -174,6 +173,8 @@ fn released_string_edges_match_borrowed_unicode_sequences_and_short_circuit() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
     }
@@ -182,11 +183,10 @@ fn released_string_edges_match_borrowed_unicode_sequences_and_short_circuit() {
         "{{ text.endswith('x', 1) }}",
         "{{ text.startswith(prefix='x') }}",
     ] {
-        let refused = match ChatTemplatePlan::prepare_utf8(template, "edge-args") {
-            Ok(plan) => plan.compile().is_err(),
-            Err(_) => true,
-        };
-        assert!(refused);
+        compare_outcome(
+            template,
+            json!({"map":{},"text":"text"}).as_object().unwrap(),
+        );
     }
 }
 
@@ -199,30 +199,45 @@ fn generated_string_edges_preserve_unicode_and_short_circuit_sequence_candidates
         "{% set text=[left,right]|join('') %}{{ text.startswith([left]+[none]) }}|{{ text.endswith([]) }}|{{ text.startswith('') }}",
         "{% macro content() %}{{ left }}{{ right }}{% endmacro %}{{ content().endswith('界'+tail) }}",
     ] {
-        compare(template, &[], &serde_json::Map::new(), caller.as_object().unwrap());
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
     }
 }
 
 #[test]
 fn generation_blocks_share_normalized_source_and_whitespace_controls() {
-    let caller=json!({"text":"É界🙂"});
+    let caller = json!({"text":"É界🙂"});
     for template in [
         " before {%- generation -%}{{ text }}{%- endgeneration -%} after ",
         "{% generation %}{% if text %}{{ text }}{% endif %}{% endgeneration %}",
         "{% generation %}{% generation %}{{ text }}{% endgeneration %}{% endgeneration %}",
         "{# {% generation %} #}{{ text }}{# {% endgeneration %} #}",
     ] {
-        compare(template,&[],&serde_json::Map::new(),caller.as_object().unwrap());
+        compare(
+            template,
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
+        );
     }
 }
 
 #[test]
-fn normalized_templates_retain_original_configuration_identity(){
+fn normalized_templates_retain_original_configuration_identity() {
     use crate::tokenizer::ModelChatTemplate;
-    let raw="{% generation %}{{ text }}{% endgeneration %}";
-    let normalized="{% if true %}{{ text }}{% endif %}";
-    let source=ChatTemplatePlan::prepare_utf8(raw,"identity").unwrap().compile().unwrap();
-    assert!(source.matches_configuration(&ModelChatTemplate::Single(raw.into()),"identity"));
-    assert!(!source.matches_configuration(&ModelChatTemplate::Single(normalized.into()),"identity"));
-    assert!(!source.matches_configuration(&ModelChatTemplate::Single(raw.into()),"other"));
+    let raw = "{% generation %}{{ text }}{% endgeneration %}";
+    let normalized = "{% if true %}{{ text }}{% endif %}";
+    let source = ChatTemplatePlan::prepare_utf8(raw, "identity")
+        .unwrap()
+        .compile()
+        .unwrap();
+    assert!(source.matches_configuration(&ModelChatTemplate::Single(raw.into()), "identity"));
+    assert!(
+        !source.matches_configuration(&ModelChatTemplate::Single(normalized.into()), "identity")
+    );
+    assert!(!source.matches_configuration(&ModelChatTemplate::Single(raw.into()), "other"));
 }

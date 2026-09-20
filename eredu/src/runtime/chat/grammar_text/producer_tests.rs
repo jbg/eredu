@@ -5,28 +5,27 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-#[derive(Debug, thiserror::Error)]
-#[error("grammar producer funding refused")]
-struct Refused;
-
 pub(crate) fn every_refusal(
-    mut render: impl FnMut(&ParserAllocationFunding) -> Result<String, Error>,
+    mut render: impl FnMut(&PreparationFunding) -> Result<String, Error>,
 ) -> String {
-    let ordinary = render(&ParserAllocationFunding::unenforced()).unwrap();
+    let ordinary = render(&PreparationFunding::unmanaged()).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let bytes = Arc::new(AtomicUsize::new(0));
     let tally = calls.clone();
     let total = bytes.clone();
-    let funding = ParserAllocationFunding::prepare(move |bytes| {
+    let funding = crate::runtime::chat::preparation_memory::test_funding(move |bytes| {
         tally.fetch_add(1, Ordering::Relaxed);
         total.fetch_add(bytes, Ordering::Relaxed);
-        Ok::<_, Refused>(())
+        Ok::<_, eredu_core::HostMetadataFundingError>(())
     })
     .unwrap();
     let expected = render(&funding).unwrap();
     assert_eq!(ordinary, expected);
     let reached = calls.load(Ordering::Relaxed);
-    assert!(reached > 2);
+    assert!(
+        reached > 1,
+        "at least one producer reservation beyond its account"
+    );
     eprintln!(
         "grammar output {} bytes; {} reservation requests; {} cumulative bytes",
         expected.len(),
@@ -36,9 +35,12 @@ pub(crate) fn every_refusal(
     for fail in 1..reached {
         let calls = Arc::new(AtomicUsize::new(0));
         let tally = calls.clone();
-        let funding = ParserAllocationFunding::prepare(move |_| {
+        let funding = crate::runtime::chat::preparation_memory::test_funding(move |_| {
             if tally.fetch_add(1, Ordering::Relaxed) == fail {
-                Err(Refused)
+                Err(eredu_core::HostMetadataFundingError::Capacity {
+                    required: 1,
+                    available: 0,
+                })
             } else {
                 Ok(())
             }
@@ -49,7 +51,10 @@ pub(crate) fn every_refusal(
         while let Some(next) = cause.source() {
             cause = next;
         }
-        assert!(cause.is::<Refused>(), "failure {fail}: {error:?}");
+        assert!(
+            cause.is::<eredu_core::HostMetadataFundingError>(),
+            "failure {fail}: {error:?}"
+        );
         assert_eq!(
             calls.load(Ordering::Relaxed),
             fail + 1,

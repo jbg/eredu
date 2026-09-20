@@ -14,7 +14,9 @@ use crate::tokenizer::TokenizerSnapshot;
 pub(crate) mod compiler;
 pub use compiler::{DecodeCompileFailure, DecodeCompilePlan, DecodeCompileRequirements};
 
-use tokenizers::decoders::fixed_profile::{FallbackOrder, Profile as Mode};
+mod mode;
+use mode::FallbackOrder;
+pub(crate) use mode::Mode;
 
 #[derive(Debug)]
 struct Record {
@@ -28,6 +30,10 @@ struct Record {
 /// Cold compilation could not produce a supported exact decoder program.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeSourceError {
+    /// Distinct model spellings cannot share one decoding ID. Model/added-token
+    /// aliases are permitted and keep upstream added-token precedence.
+    #[error("model vocabulary contains duplicate token ID {0}")]
+    DuplicateModelId(u32),
     /// This decoder form has no fixed-destination lowering in this module yet.
     #[error("unsupported fixed-destination decoder form")]
     UnsupportedDecoder,
@@ -157,15 +163,23 @@ impl PreparedDecodeSource {
                 }
                 lossy_into(&raw[..len], text)
             }
-            Mode::Metaspace { replacement, remove_first } => {
+            Mode::Metaspace {
+                replacement,
+                remove_first,
+            } => {
                 let mut len = 0;
                 let mut first = true;
                 for id in ids {
                     if let Some(piece) = self.piece(*id, skip_special) {
-                        let piece = std::str::from_utf8(piece).expect("original UTF-8 token spelling");
-                        for c in tokenizers::pre_tokenizers::metaspace::decode_piece(
-                            piece, replacement, first && remove_first,
-                        ) {
+                        let piece =
+                            std::str::from_utf8(piece).expect("original UTF-8 token spelling");
+                        for mut c in piece.chars() {
+                            if c == replacement {
+                                if first && remove_first {
+                                    continue;
+                                }
+                                c = ' ';
+                            }
                             let end = len + c.len_utf8();
                             c.encode_utf8(&mut text[len..end]);
                             len = end;

@@ -84,9 +84,8 @@ fn published_file_keeps_exact_disk_reservation_across_aliases_and_failed_commit(
     drop(escaped);
     assert!(!path.exists());
     assert_eq!(pool.report().unwrap().current_disk_bytes, 0);
-    // Empty canonical reservation storage is still installed in the real pool.
-    // Its metadata account retires with that table, separately from file bytes.
-    assert!(!account.retired.load(Ordering::SeqCst));
+    // Removing the last reservation also retires the empty paid table.
+    assert!(account.retired.load(Ordering::SeqCst));
     drop(pool);
     assert!(account.retired.load(Ordering::SeqCst));
 }

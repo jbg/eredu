@@ -790,7 +790,7 @@ pub(crate) fn inspect_chat_from_parts(
         .map_err(|cause| cause.ordinary(&profile, &request))?
         .into_owned();
     let compiler = constraint_compiler.and_then(|compiler| compiler.as_ref().ok());
-    let unbounded = llguidance::derivre::ParserAllocationFunding::unenforced();
+    let unbounded = crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged();
     let funding = compiler.map_or(&unbounded, ConstraintCompiler::allocation_funding);
     let policy = policy::CompiledChatPolicy::compile(
         &profile,

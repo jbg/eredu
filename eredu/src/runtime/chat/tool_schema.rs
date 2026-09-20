@@ -40,7 +40,7 @@ impl ToolSchemas {
     ) -> Result<Self, String> {
         let declarations = ToolDeclarations::prepare(
             tools,
-            &llguidance::derivre::ParserAllocationFunding::unenforced(),
+            &crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
         )
         .map_err(|e| e.to_string())?;
         let schemas = declarations

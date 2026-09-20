@@ -3,7 +3,7 @@ use super::{
     CompilerSource, CompilerSourceCause, ConstraintCompiler, ConstraintCompilerSourceError,
 };
 use eredu_core::{HostMetadataFunding, HostMetadataFundingError};
-use eredu_runtime::working_memory::OriginalTokenizer;
+use eredu_runtime::working_memory::{DependencyMemoryPolicy, OriginalTokenizer};
 use llguidance::toktrie::{INVALID_TOKEN, TokRxInfo};
 use std::mem::{size_of, size_of_val};
 
@@ -20,6 +20,19 @@ impl ConstraintCompiler {
         eos_token_ids: &[u32],
         funding: &HostMetadataFunding,
     ) -> Result<Self, ConstraintCompilerSourceError> {
+        Self::from_original_tokenizer_with_memory_policy(
+            tokenizer,
+            eos_token_ids,
+            funding,
+            DependencyMemoryPolicy::default(),
+        )
+    }
+    pub(crate) fn from_original_tokenizer_with_memory_policy(
+        tokenizer: OriginalTokenizer,
+        eos_token_ids: &[u32],
+        funding: &HostMetadataFunding,
+        memory: DependencyMemoryPolicy,
+    ) -> Result<Self, ConstraintCompilerSourceError> {
         let retain = |cause| ConstraintCompilerSourceError {
             cause,
             source: CompilerSource::Tokenizer(tokenizer.clone()),
@@ -32,8 +45,12 @@ impl ConstraintCompiler {
             size_of::<CompilerSourceCause>(),
             size_of::<CompilerSource>(),
             size_of::<OriginalTokenizer>(),
-            size_of::<Result<OriginalTokenizer, eredu_runtime::working_memory::OriginalTokenizerPrefixError>>(
-            ),
+            size_of::<
+                Result<
+                    OriginalTokenizer,
+                    eredu_runtime::working_memory::OriginalTokenizerPrefixError,
+                >,
+            >(),
             size_of::<TokRxInfo>(),
             size_of::<(&OriginalTokenizer, &[u32], &HostMetadataFunding)>(),
             size_of_val(&tokenizer.ids()),
@@ -89,6 +106,6 @@ impl ConstraintCompiler {
         let trie = normalized
             .compile_token_trie_source(&info, eos_token_ids)
             .map_err(|error| retain(CompilerSourceCause::Trie(error)))?;
-        Self::from_original_source(trie, funding)
+        Self::from_original_source_with_memory_policy(trie, funding, memory)
     }
 }

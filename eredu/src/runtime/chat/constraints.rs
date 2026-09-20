@@ -6,10 +6,11 @@ pub(crate) mod fixtures;
 pub(crate) mod forbidden;
 #[cfg(test)]
 mod frozen_tests;
+mod grammar_source;
 #[cfg(test)]
 mod released_funding_probe;
-mod grammar_source;
 mod source;
+mod stock_parser;
 pub(crate) use grammar_source::OriginalPreparedGrammarController;
 mod grammar_policy;
 mod original;
@@ -33,10 +34,10 @@ use eredu_core::{
     TextControllerStorage, TokenFilter, TokenFilterController,
 };
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
-use llguidance::{toktrie::TokEnv, ParserFactory};
 #[cfg(test)]
 use llguidance::Matcher;
-use serde_json::{json, Value};
+use llguidance::{ParserFactory, toktrie::TokEnv};
+use serde_json::{Value, json};
 
 use super::tool_schema::{ToolDeclarations, ToolDefinition};
 
@@ -486,12 +487,11 @@ fn constraint_error(error: String) -> ConstraintError {
 pub(crate) struct ConstraintCompiler {
     factory: Option<Arc<ParserFactory>>,
     original_trie: Option<eredu_runtime::working_memory::OriginalTokenTrieSource>,
-    allocation_funding: llguidance::derivre::ParserAllocationFunding,
-    extra_lexemes: Vec<String>,
+    allocation_funding: crate::runtime::chat::preparation_memory::PreparationFunding,
+    environment: Arc<stock_parser::Environment>,
     eos_token_ids: Vec<u32>,
     tokenizer_json: Option<Vec<u8>>,
     grammar_tokenizer: Option<super::tokenizer_env::recipe::FrozenGrammarTokenizer>,
-    slicer_source: Option<llguidance::earley::SlicerSource>,
     #[cfg(test)]
     tokenizer_analysis_runs: usize,
     #[cfg(test)]
@@ -515,8 +515,7 @@ struct CompiledDeclaration {
 
 #[derive(Debug)]
 enum DeclarationConstructionError<E> {
-    Grammar(llguidance::earley::GrammarCompilationError),
-    Warnings(DeclarationWarnings),
+    Grammar(stock_parser::Error),
     Source(E),
     #[cfg(test)]
     Fixture(String),
@@ -525,7 +524,6 @@ impl<E: std::fmt::Display> std::fmt::Display for DeclarationConstructionError<E>
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Grammar(error) => error.fmt(f),
-            Self::Warnings(error) => error.fmt(f),
             Self::Source(error) => error.fmt(f),
             #[cfg(test)]
             Self::Fixture(error) => f.write_str(error),
@@ -536,32 +534,12 @@ impl<E: std::error::Error + 'static> std::error::Error for DeclarationConstructi
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Grammar(error) => Some(error),
-            Self::Warnings(error) => Some(error),
             Self::Source(error) => Some(error),
             #[cfg(test)]
             Self::Fixture(_) => None,
         }
     }
 }
-
-#[derive(Debug)]
-struct DeclarationWarnings(llguidance::earley::CGrammar);
-impl std::fmt::Display for DeclarationWarnings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("tool grammar produced unsupported warnings: ")?;
-        for (index, (message, count)) in self.0.lexer_spec().warnings().enumerate() {
-            if index > 0 {
-                f.write_str("; ")?;
-            }
-            f.write_str(message)?;
-            if count > 1 {
-                write!(f, " ({count} times)")?;
-            }
-        }
-        Ok(())
-    }
-}
-impl std::error::Error for DeclarationWarnings {}
 
 #[derive(Debug, thiserror::Error)]
 enum CompilerSourceCause {
@@ -574,15 +552,13 @@ enum CompilerSourceCause {
     #[error("EOS token ID {0} has no consistent tokenizer mapping")]
     Eos(u32),
     #[error(transparent)]
-    Callback(
-        llguidance::derivre::ParserAllocationPreparationError<eredu_core::HostMetadataFundingError>,
-    ),
-    #[error(transparent)]
-    Storage(llguidance::derivre::ParserStorageError),
-    #[error(transparent)]
-    Metadata(eredu_core::HostMetadataFundingError),
-    #[error("tokenizer slice recognition failed: {0}")]
-    Recognition(#[source] llguidance::earley::SlicerRecognitionError),
+    Storage(crate::runtime::chat::preparation_memory::StorageFailure),
+    #[error("{0}")]
+    Metadata(#[source] eredu_core::HostMetadataFundingError),
+    #[error("grammar environment construction failed: {0}")]
+    Parser(#[source] stock_parser::Error),
+    #[error("tokenizer analysis failed: {0}")]
+    Analysis(#[source] anyhow::Error),
 }
 
 /// Source construction failure retains its actual trie and funding after any
@@ -604,102 +580,99 @@ enum CompilerSource {
 
 impl ConstraintCompiler {
     /// Retains the same producer account for facade metadata construction.
-    pub(crate) fn allocation_funding(&self) -> &llguidance::derivre::ParserAllocationFunding {
+    pub(crate) fn allocation_funding(
+        &self,
+    ) -> &crate::runtime::chat::preparation_memory::PreparationFunding {
         &self.allocation_funding
     }
 
-    /// Compiles declarations from an already accepted tokenizer trie. Source
-    /// recognition and grammar construction share the ordinary dependency workers.
-    /// Each reached compiler destination uses its prospective allocation hook;
-    /// the source and metadata account remain distinct retained authorities.
+    /// Analyzes the accepted trie with stock public APIs. Compiler headroom and
+    /// facade-owned destinations retain the original metadata account.
     pub(crate) fn from_original_source(
         trie: eredu_runtime::working_memory::OriginalTokenTrieSource,
         funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, ConstraintCompilerSourceError> {
+        Self::from_original_source_with_memory_policy(
+            trie,
+            funding,
+            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+        )
+    }
+    pub(crate) fn from_original_source_with_memory_policy(
+        trie: eredu_runtime::working_memory::OriginalTokenTrieSource,
+        funding: &eredu_core::HostMetadataFunding,
+        memory: eredu_runtime::working_memory::DependencyMemoryPolicy,
     ) -> Result<Self, ConstraintCompilerSourceError> {
         let retain = |cause| ConstraintCompilerSourceError {
             cause,
             source: CompilerSource::Trie(trie.clone()),
             funding: funding.clone(),
         };
-        let controls = [
-            std::mem::size_of::<Self>(),
-            std::mem::size_of::<ConstraintCompilerSourceError>(),
-            std::mem::size_of::<Result<Self, ConstraintCompilerSourceError>>(),
-            std::mem::size_of::<Vec<String>>(),
-            std::mem::size_of::<Vec<u32>>(),
-            std::mem::size_of::<std::slice::Iter<'_, &str>>(),
-            std::mem::size_of::<String>(),
-            std::mem::size_of::<llguidance::earley::SlicerSource>(),
-            std::mem::size_of::<llguidance::earley::SlicerRecognitionError>(),
-            std::mem::size_of::<
-                Result<
-                    llguidance::earley::SlicerSource,
-                    llguidance::earley::SlicerRecognitionError,
-                >,
-            >(),
-            std::mem::size_of::<llguidance::derivre::ParserAllocationFunding>(),
-            std::mem::size_of::<(
-                &eredu_runtime::working_memory::OriginalTokenTrieSource,
-                &eredu_core::HostMetadataFunding,
-            )>(),
-            eredu_core::HostMetadataFunding::reservation_control_bytes(),
-        ];
-        let bytes = controls
-            .into_iter()
-            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+        let allocation_funding =
+            crate::runtime::chat::preparation_memory::PreparationFunding::from_metadata(funding)
+                .with_memory_policy(memory);
+        let environment = stock_parser::Environment::new(
+            stock_parser::TokenizerSource::Original(trie.clone()),
+            &allocation_funding,
+        )
+        .map_err(|error| retain(CompilerSourceCause::Parser(error)))?;
+        let input_bytes = (0..trie.trie().vocab_size())
+            .try_fold(0usize, |total, id| {
+                total
+                    .checked_add(trie.trie().token_len(id as u32))?
+                    .checked_add(std::mem::size_of::<u32>())
+            })
+            .ok_or_else(|| {
+                retain(CompilerSourceCause::Metadata(
+                    eredu_core::HostMetadataFundingError::Overflow,
+                ))
+            })?;
+        let headroom = allocation_funding
+            .memory_policy()
+            .estimate(input_bytes)
+            .and_then(|n| {
+                n.checked_add(eredu_nn::workspace::WorkspaceContext::metadata_arc_bytes::<
+                    ParserFactory,
+                >()?)
+            })
+            .and_then(|n| {
+                n.checked_add(HostPreparationAuthority::retention_bytes::<
+                    eredu_core::HostMetadataFunding,
+                >()?)
+            })
             .ok_or_else(|| {
                 retain(CompilerSourceCause::Metadata(
                     eredu_core::HostMetadataFundingError::Overflow,
                 ))
             })?;
         funding
-            .reserve_metadata(bytes)
+            .reserve_metadata(headroom)
             .map_err(|error| retain(CompilerSourceCause::Metadata(error)))?;
-        let allocation_funding = llguidance::derivre::ParserAllocationFunding::prepare({
-            let funding = funding.clone();
-            move |bytes| funding.reserve_metadata(bytes)
-        })
-        .map_err(|error| retain(CompilerSourceCause::Callback(error)))?;
-        let patterns = llguidance::earley::SlicedBiasComputer::general_slice_patterns();
-        let mut regexes = Vec::new();
-        allocation_funding
-            .try_grow_vec(&mut regexes, patterns.len())
-            .map_err(|error| retain(CompilerSourceCause::Storage(error)))?;
-        for pattern in patterns {
-            let pattern = allocation_funding
-                .try_copy_str(pattern)
-                .map_err(|error| retain(CompilerSourceCause::Storage(error)))?;
-            regexes.push(pattern);
-        }
-        let slicer_source = llguidance::earley::SlicerSource::recognize(
-            trie.trie(),
-            &regexes,
-            allocation_funding.clone(),
-        )
-        .map_err(|error| retain(CompilerSourceCause::Recognition(error)))?;
+        let token_env: TokEnv = environment.clone();
+        let mut factory = ParserFactory::new_simple(&token_env)
+            .map_err(|error| retain(CompilerSourceCause::Analysis(error)))?;
+        environment
+            .take_failure()
+            .map_err(|error| retain(CompilerSourceCause::Parser(error)))?;
+        factory.quiet();
         let mut eos_token_ids = Vec::new();
-        allocation_funding
-            .try_extend_copy(&mut eos_token_ids, trie.trie().eos_tokens())
-            .map_err(|error| retain(CompilerSourceCause::Storage(error)))?;
-        let authority_bytes =
-            HostPreparationAuthority::retention_bytes::<eredu_core::HostMetadataFunding>()
-                .ok_or_else(|| {
-                    retain(CompilerSourceCause::Storage(
-                        allocation_funding.storage_overflow(),
-                    ))
-                })?;
-        funding
-            .reserve_metadata(authority_bytes)
-            .map_err(|error| retain(CompilerSourceCause::Metadata(error)))?;
+        for &id in trie.trie().eos_tokens() {
+            // Stock toktrie retains INVALID_TOKEN for an absent primary EOS.
+            // Public policy metadata contains only actual vocabulary IDs.
+            if (id as usize) < trie.trie().vocab_size() {
+                allocation_funding
+                    .try_push(&mut eos_token_ids, id)
+                    .map_err(|error| retain(CompilerSourceCause::Storage(error)))?;
+            }
+        }
         Ok(Self {
-            factory: None,
+            factory: Some(Arc::new(factory)),
             original_trie: Some(trie),
             allocation_funding,
-            extra_lexemes: regexes,
+            environment,
             eos_token_ids,
             tokenizer_json: None,
             grammar_tokenizer: None,
-            slicer_source: Some(slicer_source),
             #[cfg(test)]
             tokenizer_analysis_runs: 1,
             #[cfg(test)]
@@ -763,30 +736,26 @@ impl ConstraintCompiler {
         tokenizer_json: Option<Vec<u8>>,
         authority: &HostPreparationAuthority,
     ) -> Result<Self, String> {
+        let allocation_funding =
+            crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged();
+        let environment = stock_parser::Environment::new(
+            stock_parser::TokenizerSource::Ordinary(token_env),
+            &allocation_funding,
+        )
+        .map_err(|error| error.to_string())?;
+        let token_env: TokEnv = environment.clone();
         let mut factory = ParserFactory::new_simple(&token_env)
             .map_err(|error| format!("failed to analyze tokenizer trie: {error}"))?;
         factory.quiet();
-        let slicer_source = tokenizer_json
-            .as_ref()
-            .map(|_| {
-                factory
-                    .slicer()
-                    .source_plan()
-                    .map_err(|error| error.to_string())?
-                    .compile()
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        let extra_lexemes = factory.extra_lexemes().to_vec();
         Ok(Self {
             factory: Some(Arc::new(factory)),
             original_trie: None,
-            allocation_funding: llguidance::derivre::ParserAllocationFunding::unenforced(),
-            extra_lexemes,
+            allocation_funding:
+                crate::runtime::chat::preparation_memory::PreparationFunding::unmanaged(),
+            environment,
             eos_token_ids,
             tokenizer_json,
             grammar_tokenizer: None,
-            slicer_source,
             #[cfg(test)]
             tokenizer_analysis_runs: 1,
             #[cfg(test)]
@@ -939,7 +908,6 @@ impl ConstraintCompiler {
             trigger,
             *self.trie().info(),
             self.grammar_tokenizer.as_ref(),
-            self.slicer_source.as_ref(),
             &self.allocation_funding,
             &self._authority,
         )?;
@@ -962,10 +930,7 @@ impl ConstraintCompiler {
                         if match &error {
                             PreparationCause::Declaration(
                                 DeclarationConstructionError::Grammar(cause),
-                            ) => !cause.is_storage_failure(),
-                            PreparationCause::Declaration(
-                                DeclarationConstructionError::Warnings(_),
-                            ) => true,
+                            ) => cause.allows_schema_fallback(),
                             _ => false,
                         } =>
                     {
@@ -1032,13 +997,12 @@ impl ConstraintCompiler {
     fn compile_grammar(
         &self,
         grammar: llguidance::api::TopLevelGrammar,
-    ) -> Result<llguidance::earley::CGrammar, llguidance::earley::GrammarCompilationError> {
-        llguidance::api::GrammarInit::Serialized(grammar).to_cgrammar(
-            Some(self.trie()),
-            &mut llguidance::Logger::new(0, 0),
-            llguidance::api::ParserLimits::default(),
-            &self.extra_lexemes,
-            self.allocation_funding.clone(),
+    ) -> Result<stock_parser::Template, stock_parser::Error> {
+        stock_parser::Template::compile(
+            self.factory.as_ref().expect("compiler factory"),
+            self.environment.clone(),
+            grammar,
+            &self.allocation_funding,
         )
     }
 
@@ -1047,35 +1011,14 @@ impl ConstraintCompiler {
         &self,
         grammar: llguidance::api::TopLevelGrammar,
     ) -> Result<Matcher, String> {
-        let max_tokens = grammar.max_tokens;
         let compiled = self
             .compile_grammar(grammar)
             .map_err(|error| error.to_string())?;
-        if compiled.lexer_spec().warnings().len() != 0 {
-            return Err(DeclarationWarnings(compiled).to_string());
+        let matcher = Matcher::new(compiled.fixture_parser().map_err(anyhow::Error::new));
+        match matcher.get_error() {
+            Some(error) => Err(error),
+            None => Ok(matcher),
         }
-        self.matcher_from_compiled(compiled, max_tokens)
-    }
-
-    #[cfg(test)]
-    fn matcher_from_compiled(
-        &self,
-        grammar: llguidance::earley::CGrammar,
-        max_tokens: Option<usize>,
-    ) -> Result<Matcher, String> {
-        let grammar =
-            llguidance::earley::SharedGrammar::new(grammar).map_err(|error| error.to_string())?;
-        let parser = self
-            .factory
-            .as_ref()
-            .expect("fixture parser environment")
-            .create_parser_from_compiled(grammar, max_tokens)
-            .map_err(|error| format!("failed to initialize tool grammar: {error}"))?;
-        let matcher = Matcher::new(Ok(parser));
-        if let Some(error) = matcher.get_error() {
-            return Err(format!("failed to initialize tool grammar: {error}"));
-        }
-        Ok(matcher)
     }
 
     fn compile_declaration(
@@ -1085,28 +1028,14 @@ impl ConstraintCompiler {
         CompiledDeclaration,
         DeclarationConstructionError<declaration::PendingGrammarDeclarationError>,
     > {
-        #[cfg(test)]
-        let max_tokens = grammar.max_tokens;
         let compiled = self
             .compile_grammar(grammar)
             .map_err(DeclarationConstructionError::Grammar)?;
-        if compiled.lexer_spec().warnings().len() != 0 {
-            return Err(DeclarationConstructionError::Warnings(DeclarationWarnings(
-                compiled,
-            )));
-        }
-        // Synthetic environments cannot be reconstructed from serialized input.
-        // Their independent fixture parser consumes an explicit declaration copy.
         #[cfg(test)]
-        let fixture_matcher = if self.factory.is_some() {
-            let copy = compiled
-                .source_copy_plan(&self.allocation_funding)
-                .and_then(|plan| plan.compile())
-                .map_err(|error| DeclarationConstructionError::Fixture(error.to_string()))?;
-            Some(
-                self.matcher_from_compiled(copy, max_tokens)
-                    .map_err(DeclarationConstructionError::Fixture)?,
-            )
+        let fixture_matcher = if self.original_trie.is_none() {
+            Some(Matcher::new(
+                compiled.fixture_parser().map_err(anyhow::Error::new),
+            ))
         } else {
             None
         };
@@ -1234,8 +1163,8 @@ mod tests {
 
     use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice};
     use crate::runtime::chat::dialect::{
-        DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
-        GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
+        DECLARATIVE_DIALECT, DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters,
+        ExactEnvelope, GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
     };
 
     #[test]
@@ -1245,14 +1174,14 @@ mod tests {
             TokenFilter, TokenFilterController,
         };
         use eredu_runtime::{
+            TokenDomain,
             execution_control::TokenChoiceController,
             generation::{ConstrainedSampler, DefaultSampler, SpeculativeSampler},
             working_memory::WorkspaceSamplingBackend,
-            TokenDomain,
         };
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         };
         struct Retires(Arc<AtomicBool>);
         impl Drop for Retires {
@@ -1296,13 +1225,15 @@ mod tests {
         let alias = copied.clone();
         let (decision, _) = plan(&copied).logits(&[1]).unwrap().into_parts();
         assert_eq!(decision.forced_token(), Some(2));
-        assert!(decision.source().validity().same_storage(
-            source
-                .controller()
-                .prepared_plain_source()
-                .unwrap()
-                .validity()
-        ));
+        assert!(
+            decision.source().validity().same_storage(
+                source
+                    .controller()
+                    .prepared_plain_source()
+                    .unwrap()
+                    .validity()
+            )
+        );
         assert!(plan(&copied).logits(&[0]).is_err());
         assert!(plan(&copied).logits(&[1, 1]).is_err());
         let refused = Arc::new(AtomicBool::new(false));
@@ -1359,13 +1290,13 @@ mod tests {
             TokenFilter, TokenFilterController,
         };
         use eredu_runtime::{
+            TokenDomain,
             generation::{ConstrainedSampler, DefaultSampler, SpeculativeSampler, TokenMaskPlan},
             working_memory::WorkspaceSamplingBackend,
-            TokenDomain,
         };
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         };
         struct Retires(Arc<AtomicBool>);
         impl Drop for Retires {
@@ -1436,9 +1367,11 @@ mod tests {
         assert!(!retired.load(Ordering::SeqCst));
         drop(stochastic);
         assert!(retired.load(Ordering::SeqCst));
-        assert!(TokenMaskPlan::new(&TokenFilter::All, &[1, 5], None)
-            .unwrap()
-            .is_identity());
+        assert!(
+            TokenMaskPlan::new(&TokenFilter::All, &[1, 5], None)
+                .unwrap()
+                .is_identity()
+        );
     }
 
     const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
@@ -1484,7 +1417,7 @@ mod tests {
     }
 
     fn activation_tokenizer(markers: &[&str], special: bool) -> super::ChatTokenizer {
-        use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+        use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
 
         let vocabulary = (b'!'..=b'~')
             .map(|byte| (byte as char).to_string())
@@ -1554,11 +1487,13 @@ mod tests {
                 assert!(controller.filter_at(&history).unwrap().allows(ids[0]));
                 controller.commit(ids[0]).unwrap();
                 assert!(controller.constraint_is_active());
-                assert!(!controller
-                    .valid_token_ids()
-                    .unwrap()
-                    .unwrap()
-                    .contains(&ids[1]));
+                assert!(
+                    !controller
+                        .valid_token_ids()
+                        .unwrap()
+                        .unwrap()
+                        .contains(&ids[1])
+                );
                 for &token in tokenizer.encode("[ping()]", false).unwrap().get_ids() {
                     controller.commit(token).unwrap();
                 }
@@ -1688,7 +1623,7 @@ mod tests {
     #[test]
     fn qwen_parallel_calls_remain_open_until_eos_or_call_limit() {
         use crate::runtime::chat::{
-            QWEN3_XML_TOOL_SPEC, QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC,
+            QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC, QWEN3_XML_TOOL_SPEC,
         };
 
         let json_call = "<tool_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</tool_call>";
@@ -1750,10 +1685,12 @@ mod tests {
                         max_calls.is_some()
                     );
                     if max_calls.is_some() {
-                        assert!(!controller
-                            .filter_at(&history)
-                            .unwrap()
-                            .allows(u32::from(b'\n')));
+                        assert!(
+                            !controller
+                                .filter_at(&history)
+                                .unwrap()
+                                .allows(u32::from(b'\n'))
+                        );
                     } else {
                         controller.commit(255).unwrap();
                         assert!(controller.grammar_is_complete().unwrap());
@@ -2030,9 +1967,11 @@ mod tests {
         ] {
             let output = json!({"calls": [{"name": "check", "arguments": arguments}]}).to_string();
             let mut grammar = plan.generation_constraint().grammar_matcher();
-            assert!(output
-                .bytes()
-                .any(|byte| grammar.consume_token(u32::from(byte)).is_err()));
+            assert!(
+                output
+                    .bytes()
+                    .any(|byte| grammar.consume_token(u32::from(byte)).is_err())
+            );
         }
     }
 

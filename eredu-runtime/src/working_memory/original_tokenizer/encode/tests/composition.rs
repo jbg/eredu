@@ -72,55 +72,6 @@ fn ordered_normalization_matches_ordinary_and_refuses_before_source_and_operatio
 }
 
 #[test]
-fn ordered_normalization_every_real_destination_failure_keeps_original_custody() {
-    let input = json();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let source = source(&pool, &input);
-    let c = source.original_bytes();
-    let text = "A E\u{301}<R>A";
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&source, text, false).unwrap();
-    // The two ping-pong text buffers, then the actual intermediate NFC plan's
-    // decomposition, recomposition and output destinations.
-    for stage in 6..11 {
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &source,
-                text,
-                false,
-                |p| p.fail_reservation(stage),
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert!(error.matches_source(&source));
-        assert_eq!(error.retained_bytes(), e);
-        let failure = error.encoding_failure().unwrap();
-        assert_eq!(failure.partial_id_count(), 0);
-        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(failure);
-        let mut reserve = false;
-        while let Some(error) = cause {
-            reserve |= error.is::<std::collections::TryReserveError>();
-            cause = error.source();
-        }
-        assert!(reserve, "stage {stage}");
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), c);
-    }
-    drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    for stage in 0..4 {
-        let p = TokenizerPlan::prepare_json(input.as_bytes())
-            .unwrap()
-            .fail_normalizer_reservation(stage);
-        let error = pool.compile_tokenizer(p).unwrap_err();
-        assert_eq!(error.retained_bytes(), c);
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
-}
-
-#[test]
 fn ordered_normalization_prefix_derivative_refreshes_actual_added_patterns() {
     let input = json();
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();

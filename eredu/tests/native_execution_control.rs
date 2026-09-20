@@ -440,6 +440,22 @@ fn text_matches_ordinary_sampling(family: &str) {
     ignore = "run with --no-default-features --features mlx"
 )]
 fn nanbeige_controlled_host_and_disk_residency_with_affine_transforms() {
+    nanbeige_controlled_residency(eredu_core::WeightTransformationPlan::Affine {
+        bits: 4,
+        group_size: 32,
+    });
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn nanbeige_controlled_host_and_disk_residency_preserves_checkpoint() {
+    nanbeige_controlled_residency(eredu_core::WeightTransformationPlan::PreserveCheckpoint);
+}
+
+fn nanbeige_controlled_residency(transformation: eredu_core::WeightTransformationPlan) {
     for residency in [
         eredu_core::ResidencyPlan::LayerwiseHost {
             device_layer_window: 1,
@@ -453,16 +469,84 @@ fn nanbeige_controlled_host_and_disk_residency_with_affine_transforms() {
             background_queue: 1,
         },
     ] {
-        for transform in [
-            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-            eredu_core::WeightTransformationPlan::Affine {
-                bits: 4,
-                group_size: 32,
-            },
-        ] {
-            text_matches_ordinary_sampling_with_policy("nanbeige", residency.clone(), transform);
-        }
+        text_matches_ordinary_sampling_with_policy("nanbeige", residency, transformation.clone());
     }
+}
+
+fn sampling_parity_settings(temperature: f32) -> PreparedChatGenerationSettings {
+    PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            temperature: Some(temperature),
+            ..Default::default()
+        },
+        seed: 827,
+        ..Default::default()
+    }
+}
+
+// Ordinary CPU workers cannot acquire managed startup custody retrospectively.
+// Keep the reference process independent of the controlled session's native owners.
+fn ordinary_sampling_reference(root: &Path, execution: &ExecutionPlan) -> Vec<Vec<u32>> {
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "ordinary_sampling_reference_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("EREDU_SAMPLING_REFERENCE_ROOT", root)
+        .env(
+            "EREDU_SAMPLING_REFERENCE_PLAN",
+            serde_json::to_string(execution).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "ordinary reference failed: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    let reference: Vec<Vec<u32>> =
+        serde_json::from_slice(&std::fs::read(root.join("ordinary-sampling.json")).unwrap())
+            .unwrap();
+    assert_eq!(reference.len(), 2);
+    reference
+}
+
+#[test]
+#[ignore = "invoked by sampling parity tests with an isolated native runtime"]
+fn ordinary_sampling_reference_worker() {
+    let root = PathBuf::from(std::env::var_os("EREDU_SAMPLING_REFERENCE_ROOT").unwrap());
+    let execution: ExecutionPlan =
+        serde_json::from_str(&std::env::var("EREDU_SAMPLING_REFERENCE_PLAN").unwrap()).unwrap();
+    let (mut model, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root, &execution)
+            .unwrap()
+            .into_parts();
+    let mut reference = Vec::new();
+    for temperature in [0.0, 1.7] {
+        let settings = sampling_parity_settings(temperature);
+        let resolved = model.resolve_generation_config(settings.overrides).unwrap();
+        let tokens: Vec<u32> = model
+            .generate_tokens(
+                vec![4, 2, 3, 7],
+                eredu_core::TextGenerationConfig::new(resolved).with_seed(settings.seed),
+            )
+            .unwrap()
+            .take(12)
+            .map(|token| token.unwrap().token_id().unwrap())
+            .collect();
+        assert_eq!(tokens.len(), 12);
+        assert!(tokens.iter().all(|id| *id < 32));
+        reference.push(tokens);
+        model.reset().unwrap();
+    }
+    std::fs::write(
+        root.join("ordinary-sampling.json"),
+        serde_json::to_vec(&reference).unwrap(),
+    )
+    .unwrap();
 }
 
 fn text_matches_ordinary_sampling_with_policy(
@@ -493,11 +577,12 @@ fn text_matches_ordinary_sampling_with_policy(
     let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_residency(residency)
         .with_weight_transformation(transformation);
+    let baselines = ordinary_sampling_reference(&root.0, &execution);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
             .into_parts();
-    for temperature in [0.0, 1.7] {
+    for (temperature, baseline) in [0.0, 1.7].into_iter().zip(&baselines) {
         let chat = model
             .source_chat(ChatTemplateRequest {
                 messages: vec![serde_json::json!({"role":"user", "content":"word4 right"})],
@@ -505,14 +590,7 @@ fn text_matches_ordinary_sampling_with_policy(
                 ..Default::default()
             })
             .unwrap();
-        let settings = PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                temperature: Some(temperature),
-                ..Default::default()
-            },
-            seed: 827,
-            ..Default::default()
-        };
+        let settings = sampling_parity_settings(temperature);
         let trace = TraceLimits {
             per_record_bytes: 16384,
             total_bytes: 65536,
@@ -524,17 +602,6 @@ fn text_matches_ordinary_sampling_with_policy(
         assert_eq!(resolved.top_p, 0.9);
         assert_eq!(resolved.repetition_penalty, 1.1);
         assert_eq!(resolved.max_new_tokens, Some(12));
-        let baseline: Vec<_> = model
-            .generate_tokens(
-                prompt.clone(),
-                eredu_core::TextGenerationConfig::new(resolved).with_seed(settings.seed),
-            )
-            .unwrap()
-            .take(12)
-            .map(|token| token.unwrap().token_id().unwrap())
-            .collect();
-        assert!(baseline.iter().all(|id| *id < 32));
-        model.reset().unwrap();
         let mut records = vec![];
         let mut request = PreparedChatRequest::new(&chat, original_settings(settings));
         request.output_mode = PreparedChatOutputMode::Text;
@@ -552,7 +619,7 @@ fn text_matches_ordinary_sampling_with_policy(
             Some(eredu_core::FinishReason::MaxTokens)
         );
         drop(run);
-        let expected = model.decode(&baseline, true).unwrap();
+        let expected = model.decode(baseline, true).unwrap();
         let actual: String = semantics(&records)
             .iter()
             .filter_map(|event| match event {
@@ -561,7 +628,11 @@ fn text_matches_ordinary_sampling_with_policy(
             })
             .collect();
         assert_eq!(actual, expected);
-        model.reset().unwrap();
+        model
+            .prepare_reset_ordinary()
+            .unwrap()
+            .reset_admitted(eredu_core::SessionResetLimits::new(8 * 1024 * 1024 * 1024))
+            .unwrap();
     }
 }
 
@@ -572,9 +643,7 @@ fn use_family_weights(root: &Path, family: &str) {
     match family {
         "qwen2" => {}
         "k2_horizon_dense" | "k2_horizon_mova" => {
-            let fixture: serde_json::Value = serde_json::from_str(include_str!(
-                "../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-            ))
+            let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
             .unwrap();
             let mut config = fixture[if family == "k2_horizon_dense" {
                 "dense"

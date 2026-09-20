@@ -362,6 +362,15 @@ impl NativeTextStateBackend for Host {
         std::mem::swap(&mut runtime.session_mut().native, &mut slot.native);
         Ok(())
     }
+    fn exchange_text_branch(
+        runtime: &mut ModelRuntime<Self>,
+        _: TextBranchSource<'_, Self>,
+        _: TextBranchSource<'_, Self>,
+        slot: &mut Saved,
+    ) -> io::Result<()> {
+        // This host fixture has no native submission or managed request account.
+        Self::exchange_native_text_state(runtime, slot)
+    }
 }
 // This semantic fixture has no managed component proof. Bounded copying is
 // rejected before either payload is cloned; full unquoted snapshots keep their
@@ -685,17 +694,24 @@ impl TextSamplingControlBackend for Host {
             has_rng: true,
         }
     }
-    fn install_sampling_override(
+    fn apply_sampling_override(
         runtime: &mut ModelRuntime<Self>,
         state: &mut Generation,
-        request: eredu_runtime::execution_control::ValidatedSamplingOverride,
-    ) -> io::Result<()> {
-        runtime.backend().copying("reseed")?;
+        _: Option<&TextStepContext>,
+        request: SamplingOverride,
+    ) -> Result<SamplingStateFacts, SamplingOverrideError<io::Error>> {
+        let request = eredu_runtime::execution_control::prepare_sampling_override::<Self>(
+            runtime, state, request,
+        )?;
+        runtime
+            .backend()
+            .copying("reseed")
+            .map_err(SamplingOverrideError::Backend)?;
         if let Some(seed) = request.reseed() {
             state.sampling.rng = seed;
         }
         state.sampling.temperature = request.temperature();
-        Ok(())
+        Ok(Self::sampling_control_facts(state))
     }
 }
 fn start(

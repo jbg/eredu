@@ -15,7 +15,9 @@ modified vendored dependencies and private forks are prohibited by the
 Native MLX patches are the explicit exception: Eredu controls their application
 through the `safemlx-sys` native build, including when building the published crate.
 Downstream consumers must not need an Eredu checkout or dependency overrides.
-The local Rust dependency forks and root patch table do not satisfy this requirement.
+Rust dependency admission uses public APIs and configurable host-overhead estimates.
+Archive verification and fresh consumers exercise the packaged first-party chain;
+staging registry configuration stays outside the product manifests.
 
 ## Dependency direction
 
@@ -36,14 +38,17 @@ A shared row does not authorize a dependency between its members. Portable crate
 never depend on a concrete backend, the facade, `safemlx`, or another accelerator
 runtime. `eredu-evaluation` owns fixtures, metrics and comparison policy; native
 examples/tests may use it as a development dependency, production mechanisms may
-not. `eredu` without default features remains a portable facade. Backend adapters,
+not. Shared K2 Horizon conformance data is embedded in `eredu-evaluation`, with
+source hashes and publisher provenance, so backend and facade test archives do
+not require sibling source directories. `eredu` without default features remains
+a portable facade. Backend adapters,
 accelerator options and host image/audio dependencies stay feature-gated; model
 families and codec families remain available without a backend.
 
 `eredu-collections` is a dependency-free, `no_std` foundation for the shared safe
 ordered-map worker. Its prospective insertion callback reports the exact node
-layout before allocation and preserves the caller's typed refusal. The local
-JSON fork consumes this same worker. Admission policy, funding accounts and
+layout before allocation and preserves the caller's typed refusal. Portable
+source producers consume this worker. Admission policy, funding accounts and
 payload custody stay in the consumers; this collection grants no source credit
 or native authority. It inherits the workspace prohibition on unsafe code.
 
@@ -54,12 +59,12 @@ operator composition belong in the backend; family semantics do not.
 
 Every workspace package inherits `unsafe_code = "forbid"` except `safemlx`,
 `safemlx-sys` and the `eredu-ios` C-ABI example. The iOS exception is limited to
-foreign entry points, callbacks and pointer ownership. Pinned parser forks are
-portable workspace members with the same prohibition. The llguidance fork exposes
-only its safe Rust API; its C ABI/header generator is excluded. The regex fork's
-nightly `Pattern` adapter is likewise outside its compiled feature surface.
-Licenses and archive provenance remain in `third-party/parser-upstream.json`.
-No additional unsafe exception is introduced by bounded inference.
+foreign entry points, callbacks and pointer ownership. Published third-party
+dependencies retain their upstream implementation and safety boundaries.
+Their public APIs do not weaken the prohibition in portable workspace crates.
+Cargo.lock records the selected releases and archive checksums; each dependency
+is distributed with its upstream licensing and provenance. Native MLX patches
+remain confined to the published `safemlx-sys` build.
 
 ## Ownership boundary
 
@@ -473,6 +478,137 @@ records pristine parity and the derived storage reduction separately from whole
 request cost and device execution.
 
 Tokenizer matching and encoding use one implementation with explicit cache policy.
+`eredu-text::tokenizer::ModelCachePolicy` configures stock Hugging Face model
+caches through public APIs. The capacity limits entries per model cache; BPE
+keeps a separate cache on each participating thread. Zero prevents new entries.
+It does not bound process memory, reclaim retired thread-local BPE generations,
+or limit the transient allocations made by JSON parsing and model construction.
+Configuring an existing tokenizer clones and replaces its model because upstream
+exposes no mutable model accessor. Both copies coexist during that operation.
+An Eredu tokenizer snapshot records a configured policy; direct mutable access
+or an unmanaged import makes that observation unknown. Frozen recipes explicitly
+record and restore a policy, using disabled caching for unknown configurations.
+The first snapshot or vocabulary view builds an owned, sparse index with stock
+public APIs. Snapshots and borrowed `TokenizerVocabulary` views share that index. The facade
+prepares it during load so `LoadedTokenizerView` queries allocate no storage. Raw
+tokenizer mutation invalidates the wrapper's cached index without affecting older snapshots. Its cold construction
+is separate from Eredu's exact fixed-buffer decoder compilation requirements.
+Prepared tokenizer construction includes the index in its dependency headroom.
+Decoder construction rejects distinct model spellings that share one ID, while
+model/added-token aliases retain upstream added-token precedence.
+
+`TokenizerPlan` uses stock deserialization with model caches disabled, followed
+by Eredu's fixed-buffer decoder compiler. `TokenizerMemoryEstimate` defaults to
+64 KiB plus 128 bytes per serialized source byte for construction and 64 KiB
+plus 512 bytes per UTF-8 input byte for encoding. These configurable estimates
+include upstream work and output, without claiming allocation bounds. Encoding
+retains the complete upstream `Encoding` with its ID slice; private offset and
+scratch capacities are not exposed as exact measurements. Runtime retains each
+operation reservation, source identity, and completed output or error through
+settlement and retirement.
+
+Input-prefix normalization uses the same portable text worker for ordinary and
+prepared sources. A changed prepared source owns a full model copy, vocabulary
+index, and decoder program while retaining its original source identity. Its
+admission estimate charges a full construction footprint for that copy. Identity
+normalization aliases the original source. Configuration comparison uses public
+serialization plus nonserialized Unigram inference fields and the special-token
+splitting flag; this cold check can allocate temporary JSON values.
+
+Runtime serialization funds each output-buffer growth before allocation and
+retains its reservation with partial output on failure. Separate upstream scratch
+headroom defaults to 64 KiB plus 256 bytes per vocabulary entry and can be set
+through `compile_tokenizer_source_for_generation_with_serialization_headroom`.
+Token lengths and serializer internals can exceed that estimate. Library-owned
+buffer growth, admission concurrency, and source/error lifetimes remain enforced.
+
+`OriginalJsonValue` validates complete JSON with stock serde_json under
+`DependencyMemoryPolicy` headroom. A temporary upstream value supplies ordinary
+numeric and nested-string validation. Decoded root strings additionally reserve
+their first-party immutable destination; both successful results and trailing-input
+errors retain the original payer. `parse_with_memory_policy` configures the
+dependency estimate independently of that output reservation.
+
+`OriginalJsonTree` retains a stock immutable JSON value and its admission account.
+Borrowed nodes and child iterators preserve ordinary duplicate-key, numeric and
+object-order semantics; `value()` lends that same value to stock validation APIs.
+Its configurable dependency headroom covers upstream construction. A trailing-input
+error retains a completed root, while upstream retires incomplete parse temporaries.
+Capture receipts use a streaming serde visitor to deliver every field, including
+duplicates, to their fixed semantic reader. Borrowed `RawValue` nodes validate
+syntax before callbacks and typed scalar deserialization preserves numeric
+events even when a consumer enables serde_json `arbitrary_precision`. The
+receipt adapter limits nesting to 128; repeated subtree validation costs up to
+O(input bytes × depth) without building an owned JSON tree. Default dependency
+headroom is admitted before parsing; first-party output buffers, identity/shape/charge validation and
+spent-claim custody remain separate. A parse failure does not establish native
+completion or authorize another delivery attempt.
+
+The ordinary chat `tojson` filter uses serde_json's public formatter API for
+Hugging Face's Python-compatible presentation, including Unicode, key ordering,
+separators, indentation and floating-point notation.
+
+Prepared chat compiles and renders with stock MiniJinja using the same source
+normalization, Python-compatible methods, JSON filter and request clock as ordinary
+chat. Shared range arithmetic uses wide intermediates and limits ranges to 100,000
+elements. Slice normalization uses the public parser API to replace expression
+slices with a Unicode-aware compatibility filter, preserving omitted negative
+bounds and empty slices. MiniJinja is pinned because that public parser API carries
+no semver guarantee. Normalization parses once before upstream compilation; it
+does not introduce a separate template interpreter. The source adapter and slice
+filter allocate temporary storage covered by dependency estimates.
+
+`ChatMemoryEstimate` defaults to 64 KiB plus 128 bytes per serialized source byte
+for construction, and 64 KiB plus 128 bytes per serialized request-input byte for
+rendering. Each render also reserves two first-party output buffers. Configurable
+`ChatRenderLimits` default to 8 MiB of serialized input, input depth 128, 1 MiB per
+output variant, 10 million VM instructions per variant and recursion limit 256.
+Planning validates borrowed input without executing the template. Rendering runs
+each variant once with one clock observation. Failures retain partial output under
+the original reservation. Fuel and output limits do not bound intermediate values,
+filter allocations or elapsed time; dependency headroom remains an estimate.
+
+Token-trie construction packs tokenizer-derived bytes, validates stock toktrie's
+compact representation, then calls its public constructor. Ordered EOS aliases
+are preserved; absent EOS uses the upstream invalid-token sentinel, which matches
+no valid vocabulary token. `TokenTrieMemoryPolicy` defaults to 64 KiB plus 128 bytes
+per lexical payload byte and per vocabulary slot, in addition to first-party
+destinations. Multiple EOS aliases require upstream to clone the trie, so both
+copies receive headroom. Upstream construction uses infallible allocations and
+recursive traversal. A configurable 1,024-byte token-length limit bounds its input
+depth; raising it requires adequate caller stack. Prefix geometry validation checks
+the actual node and parent-pop limits, including duplicate and shared prefixes.
+It does not construct a substitute trie. Runtime exposes matching estimate and
+construction methods with this policy and retains source identity and reservation
+lifetimes through failure and final alias retirement.
+
+Prepared grammar byte tokenization calls stock toktrie's public UTF-8 fallback,
+special-token and marker workers. A scoped fallible encoder stops encoding after
+its first failure, retaining completed source-owned encodings and partial scalar
+IDs with the error. Dependency scratch receives separate input-derived headroom;
+the final fixed ID buffer is admitted before construction. No fork tokenization
+visitor or alternate tokenizer implementation is required.
+
+Tagged tool calls use stock JSON parsing and serialization in the shared text
+worker. Runtime enforces each semantic parser's total input-byte limit and
+reserves exact pending/event buffers separately from dependency headroom.
+`DependencyMemoryPolicy` defaults to 64 KiB plus 128 bytes per allowed input byte;
+callers can select different fixed and proportional estimates through
+`OriginalSemanticChannelParser::prepare_with_dependency_memory`. Each independent
+snapshot reserves the same headroom for its own mutable session. Copies preserve
+the consumed-input counter and never refund the original account. JSON containers,
+parameter indexes and their transient allocations are covered by this estimate,
+not by dependency allocation callbacks. Schema preparation reserves separate
+input-derived headroom alongside its validator. Syntax, declared types, required
+fields, insertion order, and validation failures share the ordinary parser path.
+
+Facade tool schemas compile with stock `jsonschema::Validator` and validate the
+runtime's retained `serde_json::Value` directly. The preparation account admits
+configurable dependency headroom before compilation; each validation invocation
+admits separate parsing and validation headroom. Source aliases and failures
+retain their original account. Facade-owned names, rows and grammar text use
+prospective buffer reservations without dependency allocator callbacks.
+
 `ControllerDeclarationData::admission_bytes` supplies the fixed planning allowance
 for opaque compiled declarations. Their `owned_capacity_bytes` remains unknown;
 exact filter and byte-buffer capacities retain their existing contracts. Runtime
@@ -480,23 +616,33 @@ deduplicates admission by the same immutable source identity and retains its
 charge until final retirement. This allowance is not a measured heap inventory
 or a dependency memory ceiling.
 
-The pinned dependencies own parser/table growth and their qualified allocation
-facts. Grammar, schema and tokenizer sources share immutable paid graphs; mutable
-parser/history/copy state is independently admitted. Compilation receipts bind
-actual outputs to the original account, tokenizer and execution. Completion-schema
-validation preserves the selected draft and original typed errors; no permissive
-fallback follows a funding refusal.
+Stock llguidance owns compilation, lexer/table growth, forcing and token parsing.
+The facade retains a private unstarted `TokenParser` as its closed declaration
+template because the public factory has no token-parser constructor from an
+already compiled grammar. The template is never advanced or exported. Startup
+and snapshots use `deep_clone`; upstream shares compiled grammar data while each
+session owns its mutable parser state. Original-source validation binds the
+template to the exact recipe, tokenizer and compilation receipt before startup.
 
-The parser dependencies also own prospective fixed-frame accounting. Derivre's
-borrowed operation scope retains the live recursive peak and reuses capacity only
-after child frames retire; heap requests remain cumulative. llguidance uses that
-same mechanism for mutable parser work, compiled-grammar/condition/regex
-inspection, schema construction and copying, and JSON/Lark grammar emission.
-Nested workers borrow their operation's scope rather than opening a scope at
-every recursive call. Neither a guard nor its payer can escape that lifetime.
-Retained-capacity inspection is paid before traversal; a future-copy quote does
-not authorize earlier inspection. Compiled copy plans retain their inspected
-lexer plan, and failures preserve the first funding cause and original account.
+Each live session has a separate tokenizer diagnostic slot and destination
+account. Its public token-level environment performs fallible original encoding;
+upstream Earley and slicer environments borrow only the same immutable trie.
+Cold compilation serializes access to its own diagnostic slot. Session creation,
+copying and operations admit dependency estimates. The template estimate uses
+serialized grammar size and packed vocabulary-mask width; copies add an estimate
+for their accumulated output bytes. Shared trie and slicer storage stays with
+its original source allowance. `LoadedModel::prepare_chat_with_grammar_memory`
+selects the managed compiler, schema-validation and grammar-session headroom;
+snapshots and activation tokenization retain the selected policy under their
+own accounts. Ordinary `prepare_chat` uses 64 KiB plus 128 bytes per logical
+input byte. These settings do not change tokenizer/trie, template-rendering,
+native or first-party buffer admission. Upstream parser limits bound grammar
+size, lexer states, row size and per-step fuel. These are resource controls
+and planning allowances, not allocator interception or exact dependency capacities.
+Eredu-owned history, source controls and masks retain their ordinary admission and
+lifetime checks. A failed operation owns its parser and sources until diagnostic
+retirement. Completion-schema validation preserves the selected draft and typed
+errors; funding or tokenization refusals cannot select the syntax-only fallback.
 
 Framework-managed bounds do not describe total process or system memory. Application
 buffers, event copies, allocator caches and opaque driver/JIT internals need their
@@ -516,6 +662,21 @@ roles. Native scalar facts follow the selected worker's type promotion and
 bias-only cast. They preserve known operand roles and derive physical precision
 from the actual source representation. The inline role flags allocate no storage
 and grant no collective authority.
+
+Retained sampling input plans preserve the source row's physical representation,
+backing envelope and allocation population. Sampling revisions reconstruct that
+same descriptor under their metadata account; unknown layouts remain unknown.
+The backend consumes these retained facts when pricing changed sampling settings
+for a live or restored controlled session.
+CPU optional token filters price the same expanded Boolean mask, scalar and
+seven native constructors as a required filter, while retaining the possible
+full input alias when all tokens are allowed. Both paths preserve known F32
+row layout; missing source evidence still prevents bounded admission.
+CPU repetition, frequency and presence penalties compose their selected binary
+and Select workers, with separate Boolean, F32 row and scalar backing capacities.
+Their host estimate includes both vocabulary buffers and the selected history
+suffix. A zero-length history window preserves the configured native graph;
+it does not remove its constructor or completion records.
 
 CPU paged attention consumes the shared neutral blockwise descriptor and the
 existing native accumulator. Its stage recipes describe actual CPU primitives,
@@ -557,6 +718,19 @@ TP bias correction. Sequential group-order reduction keeps its integer sort,
 broadcast-index gather and ordered additions. The quote requires positively
 represented F32 dense banks; unqualified physical layouts retain their typed
 source refusal rather than borrowing Metal or platform BLAS facts.
+
+CPU affine projections use the ordinary packed QMM worker. The native storage
+query and evaluation guard check transposed rank-two U32 weights, matching
+floating scales and affine biases, contiguous source spans, packing divisibility
+and signed loop limits. Positive rank-two through rank-four inputs retain their
+leading geometry. The quote includes promotion casts, the worker's output birth
+and five weak array captures, fixed unpacking controls, and optional output-bias
+broadcast and addition. It does not materialize a dequantized weight matrix.
+Floating parameter replacements use the shared dense projection planner; their
+retained packed companions do not participate in arithmetic or precision promotion.
+Layerwise packed U32 weights use the existing typed General CPU host-copy worker;
+the copy recipe includes them alongside floating companion tensors and authenticates
+the retained host allocation before loading.
 
 CPU I32 addition, subtraction and multiplication use the existing typed binary
 worker, including shape-checked broadcasts. Integer layouts retain their logical
@@ -616,6 +790,10 @@ index event or unchanged rank alone does not establish a slice producer. This
 preserves the scalar and stride evidence of paged keys without changing native
 indexing equations. Composed CPU recipes retain internal nested completions
 alongside capture reads and preserve the largest reached root/capture population.
+The architecture workspace trace selects the final sampling row with an exact
+sequence interval followed by removal of its singleton axis. The native text
+output adapter uses the same slice and squeeze operations, preserving the
+selected values and backing ownership while exposing their separate CPU facts.
 
 ## Capture, interventions and state control
 

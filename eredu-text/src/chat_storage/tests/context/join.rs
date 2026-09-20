@@ -39,7 +39,7 @@ fn borrowed_join_preserves_scalar_spelling_unicode_registers_and_retained_result
         .unwrap();
     assert!(rendered.retained_buffer_bytes() <= plan.requirements().buffer_bytes());
     let failure = plan
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop((messages, defaults, caller, source));
@@ -47,24 +47,18 @@ fn borrowed_join_preserves_scalar_spelling_unicode_registers_and_retained_result
     assert!(rendered.prompt(false).contains("a·\u{0}·🦀"));
     drop((rendered, failure));
 
-    // Arbitrary object formatting is not authorized by iterable geometry.
-    // Ordinary supports these objects; the bounded profile rejects explicitly.
-    for value in [
-        json!(["prefix", [1, 2]]),
-        json!(["prefix", {"x":1}]),
-        json!({"x":1}),
+    for (value, expected) in [
+        (json!(["prefix", [1, 2]]), "prefix,[1, 2]"),
+        (json!(["prefix", {"x":1}]), "prefix,{\"x\": 1}"),
+        (json!({"x":1}), "x"),
     ] {
         let caller = json!({"value":value});
-        let source = ChatTemplatePlan::prepare_utf8("{{ value|join(',') }}", "join")
-            .unwrap()
-            .compile()
-            .unwrap();
-        assert!(
-            source
-                .render_plan_with_context(
-                    ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
-                )
-                .is_err()
+        let rendered = compare(
+            "{{ value|join(',') }}",
+            &[],
+            &serde_json::Map::new(),
+            caller.as_object().unwrap(),
         );
+        assert_eq!(rendered.prompt(false), expected);
     }
 }

@@ -304,25 +304,27 @@ fn malformed_or_changed_recipe_fails_without_escaping_preparation_authority() {
 }
 
 #[test]
-fn cache_policy_is_selected_before_nested_recipe_model_in_any_key_order() {
-    use tokenizers::ModelCachePolicy;
+fn recipe_restores_with_cache_policy_in_any_key_order() {
+    use eredu_text::tokenizer::ModelCachePolicy;
     let legacy = byte_level();
     let json = serde_json::to_vec(&legacy).unwrap();
-    let raw = Tokenizer::from_bytes_with_cache_policy(&json, ModelCachePolicy::disabled()).unwrap();
+    let raw = ModelCachePolicy::disabled().from_bytes(&json).unwrap();
     let authority = HostPreparationAuthority::unmanaged();
-    let source = ChatTokenizer::from_tokenizer(raw);
+    let source = ChatTokenizer::from_tokenizer_with_cache_policy(raw, ModelCachePolicy::disabled());
     let frozen = freeze(&source, &[1], &authority).unwrap();
     let alias = source.snapshot();
     drop(source);
-    assert_eq!(alias.model_cache_policy(), ModelCachePolicy::disabled());
+    assert_eq!(alias.model_cache_policy(), Some(ModelCachePolicy::disabled()));
     for bytes in [
         frozen.bytes.clone(),
         format!(r#"{{"tokenizer":{},"encode_special_tokens":false,"version":3,"cache_policy":{{"capacity":0}}}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
         format!(r#"{{"cache_policy":{{"capacity":0}},"version":3,"encode_special_tokens":false,"tokenizer":{}}}"#, std::str::from_utf8(&json).unwrap()).into_bytes(),
     ] {
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded.model_cache_policy(), ModelCachePolicy::disabled());
-        assert_eq!(decoded.clone().model_cache_policy(), ModelCachePolicy::disabled());
+        assert_eq!(decoded.encode("ab", false).unwrap().get_ids(), &[2]);
+        assert_eq!(decoded.clone().encode("ab", false).unwrap().get_ids(), &[2]);
+        let header: RecipeHeader = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(header.policy().unwrap(), ModelCachePolicy::disabled());
         let env = restore(&bytes, &[1], &authority).unwrap();
         assert_eq!(env.tokenize_bytes(b"ab"), vec![2]);
         assert_same_environment(&frozen.environment, &env);
@@ -348,9 +350,9 @@ fn cache_policy_is_selected_before_nested_recipe_model_in_any_key_order() {
 
 #[test]
 fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram() {
-    use tokenizers::ModelCachePolicy;
+    use eredu_text::tokenizer::ModelCachePolicy;
     let raw = Tokenizer::new(
-        tokenizers::models::unigram::Unigram::from_with_cache_policy(
+        tokenizers::models::unigram::Unigram::from(
             vec![
                 ("<unk>".into(), -10.0),
                 ("a".into(), -2.0),
@@ -359,17 +361,17 @@ fn cache_policy_recipe_rejects_invalid_headers_before_hf_and_preserves_unigram()
             ],
             Some(0),
             false,
-            ModelCachePolicy::disabled(),
         )
         .unwrap(),
     );
     let mut raw = raw;
     raw.with_decoder(Some(ByteLevel::default()));
-    let source = ChatTokenizer::from_tokenizer(raw);
+    let source = ChatTokenizer::from_tokenizer_with_cache_policy(raw, ModelCachePolicy::disabled());
     let authority = HostPreparationAuthority::unmanaged();
     let frozen = freeze(&source, &[1], &authority).unwrap();
     let decoded = decode(&frozen.bytes).unwrap();
-    assert_eq!(decoded.model_cache_policy(), ModelCachePolicy::disabled());
+    let header: RecipeHeader = serde_json::from_slice(&frozen.bytes).unwrap();
+    assert_eq!(header.policy().unwrap(), ModelCachePolicy::disabled());
     assert_eq!(decoded.encode("ab", false).unwrap().get_ids(), &[3]);
     assert_eq!(
         restore(&frozen.bytes, &[1], &authority)

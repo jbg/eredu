@@ -1,7 +1,7 @@
 use super::*;
 use crate::working_memory::OriginalTokenizer;
 use eredu_core::GenerationSequenceConsumerLayout;
-use eredu_text::chat_storage::{ChatMessages, ChatRenderBuffer, ChatSourceBuffer, TextMessage};
+use eredu_text::chat_storage::{ChatMessages, ChatRenderBuffer, TextMessage};
 use eredu_text::tokenizer_storage::TokenizerPlan;
 use std::error::Error as _;
 const SOURCE: &str = include_str!("tests/template.jinja");
@@ -79,24 +79,15 @@ fn original_j_exact_short_active_idle_and_all_strong_retirement() {
 }
 
 #[test]
-fn original_j_real_three_reserve_errors_and_unwind_keep_original_accounting() {
-    for (index, buffer) in [
-        ChatSourceBuffer::Instructions,
-        ChatSourceBuffer::Bytes,
-        ChatSourceBuffer::Locations,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let plan = source_plan().fail_reservation(buffer);
+fn compiler_errors_and_unwind_keep_original_admission() {
+    for text in ["{% if %}", "{{ unmatched("] {
+        let plan = ChatTemplatePlan::prepare_utf8(text, "invalid").unwrap();
         let j = WorkingMemoryPool::chat_template_required_bytes(&plan).unwrap();
         let pool = WorkingMemoryPool::new(j, 0).unwrap();
         let error = pool.compile_chat_template(plan).unwrap_err();
         assert_eq!(error.retained_bytes(), j);
         assert_eq!(pool.used_bytes().unwrap(), j);
-        let failure = error.compiler_failure().unwrap();
-        assert_eq!(failure.retained_buffer_bytes() > 0, index != 0);
-        assert!(failure.source().is_some());
+        assert!(error.compiler_failure().unwrap().source().is_some());
         drop(pool.acquire_unquoted().unwrap());
         drop(error);
         assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -118,7 +109,13 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
     let c = tokenizer(&pool);
     let j = pool.compile_chat_template(source_plan()).unwrap();
     let h = pool
-        .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
+        .chat_render_required_bytes(
+            &j,
+            &c,
+            eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(
+                &input,
+            )),
+        )
         .unwrap();
     let source_bytes = c.original_bytes() + j.original_bytes();
     drop((j, c));
@@ -132,9 +129,7 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
         .render_plan(ChatMessages::from_text(&input))
         .unwrap();
     let error = short
-        .render_original_chat_plan(&j, &c, plan, || {
-            panic!("short H entered constructor")
-        })
+        .render_original_chat_plan(&j, &c, plan, || panic!("short H entered constructor"))
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
     assert!(
@@ -169,7 +164,13 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
     let j2 = other.compile_chat_template(source_plan()).unwrap();
     assert!(!render.has_sources(&j2, &c2));
     let foreign = other
-        .render_original_chat(&j, &c2, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
+        .render_original_chat(
+            &j,
+            &c2,
+            eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(
+                &input,
+            )),
+        )
         .unwrap_err();
     assert!(matches!(
         foreign.accounting_failure(),
@@ -190,13 +191,9 @@ fn original_h_exact_short_foreign_sources_and_retained_render_aliases() {
 }
 
 #[test]
-fn original_h_six_actual_reserve_frontiers_retain_j_c_and_full_h() {
+fn render_output_reserve_failures_retain_sources_and_admission() {
     let input = messages();
     for (index, buffer) in [
-        ChatRenderBuffer::Operands,
-        ChatRenderBuffer::Frames,
-        ChatRenderBuffer::Locals,
-        ChatRenderBuffer::Concat,
         ChatRenderBuffer::WithoutPrompt,
         ChatRenderBuffer::WithPrompt,
     ]
@@ -208,7 +205,13 @@ fn original_h_six_actual_reserve_frontiers_retain_j_c_and_full_h() {
         let j = pool.compile_chat_template(source_plan()).unwrap();
         let base = c.original_bytes() + j.original_bytes();
         let h = pool
-            .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
+            .chat_render_required_bytes(
+                &j,
+                &c,
+                eredu_text::chat_storage::ChatRenderContext::from_messages(
+                    ChatMessages::from_text(&input),
+                ),
+            )
             .unwrap();
         let plan = j
             .payload()
@@ -241,7 +244,13 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
     let c = tokenizer(&probe);
     let j = probe.compile_chat_template(source_plan()).unwrap();
     let h = probe
-        .chat_render_required_bytes(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input)))
+        .chat_render_required_bytes(
+            &j,
+            &c,
+            eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(
+                &input,
+            )),
+        )
         .unwrap();
     let base = c.original_bytes() + j.original_bytes();
     drop((c, j));
@@ -292,14 +301,22 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
                     pool.acquire_unquoted(),
                     Err(WorkingMemoryError::ReservedWorkActive)
                 ),
-                pool.render_original_chat(&j, &c, eredu_text::chat_storage::ChatRenderContext::from_messages(ChatMessages::from_text(&input))),
+                pool.render_original_chat(
+                    &j,
+                    &c,
+                    eredu_text::chat_storage::ChatRenderContext::from_messages(
+                        ChatMessages::from_text(&input),
+                    ),
+                ),
             )
         }));
         drop(releases);
         let completed: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
-        assert!(admissions
-            .into_iter()
-            .all(|value| matches!(value, Ok(true))));
+        assert!(
+            admissions
+                .into_iter()
+                .all(|value| matches!(value, Ok(true)))
+        );
         let (used, busy, third) = held.unwrap();
         let error = third.unwrap_err();
         assert!(
@@ -330,7 +347,7 @@ fn concurrent_original_h_admissions_share_c_j_without_recredit_or_blocked_failur
 fn j_poisoned_settlement_retains_actual_completed_or_partial_source_and_charge() {
     for partial in [false, true] {
         let plan = if partial {
-            source_plan().fail_reservation(ChatSourceBuffer::Locations)
+            ChatTemplatePlan::prepare_utf8("{% if %}", "chat").unwrap()
         } else {
             source_plan()
         };
@@ -338,11 +355,13 @@ fn j_poisoned_settlement_retains_actual_completed_or_partial_source_and_charge()
         let pool = WorkingMemoryPool::new(j, 0).unwrap();
         let error = pool
             .compile_chat_template_with(plan, || {
-                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _usage = pool.0.usage.lock().unwrap();
-                    panic!("poison the actual source account");
-                }))
-                .is_err());
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _usage = pool.0.usage.lock().unwrap();
+                        panic!("poison the actual source account");
+                    }))
+                    .is_err()
+                );
             })
             .unwrap_err();
         assert!(matches!(
@@ -351,7 +370,7 @@ fn j_poisoned_settlement_retains_actual_completed_or_partial_source_and_charge()
         ));
         assert_eq!(error.retained_bytes(), j);
         if partial {
-            assert!(error.compiler_failure().unwrap().retained_buffer_bytes() > 0);
+            assert!(error.compiler_failure().unwrap().source().is_some());
             assert!(error.completed.is_none());
         } else {
             assert_eq!(error.completed.as_ref().unwrap().name(), "chat");
@@ -368,7 +387,7 @@ fn j_poisoned_settlement_retains_actual_completed_or_partial_source_and_charge()
 }
 
 #[test]
-fn generic_chat_compiler_j_precedes_decode_and_retains_failed_prefix() {
+fn chat_compiler_admission_precedes_parsing_and_retains_errors() {
     const TEXT: &str = "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %}> {% endif %}";
     let plan = || ChatTemplatePlan::prepare_utf8(TEXT, "general").unwrap();
     let j = WorkingMemoryPool::chat_template_required_bytes(&plan()).unwrap();
@@ -383,18 +402,6 @@ fn generic_chat_compiler_j_precedes_decode_and_retains_failed_prefix() {
     assert_eq!(short.used_bytes().unwrap(), 0);
 
     let pool = WorkingMemoryPool::new(j, 0).unwrap();
-    let failed = pool
-        .compile_chat_template_with(plan().fail_reservation(ChatSourceBuffer::Locations), || {
-            assert_eq!(pool.used_bytes().unwrap(), j)
-        })
-        .unwrap_err();
-    assert!(failed.compiler_failure().unwrap().retained_buffer_bytes() >= TEXT.len());
-    assert_eq!(failed.retained_bytes(), j);
-    drop(pool.acquire_unquoted().unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), j);
-    drop(failed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-
     let source = pool
         .compile_chat_template_with(plan(), || assert_eq!(pool.used_bytes().unwrap(), j))
         .unwrap();
@@ -405,15 +412,14 @@ fn generic_chat_compiler_j_precedes_decode_and_retains_failed_prefix() {
     drop(peer);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 
-    // Invalid source constructs its parser storage under J and returns an
-    // owning fixed failure; no borrowed parser storage escapes the account.
+    // Compilation and the owning upstream error remain under source admission.
     let text = String::from("{% if %}");
     let plan = ChatTemplatePlan::prepare_utf8(&text, "general").unwrap();
     let j = WorkingMemoryPool::chat_template_required_bytes(&plan).unwrap();
     let pool = WorkingMemoryPool::new(j, 0).unwrap();
     let failed = pool.compile_chat_template(plan).unwrap_err();
     drop(text);
-    assert!(failed.compiler_failure().unwrap().retained_buffer_bytes() > 0);
+    assert!(failed.compiler_failure().unwrap().source().is_some());
     assert_eq!(pool.used_bytes().unwrap(), j);
     drop(failed);
     assert_eq!(pool.used_bytes().unwrap(), 0);
@@ -424,7 +430,8 @@ fn original_numeric_chat_parser_and_error_remain_under_source_custody() {
     let source = serde_json::to_string(SOURCE).unwrap();
     for number in ["1.25", "1e999"] {
         let config = format!("{{\"unused\":{number},\"chat_template\":{source}}}");
-        let plan = || ChatTemplatePlan::prepare_config(config.as_bytes(), "numeric", false).unwrap();
+        let plan =
+            || ChatTemplatePlan::prepare_config(config.as_bytes(), "numeric", false).unwrap();
         let j = WorkingMemoryPool::chat_template_required_bytes(&plan()).unwrap();
         let short = WorkingMemoryPool::new(j - 1, 0).unwrap();
         let error = short
@@ -449,7 +456,7 @@ fn original_numeric_chat_parser_and_error_remain_under_source_custody() {
             }
             Err(error) => {
                 assert_eq!(number, "1e999");
-                assert!(error.compiler_failure().unwrap().numeric_error().is_some());
+                assert!(error.compiler_failure().unwrap().source().is_some());
                 assert_eq!(pool.used_bytes().unwrap(), j);
                 drop(pool.acquire_unquoted().unwrap());
                 drop(error);

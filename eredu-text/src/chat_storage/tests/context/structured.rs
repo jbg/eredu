@@ -81,6 +81,8 @@ fn borrowed_selection_missing_and_index_conversion_match_ordinary() {
                 .render_plan_with_context(
                     ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap()
                 )
+                .unwrap()
+                .render()
                 .is_err()
         );
         let mut ordinary = ordinary();
@@ -100,7 +102,7 @@ fn borrowed_selection_missing_and_index_conversion_match_ordinary() {
 }
 
 #[test]
-fn selected_text_storage_is_measured_and_all_error_prefixes_outlive_the_context() {
+fn selected_text_and_error_prefixes_outlive_the_context() {
     let source = ChatTemplatePlan::prepare_utf8(
         "{{ cfg.a + cfg.b }}{% if add_generation_prompt %}{{ cfg.a + cfg.a }}{% endif %}",
         "context",
@@ -110,11 +112,6 @@ fn selected_text_storage_is_measured_and_all_error_prefixes_outlive_the_context(
     .unwrap();
     let caller = json!({"cfg":{"a":"é","b":"非空"}});
     let context = ChatRenderContext::from_json(&[], None, caller.as_object()).unwrap();
-    let inner = vm::RenderPlan::prepare_context(&source.inner, context).unwrap();
-    assert_eq!(
-        inner.requirements().capacity(ChatRenderBuffer::ContextText),
-        "é非空éé".len()
-    );
     let rendered = source
         .render_plan_with_context(context)
         .unwrap()
@@ -125,7 +122,7 @@ fn selected_text_storage_is_measured_and_all_error_prefixes_outlive_the_context(
     let failure = source
         .render_plan_with_context(context)
         .unwrap()
-        .fail_reservation(ChatRenderBuffer::ContextText)
+        .fail_reservation(ChatRenderBuffer::WithPrompt)
         .render()
         .unwrap_err();
     drop(caller);

@@ -1,6 +1,6 @@
 //! Standalone census with onig_probe={package="onig",version="=6.5.3",default-features=false}
-//! and fancy_probe={package="fancy-regex",path="<repo>/third-party/fancy-regex-0.19.0"}.
-//! The resolved Onig source is onig_sys69.9.3; both pinned Unicode tables are16.0.
+//! and fancy_probe={package="fancy-regex",version="=0.19.0"}.
+//! Record Cargo's resolved versions and the Unicode table versions with results.
 fn main() {
     let onig_positive = onig_probe::Regex::new(r"\w").unwrap();
     let onig_negative = onig_probe::Regex::new(r"[^\w\s]").unwrap();

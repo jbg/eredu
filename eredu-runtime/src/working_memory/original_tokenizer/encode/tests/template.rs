@@ -56,7 +56,6 @@ pub(super) fn exact_case(input: &str, text: &str, expected_ids: &[u32]) {
                         expected.extend_from_slice(expected_ids);
                     }
                     assert_eq!(output.ids(), expected);
-                    assert_eq!(output.capacities()[2], text.len() + usize::from(special));
                     assert!(output.matches_source(&original));
                     let alias = original.clone();
                     drop(original);
@@ -70,15 +69,11 @@ pub(super) fn exact_case(input: &str, text: &str, expected_ids: &[u32]) {
     }
 }
 #[test]
-fn template_c_real_frontiers_late_decode_failure_and_core_error_retirement() {
-    for stage in 0..8 {
+fn template_source_decoder_failure_and_core_error_retirement() {
+    for stage in 0..3 {
         let input = json();
         let plan = TokenizerPlan::prepare_json(input.as_bytes()).unwrap();
-        let plan = if stage < 5 {
-            plan.fail_template_reservation(stage)
-        } else {
-            plan.fail_decode_reservation(stage - 5)
-        };
+        let plan = plan.fail_decode_reservation(stage);
         let c = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
         let pool = WorkingMemoryPool::new(c, 0).unwrap();
         let admitted = std::cell::Cell::new(0usize);
@@ -96,21 +91,11 @@ fn template_c_real_frontiers_late_decode_failure_and_core_error_retirement() {
         drop(input);
         assert_eq!(error.retained_bytes(), c);
         let failed = error.compiler_failure().unwrap();
-        if stage < 5 {
-            let root = failed.root_failure().unwrap();
-            assert!(root.completed_model());
-            let actual = root.template_failure().unwrap();
-            assert!(actual.allocation_error().is_some());
-            let caps = actual.capacities();
-            assert!(caps[..stage].iter().all(|n| *n > 0));
-            assert!(caps[stage..].iter().all(|n| *n == 0));
-        } else {
-            assert!(failed.completed_tokenizer());
-            assert!(matches!(
-                failed.decode_failure().unwrap().cause(),
-                eredu_text::decoder_storage::DecodeSourceError::Allocation(_)
-            ));
-        }
+        assert!(failed.completed_tokenizer());
+        assert!(matches!(
+            failed.decode_failure().unwrap().cause(),
+            eredu_text::decoder_storage::DecodeSourceError::Allocation(_)
+        ));
         let erased = BackendFailure::new(BackendFailureKind::ResourceExhausted, error);
         drop(pool.acquire_unquoted().unwrap());
         assert_eq!(pool.used_bytes().unwrap(), c);
@@ -119,14 +104,13 @@ fn template_c_real_frontiers_late_decode_failure_and_core_error_retirement() {
     }
 }
 #[test]
-fn template_e_actual_target_errors_and_foreign_pool_preserve_original_source() {
+fn template_foreign_pool_refusal_preserves_original_source() {
     errors_case(&json(), TEXT);
 }
 pub(super) fn errors_case(input: &str, text: &str) {
     let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let original = source(&pool, &input);
     let c = original.original_bytes();
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&original, text, true).unwrap();
     let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
     let error = foreign
         .encode_tokenizer_ids(&original, text, true)
@@ -135,31 +119,7 @@ pub(super) fn errors_case(input: &str, text: &str) {
     assert!(!error.matches_source(&original));
     assert_eq!(foreign.used_bytes().unwrap(), 0);
     drop(error);
-    for stage in 0..4 {
-        let error = pool
-            .encode_tokenizer_ids_with(
-                &original,
-                text,
-                true,
-                |p| p.fail_reservation(stage),
-                || {},
-                || {},
-            )
-            .unwrap_err();
-        assert!(error.matches_source(&original));
-        assert_eq!(error.retained_bytes(), e);
-        let failure = error.encoding_failure().unwrap();
-        assert!(matches!(failure.cause(), EncodeIdsError::Reserve(_)));
-        assert_eq!(failure.partial_id_count(), 0);
-        let caps = failure.capacities();
-        assert!(caps[..stage.min(3)].iter().all(|n| *n > 0));
-        if stage < 3 {
-            assert!(caps[stage..].iter().all(|n| *n == 0));
-        }
-        assert_eq!(pool.used_bytes().unwrap(), c + e);
-        drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), c);
-    }
+    assert_eq!(pool.used_bytes().unwrap(), c);
     drop(original);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
@@ -182,8 +142,8 @@ fn template_prefix_is_private_on_actual_missing_unknown_failure_and_retains_c_an
     assert_eq!(error.retained_bytes(), e);
     assert!(error.matches_source(&original));
     let failure = error.encoding_failure().unwrap();
-    assert!(matches!(failure.cause(), EncodeIdsError::MissingUnknown));
-    assert_eq!(failure.partial_id_count(), 1);
+    assert!(matches!(failure.cause(), EncodeIdsError::Upstream(_)));
+    assert!(failure.source().is_some());
     drop(original);
     assert_eq!(pool.used_bytes().unwrap(), c + e);
     drop(error);

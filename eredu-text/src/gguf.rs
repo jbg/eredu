@@ -5,24 +5,24 @@ use std::collections::{HashMap, HashSet};
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use serde_json::{Map, Value};
 use tokenizers::{
+    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
     decoders::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
         strip::Strip,
     },
     models::{
-        bpe::{Vocab, BPE},
+        bpe::{BPE, Vocab},
         unigram::Unigram,
     },
-    normalizers::{Replace, NFC},
+    normalizers::{NFC, Replace},
     pre_tokenizers::{
+        PreTokenizerWrapper,
         byte_level::ByteLevel,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence as PreTokenizerSequence,
         split::{Split, SplitPattern},
-        PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
 };
 
 use crate::error::Error;
@@ -42,20 +42,20 @@ pub struct GgufTokenizer {
 pub fn from_metadata(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<Option<GgufTokenizer>, Error> {
-    from_metadata_with_cache_policy(metadata, tokenizers::ModelCachePolicy::default())
+    from_metadata_with_cache_policy(metadata, crate::tokenizer::ModelCachePolicy::default())
 }
 
-/// Reconstructs with model-cache policy selected before every JSON/model builder.
-/// Existing metadata/input/model allocations remain outside any finite bound.
+/// Reconstructs with a model-cache entry limit applied before first use.
+/// Parsing and model construction use ordinary upstream allocations.
 pub fn from_metadata_with_cache_policy(
     metadata: &HashMap<String, GgufMetadataValue>,
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Option<GgufTokenizer>, Error> {
     if let Some(json) = metadata
         .get("tokenizer.huggingface.json")
         .and_then(GgufMetadataValue::as_str)
     {
-        let tokenizer = Tokenizer::from_bytes_with_cache_policy(json.as_bytes(), policy)?;
+        let tokenizer = policy.from_bytes(json.as_bytes())?;
         return Ok(Some(GgufTokenizer {
             tokenizer,
             template_kwargs: special_token_kwargs(metadata)?,
@@ -107,11 +107,11 @@ pub fn template_kwargs(
 fn build_gpt(
     tokens: &[String],
     metadata: &HashMap<String, GgufMetadataValue>,
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, Error> {
     let merges = required_merges(metadata)?;
     let mut builder = BPE::builder()
-        .cache_policy(policy)
+        .cache_capacity(policy.capacity)
         .vocab_and_merges(vocab(tokens)?, merges)
         .fuse_unk(true);
     if let Some(unknown) = special_token(metadata, tokens, "unknown_token_id")? {
@@ -193,7 +193,7 @@ fn build_gpt(
 fn build_llama(
     tokens: &[String],
     metadata: &HashMap<String, GgufMetadataValue>,
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, Error> {
     let merges = match metadata
         .get("tokenizer.ggml.merges")
@@ -203,7 +203,7 @@ fn build_llama(
         None => derive_merges(tokens, metadata)?,
     };
     let mut builder = BPE::builder()
-        .cache_policy(policy)
+        .cache_capacity(policy.capacity)
         .vocab_and_merges(vocab(tokens)?, merges)
         .fuse_unk(true)
         .byte_fallback(true);
@@ -237,7 +237,7 @@ fn build_llama(
 fn build_gemma(
     tokens: &[String],
     metadata: &HashMap<String, GgufMetadataValue>,
-    policy: tokenizers::ModelCachePolicy,
+    policy: crate::tokenizer::ModelCachePolicy,
 ) -> Result<Tokenizer, Error> {
     let scores = required_scores(metadata, tokens.len())?;
     let vocabulary = tokens
@@ -258,7 +258,8 @@ fn build_gemma(
         })
         .collect();
     let unknown = special_id(metadata, "unknown_token_id")?;
-    let model = Unigram::from_with_cache_policy(vocabulary, unknown, true, policy)?;
+    let mut model = Unigram::from(vocabulary, unknown, true)?;
+    model.resize_cache(policy.capacity);
     let mut tokenizer = Tokenizer::new(model);
     let add_prefix_space =
         metadata_bool(metadata, "tokenizer.ggml.add_space_prefix")?.unwrap_or(true);
@@ -641,7 +642,7 @@ mod tests {
         let tokenizer = build_gpt(
             &["x".into()],
             &metadata,
-            tokenizers::ModelCachePolicy::default(),
+            crate::tokenizer::ModelCachePolicy::default(),
         )
         .unwrap();
         let input = "a\u{301}b x\u{200c}y\u{200d}z 1234567";
@@ -817,21 +818,35 @@ mod tests {
 
     #[test]
     fn reconstructed_gemma_uses_the_original_source_and_id_workers() {
-        for family in ["gemma2", "gemma4"] { for prefix in [false, true] {
-            let mut metadata = sentencepiece_metadata(family);
-            metadata.insert("tokenizer.ggml.add_space_prefix".into(), GgufMetadataValue::Bool(prefix));
-            let selected = from_metadata(&metadata).unwrap().unwrap().tokenizer;
-            let bytes = selected.to_string(false).unwrap();
-            let original = crate::tokenizer_storage::TokenizerPlan::prepare_json(bytes.as_bytes()).unwrap().compile().unwrap();
-            let selected_config = crate::tokenizer::Tokenizer::from_bytes(bytes.as_bytes()).unwrap();
-            assert!(original.matches_configuration(&selected_config));
-            assert!(original.input_prefix_removal_is_identity() == !prefix);
-            for text in ["hi", " hi", "hi hi", "hi\nhi", "hi\t hi", "<unk>hi", ""] {
-                let expected = selected.encode(text, false).unwrap();
-                let ids = crate::tokenizer_storage::EncodeIdsPlan::prepare(&original, text, false).unwrap().encode().unwrap();
-                assert_eq!(ids.ids(), expected.get_ids(), "{family} {prefix} {text:?}");
+        for family in ["gemma2", "gemma4"] {
+            for prefix in [false, true] {
+                let mut metadata = sentencepiece_metadata(family);
+                metadata.insert(
+                    "tokenizer.ggml.add_space_prefix".into(),
+                    GgufMetadataValue::Bool(prefix),
+                );
+                let selected = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+                let bytes = selected.to_string(false).unwrap();
+                let original =
+                    crate::tokenizer_storage::TokenizerPlan::prepare_json(bytes.as_bytes())
+                        .unwrap()
+                        .compile()
+                        .unwrap();
+                let selected_config =
+                    crate::tokenizer::Tokenizer::from_bytes(bytes.as_bytes()).unwrap();
+                assert!(original.matches_configuration(&selected_config));
+                assert!(original.input_prefix_removal_is_identity() == !prefix);
+                for text in ["hi", " hi", "hi hi", "hi\nhi", "hi\t hi", "<unk>hi", ""] {
+                    let expected = selected.encode(text, false).unwrap();
+                    let ids =
+                        crate::tokenizer_storage::EncodeIdsPlan::prepare(&original, text, false)
+                            .unwrap()
+                            .encode()
+                            .unwrap();
+                    assert_eq!(ids.ids(), expected.get_ids(), "{family} {prefix} {text:?}");
+                }
             }
-        }}
+        }
     }
 
     #[test]
@@ -904,15 +919,13 @@ mod tests {
     }
     #[test]
     fn model_cache_policy_reaches_gguf_bpe_unigram_and_embedded_json() {
-        use tokenizers::ModelCachePolicy;
+        use crate::tokenizer::ModelCachePolicy;
         for family in ["llama", "gemma2", "gemma4"] {
             let metadata = sentencepiece_metadata(family);
             let legacy = from_metadata(&metadata).unwrap().unwrap();
             let absent = from_metadata_with_cache_policy(&metadata, ModelCachePolicy::disabled())
                 .unwrap()
                 .unwrap();
-            assert_eq!(legacy.tokenizer.model_cache_policy(), ModelCachePolicy::default());
-            assert_eq!(absent.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
             for input in ["hi", "hi hi", "hi\nhi"] {
                 let a = legacy.tokenizer.encode(input, true).unwrap();
                 let b = absent.tokenizer.encode(input, true).unwrap();
@@ -933,7 +946,6 @@ mod tests {
             let restored = from_metadata_with_cache_policy(&embedded, ModelCachePolicy::disabled())
                 .unwrap()
                 .unwrap();
-            assert_eq!(restored.tokenizer.model_cache_policy(), ModelCachePolicy::disabled());
             assert_eq!(
                 restored.tokenizer.encode("hi", false).unwrap().get_ids(),
                 absent.tokenizer.encode("hi", false).unwrap().get_ids()
@@ -942,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn no_model_caches_reaches_gpt_builder_with_nonzero_merges() {
+    fn disabled_caching_preserves_gpt_builder_nonzero_merges() {
         let metadata = HashMap::from([
             (
                 "tokenizer.ggml.model".into(),
@@ -962,15 +974,13 @@ mod tests {
             ),
         ]);
         let legacy = from_metadata(&metadata).unwrap().unwrap().tokenizer;
-        let absent =
-            from_metadata_with_cache_policy(&metadata, tokenizers::ModelCachePolicy::disabled())
-                .unwrap()
-                .unwrap()
-                .tokenizer;
-        assert_eq!(
-            absent.model_cache_policy(),
-            tokenizers::ModelCachePolicy::disabled()
-        );
+        let absent = from_metadata_with_cache_policy(
+            &metadata,
+            crate::tokenizer::ModelCachePolicy::disabled(),
+        )
+        .unwrap()
+        .unwrap()
+        .tokenizer;
         assert_eq!(absent.encode("abab", false).unwrap().get_ids(), &[2, 2]);
         assert_eq!(
             legacy.encode("abab", false).unwrap().get_offsets(),

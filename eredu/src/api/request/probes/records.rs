@@ -542,7 +542,6 @@ pub(crate) fn control_bytes() -> Option<usize> {
             [V<'_>; 5],
         )>(),
         size_of::<(&str, V<'_>, F<'_>)>(),
-        V::control_bytes()?,
     ];
     parts
         .into_iter()

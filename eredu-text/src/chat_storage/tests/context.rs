@@ -1,6 +1,41 @@
 use super::*;
 
-fn compare(
+/// Check success and execution-error parity for dynamic receiver/argument
+/// profiles. Successful cases also compare both generation-prompt variants.
+fn compare_outcome(template: &str, caller: &serde_json::Map<String, serde_json::Value>) {
+    let prepared = ChatTemplatePlan::prepare_utf8(template, "outcome")
+        .unwrap()
+        .compile()
+        .map_err(|e| e.to_string())
+        .and_then(|source| {
+            source
+                .render_plan_with_context(
+                    ChatRenderContext::from_json(&[], None, Some(caller)).unwrap(),
+                )
+                .unwrap()
+                .render()
+                .map_err(|e| e.to_string())
+        });
+    for generation in [false, true] {
+        let ordinary = ordinary().apply_chat_template_json(
+            crate::tokenizer::ModelChatTemplate::Single(template.into()),
+            [Vec::<serde_json::Value>::new()],
+            None,
+            "outcome",
+            generation,
+            Some(caller),
+        );
+        match (&prepared, ordinary) {
+            (Ok(actual), Ok(expected)) => {
+                assert_eq!(actual.prompt(generation), expected[0], "{template}")
+            }
+            (Err(_), Err(_)) => {}
+            (actual, expected) => panic!("{template}: prepared={actual:?}; ordinary={expected:?}"),
+        }
+    }
+}
+
+pub(super) fn compare(
     template: &str,
     base: &[serde_json::Value],
     defaults: &serde_json::Map<String, serde_json::Value>,
@@ -98,7 +133,6 @@ fn structured_context_operations_remain_explicit_and_partial_buffers_outlive_bor
         .compile()
         .unwrap();
     for buffer in [
-        ChatRenderBuffer::Concat,
         ChatRenderBuffer::WithoutPrompt,
         ChatRenderBuffer::WithPrompt,
     ] {
@@ -107,7 +141,10 @@ fn structured_context_operations_remain_explicit_and_partial_buffers_outlive_bor
         let plan = source.render_plan_with_context(context).unwrap();
         let failure = plan.fail_reservation(buffer).render().unwrap_err();
         drop(caller);
-        assert!(failure.retained_buffer_bytes() > 0);
+        assert_eq!(
+            failure.retained_buffer_bytes() > 0,
+            buffer == ChatRenderBuffer::WithPrompt
+        );
         drop(failure);
     }
     let nested = json!({"value":{"nested":"unimplemented"}});
@@ -117,7 +154,12 @@ fn structured_context_operations_remain_explicit_and_partial_buffers_outlive_bor
             .compile()
             .unwrap();
         let context = ChatRenderContext::from_json(&[], None, nested.as_object()).unwrap();
-        assert!(source.render_plan_with_context(context).is_err());
+        let actual = source
+            .render_plan_with_context(context)
+            .unwrap()
+            .render()
+            .unwrap();
+        assert!(!actual.prompt(false).is_empty());
     }
     // A non-demanded structured binding does not alter the rendered program.
     compare(
