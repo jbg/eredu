@@ -1007,6 +1007,29 @@ pub fn inspect_artifact_with_prepared_gguf_headers<R: ModelConfigurationResolver
     inspect_artifact_inner(path.as_ref(), resolver, GgufInspectionHeaders::Captured)
 }
 
+/// Inspects SafeTensors with a caller-funded discovery/metadata policy supplied
+/// before the first header parse. GGUF uses captured headers as in the ordinary
+/// prepared-header entry. The caller completes policy construction on return.
+/// Configuration, architecture-plan and other inspection work remain separate
+/// admission responsibilities; metadata estimates are not process-wide bounds.
+pub fn inspect_artifact_with_safetensors_admission<R: ModelConfigurationResolver>(
+    path: impl AsRef<Path>,
+    resolver: &R,
+    limits: eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits,
+    policy: Arc<dyn eredu_checkpoint::safetensors::SafetensorsSourceAdmission>,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
+    let path = path.as_ref();
+    if is_gguf(path) {
+        inspect_gguf(path, resolver, GgufInspectionHeaders::Captured)
+    } else if path.is_dir() {
+        inspect_safetensors(path, resolver, Some((limits, policy)))
+    } else if !path.exists() {
+        Err(ArtifactError::MissingArtifact(path.to_path_buf()))
+    } else {
+        Err(ArtifactError::UnsupportedContainer(path.to_path_buf()))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum GgufInspectionHeaders {
     Ordinary,
@@ -1030,7 +1053,7 @@ fn inspect_artifact_inner<R: ModelConfigurationResolver>(
     if is_gguf(path) {
         inspect_gguf(path, resolver, headers)
     } else if path.is_dir() {
-        inspect_safetensors(path, resolver)
+        inspect_safetensors(path, resolver, None)
     } else if !path.exists() {
         Err(ArtifactError::MissingArtifact(path.to_path_buf()))
     } else {
@@ -1304,11 +1327,30 @@ fn validate_gguf_container(checkpoint: &GgufCheckpoint) -> Result<(), ArtifactEr
 fn inspect_safetensors<R: ModelConfigurationResolver>(
     path: &Path,
     resolver: &R,
+    admission: Option<(
+        eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits,
+        Arc<dyn eredu_checkpoint::safetensors::SafetensorsSourceAdmission>,
+    )>,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
     let (configuration, resolved_plan) = resolver.resolve_safetensors(&json)?.into_parts();
-    let catalog = eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover(path)?;
+    let catalog = match &admission {
+        Some((limits, policy)) => {
+            eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover_with_source_admission(
+                path, *limits, policy.clone(),
+            )?
+        }
+        None => eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover(path)?,
+    };
+    if let Some((_, policy)) = &admission {
+        let input = catalog.metadata_input_bytes().ok_or_else(|| {
+            ArtifactError::InvalidArtifact("tensor catalog metadata size overflow".into())
+        })?;
+        policy
+            .reserve_store(input)
+            .map_err(eredu_checkpoint::store::StoreError::SafetensorsSourceAdmission)?;
+    }
     let shards = catalog.admitted_shards();
     let descriptors = catalog.tensors().values().map(|metadata| TensorDescriptor {
         name: metadata.name.clone(),
@@ -1327,7 +1369,10 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
             length: metadata.encoded_byte_len,
         }),
     });
-    let tensors = TensorCatalog::new(descriptors)?;
+    let tensors = match admission {
+        Some((_, policy)) => TensorCatalog::with_custody(descriptors, policy)?,
+        None => TensorCatalog::new(descriptors)?,
+    };
     if tensors.is_empty() {
         return Err(ArtifactError::InvalidArtifact(
             "SafeTensors checkpoint contains no tensors".into(),

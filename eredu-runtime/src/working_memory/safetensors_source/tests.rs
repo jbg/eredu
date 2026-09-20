@@ -253,3 +253,5 @@ fn concurrent_source_opening_and_retirement_preserve_shared_pool_totals() {
         assert_eq!(pool.used_bytes().unwrap(), total * sources.len() as u64);
     }
 }
+
+mod inspection;

@@ -943,7 +943,7 @@ subsequent cache contents and independently exported metadata have separate
 admission requirements. Ordinary opening and runtime-funded opening share the
 same discovery, index and header workers.
 Runtime can move a funded SafeTensors source into a typed closed retained
-source owner. It checks the actual private discovery-policy type and owning pool
+source owner. It checks the actual private store-policy type and owning pool
 before admitting the outer allocation; an ordinary source, caller-defined policy
 or foreign pool supplies no such origin. Refusals retain the original source.
 Strong aliases share the closed source, while opaque weak identities keep the
@@ -954,6 +954,27 @@ retained header through its original policy, and ordinary owned metadata uses
 that same worker. The typed owner supplies the existing authenticated file route
 for prepared reads without copying headers; generic closed provider ownership
 does not supply a typed acquisition route.
+
+Core inspection accepts a neutral SafeTensors source policy before discovery;
+runtime can supply it from a working-memory pool without core depending on
+runtime. Strict inspection uses the same discovery and header workers, admitting
+the metadata map and tensor-descriptor map before copying them. Tensor-catalog
+clones share one immutable map and its retained custody. Equality and serialized
+values exclude custody; deserialization constructs an ordinary independent map.
+Runtime ends construction exclusion after inspection returns and retains the
+accepted contribution with either the inspection or its error. Configuration and
+architecture-plan allocations remain separate policy responsibilities.
+
+A fresh runtime store over retained shards checks their private discovery policy
+and owning pool, then admits independent store/cache controls. It neither
+rediscovers the directory/index nor reparses the retained headers. Independent
+stores retain their selected cache limits while sharing immutable shard and
+header data. The store's policy identifies its own construction contribution;
+ordinary store construction over funded shards does not establish that origin.
+The input shards and accepted fresh contribution remain owned on refusal.
+These explicit inspection and store entries do not establish admission for the
+ordinary production inspection/preparation entry points. Subsequent prepared
+views, provenance maps, payloads and recipe storage require separate admission.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that

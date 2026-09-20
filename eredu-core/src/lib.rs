@@ -80,6 +80,7 @@ pub use artifact::{
     ModelConfigurationResolver, ModelPreparationPlan, PreparationPolicy, QuantizationRequest,
     ResidencyRequest, ResolvedModelConfiguration, ValidatedGguf, ValidatedGgufCompanion,
     gguf_u32_metadata_values, inspect_artifact, inspect_artifact_with_prepared_gguf_headers,
+    inspect_artifact_with_safetensors_admission,
     plan_model_preparation, resolve_gguf_companions, validate_preparation_policy,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};

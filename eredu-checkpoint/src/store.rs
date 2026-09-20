@@ -2167,6 +2167,7 @@ pub struct SafetensorsWeightStore {
     cache: Arc<Mutex<CacheState>>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
     max_cached_shards: usize,
+    source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
 }
 
 impl SafetensorsWeightStore {
@@ -2174,7 +2175,7 @@ impl SafetensorsWeightStore {
     /// This is concrete type inspection, not a provider-reported admission claim.
     /// Ordinary sources have no policy; callers validate their own private type.
     pub fn source_admission_owner<C: std::any::Any>(&self) -> Option<&C> {
-        let policy: &dyn std::any::Any = self.shards.source_admission()?.as_ref();
+        let policy: &dyn std::any::Any = self.source_admission.as_ref()?.as_ref();
         policy.downcast_ref()
     }
 
@@ -2233,9 +2234,9 @@ impl SafetensorsWeightStore {
         admission: Arc<dyn SafetensorsSourceAdmission>,
     ) -> Result<Self, StoreError> {
         let shards = SafetensorsShards::discover_catalog_with_source_admission(
-            path.as_ref(), limits, None, Some(admission),
+            path.as_ref(), limits, None, Some(admission.clone()),
         )?;
-        Self::open_admitted(shards, max_cached_shards)
+        Self::open_admitted_with_source_admission(shards, max_cached_shards, Some(admission))
     }
 
     /// Opens the exact shard set admitted by portable artifact inspection.
@@ -2246,10 +2247,21 @@ impl SafetensorsWeightStore {
         shards: SafetensorsShards,
         max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
+        Self::open_admitted_with_source_admission(shards, max_cached_shards, None)
+    }
+
+    /// Constructs a fresh store/cache over exact retained shards. The supplied
+    /// policy reserves this store's metadata independently of discovery custody.
+    /// Its owner retains it on failure and completes construction on return.
+    pub fn open_admitted_with_source_admission(
+        shards: SafetensorsShards,
+        max_cached_shards: usize,
+        admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
+    ) -> Result<Self, StoreError> {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
-        if let Some(policy) = shards.source_admission() {
+        if let Some(policy) = &admission {
             let mut input_bytes = Some(0usize);
             let mut add = |name: &str, path: &Path| {
                 input_bytes = input_bytes.and_then(|n| n.checked_add(name.len()))
@@ -2295,8 +2307,9 @@ impl SafetensorsWeightStore {
                 .collect()
         };
         let paths = bulk::DiagnosticPaths::new(shards.payload_paths());
-        let source_admission = shards.source_admission().cloned();
+        let source_admission = admission;
         Ok(Self {
+            source_admission: source_admission.clone(),
             catalog,
             shards,
             cache: Arc::new(Mutex::new(CacheState {

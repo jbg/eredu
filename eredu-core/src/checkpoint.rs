@@ -1,7 +1,7 @@
 //! Neutral checkpoint tensor catalog contracts.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 /// Portable tensor element type.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -63,16 +63,67 @@ pub struct TensorDescriptor {
     pub storage: Option<TensorStorage>,
 }
 
-/// Validated name-indexed tensor catalog.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TensorCatalog {
+/// Validated immutable name-indexed tensor catalog. Clones share its storage.
+#[derive(Debug, Clone)]
+pub struct TensorCatalog(Arc<CatalogData>);
+#[derive(Debug)]
+struct CatalogData {
     tensors: BTreeMap<String, TensorDescriptor>,
+    _custody: Option<Arc<dyn CatalogCustody>>,
 }
-
+trait CatalogCustody: Any + fmt::Debug + Send + Sync {}
+impl<C: Any + fmt::Debug + Send + Sync> CatalogCustody for C {}
+impl PartialEq for TensorCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.tensors == other.0.tensors
+    }
+}
+impl Eq for TensorCatalog {}
+impl Serialize for TensorCatalog {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Fields<'a> {
+            tensors: &'a BTreeMap<String, TensorDescriptor>,
+        }
+        Fields {
+            tensors: &self.0.tensors,
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for TensorCatalog {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            tensors: BTreeMap<String, TensorDescriptor>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(Self(Arc::new(CatalogData {
+            tensors: fields.tensors,
+            _custody: None,
+        })))
+    }
+}
 impl TensorCatalog {
     /// Validates unique names and non-zero dimensions. An empty shape is a
     /// valid rank-zero scalar with one element.
     pub fn new(tensors: impl IntoIterator<Item = TensorDescriptor>) -> Result<Self, CatalogError> {
+        Self::construct(tensors, None)
+    }
+    /// Constructs after the caller's metadata admission and retains its custody
+    /// across catalog clones. Serialization includes values, not policy custody.
+    /// On construction failure this argument is dropped; callers that need
+    /// custody retained with an error must keep a separate shared owner.
+    pub fn with_custody<C: Any + fmt::Debug + Send + Sync>(
+        tensors: impl IntoIterator<Item = TensorDescriptor>,
+        custody: C,
+    ) -> Result<Self, CatalogError> {
+        Self::construct(tensors, Some(Arc::new(custody)))
+    }
+    fn construct(
+        tensors: impl IntoIterator<Item = TensorDescriptor>,
+        custody: Option<Arc<dyn CatalogCustody>>,
+    ) -> Result<Self, CatalogError> {
         let mut map = BTreeMap::new();
         for tensor in tensors {
             if tensor.name.trim().is_empty() {
@@ -86,23 +137,26 @@ impl TensorCatalog {
                 return Err(CatalogError::Duplicate(name));
             }
         }
-        Ok(Self { tensors: map })
+        Ok(Self(Arc::new(CatalogData {
+            tensors: map,
+            _custody: custody,
+        })))
     }
     /// Looks up a descriptor by canonical name.
     pub fn get(&self, name: &str) -> Option<&TensorDescriptor> {
-        self.tensors.get(name)
+        self.0.tensors.get(name)
     }
     /// Iterates over descriptors in deterministic name order.
     pub fn descriptors(&self) -> impl Iterator<Item = &TensorDescriptor> {
-        self.tensors.values()
+        self.0.tensors.values()
     }
     /// Number of cataloged tensors.
     pub fn len(&self) -> usize {
-        self.tensors.len()
+        self.0.tensors.len()
     }
     /// Whether the catalog is empty.
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.0.tensors.is_empty()
     }
 }
 
@@ -119,3 +173,6 @@ pub enum CatalogError {
     #[error("checkpoint tensor {0} has an invalid shape")]
     InvalidShape(String),
 }
+
+#[cfg(test)]
+mod tests;

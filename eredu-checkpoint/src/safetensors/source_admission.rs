@@ -15,7 +15,8 @@ pub struct SafetensorsIndexRequest {
 ///
 /// The caller reserves initial path/control storage before constructing this
 /// policy. Discovery extends it before reading an index and before constructing
-/// the store catalog. Shared catalogs, files and diagnostics retain the policy.
+/// metadata catalogs and stores. Shared catalogs, files and diagnostics retain
+/// the policy.
 /// The owner completes construction after opening returns and keeps accepted
 /// custody with either the source or its returned failure.
 pub trait SafetensorsSourceAdmission: Any + fmt::Debug + Send + Sync {
@@ -30,8 +31,10 @@ pub trait SafetensorsSourceAdmission: Any + fmt::Debug + Send + Sync {
         &self,
         count: usize,
     ) -> Result<Arc<dyn SafetensorsHeaderAdmission>, Arc<dyn Error + Send + Sync>>;
-    /// Reserve store map/cache/diagnostic metadata from borrowed names and paths.
-    /// This input size is for an estimate, not the map's allocated capacity.
+    /// Reserve a metadata catalog copy or store map/cache/diagnostic metadata
+    /// from borrowed names, paths and geometry. Each independently constructed
+    /// map is admitted before its copy. This input size is for an estimate, not
+    /// the map's allocated capacity.
     fn reserve_store(
         &self,
         metadata_input_bytes: usize,

@@ -247,6 +247,12 @@ impl SafetensorsShards {
         self.limits
     }
 
+    /// Borrows the actual discovery policy value without extracting it.
+    pub fn source_admission_owner<C: std::any::Any>(&self) -> Option<&C> {
+        let policy: &dyn std::any::Any = self.source_admission()?.as_ref();
+        policy.downcast_ref()
+    }
+
     pub(crate) fn source_admission(&self) -> Option<&Arc<dyn SafetensorsSourceAdmission>> {
         self.catalog.source_admission.as_ref()
     }
@@ -376,6 +382,42 @@ impl SafetensorsMetadataCatalog {
             path, limits, admission,
         )?)
         .map_err(StoreError::from)
+    }
+
+    /// Strict inspection under a policy admitted before discovery. The owner
+    /// completes construction after inspection and retains custody on failure.
+    pub fn discover_with_source_admission(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+        admission: Arc<dyn SafetensorsSourceAdmission>,
+    ) -> Result<Self, StoreError> {
+        let shards = SafetensorsShards::discover_catalog_with_source_admission(
+            path.as_ref(),
+            limits,
+            None,
+            Some(admission.clone()),
+        )?;
+        shards.validate_headers().map_err(|(_, error)| error)?;
+        let mut input = 0usize;
+        for path in shards.payload_paths() {
+            for metadata in shards.admission(path).header(path)?.tensors.values() {
+                input = metadata_input_bytes(input, metadata).ok_or_else(|| {
+                    StoreError::Overflow {
+                        context: "SafeTensors inspection metadata".into(),
+                    }
+                })?;
+            }
+        }
+        admission
+            .reserve_store(input)
+            .map_err(StoreError::SafetensorsSourceAdmission)?;
+        Self::from_admitted(shards).map_err(StoreError::from)
+    }
+
+    /// Borrowed input size for configurable metadata-copy headroom. This is not
+    /// an inventory of allocator extents or an enforceable heap ceiling.
+    pub fn metadata_input_bytes(&self) -> Option<usize> {
+        self.tensors.values().try_fold(0, metadata_input_bytes)
     }
 
     /// Builds a catalog using the retained shard admissions without rereading headers.
@@ -1086,3 +1128,21 @@ pub use header_admission::{
 
 mod source_admission;
 pub use source_admission::{SafetensorsIndexRequest, SafetensorsSourceAdmission};
+
+fn metadata_input_bytes(total: usize, metadata: &TensorMetadata) -> Option<usize> {
+    total
+        .checked_add(metadata.name.len())?
+        .checked_add(
+            metadata
+                .backing_shard
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len()),
+        )?
+        .checked_add(
+            metadata
+                .logical_shape
+                .len()
+                .checked_add(metadata.physical_shape.len())?
+                .checked_mul(std::mem::size_of::<usize>())?,
+        )
+}
