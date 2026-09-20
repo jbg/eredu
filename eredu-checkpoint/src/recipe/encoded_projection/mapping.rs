@@ -1,5 +1,5 @@
 //! Counted byte-preserving recipe mappings over borrowed child coordinates.
-use super::{EncodedRange, RecipeError, overflow};
+use super::{EncodedRange, RecipeError, children::ChildMappings, overflow};
 use std::{alloc::Layout, ops::Range};
 
 /// Owned byte coordinates for one encoded recipe node. Source coordinates refer
@@ -19,31 +19,33 @@ pub(super) enum EncodedRecipeMappingInput<'a> {
     },
     Interleaved {
         children: Children<'a>,
-        chunks: &'a [usize],
         outer: usize,
     },
 }
 pub(super) enum Children<'a> {
-    Owned(&'a [EncodedRecipeMapping]),
-    Borrowed(&'a [&'a EncodedRecipeMapping]),
+    Borrowed(&'a [&'a EncodedRecipeMapping], &'a [usize]),
+    Constructed(&'a dyn ChildMappings),
 }
 impl Children<'_> {
-    fn len(&self) -> usize {
+    fn len(&self) -> Result<usize, RecipeError> {
         match self {
-            Self::Owned(rows) => rows.len(),
-            Self::Borrowed(rows) => rows.len(),
+            Self::Borrowed(rows, chunks) if rows.len() == chunks.len() => Ok(rows.len()),
+            Self::Borrowed(..) => Err(overflow()),
+            Self::Constructed(rows) => Ok(rows.len()),
         }
     }
-    fn get(&self, index: usize) -> &EncodedRecipeMapping {
+    fn get(&self, index: usize) -> (&EncodedRecipeMapping, usize) {
         match self {
-            Self::Owned(rows) => &rows[index],
-            Self::Borrowed(rows) => rows[index],
+            Self::Borrowed(rows, chunks) => (rows[index], chunks[index]),
+            Self::Constructed(rows) => rows.get(index),
         }
     }
 }
 
 impl EncodedRecipeMapping {
-    pub(crate) fn encoded_ranges(&self) -> &[EncodedRange] { &self.ranges }
+    pub(crate) fn encoded_ranges(&self) -> &[EncodedRange] {
+        &self.ranges
+    }
 
     /// Total encoded destination length, without reading payloads.
     pub fn byte_len(&self) -> usize {
@@ -67,23 +69,17 @@ impl EncodedRecipeMappingInput<'_> {
                     writer.append_slice(input, range.clone())?;
                 }
             }
-            Self::Interleaved {
-                children,
-                chunks,
-                outer,
-            } => {
-                if children.len() != chunks.len() {
-                    return Err(overflow());
-                }
-                for (child_index, chunk) in chunks.iter().copied().enumerate() {
-                    let child = children.get(child_index);
+            Self::Interleaved { children, outer } => {
+                let count = children.len()?;
+                for child_index in 0..count {
+                    let (child, chunk) = children.get(child_index);
                     if outer.checked_mul(chunk).ok_or_else(overflow)? != child.length {
                         return Err(overflow());
                     }
                 }
                 for index in 0..*outer {
-                    for (child_index, chunk) in chunks.iter().copied().enumerate() {
-                        let child = children.get(child_index);
+                    for child_index in 0..count {
+                        let (child, chunk) = children.get(child_index);
                         let start = index.checked_mul(chunk).ok_or_else(overflow)?;
                         writer.append_slice(
                             child,
@@ -127,8 +123,7 @@ impl<'a> EncodedRecipeMappingPlan<'a> {
         outer: usize,
     ) -> Result<Self, RecipeError> {
         Self::new(EncodedRecipeMappingInput::Interleaved {
-            children: Children::Borrowed(children),
-            chunks,
+            children: Children::Borrowed(children, chunks),
             outer,
         })
     }

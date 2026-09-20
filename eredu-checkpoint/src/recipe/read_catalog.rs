@@ -77,6 +77,33 @@ pub struct ReadBatchCatalog<'a, C> {
     _custody: C,
 }
 impl<C> ReadBatchCatalog<'_, C> {
+    /// Compile an encoded recipe against this batch's actual source occurrences.
+    /// The single checkpoint traversal invokes the caller's storage policy;
+    /// unsupported numerical transforms return `None` after recipe validation.
+    pub fn compile_recipe<P: super::EncodedRecipeConstruction>(
+        &self,
+        recipe: &super::DerivedWeightRecipe,
+        construction: &mut P,
+    ) -> Result<Option<(P::Metadata, P::Mapping)>, P::Error> {
+        let mut length = 0usize;
+        for (index, tensor) in self.tensors.iter().enumerate() {
+            let canonical = self
+                .lookup(&tensor.name)
+                .ok_or(RecipeError::InconsistentReadSource(index))?;
+            if tensor.logical_shape != canonical.logical_shape
+                || tensor.stored_dtype != canonical.stored_dtype
+                || tensor.encoded_byte_len != canonical.encoded_byte_len
+            {
+                return Err(RecipeError::InconsistentReadSource(index).into());
+            }
+            length = usize::try_from(tensor.encoded_byte_len)
+                .ok()
+                .and_then(|bytes| length.checked_add(bytes))
+                .ok_or(RecipeError::ArithmeticOverflow("encoded read source bytes"))?;
+        }
+        super::encoded_projection::compile(recipe, self, self.tensors, length, construction)
+    }
+
     fn lookup(&self, key: &str) -> Option<&TensorMetadata> {
         self.rows
             .binary_search_by(|index| self.tensors[*index].name.as_str().cmp(key))

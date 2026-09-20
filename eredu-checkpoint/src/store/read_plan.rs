@@ -31,6 +31,20 @@ pub struct SafetensorsReadError<'a> {
     key: &'a str,
     cause: Cause<'a>,
 }
+impl SafetensorsReadError<'_> {
+    pub(crate) fn is_bounded_unavailable(&self) -> bool { matches!(self.cause, Cause::Bounded(_)) }
+    pub(crate) fn with_key(self, key: &str) -> SafetensorsReadError<'_> {
+        let cause = match self.cause {
+            Cause::Selection(error) => Cause::Selection(error.with_key(key)),
+            Cause::Overflow(kind) => Cause::Overflow(kind),
+            Cause::Invalid(message) => Cause::Invalid(message),
+            Cause::Bounded(message) => Cause::Bounded(message),
+            Cause::Geometry(message) => Cause::Geometry(message),
+            Cause::Destination { expected, actual } => Cause::Destination { expected, actual },
+        };
+        SafetensorsReadError { key, cause }
+    }
+}
 impl std::fmt::Display for SafetensorsReadError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.cause {

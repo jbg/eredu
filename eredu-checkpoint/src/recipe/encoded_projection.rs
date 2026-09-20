@@ -3,6 +3,12 @@
 //! source/working-storage census as contiguous encoded recipes.
 use super::*;
 use crate::store::{EncodedRange, encoded_selection_plan};
+use std::borrow::Borrow;
+mod children;
+mod construction;
+pub use children::{EncodedRecipeChildren, EncodedRecipeChildrenPlan};
+pub use construction::EncodedRecipeConstruction;
+use construction::OrdinaryConstruction;
 
 fn overflow() -> RecipeError {
     RecipeError::ArithmeticOverflow("encoded recipe range projection")
@@ -17,70 +23,70 @@ fn product(shape: &[usize]) -> Result<usize, RecipeError> {
 }
 
 mod mapping;
-pub use mapping::{EncodedRecipeMapping, EncodedRecipeMappingPlan};
 use mapping::{Children, EncodedRecipeMappingInput as MappingInput};
+pub use mapping::{EncodedRecipeMapping, EncodedRecipeMappingPlan};
 use {EncodedRecipeMapping as Mapping, EncodedRecipeMappingPlan as MappingPlan};
 
-struct Compiler<'a, C: ?Sized> {
+struct Compiler<'a, C: ?Sized, P> {
+    construction: &'a mut P,
     catalog: &'a C,
     tensors: &'a [TensorMetadata],
     source_index: usize,
     source_offset: usize,
 }
-impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
+impl<C: RecipeCatalog + ?Sized, P: EncodedRecipeConstruction> Compiler<'_, C, P> {
     fn select(
-        &self,
-        input: Mapping,
-        metadata: &RecipeMetadata,
+        &mut self,
+        input: P::Mapping,
+        shape: &[usize],
+        bits: usize,
         selection: &TensorSelection,
         output: &RecipeMetadata,
-    ) -> Result<Option<Mapping>, RecipeError> {
-        let bits = bytes(metadata.dtype.bit_width()?)?;
+    ) -> Result<Option<P::Mapping>, P::Error> {
         let plan = match encoded_selection_plan(
             "encoded recipe",
             bits,
-            &metadata.shape,
-            input.length,
+            shape,
+            input.borrow().length,
             selection,
             &output.shape,
         ) {
             Ok(plan) => plan,
-            Err(error) => match StoreError::from(error) {
-                StoreError::BoundedSelectionUnavailable { .. } => return Ok(None),
-                error => return Err(error.into()),
-            },
+            Err(error) if error.is_bounded_unavailable() => return Ok(None),
+            Err(error) => {
+                return Err(RecipeError::EncodedSelection(error.with_key("encoded recipe")).into());
+            }
         };
-        let ranges = plan.build().map_err(RecipeError::ProjectionReserve)?;
-        let mapped = MappingPlan::new(MappingInput::Selected {
-            input: &input,
-            ranges: ranges.ranges(),
-        })?
-        .build()?;
+        let ranges = self.construction.ranges(plan)?;
+        let mapped = self.construction.mapping(MappingPlan::selected(
+            input.borrow(),
+            ranges.borrow().ranges(),
+        )?)?;
         Ok(Some(mapped))
     }
-    fn compile(&mut self, recipe: &DerivedWeightRecipe) -> Result<Option<Mapping>, RecipeError> {
-        let output = infer_read_metadata(recipe, self.catalog)?;
+    fn compile(&mut self, recipe: &DerivedWeightRecipe) -> Result<Option<P::Mapping>, P::Error> {
+        let output_owner = self.construction.infer(recipe, self.catalog)?;
+        let output = output_owner.borrow();
         let mapped = match recipe {
             DerivedWeightRecipe::Source { key, selection } => {
                 let source = self.tensors.get(self.source_index).ok_or_else(overflow)?;
                 if source.name != *key {
-                    return Err(overflow());
+                    return Err(overflow().into());
                 }
                 let length = bytes(source.encoded_byte_len)?;
                 let end = self
                     .source_offset
                     .checked_add(length)
                     .ok_or_else(overflow)?;
-                let mapped =
-                    MappingPlan::new(MappingInput::Source(self.source_offset..end))?.build()?;
+                let mapped = self
+                    .construction
+                    .mapping(MappingPlan::source(self.source_offset..end)?)?;
                 self.source_index = self.source_index.checked_add(1).ok_or_else(overflow)?;
                 self.source_offset = end;
-                let metadata = RecipeMetadata {
-                    shape: source.logical_shape.clone(),
-                    dtype: source.stored_dtype.clone().into(),
-                    byte_len: source.encoded_byte_len,
-                };
-                let Some(mapped) = self.select(mapped, &metadata, selection, &output)? else {
+                let bits = bytes(output.dtype.bit_width()?)?;
+                let Some(mapped) =
+                    self.select(mapped, &source.logical_shape, bits, selection, output)?
+                else {
                     return Ok(None);
                 };
                 mapped
@@ -88,10 +94,12 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
             DerivedWeightRecipe::Concatenate { axis, inputs }
             | DerivedWeightRecipe::Stack { axis, inputs } => {
                 let outer = product(&output.shape[..*axis])?;
-                let mut children = Vec::with_capacity(inputs.len());
-                let mut chunks = Vec::with_capacity(inputs.len());
+                let mut children = self
+                    .construction
+                    .children(EncodedRecipeChildrenPlan::new(inputs.len())?)?;
                 for input in inputs {
-                    let metadata = infer_read_metadata(input, self.catalog)?;
+                    let metadata_owner = self.construction.infer(input, self.catalog)?;
+                    let metadata = metadata_owner.borrow();
                     let tail = &metadata.shape[*axis..];
                     let bits = product(tail)?
                         .checked_mul(bytes(metadata.dtype.bit_width()?)?)
@@ -105,25 +113,31 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                         return Ok(None);
                     };
                     let chunk = bits / 8;
-                    if outer.checked_mul(chunk).ok_or_else(overflow)? != child.length {
-                        return Err(overflow());
+                    if outer.checked_mul(chunk).ok_or_else(overflow)? != child.borrow().length {
+                        return Err(overflow().into());
                     }
-                    chunks.push(chunk);
-                    children.push(child);
+                    children.push(child, chunk)?;
                 }
-                MappingPlan::new(MappingInput::Interleaved {
-                    children: Children::Owned(&children),
-                    chunks: &chunks,
-                    outer,
-                })?
-                .build()?
+                self.construction
+                    .mapping(MappingPlan::new(MappingInput::Interleaved {
+                        children: Children::Constructed(&children),
+                        outer,
+                    })?)?
             }
             DerivedWeightRecipe::Select { input, selection } => {
-                let metadata = infer_read_metadata(input, self.catalog)?;
+                let metadata_owner = self.construction.infer(input, self.catalog)?;
+                let metadata = metadata_owner.borrow();
                 let Some(input) = self.compile(input)? else {
                     return Ok(None);
                 };
-                let Some(mapped) = self.select(input, &metadata, selection, &output)? else {
+                let Some(mapped) = self.select(
+                    input,
+                    &metadata.shape,
+                    bytes(metadata.dtype.bit_width()?)?,
+                    selection,
+                    output,
+                )?
+                else {
                     return Ok(None);
                 };
                 mapped
@@ -136,7 +150,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 mapped
             }
             DerivedWeightRecipe::Cast { input, dtype } => {
-                if infer_read_metadata(input, self.catalog)?.dtype != *dtype {
+                if self.construction.infer(input, self.catalog)?.borrow().dtype != *dtype {
                     return Ok(None);
                 }
                 let Some(mapped) = self.compile(input)? else {
@@ -145,7 +159,8 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 mapped
             }
             DerivedWeightRecipe::Transpose { input, axes } => {
-                let metadata = infer_read_metadata(input, self.catalog)?;
+                let metadata_owner = self.construction.infer(input, self.catalog)?;
+                let metadata = metadata_owner.borrow();
                 // Ordinary recipe inference already validated the permutation.
                 if !metadata.shape.contains(&0)
                     && !axes
@@ -163,11 +178,36 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
             }
             _ => return Ok(None),
         };
-        if mapped.length != bytes(output.byte_len)? {
+        if mapped.borrow().length != bytes(output.byte_len)? {
             return Ok(None);
         }
         Ok(Some(mapped))
     }
+}
+
+pub(super) fn compile<C: RecipeCatalog + ?Sized, P: EncodedRecipeConstruction>(
+    recipe: &DerivedWeightRecipe,
+    catalog: &C,
+    tensors: &[TensorMetadata],
+    length: usize,
+    construction: &mut P,
+) -> Result<Option<(P::Metadata, P::Mapping)>, P::Error> {
+    // Validate the whole recipe before deciding whether it is byte-readable.
+    let output = construction.infer(recipe, catalog)?;
+    let mut compiler = Compiler {
+        catalog,
+        tensors,
+        construction,
+        source_index: 0,
+        source_offset: 0,
+    };
+    let Some(mapping) = compiler.compile(recipe)? else {
+        return Ok(None);
+    };
+    if compiler.source_index != tensors.len() || compiler.source_offset != length {
+        return Err(overflow().into());
+    }
+    Ok(Some((output, mapping)))
 }
 
 pub(super) fn prepare(
@@ -179,34 +219,17 @@ pub(super) fn prepare(
     let Some(batch) = source.prepare_encoded_read(keys)? else {
         return Ok(None);
     };
-    fn compile<C: RecipeCatalog + ?Sized>(
-        recipe: &DerivedWeightRecipe,
-        catalog: &C,
-        tensors: &[TensorMetadata],
-        length: usize,
-    ) -> Result<Option<(RecipeMetadata, Mapping)>, RecipeError> {
-        // Preserve ordinary left-to-right geometry/error precedence before
-        // deciding whether the fully validated recipe is byte-readable.
-        let output = infer_read_metadata(recipe, catalog)?;
-        let mut compiler = Compiler {
-            catalog,
-            tensors,
-            source_index: 0,
-            source_offset: 0,
-        };
-        let Some(mapping) = compiler.compile(recipe)? else {
-            return Ok(None);
-        };
-        if compiler.source_index != tensors.len() || compiler.source_offset != length {
-            return Err(overflow());
-        }
-        Ok(Some((output, mapping)))
-    }
     let compiled = if use_source_cache && source.recipe_cache().is_some() {
-        compile(recipe, source, batch.tensors(), batch.byte_len())?
+        compile(
+            recipe,
+            source,
+            batch.tensors(),
+            batch.byte_len(),
+            &mut OrdinaryConstruction,
+        )?
     } else {
         let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.construct(())?;
-        compile(recipe, &catalog, batch.tensors(), batch.byte_len())?
+        catalog.compile_recipe(recipe, &mut OrdinaryConstruction)?
     };
     let Some((output, mapping)) = compiled else {
         return Ok(None);

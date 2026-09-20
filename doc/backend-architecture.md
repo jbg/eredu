@@ -901,23 +901,27 @@ source constructors, then compare and construct through the pool; there is no
 second initializer object. Source visibility and prepared-header requirements
 are enforced by the checkpoint plans before admission.
 
-Contiguous and projected encoded reads use the same finite inference worker
-as admitted metadata construction when operating on a borrowed batch catalog.
-Persistent source-cache selection remains explicit; cached reads retain their
-existing cache policy. Recursive projection and byte-preserving validation share
-this metadata path without constructing a second compiler. Ordinary preparation
-still owns its allocations: using the finite worker is not itself an admission
-grant. Finite reserve failures retain their typed allocator cause, and recipe
-validation failures preserve their original variants and diagnostics.
+Encoded reads use the same finite inference worker when operating on a borrowed
+batch catalog. Persistent source-cache selection remains explicit; cached reads
+retain their existing cache policy. Projected compilation uses one checkpoint
+traversal with a construction policy for inferred metadata, selection ranges,
+byte mappings and a single array of child owners and chunk widths. Ordinary
+construction and runtime admission execute those same plans. Source metadata is
+borrowed without temporary shape or dtype clones. Batch-catalog compilation binds
+inference to its actual source occurrences and rejects inconsistent duplicate
+metadata before traversal.
 
-Runtime also admits the checkpoint-owned finite inference plan directly. The
-existing shared initialization result retains the original account alongside
-owned output metadata or a typed inference error after borrowed recipe/catalog
-inputs retire. Inference scratch is destroyed synchronously; no native work or
-independent shared alias escapes this constructor. File and memory read sequences
-can compose key, batch, catalog and inference admission in the same pool. These
-reservations remain separate from recursive mapping, projected spans, child-array
-storage and complete producer construction.
+Runtime's construction policy admits each actual plan in the original pool and
+retains each account alongside its output or typed constructor error. Child-array
+ownership transfers with its original account before recursive population; the
+array cannot grow past the planned child count. Temporary children and inference
+scratch retire synchronously. No native work or independent alias escapes.
+Completed metadata and mappings retain their accounts after recipe/catalog
+inputs retire. Recipe validation precedes byte-read support decisions; numerical
+transforms still require numerical execution. Fixed selection failures preserve
+their typed causes without allocating a stringified store error. Machine stack,
+source birth, recipe declarations, subsequent read scratch/output and complete
+producer construction have separate limits and admission.
 
 File and memory encoded-read constructors return one move-only prepared read
 owner. Memory reads retain their direct, scratch-free copy worker; file reads
@@ -934,8 +938,8 @@ failure. Ordinary recipe compilation uses the same constructor. Source handles
 and tensor metadata are moved, not cloned; errors retain typed geometry or
 allocator causes. Runtime compares before construction and preserves the read
 inside a rejected plan. Completed projections remain charged after source stores
-and mappings retire. Keys, shape/child/recipe/overlay storage, later read scratch
-and full producer construction retain separate admission.
+and mappings retire. Keys, recipe/overlay storage, later read scratch and full
+producer construction retain separate admission.
 
 Memory-backed encoded reads inspect their actual immutable store and ordered
 keys before constructing metadata records and source spans. Ordinary reads and

@@ -21,6 +21,11 @@ pub struct SelectionValidationError<'a> {
     key: &'a str,
     cause: Cause,
 }
+impl SelectionValidationError<'_> {
+    pub(super) fn with_key(self, key: &str) -> SelectionValidationError<'_> {
+        SelectionValidationError { key, cause: self.cause }
+    }
+}
 impl std::fmt::Display for SelectionValidationError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.cause {

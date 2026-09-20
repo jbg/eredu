@@ -13,6 +13,8 @@ mod recipe_inference;
 mod recipe_mapping;
 mod selection_ranges;
 mod read_projection;
+mod recipe_compilation;
+pub use recipe_compilation::{AdmittedRecipeConstruction, EncodedRecipeConstructionError};
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public
@@ -87,6 +89,10 @@ impl<T> InitializedSharedNative<T> {
     pub fn original_bytes(&self) -> u64 {
         self.account.held_bytes()
     }
+}
+
+impl<T> std::borrow::Borrow<T> for InitializedSharedNative<T> {
+    fn borrow(&self) -> &T { &self.output }
 }
 
 /// Constructor failure and its actual output/prefix custody, independent of

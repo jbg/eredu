@@ -1,8 +1,8 @@
 use super::*;
 use crate::store::{EncodedTensorLease, ReadPolicy, SafetensorsWeightStore, TensorReadRequest};
 use safetensors::{
-    tensor::{serialize_to_file, TensorView},
     Dtype,
+    tensor::{TensorView, serialize_to_file},
 };
 
 type Recipe = DerivedWeightRecipe;
@@ -48,7 +48,9 @@ fn recursive_projection_uses_borrowed_finite_metadata_and_preserves_exact_ranges
     let output = infer_read_metadata(&recipe, &catalog).unwrap();
     assert_eq!(output.shape(), [2, 1, 3]);
     assert_eq!(output.byte_len(), 6);
+    let mut ordinary = OrdinaryConstruction;
     let mut compiler = Compiler {
+        construction: &mut ordinary,
         catalog: &catalog,
         tensors: &tensors,
         source_index: 0,
@@ -448,22 +450,28 @@ fn uncached_read_preparation_does_not_depend_on_source_cache_health() {
     assert!(poisoned.is_err());
     let whole = source("gate", TensorSelection::Full);
     assert!(whole.prepare_encoded_read(&store).is_err());
-    assert!(whole
-        .prepare_encoded_read_uncached(&store)
-        .unwrap()
-        .is_some());
-    assert!(selected_rows(vec![4, 0])
-        .prepare_encoded_read_uncached(&store)
-        .unwrap()
-        .is_some());
+    assert!(
+        whole
+            .prepare_encoded_read_uncached(&store)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        selected_rows(vec![4, 0])
+            .prepare_encoded_read_uncached(&store)
+            .unwrap()
+            .is_some()
+    );
     let conversion = Recipe::Cast {
         input: Box::new(whole),
         dtype: RecipeDtype::U32,
     };
-    assert!(conversion
-        .prepare_encoded_read_uncached(&store)
-        .unwrap()
-        .is_none());
+    assert!(
+        conversion
+            .prepare_encoded_read_uncached(&store)
+            .unwrap()
+            .is_none()
+    );
     let invalid = selected_rows(vec![usize::MAX]);
     assert!(matches!(
         invalid.prepare_encoded_read_uncached(&store),
@@ -478,4 +486,83 @@ fn uncached_read_preparation_does_not_depend_on_source_cache_health() {
         Err(RecipeError::InvalidPermutation { .. })
     ));
     assert_eq!(store.source_diagnostics().unwrap().physical_read_bytes, 0);
+}
+
+#[test]
+fn compilation_rejects_inconsistent_duplicate_source_metadata() {
+    let first = TensorMetadata {
+        name: "a".into(),
+        logical_shape: vec![2, 3],
+        physical_shape: vec![2, 3],
+        stored_dtype: StoredDtype::U8,
+        encoded_byte_len: 6,
+        backing_shard: None,
+    };
+    for second in [
+        TensorMetadata {
+            logical_shape: vec![6],
+            ..first.clone()
+        },
+        TensorMetadata {
+            stored_dtype: StoredDtype::I8,
+            ..first.clone()
+        },
+        TensorMetadata {
+            encoded_byte_len: 7,
+            ..first.clone()
+        },
+    ] {
+        let tensors = [first.clone(), second];
+        let catalog = ReadBatchCatalogPlan::new(&tensors)
+            .unwrap()
+            .construct(())
+            .unwrap();
+        let recipe = concatenate(vec![source("a", TensorSelection::Full); 2]);
+        assert!(matches!(
+            catalog.compile_recipe(&recipe, &mut OrdinaryConstruction),
+            Err(RecipeError::InconsistentReadSource(0))
+        ));
+    }
+}
+
+#[test]
+fn child_array_keeps_its_capacity_and_custody_through_population() {
+    assert!(EncodedRecipeChildrenPlan::<Mapping>::new(usize::MAX).is_err());
+    let custody = Arc::new(());
+    let alive = Arc::downgrade(&custody);
+    let mut children = EncodedRecipeChildrenPlan::<Mapping>::new(2)
+        .unwrap()
+        .construct(custody)
+        .unwrap();
+    children
+        .push(MappingPlan::source(0..4).unwrap().build().unwrap(), 2)
+        .unwrap();
+    children
+        .push(MappingPlan::source(100..104).unwrap().build().unwrap(), 2)
+        .unwrap();
+    assert!(
+        children
+            .push(MappingPlan::source(200..204).unwrap().build().unwrap(), 2)
+            .is_err()
+    );
+    let children = children.with_custody(());
+    let mapped = MappingPlan::new(MappingInput::Interleaved {
+        children: Children::Constructed(&children),
+        outer: 2,
+    })
+    .unwrap()
+    .build()
+    .unwrap();
+    assert_eq!(
+        mapped.ranges().collect::<Vec<_>>(),
+        [
+            (0..2, 0..2),
+            (100..102, 2..4),
+            (2..4, 4..6),
+            (102..104, 6..8)
+        ]
+    );
+    assert!(alive.upgrade().is_some());
+    drop(children);
+    assert!(alive.upgrade().is_none());
 }
