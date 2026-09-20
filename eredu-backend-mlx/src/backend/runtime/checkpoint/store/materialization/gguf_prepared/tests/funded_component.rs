@@ -885,3 +885,6 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
 
 #[path = "funded_component/affine_tile.rs"]
 mod affine_tile;
+
+#[path = "funded_component/encoded_input_affine.rs"]
+mod encoded_input_affine;

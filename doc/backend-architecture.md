@@ -773,6 +773,13 @@ input and selected storage quote before constructing quantization or companion
 casts. It uses the shared tile producer with separate affine and cast constructor
 banks, then submits the quote's finite traversal through the retained owner.
 Lazy inputs and mismatched quotes are rejected before producing native outputs.
+An admitted encoded checkpoint read can fill the final native input buffer
+directly. Its source account covers the metadata arena, physical backing, one
+prepared array alias and synchronous read scratch before payload I/O. Exact shape
+and dtype checks precede admission; only a complete successful read publishes an
+immutable source. Escaped array aliases retain the source account independently
+of the constructor wrapper, and failed reads retain their account with the typed
+error. Retained read metadata and runtime initialization are separate prerequisites.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming
