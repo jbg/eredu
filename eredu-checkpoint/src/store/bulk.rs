@@ -9,7 +9,7 @@ pub(crate) use projection::EncodedRange;
 mod detached;
 mod memory;
 pub use memory::{
-    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
+    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
     PreparedMemoryEncodedRead,
 };
 pub use borrowed::{EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout};

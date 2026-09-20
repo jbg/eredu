@@ -667,7 +667,7 @@ pub use bulk::{
     DetachedEncodedReadPlan, DetachedEncodedReadSlice, DetachedEncodedReads,
     DetachedReadBuildCause, DetachedReadBuildError, DetachedReadFailure, EncodedReadBatch,
     EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
-    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
+    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
     PreparedMemoryEncodedRead,
 };
 
@@ -1068,6 +1068,20 @@ impl CompositeCheckpointSource {
         self.source_owner_for(key)
             .map(|source| source.as_ref() as &dyn CheckpointSource)
     }
+
+    // Batch selection preserves the ordinary first-error/unsupported order.
+    // An empty batch or the first change of child has no single encoded owner.
+    fn encoded_read_owner(&self, keys: &[String]) -> Result<Option<&RetainedCheckpointSource>, usize> {
+        let mut owner = None;
+        for (index, key) in keys.iter().enumerate() {
+            let current = *self.owners.get(key).ok_or(index)?;
+            if owner.is_some_and(|previous| previous != current) {
+                return Ok(None);
+            }
+            owner = Some(current);
+        }
+        Ok(owner.map(|index| &self.sources[index]))
+    }
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
@@ -1155,19 +1169,10 @@ impl CheckpointSource for CompositeCheckpointSource {
         &self,
         keys: &[String],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
-        let mut owner = None;
-        for key in keys {
-            let current = *self
-                .owners
-                .get(key)
-                .ok_or_else(|| StoreError::UnknownTensor { key: key.clone() })?;
-            if owner.is_some_and(|previous| previous != current) {
-                return Ok(None);
-            }
-            owner = Some(current);
-        }
-        match owner {
-            Some(owner) => self.sources[owner].prepare_encoded_read(keys),
+        match self.encoded_read_owner(keys).map_err(|index| StoreError::UnknownTensor {
+            key: keys[index].clone(),
+        })? {
+            Some(source) => source.prepare_encoded_read(keys),
             None => Ok(None),
         }
     }

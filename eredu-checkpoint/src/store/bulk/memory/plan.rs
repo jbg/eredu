@@ -40,11 +40,36 @@ impl MemoryEncodedReadPlanError {
     }
 }
 
-/// A borrowed original constructor over one immutable store and ordered keys.
-/// Inspection allocates nothing and reads no payload bytes. Repeated keys retain
-/// separate metadata/span occurrences and share the same original source owner.
+/// A fixed refusal from an authorized memory-read route or its source inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MemoryEncodedReadRouteError {
+    /// An actual enclosing source view excludes this requested occurrence.
+    #[error("memory read source occurrence {index} is not authorized")]
+    UnauthorizedTensor { index: usize },
+    /// The selected source cannot describe this batch.
+    #[error(transparent)]
+    Source(#[from] MemoryEncodedReadPlanError),
+}
+
+enum PlanSource<'a> {
+    Borrowed(&'a MemoryWeightStore),
+    Retained(Arc<MemoryWeightStore>),
+}
+impl std::ops::Deref for PlanSource<'_> {
+    type Target = MemoryWeightStore;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(source) => source,
+            Self::Retained(source) => source,
+        }
+    }
+}
+
+/// An original constructor over one immutable store and borrowed ordered keys.
+/// Repeated keys retain separate metadata/span occurrences and share the same
+/// original source owner. A routed plan retains its selected concrete store.
 pub struct MemoryEncodedReadPlan<'a> {
-    store: &'a MemoryWeightStore,
+    store: PlanSource<'a>,
     keys: &'a [String],
     byte_len: usize,
     backing_bytes: usize,
@@ -54,6 +79,31 @@ impl<'a> MemoryEncodedReadPlan<'a> {
     /// metadata or source handles. Source payload admission remains separate.
     pub fn new(
         store: &'a MemoryWeightStore,
+        keys: &'a [String],
+    ) -> Result<Self, MemoryEncodedReadPlanError> {
+        Self::inspect(PlanSource::Borrowed(store), keys)
+    }
+
+    /// Follow actual built-in source owners and validate their batch visibility
+    /// before inspection. The plan retains the selected store, so construction
+    /// invokes no routing callbacks and does not need the enclosing views alive.
+    /// `None` means no concrete memory route, including mixed composite children;
+    /// it never invokes ordinary acquisition or accepts a forwarded owner identity.
+    /// Built-in traversal clones existing handles without allocating route rows.
+    pub fn from_source(
+        source: &RetainedCheckpointSource,
+        keys: &'a [String],
+    ) -> Result<Option<Self>, MemoryEncodedReadRouteError> {
+        let Some(store) = acquisition::retained_route::encoded_memory_source(source, keys)? else {
+            return Ok(None);
+        };
+        Self::inspect(PlanSource::Retained(store), keys)
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn inspect(
+        store: PlanSource<'a>,
         keys: &'a [String],
     ) -> Result<Self, MemoryEncodedReadPlanError> {
         use MemoryEncodedReadPlanError as E;
@@ -237,5 +287,7 @@ impl<C> std::error::Error for MemoryEncodedReadBuildError<C> {
     }
 }
 
+#[cfg(test)]
+mod route_tests;
 #[cfg(test)]
 mod tests;

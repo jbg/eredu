@@ -2,7 +2,8 @@
 use super::*;
 use eredu_checkpoint::store::{
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
-    MemoryWeightStore, PreparedMemoryEncodedRead,
+    MemoryEncodedReadRouteError, MemoryWeightStore, PreparedMemoryEncodedRead,
+    RetainedCheckpointSource,
 };
 
 /// Binds the actual source and ordered occurrences before the cold pool compares
@@ -16,6 +17,16 @@ impl<'a> MemoryEncodedReadInitializer<'a> {
         keys: &'a [String],
     ) -> Result<Self, MemoryEncodedReadPlanError> {
         MemoryEncodedReadPlan::new(source, keys).map(Self)
+    }
+
+    /// Select an authorized concrete memory owner before sizing its original
+    /// constructor. Unsupported routes return `None`; ordinary source behavior
+    /// is unchanged. Once selected, the plan retains the store through admission.
+    pub fn from_source(
+        source: &RetainedCheckpointSource,
+        keys: &'a [String],
+    ) -> Result<Option<Self>, MemoryEncodedReadRouteError> {
+        MemoryEncodedReadPlan::from_source(source, keys).map(|plan| plan.map(Self))
     }
 
     /// Total managed constructor contribution including the retained account.

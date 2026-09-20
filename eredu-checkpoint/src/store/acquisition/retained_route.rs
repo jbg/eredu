@@ -122,10 +122,12 @@ fn stable_materialized_key(source: &RetainedCheckpointSource, key: &str) -> Opti
                 Some(false)
             }
         }
-        Route::Composite(owner) => match owner.source_owner_for(key) {
-            Ok(child) => stable_materialized_key(child, key),
-            Err(_) => Some(false),
-        },
+        Route::Composite(owner) => {
+            match owner.owners.get(key).and_then(|index| owner.sources.get(*index)) {
+                Some(child) => stable_materialized_key(child, key),
+                None => Some(false),
+            }
+        }
     }
 }
 
@@ -135,6 +137,62 @@ struct StepOwner {
     // is known. They are retained only if every child is concrete and immutable.
     validate_prepared: bool,
     materialized: bool,
+}
+
+/// Select one immutable memory owner using the actual enclosing batch contracts.
+/// No source callback is needed after this cold selection has returned its owner.
+pub(in crate::store) fn encoded_memory_source(
+    source: &RetainedCheckpointSource,
+    keys: &[String],
+) -> Result<Option<Arc<MemoryWeightStore>>, MemoryEncodedReadRouteError> {
+    let mut current = source.clone();
+    loop {
+        let Some(owner) = current.acquisition_owner() else {
+            return Ok(None);
+        };
+        if let Owner::Memory(store) = owner.0 {
+            return Ok(Some(store));
+        }
+        current = match owner.route() {
+            Route::Memory(_) => unreachable!("memory owner returned above"),
+            Route::Unavailable | Route::Safetensors(_) | Route::Gguf(_) => return Ok(None),
+            Route::Prepared(owner) => {
+                // Ordinary encoded preparation delegates immediately when its
+                // child promises a fixed catalog. Authenticate that promise
+                // through concrete owners, including off-route composite children.
+                if stable_recipe_presence(&owner.source) != Some(true) {
+                    return Ok(None);
+                }
+                owner.source.clone()
+            }
+            Route::Restricted(owner) => {
+                for (index, key) in keys.iter().enumerate() {
+                    if !owner.is_authorized(key) {
+                        return Err(MemoryEncodedReadRouteError::UnauthorizedTensor { index });
+                    }
+                }
+                owner.source.clone()
+            }
+            Route::Composite(owner) => {
+                let child = owner.encoded_read_owner(keys).map_err(|index| {
+                    MemoryEncodedReadPlanError::UnknownTensor { index }
+                })?;
+                let Some(child) = child else { return Ok(None) };
+                child.clone()
+            }
+            Route::Resolved(owner) => {
+                for (index, key) in keys.iter().enumerate() {
+                    let Some(materialized) = stable_materialized_key(&owner.source, key) else {
+                        return Ok(None);
+                    };
+                    if !materialized && !owner.contract.source_keys().contains(key) {
+                        return Err(MemoryEncodedReadRouteError::UnauthorizedTensor { index });
+                    }
+                }
+                owner.source.clone()
+            }
+        };
+    }
 }
 pub(super) struct RetainedGgufRoute {
     steps: Vec<StepOwner>,

@@ -875,6 +875,15 @@ and failed reserve prefixes retain its custody after all metadata and source
 handles. The move-only result reads into caller-owned storage without staging or
 read scratch. Existing source payloads and keys retain separate admission; this
 constructor does not establish file-header, recipe-compiler or whole-model fit.
+Admitted memory-read plans can also select through retained built-in source
+views. Selection authenticates each concrete owner, preserves restricted/resolved
+visibility and the composite single-child batch rule, and retains the selected
+memory store before comparison. Prepared views require the concrete fixed-catalog
+promise, including off-route composite dependencies. Unsupported or forwarded
+owner identities return no plan without invoking ordinary read construction.
+The selected plan needs no routing callbacks during construction; rejected plans
+retain their source until retirement, and completed batches retain the original
+payload handles after the surrounding views and catalog store retire.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

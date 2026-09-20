@@ -156,3 +156,60 @@ fn failed_producer_retains_actual_memory_read_after_borrowed_plan_retires() {
     drop(failure);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+#[test]
+fn routed_memory_admission_keeps_selected_source_through_rejection_and_success() {
+    use eredu_checkpoint::store::RestrictedCheckpointSource;
+    use std::{collections::BTreeSet, sync::Arc};
+    for short in [true, false] {
+        let leaf = Arc::new(source());
+        let alive = Arc::downgrade(&leaf);
+        let root: RetainedCheckpointSource = Arc::new(
+            RestrictedCheckpointSource::including(
+                leaf.clone(),
+                "first only",
+                BTreeSet::from(["first".into()]),
+            )
+            .unwrap(),
+        )
+        .into();
+        let denied = ["second".into()];
+        assert!(matches!(
+            MemoryEncodedReadInitializer::from_source(&root, &denied),
+            Err(MemoryEncodedReadRouteError::UnauthorizedTensor { index: 0 })
+        ));
+        let keys = ["first".into(), "first".into()];
+        let plan = MemoryEncodedReadInitializer::from_source(&root, &keys)
+            .unwrap()
+            .unwrap();
+        let Some(bytes) = requirement(&plan) else {
+            return;
+        };
+        drop((root, leaf));
+        assert!(alive.upgrade().is_some());
+        let pool = WorkingMemoryPool::new(bytes - u64::from(short), 0).unwrap();
+        if short {
+            let error = plan.prepare(&pool).unwrap_err();
+            assert!(error.rejected_plan().is_some());
+            assert!(matches!(
+                error.accounting_failure(),
+                Some(WorkingMemoryError::BudgetExceeded { .. })
+            ));
+            assert!(alive.upgrade().is_some());
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+            drop(error);
+            assert!(alive.upgrade().is_none());
+        } else {
+            let read = plan.prepare(&pool).unwrap();
+            // The finished batch keeps payload owners, not its catalog wrapper.
+            assert!(alive.upgrade().is_none());
+            drop(keys);
+            let mut output = [0; 4];
+            read.output().read_into(&mut output).unwrap();
+            assert_eq!(output, [13, 29, 13, 29]);
+            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            drop(read);
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+        }
+    }
+}
