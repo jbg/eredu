@@ -50,11 +50,10 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 error => return Err(error.into()),
             },
         };
-        let mut ranges = vec![0..0; plan.range_count()];
-        plan.fill_into(&mut ranges).map_err(StoreError::from)?;
+        let ranges = plan.build().map_err(RecipeError::ProjectionReserve)?;
         let mapped = MappingPlan::new(MappingInput::Selected {
             input: &input,
-            ranges: &ranges,
+            ranges: ranges.ranges(),
         })?
         .build()?;
         Ok(Some(mapped))

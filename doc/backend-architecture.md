@@ -867,6 +867,15 @@ intact. Construction retains typed allocation errors and publishes no native
 alias. Child-reference arrays remain borrowed prerequisites. This mapping
 admission does not cover source metadata, inference, projected read spans or
 child-array construction, and does not establish whole-compiler admission.
+Selection-range destinations likewise use the shared physical-read geometry
+worker. Public encoded planning validates into caller-owned shape scratch before
+counting; compiler-internal planning uses its already inferred geometry. Both
+construct the same exact requested range vector. Runtime implements the existing
+shared initializer directly for that destination plan, preserving reserve errors
+and keeping the owned ranges charged after input shapes and selections retire.
+Mapping construction can borrow these admitted ranges in the same pool. Shape
+scratch, child arrays, projected source spans and whole-compiler construction
+retain separate admission.
 Encoded recipe reads share one source-key traversal for structural qualification,
 counting and construction. The ordered occurrence list preserves duplicates and
 uses exact requested vector/string capacities. Runtime implements its existing

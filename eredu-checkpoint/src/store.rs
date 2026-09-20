@@ -645,7 +645,7 @@ mod read_plan;
 pub(crate) use read_plan::encoded_selection_plan;
 pub use read_plan::{
     SafetensorsReadDestinationPlan, SafetensorsReadError, SafetensorsReadRanges,
-    SafetensorsReadSource,
+    SafetensorsReadSource, SelectionReadDestinationPlan, SelectionReadRanges,
 };
 
 mod lease_controls;

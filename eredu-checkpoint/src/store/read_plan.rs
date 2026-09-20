@@ -235,8 +235,8 @@ impl<'s> SafetensorsReadDestinationPlan<'s, '_> {
 
 /// Counted geometry for one already validated selection. Both the source and
 /// inferred output shapes remain borrowed through the actual destination fill.
-/// This crate-private worker grants neither source authority nor admission.
-pub(crate) struct SelectionReadDestinationPlan<'s, 'd> {
+/// This geometry worker grants neither source authority nor admission.
+pub struct SelectionReadDestinationPlan<'s, 'd> {
     key: &'s str,
     bits: usize,
     shape: &'s [usize],
@@ -248,6 +248,73 @@ pub(crate) struct SelectionReadDestinationPlan<'s, 'd> {
     layout: Layout,
 }
 impl<'s, 'd> SelectionReadDestinationPlan<'s, 'd> {
+    /// Validate a selection using caller-owned shape scratch, then count its
+    /// byte-aligned ranges with the same worker used by encoded recipes.
+    /// Scratch lengths come from [`SelectionValidationPlan`]. This method
+    /// allocates nothing and retains no payload or source authority.
+    pub fn for_encoded(
+        key: &'s str,
+        bits: usize,
+        shape: &'s [usize],
+        payload_len: usize,
+        selection: &'s TensorSelection,
+        initial_shape: &'d mut [usize],
+        replacement_shape: &'d mut [usize],
+    ) -> Result<Self, SafetensorsReadError<'s>> {
+        let validation =
+            SelectionValidationPlan::new(key, shape, selection).ok_or(SafetensorsReadError {
+                key,
+                cause: Cause::Geometry("shape destination layout overflow"),
+            })?;
+        let output = validation
+            .validate_into(initial_shape, replacement_shape)
+            .map_err(|error| SafetensorsReadError {
+                key,
+                cause: Cause::Selection(error),
+            })?;
+        Self::new(
+            key,
+            bits,
+            shape,
+            payload_len,
+            selection,
+            output,
+            ReadPolicy::RequireBounded,
+        )
+    }
+    /// Exact requested range backing plus fixed constructor/result controls.
+    /// Borrowed source/shape/selection storage, allocator overhead and machine
+    /// stack are excluded. The caller owns their separate admission.
+    pub fn required_bytes(&self) -> Option<usize> {
+        [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<SelectionReadRanges>(),
+            std::mem::size_of::<FixedResult<'static>>(),
+            std::mem::size_of::<Fixed<'static>>(),
+            std::mem::size_of::<Result<SelectionReadRanges, std::collections::TryReserveError>>(),
+        ]
+        .into_iter()
+        .try_fold(self.layout.size(), usize::checked_add)
+    }
+    /// Construct the counted range vector. The immutable inputs are exactly
+    /// those already accepted by the count traversal; filling cannot acquire
+    /// new source state or change validation. Reserve errors retain their type.
+    pub fn build(self) -> Result<SelectionReadRanges, std::collections::TryReserveError> {
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(self.count)?;
+        ranges.resize(self.count, 0..0);
+        let filled = self
+            .fill_into(&mut ranges)
+            .expect("immutable counted selection geometry");
+        let physically_bounded = filled.physically_bounded();
+        let used = filled.ranges().len();
+        ranges.truncate(used);
+        Ok(SelectionReadRanges {
+            ranges,
+            physically_bounded,
+        })
+    }
+
     fn new(
         key: &'s str,
         bits: usize,
@@ -322,6 +389,24 @@ impl<'s, 'd> SelectionReadDestinationPlan<'s, 'd> {
         })
     }
 }
+/// Owned coalesced byte ranges, independent of the borrowed selection and
+/// shape scratch. This is geometry, not a lease or payload admission.
+#[derive(Debug)]
+pub struct SelectionReadRanges {
+    ranges: Vec<Range<usize>>,
+    physically_bounded: bool,
+}
+impl SelectionReadRanges {
+    /// Ordered relative ranges, preserving non-adjacent repeated selections.
+    pub fn ranges(&self) -> &[Range<usize>] {
+        &self.ranges
+    }
+    /// Whether the selected geometry restricts the requested physical bytes.
+    pub fn physically_bounded(&self) -> bool {
+        self.physically_bounded
+    }
+}
+
 /// Borrowed coalesced read ranges. This is geometry, not an acquired lease.
 pub struct SafetensorsReadRanges<'a> {
     ranges: &'a [Range<usize>],

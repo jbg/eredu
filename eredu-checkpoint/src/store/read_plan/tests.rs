@@ -826,3 +826,38 @@ fn encoded_projection_range_plan_retains_typed_alignment_and_overflow_errors() {
         Cause::Geometry("inner stride overflow")
     ));
 }
+
+#[test]
+fn encoded_destination_validates_before_counting_and_builds_owned_ranges() {
+    let selection = TensorSelection::Indices { axis: 1, indices: vec![2, 0, 2] };
+    let mut initial = [0; 2];
+    let mut replacement = [];
+    let plan = SelectionReadDestinationPlan::for_encoded(
+        "matrix", 8, &[2, 3], 6, &selection, &mut initial, &mut replacement,
+    ).unwrap();
+    assert!(plan.required_bytes().unwrap() >= plan.range_layout().size());
+    let ranges = plan.build().unwrap();
+    assert_eq!(ranges.ranges(), [2..3, 0..1, 2..3, 5..6, 3..4, 5..6]);
+    assert!(ranges.physically_bounded());
+    drop(selection);
+    initial.fill(99);
+    assert_eq!(ranges.ranges()[0], 2..3);
+
+    for selection in [
+        TensorSelection::Indices { axis: 2, indices: vec![0] },
+        TensorSelection::Indices { axis: 1, indices: vec![3] },
+        TensorSelection::Range { axis: 0, start: 2, end: 1 },
+    ] {
+        assert!(SelectionReadDestinationPlan::for_encoded(
+            "matrix", 8, &[2, 3], 6, &selection, &mut initial, &mut replacement,
+        ).is_err());
+    }
+    let packed = TensorSelection::Range { axis: 0, start: 1, end: 2 };
+    let error = match SelectionReadDestinationPlan::for_encoded(
+        "packed", 4, &[4], 2, &packed, &mut [0], &mut [],
+    ) {
+        Ok(_) => panic!("a half-byte selection is not a bounded byte read"),
+        Err(error) => StoreError::from(error),
+    };
+    assert!(matches!(error, StoreError::BoundedSelectionUnavailable { .. }));
+}
