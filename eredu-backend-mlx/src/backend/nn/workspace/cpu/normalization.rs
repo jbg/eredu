@@ -6,6 +6,8 @@ mod weightless_half;
 mod grouped;
 #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 mod grouped_tests;
+#[cfg(all(test, target_vendor = "apple", not(feature = "cuda")))]
+mod offset_tests;
 
 #[derive(Clone, Copy)]
 enum Buffer { Full=0, Row=1, Vector=2, Scalar=3 }
@@ -45,14 +47,14 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     if let WorkspaceOperationKindView::ConstructedNormalization(spec)=operation.kind {
         if let Some(groups)=spec.groups {return grouped::inspect(operation,mechanism,spec,groups);}
     }
-    let (learned,constructed)=match operation.kind {
-        WorkspaceOperationKindView::Normalization("rms",None)=>(operation.inputs.len()==2,false),
+    let (learned,constructed,offset)=match operation.kind {
+        WorkspaceOperationKindView::Normalization("rms",None)=>(operation.inputs.len()==2,false,false),
         WorkspaceOperationKindView::ConstructedNormalization(spec)=>{
             spec.validate_fixed()?;
             match &spec.scale {
-                NormalizationScale::Learned(_)=>(true,true),
-                NormalizationScale::Unit=>(false,true),
-                NormalizationScale::LearnedOffset{..}=>return Ok(None),
+                NormalizationScale::Learned(_)=>(true,true,false),
+                NormalizationScale::Unit=>(false,true,false),
+                NormalizationScale::LearnedOffset{..}=>(true,true,true),
             }
         }
         _=>return Ok(None),
@@ -68,7 +70,8 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let Some(input_dtype)=input.representation().map(|r|r.dtype()) else{return Ok(None)};
     let gain_dtype=if learned {let Some(gain)=operation.inputs.get(1).and_then(|gain|gain.representation())
         else{return Ok(None)};gain.dtype()}else{input_dtype};
-    let promoted=super::super::representation::promote(input_dtype,gain_dtype);
+    let scale_dtype=if offset {WorkspaceFloatingType::Float32}else{gain_dtype};
+    let promoted=super::super::representation::promote(input_dtype,scale_dtype);
     let native_dtype=|dtype|match dtype {
         WorkspaceFloatingType::Float32=>Dtype::Float32,
         WorkspaceFloatingType::Bfloat16=>Dtype::Bfloat16,
@@ -103,17 +106,30 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
             return weightless_half::source(input_native,rank,width,rows,count);
         }
         let mut p=Population::default();
+        if offset {
+            // The ungrouped worker adds an eager F32 scalar directly to the
+            // stored gain. The Add frontend widens it before broadcasting.
+            p.cast(gain_native,Dtype::Float32,1,width,Buffer::Vector)?;
+            p.cast(Dtype::Float32,Dtype::Float32,0,1,Buffer::Scalar)?;
+            p.alias(1,1)?;p.alias(0,1)?;
+            let add=OperationEvent::cpu_binary_layout(CpuBinaryOperation::Add,Dtype::Float32,1,width,false)?;
+            p.birth(Buffer::Vector,add.backing_births())?;p.native.binary(add)?;
+        }
         if learned {
             // Only equal half inputs enter input_precision_rms's GPU probe.
             // CPU declines it; its actual unused cast still has a constructor.
-            if input_dtype==gain_dtype&&input_dtype!=WorkspaceFloatingType::Float32 {
+            if input_dtype==scale_dtype&&input_dtype!=WorkspaceFloatingType::Float32 {
                 p.cast(input_native,Dtype::Float32,rank,count,Buffer::Full)?;
             }
-            p.cast(gain_native,native,1,width,Buffer::Vector)?;
+            p.cast(native_dtype(scale_dtype),native,1,width,Buffer::Vector)?;
             p.cast(input_native,Dtype::Float32,rank,count,Buffer::Full)?;
         }
         p.unary(CpuUnaryOperation::Square,rank,Buffer::Full)?;
-        p.copy(OperationEvent::cpu_row_sum_layout(rank,width,rows,false)?,Some(Buffer::Row))?;
+        if width==1 {
+            p.cast(Dtype::Float32,Dtype::Float32,rank,count,Buffer::Full)?;
+        }else{
+            p.copy(OperationEvent::cpu_row_sum_layout(rank,width,rows,false)?,Some(Buffer::Row))?;
+        }
         // mean divides once by the width scalar; no reciprocal rewrite.
         p.binary(CpuBinaryOperation::Divide,Dtype::Float32,rank,rows,
             Buffer::Row,Buffer::Scalar,0,1,Buffer::Row)?;
@@ -137,7 +153,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     if source.births.into_iter().try_fold(0usize,usize::checked_add)!=Some(source.native.births) {
         return Err(MlxWorkspaceFactError::descriptor("CPU RMS physical source population differs"));
     }
-    let seeds=2usize; // separately owned actual mean width and epsilon scalars.
+    let seeds=2+usize::from(offset); // actual mean width, epsilon and optional gain offset.
     let full=mechanism.allocation.fixed_buffer_capacity(facts::mul(input.elements()?,4)?)?;
     let row=mechanism.allocation.fixed_buffer_capacity(facts::mul(u64::try_from(rows)?,4)?)?;
     let vector=mechanism.allocation.fixed_buffer_capacity(facts::mul(u64::try_from(width)?,4)?)?;
@@ -147,7 +163,7 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let scratch_bytes=total.checked_sub(full).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
     let frames=[size_of::<Population>()*3,size_of::<Option<Population>>(),size_of::<OperationPlan>(),
         size_of::<Option<OperationPlan>>(),size_of::<WorkspaceOperationView<'_>>(),size_of::<WorkspaceLayoutView<'_>>()*3,
-        size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<WorkspaceFloatingType>()*4,size_of::<Dtype>()*3,
+        size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<WorkspaceFloatingType>()*5,size_of::<Dtype>()*3,
         size_of::<Option<WorkspaceRepresentation>>(),size_of::<WorkspaceRepresentation>(),
         size_of::<(CpuBinaryOperation,Dtype,usize,usize,Buffer,Buffer,usize,usize,Buffer)>(),
         size_of::<(Dtype,Dtype,usize,usize,Buffer)>(),size_of::<(CpuUnaryOperation,usize,Buffer)>(),
@@ -162,10 +178,18 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
         size_of::<Result<Option<safemlx::Array>,safemlx::error::Exception>>(),
         size_of::<usize>()*9,size_of::<u64>()*5,size_of::<[usize;4]>(),size_of::<[u64;4]>(),
         size_of::<std::iter::Zip<std::array::IntoIter<usize,4>,std::array::IntoIter<u64,4>>>(),
-        size_of::<std::slice::Iter<i32>>(),size_of::<bool>()*3,
+        size_of::<std::slice::Iter<i32>>(),size_of::<bool>()*4,
         size_of::<std::iter::Enumerate<eredu_nn::workspace::WorkspaceLayoutIter<'_>>>()];
     source.native.controls=frames.into_iter().try_fold(source.native.controls.checked_add(size_of_val(&frames))
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,|n,b|n.checked_add(b).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW))?;
+    if offset {
+        let frames=[size_of::<(&mut crate::backend::nn::shared::MlxRmsNorm,&crate::MlxTensor,&safemlx::Stream)>(),
+            size_of::<safemlx::Array>()*2,size_of::<f32>(),size_of::<Option<f32>>(),
+            size_of::<Result<safemlx::Array,eredu_nn::Error>>(),
+            size_of::<Result<crate::MlxTensor,eredu_nn::Error>>()];
+        source.native.controls=frames.into_iter().try_fold(source.native.controls.checked_add(size_of_val(&frames))
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,|n,b|n.checked_add(b).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW))?;
+    }
     Ok(Some(OperationPlan { alias_input: None,dtype,population:source.native,output_bytes:full,scratch_bytes,rank,
         parameter_shells:usize::from(learned),seeds,validations:0}))
 }

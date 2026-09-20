@@ -746,6 +746,12 @@ their actual Broadcast alias producers before the binary task; native evaluation
 still checks strides, physical spans and signed loop limits. The logical peer
 dependency keeps its typed zero, multiply and add sequence unchanged.
 
+Ungrouped learned-offset RMS normalization uses the shared CPU RMS recipe. The
+explicit F32 offset promotes the learned gain before normalization, so the recipe
+counts that cast/add sequence, its scalar source and vector backing, and the F32
+result. Width-one means retain their actual identity-cast reduction. Grouped RMS
+keeps its distinct reshape and final input-precision cast sequence.
+
 The neutral `zeros_like` trace delegates to the existing typed zero constructor,
 using the prototype's authenticated scalar precision and shape without claiming
 its values as graph inputs. Generic host initialization remains a separate

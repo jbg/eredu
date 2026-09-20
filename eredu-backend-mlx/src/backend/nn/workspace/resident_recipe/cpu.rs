@@ -902,10 +902,6 @@ mod tests {
                 context.begin_span();let output=WorkspaceBackend::rms_norm_without_weight(&input,1e-6,&context).unwrap();
                 let unit=context.report(&[output]).unwrap();
                 assert!(cpu.plan(unit.operations[0].as_view()).unwrap().is_some());
-                let mut refused=report;
-                let WorkspaceOperationKind::ConstructedNormalization(spec)=&mut refused.operations[0].kind else{panic!("normalization identity")};
-                spec.scale=NormalizationScale::LearnedOffset{weight:ParameterSpec::trainable("cpu.weight").unwrap(),offset:1.0};
-                assert!(cpu.plan(refused.operations[0].as_view()).unwrap().is_none());
             }
         }
     }
