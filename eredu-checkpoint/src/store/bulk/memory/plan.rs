@@ -46,6 +46,9 @@ pub enum MemoryEncodedReadRouteError {
     /// An actual enclosing source view excludes this requested occurrence.
     #[error("memory read source occurrence {index} is not authorized")]
     UnauthorizedTensor { index: usize },
+    /// A completed source differs from its enclosing prepared catalog.
+    #[error("memory read source occurrence {index} differs from the prepared catalog")]
+    PreparedCatalogMismatch { index: usize },
     /// The selected source cannot describe this batch.
     #[error(transparent)]
     Source(#[from] MemoryEncodedReadPlanError),
@@ -94,12 +97,17 @@ impl<'a> MemoryEncodedReadPlan<'a> {
         source: &RetainedCheckpointSource,
         keys: &'a [String],
     ) -> Result<Option<Self>, MemoryEncodedReadRouteError> {
-        let Some(store) = acquisition::retained_route::encoded_memory_source(source, keys)? else {
-            return Ok(None);
-        };
+        acquisition::retained_route::encoded_memory_plan(source, keys)
+    }
+
+    pub(in crate::store) fn retained(
+        store: Arc<MemoryWeightStore>, keys: &'a [String],
+    ) -> Result<Self, MemoryEncodedReadPlanError> {
         Self::inspect(PlanSource::Retained(store), keys)
-            .map(Some)
-            .map_err(Into::into)
+    }
+
+    pub(in crate::store) fn metadata(&self, index: usize) -> &TensorMetadata {
+        &self.store.tensors[&self.keys[index]].metadata
     }
 
     fn inspect(

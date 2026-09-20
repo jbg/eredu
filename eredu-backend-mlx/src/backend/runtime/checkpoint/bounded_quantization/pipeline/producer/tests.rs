@@ -674,7 +674,17 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                 });
                 assert_eq!(pool.used_bytes().unwrap(), with_outputs);
                 let (source, _) = result.into_parts();
-                let source = Arc::new(source).into();
+                let source: eredu_checkpoint::store::RetainedCheckpointSource = Arc::new(source).into();
+                let catalog = source.source_keys().into_iter().map(|key| {
+                    let row = eredu_checkpoint::store::PreparedTensorSource {
+                        metadata: source.source_metadata(&key).unwrap(),
+                        provenance: source.source_provenance(&key).unwrap(),
+                    };
+                    (key, row)
+                }).collect();
+                let source = Arc::new(eredu_checkpoint::store::PreparedCheckpointSource::new(
+                    source, catalog,
+                ).unwrap()).into();
                 let keys = [String::from("weight")];
                 let read = eredu_checkpoint::store::MemoryEncodedReadPlan::from_source(&source, &keys)
                     .unwrap().unwrap().construct(()).unwrap();

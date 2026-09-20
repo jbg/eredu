@@ -741,6 +741,21 @@ pub struct PreparedTensorSource {
     pub provenance: TensorSourceProvenance,
 }
 
+impl PreparedTensorSource {
+    // Encoded batches describe full scalar tensors. Compare the generated
+    // provenance by borrowing its fields instead of cloning strings or paths.
+    fn matches_encoded_metadata(&self, metadata: &TensorMetadata) -> bool {
+        let provenance = &self.provenance;
+        self.metadata == *metadata
+            && provenance.catalog_key == metadata.name
+            && provenance.physical_tensor == metadata.name
+            && provenance.output == metadata.name
+            && provenance.backing_shard == metadata.backing_shard
+            && matches!(&provenance.source_encoding,
+                crate::SourceTensorEncoding::Safetensors(dtype) if dtype == &metadata.stored_dtype)
+    }
+}
+
 /// Checkpoint source pinned to an exact metadata and provenance snapshot.
 ///
 /// The wrapper admits metadata and provenance once, then validates each
@@ -970,7 +985,7 @@ impl CheckpointSource for PreparedCheckpointSource {
         };
         for metadata in batch.tensors() {
             let expected = self.expected(&metadata.name)?;
-            if metadata != &expected.metadata || expected.provenance != bulk::provenance(metadata) {
+            if !expected.matches_encoded_metadata(metadata) {
                 return Err(StoreError::PreparedCatalogMismatch {
                     key: metadata.name.clone(),
                 });

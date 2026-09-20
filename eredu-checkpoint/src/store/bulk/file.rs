@@ -9,6 +9,11 @@ pub enum SafetensorsEncodedReadPlanErrorKind {
     UnknownTensor { index: usize },
     /// An enclosing concrete view excludes this occurrence.
     UnauthorizedTensor { index: usize },
+    /// A completed source differs from its enclosing prepared catalog.
+    PreparedCatalogMismatch {
+        /// Ordered source occurrence that differs.
+        index: usize,
+    },
     /// The source has not prepared this header.
     HeaderUnavailable { index: usize },
     /// The source retains a failed header construction.
@@ -37,6 +42,11 @@ impl SafetensorsEncodedReadPlanError {
     pub(in crate::store) fn unknown(index: usize) -> Self {
         Self(InspectionCause::Fixed(
             SafetensorsEncodedReadPlanErrorKind::UnknownTensor { index },
+        ))
+    }
+    pub(in crate::store) fn catalog_mismatch(index: usize) -> Self {
+        Self(InspectionCause::Fixed(
+            SafetensorsEncodedReadPlanErrorKind::PreparedCatalogMismatch { index },
         ))
     }
     fn unavailable(index: usize) -> Self {
@@ -88,6 +98,9 @@ impl SafetensorsEncodedReadPlanError {
             K::UnknownTensor { index } => StoreError::UnknownTensor {
                 key: keys[index].clone(),
             },
+            K::PreparedCatalogMismatch { index } => StoreError::PreparedCatalogMismatch {
+                key: keys[index].clone(),
+            },
             K::UnauthorizedTensor { index } => StoreError::UnauthorizedTensor {
                 key: keys[index].clone(),
                 contract: self
@@ -124,6 +137,8 @@ impl fmt::Display for SafetensorsEncodedReadPlanError {
             K::UnknownTensor { index } => {
                 write!(f, "encoded file source occurrence {index} is absent")
             }
+            K::PreparedCatalogMismatch { index } => write!(f,
+                "encoded file source occurrence {index} differs from the prepared catalog"),
             K::UnauthorizedTensor { index } => write!(
                 f,
                 "encoded file source occurrence {index} is not authorized by {:?}",
@@ -185,10 +200,11 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
         source: &'a RetainedCheckpointSource,
         keys: &'a [String],
     ) -> Result<Option<Self>, SafetensorsEncodedReadPlanError> {
-        let Some(store) = acquisition::retained_route::encoded_file_source(source, keys)? else {
-            return Ok(None);
-        };
-        Self::new(store, keys).map(Some)
+        acquisition::retained_route::encoded_file_plan(source, keys)
+    }
+
+    pub(in crate::store) fn metadata(&self, index: usize) -> &TensorMetadata {
+        self.entry(index, 0).expect("inspected immutable header").0
     }
 
     /// Inspect only headers already retained by this exact source. Missing headers

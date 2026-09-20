@@ -206,3 +206,6 @@ impl CheckpointSource for MaterializedCheckpointSource {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod prepared_tests;

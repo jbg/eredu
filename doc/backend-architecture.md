@@ -1153,6 +1153,13 @@ The MLX `QuantizedCheckpoint` result moves that neutral source and its conversio
 report into loading, without implementing a second checkpoint source. Output
 buffers retain their payload reservations and estimated catalog metadata headroom;
 this source type does not itself grant allocation authority.
+Prepared encoded reads authenticate each concrete source and inspect the immutable
+leaf before comparing enclosing catalogs from inner to outer. Catalogs over a
+materialized source compare metadata and scalar provenance with the same borrowed
+predicate as ordinary reads. This does not require a recipe cache or invoke an
+ordinary read callback. Missing entries and catalog mismatches preserve ordered
+occurrence diagnostics; unqualified custom sources remain unsupported by this
+closed constructor.
 
 Cold declarations, candidate recipes, overlay/result storage and the enclosing
 prepared-manager handoff remain separate admission responsibilities.

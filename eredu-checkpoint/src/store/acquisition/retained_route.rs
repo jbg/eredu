@@ -177,7 +177,7 @@ struct StepOwner {
 }
 
 mod encoded;
-pub(in crate::store) use encoded::{encoded_file_source, encoded_memory_source};
+pub(in crate::store) use encoded::{encoded_file_plan, encoded_memory_plan};
 
 pub(super) struct RetainedGgufRoute {
     steps: Vec<StepOwner>,

@@ -1,6 +1,7 @@
 use super::*;
 use eredu_checkpoint::store::{
     MemoryWeightStore, RestrictedCheckpointSource, SafetensorsWeightStore, TensorSelection,
+    MaterializedCheckpointSource, PreparedCheckpointSource, PreparedTensorSource,
 };
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 use std::sync::Arc;
@@ -40,7 +41,7 @@ fn routed_memory_and_file_recipes_keep_custody_after_source_and_key_retirement()
         &path,
     )
     .unwrap();
-    let memory: RetainedCheckpointSource = Arc::new(
+    let memory = || -> RetainedCheckpointSource { Arc::new(
         MemoryWeightStore::from_safetensors([(
             "雪".into(),
             Dtype::U8,
@@ -49,10 +50,26 @@ fn routed_memory_and_file_recipes_keep_custody_after_source_and_key_retirement()
         )])
         .unwrap(),
     )
-    .into();
-    let file: RetainedCheckpointSource =
-        Arc::new(SafetensorsWeightStore::open(path).unwrap()).into();
-    for source in [memory, file] {
+    .into() };
+    let file = || -> RetainedCheckpointSource {
+        Arc::new(SafetensorsWeightStore::open(&path).unwrap()).into()
+    };
+    let mut sources = vec![memory(), file()];
+    for source in [memory(), file()] {
+        let overlay: RetainedCheckpointSource = Arc::new(MaterializedCheckpointSource::new(
+            source, MemoryWeightStore::from_safetensors([]).unwrap(),
+            Default::default(), Default::default(),
+        )).into();
+        let catalog = overlay.source_keys().into_iter().map(|key| {
+            let row = PreparedTensorSource {
+                metadata: overlay.source_metadata(&key).unwrap(),
+                provenance: overlay.source_provenance(&key).unwrap(),
+            };
+            (key, row)
+        }).collect();
+        sources.push(Arc::new(PreparedCheckpointSource::new(overlay, catalog).unwrap()).into());
+    }
+    for source in sources {
         let root: RetainedCheckpointSource = Arc::new(
             RestrictedCheckpointSource::including(
                 source,

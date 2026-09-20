@@ -214,16 +214,6 @@ fn read_exact_vectored(
     Ok(())
 }
 
-pub(super) fn provenance(metadata: &TensorMetadata) -> TensorSourceProvenance {
-    TensorSourceProvenance {
-        catalog_key: metadata.name.clone(),
-        physical_tensor: metadata.name.clone(),
-        output: metadata.name.clone(),
-        backing_shard: metadata.backing_shard.clone(),
-        source_encoding: crate::SourceTensorEncoding::Safetensors(metadata.stored_dtype.clone()),
-    }
-}
-
 pub(super) fn prepare(
     store: &SafetensorsWeightStore,
     keys: &[String],

@@ -3,6 +3,7 @@ use super::*;
 
 enum Refusal {
     Unknown { index: usize },
+    CatalogMismatch { index: usize },
     Unauthorized { index: usize },
 }
 impl From<Refusal> for MemoryEncodedReadRouteError {
@@ -12,6 +13,7 @@ impl From<Refusal> for MemoryEncodedReadRouteError {
                 MemoryEncodedReadPlanError::UnknownTensor { index }.into()
             }
             Refusal::Unauthorized { index, .. } => Self::UnauthorizedTensor { index },
+            Refusal::CatalogMismatch { index } => Self::PreparedCatalogMismatch { index },
         }
     }
 }
@@ -20,16 +22,34 @@ impl From<Refusal> for MemoryEncodedReadRouteError {
 fn child<'a>(
     route: Route<'a>,
     keys: &[String],
-) -> Result<Option<&'a RetainedCheckpointSource>, Refusal> {
-    Ok(match route {
+) -> Result<
+    Option<(
+        &'a RetainedCheckpointSource,
+        Option<&'a PreparedCheckpointSource>,
+    )>,
+    Refusal,
+> {
+    let mut prepared = None;
+    let source = match route {
         Route::Unavailable | Route::Memory(_) | Route::Safetensors(_) | Route::Gguf(_) => None,
         Route::Materialized(owner) => owner.encoded_read_owner(keys),
         Route::Prepared(owner) => {
             // The ordinary encoded path delegates immediately when its child
             // promises a fixed catalog. Authenticate all concrete dependencies
-            // of that promise, including unselected composite children.
-            if stable_recipe_presence(&owner.source) != Some(true) {
-                return Ok(None);
+            // of that promise, including unselected composite children. A known
+            // cacheless child instead needs its expected entries and a comparison
+            // against the completed immutable leaf metadata.
+            match stable_recipe_presence(&owner.source) {
+                None => return Ok(None),
+                Some(true) => {}
+                Some(false) => {
+                    prepared = Some(owner);
+                    for (index, key) in keys.iter().enumerate() {
+                        if !owner.catalog.contains_key(key) {
+                            return Err(Refusal::Unknown { index });
+                        }
+                    }
+                }
             }
             Some(&owner.source)
         }
@@ -55,28 +75,56 @@ fn child<'a>(
             }
             Some(&owner.source)
         }
-    })
+    };
+    Ok(source.map(|source| (source, prepared)))
 }
 
-/// An owning memory route can release its enclosing views before construction.
-pub(in crate::store) fn encoded_memory_source(
-    source: &RetainedCheckpointSource,
-    keys: &[String],
-) -> Result<Option<Arc<MemoryWeightStore>>, MemoryEncodedReadRouteError> {
-    let mut current = source.clone();
-    loop {
-        let Some(owner) = current.acquisition_owner() else {
-            return Ok(None);
-        };
-        if let Owner::Memory(store) = owner.0 {
-            return Ok(Some(store));
+// Compare after the concrete child is inspected, from inner to outer views,
+// preserving ordinary encoded-read validation and error order. The leaf plan
+// keeps immutable metadata; no route rows, catalog clones or cache are created.
+fn validate_prepared<'a>(
+    prepared: Option<&PreparedCheckpointSource>,
+    count: usize,
+    mut metadata: impl FnMut(usize) -> &'a TensorMetadata,
+) -> Result<(), Refusal> {
+    let Some(owner) = prepared else { return Ok(()) };
+    for index in 0..count {
+        let metadata = metadata(index);
+        let expected = owner
+            .catalog
+            .get(&metadata.name)
+            .ok_or(Refusal::Unknown { index })?;
+        if !expected.matches_encoded_metadata(metadata) {
+            return Err(Refusal::CatalogMismatch { index });
         }
-        let Some(next) = child(owner.route(), keys).map_err(MemoryEncodedReadRouteError::from)?
-        else {
-            return Ok(None);
-        };
-        current = next.clone();
     }
+    Ok(())
+}
+
+/// An owning memory plan can release its enclosing views after inspection.
+pub(in crate::store) fn encoded_memory_plan<'a>(
+    source: &RetainedCheckpointSource,
+    keys: &'a [String],
+) -> Result<Option<MemoryEncodedReadPlan<'a>>, MemoryEncodedReadRouteError> {
+    let Some(owner) = source.acquisition_owner() else {
+        return Ok(None);
+    };
+    if let Owner::Memory(store) = owner.0 {
+        return MemoryEncodedReadPlan::retained(store, keys)
+            .map(Some)
+            .map_err(Into::into);
+    }
+    let Some((next, prepared)) =
+        child(owner.route(), keys).map_err(MemoryEncodedReadRouteError::from)?
+    else {
+        return Ok(None);
+    };
+    let Some(plan) = encoded_memory_plan(next, keys)? else {
+        return Ok(None);
+    };
+    validate_prepared(prepared, keys.len(), |index| plan.metadata(index))
+        .map_err(MemoryEncodedReadRouteError::from)?;
+    Ok(Some(plan))
 }
 
 // The source lends this route for its own lifetime. Its loan must name exactly
@@ -104,33 +152,36 @@ fn borrowed_route<'a>(
 /// File plans borrow their source during inspection/construction. Refusals retain
 /// the actual authorization or header owner independently of that loan. Routing
 /// creates no allocated rows and invokes no ordinary read preparation.
-pub(in crate::store) fn encoded_file_source<'a>(
+pub(in crate::store) fn encoded_file_plan<'a>(
     source: &'a RetainedCheckpointSource,
-    keys: &[String],
-) -> Result<Option<&'a SafetensorsWeightStore>, SafetensorsEncodedReadPlanError> {
-    let mut current = source;
-    loop {
-        let Some(owner) = current.acquisition_owner() else {
-            return Ok(None);
-        };
-        let Some(route) = borrowed_route(&owner, current) else {
-            return Ok(None);
-        };
-        if let Route::Safetensors(store) = route {
-            return Ok(Some(store));
-        }
-        let next = match child(route, keys) {
-            Ok(next) => next,
-            Err(Refusal::Unknown { index }) => {
-                return Err(SafetensorsEncodedReadPlanError::unknown(index));
-            }
-            Err(Refusal::Unauthorized { index, .. }) => {
-                return Err(SafetensorsEncodedReadPlanError::unauthorized(index, owner));
-            }
-        };
-        let Some(next) = next else {
-            return Ok(None);
-        };
-        current = next;
+    keys: &'a [String],
+) -> Result<Option<SafetensorsEncodedReadPlan<'a>>, SafetensorsEncodedReadPlanError> {
+    let Some(owner) = source.acquisition_owner() else {
+        return Ok(None);
+    };
+    let Some(route) = borrowed_route(&owner, source) else {
+        return Ok(None);
+    };
+    if let Route::Safetensors(store) = route {
+        return SafetensorsEncodedReadPlan::new(store, keys).map(Some);
     }
+    let refusal = |error| match error {
+        Refusal::Unknown { index } => SafetensorsEncodedReadPlanError::unknown(index),
+        Refusal::Unauthorized { index } => {
+            SafetensorsEncodedReadPlanError::unauthorized(index, owner)
+        }
+        Refusal::CatalogMismatch { index } => {
+            SafetensorsEncodedReadPlanError::catalog_mismatch(index)
+        }
+    };
+    let (next, prepared) = match child(route, keys) {
+        Ok(Some(next)) => next,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(refusal(error)),
+    };
+    let Some(plan) = encoded_file_plan(next, keys)? else {
+        return Ok(None);
+    };
+    validate_prepared(prepared, keys.len(), |index| plan.metadata(index)).map_err(refusal)?;
+    Ok(Some(plan))
 }
