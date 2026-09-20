@@ -29,6 +29,20 @@ pub(super) enum ConstructionError {
     #[error("cold conversion: {0}")]
     Conversion(#[from] PipelineAdmissionError<encoded_affine::TileError<()>>),
 }
+impl ConstructionError {
+    fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self {
+            Self::Resources(cause) => cause.into_backend_failure(),
+            Self::Preparation(cause) => BackendFailure::from_error(cause),
+            Self::Conversion(cause) => match cause {
+                PipelineAdmissionError::Policy(cause) => BackendFailure::from_error(cause),
+                PipelineAdmissionError::Admission(cause) => cause.into_backend_failure(),
+                PipelineAdmissionError::Producer(cause) => cause.into_backend_failure(),
+            },
+        }
+    }
+}
 
 struct MetadataInputs<'a> {
     source: &'a RetainedCheckpointSource,
@@ -56,12 +70,12 @@ impl ColdConversion<'_> {
         self,
     ) -> Result<
         ConvertedQuantization,
-        SharedNativeInitializationFailure<Cell<Option<ConvertedQuantization>>, ConstructionError>,
+        SharedNativeInitializationFailure<(), eredu_core::BackendFailure>,
     > {
         let initialized = self
             .pool
             .initialize_shared_native(self)
-            .map_err(|error| error.into_parts().1)?;
+            .map_err(|error| error.into_parts().1.retire_output_and_map_error(ConstructionError::into_backend_failure))?;
         // This private output independently retains its account through both
         // the plan and source root. The generic initialized owner stays borrowed.
         Ok(initialized

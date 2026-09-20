@@ -77,6 +77,16 @@ pub(crate) struct FailedSubmission<I: 'static, E> {
     cause: E,
     _pending: PendingRole<I, Custody>,
 }
+impl<I: 'static, E> FailedSubmission<I, E> {
+    /// Maps the owned cause on this thread, then hands pending native work to
+    /// ordinary recovery. Dropping that owner is not a completion assertion.
+    pub(crate) fn retire_and_map_error<F>(self, map: impl FnOnce(E) -> F) -> F {
+        let Self { cause, _pending } = self;
+        let error = map(cause);
+        drop(_pending);
+        error
+    }
+}
 impl<I: 'static, E: std::fmt::Debug> std::fmt::Debug for FailedSubmission<I, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FailedColdSubmission")

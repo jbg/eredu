@@ -74,7 +74,7 @@ impl<C: fmt::Debug + 'static> InitializedSharedNative<PreparedEncodedRead<C>> {
         self.validate_pool(pool)?;
         let catalog = pool
             .initialize_shared_native(ReadBatchCatalogPlan::new(self.output.tensors())?)
-            .map_err(|error| E::Catalog(error.retire_output_and_map_error(|cause| cause)))?;
+            .map_err(|error| E::Catalog(error.into_parts().1.retire_output_and_map_error(|cause| cause)))?;
         let compiled = catalog
             .output()
             .compile_recipe(recipe, &mut AdmittedRecipeConstruction::new(pool))?;

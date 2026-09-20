@@ -87,7 +87,7 @@ pub(super) struct CpuExecutionError(#[source] SharedNativeInitializationError<In
 
 impl CpuExecutionError {
     pub(super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
-        eredu_core::BackendFailure::from_error(self.0.retire_output_and_map_error(|error| {
+        eredu_core::BackendFailure::from_error(self.0.into_parts().1.retire_output_and_map_error(|error| {
             match error {
                 ConstructorFailure::Selection(error) => eredu_core::BackendFailure::from_error(error),
                 ConstructorFailure::Selected(error) => eredu_core::BackendFailure::from_error(error),

@@ -1182,6 +1182,13 @@ materialized source share metadata custody, including surviving opaque identitie
 failure diagnostics retain the initializer account. Native resources, tile work,
 original source/header birth and model-manager construction retain their own
 admission requirements.
+Cold conversion errors retire thread-local constructor outputs and transfer
+pending native work to the existing recovery owner before entering the shared
+backend error envelope. Typed causes and their original diagnostic accounts
+survive that conversion; error transfer does not assert native completion.
+The shared initialization failure owns this retirement operation, so callers
+separate any rejected plan locally and use the same operation for constructor
+and settlement failures.
 
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed

@@ -125,6 +125,28 @@ enum Failure {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub(super) struct ResourceError(#[from] Failure);
+impl ResourceError {
+    pub(super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self.0 {
+            Failure::Policy(cause) => BackendFailure::from_error(cause),
+            Failure::Stream(cause) => cause.into_backend_failure(),
+            Failure::Worker(cause) => cause.into_backend_failure(),
+            Failure::Initialization(error) => BackendFailure::from_error(
+                error.into_parts().1.retire_output_and_map_error(|error| {
+                    let ConstructionError { cause, _prefix, _custody } = error;
+                    drop(_prefix);
+                    drop(_custody);
+                    match cause {
+                        Cause::Runtime(cause) => BackendFailure::from_error(cause),
+                        Cause::Stream(cause) => cause.into_backend_failure(),
+                        Cause::Worker(cause) => cause.into_backend_failure(),
+                    }
+                }),
+            ),
+        }
+    }
+}
 impl From<WorkingMemoryError> for ResourceError {
     fn from(cause: WorkingMemoryError) -> Self {
         Self(Failure::Policy(cause))

@@ -60,6 +60,14 @@ pub(in super::super) struct CacheAdmissionError(
     #[source] SharedNativeInitializationError<Initializer>,
 );
 
+impl CacheAdmissionError {
+    pub(in super::super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        eredu_core::BackendFailure::from_error(
+            self.0.into_parts().1.retire_output_and_map_error(|never| -> Infallible { match never {} }),
+        )
+    }
+}
+
 impl BoundedAllocatorCache {
     pub(in super::super) fn new(working_set_limit_bytes: u64) -> Self {
         Self::with_cleanup(

@@ -74,7 +74,7 @@ impl MlxGpuStreamError {
             Failure::Source(error) => error.into_backend_failure(),
             Failure::Worker(error) => error.into_backend_failure(),
             Failure::Constructor(error) => BackendFailure::from_error(
-                error.retire_output_and_map_error(|error| match error {
+                error.into_parts().1.retire_output_and_map_error(|error| match error {
                     ConstructorFailure::Preparation(error) => error.cause(),
                     ConstructorFailure::Native(error) => error.cause(),
                 }),

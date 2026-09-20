@@ -361,33 +361,42 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
     ));
     assert_eq!(producer.slots, [0, 1]);
     assert_eq!(producer.peak_live, 2);
-    let mut cause: &(dyn std::error::Error + 'static) = &error;
-    let input_error = loop {
-        if let Some(input) = cause.downcast_ref::<crate::backend::runtime::checkpoint::store::EncodedInputConstructionError>() {
-            break input;
-        }
-        cause = cause
-            .source()
-            .expect("original typed input cause in error chain");
-    };
-    assert!(matches!(
-        input_error,
-        crate::backend::runtime::checkpoint::store::EncodedInputConstructionError::Read(
-            EncodedReadFailure {
-                cause: EncodedReadFailureCause::Changed,
-                ..
-            }
-        )
-    ));
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
         producer.live.get() == 1
     });
-    // The first tile retires independently. The failed second invocation and
-    // its source error account remain live while the returned error is held.
+    // The first tile retires independently. Mapping the failed second tile
+    // retires local native wrappers while keeping its typed input diagnostic.
     assert_eq!(producer.live.get(), 1);
     assert!(producer.pool.used_bytes().unwrap() > 0);
-    drop(error);
+    let PipelineAdmissionError::Producer(error) = error else { unreachable!() };
+    let diagnostic = error.into_backend_failure();
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::reclaim_allocation_owners();
+        producer.live.get() == 0
+    });
+    assert_eq!(producer.live.get(), 0);
+    assert!(producer.pool.used_bytes().unwrap() > 0);
+    std::thread::spawn(move || {
+        let mut cause: &(dyn std::error::Error + 'static) = &diagnostic;
+        let input_error = loop {
+            if let Some(input) = cause.downcast_ref::<crate::backend::runtime::checkpoint::store::EncodedInputConstructionError>() {
+                break input;
+            }
+            cause = cause
+                .source()
+                .expect("original typed input cause in error chain");
+        };
+        assert!(matches!(
+            input_error,
+            crate::backend::runtime::checkpoint::store::EncodedInputConstructionError::Read(
+                EncodedReadFailure {
+                    cause: EncodedReadFailureCause::Changed,
+                    ..
+                }
+            )
+        ));
+    }).join().unwrap();
     drain(&producer);
 }
 
@@ -762,7 +771,10 @@ fn check_cold_metadata_refusals(
     // Known metadata permits admission, then ordinary cold collision checking
     // fails. Its formatted cause keeps the original account until error drop.
     let failure = conversion().prepare().unwrap_err();
-    assert!(matches!(failure.constructor_failure(), Some(admission::ConstructionError::Preparation(Error::Quantization(_)))));
+    let cause = std::error::Error::source(failure.constructor_failure().unwrap()).unwrap();
+    assert!(matches!(cause.downcast_ref::<Error>(), Some(Error::Quantization(_))));
+    fn transferable<T: Send + Sync>(_: &T) {}
+    transferable(&failure);
     assert_eq!(pool.used_bytes().unwrap(), persistent + required);
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
     drop(failure);

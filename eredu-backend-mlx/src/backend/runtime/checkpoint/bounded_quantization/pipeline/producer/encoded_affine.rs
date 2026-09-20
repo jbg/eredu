@@ -10,9 +10,8 @@ use safemlx::{
     CpuAffineQuantizeSubmissionLayout, ImmutableHostTransferBuffer, PreparedInputRuntime,
 };
 
-/// Every constructor retains its actual prefix/account. Some slot prefixes own
-/// thread-local recovery state, so this error is intentionally not erased into
-/// the backend's Send + Sync error envelope.
+/// Local constructor failures retain their actual prefix/account. Conversion
+/// into the shared backend error retires thread-local wrappers first.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ConstructionError {
     #[error("affine tile materialization: {0}")]
@@ -31,8 +30,8 @@ pub(super) enum ConstructionError {
     ),
 }
 
-/// Failure retains its actual constructor or native invocation prefix. Native
-/// recovery remains thread-local and is not erased into a Send error envelope.
+/// Failure retains its actual constructor or native invocation prefix. Shared
+/// diagnostics are produced only after local wrappers enter ordinary recovery.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TileError<I: 'static> {
     #[error("tile resources: {0}")]
@@ -45,8 +44,6 @@ pub(super) enum TileError<I: 'static> {
     Layout(#[source] safemlx::OriginalBufferCause),
     #[error("tile source read: {0}")]
     Read(#[from] eredu_runtime::working_memory::EncodedRecipeSourceError),
-    #[error("tile source requires numerical or unsupported read construction")]
-    ReadUnavailable,
     #[error("tile output metadata: {0}")]
     Metadata(
         #[source]
@@ -66,6 +63,37 @@ pub(super) enum TileError<I: 'static> {
 impl<I: 'static> From<eredu_checkpoint::recipe::RecipeError> for TileError<I> {
     fn from(cause: eredu_checkpoint::recipe::RecipeError) -> Self {
         Self::Backend(cause.into())
+    }
+}
+
+impl ConstructionError {
+    fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self {
+            Self::Backend(cause) => BackendFailure::from_error(cause),
+            Self::Slot(cause) => cause.into_backend_failure(),
+            Self::Alias(cause) => BackendFailure::from_error(cause),
+            Self::Input(cause) => BackendFailure::from_error(
+                cause.retire_output_and_map_error(std::convert::identity),
+            ),
+        }
+    }
+}
+impl<I: 'static> TileError<I> {
+    pub(super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self {
+            Self::Resources(cause) => cause.into_backend_failure(),
+            Self::Backend(cause) => BackendFailure::from_error(cause),
+            Self::Policy(cause) => BackendFailure::from_error(cause),
+            Self::Layout(cause) => BackendFailure::from_error(cause),
+            Self::Read(cause) => BackendFailure::from_error(cause),
+            Self::Metadata(cause) => BackendFailure::from_error(cause),
+            Self::Admission(cause) => BackendFailure::from_error(
+                cause.retire_output_and_map_error(std::convert::identity),
+            ),
+            Self::Invocation(cause) => cause.retire_and_map_error(ConstructionError::into_backend_failure),
+        }
     }
 }
 
@@ -106,7 +134,7 @@ impl<'a> Tile<'a> {
         metadata.validate_pool(pool)?;
         let read = pool
             .prepare_encoded_recipe(source, recipe)?
-            .ok_or(TileError::ReadUnavailable)?;
+            .ok_or(TileError::Policy(W::UnknownBound))?;
         if read.output() != metadata.output().inferred() {
             return Err(W::IdentityMismatch.into());
         }

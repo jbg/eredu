@@ -55,6 +55,18 @@ impl SharedNativeInitializer for Initializer {
 #[error(transparent)]
 pub(crate) struct ColdMaterializationSlotError(SharedNativeInitializationError<Initializer>);
 
+impl ColdMaterializationSlotError {
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        eredu_core::BackendFailure::from_error(
+            self.0.into_parts().1.retire_output_and_map_error(|error| {
+                let ConstructionFailure { _prefix, cause } = error;
+                drop(_prefix);
+                cause
+            }),
+        )
+    }
+}
+
 /// A move-only source-funded slot. Its one checkout transfers the actual
 /// prepared node; the node keeps its account independently of this wrapper.
 pub(crate) struct ColdMaterializationSlot(InitializedSharedNative<Slot>);

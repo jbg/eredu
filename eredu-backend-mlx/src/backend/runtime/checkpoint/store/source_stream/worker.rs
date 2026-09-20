@@ -72,7 +72,7 @@ impl MaterializationSourceWorkerError {
             Failure::Stream(error) => error.into_backend_failure(),
             Failure::Scheduler(error) => BackendFailure::from_error(error),
             Failure::Initialization(error) => BackendFailure::from_error(
-                error.retire_output_and_map_error(|error| match error {
+                error.into_parts().1.retire_output_and_map_error(|error| match error {
                     ConstructorFailure::Preparation(error) => error.cause(),
                     ConstructorFailure::Native(error) => error.cause(),
                 }),
