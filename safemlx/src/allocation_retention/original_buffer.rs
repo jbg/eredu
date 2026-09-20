@@ -220,12 +220,13 @@ impl OriginalBufferBudget {
             size_of::<&PreparedInputRuntime>(),size_of::<usize>()*3,size_of::<u32>()];
         frames.into_iter().try_fold(native.checked_add(size_of::<[usize;6]>())?,usize::checked_add)
     }
-    /// Bound original Metal backing from the sum of requested payload bytes and
-    /// the maximum number of positive allocation attempts, retaining every birth.
-    /// The actual retained allocator supplies the page quantum. Zero payload has
-    /// zero physical backing; CPU header rules are deliberately unsupported.
+    /// Bound original CPU or Metal backing from total requested payload bytes
+    /// and the maximum number of allocation attempts, retaining every birth.
+    /// The actual retained allocator supplies the page quantum and header rule.
+    /// CPU attempts include empty payloads, whose headers still occupy backing;
+    /// Metal empty payloads have no physical backing.
     /// This pure query does not initialize, allocate, lend a runtime, or issue credit.
-    pub fn metal_population_layout(
+    pub fn population_layout(
         runtime: &PreparedInputRuntime,
         requested_bytes: usize,
         maximum_births: usize,
@@ -237,7 +238,7 @@ impl OriginalBufferBudget {
         // SAFETY: runtime keeps genuine immutable allocator facts alive. Native
         // reads those scalar facts and the linked physical rounding worker only.
         OriginalBufferCause::check(unsafe {
-            safemlx_sys::mlx_original_buffer_metal_population_layout_for(
+            safemlx_sys::mlx_original_buffer_population_layout_for(
                 &mut raw,
                 runtime.raw(),
                 requested_bytes,

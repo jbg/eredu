@@ -258,7 +258,7 @@ fn original_cpu_selector_preserves_ranking_transforms_and_escaped_custody() {
                 )
                 .unwrap();
                 let completion = recipe.completion;
-                let physical = OriginalBufferBudget::metal_population_layout(
+                let physical = OriginalBufferBudget::population_layout(
                     &allocator,
                     recipe.storage.mutable_bytes().try_into().unwrap(),
                     recipe.storage.maximum_births(),

@@ -26,7 +26,7 @@ impl OriginalCopyLayoutBuilder {
             DeviceType::Cpu=>IsolatedCopyNativeLayout::cpu(self.operands,self.source_clones,self.maximum_rank),
             DeviceType::Gpu=>self.layout(0),
         }.ok_or(OriginalCopyCause::UnknownLayout)?;
-        let population=OriginalBufferBudget::metal_population_layout(runtime,
+        let population=OriginalBufferBudget::population_layout(runtime,
             self.logical_bytes.checked_mul(2).ok_or(OriginalCopyCause::Overflow)?,
             self.operands.checked_mul(2).ok_or(OriginalCopyCause::Overflow)?)?;
         Ok(Some(RealtimeCopyPlan {stream,layout,

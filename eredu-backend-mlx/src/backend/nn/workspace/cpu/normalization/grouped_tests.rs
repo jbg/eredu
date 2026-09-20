@@ -92,7 +92,7 @@ fn original_cpu_grouped_rms_matches_scalar_and_preserves_independent_sources() {
         let context=WorkspaceContext::new(cpu);let report=quote(cpu,groups,scale,WorkspaceFloatingType::Float32,&context);
         let recipe=SpeculativeNumericalRecipe::inspect_cpu_equations(&report,ordinary,cpu,&context).unwrap();
         let completion=recipe.completion;
-        let physical=OriginalBufferBudget::metal_population_layout(&allocator,usize::try_from(recipe.storage.mutable_bytes()).unwrap(),
+        let physical=OriginalBufferBudget::population_layout(&allocator,usize::try_from(recipe.storage.mutable_bytes()).unwrap(),
             recipe.storage.maximum_births()).unwrap().capacity();
         let released=Arc::new(AtomicBool::new(false));let owner=Arc::new(Lifetime(released.clone()));
         let retained_owner=Arc::downgrade(&owner);

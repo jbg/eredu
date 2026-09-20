@@ -250,7 +250,7 @@ fn original_cpu_joint_selector_preserves_unbiased_weights_strided_selection_and_
         }
         let recipe = quote(&inputs, spec, ordinary, cpu);
         let completion = recipe.completion;
-        let physical = OriginalBufferBudget::metal_population_layout(
+        let physical = OriginalBufferBudget::population_layout(
             &allocator,
             recipe.storage.mutable_bytes().try_into().unwrap(),
             recipe.storage.maximum_births(),

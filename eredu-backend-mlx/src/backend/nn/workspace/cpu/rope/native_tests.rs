@@ -192,7 +192,7 @@ fn run_native(explicit:bool) {
             else{context.finish_report(&[output])}.unwrap();
         let recipe=SpeculativeNumericalRecipe::inspect_cpu_outputs(&report,output_roots,ordinary,cpu,&context).unwrap();
         let completion=recipe.completion;
-        let physical=OriginalBufferBudget::metal_population_layout(&allocator,
+        let physical=OriginalBufferBudget::population_layout(&allocator,
             usize::try_from(recipe.storage.mutable_bytes()).unwrap(),recipe.storage.maximum_births()).unwrap().capacity();
         let released=Arc::new(AtomicBool::new(false));let owner=Arc::new(Lifetime(released.clone()));
         let graph=PreparedSubmissionGraphQuota::try_new(recipe.graph_capacity,owner.clone()).unwrap().try_allocate().unwrap();

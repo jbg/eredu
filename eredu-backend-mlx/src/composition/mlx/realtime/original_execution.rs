@@ -130,7 +130,7 @@ impl FrameNativeLayout {
     pub(super) fn inspect(source:&CompiledRealtimeFrameSource,runtime:&PreparedInputRuntime,
         input:eredu_runtime::RealtimeIngressSource<'_>)->Result<Self,Error> {
         let recipe=*source.operations.recipe();
-        let population=OriginalBufferBudget::metal_population_layout(runtime,
+        let population=OriginalBufferBudget::population_layout(runtime,
             usize::try_from(recipe.storage.mutable_bytes()).map_err(|_|overflow())?,
             recipe.storage.maximum_births()).map_err(|cause|Error::Neural(
                 source.funding().metadata_source(cause)))?;

@@ -5347,7 +5347,7 @@ extern "C" {
         release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
     ) -> u32;
     pub fn mlx_original_buffer_layout_for(out: *mut mlx_original_buffer_layout) -> u32;
-    pub fn mlx_original_buffer_metal_population_layout_for(
+    pub fn mlx_original_buffer_population_layout_for(
         out: *mut mlx_original_buffer_population_layout,
         runtime: mlx_prepared_input_runtime,
         requested_bytes: usize,

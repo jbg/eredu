@@ -103,7 +103,7 @@ fn original_cpu_affine_matches_independent_packed_weight_equations() {
                 )
                 .unwrap();
                 let completion = recipe.completion;
-                let physical = OriginalBufferBudget::metal_population_layout(
+                let physical = OriginalBufferBudget::population_layout(
                     &allocator,
                     recipe.storage.mutable_bytes() as usize,
                     recipe.storage.maximum_births(),

@@ -277,7 +277,7 @@ impl AddressableQuote {
             .ok_or_else(invalid)?;
         let equation = population.finish(roles, id_completions, &context)?;
         let numerical = equation.with_indexed_source(&residency, &context)?;
-        let backing = safemlx::OriginalBufferBudget::metal_population_layout(
+        let backing = safemlx::OriginalBufferBudget::population_layout(
             runtime,
             usize::try_from(numerical.storage.mutable_bytes()).map_err(|_| invalid())?,
             numerical.storage.maximum_births(),

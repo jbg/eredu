@@ -1293,6 +1293,11 @@ host constructor and issues no device evaluation.
 A recipe with a certified zero GPU-kernel population creates no pipeline cache.
 Unknown populations remain unqualified, and positive populations require the
 existing native cache layout and admitted construction.
+The shared native allocation-population query uses the retained allocator to
+bound the sum of independently rounded births. CPU populations include a size
+header for every allocation attempt, including empty payloads; Metal empty
+payloads have no backing. Finite payload and birth bounds retain every generation
+without relying on donation, cache reuse or early retirement.
 
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same

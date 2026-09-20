@@ -105,7 +105,7 @@ impl EmbeddedNativeLayout {
             .record()
             .mutable_storage()
             .ok_or(EmbeddedNativeCause::Missing("native backing"))?;
-        let population = OriginalBufferBudget::metal_population_layout(
+        let population = OriginalBufferBudget::population_layout(
             &runtime,
             usize::try_from(storage.mutable_bytes()).map_err(|_| EmbeddedNativeCause::Overflow)?,
             storage.maximum_births(),

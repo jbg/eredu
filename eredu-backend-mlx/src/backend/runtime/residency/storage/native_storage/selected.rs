@@ -184,7 +184,7 @@ impl MlxNativeStorage {
             .map_err(|cause| Error::Other(Box::new(NativeStorageCause::Cold(cause.retained()))))?;
         let requested = usize::try_from(requested_bytes)
             .map_err(|_| Error::PrefillControl(WorkingMemoryError::Overflow))?;
-        match OriginalBufferBudget::metal_population_layout(runtime, requested, maximum_births) {
+        match OriginalBufferBudget::population_layout(runtime, requested, maximum_births) {
             Ok(layout) => Ok(Some(layout)),
             Err(OriginalBufferCause::Unsupported) => Ok(None),
             Err(cause) => Err(Error::Other(Box::new(NativeStorageCause::Fixed(cause)))),

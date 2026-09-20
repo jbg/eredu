@@ -619,7 +619,7 @@ impl Arithmetic {
                 .agreement_inputs()
                 .ok_or_else(|| fail(LogicalCause::Identity, c))?
                 .runtime();
-            let backing = OriginalBufferBudget::metal_population_layout(
+            let backing = OriginalBufferBudget::population_layout(
                 runtime,
                 usize::try_from(recipe.storage.mutable_bytes()).map_err(|_| overflow())?,
                 recipe.storage.maximum_births(),

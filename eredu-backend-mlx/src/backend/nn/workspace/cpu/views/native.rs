@@ -64,7 +64,7 @@ fn original_cpu_integer_gather_and_strided_reshape_preserve_values_and_custody()
             SpeculativeNumericalRecipe::inspect_cpu_outputs(&report,1,ordinary,cpu,&context).unwrap()
         } else {trace_gather(&[18],3,true,ordinary,cpu)};
         let completion = recipe.completion;
-        let physical = OriginalBufferBudget::metal_population_layout(
+        let physical = OriginalBufferBudget::population_layout(
             &allocator,
             recipe.storage.mutable_bytes().try_into().unwrap(),
             recipe.storage.maximum_births(),

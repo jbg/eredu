@@ -203,7 +203,7 @@ pub(super) fn capacity(
     )>())?;
     let bytes = usize::try_from(recipe.storage.mutable_bytes())
         .map_err(|_| context.metadata_error(format_args!("boundary native capacity overflow")))?;
-    let backing = safemlx::OriginalBufferBudget::metal_population_layout(
+    let backing = safemlx::OriginalBufferBudget::population_layout(
         runtime,
         bytes,
         recipe.storage.maximum_births(),

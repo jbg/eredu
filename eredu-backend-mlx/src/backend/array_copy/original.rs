@@ -503,7 +503,7 @@ impl OriginalCopyLayoutBuilder {
             .checked_add(self.host_stores.count)
             .ok_or(OriginalCopyCause::Overflow)?;
         let population =
-            OriginalBufferBudget::metal_population_layout(&runtime, logical_bytes, births)?;
+            OriginalBufferBudget::population_layout(&runtime, logical_bytes, births)?;
         let buffer_bytes = population.capacity();
         let physical_bytes = buffer_bytes
             .checked_add(self.host_stores.backing)

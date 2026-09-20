@@ -101,10 +101,10 @@ size_t mlx_host_transfer_array_view_control_bytes(void);
 
 // Pure owner/transport layouts; excludes physical capacity and Graph births.
 unsigned mlx_original_buffer_layout_for(mlx_original_buffer_layout*);
-// Pure original Metal population bound using this retained allocator. Input
-// bytes bounds the sum of requested payloads; births bounds positive attempts.
-// Each physical birth rounds separately. CPU headers are a separate mechanism.
-unsigned mlx_original_buffer_metal_population_layout_for(
+// Pure original CPU/Metal population bound using this retained allocator.
+// Input bytes bounds the sum of requested payloads; births bounds all allocation
+// attempts, including empty CPU requests. Each header and birth rounds separately.
+unsigned mlx_original_buffer_population_layout_for(
     mlx_original_buffer_population_layout*, mlx_prepared_input_runtime,
     size_t requested_bytes, size_t maximum_births);
 // Exact one-birth capacity from this actual retained allocator, using the same

@@ -410,7 +410,7 @@ impl Plan {
         let runtime = environment.input_runtime()?;
         let row = recipe.records().get(ordinal).ok_or(Cause::Unknown)?;
         let storage = row.mutable_storage().ok_or(Cause::Unknown)?;
-        let population = OriginalBufferBudget::metal_population_layout(
+        let population = OriginalBufferBudget::population_layout(
             &runtime,
             usize::try_from(storage.mutable_bytes()).map_err(|_| Cause::Overflow)?,
             storage.maximum_births(),

@@ -259,9 +259,9 @@ fn ordinary_buffer_checked_attachment_busy_returns_same_prepared_owner() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
 #[test]
-fn original_metal_population_covers_independently_rounded_sources() {
+fn original_population_covers_independently_rounded_sources() {
     let runtime = PreparedInputRuntime::prepare().unwrap();
     let lengths = [1usize, 2, 4096, 4097];
     let actual = lengths
@@ -274,13 +274,13 @@ fn original_metal_population_covers_independently_rounded_sources() {
         .sum::<usize>();
     let requested = lengths.iter().sum::<usize>() * size_of::<u32>();
     let population =
-        OriginalBufferBudget::metal_population_layout(&runtime, requested, lengths.len()).unwrap();
+        OriginalBufferBudget::population_layout(&runtime, requested, lengths.len()).unwrap();
     assert!(population.capacity() >= actual);
     assert!(population.control_bytes() > 0);
     // Four-byte scalar sources individually occupy a physical page. The
     // ordinary small-buffer allowance (strictly below twice the payload) is
     // insufficient even when its equation has a certified birth population.
-    let scalar = OriginalBufferBudget::metal_population_layout(&runtime, 4, 1).unwrap();
+    let scalar = OriginalBufferBudget::population_layout(&runtime, 4, 1).unwrap();
     assert!(
         scalar.capacity()
             >= crate::OriginalPromptInputFacts::inspect(&runtime, 1)
@@ -289,27 +289,54 @@ fn original_metal_population_covers_independently_rounded_sources() {
     );
     assert!(scalar.capacity() > 7);
     assert_eq!(
-        OriginalBufferBudget::metal_population_layout(&runtime, 0, 0)
+        OriginalBufferBudget::population_layout(&runtime, 0, 0)
             .unwrap()
             .capacity(),
         0
     );
+    let empty = OriginalBufferBudget::request_layout(&runtime, 0).unwrap().capacity();
+    let empty_population = OriginalBufferBudget::population_layout(&runtime, 0, 8).unwrap();
+    assert!(empty_population.capacity() >= 8 * empty);
+    if empty == 0 {
+        assert_eq!(empty_population.capacity(), 0);
+    } else {
+        assert!(empty_population.capacity() > 0);
+        assert_eq!(
+            OriginalBufferBudget::population_layout(&runtime, 0, usize::MAX),
+            Err(OriginalBufferCause::InvalidLayout)
+        );
+    }
+    let page = crate::memory::host_page_size().unwrap();
+    let header = size_of::<usize>();
+    for requests in [
+        vec![0],
+        vec![0, 0, 0],
+        vec![1, 0, page - header, page - header + 1],
+        vec![page - 1, page, page + 1, 2 * page + 1],
+    ] {
+        let actual: usize = requests.iter().map(|&bytes| {
+            OriginalBufferBudget::request_layout(&runtime, bytes).unwrap().capacity()
+        }).sum();
+        let bound = OriginalBufferBudget::population_layout(
+            &runtime, requests.iter().sum(), requests.len()
+        ).unwrap().capacity();
+        assert!(bound >= actual, "requests={requests:?}: {bound} < {actual}");
+        assert!(bound < actual + requests.len() * page);
+        let larger_population = OriginalBufferBudget::population_layout(
+            &runtime, requests.iter().sum(), requests.len() + 3
+        ).unwrap().capacity();
+        assert!(larger_population >= bound);
+    }
     assert_eq!(
-        OriginalBufferBudget::metal_population_layout(&runtime, 0, 8)
-            .unwrap()
-            .capacity(),
-        0
-    );
-    assert_eq!(
-        OriginalBufferBudget::metal_population_layout(&runtime, 1, 0),
+        OriginalBufferBudget::population_layout(&runtime, 1, 0),
         Err(OriginalBufferCause::InvalidLayout)
     );
     assert_eq!(
-        OriginalBufferBudget::metal_population_layout(&runtime, usize::MAX, 1),
+        OriginalBufferBudget::population_layout(&runtime, usize::MAX, 1),
         Err(OriginalBufferCause::InvalidLayout)
     );
     assert_eq!(
-        OriginalBufferBudget::metal_population_layout(&runtime, 1, usize::MAX),
+        OriginalBufferBudget::population_layout(&runtime, 1, usize::MAX),
         Err(OriginalBufferCause::InvalidLayout)
     );
 }

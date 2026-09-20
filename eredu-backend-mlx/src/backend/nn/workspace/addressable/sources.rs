@@ -287,7 +287,7 @@ impl AddressableSources {
         // would mistake source constructors for numerical Eval entries.
         let equation = population.finish(maximum_quote.outputs.len(), 1, &context)?;
         let numerical = equation.with_indexed_source(&maximum_quote.residency, &context)?;
-        let backing = safemlx::OriginalBufferBudget::metal_population_layout(self.runtime(),
+        let backing = safemlx::OriginalBufferBudget::population_layout(self.runtime(),
             usize::try_from(numerical.storage.mutable_bytes()).map_err(|_| invalid())?, numerical.storage.maximum_births())
             .map_err(|cause| context.metadata_source(cause))?;
         let capacity = BoundaryStageCapacity { graph: numerical.graph_capacity, records: numerical.record_capacity, backing: backing.capacity() };

@@ -919,7 +919,7 @@ impl Plan {
             (false, None) => SpeculativeNumericalRecipe::inspect_with_nested(report, roots,
                 capture.map_or(0,|capture|capture.completions), mechanism, context),
         }.map_err(Error::from)?;
-        let population = OriginalBufferBudget::metal_population_layout(
+        let population = OriginalBufferBudget::population_layout(
             &runtime,
             usize::try_from(recipe.storage.mutable_bytes()).map_err(|_| Cause::Overflow)?,
             recipe.storage.maximum_births(),

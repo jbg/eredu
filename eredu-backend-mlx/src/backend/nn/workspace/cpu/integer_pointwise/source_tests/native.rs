@@ -76,7 +76,7 @@ fn original_cpu_integer_peer_preserves_values_and_escaped_output_custody() {
         drop(ordinary_output);
         let recipe = trace_peer(shape, ordinary, cpu);
         let completion = recipe.completion;
-        let physical = OriginalBufferBudget::metal_population_layout(
+        let physical = OriginalBufferBudget::population_layout(
             &allocator,
             recipe.storage.mutable_bytes().try_into().unwrap(),
             recipe.storage.maximum_births(),

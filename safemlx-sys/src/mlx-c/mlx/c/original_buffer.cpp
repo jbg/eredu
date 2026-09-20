@@ -144,35 +144,42 @@ extern "C" unsigned mlx_original_buffer_layout_for(mlx_original_buffer_layout* o
   return MLX_ORIGINAL_BUFFER_OK;
 }
 
-extern "C" unsigned mlx_original_buffer_metal_population_layout_for(
+extern "C" unsigned mlx_original_buffer_population_layout_for(
     mlx_original_buffer_population_layout* out, mlx_prepared_input_runtime runtime,
     size_t requested_bytes, size_t maximum_births) {
   using Kind = allocator::HostTransferStorageKind;
   if (!out || !runtime.allocator) return MLX_ORIGINAL_BUFFER_LAYOUT;
-  if (runtime.storage_kind != static_cast<unsigned>(Kind::metal_shared))
+  if (runtime.storage_kind != static_cast<unsigned>(Kind::metal_shared) &&
+      runtime.storage_kind != static_cast<unsigned>(Kind::cpu))
     return MLX_ORIGINAL_BUFFER_UNSUPPORTED;
+  const auto kind = static_cast<Kind>(runtime.storage_kind);
   const allocator::PreparedInputFacts facts{runtime.page_size, runtime.maximum,
-      Kind::metal_shared, runtime.controls};
+      kind, runtime.controls};
   size_t quantum = 0;
   // Use the exact physical rounding worker used by malloc_original; this does
-  // not initialize/query the allocator, and CPU's header is intentionally absent.
-  if (!allocator::original_buffer_physical_capacity(facts, 1, quantum) || !quantum)
+  // not initialize/query the allocator. A one-byte request occupies one page.
+  if (!allocator::original_buffer_physical_capacity(facts, 1, quantum) ||
+      !quantum || quantum != runtime.page_size)
     return MLX_ORIGINAL_BUFFER_UNSUPPORTED;
   if (requested_bytes && !maximum_births) return MLX_ORIGINAL_BUFFER_LAYOUT;
-  const size_t padding = quantum - 1;
+  const size_t header = kind == Kind::cpu ? sizeof(size_t) : 0;
+  if (quantum - 1 > std::numeric_limits<size_t>::max() - header)
+    return MLX_ORIGINAL_BUFFER_LAYOUT;
+  const size_t padding = quantum - 1 + header;
   size_t capacity = 0;
-  if (requested_bytes) {
+  if (requested_bytes || header) {
     if (maximum_births && padding >
         (std::numeric_limits<size_t>::max() - requested_bytes) / maximum_births)
       return MLX_ORIGINAL_BUFFER_LAYOUT;
-    // For each positive request r: round_up(r, quantum) <= r + quantum - 1.
-    // The supplied finite payload and birth bounds therefore also bound all
-    // retained generations; no donation, eager retirement or cache reuse assumed.
+    // Each physical birth costs at most r + header + quantum - 1. CPU includes
+    // zero-payload births because their headers still occupy a page; Metal
+    // empty requests have no backing. Retain every generation without credit
+    // for donation, eager retirement or cache reuse.
     capacity = requested_bytes + maximum_births * padding;
   }
   *out = {capacity, sizeof(mlx_original_buffer_population_layout) +
       sizeof(mlx_prepared_input_runtime) + sizeof(allocator::PreparedInputFacts) +
-      sizeof(size_t) * 6 + sizeof(unsigned)};
+      sizeof(size_t) * 7 + sizeof(unsigned) + sizeof(Kind)};
   return MLX_ORIGINAL_BUFFER_OK;
 }
 

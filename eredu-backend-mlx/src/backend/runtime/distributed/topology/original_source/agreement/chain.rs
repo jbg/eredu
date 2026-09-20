@@ -159,7 +159,7 @@ impl ArithmeticQuote {
                     source.funding(),
                 )
             })?;
-        let backing = OriginalBufferBudget::metal_population_layout(
+        let backing = OriginalBufferBudget::population_layout(
             inputs.runtime(),
             usize::try_from(recipe.storage.mutable_bytes()).map_err(|_| overflow())?,
             recipe.storage.maximum_births(),

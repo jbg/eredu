@@ -156,7 +156,7 @@ impl Encoding {
                 .map_err(|cause|fail(cause.into(),&custody))?;
             drop((outputs,sources));
             let runtime=owner.owner().request.source.agreement_inputs().ok_or_else(invalid)?.runtime();
-            let backing=OriginalBufferBudget::metal_population_layout(runtime,
+            let backing=OriginalBufferBudget::population_layout(runtime,
                 usize::try_from(recipe.storage.mutable_bytes()).map_err(|_|overflow())?,recipe.storage.maximum_births())
                 .map_err(|cause|fail(cause.into(),&custody))?;
             reserve(funding,&[usize::try_from(recipe.controls).map_err(|_|overflow())?,

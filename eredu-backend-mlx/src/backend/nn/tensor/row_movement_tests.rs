@@ -133,7 +133,7 @@ fn run_case(
         },
         PreparedGroupedOutputs::default(),
     );
-    let physical = OriginalBufferBudget::metal_population_layout(
+    let physical = OriginalBufferBudget::population_layout(
         &allocator,
         recipe.storage.mutable_bytes().try_into().unwrap(),
         recipe.storage.maximum_births(),

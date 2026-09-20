@@ -107,7 +107,7 @@ impl MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for In
         assert_eq!(completion.traversal.roots(),closing.len());
         let graph_bytes=usize::try_from(graph_capacity::ResidentGraphStorage::for_completion(completion).unwrap().full_capacity.unwrap()).unwrap();
         let record_bytes=usize::try_from(record_capacity::ResidentRecordStorage::for_completion(completion).unwrap().full_capacity.unwrap()).unwrap();
-        let physical=OriginalBufferBudget::metal_population_layout(self.allocator,
+        let physical=OriginalBufferBudget::population_layout(self.allocator,
             usize::try_from(storage.mutable_bytes()).unwrap(),storage.maximum_births()).unwrap().capacity();
         assert!(graph_bytes>0&&record_bytes>0&&physical>0);
         // Independent sentinels distinguish a retained native domain from a

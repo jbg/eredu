@@ -88,7 +88,7 @@ impl Decoding {
             let recipe=selected_parallel_numerical(&report,2,mechanism,&context).map_err(|cause|fail(cause.into(),&custody))?;
             drop((prototype,wire));
             let runtime=owner.owner().request.source.agreement_inputs().ok_or_else(invalid)?.runtime();
-            let backing=OriginalBufferBudget::metal_population_layout(runtime,
+            let backing=OriginalBufferBudget::population_layout(runtime,
                 usize::try_from(recipe.storage.mutable_bytes()).map_err(|_|overflow())?,recipe.storage.maximum_births())
                 .map_err(|cause|fail(cause.into(),&custody))?;
             reserve(funding,&[usize::try_from(recipe.controls).map_err(|_|overflow())?,

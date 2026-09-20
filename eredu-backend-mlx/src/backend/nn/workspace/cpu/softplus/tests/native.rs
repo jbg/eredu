@@ -104,7 +104,7 @@ fn original_cpu_softplus_preserves_precision_numerics_and_escaped_custody() {
             input.evaluated().unwrap();
             let recipe = trace(shape, floating);
             let completion = recipe.completion;
-            let physical = OriginalBufferBudget::metal_population_layout(
+            let physical = OriginalBufferBudget::population_layout(
                 &allocator,
                 recipe.storage.mutable_bytes().try_into().unwrap(),
                 recipe.storage.maximum_births(),
