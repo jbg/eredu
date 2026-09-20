@@ -177,7 +177,7 @@ fn metal_copy_program_report_covers_source_destination_and_compaction_overlap() 
     assert_eq!(state.displaced_bytes, Some(0));
 }
 
-#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn cpu_saved_copy_trace_preserves_floating_source_and_independent_destination() {
     use crate::backend::nn::workspace::{MlxMetalWorkspaceMechanisms,MlxCpuWorkspaceMechanisms,MlxCpuMatmulMechanism};

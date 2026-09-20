@@ -890,6 +890,11 @@ geometry and cannot create another prediction. See [execution control](execution
 [bounded capture](bounded-capture.md), [interventions](interventions.md) and
 [component analysis](component-analysis.md).
 
+Saved-array and pending-input copy admission selects native resource requirements
+from the retained execution stream. CPU copies use the shared CPU copy worker
+without requiring the Metal feature, with no GPU pipeline lookups. Source
+completion, physical-buffer admission and destination custody remain required.
+
 Hybrid snapshot inspection and copying use the same grouped source worker for
 ordinary and prepared entry. Every actual fixed-role child table is retained
 and funded, including an empty table on an all-KV layer. The worker preserves

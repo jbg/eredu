@@ -417,7 +417,6 @@ impl OriginalCopyLayoutBuilder {
         if self.operands == 0
             || !cfg!(all(
                 target_vendor = "apple",
-                feature = "metal",
                 not(feature = "cuda")
             ))
         {
@@ -456,7 +455,6 @@ impl OriginalCopyLayoutBuilder {
             || self.source_clones != 1
             || !cfg!(all(
                 target_vendor = "apple",
-                feature = "metal",
                 not(feature = "cuda")
             ))
         {
@@ -508,7 +506,15 @@ impl OriginalCopyLayoutBuilder {
         let physical_bytes = buffer_bytes
             .checked_add(self.host_stores.backing)
             .ok_or(OriginalCopyCause::Overflow)?;
-        let pipeline = PreparedPipelineCachePlan::new(layout.kernel_attempts);
+        let pipeline = (layout.kernel_attempts != 0)
+            .then(|| PreparedPipelineCachePlan::new(layout.kernel_attempts));
+        let pipeline_bytes = match pipeline {
+            Some(plan) => plan
+                .layout::<WorkspaceCopyRetention>()?
+                .required_bytes()
+                .ok_or(OriginalCopyCause::Overflow)?,
+            None => 0,
+        };
         let parts = [
             layout.controls,
             population.control_bytes(),
@@ -526,10 +532,7 @@ impl OriginalCopyLayoutBuilder {
             PreparedPrefillFailure::<WorkspaceCopyRetention>::layout()?
                 .total_bytes()
                 .ok_or(OriginalCopyCause::Overflow)?,
-            pipeline
-                .layout::<WorkspaceCopyRetention>()?
-                .required_bytes()
-                .ok_or(OriginalCopyCause::Overflow)?,
+            pipeline_bytes,
             safemlx::OriginalNativeControlLayout::inspect()?.fixed_control_bytes,
             OperationEvent::nested_completion_control_bytes::<1>()
                 .ok_or(OriginalCopyCause::UnknownLayout)?,
@@ -609,7 +612,7 @@ pub(crate) struct OriginalCopyPlan<'a> {
     pool: &'a WorkingMemoryPool,
     allocator: &'static InitializedInputAllocator,
     layout: IsolatedCopyNativeLayout,
-    pipeline: PreparedPipelineCachePlan,
+    pipeline: Option<PreparedPipelineCachePlan>,
     physical_bytes: usize,
     buffer_bytes: usize,
     host_stores: host_store::Population,
@@ -684,9 +687,11 @@ impl OriginalCopyPlan<'_> {
             .map_err(|e| e.into_parts().0)?;
             let pipeline = self
                 .pipeline
-                .realize(retained.clone())
-                .map_err(|e| e.into_parts().0)?;
-            pipeline.install(&graph)?;
+                .map(|plan| plan.realize(retained.clone()).map_err(|e| e.into_parts().0))
+                .transpose()?;
+            if let Some(pipeline) = &pipeline {
+                pipeline.install(&graph)?;
+            }
             let buffer = PreparedOriginalBufferBudget::try_new(
                 &runtime,
                 self.buffer_bytes,
@@ -723,7 +728,7 @@ pub(crate) struct PreparedOriginalCopy {
     record: SubmissionRecordQuota,
     buffer: OriginalBufferBudget,
     failure: RetainedPrefillFailure,
-    _pipeline: PreparedPipelineCache<WorkspaceCopyRetention>,
+    _pipeline: Option<PreparedPipelineCache<WorkspaceCopyRetention>>,
     layout: IsolatedCopyNativeLayout,
     custody: WorkspaceCopyRetention,
     host_stores: host_store::Population,
